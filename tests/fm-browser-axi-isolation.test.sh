@@ -116,6 +116,24 @@ assert_port_in_spawn_range() {
   [ "$port" -ge 19000 ] && [ "$port" -le 20999 ] || fail "$label: port $port is outside 19000..20999"
 }
 
+test_port_allocator_degrades_when_probe_tools_are_missing() {
+  local w no_probe err out status
+  w="$TMP_ROOT/no-probe"
+  no_probe="$w/path"
+  err="$w/err.log"
+  mkdir -p "$no_probe"
+
+  eval "$(sed -n '/^browser_axi_port_is_free()/,/^browser_axi_profile_mode()/p' "$ROOT/bin/fm-spawn.sh" | sed '$d')"
+  out=$(PATH="$no_probe" browser_axi_alloc_port fm-no-probe-z9 2>"$err")
+  status=$?
+
+  expect_code 0 "$status" "port allocator should not fail when lsof and nc are missing"
+  [ -z "$out" ] || fail "port allocator should leave explicit port unset without probe tools, got: $out"
+  assert_contains "$(cat "$err")" "warning: cannot probe chrome-devtools-axi ports without lsof or nc" \
+    "port allocator did not warn about missing probe tools"
+  pass "port allocator degrades to AXI's fallback when probe tools are missing"
+}
+
 test_persistent_spawn_wires_axi_env_and_meta() {
   local w fakebin npm_prefix mcp launchlog launch meta session port profile
   {
@@ -209,8 +227,8 @@ EOF
   pass "ephemeral spawn keeps the isolated AXI session and omits the persistent browser profile"
 }
 
-test_teardown_stops_recorded_axi_bridge() {
-  local w fakebin npm_prefix mcp state id meta log out status
+test_teardown_stops_recorded_axi_bridge_and_removes_profile() {
+  local w fakebin npm_prefix mcp state id meta log profile out status
   {
     IFS= read -r w
     IFS= read -r fakebin
@@ -223,8 +241,9 @@ EOF
   id='browser-teardown-z4'
   log="$w/axi-stop.log"
   meta="$state/$id.meta"
+  profile="$w/user-home/.fm-browser-profiles/fm-test-$id"
   : > "$log"
-  mkdir -p "$state"
+  mkdir -p "$state" "$profile/Default"
   fm_write_meta "$meta" \
     "window=firstmate:fm-$id" \
     "worktree=$w/missing-worktree" \
@@ -237,7 +256,7 @@ EOF
     "browser_axi_session=fm-test-$id" \
     "browser_axi_port=19399" \
     "browser_axi_profile_mode=persistent" \
-    "browser_axi_user_data_dir=$w/user-home/.fm-browser-profiles/fm-test-$id" \
+    "browser_axi_user_data_dir=$profile" \
     "browser_axi_mcp_path=$mcp"
 
   out=$(PATH="$fakebin:$BASE_PATH" HOME="$w/user-home" FM_FAKE_AXI_LOG="$log" \
@@ -250,11 +269,13 @@ EOF
   expect_code 0 "$status" "teardown should succeed: $out"
   assert_contains "$(cat "$log")" "cmd=stop session=fm-test-$id port=19399 mcp=$mcp auto= browser= userdir=" \
     "teardown did not stop AXI with the recorded isolated session and sanitized env"
+  [ ! -e "$profile" ] || fail "teardown: persistent browser profile was not removed"
   [ ! -e "$meta" ] || fail "teardown: meta was not removed"
-  pass "teardown stops the recorded chrome-devtools-axi bridge before clearing task state"
+  pass "teardown stops the recorded chrome-devtools-axi bridge and removes its persistent profile"
 }
 
+test_port_allocator_degrades_when_probe_tools_are_missing
 test_persistent_spawn_wires_axi_env_and_meta
 test_distinct_tasks_get_distinct_axi_identities
 test_ephemeral_spawn_omits_user_data_dir
-test_teardown_stops_recorded_axi_bridge
+test_teardown_stops_recorded_axi_bridge_and_removes_profile

@@ -51,8 +51,9 @@
 #   dispatch profiles, and backlog backend inherit the primary's settings
 #   (fm-config-inherit-lib.sh).
 #   Every spawn also gets a per-task chrome-devtools-axi browser identity:
-#   CHROME_DEVTOOLS_AXI_SESSION, CHROME_DEVTOOLS_AXI_PORT, and, by default,
-#   CHROME_DEVTOOLS_AXI_USER_DATA_DIR under $HOME/.fm-browser-profiles/.
+#   CHROME_DEVTOOLS_AXI_SESSION, an explicit CHROME_DEVTOOLS_AXI_PORT when a
+#   local port probe can find one, and, by default, CHROME_DEVTOOLS_AXI_USER_DATA_DIR
+#   under $HOME/.fm-browser-profiles/.
 #   Set FM_BROWSER_AXI_PROFILE_MODE=ephemeral for a clean AXI isolated browser
 #   instead of a persistent per-task profile.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
@@ -518,8 +519,8 @@ browser_axi_port_is_free() {
 browser_axi_alloc_port() {
   local session=$1 start=19000 end=20999 count seed offset i port
   if ! command -v lsof >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
-    echo "error: cannot allocate chrome-devtools-axi port: need lsof or nc on PATH" >&2
-    return 1
+    echo "warning: cannot probe chrome-devtools-axi ports without lsof or nc; leaving CHROME_DEVTOOLS_AXI_PORT unset for AXI's session-hash fallback" >&2
+    return 0
   fi
   count=$((end - start + 1))
   seed=$(printf '%s' "$session" | cksum | awk '{print $1}')
@@ -533,8 +534,8 @@ browser_axi_alloc_port() {
     fi
     i=$((i + 1))
   done
-  echo "error: no free chrome-devtools-axi port in 19000..20999 for $session" >&2
-  return 1
+  echo "warning: no free chrome-devtools-axi port in 19000..20999 for $session; leaving CHROME_DEVTOOLS_AXI_PORT unset for AXI's session-hash fallback" >&2
+  return 0
 }
 
 browser_axi_profile_mode() {
@@ -579,7 +580,9 @@ browser_axi_resolve_mcp_path() {
 browser_axi_env_prefix() {
   printf '%s' 'env -u CHROME_DEVTOOLS_AXI_AUTO_CONNECT -u CHROME_DEVTOOLS_AXI_BROWSER_URL -u CHROME_DEVTOOLS_AXI_USER_DATA_DIR -u CHROME_DEVTOOLS_AXI_MCP_PATH'
   printf ' CHROME_DEVTOOLS_AXI_SESSION=%s' "$(shell_quote "$BROWSER_AXI_SESSION")"
-  printf ' CHROME_DEVTOOLS_AXI_PORT=%s' "$(shell_quote "$BROWSER_AXI_PORT")"
+  if [ -n "$BROWSER_AXI_PORT" ]; then
+    printf ' CHROME_DEVTOOLS_AXI_PORT=%s' "$(shell_quote "$BROWSER_AXI_PORT")"
+  fi
   printf ' CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS=%s' "$(shell_quote 60000)"
   if [ -n "$BROWSER_AXI_USER_DATA_DIR" ]; then
     printf ' CHROME_DEVTOOLS_AXI_USER_DATA_DIR=%s' "$(shell_quote "$BROWSER_AXI_USER_DATA_DIR")"
@@ -1102,7 +1105,7 @@ META_WINDOW=$T
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "browser_axi_session=$BROWSER_AXI_SESSION"
-  echo "browser_axi_port=$BROWSER_AXI_PORT"
+  [ -z "$BROWSER_AXI_PORT" ] || echo "browser_axi_port=$BROWSER_AXI_PORT"
   echo "browser_axi_profile_mode=$BROWSER_AXI_PROFILE_MODE"
   [ -z "$BROWSER_AXI_USER_DATA_DIR" ] || echo "browser_axi_user_data_dir=$BROWSER_AXI_USER_DATA_DIR"
   [ -z "$BROWSER_AXI_MCP_PATH" ] || echo "browser_axi_mcp_path=$BROWSER_AXI_MCP_PATH"

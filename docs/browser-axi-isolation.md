@@ -6,8 +6,9 @@ Date: 2026-07-10.
 The identity is harness-neutral, so Claude, Codex, OpenCode, Pi, and Grok receive the same browser environment contract.
 The contract uses `chrome-devtools-axi` as the worker browser path.
 Each worker receives a sanitized `CHROME_DEVTOOLS_AXI_SESSION` derived from the firstmate home fingerprint and the task id.
-Each worker receives an explicit free localhost `CHROME_DEVTOOLS_AXI_PORT` from the reserved `19000..20999` range.
+Each worker receives an explicit free localhost `CHROME_DEVTOOLS_AXI_PORT` from the reserved `19000..20999` range when a probe can find one with `lsof` or `nc`.
 The explicit port avoids relying on AXI's named-session port hash, because AXI documents and prior testing reproduced hash collisions on a busy machine.
+If no probe tool is available or the reserved range is full, spawn leaves `CHROME_DEVTOOLS_AXI_PORT` unset, warns, and lets AXI use its session-hash fallback.
 Persistent mode is the default.
 Persistent mode sets `CHROME_DEVTOOLS_AXI_USER_DATA_DIR` to `$HOME/.fm-browser-profiles/<session>`.
 That profile directory gives a task its own cookies, localStorage, IndexedDB, service workers, and login state.
@@ -19,10 +20,10 @@ Spawn also clears any ambient `CHROME_DEVTOOLS_AXI_USER_DATA_DIR` before applyin
 When a usable `chrome-devtools-mcp` script path is discoverable, spawn exports `CHROME_DEVTOOLS_AXI_MCP_PATH` for the worker.
 That avoids depending on cold `npx chrome-devtools-mcp@latest` startup during the first browser action.
 If no usable MCP script path is discoverable, spawn leaves the path unset and lets AXI use its normal fallback.
-Task metadata records `browser_axi_session`, `browser_axi_port`, `browser_axi_profile_mode`, and the persistent profile or MCP path when present.
+Task metadata records `browser_axi_session`, `browser_axi_profile_mode`, and the persistent profile, explicit port, or MCP path when present.
 `bin/fm-teardown.sh` reads those metadata fields and runs `chrome-devtools-axi stop` best-effort before removing the task endpoint.
-Teardown does not delete persistent browser profiles.
-Persistent profile retention is deliberate so a respawned task can keep its browser identity.
-A profile directory should be removed only after its AXI bridge is stopped and no Chrome process still uses that path.
+Teardown removes the persistent browser profile directory recorded in task metadata after the AXI bridge has been stopped.
+Persistent profile retention lasts only while the task remains live, so same-id recovery respawns keep their browser identity until final teardown.
+Profile removal is guarded to paths under `.fm-browser-profiles`, so metadata cannot direct teardown to remove an arbitrary directory.
 The mechanism was validated before implementation with concurrent persistent workers, persistent restart, and ephemeral clean-slate sessions.
 The validation covered both Claude CLI and Codex CLI workers.

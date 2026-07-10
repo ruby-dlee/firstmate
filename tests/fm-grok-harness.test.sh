@@ -121,10 +121,11 @@ test_fm_lock_recognizes_grok_holder() {
   home="$TMP_ROOT/lock-home"
   fakebin=$(fm_fakebin "$TMP_ROOT/lock-fake")
   mkdir -p "$home/state"
-  printf '%s\n' "$$" > "$home/state/.lock"
+  printf '%s\n%s\n' "$$" 'Mon Jan  1 00:00:00 2024' > "$home/state/.lock"
   cat > "$fakebin/ps" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
+  *"lstart="*) printf '%s\n' 'Mon Jan  1 00:00:00 2024'; exit 0 ;;
   *"comm="*) printf '%s\n' '/usr/local/bin/grok'; exit 0 ;;
   *"args="*) printf '%s\n' 'grok'; exit 0 ;;
 esac

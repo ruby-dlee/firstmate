@@ -72,6 +72,7 @@ for script in bin/*.sh bin/backends/*.sh; do bash -n "$script"; done   # syntax-
 shellcheck bin/*.sh bin/backends/*.sh tests/*.sh   # lint the toolbelt and behavior tests; CI enforces this
 for test_script in tests/*.test.sh; do bash "$test_script"; done   # behavior tests, matching CI and no-mistakes commands.test
 tests/fm-wake-queue.test.sh               # durable wake queue losslessness, catch-up, double-drain, duplicate-collapse, and drain liveness guard tests
+tests/fm-lock.test.sh                     # session lock PID/start-time identity, stale PID reuse, same-holder re-acquire, and app-server rejection tests
 tests/fm-watcher-lock.test.sh             # watcher singleton, lock-race, PID identity stability, watch-arm liveness, and guard-warning tests
 tests/fm-turnend-guard.test.sh            # shared supervision predicate plus Claude Stop-hook scoping, loop guard, fail-open, and live watcher health tests
 tests/fm-arm-pretool-check.test.sh        # PreToolUse watcher-arm seatbelt: CLI/stdin allow-deny table, fail-open, --claude output shaping, and all five harness wiring files

@@ -32,10 +32,14 @@ function pidAlive(pid: string): boolean {
   }
 }
 
+function firstLockLine(text: string): string {
+  return text.split(/\r?\n/, 1)[0].trim();
+}
+
 function lockOwnership(): LockOwnership {
   let lockPid = "";
   try {
-    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
+    lockPid = firstLockLine(readFileSync(`${state}/.lock`, "utf8"));
   } catch {
     return "missing";
   }

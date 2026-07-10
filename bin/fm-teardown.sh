@@ -128,6 +128,25 @@ meta_value() {
   fm_meta_get "$meta" "$key"
 }
 
+stop_browser_axi_for_meta() {
+  local meta=$1 session port mcp env_args
+  session=$(meta_value "$meta" browser_axi_session)
+  [ -n "$session" ] || return 0
+  if ! command -v chrome-devtools-axi >/dev/null 2>&1; then
+    echo "warning: chrome-devtools-axi not found; browser bridge for $session was not stopped" >&2
+    return 0
+  fi
+  port=$(meta_value "$meta" browser_axi_port)
+  mcp=$(meta_value "$meta" browser_axi_mcp_path)
+  env_args=(-u CHROME_DEVTOOLS_AXI_AUTO_CONNECT -u CHROME_DEVTOOLS_AXI_BROWSER_URL -u CHROME_DEVTOOLS_AXI_USER_DATA_DIR -u CHROME_DEVTOOLS_AXI_MCP_PATH)
+  env_args+=("CHROME_DEVTOOLS_AXI_SESSION=$session")
+  [ -z "$port" ] || env_args+=("CHROME_DEVTOOLS_AXI_PORT=$port")
+  [ -z "$mcp" ] || env_args+=("CHROME_DEVTOOLS_AXI_MCP_PATH=$mcp")
+  if ! env "${env_args[@]}" chrome-devtools-axi stop >/dev/null 2>&1; then
+    echo "warning: chrome-devtools-axi stop failed for $session; continuing teardown" >&2
+  fi
+}
+
 require_orca_worktree_id() {
   local meta=$1 id
   id=$(meta_value "$meta" orca_worktree_id)
@@ -875,6 +894,7 @@ cleanup_firstmate_home_children() {
     else
       child_t=$(fm_backend_target_of_meta "$child_meta")
     fi
+    stop_browser_axi_for_meta "$child_meta"
     if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
@@ -991,6 +1011,7 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
+stop_browser_axi_for_meta "$META"
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1

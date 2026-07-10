@@ -27,6 +27,7 @@ Inheritance also copies the literal `config/crew-dispatch.json` file, so secondm
 Each adapter splits into mechanics and knowledge.
 The per-task mechanics, including launch command, autonomy flag, and crewmate turn-end hook, live in `bin/fm-spawn.sh`.
 The primary-session "no turn ends blind" guard contract and harness hook installation paths live in `docs/turnend-guard.md`.
+Per-agent browser isolation is spawn-owned and harness-neutral; `docs/browser-axi-isolation.md` owns the mechanism and teardown cleanup contract.
 The primary-session watcher wake protocols are rendered from `docs/supervision-protocols/` by `bin/fm-supervision-instructions.sh`.
 The supervision knowledge lives here: busy signature, exit command, interrupt, dialogs, resume behavior, skill invocation, and quirks.
 

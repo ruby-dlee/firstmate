@@ -97,6 +97,7 @@ make_fake_ps_harness() {
 set -u
 harness=${FM_FAKE_HARNESS:-claude}
 case "$*" in
+  *"lstart="*) printf '%s\n' 'Mon Jan  1 00:00:00 2024'; exit 0 ;;
   *"comm="*) printf '/usr/local/bin/%s\n' "$harness"; exit 0 ;;
   *"args="*) printf '%s\n' "$harness"; exit 0 ;;
 esac
@@ -118,6 +119,7 @@ for arg in "\$@"; do
   prev="\$arg"
 done
 case "\$*" in
+  *"lstart="*) printf '%s\n' 'Mon Jan  1 00:00:00 2024'; exit 0 ;;
   *"comm="*)
     if [ "\$pid" = "$holder_pid" ]; then
       printf '/usr/local/bin/pi\n'
@@ -184,9 +186,18 @@ SH
   chmod +x "$fakebin/herdr"
 }
 
-run_session_start() {  # <home> <root> <path>
+# run_session_start <home> <root> <path>
+# Drop every harness env marker from bin/fm-harness.sh detect_own so the
+# surrounding interactive shell cannot leak past the suite's fake ps harness.
+# Markers today: CLAUDECODE (claude), PI_CODING_AGENT (pi), GROK_AGENT (grok).
+# codex and opencode have no env markers (ancestry only). Without this, a local
+# claude/pi/grok session fails cases that pin a different fake harness while CI
+# (no ambient markers) still passes.
+run_session_start() {
   local home=$1 root=$2 path=$3
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" "$SESSION_START"
+  env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" \
+    "$SESSION_START"
 }
 
 hash_file_for_test() {
@@ -290,7 +301,7 @@ EOF
 
   sleep 300 &
   holder_pid=$!
-  printf '%s\n' "$holder_pid" > "$home/state/.lock"
+  printf '%s\n%s\n' "$holder_pid" 'Mon Jan  1 00:00:00 2024' > "$home/state/.lock"
 
   status=0
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?

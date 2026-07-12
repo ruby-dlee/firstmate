@@ -67,6 +67,35 @@ fm_test_tmproot() {
   printf '%s\n' "$root"
 }
 
+# --- node capability probe ---------------------------------------------------
+#
+# fm_node_supports_ts_import succeeds when the ambient node can import a .ts
+# module directly (native type stripping, absent before node 22.6 and flagged
+# until 22.18/23.6). The tracked Pi primary extensions are TypeScript imported
+# as-is by their tests, so on an older node those tests skip instead of failing
+# with ERR_UNKNOWN_FILE_EXTENSION. The probe runs once per test file.
+
+FM_NODE_TS_IMPORT_SUPPORT=""
+
+fm_node_supports_ts_import() {
+  if [ -z "$FM_NODE_TS_IMPORT_SUPPORT" ]; then
+    local probe_dir
+    probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-node-ts-probe.XXXXXX") || return 1
+    printf 'export const ok: string = "ok";\n' > "$probe_dir/probe.ts"
+    if PROBE="$probe_dir/probe.ts" node --input-type=module -e '
+      import { pathToFileURL } from "node:url";
+      const mod = await import(pathToFileURL(process.env.PROBE).href);
+      if (mod.ok !== "ok") process.exit(1);
+    ' >/dev/null 2>&1; then
+      FM_NODE_TS_IMPORT_SUPPORT=yes
+    else
+      FM_NODE_TS_IMPORT_SUPPORT=no
+    fi
+    rm -rf "$probe_dir"
+  fi
+  [ "$FM_NODE_TS_IMPORT_SUPPORT" = yes ]
+}
+
 # --- fakebin / PATH shims ---------------------------------------------------
 #
 # fm_fakebin <dir> creates <dir>/fakebin and echoes it; prepend it to PATH to

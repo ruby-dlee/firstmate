@@ -102,10 +102,14 @@ function shouldArm(paths) {
   }
 }
 
+function firstLockLine(text) {
+  return text.split(/\r?\n/, 1)[0].trim();
+}
+
 async function sessionOwnsLock(paths) {
   let lockPid = "";
   try {
-    lockPid = readFileSync(`${paths.state}/.lock`, "utf8").trim();
+    lockPid = firstLockLine(readFileSync(`${paths.state}/.lock`, "utf8"));
   } catch {
     return false;
   }

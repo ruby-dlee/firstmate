@@ -82,11 +82,13 @@ harness_pid() {
 holder_alive() {
   local lock=$1 pid recorded_start current_start command
   pid=$(lock_pid "$lock")
-  recorded_start=$(lock_start_time "$lock")
-  [ -n "$recorded_start" ] || return 1
+  [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  current_start=$(process_start_time "$pid") || return 1
-  [ "$current_start" = "$recorded_start" ] || return 1
+  recorded_start=$(lock_start_time "$lock")
+  if [ -n "$recorded_start" ]; then
+    current_start=$(process_start_time "$pid") || return 1
+    [ "$current_start" = "$recorded_start" ] || return 1
+  fi
   command=$(process_command_text "$pid") || return 1
   command_is_app_server "$command" && return 1
   printf '%s' "$command" | grep -qE "$HARNESS_RE"

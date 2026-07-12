@@ -61,8 +61,8 @@ SH
 
 start_live_holder() {
   sleep 300 >/dev/null 2>&1 &
-  FM_LOCK_TEST_PIDS+=("$!")
-  printf '%s\n' "$!"
+  FM_LOCK_TEST_HOLDER=$!
+  FM_LOCK_TEST_PIDS+=("$FM_LOCK_TEST_HOLDER")
 }
 
 test_pid_reuse_with_mismatched_start_time_acquires() {
@@ -72,7 +72,8 @@ test_pid_reuse_with_mismatched_start_time_acquires() {
   mkdir -p "$home/state"
   make_fake_ps "$fakebin"
 
-  holder=$(start_live_holder)
+  start_live_holder
+  holder=$FM_LOCK_TEST_HOLDER
   printf '%s\n%s\n' "$holder" 'Sun Dec 31 23:59:59 2023' > "$home/state/.lock"
 
   status=0
@@ -96,7 +97,8 @@ test_live_same_identity_blocks_another_session() {
   mkdir -p "$home/state"
   make_fake_ps "$fakebin"
 
-  holder=$(start_live_holder)
+  start_live_holder
+  holder=$FM_LOCK_TEST_HOLDER
   printf '%s\n%s\n' "$holder" 'Mon Jan  1 00:00:00 2024' > "$home/state/.lock"
 
   status=0
@@ -118,7 +120,8 @@ test_same_session_reacquire_succeeds() {
   mkdir -p "$home/state"
   make_fake_ps "$fakebin"
 
-  holder=$(start_live_holder)
+  start_live_holder
+  holder=$FM_LOCK_TEST_HOLDER
   printf '%s\n%s\n' "$holder" 'Mon Jan  1 00:00:00 2024' > "$home/state/.lock"
 
   status=0
@@ -143,7 +146,8 @@ test_app_server_holder_is_stale() {
   mkdir -p "$home/state"
   make_fake_ps "$fakebin"
 
-  holder=$(start_live_holder)
+  start_live_holder
+  holder=$FM_LOCK_TEST_HOLDER
   printf '%s\n%s\n' "$holder" 'Mon Jan  1 00:00:00 2024' > "$home/state/.lock"
 
   status=0
@@ -160,7 +164,30 @@ test_app_server_holder_is_stale() {
   pass "fm-lock rejects Codex app-server as a live session holder"
 }
 
+test_legacy_one_line_lock_live_holder_blocks() {
+  local home fakebin holder out status
+  home="$TMP_ROOT/legacy-home"
+  fakebin="$TMP_ROOT/legacy-fakebin"
+  mkdir -p "$home/state"
+  make_fake_ps "$fakebin"
+
+  start_live_holder
+  holder=$FM_LOCK_TEST_HOLDER
+  printf '%s\n' "$holder" > "$home/state/.lock"
+
+  status=0
+  out=$(FM_HOME="$home" \
+    FM_FAKE_HOLDER_PID="$holder" \
+    PATH="$fakebin:$PATH" \
+    "$LOCK" 2>&1) || status=$?
+
+  expect_code 1 "$status" "legacy one-line lock with a live harness holder should block"
+  assert_contains "$out" "another live firstmate session holds the lock" "legacy one-line lock did not block"
+  pass "fm-lock falls back to harness liveness for a legacy one-line lock"
+}
+
 test_pid_reuse_with_mismatched_start_time_acquires
 test_live_same_identity_blocks_another_session
 test_same_session_reacquire_succeeds
 test_app_server_holder_is_stale
+test_legacy_one_line_lock_live_holder_blocks

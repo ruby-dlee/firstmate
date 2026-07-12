@@ -42,15 +42,6 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  cat > "$fakebin/lsof" <<'SH'
-#!/usr/bin/env bash
-exit 1
-SH
-  cat > "$fakebin/npm" <<'SH'
-#!/usr/bin/env bash
-exit 1
-SH
-  chmod +x "$fakebin/lsof" "$fakebin/npm"
   fm_fake_exit0 "$fakebin" treehouse
   printf '%s\n' "$fakebin"
 }
@@ -64,7 +55,7 @@ make_spawn_case() {
   wt="$case_dir/wt"
   launchlog="$case_dir/launch.log"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$case_dir/user-home"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
@@ -93,7 +84,7 @@ run_spawn() {
   local home=$1 wt=$2 fakebin=$3 launchlog=$4
   shift 4
   : > "$launchlog"
-  HOME="$(dirname "$home")/user-home" FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
@@ -114,28 +105,9 @@ assert_meta_profile() {
   assert_grep "effort=$effort" "$meta" "meta missing effort=$effort"
 }
 
-meta_field() {
-  grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-
-}
-
-assert_browser_axi_wrapper() {
-  local launch=$1 meta=$2 label=$3 session port profile
-  session=$(meta_field "$meta" browser_axi_session)
-  port=$(meta_field "$meta" browser_axi_port)
-  profile=$(meta_field "$meta" browser_axi_user_data_dir)
-  [ -n "$session" ] || fail "$label: meta missing browser_axi_session"
-  [ -n "$port" ] || fail "$label: meta missing browser_axi_port"
-  [ -n "$profile" ] || fail "$label: meta missing browser_axi_user_data_dir"
-  assert_contains "$launch" "env -u CHROME_DEVTOOLS_AXI_AUTO_CONNECT -u CHROME_DEVTOOLS_AXI_BROWSER_URL -u CHROME_DEVTOOLS_AXI_USER_DATA_DIR -u CHROME_DEVTOOLS_AXI_MCP_PATH" \
-    "$label: launch missing AXI env sanitizer"
-  assert_contains "$launch" "CHROME_DEVTOOLS_AXI_SESSION='$session'" "$label: launch missing AXI session"
-  assert_contains "$launch" "CHROME_DEVTOOLS_AXI_PORT='$port'" "$label: launch missing AXI port"
-  assert_contains "$launch" "CHROME_DEVTOOLS_AXI_USER_DATA_DIR='$profile'" "$label: launch missing AXI profile"
-}
-
-test_no_profile_keeps_claude_harness_launch_suffix() {
-  local rec id out status expected launch meta
-  id='profile-off-z1'
+test_no_profile_keeps_claude_launch_unchanged() {
+  local rec id out status expected launch
+  id=profile-off-z1
   rec=$(make_spawn_case profile-off claude "$id")
   read_case_record "$rec"
 
@@ -143,19 +115,17 @@ test_no_profile_keeps_claude_harness_launch_suffix() {
   status=$?
   expect_code 0 "$status" "claude spawn without profile flags should succeed"
   assert_contains "$out" "spawned $id harness=claude" "spawn did not report claude"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" claude default default
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "no-profile"
   expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
-  assert_contains "$launch" "$expected" "no-profile claude harness launch changed"
-  pass "no --model/--effort records defaults and keeps the claude harness launch suffix unchanged"
+  [ "$launch" = "$expected" ] || fail "no-profile claude launch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  pass "no --model/--effort records defaults and keeps the claude launch byte-identical"
 }
 
 test_active_dispatch_profile_requires_explicit_harness_for_ship() {
   local rec id out status
-  id='profile-required-ship-z11'
+  id=profile-required-ship-z11
   rec=$(make_spawn_case profile-required-ship claude "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -171,7 +141,7 @@ test_active_dispatch_profile_requires_explicit_harness_for_ship() {
 
 test_active_dispatch_profile_requires_explicit_harness_for_scout() {
   local rec id out status
-  id='profile-required-scout-z12'
+  id=profile-required-scout-z12
   rec=$(make_spawn_case profile-required-scout claude "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -186,8 +156,8 @@ test_active_dispatch_profile_requires_explicit_harness_for_scout() {
 }
 
 test_active_dispatch_profile_allows_explicit_harness() {
-  local rec id out status launch meta
-  id='profile-explicit-z13'
+  local rec id out status launch
+  id=profile-explicit-z13
   rec=$(make_spawn_case profile-explicit claude "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -197,10 +167,8 @@ test_active_dispatch_profile_allows_explicit_harness() {
   status=$?
   expect_code 0 "$status" "explicit harness should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report explicit codex harness"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" codex gpt-5 high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "explicit harness"
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
     "explicit harness launch did not thread model and effort"
   pass "active crew-dispatch profile allows an explicit resolved harness"
@@ -208,7 +176,7 @@ test_active_dispatch_profile_allows_explicit_harness() {
 
 test_active_dispatch_profile_allows_positional_harness() {
   local rec id out status
-  id='profile-positional-z14'
+  id=profile-positional-z14
   rec=$(make_spawn_case profile-positional claude "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -223,8 +191,8 @@ test_active_dispatch_profile_allows_positional_harness() {
 }
 
 test_active_dispatch_profile_allows_raw_launch_command() {
-  local rec id out status launch meta
-  id='profile-raw-z15'
+  local rec id out status launch
+  id=profile-raw-z15
   rec=$(make_spawn_case profile-raw claude "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -234,63 +202,55 @@ test_active_dispatch_profile_allows_raw_launch_command() {
   status=$?
   expect_code 0 "$status" "raw launch command should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=custom-agent" "spawn did not report raw command harness"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" custom-agent default default
+  assert_meta_profile "$HOME_DIR/state/$id.meta" custom-agent default default
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "raw launch"
-  assert_contains "$launch" "custom-agent --flag" "raw launch command changed"
+  [ "$launch" = "custom-agent --flag" ] || fail "raw launch command changed"$'\n'"actual: $launch"
   pass "active crew-dispatch profile allows the raw launch-command escape hatch"
 }
 
 test_claude_threads_model_and_effort() {
-  local rec id out status launch meta
-  id='profile-claude-z2'
+  local rec id out status launch
+  id=profile-claude-z2
   rec=$(make_spawn_case profile-claude claude "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort high)
   status=$?
   expect_code 0 "$status" "claude spawn with profile flags should succeed"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" claude sonnet high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude sonnet high
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "claude profile"
   assert_contains "$launch" "claude --dangerously-skip-permissions --model 'sonnet' --effort 'high'" \
     "claude launch did not thread model and effort flags"
   pass "claude receives --model and --effort profile flags"
 }
 
 test_codex_threads_model_and_effort() {
-  local rec id out status launch meta
-  id='profile-codex-z3'
+  local rec id out status launch
+  id=profile-codex-z3
   rec=$(make_spawn_case profile-codex codex "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model gpt-5 --effort high)
   status=$?
   expect_code 0 "$status" "codex spawn with profile flags should succeed"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" codex gpt-5 high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "codex profile"
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
     "codex launch did not thread model and reasoning effort config"
   pass "codex receives --model and model_reasoning_effort profile flags"
 }
 
 test_codex_omits_invalid_max_effort() {
-  local rec id out status launch meta
-  id='profile-codex-max-z4'
+  local rec id out status launch
+  id=profile-codex-max-z4
   rec=$(make_spawn_case profile-codex-max codex "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model gpt-5 --effort max)
   status=$?
   expect_code 0 "$status" "codex spawn with unsupported max effort should omit the effort flag"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" codex gpt-5 max
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "codex max"
   assert_contains "$launch" "codex --model 'gpt-5' --dangerously-bypass-approvals-and-sandbox" \
     "codex launch did not preserve the model flag when max effort was omitted"
   assert_not_contains "$launch" "model_reasoning_effort" "codex launch must omit unsupported max reasoning effort"
@@ -298,18 +258,16 @@ test_codex_omits_invalid_max_effort() {
 }
 
 test_grok_threads_model_and_reasoning_effort() {
-  local rec id out status launch meta
-  id='profile-grok-z5'
+  local rec id out status launch
+  id=profile-grok-z5
   rec=$(make_spawn_case profile-grok grok "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model grok-4 --effort high)
   status=$?
   expect_code 0 "$status" "grok spawn with profile flags should succeed"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" grok grok-4 high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "grok profile"
   assert_contains "$launch" "grok --always-approve --model 'grok-4' --reasoning-effort 'high'" \
     "grok launch did not thread model and reasoning-effort flags"
   assert_not_contains "$launch" "--effort" "grok launch must use --reasoning-effort, not --effort"
@@ -317,18 +275,16 @@ test_grok_threads_model_and_reasoning_effort() {
 }
 
 test_grok_omits_invalid_max_reasoning_effort() {
-  local rec id out status launch meta
-  id='profile-grok-max-z6'
+  local rec id out status launch
+  id=profile-grok-max-z6
   rec=$(make_spawn_case profile-grok-max grok "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model grok-4 --effort max)
   status=$?
   expect_code 0 "$status" "grok spawn with unsupported max reasoning effort should omit the effort flag"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" grok grok-4 max
+  assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "grok max"
   assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$(cat " \
     "grok launch did not preserve the model flag when max effort was omitted"
   assert_not_contains "$launch" "--reasoning-effort" "grok launch must omit unsupported max reasoning effort"
@@ -337,18 +293,16 @@ test_grok_omits_invalid_max_reasoning_effort() {
 }
 
 test_opencode_threads_model_and_ignores_effort_axis() {
-  local rec id out status launch meta
-  id='profile-opencode-z7'
+  local rec id out status launch
+  id=profile-opencode-z7
   rec=$(make_spawn_case profile-opencode opencode "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model anthropic/claude-sonnet-4-5 --effort high)
   status=$?
   expect_code 0 "$status" "opencode spawn with model and ignored effort should succeed"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" opencode anthropic/claude-sonnet-4-5 high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" opencode anthropic/claude-sonnet-4-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "opencode profile"
   assert_contains "$launch" "opencode --model 'anthropic/claude-sonnet-4-5' --prompt" \
     "opencode launch did not thread model"
   assert_not_contains "$launch" "--effort" "opencode launch must not pass unsupported --effort"
@@ -358,18 +312,16 @@ test_opencode_threads_model_and_ignores_effort_axis() {
 }
 
 test_pi_omits_invalid_max_effort() {
-  local rec id out status launch meta
-  id='profile-pi-z8'
+  local rec id out status launch
+  id=profile-pi-z8
   rec=$(make_spawn_case profile-pi pi "$id")
   read_case_record "$rec"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort max)
   status=$?
   expect_code 0 "$status" "pi spawn with max effort should not pass an invalid flag"
-  meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" pi sonnet max
+  assert_meta_profile "$HOME_DIR/state/$id.meta" pi sonnet max
   launch=$(cat "$LAUNCH_LOG")
-  assert_browser_axi_wrapper "$launch" "$meta" "pi max"
   assert_contains "$launch" "pi --model 'sonnet' -e" "pi launch did not thread model"
   assert_not_contains "$launch" "--thinking" "pi launch must omit --thinking max because the CLI rejects it"
   pass "pi threads model and omits unsupported max effort"
@@ -377,8 +329,8 @@ test_pi_omits_invalid_max_effort() {
 
 test_batch_forwards_shared_profile_flags() {
   local rec id1 id2 out status
-  id1='profile-batch-a-z9'
-  id2='profile-batch-b-z10'
+  id1=profile-batch-a-z9
+  id2=profile-batch-b-z10
   rec=$(make_spawn_case profile-batch claude "$id1" "$id2")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -396,7 +348,7 @@ test_batch_forwards_shared_profile_flags() {
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
   local rec id sm out status
-  id='profile-secondmate-z16'
+  id=profile-secondmate-z16
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
@@ -412,7 +364,7 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
-test_no_profile_keeps_claude_harness_launch_suffix
+test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
 test_active_dispatch_profile_allows_explicit_harness

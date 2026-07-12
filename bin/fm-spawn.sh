@@ -50,11 +50,6 @@
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
 #   (fm-config-inherit-lib.sh).
-#   Every spawn also gets a per-task chrome-devtools-axi browser identity:
-#   CHROME_DEVTOOLS_AXI_SESSION, CHROME_DEVTOOLS_AXI_PORT, and, by default,
-#   CHROME_DEVTOOLS_AXI_USER_DATA_DIR under $HOME/.fm-browser-profiles/.
-#   Set FM_BROWSER_AXI_PROFILE_MODE=ephemeral for a clean AXI isolated browser
-#   instead of a persistent per-task profile.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
@@ -480,115 +475,6 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-browser_axi_safe_id() {
-  local raw=$1 safe
-  safe=$(printf '%s' "$raw" | LC_ALL=C sed 's/[^A-Za-z0-9._-]/-/g; s/--*/-/g; s/^-//; s/-$//')
-  [ -n "$safe" ] || safe=worker
-  printf '%s\n' "$safe"
-}
-
-browser_axi_home_hash() {
-  local home_real hash
-  if home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P); then
-    :
-  else
-    home_real=$FM_HOME
-  fi
-  hash=$(printf '%s' "$home_real" | cksum | awk '{print $1}')
-  printf '%s\n' "$hash"
-}
-
-browser_axi_port_is_free() {
-  local port=$1
-  if command -v lsof >/dev/null 2>&1; then
-    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-      return 1
-    fi
-    return 0
-  fi
-  if command -v nc >/dev/null 2>&1; then
-    if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
-      return 1
-    fi
-    return 0
-  fi
-  return 2
-}
-
-browser_axi_alloc_port() {
-  local session=$1 start=19000 end=20999 count seed offset i port
-  if ! command -v lsof >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
-    echo "error: cannot allocate chrome-devtools-axi port: need lsof or nc on PATH" >&2
-    return 1
-  fi
-  count=$((end - start + 1))
-  seed=$(printf '%s' "$session" | cksum | awk '{print $1}')
-  offset=$((seed % count))
-  i=0
-  while [ "$i" -lt "$count" ]; do
-    port=$((start + ((offset + i) % count)))
-    if browser_axi_port_is_free "$port"; then
-      printf '%s\n' "$port"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  echo "error: no free chrome-devtools-axi port in 19000..20999 for $session" >&2
-  return 1
-}
-
-browser_axi_profile_mode() {
-  local mode=${FM_BROWSER_AXI_PROFILE_MODE:-persistent}
-  case "$mode" in
-    ''|persistent) printf '%s\n' persistent ;;
-    ephemeral) printf '%s\n' ephemeral ;;
-    *)
-      echo "error: FM_BROWSER_AXI_PROFILE_MODE must be persistent or ephemeral, got '$mode'" >&2
-      return 1
-      ;;
-  esac
-}
-
-browser_axi_resolve_mcp_path() {
-  local candidate npm_prefix
-  candidate=${CHROME_DEVTOOLS_AXI_MCP_PATH:-}
-  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-  if command -v npm >/dev/null 2>&1; then
-    npm_prefix=$(npm prefix -g 2>/dev/null || true)
-    if [ -n "$npm_prefix" ]; then
-      candidate="$npm_prefix/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"
-      if [ -f "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-    fi
-  fi
-  if [ -n "${HOME:-}" ] && [ -d "$HOME/.npm/_npx" ]; then
-    candidate=$(find "$HOME/.npm/_npx" -path '*/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js' -type f 2>/dev/null | sort | tail -1)
-    if [ -n "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  fi
-  return 0
-}
-
-browser_axi_env_prefix() {
-  printf '%s' 'env -u CHROME_DEVTOOLS_AXI_AUTO_CONNECT -u CHROME_DEVTOOLS_AXI_BROWSER_URL -u CHROME_DEVTOOLS_AXI_USER_DATA_DIR -u CHROME_DEVTOOLS_AXI_MCP_PATH'
-  printf ' CHROME_DEVTOOLS_AXI_SESSION=%s' "$(shell_quote "$BROWSER_AXI_SESSION")"
-  printf ' CHROME_DEVTOOLS_AXI_PORT=%s' "$(shell_quote "$BROWSER_AXI_PORT")"
-  printf ' CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS=%s' "$(shell_quote 60000)"
-  if [ -n "$BROWSER_AXI_USER_DATA_DIR" ]; then
-    printf ' CHROME_DEVTOOLS_AXI_USER_DATA_DIR=%s' "$(shell_quote "$BROWSER_AXI_USER_DATA_DIR")"
-  fi
-  if [ -n "$BROWSER_AXI_MCP_PATH" ]; then
-    printf ' CHROME_DEVTOOLS_AXI_MCP_PATH=%s' "$(shell_quote "$BROWSER_AXI_MCP_PATH")"
-  fi
-}
-
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
@@ -764,15 +650,6 @@ fi
 # once here so every downstream comparison uses the same physical form
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
-
-BROWSER_AXI_PROFILE_MODE=$(browser_axi_profile_mode)
-BROWSER_AXI_SESSION=$(browser_axi_safe_id "fm-$(browser_axi_home_hash)-$ID")
-BROWSER_AXI_PORT=$(browser_axi_alloc_port "$BROWSER_AXI_SESSION")
-BROWSER_AXI_USER_DATA_DIR=
-if [ "$BROWSER_AXI_PROFILE_MODE" = persistent ]; then
-  BROWSER_AXI_USER_DATA_DIR="${HOME:-$FM_HOME}/.fm-browser-profiles/$BROWSER_AXI_SESSION"
-fi
-BROWSER_AXI_MCP_PATH=$(browser_axi_resolve_mcp_path)
 
 real_path_or_raw() {  # <path>
   local path=$1 real
@@ -1118,11 +995,6 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
-  echo "browser_axi_session=$BROWSER_AXI_SESSION"
-  echo "browser_axi_port=$BROWSER_AXI_PORT"
-  echo "browser_axi_profile_mode=$BROWSER_AXI_PROFILE_MODE"
-  [ -z "$BROWSER_AXI_USER_DATA_DIR" ] || echo "browser_axi_user_data_dir=$BROWSER_AXI_USER_DATA_DIR"
-  [ -z "$BROWSER_AXI_MCP_PATH" ] || echo "browser_axi_mcp_path=$BROWSER_AXI_MCP_PATH"
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
@@ -1171,7 +1043,6 @@ if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
 fi
-LAUNCH="$(browser_axi_env_prefix) $LAUNCH"
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.

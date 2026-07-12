@@ -156,47 +156,6 @@ stop_browser_axi_for_meta() {
   fi
 }
 
-browser_axi_profile_root_for_path() {
-  local profile=$1
-  case "$profile" in
-    */.fm-browser-profiles/*) printf '%s/.fm-browser-profiles\n' "${profile%/.fm-browser-profiles/*}" ;;
-    *) return 1 ;;
-  esac
-}
-
-remove_browser_axi_profile_for_meta() {
-  local meta=$1 mode profile root profile_abs root_abs
-  mode=$(meta_value "$meta" browser_axi_profile_mode)
-  [ "$mode" = persistent ] || return 0
-  profile=$(meta_value "$meta" browser_axi_user_data_dir)
-  [ -n "$profile" ] || return 0
-  [ -e "$profile" ] || return 0
-  if ! root=$(browser_axi_profile_root_for_path "$profile"); then
-    echo "warning: refusing to remove browser profile outside .fm-browser-profiles: $profile" >&2
-    return 0
-  fi
-  if ! root_abs=$(cd "$root" 2>/dev/null && pwd -P); then
-    echo "warning: refusing to remove browser profile because root is not accessible: $root" >&2
-    return 0
-  fi
-  if ! profile_abs=$(cd "$profile" 2>/dev/null && pwd -P); then
-    echo "warning: refusing to remove browser profile because it is not an accessible directory: $profile" >&2
-    return 0
-  fi
-  case "$profile_abs" in
-    "$root_abs"/*) ;;
-    *)
-      echo "warning: refusing to remove browser profile outside resolved root: $profile" >&2
-      return 0
-      ;;
-  esac
-  [ "$profile_abs" != "$root_abs" ] || {
-    echo "warning: refusing to remove browser profile root itself: $profile" >&2
-    return 0
-  }
-  rm -rf "$profile_abs"
-}
-
 require_orca_worktree_id() {
   local meta=$1 id
   id=$(meta_value "$meta" orca_worktree_id)
@@ -977,7 +936,6 @@ cleanup_firstmate_home_children() {
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
-    remove_browser_axi_profile_for_meta "$child_meta"
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
   done
 }
@@ -1097,7 +1055,6 @@ if [ "$KIND" = secondmate ]; then
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
-remove_browser_axi_profile_for_meta "$META"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.

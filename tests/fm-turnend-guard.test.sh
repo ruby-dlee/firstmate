@@ -594,6 +594,7 @@ test_pi_extension_forces_followup() {
 
 test_pi_extension_injects_once_per_logical_agent_run() {
   local repo home ext log out status
+  fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi logical-run guard check"; return; }
   repo="$TMP_ROOT/pi-logical-run-root"
   home="$TMP_ROOT/pi-logical-run-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
@@ -656,6 +657,7 @@ EOF
 
 test_pi_extension_retries_after_followup_delivery_failure() {
   local repo home ext out status
+  fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi delivery-failure guard check"; return; }
   repo="$TMP_ROOT/pi-delivery-failure-root"
   home="$TMP_ROOT/pi-delivery-failure-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"

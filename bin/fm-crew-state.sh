@@ -170,7 +170,7 @@ crew_pane_is_busy() {  # <target>
     tmux) fm_pane_is_busy "$1" ;;
     *)
       local bs tail40
-      bs=$(fm_backend_busy_state "$TASK_BACKEND" "$1" 2>/dev/null)
+      bs=$(fm_backend_busy_state "$TASK_BACKEND" "$1" "$EXPECTED_LABEL" 2>/dev/null)
       case "$bs" in
         busy) return 0 ;;
         *)

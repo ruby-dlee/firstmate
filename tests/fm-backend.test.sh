@@ -613,8 +613,8 @@ test_managed_tmux_target_identity() {
 
   [ "$(fm_backend_target_state tmux '' fm-intended-task)" = unknown ] \
     || fail "an empty managed endpoint target should be unknown"
-  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = absent ] \
-    || fail "a reused tmux window id with another label should be absent for the managed task"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+    || fail "a live tmux window id with another label should have unknown managed state"
   out=$(fm_backend_agent_alive tmux @77 fm-intended-task)
   [ "$out" = unknown ] || fail "a reused tmux window id should have unknown agent liveness"
   ! fm_backend_capture tmux @77 10 fm-intended-task \

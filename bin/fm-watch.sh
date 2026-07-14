@@ -183,7 +183,7 @@ hash_pane() {
 # regex-fallback path.
 window_is_busy() {  # <window> <tail40>
   local w=$1 tail40=$2 bs
-  bs=$(fm_backend_busy_state "$(window_backend "$w")" "$w" 2>/dev/null)
+  bs=$(fm_backend_busy_state "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null)
   case "$bs" in
     busy) return 0 ;;
     idle) return 1 ;;

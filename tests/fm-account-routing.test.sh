@@ -471,6 +471,25 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   pass "resume uses below-reserve sticky recovery and never deletes mapping on a failed attempt"
 }
 
+test_unmanaged_respawn_preserves_report_cutover_state() {
+  local id rec out status
+  id=account-legacy-respawn-z9b
+  rec=$(make_case legacy-respawn claude "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  out=$(run_spawn "$id" "$PROJ_DIR")
+  status=$?
+  [ "$status" -eq 0 ] || fail "pre-cutover unmanaged respawn should succeed (exit $status): $out"
+  assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover unmanaged respawn silently activated the report gate"
+  pass "unmanaged respawn preserves a legacy task's report cutover state"
+}
+
 test_recovered_reservations_are_owned_until_launch_commit() {
   local id rec out status account_task session lineage
   id=account-recover-owned-z9b
@@ -791,6 +810,31 @@ test_raw_enforced_launch_is_rejected_before_mutation() {
   assert_not_grep '^new-window ' "$TMUX_LOG" "raw enforced launch created an endpoint"
   assert_contains "$out" "does not accept raw launch commands" "raw enforced launch blocker was unclear"
   pass "raw launch commands cannot bypass enforced account wrapping"
+}
+
+test_global_enforce_refuses_unsupported_harnesses() {
+  local first second rec out status
+  first=account-enforce-opencode-z15b
+  second=account-enforce-raw-z15c
+  rec=$(make_case enforce-unsupported opencode "$first" "$second")
+  read_case "$rec"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+
+  out=$(run_spawn "$first" "$PROJ_DIR")
+  status=$?
+  [ "$status" -ne 0 ] || fail "global enforce unexpectedly admitted opencode"
+  assert_contains "$out" "enforced account routing requires a claude or codex harness" "unsupported enforced harness blocker was unclear"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "unsupported enforced harness created an endpoint"
+  assert_absent "$HOME_DIR/state/$first.meta" "unsupported enforced harness wrote task metadata"
+
+  clear_case_logs
+  out=$(run_spawn "$second" "$PROJ_DIR" --harness 'custom-agent --unsafe')
+  status=$?
+  [ "$status" -ne 0 ] || fail "global enforce unexpectedly admitted a raw unsupported harness"
+  assert_contains "$out" "enforced account routing requires a claude or codex harness" "raw unsupported enforced harness blocker was unclear"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "raw unsupported enforced harness created an endpoint"
+  assert_absent "$HOME_DIR/state/$second.meta" "raw unsupported enforced harness wrote task metadata"
+  pass "global enforced routing refuses unsupported and raw harnesses before mutation"
 }
 
 test_malformed_routing_mode_fails_closed() {
@@ -1497,6 +1541,7 @@ test_enforce_failure_rolls_back_prepared_endpoint
 test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+test_unmanaged_respawn_preserves_report_cutover_state
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
@@ -1509,6 +1554,7 @@ test_duplicate_spawn_preserves_original_endpoint_and_lease
 test_reservation_occurs_after_worktree_preparation
 test_reserved_generation_is_durable_before_spawn_progresses
 test_raw_enforced_launch_is_rejected_before_mutation
+test_global_enforce_refuses_unsupported_harnesses
 test_malformed_routing_mode_fails_closed
 test_invalid_selection_response_releases_reservation
 test_fresh_launch_requires_session_binding_and_fully_rolls_back

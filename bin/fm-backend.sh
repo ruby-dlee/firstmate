@@ -612,7 +612,7 @@ fm_backend_worktree_path() {  # <backend> <worktree-id>
 # uses unknown as the cue for its pane-hash + FM_BUSY_REGEX detection, while
 # fm-crew-state.sh also corroborates native idle verdicts before treating a
 # no-run crew as not busy.
-fm_backend_busy_state() {  # <backend> <target>
+fm_backend_busy_state() {  # <backend> <target> [expected-label]
   local backend=$1
   shift
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
@@ -672,6 +672,7 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
       session=${target%%:*}
       pane=${target#*:}
       [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
+      fm_backend_herdr_expected_label_matches "$target" "$expected_label" || return 1
       # fm_backend_herdr_cli (not a raw HERDR_SESSION-only call): verified
       # empirically (docs/herdr-backend.md "Session targeting") that the bare
       # env var alone is NOT reliably honored once another herdr server is
@@ -713,7 +714,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # present, absent, or unknown. Callers may release an external lease only on
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} out session pane sessions panes tabs tab_id scoped count
+  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes tabs tab_id scoped count
   local workspace surface workspaces title expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
@@ -723,6 +724,14 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
   fm_backend_source "$backend" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
   case "$backend" in
     tmux)
+      case "$target" in
+        @*)
+          if tmux display-message -p -t "$target" '#{window_name}' >/dev/null 2>&1; then
+            printf 'unknown'
+            return 0
+          fi
+          ;;
+      esac
       if out=$(tmux list-panes -a -F '#{pane_id}' 2>&1); then
         printf 'absent'
       else
@@ -749,17 +758,12 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         printf 'absent'
         return 0
       fi
-      if ! panes=$(fm_backend_herdr_cli "$session" pane list 2>/dev/null) \
-        || ! printf '%s\n' "$panes" | jq -e '(.result.panes | type) == "array"' >/dev/null 2>&1; then
-        printf 'unknown'
-        return 0
-      fi
-      if printf '%s\n' "$panes" | jq -e --arg pane "$pane" \
-        'any(.result.panes[]?; (.pane_id | tostring) == $pane)' >/dev/null 2>&1; then
-        printf 'present'
-      else
-        printf 'absent'
-      fi
+      identity=$(fm_backend_herdr_identity_state "$target" "$expected_label")
+      case "$identity" in
+        match) printf 'present' ;;
+        absent) printf 'absent' ;;
+        *) printf 'unknown' ;;
+      esac
       ;;
     zellij)
       fm_backend_zellij_parse_target "$target" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
@@ -886,7 +890,7 @@ fm_backend_agent_alive() {  # <backend> <target> [expected-label]
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
     tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" ;;
-    herdr) fm_backend_herdr_agent_alive "$target" ;;
+    herdr) fm_backend_herdr_agent_alive "$target" "$expected_label" ;;
     *) printf 'unknown' ;;
   esac
 }

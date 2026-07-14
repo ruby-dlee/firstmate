@@ -108,7 +108,27 @@ test_stale_lock_rejects_reused_pid() {
   pass "report stack lock verifies process-start identity before trusting a live pid"
 }
 
+test_visual_symlink_fails_closed_and_cleans_staging() {
+  local id=report-symlink-e5 out status staged
+  write_task "$id" ship
+  printf '# Completion\n\n## Summary\n\nSymlink safety.\n' > "$HOME_DIR/data/$id/completion.md"
+  mkdir -p "$TMP_ROOT/outside-visuals"
+  printf 'private visual bytes\n' > "$TMP_ROOT/outside-visuals/private.png"
+  ln -s "$TMP_ROOT/outside-visuals" "$HOME_DIR/data/$id/visuals"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "symlinked visual root unexpectedly published"
+  assert_contains "$out" "visual evidence root must be a real directory" "symlinked visual refusal was not actionable"
+  if grep -R -F 'private visual bytes' "$STACK" >/dev/null 2>&1; then
+    fail "symlinked visual content escaped into the report stack"
+  fi
+  staged=$(find "$STACK/entries" -maxdepth 1 -type d -name ".*${id}*.tmp" -print 2>/dev/null)
+  [ -z "$staged" ] || fail "failed report publication leaked staging directory $staged"
+  pass "report stack rejects symlinked visuals and removes failed staging"
+}
+
 test_publish_ship_with_visual
 test_required_source_fails_closed
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
+test_visual_symlink_fails_closed_and_cleans_staging

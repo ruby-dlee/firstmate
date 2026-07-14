@@ -36,6 +36,7 @@ SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
+PROMOTE="$ROOT/bin/fm-promote.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -454,6 +455,33 @@ EOF
   pass "merge entrypoints refuse both gate signals before metadata or Git mutation"
 }
 
+run_promote_guarded() {
+  local cwd=$1 home=$2
+  shift 2
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
+      "FM_DATA_OVERRIDE=$home/data" "$@" "$PROMOTE" task-x1 ) 2>&1
+}
+
+test_promote_refuses_gate_contexts() {
+  local home before out rc
+  home="$TMP/promote-guard-home"
+  mkdir -p "$home/state" "$home/data/task-x1"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=scout"
+  before=$(cat "$home/state/task-x1.meta")
+
+  out=$(run_promote_guarded "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "promote: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "promote: env-marker refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before" ] || fail "refused promotion mutated task metadata"
+
+  out=$(run_promote_guarded "$GATE_WT" "$home"); rc=$?
+  expect_code 3 "$rc" "promote: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "promote: path-backstop refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before" ] || fail "path-refused promotion mutated task metadata"
+  pass "fm-promote refuses both gate signals before task mutation"
+}
+
 # --- tracked .no-mistakes.yaml ----------------------------------------------
 
 test_no_mistakes_yaml_disables_project_settings() {
@@ -492,4 +520,5 @@ test_spawn_refuses_and_admits
 test_send_refuses_and_admits
 test_teardown_refuses_and_admits
 test_merge_entrypoints_refuse_gate_contexts
+test_promote_refuses_gate_contexts
 test_no_mistakes_yaml_disables_project_settings

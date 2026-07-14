@@ -440,9 +440,10 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # maps to `alive`; `unknown` stays `unknown` - fail-safe toward refusal,
 # exactly like the husk check itself. Callers must never treat `unknown` as a
 # confirmed-dead signal.
-fm_backend_herdr_agent_alive() {  # <target>
-  local target=$1
+fm_backend_herdr_agent_alive() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-}
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'unknown'; return 0; }
   case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
     dead|no-agent) printf 'dead' ;;
     live) printf 'alive' ;;
@@ -560,9 +561,51 @@ fm_backend_herdr_parse_target() {  # <target>
   [ -n "$FM_BACKEND_HERDR_SESSION" ] && [ -n "$FM_BACKEND_HERDR_PANE" ] && [ "$FM_BACKEND_HERDR_PANE" != "$target" ]
 }
 
-fm_backend_herdr_target_ready() {  # <target>
+fm_backend_herdr_identity_state() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-} panes tabs tab_id
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$panes" | jq -e '(.result.panes | type) == "array"' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  tab_id=$(printf '%s\n' "$panes" | jq -r --arg pane "$FM_BACKEND_HERDR_PANE" \
+    '.result.panes[]? | select((.pane_id | tostring) == $pane) | .tab_id // empty' 2>/dev/null | head -1)
+  if [ -z "$tab_id" ]; then
+    printf 'absent'
+    return 0
+  fi
+  if [ -z "$expected_label" ]; then
+    printf 'match'
+    return 0
+  fi
+  tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$tabs" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" --arg want "$expected_label" \
+    'any(.result.tabs[]?; (.tab_id | tostring) == $tab and .label == $want)' >/dev/null 2>&1; then
+    printf 'match'
+  elif printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" \
+    'any(.result.tabs[]?; (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
+    printf 'mismatch'
+  else
+    printf 'unknown'
+  fi
+}
+
+fm_backend_herdr_expected_label_matches() {  # <target> [expected-label]
+  [ -n "${2:-}" ] || return 0
+  [ "$(fm_backend_herdr_identity_state "$1" "${2:-}")" = match ]
+}
+
+fm_backend_herdr_target_ready() {  # <target> [expected-label]
   fm_backend_herdr_parse_target "$1" || return 1
   fm_backend_herdr_server_ensure "$FM_BACKEND_HERDR_SESSION" || return 1
+  fm_backend_herdr_expected_label_matches "$1" "${2:-}" || return 1
 }
 
 # fm_backend_herdr_current_path: the live FOREGROUND process's cwd, or empty on
@@ -596,8 +639,8 @@ fm_backend_herdr_send_text_line() {  # <target> <text>
 # caller sends Enter separately. Mirrors tmux's `send-keys -t T -l text`.
 # Verified: `pane send-text` does NOT auto-submit (contrary to the addendum's
 # original guess); it behaves exactly like tmux's `-l` literal send.
-fm_backend_herdr_send_literal() {  # <target> <text>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_send_literal() {  # <target> <text> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
@@ -617,8 +660,8 @@ fm_backend_herdr_normalize_key() {  # <key>
 
 # fm_backend_herdr_send_key: one named special key. Mirrors fm-send.sh's --key
 # path (tmux's `send-keys -t T key`).
-fm_backend_herdr_send_key() {  # <target> <key>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_send_key() {  # <target> <key> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   local key
   key=$(fm_backend_herdr_normalize_key "$2")
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-keys "$FM_BACKEND_HERDR_PANE" "$key" >/dev/null 2>&1
@@ -637,8 +680,8 @@ fm_backend_herdr_send_key() {  # <target> <key>
 # the composer-state guard/fallback reads around submit and injection). Workaround:
 # always request a generous fetch far above any realistic viewport height, then
 # trim to the caller's requested bound ourselves with `tail`.
-fm_backend_herdr_capture() {  # <target> <lines>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_capture() {  # <target> <lines> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   local lines=${2:-200} fetch out
   case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
   fetch=$lines
@@ -848,16 +891,17 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 # already branches on for tmux ("empty" means "confirmed submitted" for every
 # backend; how each backend confirms it is an internal decision - herdr's is
 # no longer literally "the composer read empty").
-fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
+fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} i=0 verdict baseline confirm_sleep
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
-  fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
+  fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'unknown'; return 0; }
+  fm_backend_herdr_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
   sleep "$settle"
   baseline=$(fm_backend_herdr_classify_submit_agent_status \
     "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   while :; do
-    fm_backend_herdr_send_key "$target" Enter || true
+    fm_backend_herdr_send_key "$target" Enter "$expected_label" || true
     if [ "$baseline" = idle ]; then
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
@@ -878,8 +922,11 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors
 # tmux-kill-window's `|| true` contract). Verified: closing a tab's only pane
 # closes the tab too, so a separate tab close is unnecessary.
-fm_backend_herdr_kill() {  # <target>
-  fm_backend_herdr_target_ready "$1" || return 0
+fm_backend_herdr_kill() {  # <target> [backend-id] [expected-label]
+  if ! fm_backend_herdr_target_ready "$1" "${3:-}"; then
+    [ -z "${3:-}" ] && return 0
+    return 1
+  fi
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
 }
 
@@ -927,8 +974,8 @@ fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
 # gets real semantics" per the design report. See
 # fm_backend_herdr_classify_agent_status for the status->busy/idle/unknown
 # mapping.
-fm_backend_herdr_busy_state() {  # <target>
-  fm_backend_herdr_target_ready "$1" || { printf 'unknown'; return 0; }
+fm_backend_herdr_busy_state() {  # <target> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${2:-}" || { printf 'unknown'; return 0; }
   fm_backend_herdr_classify_agent_status \
     "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")"
 }

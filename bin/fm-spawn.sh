@@ -857,6 +857,10 @@ case "$HARNESS" in
       echo "error: --account-pool/--account-profile requires a claude or codex harness, not '$HARNESS'" >&2
       exit 1
     fi
+    if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+      echo "error: enforced account routing requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
     ACCOUNT_EFFECTIVE_MODE=off
     ;;
 esac
@@ -910,7 +914,15 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     cp -p "$RESUME_META" "$META_BACKUP" || exit 1
   fi
 fi
+EXISTING_META=0
+EXISTING_REPORT_REQUIRED_SET=0
+EXISTING_REPORT_REQUIRED=
 if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
+  EXISTING_META=1
+  if grep -q '^report_required=' "$STATE/$ID.meta"; then
+    EXISTING_REPORT_REQUIRED_SET=1
+    EXISTING_REPORT_REQUIRED=$(fm_meta_get "$STATE/$ID.meta" report_required)
+  fi
   if [ "$(fm_meta_get "$STATE/$ID.meta" rollback_pending)" = 1 ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_rollback_cleanup)" = pending ]; then
     echo "error: rollback cleanup is pending for $ID; tear down the retained task state before spawning again" >&2
     exit 1
@@ -1599,8 +1611,12 @@ META_TMP="$STATE/.$ID.meta.$$"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-    RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
-    [ -z "$RECORDED_REPORT_REQUIRED" ] || echo "report_required=$RECORDED_REPORT_REQUIRED"
+    if grep -q '^report_required=' "$RESUME_META"; then
+      RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
+      echo "report_required=$RECORDED_REPORT_REQUIRED"
+    fi
+  elif [ "$EXISTING_META" = 1 ]; then
+    [ "$EXISTING_REPORT_REQUIRED_SET" = 0 ] || echo "report_required=$EXISTING_REPORT_REQUIRED"
   else
     echo "report_required=1"
   fi

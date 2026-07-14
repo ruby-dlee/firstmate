@@ -209,18 +209,34 @@ function acquireLock() {
 function copyVisuals(source, destination) {
   const copied = [];
   if (!fs.existsSync(source)) return copied;
+  const sourceStat = fs.lstatSync(source);
+  if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
+    throw new Error(`visual evidence root must be a real directory at ${source}`);
+  }
+  const sourceReal = fs.realpathSync(source);
   let total = 0;
   function visit(current, relative = "") {
+    const currentReal = fs.realpathSync(current);
+    const currentRelative = path.relative(sourceReal, currentReal);
+    if (currentRelative === ".." || currentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(currentRelative)) {
+      throw new Error(`visual evidence escapes its task directory at ${current}`);
+    }
     for (const dirent of fs.readdirSync(current, { withFileTypes: true })) {
       const nextRelative = path.join(relative, dirent.name);
       const input = path.join(current, dirent.name);
+      if (dirent.isSymbolicLink()) throw new Error(`visual evidence must not contain symlinks at ${input}`);
       if (dirent.isDirectory()) visit(input, nextRelative);
       if (!dirent.isFile()) continue;
-      total += fs.statSync(input).size;
+      const inputReal = fs.realpathSync(input);
+      const inputRelative = path.relative(sourceReal, inputReal);
+      if (inputRelative === ".." || inputRelative.startsWith(`..${path.sep}`) || path.isAbsolute(inputRelative)) {
+        throw new Error(`visual evidence escapes its task directory at ${input}`);
+      }
+      total += fs.statSync(inputReal).size;
       if (total > 20 * 1024 * 1024) throw new Error("visual evidence exceeds the 20 MiB report limit");
       const output = path.join(destination, "visuals", nextRelative);
       fs.mkdirSync(path.dirname(output), { recursive: true });
-      fs.copyFileSync(input, output);
+      fs.copyFileSync(inputReal, output);
       copied.push(path.posix.join("visuals", ...nextRelative.split(path.sep)));
     }
   }
@@ -278,41 +294,44 @@ function publish(taskId, legacy) {
   const staged = path.join(entriesDir, `.${id}.${process.pid}.tmp`);
   fs.rmSync(staged, { recursive: true, force: true });
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
-  const visuals = copyVisuals(path.join(taskData, "visuals"), staged);
-  const manifest = {
-    schemaVersion: 1,
-    reportId: id,
-    taskId,
-    title: titleFromBrief(taskId, brief),
-    summary: firstSummary(markdown, lastStatus(status)),
-    completedAt: previousManifest?.completedAt || new Date().toISOString(),
-    kind: meta.kind || "ship",
-    mode: meta.mode || "no-mistakes",
-    project: meta.project ? path.basename(meta.project) : "unknown",
-    harness: meta.harness || "unknown",
-    accountProfile: meta.account_profile || "",
-    prUrl: safeHttpUrl(meta.pr),
-    commit: gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]),
-    branch: gitValue(meta.worktree, ["branch", "--show-current"]),
-    visuals,
-  };
-  fs.writeFileSync(path.join(staged, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-  fs.writeFileSync(path.join(staged, "report.md"), markdown, { mode: 0o600 });
-  fs.writeFileSync(path.join(staged, "brief.md"), brief || "Task brief unavailable.\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(staged, "status.log"), status || "Status trail unavailable.\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
-
-  if (fs.existsSync(destination)) fs.renameSync(destination, previous);
   try {
-    fs.renameSync(staged, destination);
-  } catch (error) {
-    if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, destination);
+    const visuals = copyVisuals(path.join(taskData, "visuals"), staged);
+    const manifest = {
+      schemaVersion: 1,
+      reportId: id,
+      taskId,
+      title: titleFromBrief(taskId, brief),
+      summary: firstSummary(markdown, lastStatus(status)),
+      completedAt: previousManifest?.completedAt || new Date().toISOString(),
+      kind: meta.kind || "ship",
+      mode: meta.mode || "no-mistakes",
+      project: meta.project ? path.basename(meta.project) : "unknown",
+      harness: meta.harness || "unknown",
+      accountProfile: meta.account_profile || "",
+      prUrl: safeHttpUrl(meta.pr),
+      commit: gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]),
+      branch: gitValue(meta.worktree, ["branch", "--show-current"]),
+      visuals,
+    };
+    fs.writeFileSync(path.join(staged, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(staged, "report.md"), markdown, { mode: 0o600 });
+    fs.writeFileSync(path.join(staged, "brief.md"), brief || "Task brief unavailable.\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(staged, "status.log"), status || "Status trail unavailable.\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
+
+    if (fs.existsSync(destination)) fs.renameSync(destination, previous);
+    try {
+      fs.renameSync(staged, destination);
+    } catch (error) {
+      if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, destination);
+      throw error;
+    }
+    fs.rmSync(previous, { recursive: true, force: true });
+    renderIndex();
+    console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
+  } finally {
     fs.rmSync(staged, { recursive: true, force: true });
-    throw error;
   }
-  fs.rmSync(previous, { recursive: true, force: true });
-  renderIndex();
-  console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
 }
 
 function resolveReportPath(taskId) {

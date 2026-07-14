@@ -752,6 +752,39 @@ test_kill_is_best_effort() {
   pass "fm_backend_herdr_kill: calls pane close and stays best-effort on failure"
 }
 
+test_managed_identity_rejects_reused_pane() {
+  local dir log fb out
+  dir="$TMP_ROOT/managed-identity"; log="$dir/log"; mkdir -p "$dir/fakebin"; : > "$log"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HERDR_LOG"
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  status\ --json*) printf '{"client":{"protocol":14},"server":{"running":true}}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-other-task"}]}}\n' ;;
+  pane\ get*) printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' ;;
+  agent\ get*) printf '{"result":{"agent":{"agent_status":"working"}}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" bash -c '
+    . "$0/bin/fm-backend.sh"
+    [ "$(fm_backend_target_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 11
+    ! fm_backend_capture herdr default:w1:p2 10 fm-intended-task || exit 12
+    ! fm_backend_send_key herdr default:w1:p2 Enter fm-intended-task || exit 13
+    [ "$(fm_backend_send_text_submit herdr default:w1:p2 message 1 0 0 fm-intended-task)" = unknown ] || exit 14
+    ! fm_backend_kill herdr default:w1:p2 "" fm-intended-task || exit 15
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 16
+    [ "$(fm_backend_busy_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 17
+  ' "$ROOT" 2>&1) || fail "managed Herdr identity validation failed: $out"
+  if grep -Eq 'pane (read|send-text|send-keys|close)|agent get' "$log"; then
+    fail "a reused Herdr pane reached a read, mutation, or agent-state command"
+  fi
+  pass "managed Herdr operations reject pane ids owned by another task tab"
+}
+
 test_current_path_reads_cwd() {
   local dir log resp fb out
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2010,6 +2043,7 @@ test_capture_works_around_small_lines_bug
 test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
+test_managed_identity_rejects_reused_pane
 test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle

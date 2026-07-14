@@ -42,7 +42,7 @@ test_publish_ship_with_visual() {
   local id=report-ship-a1 entry count manifest report_id completed_at
   write_task "$id" ship
   mkdir -p "$HOME_DIR/data/$id/visuals"
-  printf '# Completion\n\n## Summary\n\nA searchable report stack is ready.\n\n## What changed\n\nAdded publication.\n\n## Verification\n\nTests passed.\n\npassword=must-also-not-leak\nAWS_SECRET_ACCESS_KEY=aws-secret-value\nDB_PASSWORD=db-secret-value\nSLACK_BOT_TOKEN=slack-secret-value\nhttps://user:url-secret@example.invalid/path\n\n## Visual evidence\n\nSee overview.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n## Summary\n\nA searchable report stack is ready.\n\n## What changed\n\nAdded publication.\n\n## Verification\n\nTests passed.\n\npassword=must-also-not-leak\nAWS_SECRET_ACCESS_KEY=aws-secret-value\nDB_PASSWORD=db-secret-value\nSLACK_BOT_TOKEN=slack-secret-value\nhttps://user:url-secret@example.invalid/path\n{"password":"json-password-secret","access_token":"json-access-secret","safe":"visible"}\n\n## Visual evidence\n\nSee overview.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
   printf 'synthetic image bytes' > "$HOME_DIR/data/$id/visuals/overview.png"
 
   run_stack publish "$id" >/dev/null || fail "ship report publication failed"
@@ -60,11 +60,12 @@ test_publish_ship_with_visual() {
     fail "credential-like report text was not redacted"
   fi
   assert_grep 'password=[REDACTED]' "$(dirname "$entry")/report.md" "report redaction left no visible marker"
-  if grep -E 'aws-secret-value|db-secret-value|slack-secret-value|url-secret' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
+  if grep -E 'aws-secret-value|db-secret-value|slack-secret-value|url-secret|json-password-secret|json-access-secret' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
     fail "prefixed or URL credentials survived report redaction"
   fi
   assert_grep 'AWS_SECRET_ACCESS_KEY=[REDACTED]' "$(dirname "$entry")/report.md" "prefixed access-key redaction left no marker"
   assert_grep 'https://[REDACTED]@example.invalid/path' "$(dirname "$entry")/report.md" "credential URL redaction left no marker"
+  assert_grep '"password":"[REDACTED]","access_token":"[REDACTED]","safe":"visible"' "$(dirname "$entry")/report.md" "inline JSON credential redaction damaged safe fields"
 
   manifest="$(dirname "$entry")/manifest.json"
   report_id=$(sed -n 's/.*"reportId": "\([^"]*\)".*/\1/p' "$manifest")
@@ -137,6 +138,16 @@ test_stale_lock_reclaim_is_serialized() {
     fail "concurrent stale-lock reclaim leaked quarantine state"
   fi
   pass "report stack serializes concurrent stale-lock reclamation"
+}
+
+test_abandoned_reclaim_marker_is_recovered() {
+  mkdir -p "$STACK/.publish.lock"
+  printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$STACK/.publish.lock/owner"
+  printf '{"pid":%s,"startedAt":"different-process-start","token":"abandoned"}\n' "$$" > "$STACK/.publish.lock/.reclaim"
+  touch -t 200001010000 "$STACK/.publish.lock" "$STACK/.publish.lock/owner" "$STACK/.publish.lock/.reclaim"
+  run_stack render >/dev/null || fail "abandoned report-lock reclaim marker was not recovered"
+  assert_absent "$STACK/.publish.lock" "report render retained a lock with an abandoned reclaim marker"
+  pass "report stack recovers abandoned reclaim ownership by process identity and age"
 }
 
 test_readers_wait_for_publication_lock() {
@@ -254,6 +265,7 @@ test_required_source_fails_closed
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
+test_abandoned_reclaim_marker_is_recovered
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
 test_source_symlinks_fail_closed

@@ -1118,6 +1118,48 @@ test_failed_secondmate_rollback_preserves_home_for_relaunch() {
   pass "failed secondmate rollback clears task state without retiring its home"
 }
 
+test_failed_secondmate_respawn_rollback_restores_prior_state() {
+  local id rec sm expected out status artifact
+  id=account-secondmate-restore-z18f
+  rec=$(make_case secondmate-restore claude "$id")
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$sm" \
+    "project=$sm" \
+    "home=$sm" \
+    "harness=claude" \
+    "kind=secondmate" \
+    "mode=secondmate" \
+    "custom_extension=preserve-secondmate"
+  expected="$CASE_DIR/original-secondmate.meta"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
+  done
+
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed secondmate respawn precondition unexpectedly succeeded"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "failed secondmate respawn lost cleanup metadata"
+
+  clear_case_logs
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "secondmate rollback cleanup continued through a restored generation"
+  cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "secondmate rollback cleanup deleted or changed restored metadata"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
+      || fail "secondmate rollback cleanup deleted restored $artifact state"
+  done
+  assert_contains "$out" "previous task state was restored" "secondmate rollback restoration guidance was unclear"
+  assert_present "$sm/.fm-secondmate-home" "secondmate rollback cleanup retired the persistent home"
+  pass "failed secondmate respawn rollback preserves restored metadata and sidecars"
+}
+
 test_observe_invalid_response_remains_advisory() {
   local id rec out status launch
   id=account-observe-invalid-z19
@@ -1686,6 +1728,23 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
 }
 
+test_account_timeout_wrapper_uses_hard_kill_fallback() {
+  local fakebin log
+  fakebin=$(fm_fakebin "$TMP_ROOT/hard-timeout")
+  log="$TMP_ROOT/hard-timeout.args"
+  cat > "$fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$FM_FAKE_TIMEOUT_LOG"
+SH
+  chmod +x "$fakebin/timeout"
+  PATH="$fakebin:$PATH" FM_FAKE_TIMEOUT_LOG="$log" bash -c '
+    . "$1"
+    fm_account_run_bounded 3 true
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" || fail "account timeout wrapper invocation failed"
+  assert_grep '--kill-after=1 3 true' "$log" "account timeout wrapper omitted the hard KILL fallback"
+  pass "Agent Fleet control timeouts force-kill TERM-resistant subprocesses"
+}
+
 test_teardown_stops_after_rollback_restores_predecessor() {
   local id rec old_task failed_task out status
   id=account-teardown-restore-z28
@@ -1747,6 +1806,7 @@ test_failed_cleanup_persists_retryable_metadata
 test_unknown_spawn_endpoint_retains_lease_for_retry
 test_rollback_retry_rechecks_live_endpoint_before_release
 test_failed_secondmate_rollback_preserves_home_for_relaunch
+test_failed_secondmate_respawn_rollback_restores_prior_state
 test_observe_invalid_response_remains_advisory
 test_explicit_secondmate_profile_ignores_configured_pool
 test_enforced_orca_is_rejected_before_owned_resource_creation
@@ -1769,6 +1829,7 @@ test_oversized_continuation_stops_before_mutation
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_agent_fleet_contract_is_validated_before_routing
 test_agent_fleet_lifecycle_calls_are_bounded
+test_account_timeout_wrapper_uses_hard_kill_fallback
 test_teardown_stops_after_rollback_restores_predecessor
 
 echo "# all fm-account-routing tests passed"

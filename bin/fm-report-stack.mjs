@@ -153,6 +153,7 @@ function redactSensitive(value) {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b/g, "[REDACTED TOKEN]")
     .replace(/\b(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    .replace(/((["'])(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|passwd|secret|authorization|cookie)\2\s*:\s*)(["'])(?:\\.|(?!\3).)*\3/gi, "$1$3[REDACTED]$3")
     .replace(/^(\s*(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|passwd|secret|authorization|cookie)\s*[:=]\s*).+$/gim, "$1[REDACTED]");
 }
 
@@ -205,16 +206,23 @@ function acquireLock() {
   fs.mkdirSync(stackRoot, { recursive: true, mode: 0o700 });
   const lock = path.join(stackRoot, ".publish.lock");
   for (let attempt = 0; attempt < 100; attempt += 1) {
+    const token = crypto.randomUUID();
+    const candidate = path.join(stackRoot, `.publish.lock.candidate.${process.pid}.${token}`);
     try {
-      fs.mkdirSync(lock, { mode: 0o700 });
-      let token;
+      fs.mkdirSync(candidate, { mode: 0o700 });
       try {
         const startedAt = processStartIdentity(process.pid);
         if (!startedAt) throw new Error(`cannot identify report publisher process ${process.pid}`);
-        token = crypto.randomUUID();
-        fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, { mode: 0o600 });
+        fs.writeFileSync(path.join(candidate, "owner"), `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, { mode: 0o600 });
+        if (fs.existsSync(lock)) {
+          fs.rmSync(candidate, { recursive: true, force: true });
+          const existsError = new Error(`report lock exists at ${lock}`);
+          existsError.code = "EEXIST";
+          throw existsError;
+        }
+        fs.renameSync(candidate, lock);
       } catch (error) {
-        fs.rmSync(lock, { recursive: true, force: true });
+        fs.rmSync(candidate, { recursive: true, force: true });
         throw error;
       }
       return () => {
@@ -226,7 +234,7 @@ function acquireLock() {
         }
       };
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+      if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
       try {
         let owner = Number.NaN;
         let ownerStartedAt = "";
@@ -247,33 +255,72 @@ function acquireLock() {
           try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
         }
         if (ownerAlive) ownerAlive = processStartIdentity(owner) === ownerStartedAt;
-        const staleStat = fs.statSync(lock);
-        if (!ownerAlive && Date.now() - staleStat.mtimeMs > 60_000) {
+        const lockStat = fs.statSync(lock);
+        let staleMtimeMs = lockStat.mtimeMs;
+        try { staleMtimeMs = Math.min(staleMtimeMs, fs.statSync(path.join(lock, "owner")).mtimeMs); } catch (ownerStatError) { if (ownerStatError.code !== "ENOENT") throw ownerStatError; }
+        if (!ownerAlive && Date.now() - staleMtimeMs > 60_000) {
           const reclaim = path.join(lock, ".reclaim");
           const reclaimToken = crypto.randomUUID();
           let claimed = false;
           try {
-            fs.writeFileSync(reclaim, reclaimToken, { flag: "wx", mode: 0o600 });
+            const reclaimStartedAt = processStartIdentity(process.pid);
+            if (!reclaimStartedAt) throw new Error(`cannot identify report lock reclaimer ${process.pid}`);
+            const reclaimOwner = { pid: process.pid, startedAt: reclaimStartedAt, token: reclaimToken };
+            fs.writeFileSync(reclaim, `${JSON.stringify(reclaimOwner)}\n`, { flag: "wx", mode: 0o600 });
             claimed = true;
             const claimedStat = fs.statSync(lock);
-            if (claimedStat.dev !== staleStat.dev || claimedStat.ino !== staleStat.ino) {
+            if (claimedStat.dev !== lockStat.dev || claimedStat.ino !== lockStat.ino) {
               fs.rmSync(reclaim, { force: true });
               claimed = false;
               continue;
             }
             const quarantine = path.join(stackRoot, `.publish.lock.stale.${process.pid}.${reclaimToken}`);
             fs.renameSync(lock, quarantine);
-            if (fs.readFileSync(path.join(quarantine, ".reclaim"), "utf8") !== reclaimToken) {
+            const quarantinedReclaim = JSON.parse(fs.readFileSync(path.join(quarantine, ".reclaim"), "utf8"));
+            if (quarantinedReclaim.token !== reclaimToken) {
               throw new Error(`report lock changed while reclaiming ${lock}`);
             }
             fs.rmSync(quarantine, { recursive: true, force: true });
             continue;
           } catch (reclaimError) {
-            if (reclaimError.code !== "EEXIST" && reclaimError.code !== "ENOENT") throw reclaimError;
+            if (reclaimError.code === "EEXIST") {
+              try {
+                const reclaimStat = fs.statSync(reclaim);
+                const reclaimRaw = fs.readFileSync(reclaim, "utf8").trim();
+                let reclaimOwner;
+                try {
+                  reclaimOwner = JSON.parse(reclaimRaw);
+                } catch {
+                  reclaimOwner = { pid: Number.NaN, startedAt: "", token: reclaimRaw };
+                }
+                let reclaimAlive = Number.isInteger(reclaimOwner.pid) && reclaimOwner.pid > 0 && typeof reclaimOwner.startedAt === "string" && reclaimOwner.startedAt.length > 0;
+                if (reclaimAlive) {
+                  try { process.kill(reclaimOwner.pid, 0); } catch (killError) { if (killError.code === "ESRCH") reclaimAlive = false; }
+                }
+                if (reclaimAlive) reclaimAlive = processStartIdentity(reclaimOwner.pid) === reclaimOwner.startedAt;
+                const currentLockStat = fs.statSync(lock);
+                if (!reclaimAlive && Date.now() - reclaimStat.mtimeMs > 60_000
+                  && currentLockStat.dev === lockStat.dev && currentLockStat.ino === lockStat.ino) {
+                  const currentReclaimRaw = fs.readFileSync(reclaim, "utf8").trim();
+                  let currentReclaimToken;
+                  try {
+                    currentReclaimToken = JSON.parse(currentReclaimRaw).token;
+                  } catch {
+                    currentReclaimToken = currentReclaimRaw;
+                  }
+                  if (currentReclaimToken === reclaimOwner.token) fs.rmSync(reclaim, { force: true });
+                }
+              } catch (reclaimOwnerError) {
+                if (reclaimOwnerError.code !== "ENOENT") throw reclaimOwnerError;
+              }
+            } else if (reclaimError.code !== "ENOENT") {
+              throw reclaimError;
+            }
           } finally {
             if (claimed) {
               try {
-                if (fs.readFileSync(reclaim, "utf8") === reclaimToken) fs.rmSync(reclaim, { force: true });
+                const reclaimOwner = JSON.parse(fs.readFileSync(reclaim, "utf8"));
+                if (reclaimOwner.token === reclaimToken) fs.rmSync(reclaim, { force: true });
               } catch (cleanupError) {
                 if (cleanupError.code !== "ENOENT") throw cleanupError;
               }

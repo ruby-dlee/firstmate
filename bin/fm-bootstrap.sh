@@ -99,6 +99,9 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-account-routing-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-gate-refuse-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 
 fleet_sync_origin_backed_project_count() {
   local count proj

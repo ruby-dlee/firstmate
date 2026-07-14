@@ -262,6 +262,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_tab=$(fm_account_meta_value "$RESUME_META" zellij_tab_id)
     rollback_home=$(fm_account_meta_value "$RESUME_META" home)
     rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
+    rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
     if [ -n "$rollback_target" ]; then
       spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
     fi
@@ -285,13 +286,15 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       exit 1
     fi
     rollback_profile=$(fm_account_meta_value "$RESUME_META" account_profile)
-    if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ]; then
+    if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ] && [ -z "$rollback_backup" ]; then
       rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
       [ -z "$rollback_tasktmp" ] || rm -rf "$rollback_tasktmp"
     fi
     fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
     if [ -z "$rollback_profile" ]; then
-      if [ "$rollback_kind" = secondmate ]; then
+      if [ -n "$rollback_backup" ]; then
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id and the previous task state was restored; rerun against the restored task generation" >&2
+      elif [ "$rollback_kind" = secondmate ]; then
         echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; retry the secondmate spawn without tearing down its home" >&2
       else
         echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; tear down its retained worktree before spawning again" >&2

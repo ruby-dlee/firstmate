@@ -412,9 +412,9 @@ run_bounded() {  # <seconds> <command> [args...]
   local seconds=$1
   shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
+    timeout --kill-after=1 "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
+    gtimeout --kill-after=1 "$seconds" "$@"
   else
     # shellcheck disable=SC2016  # single quotes are deliberate: Perl expands its own variables.
     perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"

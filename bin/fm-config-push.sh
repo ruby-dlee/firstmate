@@ -57,6 +57,10 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="$FM_HOME/data"
 SECONDMATES_MD="$DATA/secondmates.md"
 
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
+
 "$SCRIPT_DIR/fm-guard.sh" || true
 
 # shellcheck source=bin/fm-ff-lib.sh

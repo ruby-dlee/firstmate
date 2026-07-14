@@ -1132,6 +1132,25 @@ SH
   pass "watcher bounds and separately cadences account session synchronization"
 }
 
+test_watcher_timeout_wrapper_uses_hard_kill_fallback() {
+  local dir state fakebin log
+  dir=$(make_case watcher-hard-timeout); state="$dir/state"
+  fakebin=$(fm_fakebin "$dir/hard-timeout")
+  log="$dir/hard-timeout.args"
+  cat > "$fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$FM_FAKE_TIMEOUT_LOG"
+SH
+  chmod +x "$fakebin/timeout"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_FAKE_TIMEOUT_LOG="$log" bash -c '
+    . "$1"
+    run_bounded 4 true
+  ' _ "$WATCH" || fail "watcher timeout wrapper invocation failed"
+  grep -F -- '--kill-after=1 4 true' "$log" >/dev/null \
+    || fail "watcher timeout wrapper omitted the hard KILL fallback"
+  pass "watcher timeouts force-kill TERM-resistant subprocesses"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1166,3 +1185,4 @@ test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
 test_account_session_sync_is_bounded_and_cadenced
+test_watcher_timeout_wrapper_uses_hard_kill_fallback

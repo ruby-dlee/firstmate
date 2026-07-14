@@ -69,6 +69,8 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
+FM_AFK_LAUNCH_LOCK_TOKEN=
+
 fm_afk_launch_lock_owned() {
   local pid expected actual
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
@@ -83,24 +85,56 @@ fm_afk_launch_lock_identity() {
     || stat -c '%d:%i:%W' "$FM_AFK_LAUNCH_LOCK" 2>/dev/null
 }
 
+fm_afk_launch_atomic_rename() {
+  if command -v node >/dev/null 2>&1; then
+    node -e 'try { require("node:fs").renameSync(process.argv[1], process.argv[2]); } catch { process.exit(1); }' "$1" "$2"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)' "$1" "$2"
+  else
+    return 1
+  fi
+}
+
+fm_afk_launch_reclaim_owned() {
+  local reclaim=$1 pid expected actual
+  [ -d "$reclaim" ] || return 1
+  pid=$(cat "$reclaim/pid" 2>/dev/null) || return 1
+  expected=$(cat "$reclaim/pid-identity" 2>/dev/null) || return 1
+  actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  [ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
 fm_afk_launch_lock_acquire() {
   local i incomplete=0 identity quarantine stale_identity claimed_identity last_identity=
+  local candidate claim_candidate reclaim reclaim_identity token reclaim_token ownerless_grace
+  ownerless_grace=${FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS:-1}
+  case "$ownerless_grace" in ''|*[!0-9]*) return 1 ;; esac
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   for i in $(seq 1 200); do
-    if mkdir "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
-      if ! printf '%s' "$$" > "$FM_AFK_LAUNCH_LOCK/pid"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      fi
+    if [ ! -e "$FM_AFK_LAUNCH_LOCK" ]; then
+      token="$$.$RANDOM.$i"
+      candidate="$FM_AFK_LAUNCH_LOCK.candidate.$token"
+      rm -rf "$candidate" 2>/dev/null || true
+      mkdir "$candidate" 2>/dev/null || { sleep 0.05; continue; }
       identity=$(fm_pid_identity "$$" 2>/dev/null) || {
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
+        rm -rf "$candidate"
         return 1
       }
-      if [ -z "$identity" ] || ! printf '%s' "$identity" > "$FM_AFK_LAUNCH_LOCK/pid-identity"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
+      if [ -z "$identity" ] \
+        || ! printf '%s' "$$" > "$candidate/pid" \
+        || ! printf '%s' "$identity" > "$candidate/pid-identity" \
+        || ! printf '%s' "$token" > "$candidate/token"; then
+        rm -rf "$candidate"
         return 1
       fi
-      return 0
+      if [ ! -e "$FM_AFK_LAUNCH_LOCK" ] && fm_afk_launch_atomic_rename "$candidate" "$FM_AFK_LAUNCH_LOCK"; then
+        if [ "$(cat "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)" = "$token" ]; then
+          FM_AFK_LAUNCH_LOCK_TOKEN=$token
+          return 0
+        fi
+        return 1
+      fi
+      rm -rf "$candidate" 2>/dev/null || true
     fi
     stale_identity=$(fm_afk_launch_lock_identity) || {
       sleep 0.05
@@ -112,7 +146,7 @@ fm_afk_launch_lock_acquire() {
     fi
     if [ ! -s "$FM_AFK_LAUNCH_LOCK/pid" ] || [ ! -s "$FM_AFK_LAUNCH_LOCK/pid-identity" ]; then
       incomplete=$((incomplete + 1))
-      if [ "$incomplete" -lt 20 ]; then
+      if [ "$incomplete" -lt $((ownerless_grace * 20)) ]; then
         sleep 0.05
         continue
       fi
@@ -120,28 +154,55 @@ fm_afk_launch_lock_acquire() {
       incomplete=0
     fi
     if ! fm_afk_launch_lock_owned; then
-      if ! mkdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null; then
+      reclaim="$FM_AFK_LAUNCH_LOCK/.reclaim"
+      if [ -e "$reclaim" ]; then
+        if fm_afk_launch_reclaim_owned "$reclaim" \
+          || [ "$(fm_path_age "$reclaim" 2>/dev/null || echo 0)" -lt "$ownerless_grace" ]; then
+          sleep 0.05
+          continue
+        fi
+        reclaim_identity=$(stat -f '%d:%i:%B' "$reclaim" 2>/dev/null \
+          || stat -c '%d:%i:%W' "$reclaim" 2>/dev/null) || { sleep 0.05; continue; }
+        if fm_afk_launch_atomic_rename "$reclaim" "$FM_AFK_LAUNCH_LOCK/.reclaim.stale.${reclaim_identity//:/_}.$$.$RANDOM"; then
+          rm -rf "$FM_AFK_LAUNCH_LOCK"/.reclaim.stale."${reclaim_identity//:/_}".$$.* 2>/dev/null || true
+        fi
+        sleep 0.05
+        continue
+      fi
+      reclaim_token="$$.$RANDOM.$i"
+      claim_candidate="$FM_AFK_LAUNCH_LOCK/.reclaim-candidate.$reclaim_token"
+      mkdir "$claim_candidate" 2>/dev/null || { sleep 0.05; continue; }
+      identity=$(fm_pid_identity "$$" 2>/dev/null) || {
+        rm -rf "$claim_candidate"
+        return 1
+      }
+      if [ -z "$identity" ] \
+        || ! printf '%s' "$$" > "$claim_candidate/pid" \
+        || ! printf '%s' "$identity" > "$claim_candidate/pid-identity" \
+        || ! printf '%s' "$reclaim_token" > "$claim_candidate/token" \
+        || ! fm_afk_launch_atomic_rename "$claim_candidate" "$reclaim"; then
+        rm -rf "$claim_candidate" 2>/dev/null || true
         sleep 0.05
         continue
       fi
       claimed_identity=$(fm_afk_launch_lock_identity) || claimed_identity=
       if [ -z "$claimed_identity" ] || [ "$claimed_identity" != "$stale_identity" ]; then
-        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
       if fm_afk_launch_lock_owned; then
-        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
-      quarantine="$FM_AFK_LAUNCH_LOCK.stale.$$.$i"
-      if ! mv "$FM_AFK_LAUNCH_LOCK" "$quarantine" 2>/dev/null; then
-        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+      quarantine="$FM_AFK_LAUNCH_LOCK.stale.$reclaim_token"
+      if ! fm_afk_launch_atomic_rename "$FM_AFK_LAUNCH_LOCK" "$quarantine"; then
+        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
-      if [ ! -d "$quarantine/.reclaim" ]; then
+      if [ "$(cat "$quarantine/.reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ]; then
         fm_afk_launch_log "launcher lock changed while reclaiming it"
         return 1
       fi
@@ -156,10 +217,12 @@ fm_afk_launch_lock_acquire() {
 }
 
 fm_afk_launch_lock_release() {
-  local pid
+  local pid token
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
-  [ "$pid" = "$$" ] || return 0
+  token=$(cat "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)
+  [ "$pid" = "$$" ] && [ -n "$FM_AFK_LAUNCH_LOCK_TOKEN" ] && [ "$token" = "$FM_AFK_LAUNCH_LOCK_TOKEN" ] || return 0
   rm -rf "$FM_AFK_LAUNCH_LOCK"
+  FM_AFK_LAUNCH_LOCK_TOKEN=
 }
 
 fm_afk_launch_usage() {

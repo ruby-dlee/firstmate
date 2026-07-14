@@ -42,6 +42,9 @@ HOME_SEED="$ROOT/bin/fm-home-seed.sh"
 BACKLOG_HANDOFF="$ROOT/bin/fm-backlog-handoff.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 AFK_LAUNCH="$ROOT/bin/fm-afk-launch.sh"
+BOOTSTRAP="$ROOT/bin/fm-bootstrap.sh"
+UPDATE="$ROOT/bin/fm-update.sh"
+CONFIG_PUSH="$ROOT/bin/fm-config-push.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -511,6 +514,18 @@ run_primary_mutator_guarded() {
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
           "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$AFK_LAUNCH" start-native ) 2>&1
       ;;
+    bootstrap)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$BOOTSTRAP" ) 2>&1
+      ;;
+    update)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$UPDATE" ) 2>&1
+      ;;
+    config-push)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$CONFIG_PUSH" ) 2>&1
+      ;;
   esac
 }
 
@@ -521,7 +536,7 @@ test_primary_mutators_refuse_gate_contexts() {
   printf '# Backlog\n\n## In flight\n## Queued\n- [ ] queued-x - queued\n## Done\n' > "$home/data/backlog.md"
   fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship"
 
-  for name in session-start home-seed backlog-handoff pr-check afk-launch; do
+  for name in session-start home-seed backlog-handoff pr-check afk-launch bootstrap update config-push; do
     out=$(run_primary_mutator_guarded "$name" "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
     expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
     assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"

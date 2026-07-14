@@ -269,6 +269,27 @@ unit_stale_lock_reclaim_is_serialized() {
   rm -rf "$st"
 }
 
+unit_abandoned_reclaim_is_recovered() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-abandoned.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock/.reclaim"
+  printf '%s' "$$" > "$st/state/.afk-launch.lock/pid"
+  printf 'different-process-identity' > "$st/state/.afk-launch.lock/pid-identity"
+  printf '%s' "$$" > "$st/state/.afk-launch.lock/.reclaim/pid"
+  printf 'different-process-identity' > "$st/state/.afk-launch.lock/.reclaim/pid-identity"
+  printf 'abandoned' > "$st/state/.afk-launch.lock/.reclaim/token"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS=0 bash -c '
+    . "$1"
+    fm_afk_launch_lock_acquire
+    fm_afk_launch_lock_release
+  ' _ "$LAUNCH" && [ ! -e "$st/state/.afk-launch.lock" ]; then
+    pass "launcher lock recovers abandoned reclaim ownership by process identity and age"
+  else
+    fail "launcher lock could not recover an abandoned reclaim owner"
+  fi
+  rm -rf "$st"
+}
+
 unit_signal_exits_with_lock_cleanup() {
   local st marker child
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-signal.XXXXXX")
@@ -1072,6 +1093,7 @@ unit_failed_start_rolls_back_state
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_stale_lock_reclaim_is_serialized
+unit_abandoned_reclaim_is_recovered
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_creation_intent_reconciles

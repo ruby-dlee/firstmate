@@ -35,9 +35,9 @@ fm_account_run_bounded() {
   shift
   case "$seconds" in ''|*[!0-9]*|0) return 2 ;; esac
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
+    timeout --kill-after=1 "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$seconds" "$@"
+    gtimeout --kill-after=1 "$seconds" "$@"
   elif command -v perl >/dev/null 2>&1; then
     perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
   else

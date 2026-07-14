@@ -500,6 +500,12 @@ persist_failed_account_rollback() {
   META_INSTALLED=1
 }
 
+clear_account_rollback_markers() {
+  local meta="$STATE/$ID.meta" tmp="$STATE/.$ID.meta.rollback-commit.$$"
+  awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+}
+
 spawn_abort_cleanup() {
   local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name
   trap - EXIT
@@ -1711,6 +1717,13 @@ META_TMP="$STATE/.$ID.meta.$$"
     if [ "$RESUME_ACCOUNT" = 1 ]; then
       echo "provider_session_id=$RECORDED_SESSION"
     fi
+    echo "account_rollback_cleanup=pending"
+    rollback_backup_name=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_backup)
+    rollback_artifacts_name=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_artifacts)
+    rollback_preserve_session=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_preserve_session)
+    [ -z "$rollback_backup_name" ] || echo "account_rollback_backup=$rollback_backup_name"
+    [ -z "$rollback_artifacts_name" ] || echo "account_rollback_artifacts=$rollback_artifacts_name"
+    [ -z "$rollback_preserve_session" ] || echo "account_rollback_preserve_session=$rollback_preserve_session"
   fi
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
@@ -1862,6 +1875,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;
     *) echo "error: managed endpoint state is unknown before launch commit for $ID" >&2; exit 1 ;;
   esac
+  clear_account_rollback_markers || { echo "error: failed to commit managed rollback metadata for $ID" >&2; exit 1; }
   ACCOUNT_SPAWN_COMMITTED=1
   [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
   META_BACKUP=

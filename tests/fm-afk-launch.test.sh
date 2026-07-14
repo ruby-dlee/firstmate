@@ -453,6 +453,10 @@ unit_detached_daemons_receive_state_override() {
     *"FM_STATE_OVERRIDE=$st/override-state"*) ;;
     *) fail "herdr daemon command lost FM_STATE_OVERRIDE" ;;
   esac
+  case "$herdr_cmd" in
+    *"FM_AFK_STATE_PREPARED=1"*) ;;
+    *) fail "herdr daemon command lost FM_AFK_STATE_PREPARED" ;;
+  esac
 
   rm -f "$st/override-state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/override-state" FM_AFK_LAUNCH_ENTRY=/bin/true bash -c '
@@ -469,7 +473,11 @@ unit_detached_daemons_receive_state_override() {
     *"FM_STATE_OVERRIDE=$st/override-state"*) ;;
     *) fail "tmux daemon command lost FM_STATE_OVERRIDE" ;;
   esac
-  pass "detached away daemons receive the effective state override"
+  case "$tmux_cmd" in
+    *"FM_AFK_STATE_PREPARED=1"*) ;;
+    *) fail "tmux daemon command lost FM_AFK_STATE_PREPARED" ;;
+  esac
+  pass "detached away daemons receive the prepared effective state"
   rm -rf "$st"
 }
 
@@ -1141,6 +1149,7 @@ e2e_tmux() {
   rm -rf "$home_tmp" 2>/dev/null || true
 }
 
+unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
 unit_stop_ordering
@@ -1155,7 +1164,6 @@ unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_creation_intent_reconciles
 unit_expired_herdr_creation_intent_clears
-unit_detached_daemons_receive_state_override
 unit_herdr_error_with_exact_ids_closes_exact
 unit_herdr_run_failure_preserves_unconfirmed_record
 unit_record_failure_closes_terminal

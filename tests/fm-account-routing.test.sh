@@ -891,13 +891,15 @@ test_reservation_occurs_after_worktree_preparation() {
 }
 
 test_reserved_generation_is_durable_before_spawn_progresses() {
-  local id rec real_mv marker gate spawn_pid status meta task
+  local id rec real_mv marker gate installed_marker installed_gate spawn_pid status meta task
   id=account-durable-lease-z14b
   rec=$(make_case durable-lease claude "$id")
   read_case "$rec"
   real_mv=$(command -v mv)
   marker="$CASE_DIR/provisional-meta-persisted"
   gate="$CASE_DIR/continue-after-provisional-meta"
+  installed_marker="$CASE_DIR/endpoint-meta-installed"
+  installed_gate="$CASE_DIR/continue-after-endpoint-meta"
   cat > "$FAKEBIN_DIR/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -908,13 +910,20 @@ case "${1:-}" in
     while [ ! -f "$FM_FAKE_PROVISIONAL_META_GATE" ]; do sleep 0.05; done
     exit 0
     ;;
+  *.meta.[0-9]*)
+    "$FM_FAKE_REAL_MV" "$@" || exit $?
+    touch "$FM_FAKE_INSTALLED_META_MARKER"
+    while [ ! -f "$FM_FAKE_INSTALLED_META_GATE" ]; do sleep 0.05; done
+    exit 0
+    ;;
 esac
 exec "$FM_FAKE_REAL_MV" "$@"
 SH
   chmod +x "$FAKEBIN_DIR/mv"
 
   FM_FAKE_REAL_MV="$real_mv" FM_FAKE_PROVISIONAL_META_MARKER="$marker" \
-    FM_FAKE_PROVISIONAL_META_GATE="$gate" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
+    FM_FAKE_PROVISIONAL_META_GATE="$gate" FM_FAKE_INSTALLED_META_MARKER="$installed_marker" \
+    FM_FAKE_INSTALLED_META_GATE="$installed_gate" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
     > "$CASE_DIR/spawn-stdout" 2> "$CASE_DIR/spawn-stderr" &
   spawn_pid=$!
   for _ in $(seq 1 100); do
@@ -930,6 +939,14 @@ SH
   assert_grep 'account_profile=claude-2' "$meta" "provisional metadata lost the selected account profile"
   assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
   touch "$gate"
+  for _ in $(seq 1 100); do
+    [ -f "$installed_marker" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -f "$installed_marker" ] || { touch "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never installed endpoint metadata"; }
+  assert_grep 'account_rollback_cleanup=pending' "$meta" "endpoint metadata cleared rollback recovery before launch commit"
+  touch "$installed_gate"
   status=0
   wait "$spawn_pid" || status=$?
   expect_code 0 "$status" "spawn should continue after its provisional generation is durable"
@@ -1970,6 +1987,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
 
+test_reserved_generation_is_durable_before_spawn_progresses
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session
@@ -1993,7 +2011,6 @@ test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
 test_duplicate_spawn_preserves_original_endpoint_and_lease
 test_reservation_occurs_after_worktree_preparation
-test_reserved_generation_is_durable_before_spawn_progresses
 test_raw_enforced_launch_is_rejected_before_mutation
 test_global_enforce_refuses_unsupported_harnesses
 test_malformed_routing_mode_fails_closed

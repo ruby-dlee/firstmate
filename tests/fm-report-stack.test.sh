@@ -91,6 +91,27 @@ test_publish_ship_with_visual() {
   pass "report stack replaces corrected ship reports without changing stable identity"
 }
 
+test_report_links_reject_credentials_and_encode_visual_paths() {
+  local id=report-links-a2 entry manifest visual
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Safe report links."
+  printf 'pr=https://report-user:report-secret@example.invalid/pull/1\n' >> "$HOME_DIR/state/$id.meta"
+  visual="$HOME_DIR/data/$id/visuals/screens/evidence #1?%.png"
+  mkdir -p "$(dirname "$visual")"
+  printf 'synthetic image bytes' > "$visual"
+
+  run_stack publish "$id" >/dev/null || fail "safe-link report publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"prUrl": ""' "$manifest" "credential-bearing pull request URL was retained"
+  if grep -R -F 'report-secret' "$STACK" >/dev/null 2>&1; then
+    fail "pull request URL credentials leaked into the report stack"
+  fi
+  assert_grep 'visuals/screens/evidence%20%231%3F%25.png' "$entry" "visual URL path segments were not encoded"
+  assert_present "$(dirname "$entry")/visuals/screens/evidence #1?%.png" "encoded visual link lost its copied artifact"
+  pass "report links reject credentials and encode visual paths"
+}
+
 test_required_source_fails_closed() {
   local id=report-missing-b2 out status
   write_task "$id" ship
@@ -333,6 +354,7 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
 }
 
 test_publish_ship_with_visual
+test_report_links_reject_credentials_and_encode_visual_paths
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_scout_and_legacy_sources

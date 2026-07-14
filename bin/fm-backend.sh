@@ -820,7 +820,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
       fm_backend_cmux_parse_target "$target" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
       workspace=$FM_BACKEND_CMUX_WORKSPACE
       surface=$FM_BACKEND_CMUX_SURFACE
-      if ! workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) \
+      if ! workspaces=$(fm_backend_cmux_all_workspaces 2>/dev/null) \
         || ! printf '%s\n' "$workspaces" | jq -e '(.workspaces | type) == "array"' >/dev/null 2>&1; then
         printf 'unknown'
         return 0

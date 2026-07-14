@@ -195,10 +195,15 @@ function safeHttpUrl(value) {
   if (!value) return "";
   try {
     const parsed = new URL(value);
+    if (parsed.username || parsed.password) return "";
     return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : "";
   } catch {
     return "";
   }
+}
+
+function relativeUrl(value) {
+  return String(value).split("/").map((segment) => encodeURIComponent(segment)).join("/");
 }
 
 function sharedCss() {
@@ -209,7 +214,7 @@ function reportPage(manifest, markdown, visuals) {
   const gallery = visuals.length
     ? `<section><h2>Visual evidence</h2><div class="gallery">${visuals.map((visual) => {
       const label = escapeHtml(path.basename(visual));
-      const href = escapeHtml(visual);
+      const href = escapeHtml(relativeUrl(visual));
       return /\.(?:gif|jpe?g|png|svg|webp)$/i.test(visual)
         ? `<figure><a href="${href}"><img src="${href}" alt="${label}"></a><figcaption>${label}</figcaption></figure>`
         : `<figure><a href="${href}">${label}</a><figcaption>Visual artifact</figcaption></figure>`;

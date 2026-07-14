@@ -235,14 +235,14 @@ esac
 # Was the platform/budget authoritatively resolved by any source (override,
 # registry, inbox, or relay)? Drives the follow-up fail-safe below.
 CONTEXT_RESOLVED=0
-if [ -n "$REQ_PLATFORM" ] && [ -n "$REQ_EXPLICIT_MAX" ]; then
+if [ -n "$REQ_PLATFORM" ] || [ -n "$REQ_EXPLICIT_MAX" ]; then
   CONTEXT_RESOLVED=1
 fi
 
 if [ "$FOLLOWUP" = 1 ] && [ "$CONTEXT_RESOLVED" = 0 ]; then
   relay_note=
   [ "$ALLOW_RELAY" = 1 ] && relay_note=", and the relay did not supply the missing value by request_id"
-  printf 'fm-x-reply: refusing follow-up for %s: could not authoritatively determine both the reply platform and explicit budget (local per-request context was incomplete%s). Hold and retry once both values are recoverable.\n' \
+  printf 'fm-x-reply: refusing follow-up for %s: could not authoritatively determine a reply platform or explicit budget (local per-request context was incomplete%s). Hold and retry once either value is recoverable.\n' \
     "$REQ" "$relay_note" >&2
   exit 8
 fi

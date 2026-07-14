@@ -1459,6 +1459,20 @@ TXT
   pass "a partial registry platform combines with the relay's authoritative budget"
 }
 
+test_followup_platform_only_context_uses_platform_default() {
+  local home out rc reply
+  home="$TMP_ROOT/reg-platform-default"; mkdir -p "$home/state/x-context"
+  jq -cn '{request_id:"req-platform-default",platform:"discord",reply_max_chars:""}' \
+    > "$home/state/x-context/req-platform-default.json"
+  reply="This Discord follow-up intentionally exceeds the X message budget while remaining below Discord's documented default. The durable context knows the platform but comes from a legacy record without an explicit relay limit, so the reply must use the Discord default and remain a single message instead of being refused or split into an X-sized thread."
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-reply.sh" req-platform-default --followup - <<<"$reply" 2>/dev/null); rc=$?
+  expect_code 0 "$rc" "platform-only follow-up exit"
+  [ "$out" = "req-platform-default" ] || fail "platform-only follow-up must echo the request_id"
+  jq -e 'has("texts")|not' "$home/state/x-outbox/req-platform-default.json" >/dev/null \
+    || fail "platform-only Discord follow-up did not use the Discord default budget"
+  pass "platform-only follow-up context uses the documented platform default"
+}
+
 # Regression case 4: concurrent requests through one secondmate keep their own
 # platform/budget - the per-request registry cannot be cross-overwritten the way a
 # single x_request per task was.
@@ -2265,6 +2279,7 @@ test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup
 test_regression_unresolved_followup_fails_safe
 test_followup_partial_registry_uses_relay_budget_live
+test_followup_platform_only_context_uses_platform_default
 test_regression_concurrent_requests_keep_own_platform
 test_dismiss_clears_context_registry
 test_dismiss_success_posts_request_only

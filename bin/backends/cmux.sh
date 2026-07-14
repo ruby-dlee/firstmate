@@ -344,7 +344,7 @@ fm_backend_cmux_all_workspaces() {
 # duplicate-check posture.
 fm_backend_cmux_workspace_id_for_label() {  # <label>
   local label=$1
-  fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null \
+  fm_backend_cmux_all_workspaces \
     | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
 }
 
@@ -421,18 +421,19 @@ fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>
 # header for the fresh-surface pitfall this avoids). When the caller knows
 # the owning firstmate task label, refresh stale workspace/surface ids by label.
 fm_backend_cmux_target_ready() {  # <target> [expected-label]
-  local expected_label=${2:-} expected_title title wsid sfid
+  local expected_label=${2:-} expected_title title wsid sfid workspaces
   fm_backend_cmux_parse_target "$1" || return 1
   if [ -n "$expected_label" ]; then
     expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
-    title=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null | jq -r --arg id "$FM_BACKEND_CMUX_WORKSPACE" '.workspaces[]? | select(.id == $id) | .title' 2>/dev/null)
+    workspaces=$(fm_backend_cmux_all_workspaces) || return 1
+    title=$(printf '%s' "$workspaces" | jq -r --arg id "$FM_BACKEND_CMUX_WORKSPACE" '.workspaces[]? | select(.id == $id) | .title' 2>/dev/null)
     if [ "$title" = "$expected_title" ]; then
       fm_backend_cmux_surface_exists "$FM_BACKEND_CMUX_WORKSPACE" "$FM_BACKEND_CMUX_SURFACE" && return 0
       wsid=$FM_BACKEND_CMUX_WORKSPACE
     elif [ -n "$title" ]; then
       return 1
     else
-      wsid=$(fm_backend_cmux_workspace_id_for_label "$expected_title")
+      wsid=$(printf '%s' "$workspaces" | jq -r --arg want "$expected_title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1)
       [ -n "$wsid" ] || return 1
     fi
     sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")

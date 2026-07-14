@@ -1900,6 +1900,37 @@ test_meta_rewrites_do_not_depend_on_tmpdir() {
   pass "meta rewrites are independent of TMPDIR"
 }
 
+test_meta_rewrites_serialize_with_account_session_updates() {
+  local home state meta ready release holder writer
+  home="$TMP_ROOT/link-account-meta-lock"
+  state="$home/state"
+  meta="$state/fix-meta-lock-k5.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state"
+  printf 'window=w\nkind=ship\nx_request=req-lock\nx_request_ts=1700000000\nx_followups=0\n' > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" fix-meta-lock-k5) || exit 1
+    touch "$3"
+    while [ ! -f "$4" ]; do sleep 0.05; done
+    printf "provider_session_id=session-new\n" >> "$2/fix-meta-lock-k5.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  bash -c '. "$1/bin/fm-x-lib.sh"; fmx_meta_followups_set "$2" 1' _ "$ROOT" "$meta" &
+  writer=$!
+  sleep 0.1
+  assert_grep 'x_followups=0' "$meta" "X metadata rewrite bypassed the account metadata lock"
+  touch "$release"
+  wait "$holder" || fail "account session update lock holder failed"
+  wait "$writer" || fail "X metadata rewrite failed after the account metadata lock was released"
+  assert_grep 'provider_session_id=session-new' "$meta" "X metadata rewrite lost the concurrent provider session update"
+  assert_grep 'x_followups=1' "$meta" "X metadata rewrite did not publish after the account metadata lock was released"
+  pass "X metadata rewrites serialize with account session updates"
+}
+
 test_link_rejects_unsafe_and_missing() {
   local home rc
   home="$TMP_ROOT/link-bad"; mkdir -p "$home/state"
@@ -2297,6 +2328,7 @@ test_link_carry_count_and_ts_preserve_followup_binding
 test_link_recovery_relink_carries_discord_context_after_inbox_drain
 test_link_carry_count_validation
 test_meta_rewrites_do_not_depend_on_tmpdir
+test_meta_rewrites_serialize_with_account_session_updates
 test_link_rejects_unsafe_and_missing
 test_followup_check_states
 test_followup_check_expired_prunes_link

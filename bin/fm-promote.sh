@@ -17,16 +17,25 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 META="$STATE/$ID.meta"
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+release_meta_lock() {
+  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+}
+trap release_meta_lock EXIT
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
 
-TMP="$META.tmp"
+TMP="$STATE/.$ID.meta.promote.$$"
 grep -v '^kind=' "$META" > "$TMP"
 echo "kind=ship" >> "$TMP"
 mv "$TMP" "$META"
+fm_account_meta_lock_release "$META_LOCK"
+trap - EXIT
 
 MESSAGE="<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write $DATA/$ID/completion.md with sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups; report done>"
 MESSAGE_Q=$(printf '%s' "$MESSAGE" | sed "s/'/'\\\\''/g")

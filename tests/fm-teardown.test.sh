@@ -824,6 +824,38 @@ test_pr_check_records_remote_head_when_local_lags() {
   pass "fm-pr-check records the remote PR head when the local worktree lags"
 }
 
+test_pr_check_serializes_with_account_session_updates() {
+  local case_dir state meta ready release holder pr_check url
+  case_dir=$(make_case pr-check-meta-lock)
+  state="$case_dir/state"
+  meta="$state/task-x1.meta"
+  ready="$case_dir/holder-ready"
+  release="$case_dir/holder-release"
+  url=https://github.com/example/repo/pull/7
+  write_meta "$case_dir" no-mistakes ship
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    touch "$3"
+    while [ ! -f "$4" ]; do sleep 0.05; done
+    printf "provider_session_id=session-new\n" >> "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  sleep 0.1
+  assert_no_grep '^pr=' "$meta" "PR recording bypassed the account metadata lock"
+  touch "$release"
+  wait "$holder" || fail "PR account session update lock holder failed"
+  wait "$pr_check" || fail "PR recording failed after the account metadata lock was released"
+  assert_grep 'provider_session_id=session-new' "$meta" "PR recording lost the concurrent provider session update"
+  assert_grep "pr=$url" "$meta" "PR recording did not publish after the account metadata lock was released"
+  pass "fm-pr-check serializes with account session updates"
+}
+
 test_content_in_default_fallback_allows() {
   local case_dir rc
   case_dir=$(make_case content-landed)
@@ -1776,6 +1808,7 @@ test_squash_merged_pr_allows_replayed_unpushed_patch
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
+test_pr_check_serializes_with_account_session_updates
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses

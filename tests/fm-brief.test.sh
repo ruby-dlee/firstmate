@@ -135,7 +135,7 @@ test_promoted_scout_receives_completion_contract() {
   local home data id out expected_report
   home="$TMP_ROOT/promote-report-home"
   data="$TMP_ROOT/promote report data"
-  id=promote-report-c3
+  id='promote-report-c3'
   mkdir -p "$home/state" "$data"
   printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$home/state/$id.meta"
   out=$(FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
@@ -147,6 +147,40 @@ test_promoted_scout_receives_completion_contract() {
   assert_contains "$out" "$expected_report" "promoted scout did not receive the authoritative completion-report path"
   assert_not_contains "$out" "write data/$id/completion.md" "promoted scout retained a worktree-relative report path"
   pass "fm-promote.sh: promoted scouts receive the ship completion-report contract"
+}
+
+test_promote_serializes_with_account_session_updates() {
+  local home data state id meta ready release holder promote
+  home="$TMP_ROOT/promote-meta-lock-home"
+  data="$TMP_ROOT/promote-meta-lock-data"
+  state="$home/state"
+  id='promote-meta-lock-c4'
+  meta="$state/$id.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" "$3") || exit 1
+    touch "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    printf "provider_session_id=session-new\n" >> "$2/$3.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$id" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-promote.sh" "$id" > "$home/promote.out" 2> "$home/promote.err" &
+  promote=$!
+  sleep 0.1
+  assert_grep 'kind=scout' "$meta" "scout promotion bypassed the account metadata lock"
+  touch "$release"
+  wait "$holder" || fail "promotion account session update lock holder failed"
+  wait "$promote" || fail "promotion failed after the account metadata lock was released"
+  assert_grep 'provider_session_id=session-new' "$meta" "promotion lost the concurrent provider session update"
+  assert_grep 'kind=ship' "$meta" "promotion did not publish after the account metadata lock was released"
+  pass "fm-promote.sh: serializes with account session updates"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {
@@ -317,6 +351,7 @@ test_ship_project_memory_wording
 test_ship_completion_report_contract
 test_scout_completion_report_contract
 test_promoted_scout_receives_completion_contract
+test_promote_serializes_with_account_session_updates
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout

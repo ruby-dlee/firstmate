@@ -13,11 +13,18 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 URL=$2
 
 META="$STATE/$ID.meta"
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+release_meta_lock() {
+  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+}
+trap release_meta_lock EXIT
 if [ -f "$META" ]; then
   WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   PR_HEAD=
@@ -35,6 +42,8 @@ if [ -f "$META" ]; then
     echo "pr_head=$PR_HEAD" >> "$META"
   fi
 fi
+fm_account_meta_lock_release "$META_LOCK"
+trap - EXIT
 
 cat > "$STATE/$ID.check.sh" <<EOF
 state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)

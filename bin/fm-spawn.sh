@@ -1555,20 +1555,28 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       ACCOUNT_LEASE_CREATED=1
     else
       account_recover_status=$?
-      [ "$account_recover_status" -ne 2 ] || ACCOUNT_LEASE_CREATED=1
+      if [ "$account_recover_status" -eq 2 ]; then
+        ACCOUNT_LEASE_CREATED=1
+        persist_failed_account_rollback || true
+      fi
       exit 1
     fi
+    persist_failed_account_rollback || exit 1
     fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
   else
     if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
       :
     else
       account_select_status=$?
-      [ "$account_select_status" -ne 2 ] || ACCOUNT_LEASE_CREATED=1
+      if [ "$account_select_status" -eq 2 ]; then
+        ACCOUNT_LEASE_CREATED=1
+        persist_failed_account_rollback || true
+      fi
       exit 1
     fi
     ACCOUNT_PROFILE=$FM_ACCOUNT_SELECTED_PROFILE
     ACCOUNT_LEASE_CREATED=1
+    persist_failed_account_rollback || exit 1
     fm_account_lineage_append "$DATA" "$ID" reserved "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" || exit 1
   fi
 fi
@@ -1650,7 +1658,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   while IFS= read -r meta_line || [ -n "$meta_line" ]; do
     meta_key=${meta_line%%=*}
     case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
     esac
     printf '%s\n' "$meta_line" >> "$META_TMP"
   done < "$RESUME_META"

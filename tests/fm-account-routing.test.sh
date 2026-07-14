@@ -732,6 +732,53 @@ test_reservation_occurs_after_worktree_preparation() {
   pass "account capacity is reserved only when the prepared endpoint can bind"
 }
 
+test_reserved_generation_is_durable_before_spawn_progresses() {
+  local id rec real_mv marker gate spawn_pid status meta task
+  id=account-durable-lease-z14b
+  rec=$(make_case durable-lease claude "$id")
+  read_case "$rec"
+  real_mv=$(command -v mv)
+  marker="$CASE_DIR/provisional-meta-persisted"
+  gate="$CASE_DIR/continue-after-provisional-meta"
+  cat > "$FAKEBIN_DIR/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  *.meta.rollback-pending.*)
+    "$FM_FAKE_REAL_MV" "$@" || exit $?
+    touch "$FM_FAKE_PROVISIONAL_META_MARKER"
+    while [ ! -f "$FM_FAKE_PROVISIONAL_META_GATE" ]; do sleep 0.05; done
+    exit 0
+    ;;
+esac
+exec "$FM_FAKE_REAL_MV" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/mv"
+
+  FM_FAKE_REAL_MV="$real_mv" FM_FAKE_PROVISIONAL_META_MARKER="$marker" \
+    FM_FAKE_PROVISIONAL_META_GATE="$gate" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
+    > "$CASE_DIR/spawn-stdout" 2> "$CASE_DIR/spawn-stderr" &
+  spawn_pid=$!
+  for _ in $(seq 1 100); do
+    [ -f "$marker" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -f "$marker" ] || { touch "$gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never persisted provisional managed metadata"; }
+  meta="$HOME_DIR/state/$id.meta"
+  task=$(logged_account_task)
+  assert_grep 'account_rollback_cleanup=pending' "$meta" "provisional metadata was not marked for rollback recovery"
+  assert_grep "account_task=$task" "$meta" "provisional metadata lost the reserved Agent Fleet task"
+  assert_grep 'account_profile=claude-2' "$meta" "provisional metadata lost the selected account profile"
+  assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
+  touch "$gate"
+  status=0
+  wait "$spawn_pid" || status=$?
+  expect_code 0 "$status" "spawn should continue after its provisional generation is durable"
+  assert_not_grep 'account_rollback_cleanup=pending' "$meta" "committed metadata retained the provisional rollback marker"
+  pass "managed account identity is durable immediately after reservation"
+}
+
 test_raw_enforced_launch_is_rejected_before_mutation() {
   local id rec out status
   id=account-raw-z15
@@ -769,7 +816,7 @@ test_malformed_routing_mode_fails_closed() {
 }
 
 test_invalid_selection_response_releases_reservation() {
-  local id rec out status task release_count
+  local id rec out status task release_count retained_id retained_rec retained_task
   id=account-invalid-select-z17
   rec=$(make_case invalid-select claude "$id")
   read_case "$rec"
@@ -787,6 +834,19 @@ test_invalid_selection_response_releases_reservation() {
   [ "$status" -ne 0 ] || fail "malformed lease response with a transient release failure unexpectedly succeeded"
   release_count=$(grep -c 'lease release .* --force' "$AF_LOG" || true)
   [ "$release_count" -eq 2 ] || fail "malformed lease rollback did not retry the owned reservation after release failure"
+
+  retained_id=account-invalid-select-retained-z17b
+  retained_rec=$(make_case invalid-select-retained claude "$retained_id")
+  read_case "$retained_rec"
+  out=$(FM_FAKE_AF_BAD_SELECTION=1 FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_spawn "$retained_id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "malformed lease response with persistent release failure unexpectedly succeeded"
+  retained_task=$(logged_account_task)
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$retained_id.meta" \
+    "unreleased invalid selection did not persist rollback metadata"
+  assert_grep "account_task=$retained_task" "$HOME_DIR/state/$retained_id.meta" \
+    "unreleased invalid selection lost its Agent Fleet task identity"
   pass "post-acquisition response validation always releases the reservation"
 }
 
@@ -963,6 +1023,7 @@ test_cross_profile_continuation_for_harness() {
   run_send "$id" "Preserve the verified next action for $harness." >/dev/null \
     || fail "$harness steering trail precondition failed"
   assert_grep "Preserve the verified next action for $harness." "$HOME_DIR/data/$id/steering.md" "$harness managed steering was not recorded"
+  printf '# Pending steering audit\n\n- Preserve pending delivery for %s.\n' "$harness" > "$HOME_DIR/data/$id/steering-pending.md"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$new_profile" FM_FAKE_AF_POOL=explicit run_spawn "$id" --continue-account --account-profile "$new_profile")
@@ -975,6 +1036,7 @@ test_cross_profile_continuation_for_harness() {
   assert_grep 'done: external side effect alpha; do not rerun' "$packet" "$harness continuation packet lost completed side-effect state"
   assert_grep 'Keep the existing branch' "$packet" "$harness continuation packet lost decisions"
   assert_grep "Preserve the verified next action for $harness." "$packet" "$harness continuation packet lost steering"
+  assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "--profile '$new_profile' --task '$new_task'" "$harness continuation did not use the new profile/generation"
   assert_contains "$launch" "cat '$packet'" "$harness continuation did not seed the fresh provider from task-owned state"
@@ -1262,7 +1324,9 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
   [ "$status" -eq 0 ] || fail "successful steering delivery was reclassified by audit failure: $out"
   assert_contains "$out" "text was sent" "audit failure warning did not preserve delivery truth"
   assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not delivered before audit failure"
-  pass "steering audit failures cannot turn a delivered message into a retry signal"
+  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-pending.md" \
+    "delivered steering was not durably recorded after the canonical trail failed"
+  pass "steering audit failures durably spool delivery without returning a retry signal"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -1443,6 +1507,7 @@ test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
 test_duplicate_spawn_preserves_original_endpoint_and_lease
 test_reservation_occurs_after_worktree_preparation
+test_reserved_generation_is_durable_before_spawn_progresses
 test_raw_enforced_launch_is_rejected_before_mutation
 test_malformed_routing_mode_fails_closed
 test_invalid_selection_response_releases_reservation

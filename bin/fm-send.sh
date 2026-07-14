@@ -262,9 +262,23 @@ else
       printf '\n'
     } >> "$steering_dir/steering.md" || return 1
   }
+  record_pending_managed_steering() {
+    steering_id=$(fm_send_id_from_meta "$TARGET_META")
+    steering_dir="$DATA/$steering_id"
+    mkdir -p "$steering_dir" || return 1
+    {
+      printf -- '- %s (delivered; steering trail append pending)\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '%s\n' "$*" | sed 's/^/> /'
+      printf '\n'
+    } >> "$steering_dir/steering-pending.md" || return 1
+  }
   if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
     if ! record_managed_steering "$@"; then
-      echo "warning: text was sent to $T but its managed steering trail could not be recorded" >&2
+      if record_pending_managed_steering "$@"; then
+        echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
+      else
+        echo "warning: text was sent to $T but its managed steering delivery could not be durably recorded" >&2
+      fi
     fi
   fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves

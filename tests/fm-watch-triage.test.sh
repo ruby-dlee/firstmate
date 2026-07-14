@@ -1096,6 +1096,42 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+test_account_session_sync_is_bounded_and_cadenced() {
+  local dir state fake_root sync_bin calls elapsed_file sync_cadence_file elapsed count
+  dir=$(make_case account-session-sync); state="$dir/state"
+  fake_root="$dir/root"
+  sync_bin="$fake_root/bin/fm-account-session-sync.sh"
+  calls="$dir/account-session-sync.calls"
+  elapsed_file="$dir/account-session-sync.elapsed"
+  sync_cadence_file="$state/.last-account-session-sync"
+  mkdir -p "$fake_root/bin"
+  cat > "$sync_bin" <<'SH'
+#!/usr/bin/env bash
+printf 'call\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
+sleep 10
+SH
+  chmod +x "$sync_bin"
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_ROOT_OVERRIDE="$fake_root"
+    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=60
+    export FM_ACCOUNT_SESSION_SYNC_TIMEOUT=1
+    export FM_FAKE_ACCOUNT_SYNC_CALLS="$calls"
+    # shellcheck source=bin/fm-watch.sh
+    . "$WATCH"
+    start=$(date +%s)
+    sync_account_sessions_if_due
+    sync_account_sessions_if_due
+    echo $(( $(date +%s) - start )) > "$elapsed_file"
+  ) || fail "bounded account session synchronization failed"
+  elapsed=$(cat "$elapsed_file")
+  count=$(wc -l < "$calls" | tr -d '[:space:]')
+  [ "$elapsed" -lt 5 ] || fail "account session synchronization stalled watcher progress for ${elapsed}s"
+  [ "$count" -eq 1 ] || fail "account session synchronization ignored its persistent cadence (calls=$count)"
+  assert_present "$sync_cadence_file" "account session synchronization did not persist its cadence"
+  pass "watcher bounds and separately cadences account session synchronization"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1129,3 +1165,4 @@ test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
+test_account_session_sync_is_bounded_and_cadenced

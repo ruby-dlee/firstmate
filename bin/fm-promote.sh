@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 META="$STATE/$ID.meta"
@@ -24,6 +25,7 @@ grep -v '^kind=' "$META" > "$TMP"
 echo "kind=ship" >> "$TMP"
 mv "$TMP" "$META"
 
-HOME_Q=$(printf '%q' "$FM_HOME")
+MESSAGE="<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write $DATA/$ID/completion.md with sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups; report done>"
+MESSAGE_Q=$(printf '%s' "$MESSAGE" | sed "s/'/'\\\\''/g")
 echo "promoted $ID to ship (teardown protection restored)"
-echo "next: FM_HOME=$HOME_Q bin/fm-send.sh fm-$ID '<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write data/$ID/completion.md with sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups; report done>'"
+printf "next: FM_HOME=%q bin/fm-send.sh fm-%s '%s'\n" "$FM_HOME" "$ID" "$MESSAGE_Q"

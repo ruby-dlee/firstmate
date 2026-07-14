@@ -13,7 +13,7 @@
 # instructions and stamps NO_MISTAKES_GATE into the gate agent's environment).
 # THIS is the firstmate capability-removal half: an enforceable script refusal,
 # not a prose rule the neutralized agent would never read. It is sourced at the
-# top of the three fleet-lifecycle entrypoints and called before any fleet
+# top of the fleet-lifecycle and merge entrypoints and called before any fleet
 # mutation, so a gate agent that still reaches for the fleet is stopped cold.
 #
 # Two independent signals, either of which refuses (fail closed):
@@ -53,7 +53,8 @@
 # neutral-execution-context and the HEAD-continuity guard. The dedicated
 # tests/fm-gate-refuse.test.sh strips the bypass so it still verifies real refusal.
 #
-# Sourced by bin/fm-spawn.sh, bin/fm-send.sh, bin/fm-teardown.sh, and the tests.
+# Sourced by bin/fm-spawn.sh, bin/fm-send.sh, bin/fm-teardown.sh,
+# bin/fm-pr-merge.sh, bin/fm-merge-local.sh, and the tests.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a
 # gate context.

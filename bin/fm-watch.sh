@@ -99,6 +99,8 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+ACCOUNT_SESSION_SYNC_INTERVAL=${FM_ACCOUNT_SESSION_SYNC_INTERVAL:-60}
+ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -406,16 +408,29 @@ scan_signals() {
   return 0
 }
 
-run_check() {
-  local c=$1
+run_bounded() {  # <seconds> <command> [args...]
+  local seconds=$1
+  shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    timeout "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    gtimeout "$seconds" "$@"
   else
     # shellcheck disable=SC2016  # single quotes are deliberate: Perl expands its own variables.
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
   fi
+}
+
+run_check() {
+  local c=$1
+  run_bounded "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+}
+
+sync_account_sessions_if_due() {
+  local cadence="$STATE/.last-account-session-sync"
+  [ "$(age_of "$cadence")" -ge "$ACCOUNT_SESSION_SYNC_INTERVAL" ] || return 0
+  touch "$cadence"
+  run_bounded "$ACCOUNT_SESSION_SYNC_TIMEOUT" "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the
@@ -630,7 +645,7 @@ while :; do
   # Reconcile only metas still missing provider_session_id; failures stay
   # silent and retry here, while recovery itself requires the mapping and
   # fails closed.
-  "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
+  sync_account_sessions_if_due
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.

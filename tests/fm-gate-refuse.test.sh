@@ -34,6 +34,8 @@ GATE_LIB="$ROOT/bin/fm-gate-refuse-lib.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
+MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -358,6 +360,100 @@ test_teardown_refuses_and_admits() {
   pass "fm-teardown: refuses on marker and gate-worktree backstop; a normal teardown is unaffected"
 }
 
+# --- merge entrypoints ------------------------------------------------------
+
+run_pr_merge_guarded() {
+  local cwd=$1 home=$2 fakebin=$3 log=$4
+  shift 4
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
+      "FM_TEST_GH_AXI_LOG=$log" "PATH=$fakebin:$PATH" "$@" \
+      "$PR_MERGE" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+}
+
+make_local_merge_case() {
+  local name=$1 case_dir project before
+  case_dir="$TMP/$name"
+  project="$case_dir/project"
+  mkdir -p "$case_dir/state"
+  git init -q -b main "$project"
+  git -C "$project" commit -q --allow-empty -m baseline
+  before=$(git -C "$project" rev-parse HEAD)
+  git -C "$project" branch fm/task-x1
+  git -C "$project" switch -q fm/task-x1
+  printf 'land me\n' > "$project/change.txt"
+  git -C "$project" add change.txt
+  git -C "$project" commit -q -m change
+  git -C "$project" switch -q main
+  fm_write_meta "$case_dir/state/task-x1.meta" "project=$project" "mode=local-only"
+  printf '%s|%s\n' "$case_dir" "$before"
+}
+
+run_local_merge_guarded() {
+  local cwd=$1 case_dir=$2
+  shift 2
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" "$@" \
+      "$MERGE_LOCAL" task-x1 ) 2>&1
+}
+
+test_merge_entrypoints_refuse_gate_contexts() {
+  local home fakebin log before_meta out rc local_case case_dir before after
+  home="$TMP/merge-guard-home"
+  fakebin=$(fm_fakebin "$TMP/merge-guard-fake")
+  log="$TMP/merge-guard-gh.log"
+  mkdir -p "$home/state"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship" "mode=no-mistakes"
+  before_meta=$(cat "$home/state/task-x1.meta")
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+SH
+  chmod +x "$fakebin/gh-axi"
+
+  out=$(run_pr_merge_guarded "$NORMAL_CWD" "$home" "$fakebin" "$log" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "pr merge: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "pr merge: env-marker refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before_meta" ] || fail "refused PR merge mutated task metadata"
+  [ ! -s "$log" ] || fail "refused PR merge invoked gh-axi"
+
+  out=$(run_pr_merge_guarded "$GATE_WT" "$home" "$fakebin" "$log"); rc=$?
+  expect_code 3 "$rc" "pr merge: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "pr merge: path-backstop refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before_meta" ] || fail "path-refused PR merge mutated task metadata"
+  [ ! -s "$log" ] || fail "path-refused PR merge invoked gh-axi"
+
+  local_case=$(make_local_merge_case merge-local-envmark)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$NORMAL_CWD" "$case_dir" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "local merge: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "local merge: env-marker refusal message"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" = "$before" ] || fail "refused local merge advanced main"
+
+  local_case=$(make_local_merge_case merge-local-backstop)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$GATE_WT" "$case_dir"); rc=$?
+  expect_code 3 "$rc" "local merge: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "local merge: path-backstop refusal message"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" = "$before" ] || fail "path-refused local merge advanced main"
+
+  local_case=$(make_local_merge_case merge-local-ok)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$NORMAL_CWD" "$case_dir"); rc=$?
+  expect_code 0 "$rc" "local merge: normal session should still merge"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" != "$before" ] || fail "normal local merge did not advance main"
+  pass "merge entrypoints refuse both gate signals before metadata or Git mutation"
+}
+
 # --- tracked .no-mistakes.yaml ----------------------------------------------
 
 test_no_mistakes_yaml_disables_project_settings() {
@@ -395,4 +491,5 @@ test_helper_normal_is_noop
 test_spawn_refuses_and_admits
 test_send_refuses_and_admits
 test_teardown_refuses_and_admits
+test_merge_entrypoints_refuse_gate_contexts
 test_no_mistakes_yaml_disables_project_settings

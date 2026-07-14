@@ -119,16 +119,20 @@ test_ship_completion_report_contract() {
 }
 
 test_promoted_scout_receives_completion_contract() {
-  local home id out
+  local home data id out expected_report
   home="$TMP_ROOT/promote-report-home"
+  data="$TMP_ROOT/promote report data"
   id=promote-report-c3
-  mkdir -p "$home/state"
+  mkdir -p "$home/state" "$data"
   printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$home/state/$id.meta"
-  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
+  out=$(FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
     || fail "scout promotion failed"
   assert_grep 'kind=ship' "$home/state/$id.meta" "scout promotion did not update task kind"
   assert_contains "$out" "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" \
     "promoted scout did not receive the ship completion-report schema"
+  expected_report="$data/$id/completion.md"
+  assert_contains "$out" "$expected_report" "promoted scout did not receive the authoritative completion-report path"
+  assert_not_contains "$out" "write data/$id/completion.md" "promoted scout retained a worktree-relative report path"
   pass "fm-promote.sh: promoted scouts receive the ship completion-report contract"
 }
 

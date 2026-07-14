@@ -146,8 +146,15 @@ fm_account_process_start_time() {  # <pid>
   printf '%s\n' "$out"
 }
 
-fm_account_meta_lock_owner_alive() {  # <lock-dir>
-  local owner=$1/owner pid recorded current
+fm_account_meta_lock_owner_alive() {  # <lock-path>
+  local lock=$1 owner pid recorded current
+  if [ -f "$lock" ] && [ ! -L "$lock" ]; then
+    owner=$lock
+  elif [ -d "$lock" ] && [ ! -L "$lock" ]; then
+    owner=$lock/owner
+  else
+    return 1
+  fi
   [ -f "$owner" ] || return 1
   pid=$(sed -n '1p' "$owner" 2>/dev/null)
   recorded=$(sed -n '2p' "$owner" 2>/dev/null)
@@ -166,9 +173,27 @@ fm_account_path_inode() {
   stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null
 }
 
-fm_account_meta_lock_reclaim() {  # <lock-dir> <ownerless-grace-seconds>
+fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after
   local ownerless_since baseline required_grace
+  [ ! -L "$lock" ] || return 1
+  if [ -f "$lock" ]; then
+    guard="$lock.reclaiming"
+    mkdir "$guard" 2>/dev/null || return 1
+    inode_before=$(fm_account_path_inode "$lock") || { rmdir "$guard" 2>/dev/null || true; return 1; }
+    if fm_account_meta_lock_owner_alive "$lock"; then
+      rmdir "$guard" 2>/dev/null || true
+      return 1
+    fi
+    inode_after=$(fm_account_path_inode "$lock") || { rmdir "$guard" 2>/dev/null || true; return 1; }
+    if [ "$inode_before" != "$inode_after" ]; then
+      rmdir "$guard" 2>/dev/null || true
+      return 1
+    fi
+    rm -f "$lock" || { rmdir "$guard" 2>/dev/null || true; return 1; }
+    rmdir "$guard" 2>/dev/null || true
+    return 0
+  fi
   [ -d "$lock" ] || return 1
   inode_before=$(fm_account_path_inode "$lock") || return 1
   mtime=$(fm_account_path_mtime "$lock") || return 1
@@ -218,7 +243,7 @@ fm_account_meta_lock_reclaim() {  # <lock-dir> <ownerless-grace-seconds>
 }
 
 fm_account_meta_lock_acquire() {  # <state-dir> <task>
-  local state=$1 task=$2 lock deadline now start owner_tmp
+  local state=$1 task=$2 lock deadline now start owner_tmp owner_inode lock_inode
   local wait_seconds=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
   local ownerless_grace=${FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS:-2}
   fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account metadata lock" >&2; return 1; }
@@ -230,36 +255,58 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
   }
   mkdir -p "$state" || return 1
   lock="$state/.account-meta-$task.lock"
+  owner_tmp="$state/.account-meta-$task.owner.$$.$RANDOM"
+  printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
+    rm -f "$owner_tmp"
+    return 1
+  }
+  owner_inode=$(fm_account_path_inode "$owner_tmp") || { rm -f "$owner_tmp"; return 1; }
   deadline=$(( $(date +%s) + wait_seconds ))
-  while ! mkdir "$lock" 2>/dev/null; do
+  while :; do
+    if ln -n "$owner_tmp" "$lock" 2>/dev/null; then
+      lock_inode=$(fm_account_path_inode "$lock" 2>/dev/null || true)
+      if [ -f "$lock" ] && [ ! -L "$lock" ] && [ "$lock_inode" = "$owner_inode" ]; then
+        break
+      fi
+      if [ -d "$lock" ] && [ ! -L "$lock" ]; then
+        rm -f "$lock/${owner_tmp##*/}" 2>/dev/null || true
+      fi
+    fi
     if fm_account_meta_lock_reclaim "$lock" "$ownerless_grace"; then
       continue
     fi
     now=$(date +%s)
     [ "$now" -lt "$deadline" ] || {
       echo "error: timed out waiting for account metadata lock for $task" >&2
+      rm -f "$owner_tmp"
       return 1
     }
     sleep 0.05
   done
-  owner_tmp="$lock/.owner.$$"
-  printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
-    rm -rf "$lock"
-    return 1
-  }
-  mv "$owner_tmp" "$lock/owner" || { rm -rf "$lock"; return 1; }
-  rm -f "$lock/.ownerless-since"
+  rm -f "$owner_tmp"
   printf '%s\n' "$lock"
 }
 
-fm_account_meta_lock_release() {  # <lock-dir>
-  local lock=$1 pid released
-  [ -d "$lock" ] || return 0
-  pid=$(sed -n '1p' "$lock/owner" 2>/dev/null)
+fm_account_meta_lock_release() {  # <lock-path>
+  local lock=$1 owner pid released
+  [ -e "$lock" ] || return 0
+  if [ -f "$lock" ] && [ ! -L "$lock" ]; then
+    owner=$lock
+  elif [ -d "$lock" ] && [ ! -L "$lock" ]; then
+    owner=$lock/owner
+  else
+    echo "error: refusing to release unsafe account metadata lock $lock" >&2
+    return 1
+  fi
+  pid=$(sed -n '1p' "$owner" 2>/dev/null)
   [ "$pid" = "$$" ] || {
     echo "error: refusing to release account metadata lock owned by ${pid:-unknown}" >&2
     return 1
   }
+  if [ -f "$lock" ]; then
+    rm -f "$lock"
+    return
+  fi
   released="$lock.release.$$.$RANDOM"
   mv "$lock" "$released" || return 1
   rm -rf "$released"

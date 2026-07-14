@@ -40,6 +40,9 @@ case "$*" in
       present) exit 0 ;;
       absent|unknown) exit 1 ;;
     esac
+    if [ "${FM_FAKE_TMUX_RENAMED:-0}" = 1 ]; then
+      case "$*" in *'%77'*) [ -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}" ]; exit $? ;; *) exit 1 ;; esac
+    fi
     [ -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}" ]; exit $?
     ;;
 esac
@@ -923,11 +926,13 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 }
 
 test_cross_profile_continuation_for_harness() {
-  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task packet out status launch
+  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task packet out status launch source_model
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
-  out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew")
+  source_model="$harness-source-model"
+  out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
   status=$?
   [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -951,6 +956,8 @@ test_cross_profile_continuation_for_harness() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "--profile '$new_profile' --task '$new_task'" "$harness continuation did not use the new profile/generation"
   assert_contains "$launch" "cat '$packet'" "$harness continuation did not seed the fresh provider from task-owned state"
+  assert_contains "$launch" "--model '$source_model'" "$harness same-provider continuation lost its inherited model"
+  assert_regex '^effort=high$' "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "$harness continuation did not release its predecessor after binding"
   assert_grep "session remove --task $old_task" "$AF_LOG" "$harness continuation did not remove its predecessor mapping"
   assert_grep "agent_fleet_task=$new_task" "$HOME_DIR/data/$id/account-attempts.md" "$harness continuation lineage lost the new attempt"
@@ -958,12 +965,13 @@ test_cross_profile_continuation_for_harness() {
 }
 
 test_cross_provider_continuation_uses_target_default_pool() {
-  local source=$1 target=$2 id rec old_task out status
+  local source=$1 target=$2 id rec old_task out status source_model launch
   id="account-continue-$source-to-$target-z21a"
   rec=$(make_case "continue-$source-to-$target" "$source" "$id")
   read_case "$rec"
+  source_model="$source-source-model"
   out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew")
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort high)
   status=$?
   [ "$status" -eq 0 ] || fail "$source initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -978,6 +986,10 @@ test_cross_provider_continuation_uses_target_default_pool() {
     "$source-to-$target continuation did not select the target provider's default pool"
   assert_not_grep "lease choose --pool $source-crew" "$AF_LOG" \
     "$source-to-$target continuation inherited the predecessor provider's pool"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "$source_model" "$source-to-$target continuation inherited the source provider's model"
+  assert_regex '^model=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target model default"
+  assert_regex '^effort=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target effort default"
   assert_grep "predecessor=$old_task" "$HOME_DIR/data/$id/account-attempts.md" \
     "$source-to-$target continuation lost predecessor lineage"
   pass "$source-to-$target continuation resolves the target provider pool"
@@ -1190,8 +1202,106 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
   pass "steering audit failures cannot turn a delivered message into a retry signal"
 }
 
+test_managed_tmux_identity_survives_window_rename() {
+  local id rec out status
+  id=account-tmux-identity-z25
+  rec=$(make_case tmux-identity claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "stable tmux identity precondition spawn failed"
+  assert_regex '^window=firstmate:fm-account-tmux-identity-z25$' "$HOME_DIR/state/$id.meta" "managed tmux metadata lost its user-facing window label"
+  assert_regex '^tmux_window_id=%77$' "$HOME_DIR/state/$id.meta" "managed tmux metadata did not persist the stable window id"
+  clear_case_logs
+
+  set +e
+  out=$(FM_FAKE_TMUX_RENAMED=1 FM_FAKE_TMUX_KILL_FAIL=1 run_teardown "$id" --force 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "renamed live tmux endpoint allowed managed teardown"
+  assert_not_grep 'lease release' "$AF_LOG" "renamed live tmux endpoint released its Agent Fleet lease"
+  assert_present "$HOME_DIR/state/$id.meta" "renamed live tmux endpoint lost its recovery metadata"
+  [ -n "$out" ] || true
+  pass "managed tmux lifecycle uses rename-stable endpoint identity"
+}
+
+test_native_resume_rejects_regressed_sessionstart_evidence() {
+  local id rec out status account_task
+  id=account-resume-regressed-z26
+  rec=$(make_case resume-regressed claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "regressed resume precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  set +e
+  out=$(FM_FAKE_AF_UPDATED_AT_BEFORE=2026-07-13T00:00:01Z FM_FAKE_AF_UPDATED_AT_AFTER=2026-07-13T00:00:00Z \
+    run_spawn "$id" --resume-account)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "native resume accepted a regressed SessionStart timestamp"
+  assert_contains "$out" "no fresh Agent Fleet SessionStart update" "regressed SessionStart evidence did not fail as stale"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "regressed SessionStart failure leaked its recovered reservation"
+  pass "native resume requires monotonically newer SessionStart evidence"
+}
+
+test_session_sync_metadata_publish_failure_is_closed() {
+  local id rec meta_tmp before_lineage after_lineage failbin out status
+  id=account-sync-publish-z27
+  rec=$(make_case sync-publish claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session publish precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  before_lineage=$(grep -c 'event=session-bound' "$HOME_DIR/data/$id/account-attempts.md")
+  failbin="$CASE_DIR/failbin"
+  mkdir -p "$failbin"
+  cat > "$failbin/mv" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *'.meta.sync.'*) exit 71 ;; esac
+exec /bin/mv "$@"
+SH
+  chmod +x "$failbin/mv"
+
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
+    FM_FAKE_AF_POOL=claude-crew FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_PROVIDER=claude \
+    PATH="$failbin:$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "session sync reported success after metadata replacement failed"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "failed session publication changed durable metadata"
+  after_lineage=$(grep -c 'event=session-bound' "$HOME_DIR/data/$id/account-attempts.md")
+  [ "$after_lineage" -eq "$before_lineage" ] || fail "failed session publication appended lineage before durable metadata"
+  [ -n "$out" ] || true
+  pass "session synchronization fails closed on metadata publication"
+}
+
+test_oversized_continuation_stops_before_mutation() {
+  local id rec out status
+  id=account-continuation-size-z28
+  rec=$(make_case continuation-size claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation size precondition spawn failed"
+  dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$HOME_DIR/state/$id.status"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  set +e
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "oversized continuation packet was accepted"
+  assert_contains "$out" 'maximum is 65536' "oversized continuation rejection did not report its bound"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "oversized continuation created a replacement endpoint"
+  assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "oversized continuation acquired an Agent Fleet lease"
+  pass "continuation packet size is bounded before external mutation"
+}
+
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
-  local case_dir state lock workers pids pid rc
+  local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
   state="$case_dir/state"
   lock="$state/.account-meta-lock-task.lock"
@@ -1210,6 +1320,15 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
     bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \
     _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "old ownerless metadata lock was not reclaimed"
+
+  owner_lines=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '
+    . "$1"
+    held=$(fm_account_meta_lock_acquire "$2" lock-task)
+    [ -f "$held" ] || exit 71
+    wc -l < "$held" | tr -d "[:space:]"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state") || fail "metadata lock ownership was not atomically published"
+  [ "$owner_lines" -eq 2 ] || fail "published metadata lock did not contain complete ownership"
 
   mkdir -p "$lock"
   printf '999999\nstale-owner\n' > "$lock/owner"
@@ -1283,6 +1402,10 @@ test_concurrent_continuations_serialize_before_mutation
 test_continuation_fails_closed_without_original_brief
 test_session_sync_cannot_recreate_metadata_after_teardown
 test_managed_steering_audit_failure_does_not_reclassify_delivery
+test_managed_tmux_identity_survives_window_rename
+test_native_resume_rejects_regressed_sessionstart_evidence
+test_session_sync_metadata_publish_failure_is_closed
+test_oversized_continuation_stops_before_mutation
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 
 echo "# all fm-account-routing tests passed"

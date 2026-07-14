@@ -52,6 +52,34 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$WAIT" in ''|*[!0-9]*) echo "error: --wait must be a non-negative integer" >&2; exit 2 ;; esac
+session_timestamp_advances() {  # <candidate> <baseline>
+  LC_ALL=C awk -v candidate="$1" -v baseline="$2" '
+    function valid(value) {
+      return value ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]([.][0-9]+)?Z$/
+    }
+    function whole(value) {
+      sub(/[.][0-9]+Z$/, "Z", value)
+      return value
+    }
+    function fraction(value, result) {
+      if (value !~ /[.][0-9]+Z$/) return "0"
+      result = value
+      sub(/^.*[.]/, "", result)
+      sub(/Z$/, "", result)
+      return result
+    }
+    BEGIN {
+      if (!valid(candidate) || !valid(baseline)) exit 2
+      if (whole(candidate) > whole(baseline)) exit 0
+      if (whole(candidate) < whole(baseline)) exit 1
+      candidate_fraction = fraction(candidate)
+      baseline_fraction = fraction(baseline)
+      while (length(candidate_fraction) < length(baseline_fraction)) candidate_fraction = candidate_fraction "0"
+      while (length(baseline_fraction) < length(candidate_fraction)) baseline_fraction = baseline_fraction "0"
+      exit !("x" candidate_fraction > "x" baseline_fraction)
+    }
+  '
+}
 if [ "$ALL" = 1 ]; then
   [ -z "$ID" ] || { echo "error: --all does not accept a task id" >&2; exit 2; }
   rc=0
@@ -99,8 +127,14 @@ while :; do
     [ "$mapped_provider" = "$HARNESS" ] || { echo "error: Agent Fleet session provider mismatch for $ID" >&2; exit 1; }
     case "$session_id" in ''|*$'\n'*|*=*) echo "error: unsafe provider session id for $ID" >&2; exit 1 ;; esac
     case "$updated_at" in ''|*$'\n'*|*=*) echo "error: unsafe provider session update timestamp for $ID" >&2; exit 1 ;; esac
-    if [ -z "$AFTER_UPDATED_AT" ] || [ "$updated_at" != "$AFTER_UPDATED_AT" ]; then
+    if [ -z "$AFTER_UPDATED_AT" ]; then
       break
+    fi
+    if session_timestamp_advances "$updated_at" "$AFTER_UPDATED_AT"; then
+      break
+    else
+      timestamp_status=$?
+      [ "$timestamp_status" -ne 2 ] || { echo "error: invalid Agent Fleet session update timestamp for $ID" >&2; exit 1; }
     fi
   fi
   [ "$(date +%s)" -lt "$deadline" ] || {
@@ -122,8 +156,8 @@ fi
 if [ -z "$EXISTING" ]; then
   META_TMP="$STATE/.$ID.meta.sync.$$"
   awk '!/^provider_session_id=/' "$META" > "$META_TMP" || { rm -f "$META_TMP"; exit 1; }
-  printf 'provider_session_id=%s\n' "$session_id" >> "$META_TMP"
-  mv "$META_TMP" "$META"
+  printf 'provider_session_id=%s\n' "$session_id" >> "$META_TMP" || { rm -f "$META_TMP"; exit 1; }
+  mv "$META_TMP" "$META" || { rm -f "$META_TMP"; exit 1; }
   fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)" || exit 1
 fi
 if [ "$PRINT_UPDATED_AT" = 1 ]; then

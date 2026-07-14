@@ -19,6 +19,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PACKET_TMP=
+MAX_PACKET_BYTES=65536
 cleanup_packet_tmp() {
   [ -z "$PACKET_TMP" ] || rm -f "$PACKET_TMP"
 }
@@ -147,6 +148,12 @@ append_file_section "Recalled context" "$TASK_DIR/recalled.md"
 append_file_section "Provider transcript summary" "$TASK_DIR/transcript-summary.md"
 append_file_section "Account attempt lineage" "$TASK_DIR/account-attempts.md"
 
-mv "$PACKET_TMP" "$PACKET"
+PACKET_BYTES=$(wc -c < "$PACKET_TMP" | tr -d '[:space:]')
+case "$PACKET_BYTES" in ''|*[!0-9]*) echo "error: cannot measure continuation packet for $ID" >&2; exit 1 ;; esac
+if [ "$PACKET_BYTES" -gt "$MAX_PACKET_BYTES" ]; then
+  echo "error: continuation packet for $ID is $PACKET_BYTES bytes; maximum is $MAX_PACKET_BYTES" >&2
+  exit 1
+fi
+mv "$PACKET_TMP" "$PACKET" || exit 1
 PACKET_TMP=
 printf '%s\n' "$PACKET"

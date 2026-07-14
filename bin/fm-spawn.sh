@@ -430,6 +430,7 @@ persist_failed_account_rollback() {
       [ -z "${ACCOUNT_PREDECESSOR_POOL:-}" ] || echo "account_predecessor_pool=$ACCOUNT_PREDECESSOR_POOL"
       [ -z "${ACCOUNT_PREDECESSOR_SESSION:-}" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
       [ "${BACKEND:-tmux}" != herdr ] || {
         echo "herdr_session=${HERDR_SES:-}"
         echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
@@ -720,8 +721,10 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   fi
   HARNESS_SET=1
   ARG3=$HARNESS_ARG
-  [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
-  [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
+  if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+    [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
+    [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
+  fi
   [ "$MODEL" = default ] && MODEL=
   [ "$EFFORT" = default ] && EFFORT=
   if [ "$KIND" = secondmate ]; then
@@ -1608,6 +1611,9 @@ META_TMP="$STATE/.$ID.meta.$$"
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = tmux ]; then
+    echo "tmux_window_id=$WID"
+  fi
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
@@ -1638,7 +1644,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   while IFS= read -r meta_line || [ -n "$meta_line" ]; do
     meta_key=${meta_line%%=*}
     case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
     esac
     printf '%s\n' "$meta_line" >> "$META_TMP"
   done < "$RESUME_META"

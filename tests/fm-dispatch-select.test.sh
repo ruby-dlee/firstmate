@@ -239,8 +239,36 @@ SH
   expect_code 2 "$status" "enforced poolless quota-balanced dispatch must be rejected"
   [ -z "$out" ] || fail "rejected enforced selection emitted a profile: $out"
   [ ! -e "$quota_marker" ] || fail "enforced poolless selection consulted ambient quota-axi"
-  assert_contains "$(cat "$TMP_ROOT/enforced-pool-only/error.log")" 'requires account_pool on every candidate' \
+  assert_contains "$(cat "$TMP_ROOT/enforced-pool-only/error.log")" 'requires a non-empty valid account_pool on every candidate' \
     "enforced pool-only error was unclear"
+
+  profiles='[{"harness":"claude","account_pool":""},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_ACCOUNT_ROUTING=enforce "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$profiles" \
+    2>"$TMP_ROOT/enforced-pool-only/empty-error.log")
+  status=$?
+  expect_code 2 "$status" "enforced empty account pool must be rejected"
+  [ -z "$out" ] || fail "rejected empty pool selection emitted a profile: $out"
+
+  profiles='[{"harness":"claude","account_pool":"-invalid"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_ACCOUNT_ROUTING=enforce "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$profiles" \
+    2>"$TMP_ROOT/enforced-pool-only/invalid-error.log")
+  status=$?
+  expect_code 2 "$status" "enforced invalid account pool must be rejected"
+  [ -z "$out" ] || fail "rejected invalid pool selection emitted a profile: $out"
+
+  profiles='[{"harness":"claude","account_pool":"good\npool"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_ACCOUNT_ROUTING=enforce "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$profiles" \
+    2>"$TMP_ROOT/enforced-pool-only/newline-error.log")
+  status=$?
+  expect_code 2 "$status" "enforced account pool with an embedded newline must be rejected"
+  [ -z "$out" ] || fail "rejected embedded-newline pool selection emitted a profile: $out"
+
+  profiles='[{"harness":"claude","account_pool":"good-pool\n"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_ACCOUNT_ROUTING=enforce "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$profiles" \
+    2>"$TMP_ROOT/enforced-pool-only/trailing-newline-error.log")
+  status=$?
+  expect_code 2 "$status" "enforced account pool with a trailing newline must be rejected"
+  [ -z "$out" ] || fail "rejected trailing-newline pool selection emitted a profile: $out"
   pass "enforced quota-balanced dispatch accepts only explicit pools"
 }
 

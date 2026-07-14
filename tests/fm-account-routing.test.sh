@@ -162,14 +162,22 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$*" in
+  '--format json contract')
+    [ -z "${FM_FAKE_AF_CONTRACT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_CONTRACT_SLEEP"
+    printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-1}"
+    ;;
   *" choose "*|*" lease choose "*|*" lease acquire "*|*" lease recover "*)
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     case "$*" in
       *" lease recover "*)
+        [ -z "${FM_FAKE_AF_RECOVER_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RECOVER_SLEEP"
         [ -z "${FM_FAKE_AF_RECOVER_TASK:-}" ] || task=$FM_FAKE_AF_RECOVER_TASK
         [ "${FM_FAKE_AF_STALE_REFRESH_ON_RECOVER:-0}" != 1 ] || touch "${FM_FAKE_AF_SESSION_REFRESHED:?}"
+        ;;
+      *" lease choose "*|*" lease acquire "*)
+        [ -z "${FM_FAKE_AF_SELECT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SELECT_SLEEP"
         ;;
     esac
     printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$provider"
@@ -190,6 +198,7 @@ case "$*" in
     printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$task" "$updated_at"
     ;;
   *" lease release "*)
+    [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
     [ -z "${FM_FAKE_AF_RELEASE_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_MARKER"
     [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 43
     if [ -n "${FM_FAKE_AF_RELEASE_FAIL_ONCE:-}" ] && [ ! -f "$FM_FAKE_AF_RELEASE_FAIL_ONCE" ]; then
@@ -199,6 +208,7 @@ case "$*" in
     printf '{"ok":true}\n'
     ;;
   *" session remove "*)
+    [ -z "${FM_FAKE_AF_SESSION_REMOVE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SESSION_REMOVE_SLEEP"
     [ "${FM_FAKE_AF_SESSION_REMOVE_FAIL:-0}" != 1 ] || exit 44
     if [ -n "${FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE:-}" ] && [ ! -f "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE" ]; then
       touch "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE"
@@ -322,6 +332,9 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   [ "$launch" = "$expected" ] || fail "routing off changed the launch bytes"
   assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "routing off wrote account metadata"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "routing off wrote session metadata"
+  assert_grep 'report_required=1' "$HOME_DIR/state/$id.meta" "post-cutover spawn did not activate the report gate"
+  assert_grep '# Completion report' "$HOME_DIR/data/$id/brief.md" "post-cutover spawn did not upgrade a legacy unspawned brief"
+  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$HOME_DIR/data/$id/brief.md" "upgraded brief omitted the completion-report sections"
   assert_contains "$out" "spawned $id" "default-off spawn did not complete"
   pass "routing off makes no Agent Fleet call and preserves launch/meta bytes"
 }
@@ -814,11 +827,14 @@ test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt() {
 }
 
 test_duplicate_spawn_preserves_original_endpoint_and_lease() {
-  local id rec out status
+  local id rec out status artifact
   id=account-duplicate-z13
   rec=$(make_case duplicate claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "initial duplicate test spawn failed"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    printf 'existing-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
+  done
   clear_case_logs
   out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
@@ -826,6 +842,10 @@ test_duplicate_spawn_preserves_original_endpoint_and_lease() {
   [ ! -s "$AF_LOG" ] || fail "duplicate managed spawn touched the original lease: $(cat "$AF_LOG")"
   assert_not_grep '^kill-window ' "$TMUX_LOG" "duplicate managed spawn killed the original endpoint"
   assert_present "$CASE_DIR/endpoint-live" "duplicate managed spawn removed the original endpoint marker"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "existing-$artifact" ] \
+      || fail "duplicate managed spawn removed the existing $artifact sidecar"
+  done
   assert_contains "$out" "managed metadata already exists" "duplicate managed spawn did not fail at ownership guard"
   pass "duplicate spawn cannot release or kill an existing managed task"
 }
@@ -1625,6 +1645,76 @@ SH
   pass "metadata locks reclaim abandoned directories without deleting new owners"
 }
 
+test_agent_fleet_contract_is_validated_before_routing() {
+  local id rec out status
+  id=account-contract-z26
+  rec=$(make_case contract claude "$id")
+  read_case "$rec"
+  if out=$(FM_FAKE_AF_CONTRACT_VERSION=2 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "incompatible Agent Fleet contract unexpectedly enforced routing"
+  assert_not_grep 'lease (choose|acquire)' "$AF_LOG" "incompatible Agent Fleet contract mutated a lease"
+  assert_contains "$out" "unsupported Agent Fleet contract version 2" "contract mismatch was not actionable"
+
+  clear_case_logs
+  if out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_CONTRACT_VERSION=2 run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "observe mode should degrade on an incompatible Agent Fleet contract"
+  assert_not_grep ' choose ' "$AF_LOG" "incompatible observe contract still queried selection"
+  assert_contains "$out" "observe contract unavailable" "observe contract fallback was not surfaced"
+  pass "Agent Fleet contract v1 is required before observation or enforcement"
+}
+
+test_agent_fleet_lifecycle_calls_are_bounded() {
+  local id rec out status started elapsed
+  id=account-control-timeout-z27
+  rec=$(make_case control-timeout claude "$id")
+  read_case "$rec"
+  started=$(date +%s)
+  if out=$(FM_FAKE_AF_SELECT_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -eq 0 ] || fail "timed-out lease choice was not reconciled through recovery: $out"
+  [ "$elapsed" -lt 5 ] || fail "lease choice timeout was not bounded (elapsed ${elapsed}s)"
+  assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
+
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  started=$(date +%s)
+  if out=$(FM_FAKE_AF_RELEASE_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -ne 0 ] || fail "ambiguous timed-out lease release unexpectedly completed teardown"
+  [ "$elapsed" -lt 5 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
+  assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease release discarded retry metadata"
+  pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
+}
+
+test_teardown_stops_after_rollback_restores_predecessor() {
+  local id rec old_task failed_task out status
+  id=account-teardown-restore-z28
+  rec=$(make_case teardown-restore claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "rollback restore precondition spawn failed"
+  old_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  if out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_spawn "$id" --continue-account --account-profile claude-3); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "failed continuation precondition unexpectedly succeeded"
+  failed_task=$(meta_account_task "$id")
+  [ "$failed_task" != "$old_task" ] || fail "failed continuation did not install its rollback generation"
+
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  if out=$(run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "teardown continued after restoring predecessor metadata"
+  [ "$(meta_account_task "$id")" = "$old_task" ] || fail "teardown did not preserve restored predecessor metadata"
+  assert_not_grep "lease release --task $old_task" "$AF_LOG" "teardown released the restored predecessor in the stale generation pass"
+  assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
+
+  clear_case_logs
+  run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"
+  assert_grep "lease release --task $old_task" "$AF_LOG" "fresh teardown did not release the restored predecessor"
+  pass "teardown stops and revalidates after rollback restores predecessor state"
+}
+
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session
@@ -1677,5 +1767,8 @@ test_native_resume_rejects_regressed_sessionstart_evidence
 test_session_sync_metadata_publish_failure_is_closed
 test_oversized_continuation_stops_before_mutation
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+test_agent_fleet_contract_is_validated_before_routing
+test_agent_fleet_lifecycle_calls_are_bounded
+test_teardown_stops_after_rollback_restores_predecessor
 
 echo "# all fm-account-routing tests passed"

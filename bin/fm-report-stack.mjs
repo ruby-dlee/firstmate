@@ -152,7 +152,8 @@ function redactSensitive(value) {
   return String(value)
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b/g, "[REDACTED TOKEN]")
-    .replace(/^(\s*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization|cookie)\s*[:=]\s*).+$/gim, "$1[REDACTED]");
+    .replace(/\b(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    .replace(/^(\s*(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|passwd|secret|authorization|cookie)\s*[:=]\s*).+$/gim, "$1[REDACTED]");
 }
 
 function safeHttpUrl(value) {
@@ -286,6 +287,15 @@ function acquireLock() {
     }
   }
   throw new Error(`report stack is busy at ${lock}`);
+}
+
+function withLock(callback) {
+  const release = acquireLock();
+  try {
+    return callback();
+  } finally {
+    release();
+  }
 }
 
 function copyVisuals(source, destination, dataRoot) {
@@ -439,22 +449,21 @@ function resolveReportPath(taskId) {
 
 try {
   if (command === "publish") {
-    const release = acquireLock();
-    try { publish(args.find((arg) => !arg.startsWith("--")), args.includes("--legacy")); } finally { release(); }
+    withLock(() => publish(args.find((arg) => !arg.startsWith("--")), args.includes("--legacy")));
   } else if (command === "render") {
-    const release = acquireLock();
-    try { renderIndex(); } finally { release(); }
+    withLock(renderIndex);
     console.log(path.join(stackRoot, "index.html"));
   } else if (command === "list") {
-    const rows = readManifests();
+    const rows = withLock(readManifests);
     if (args.includes("--json")) console.log(JSON.stringify(rows, null, 2));
     else for (const row of rows) console.log(`${row.completedAt}\t${row.taskId}\t${row.kind}\t${row.title}`);
   } else if (command === "path") {
-    console.log(resolveReportPath(args[0]));
+    console.log(withLock(() => resolveReportPath(args[0])));
   } else if (command === "open") {
-    const release = acquireLock();
-    try { renderIndex(); } finally { release(); }
-    const target = resolveReportPath(args[0]);
+    const target = withLock(() => {
+      renderIndex();
+      return resolveReportPath(args[0]);
+    });
     execFileSync(process.platform === "darwin" ? "open" : "xdg-open", [target], { stdio: "ignore" });
     console.log(target);
   } else {

@@ -179,7 +179,7 @@ managed_endpoint_blocker() {  # <status> <task> [restored]
 }
 
 release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
-  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status acquired=0
+  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status rollback_backup acquired=0
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
@@ -218,34 +218,22 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
     return 1
   fi
   if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
+    rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
     fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
       echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
       fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
       return 1
     }
+    if [ -n "$rollback_backup" ]; then
+      echo "error: rolled-back Agent Fleet state for $task was restored; rerun teardown against the restored task generation" >&2
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      return 2
+    fi
     profile=$(fm_meta_get "$meta" account_profile)
     if [ -z "$profile" ]; then
       MANAGED_ACCOUNT_LOCK=$lock
       [ "$acquired" = 0 ] || TEARDOWN_ACCOUNT_LOCKS+=("$lock")
       return 0
-    fi
-    backend=$(fm_backend_of_meta "$meta")
-    target=$(fm_backend_target_of_meta "$meta")
-    zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
-    if [ -n "$target" ]; then
-      if [ -n "$probe_home" ]; then
-        ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" ) 2>/dev/null || true
-      else
-        fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
-      fi
-    fi
-    if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
-      :
-    else
-      endpoint_status=$?
-      managed_endpoint_blocker "$endpoint_status" "$task" restored
-      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
-      return 1
     fi
   fi
   account_task=$(fm_meta_get "$meta" account_task)

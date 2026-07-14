@@ -65,6 +65,8 @@ esac
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-report-contract-lib.sh
+. "$SCRIPT_DIR/fm-report-contract-lib.sh"
 PAUSED_VERB=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -322,6 +324,8 @@ EOF
     ;;
 esac
 
+REPORT_CONTRACT=$(fm_completion_report_contract "$DATA" "$ID")
+
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -362,12 +366,7 @@ $RULE1
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
-# Completion report
-Before the final \`done:\` status, write \`$DATA/$ID/completion.md\` with these sections: Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
-Make it stand alone for the captain: explain the outcome, name important files or links, record the validation performed, and call out remaining risk or decisions.
-Put screenshots, diagrams, or other visual artifacts under \`$DATA/$ID/visuals/\` and reference them from the report when they materially help review.
-If review or the no-mistakes pipeline changes the implementation after the report is first written, refresh the report before the later final \`done:\` status.
-These completion-report paths and the status file are the only authorized writes outside the worktree.
+$REPORT_CONTRACT
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

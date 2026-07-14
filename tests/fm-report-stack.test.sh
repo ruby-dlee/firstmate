@@ -42,7 +42,7 @@ test_publish_ship_with_visual() {
   local id=report-ship-a1 entry count manifest report_id completed_at
   write_task "$id" ship
   mkdir -p "$HOME_DIR/data/$id/visuals"
-  printf '# Completion\n\n## Summary\n\nA searchable report stack is ready.\n\n## What changed\n\nAdded publication.\n\n## Verification\n\nTests passed.\n\npassword=must-also-not-leak\n\n## Visual evidence\n\nSee overview.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n## Summary\n\nA searchable report stack is ready.\n\n## What changed\n\nAdded publication.\n\n## Verification\n\nTests passed.\n\npassword=must-also-not-leak\nAWS_SECRET_ACCESS_KEY=aws-secret-value\nDB_PASSWORD=db-secret-value\nSLACK_BOT_TOKEN=slack-secret-value\nhttps://user:url-secret@example.invalid/path\n\n## Visual evidence\n\nSee overview.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
   printf 'synthetic image bytes' > "$HOME_DIR/data/$id/visuals/overview.png"
 
   run_stack publish "$id" >/dev/null || fail "ship report publication failed"
@@ -60,6 +60,11 @@ test_publish_ship_with_visual() {
     fail "credential-like report text was not redacted"
   fi
   assert_grep 'password=[REDACTED]' "$(dirname "$entry")/report.md" "report redaction left no visible marker"
+  if grep -E 'aws-secret-value|db-secret-value|slack-secret-value|url-secret' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
+    fail "prefixed or URL credentials survived report redaction"
+  fi
+  assert_grep 'AWS_SECRET_ACCESS_KEY=[REDACTED]' "$(dirname "$entry")/report.md" "prefixed access-key redaction left no marker"
+  assert_grep 'https://[REDACTED]@example.invalid/path' "$(dirname "$entry")/report.md" "credential URL redaction left no marker"
 
   manifest="$(dirname "$entry")/manifest.json"
   report_id=$(sed -n 's/.*"reportId": "\([^"]*\)".*/\1/p' "$manifest")
@@ -132,6 +137,20 @@ test_stale_lock_reclaim_is_serialized() {
     fail "concurrent stale-lock reclaim leaked quarantine state"
   fi
   pass "report stack serializes concurrent stale-lock reclamation"
+}
+
+test_readers_wait_for_publication_lock() {
+  local started reader
+  mkdir -p "$STACK/.publish.lock"
+  started=$(LC_ALL=C ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]][[:space:]]*/ /g')
+  printf '{"pid":%s,"startedAt":"%s"}\n' "$$" "$started" > "$STACK/.publish.lock/owner"
+  run_stack list --json > "$TMP_ROOT/locked-reader.out" 2> "$TMP_ROOT/locked-reader.err" &
+  reader=$!
+  sleep 0.2
+  kill -0 "$reader" 2>/dev/null || fail "report reader bypassed the publication lock"
+  rm -rf "$STACK/.publish.lock"
+  wait "$reader" || fail "report reader failed after the publication lock was released"
+  pass "report readers hold the publication lock while resolving entries"
 }
 
 test_source_symlinks_fail_closed() {
@@ -235,6 +254,7 @@ test_required_source_fails_closed
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
+test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
 test_source_symlinks_fail_closed
 test_ambiguous_task_ids_require_report_ids

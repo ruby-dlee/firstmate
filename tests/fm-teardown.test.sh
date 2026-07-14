@@ -1267,6 +1267,10 @@ add_fake_agent_fleet() {
 set -u
 printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
 case "$*" in
+  '--format json contract')
+    printf '{"contract_version":1}\n'
+    exit 0
+    ;;
   *"lease release"*)
     [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'lease-release %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
     [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 42

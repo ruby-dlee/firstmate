@@ -316,7 +316,7 @@ unit_herdr_partial_create_recovery() {
     fm_afk_launch_record_write() { printf "%s:%s:%s" "$1" "$2" "$3" > "$RECORDED"; }
     fm_afk_launch_create_herdr lab:captain herdr
   ' _ "$LAUNCH"
-  if [ "$(cat "$recorded" 2>/dev/null || true)" = "herdr:lab:pane-exact:ws-partial" ]; then
+  if [ "$(cat "$recorded" 2>/dev/null || true)" = "herdr:lab:pane-exact:ws-partial|afk-exact-label" ]; then
     pass "herdr create: malformed response recovers durable exact ownership"
   else
     fail "herdr create: malformed response left terminal ownership unknown"
@@ -336,7 +336,7 @@ unit_herdr_creation_intent_reconciles() {
     fm_backend_herdr_cli() {
       case "$2 $3" in
         "workspace list") printf %s '\''{"result":{"workspaces":[{"workspace_id":"ws-planned","label":"afk-planned-label"}]}}'\'' ;;
-        "pane list") printf %s '\''{"result":{"panes":[{"pane_id":"pane-planned"}]}}'\'' ;;
+        "pane list") if [ -e "$CLOSED" ]; then printf %s '\''{"result":{"panes":[]}}'\''; else printf %s '\''{"result":{"panes":[{"pane_id":"pane-planned"}]}}'\''; fi ;;
         "pane close") : > "$CLOSED" ;;
         "pane get") printf %s '\''{"error":{"code":"pane_not_found"}}'\''; return 1 ;;
         *) return 2 ;;
@@ -681,6 +681,7 @@ unit_tmux_planned_record_and_collision() {
         printf "%s" "$4" > "$FM_HOME/created-name"
         return 1
       fi
+      if [ "$1" = has-session ]; then printf "%s" "can'\''t find session" >&2; return 1; fi
       [ "$1" != kill-session ] || : > "$FM_HOME/killed"
       return 1
     }
@@ -699,6 +700,7 @@ unit_tmux_planned_record_and_collision() {
     . "$1"
     tmux() {
       [ "$1" != new-session ] || { printf "%s" "$4" > "$FM_HOME/created-name"; return 1; }
+      [ "$1" != has-session ] || { printf "%s" "can'\''t find session" >&2; return 1; }
       [ "$1" != kill-session ] || : > "$FM_HOME/killed"
       return 1
     }
@@ -896,6 +898,75 @@ unit_flag_write_failure_aborts() {
   rm -rf "$st"
 }
 
+unit_herdr_reused_pane_identity_fails_closed() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-reused.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'herdr\tlab:pane-reused\tws-owned|afk-owned\n' > "$st/state/.afk-daemon-terminal"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_cli() {
+      case "$2 $3" in
+        "workspace list") printf %s '\''{"result":{"workspaces":[{"workspace_id":"ws-owned","label":"afk-owned"}]}}'\'' ;;
+        "pane list") printf %s '\''{"result":{"panes":[]}}'\'' ;;
+        "pane get") printf %s '\''{"result":{"pane":{"pane_id":"pane-reused"}}}'\'' ;;
+        "pane close") : > "$FM_HOME/closed" ;;
+        *) return 2 ;;
+      esac
+    }
+    fm_afk_launch_record_read
+    ! fm_afk_launch_close_recorded
+  ' _ "$LAUNCH" && [ ! -e "$st/closed" ] && [ -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr identity: a reused pane id cannot close another workspace"
+  else
+    fail "herdr identity: a reused pane id was closed or discarded"
+  fi
+  rm -rf "$st"
+}
+
+unit_tmux_partial_create_preserves_record() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-tmux-partial.XXXXXX")
+  mkdir -p "$st/state"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    tmux() {
+      case "$1" in
+        new-session) return 1 ;;
+        has-session) return 0 ;;
+        kill-session) : > "$FM_HOME/killed" ;;
+      esac
+    }
+    ! fm_afk_launch_create_tmux captain:0 tmux
+  ' _ "$LAUNCH" && [ -s "$st/state/.afk-daemon-terminal" ] && [ ! -e "$st/killed" ]; then
+    pass "tmux launch: partial creation preserves its exact reconciliation record"
+  else
+    fail "tmux launch: partial creation lost its exact reconciliation record"
+  fi
+  rm -rf "$st"
+}
+
+unit_legacy_supervisor_fallback_is_usable() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-legacy-fallback.XXXXXX")
+  mkdir -p "$st/state"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    daemon_lock_held_by_live_daemon() { return 1; }
+    fm_afk_launch_reconcile() { return 0; }
+    fm_afk_clear_stale_artifacts() { return 0; }
+    fm_afk_launch_flag_write() { return 0; }
+    fm_afk_launch_create_tmux() { printf "%s|%s" "$1" "$2" > "$FM_HOME/fallback"; }
+    fm_afk_launch_start
+  ' _ "$LAUNCH" && [ "$(cat "$st/fallback" 2>/dev/null)" = 'firstmate:0|tmux' ]; then
+    pass "supervisor discovery: the explicit legacy fallback remains usable"
+  else
+    fail "supervisor discovery: the legacy fallback was rejected"
+  fi
+  rm -rf "$st"
+}
+
 # ---------------------------------------------------------------------------
 # E2E herdr: topology invariant.
 # ---------------------------------------------------------------------------
@@ -1024,6 +1095,9 @@ unit_lock_requires_complete_metadata
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
+unit_herdr_reused_pane_identity_fails_closed
+unit_tmux_partial_create_preserves_record
+unit_legacy_supervisor_fallback_is_usable
 unit_clear_failure_aborts_entry
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup

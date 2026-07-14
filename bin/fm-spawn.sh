@@ -127,6 +127,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-report-contract-lib.sh
+. "$SCRIPT_DIR/fm-report-contract-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -381,6 +383,12 @@ RAW_LAUNCH=0
 ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
+ORIGINAL_STATUS_PRESENT=-1
+ORIGINAL_TURN_ENDED_PRESENT=-1
+ORIGINAL_CHECK_PRESENT=-1
+ORIGINAL_PI_EXT_PRESENT=-1
+ORIGINAL_GROK_TOKEN_PRESENT=-1
+ORIGINAL_TASK_TMP_PRESENT=-1
 
 snapshot_existing_artifacts() {
   local backup="$STATE/.$ID.artifacts.rollback.$$" name source tasktmp="/tmp/fm-$ID"
@@ -598,8 +606,12 @@ spawn_abort_cleanup() {
         mv "$rollback_tmp" "$STATE/$ID.meta"
       fi
       if [ "$account_clean" = 1 ] && [ "$restored_existing_meta" != 1 ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$worktree_clean" = 1 ]; then
-        rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
-        [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"
+        [ "$ORIGINAL_STATUS_PRESENT" != 0 ] || rm -f "$STATE/$ID.status"
+        [ "$ORIGINAL_TURN_ENDED_PRESENT" != 0 ] || rm -f "$STATE/$ID.turn-ended"
+        [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
+        [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
+        [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
       fi
       if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
         persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
@@ -672,6 +684,13 @@ ID=${POS[0]}
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
+
+if [ -e "$STATE/$ID.status" ] || [ -L "$STATE/$ID.status" ]; then ORIGINAL_STATUS_PRESENT=1; else ORIGINAL_STATUS_PRESENT=0; fi
+if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGINAL_TURN_ENDED_PRESENT=1; else ORIGINAL_TURN_ENDED_PRESENT=0; fi
+if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
+if [ -e "$STATE/$ID.pi-ext.ts" ] || [ -L "$STATE/$ID.pi-ext.ts" ]; then ORIGINAL_PI_EXT_PRESENT=1; else ORIGINAL_PI_EXT_PRESENT=0; fi
+if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token" ]; then ORIGINAL_GROK_TOKEN_PRESENT=1; else ORIGINAL_GROK_TOKEN_PRESENT=0; fi
+if [ -e "/tmp/fm-$ID" ] || [ -L "/tmp/fm-$ID" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
@@ -1233,6 +1252,12 @@ else
 fi
 if [ "$RECOVERY_ACCOUNT" != 1 ]; then
   [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+fi
+if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ] && ! grep -q '^# Completion report$' "$BRIEF"; then
+  {
+    printf '\n'
+    fm_completion_report_contract "$DATA" "$ID"
+  } >> "$BRIEF"
 fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->

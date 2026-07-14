@@ -113,6 +113,7 @@ ATTEMPT=$(fm_meta_get "$META" account_attempt)
 [ -n "$ATTEMPT" ] || ATTEMPT=legacy
 EXISTING=$(fm_meta_get "$META" provider_session_id)
 binary=$(fm_account_fleet_bin) || exit 1
+fm_account_validate_contract "$binary" || exit 1
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do

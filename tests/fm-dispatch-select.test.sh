@@ -180,6 +180,7 @@ make_fake_agent_fleet() {
 #!/usr/bin/env bash
 set -u
 [ -z "${FM_FAKE_AF_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
+[ "$*" != "--format json contract" ] || { printf '{"contract_version":1}\n'; exit 0; }
 [ -z "${FM_FAKE_AF_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SLEEP"
 pool=
 provider=
@@ -347,7 +348,7 @@ SH
     "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" 2>"$TMP_ROOT/account-fallback/error.log")
   err=$(cat "$TMP_ROOT/account-fallback/error.log")
   [ "$out" = '{"harness":"claude","account_pool":"claude-crew"}' ] || fail "pool failure should use first profile"
-  assert_contains "$err" 'agent-fleet pool status failed' "pool failure fallback was not logged"
+  assert_contains "$err" 'agent-fleet contract mismatch' "contract failure fallback was not logged"
   [ ! -e "$quota_marker" ] || fail "pool failure fell through to default-account quota"
 
   pinned='[{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-1"},{"harness":"codex","account_pool":"codex-crew"}]'

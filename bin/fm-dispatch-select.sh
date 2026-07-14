@@ -195,6 +195,11 @@ if [ "$pooled_count" -gt 0 ]; then
     first_profile
     exit 0
   fi
+  if ! fm_account_validate_contract "$agent_fleet_cmd"; then
+    log "agent-fleet contract mismatch for account_pool summaries; using first profile"
+    first_profile
+    exit 0
+  fi
   summaries='[]'
   while IFS=$(printf '\t') read -r index harness pool; do
     if ! pool_json=$(fm_account_run_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then

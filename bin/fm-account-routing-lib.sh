@@ -67,6 +67,46 @@ fm_account_fleet_bin() {
   }
 }
 
+fm_account_control_timeout() {
+  local seconds=${FM_ACCOUNT_CONTROL_TIMEOUT:-10}
+  case "$seconds" in
+    ''|*[!0-9]*|0)
+      echo "error: FM_ACCOUNT_CONTROL_TIMEOUT must be a positive integer" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$seconds"
+}
+
+fm_account_run_control() {
+  local seconds
+  seconds=$(fm_account_control_timeout) || return 1
+  fm_account_run_bounded "$seconds" "$@"
+}
+
+FM_ACCOUNT_CONTRACT_BIN=
+fm_account_validate_contract() {  # <agent-fleet-bin>
+  local binary=$1 json version
+  [ "$FM_ACCOUNT_CONTRACT_BIN" != "$binary" ] || return 0
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required for account routing" >&2
+    return 1
+  }
+  json=$(fm_account_run_control "$binary" --format json contract 2>/dev/null) || {
+    echo "error: cannot verify the Agent Fleet contract" >&2
+    return 1
+  }
+  version=$(printf '%s\n' "$json" | jq -er '.contract_version | select(type == "number")' 2>/dev/null) || {
+    echo "error: agent-fleet returned an invalid contract" >&2
+    return 1
+  }
+  [ "$version" = 1 ] || {
+    echo "error: unsupported Agent Fleet contract version $version (expected 1)" >&2
+    return 1
+  }
+  FM_ACCOUNT_CONTRACT_BIN=$binary
+}
+
 fm_account_read_single_value() {  # <file>
   local file=$1 values count value
   [ -e "$file" ] || return 1
@@ -552,8 +592,12 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
     [ "$mode" = observe ] && { echo "fm-account-routing: observe unavailable; legacy launch unchanged" >&2; return 0; }
     return 1
   }
+  fm_account_validate_contract "$binary" || {
+    [ "$mode" = observe ] && { echo "fm-account-routing: observe contract unavailable; legacy launch unchanged" >&2; return 0; }
+    return 1
+  }
   if [ "$mode" = observe ]; then
-    if json=$("$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --dry-run 2>/dev/null); then
+    if json=$(fm_account_run_control "$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --dry-run 2>/dev/null); then
       status=0
     else
       status=$?
@@ -562,15 +606,23 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
       echo "fm-account-routing: observe decision unavailable for pool=$pool provider=$harness; legacy launch unchanged" >&2
       return 0
     fi
-  elif [ -n "$requested_profile" ] && [ "$pool" = explicit ]; then
-    json=$("$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool") || return 1
-    acquired=1
   else
-    if [ -n "$requested_profile" ]; then
-      json=$("$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --profile "$requested_profile") || return 1
+    if [ -n "$requested_profile" ] && [ "$pool" = explicit ]; then
+      if json=$(fm_account_run_control "$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool"); then status=0; else status=$?; fi
+    elif [ -n "$requested_profile" ]; then
+      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --profile "$requested_profile"); then status=0; else status=$?; fi
     else
-      json=$("$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness") || return 1
+      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness"); then status=0; else status=$?; fi
     fi
+    if [ "$status" -eq 124 ]; then
+      if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
+        status=0
+      else
+        echo "error: Agent Fleet lease mutation timed out and ownership could not be reconciled for $task" >&2
+        return 2
+      fi
+    fi
+    [ "$status" -eq 0 ] || return "$status"
     acquired=1
   fi
   if ! selected_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' selection) \
@@ -607,6 +659,7 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
 fm_account_exec_command() {  # <profile> <pool> <task>
   local binary
   binary=$(fm_account_fleet_bin) || return 1
+  fm_account_validate_contract "$binary" || return 1
   printf '%s --format json exec --profile %s --task %s --pool %s --' \
     "$(fm_account_shell_quote "$binary")" \
     "$(fm_account_shell_quote "$1")" \
@@ -617,6 +670,7 @@ fm_account_exec_command() {  # <profile> <pool> <task>
 fm_account_resume_command() {  # <task>
   local binary
   binary=$(fm_account_fleet_bin) || return 1
+  fm_account_validate_contract "$binary" || return 1
   printf '%s --format json resume --task %s --' \
     "$(fm_account_shell_quote "$binary")" \
     "$(fm_account_shell_quote "$1")"
@@ -626,9 +680,19 @@ fm_account_resume_command() {  # <task>
 # sticky recovery reservation. This path intentionally bypasses new-task quota
 # reserve filtering inside Agent Fleet while still refusing a live owner.
 fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-provider>
-  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json mapped_task profile pool provider
+  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json status mapped_task profile pool provider
   binary=$(fm_account_fleet_bin) || return 1
-  json=$("$binary" --format json lease recover --task "$task") || return 1
+  fm_account_validate_contract "$binary" || return 1
+  if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then status=0; else status=$?; fi
+  if [ "$status" -eq 124 ]; then
+    if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
+      status=0
+    else
+      echo "error: Agent Fleet recovery timed out and ownership could not be reconciled for $task" >&2
+      return 2
+    fi
+  fi
+  [ "$status" -eq 0 ] || return "$status"
   if ! mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' recovery) \
     || ! profile=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' recovery) \
     || ! pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' recovery) \
@@ -651,13 +715,22 @@ fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-pr
 fm_account_release() {  # <task> [--force]
   local binary task=$1 force=${2:-} out status
   binary=$(fm_account_fleet_bin) || return 1
+  fm_account_validate_contract "$binary" || return 1
   set +e
   if [ "$force" = --force ]; then
-    out=$("$binary" --format json lease release --task "$task" --force 2>&1)
+    out=$(fm_account_run_control "$binary" --format json lease release --task "$task" --force 2>&1)
   else
-    out=$("$binary" --format json lease release --task "$task" 2>&1)
+    out=$(fm_account_run_control "$binary" --format json lease release --task "$task" 2>&1)
   fi
   status=$?
+  if [ "$status" -eq 124 ]; then
+    if [ "$force" = --force ]; then
+      out=$(fm_account_run_control "$binary" --format json lease release --task "$task" --force 2>&1)
+    else
+      out=$(fm_account_run_control "$binary" --format json lease release --task "$task" 2>&1)
+    fi
+    status=$?
+  fi
   set -e
   if [ "$status" -eq 0 ]; then
     return 0
@@ -672,9 +745,14 @@ fm_account_release() {  # <task> [--force]
 fm_account_session_remove() {  # <task>
   local binary out status
   binary=$(fm_account_fleet_bin) || return 1
+  fm_account_validate_contract "$binary" || return 1
   set +e
-  out=$("$binary" --format json session remove --task "$1" 2>&1)
+  out=$(fm_account_run_control "$binary" --format json session remove --task "$1" 2>&1)
   status=$?
+  if [ "$status" -eq 124 ]; then
+    out=$(fm_account_run_control "$binary" --format json session remove --task "$1" 2>&1)
+    status=$?
+  fi
   set -e
   if [ "$status" -eq 0 ]; then
     return 0

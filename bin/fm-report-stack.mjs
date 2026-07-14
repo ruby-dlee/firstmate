@@ -38,10 +38,9 @@ function fail(message) {
   process.exit(1);
 }
 
-function parseMeta(file) {
+function parseMeta(content) {
   const result = {};
-  if (!fs.existsSync(file)) return result;
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+  for (const line of content.split(/\r?\n/)) {
     const index = line.indexOf("=");
     if (index > 0) result[line.slice(0, index)] = line.slice(index + 1);
   }
@@ -98,6 +97,51 @@ function processStartIdentity(pid) {
   } catch {
     return "";
   }
+}
+
+function isContained(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function realDirectory(directory, root, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`${label} is missing at ${directory}`);
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`${label} must be a real directory at ${directory}`);
+  const real = fs.realpathSync(directory);
+  if (root && !isContained(root, real)) throw new Error(`${label} escapes its configured root at ${directory}`);
+  return real;
+}
+
+function configuredRoot(directory, label) {
+  let stat;
+  try {
+    stat = fs.statSync(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`${label} is missing at ${directory}`);
+    throw error;
+  }
+  if (!stat.isDirectory()) throw new Error(`${label} must be a directory at ${directory}`);
+  return fs.realpathSync(directory);
+}
+
+function readArtifact(file, root, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  const real = fs.realpathSync(file);
+  if (!isContained(root, real)) throw new Error(`${label} escapes its configured root at ${file}`);
+  return fs.readFileSync(real, "utf8");
 }
 
 function escapeHtml(value) {
@@ -162,15 +206,24 @@ function acquireLock() {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
+      let token;
       try {
         const startedAt = processStartIdentity(process.pid);
         if (!startedAt) throw new Error(`cannot identify report publisher process ${process.pid}`);
-        fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify({ pid: process.pid, startedAt })}\n`, { mode: 0o600 });
+        token = crypto.randomUUID();
+        fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, { mode: 0o600 });
       } catch (error) {
         fs.rmSync(lock, { recursive: true, force: true });
         throw error;
       }
-      return () => fs.rmSync(lock, { recursive: true, force: true });
+      return () => {
+        try {
+          const owner = JSON.parse(fs.readFileSync(path.join(lock, "owner"), "utf8"));
+          if (owner.token === token) fs.rmSync(lock, { recursive: true, force: true });
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      };
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       try {
@@ -193,9 +246,38 @@ function acquireLock() {
           try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
         }
         if (ownerAlive) ownerAlive = processStartIdentity(owner) === ownerStartedAt;
-        if (!ownerAlive && Date.now() - fs.statSync(lock).mtimeMs > 60_000) {
-          fs.rmSync(lock, { recursive: true, force: true });
-          continue;
+        const staleStat = fs.statSync(lock);
+        if (!ownerAlive && Date.now() - staleStat.mtimeMs > 60_000) {
+          const reclaim = path.join(lock, ".reclaim");
+          const reclaimToken = crypto.randomUUID();
+          let claimed = false;
+          try {
+            fs.writeFileSync(reclaim, reclaimToken, { flag: "wx", mode: 0o600 });
+            claimed = true;
+            const claimedStat = fs.statSync(lock);
+            if (claimedStat.dev !== staleStat.dev || claimedStat.ino !== staleStat.ino) {
+              fs.rmSync(reclaim, { force: true });
+              claimed = false;
+              continue;
+            }
+            const quarantine = path.join(stackRoot, `.publish.lock.stale.${process.pid}.${reclaimToken}`);
+            fs.renameSync(lock, quarantine);
+            if (fs.readFileSync(path.join(quarantine, ".reclaim"), "utf8") !== reclaimToken) {
+              throw new Error(`report lock changed while reclaiming ${lock}`);
+            }
+            fs.rmSync(quarantine, { recursive: true, force: true });
+            continue;
+          } catch (reclaimError) {
+            if (reclaimError.code !== "EEXIST" && reclaimError.code !== "ENOENT") throw reclaimError;
+          } finally {
+            if (claimed) {
+              try {
+                if (fs.readFileSync(reclaim, "utf8") === reclaimToken) fs.rmSync(reclaim, { force: true });
+              } catch (cleanupError) {
+                if (cleanupError.code !== "ENOENT") throw cleanupError;
+              }
+            }
+          }
         }
       } catch (statError) {
         if (statError.code !== "ENOENT") throw statError;
@@ -206,7 +288,7 @@ function acquireLock() {
   throw new Error(`report stack is busy at ${lock}`);
 }
 
-function copyVisuals(source, destination) {
+function copyVisuals(source, destination, dataRoot) {
   const copied = [];
   if (!fs.existsSync(source)) return copied;
   const sourceStat = fs.lstatSync(source);
@@ -214,6 +296,9 @@ function copyVisuals(source, destination) {
     throw new Error(`visual evidence root must be a real directory at ${source}`);
   }
   const sourceReal = fs.realpathSync(source);
+  if (!isContained(dataRoot, sourceReal)) {
+    throw new Error(`visual evidence escapes its configured data root at ${source}`);
+  }
   let total = 0;
   function visit(current, relative = "") {
     const currentReal = fs.realpathSync(current);
@@ -263,18 +348,23 @@ function renderIndex() {
 
 function publish(taskId, legacy) {
   if (!taskId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(taskId)) throw new Error("publish requires a safe task id");
+  const dataRoot = configuredRoot(dataDir, "configured data root");
+  const stateRoot = configuredRoot(stateDir, "configured state root");
   const metaFile = path.join(stateDir, `${taskId}.meta`);
-  if (!fs.existsSync(metaFile)) throw new Error(`no task metadata at ${metaFile}`);
-  const meta = parseMeta(metaFile);
+  const metaSource = readArtifact(metaFile, stateRoot, "task metadata");
+  if (metaSource === undefined) throw new Error(`no task metadata at ${metaFile}`);
+  const meta = parseMeta(metaSource);
   if (meta.kind === "secondmate") throw new Error("persistent secondmate retirement is not a completion report");
   const taskData = path.join(dataDir, taskId);
+  realDirectory(taskData, dataRoot, "task data directory");
   const briefFile = path.join(taskData, "brief.md");
   const statusFile = path.join(stateDir, `${taskId}.status`);
-  const brief = redactSensitive(fs.existsSync(briefFile) ? fs.readFileSync(briefFile, "utf8") : "");
-  const status = redactSensitive(fs.existsSync(statusFile) ? fs.readFileSync(statusFile, "utf8") : "");
+  const brief = redactSensitive(readArtifact(briefFile, dataRoot, "task brief") || "");
+  const status = redactSensitive(readArtifact(statusFile, stateRoot, "status trail") || "");
   const sourceFile = meta.kind === "scout" ? path.join(taskData, "report.md") : path.join(taskData, "completion.md");
+  const source = readArtifact(sourceFile, dataRoot, "completion report");
   let markdown;
-  if (fs.existsSync(sourceFile)) markdown = redactSensitive(fs.readFileSync(sourceFile, "utf8"));
+  if (source !== undefined) markdown = redactSensitive(source);
   else if (legacy) markdown = `# ${titleFromBrief(taskId, brief)}\n\n## Summary\n\n${lastStatus(status)}\n\n## Preserved trail\n\nThis compatibility report was synthesized for a task created before completion reports were required.\nSee the attached task brief and status trail for details.\n`;
   else throw new Error(`required completion report is missing at ${sourceFile}`);
   if (!markdown.trim()) throw new Error(`completion report is empty at ${sourceFile}`);
@@ -295,7 +385,7 @@ function publish(taskId, legacy) {
   fs.rmSync(staged, { recursive: true, force: true });
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
   try {
-    const visuals = copyVisuals(path.join(taskData, "visuals"), staged);
+    const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
     const manifest = {
       schemaVersion: 1,
       reportId: id,
@@ -336,9 +426,15 @@ function publish(taskId, legacy) {
 
 function resolveReportPath(taskId) {
   if (!taskId) return path.join(stackRoot, "index.html");
-  const match = readManifests().find((row) => row.taskId === taskId || row.reportId === taskId);
-  if (!match) throw new Error(`no report found for ${taskId}`);
-  return path.join(entriesDir, match.reportId, "report.html");
+  const rows = readManifests();
+  const exact = rows.find((row) => row.reportId === taskId);
+  if (exact) return path.join(entriesDir, exact.reportId, "report.html");
+  const matches = rows.filter((row) => row.taskId === taskId);
+  if (matches.length === 0) throw new Error(`no report found for ${taskId}`);
+  if (matches.length > 1) {
+    throw new Error(`task id ${taskId} is ambiguous; use one of these report ids: ${matches.map((row) => row.reportId).join(", ")}`);
+  }
+  return path.join(entriesDir, matches[0].reportId, "report.html");
 }
 
 try {

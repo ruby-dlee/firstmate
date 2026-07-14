@@ -37,6 +37,10 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
 PROMOTE="$ROOT/bin/fm-promote.sh"
+SESSION_START="$ROOT/bin/fm-session-start.sh"
+HOME_SEED="$ROOT/bin/fm-home-seed.sh"
+BACKLOG_HANDOFF="$ROOT/bin/fm-backlog-handoff.sh"
+PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -482,6 +486,56 @@ test_promote_refuses_gate_contexts() {
   pass "fm-promote refuses both gate signals before task mutation"
 }
 
+run_primary_mutator_guarded() {
+  local name=$1 cwd=$2 home=$3
+  shift 3
+  case "$name" in
+    session-start)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$SESSION_START" ) 2>&1
+      ;;
+    home-seed)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$HOME_SEED" secondmate-x "$home/secondmate" --no-projects ) 2>&1
+      ;;
+    backlog-handoff)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$BACKLOG_HANDOFF" secondmate-x queued-x ) 2>&1
+      ;;
+    pr-check)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$PR_CHECK" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+      ;;
+  esac
+}
+
+test_primary_mutators_refuse_gate_contexts() {
+  local home name out rc
+  home="$TMP/primary-mutators"
+  mkdir -p "$home/data" "$home/state"
+  printf '# Backlog\n\n## In flight\n## Queued\n- [ ] queued-x - queued\n## Done\n' > "$home/data/backlog.md"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship"
+
+  for name in session-start home-seed backlog-handoff pr-check; do
+    out=$(run_primary_mutator_guarded "$name" "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
+    expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"
+
+    out=$(run_primary_mutator_guarded "$name" "$GATE_WT" "$home"); rc=$?
+    expect_code 3 "$rc" "$name: gate-worktree cwd must refuse"
+    assert_contains "$out" "$PATH_MSG" "$name: path-backstop refusal message"
+  done
+
+  assert_absent "$home/state/.lock" "refused session start acquired the fleet lock"
+  assert_absent "$home/data/secondmates.md" "refused home seed changed the secondmate registry"
+  assert_absent "$home/state/task-x1.check.sh" "refused PR check armed a merge poll"
+  if grep -q '^pr=' "$home/state/task-x1.meta"; then
+    fail "refused PR check changed task metadata"
+  fi
+  assert_grep 'queued-x' "$home/data/backlog.md" "refused backlog handoff moved the queued item"
+  pass "primary fleet mutators refuse both gate signals before state changes"
+}
+
 # --- tracked .no-mistakes.yaml ----------------------------------------------
 
 test_no_mistakes_yaml_disables_project_settings() {
@@ -521,4 +575,5 @@ test_send_refuses_and_admits
 test_teardown_refuses_and_admits
 test_merge_entrypoints_refuse_gate_contexts
 test_promote_refuses_gate_contexts
+test_primary_mutators_refuse_gate_contexts
 test_no_mistakes_yaml_disables_project_settings

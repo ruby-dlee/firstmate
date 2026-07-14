@@ -333,7 +333,6 @@ install_cmd() {
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
     gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
-    agent-fleet) echo "command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release and ensure agent-fleet is on PATH" ;;
     *) return 1 ;;
   esac
 }
@@ -341,6 +340,7 @@ install_cmd() {
 manual_install_url() {
   case "$1" in
     herdr) echo "https://herdr.dev" ;;
+    agent-fleet) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing" ;;
     *) return 1 ;;
   esac
 }
@@ -524,9 +524,9 @@ account_routing_preflight() {
   fi
   [ "$needs_agent_fleet" = 1 ] || return 0
   if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
-    [ -x "$FM_AGENT_FLEET_BIN" ] || echo "MISSING: agent-fleet (install: $(install_cmd agent-fleet))"
+    [ -x "$FM_AGENT_FLEET_BIN" ] || missing_tool_diagnostic agent-fleet
   else
-    command -v agent-fleet >/dev/null 2>&1 || echo "MISSING: agent-fleet (install: $(install_cmd agent-fleet))"
+    command -v agent-fleet >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
   fi
   if ! command -v jq >/dev/null 2>&1; then
     echo "MISSING: jq (install: $(install_cmd jq))"

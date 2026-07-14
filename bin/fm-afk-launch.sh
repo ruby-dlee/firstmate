@@ -76,8 +76,13 @@ fm_afk_launch_lock_owned() {
   [ -n "$expected" ] && [ "$actual" = "$expected" ]
 }
 
+fm_afk_launch_lock_identity() {
+  stat -f '%d:%i:%B' "$FM_AFK_LAUNCH_LOCK" 2>/dev/null \
+    || stat -c '%d:%i:%W' "$FM_AFK_LAUNCH_LOCK" 2>/dev/null
+}
+
 fm_afk_launch_lock_acquire() {
-  local i incomplete=0 identity
+  local i incomplete=0 identity quarantine stale_identity claimed_identity last_identity=
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   for i in $(seq 1 200); do
     if mkdir "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
@@ -95,6 +100,14 @@ fm_afk_launch_lock_acquire() {
       fi
       return 0
     fi
+    stale_identity=$(fm_afk_launch_lock_identity) || {
+      sleep 0.05
+      continue
+    }
+    if [ "$stale_identity" != "$last_identity" ]; then
+      incomplete=0
+      last_identity=$stale_identity
+    fi
     if [ ! -s "$FM_AFK_LAUNCH_LOCK/pid" ] || [ ! -s "$FM_AFK_LAUNCH_LOCK/pid-identity" ]; then
       incomplete=$((incomplete + 1))
       if [ "$incomplete" -lt 20 ]; then
@@ -105,7 +118,32 @@ fm_afk_launch_lock_acquire() {
       incomplete=0
     fi
     if ! fm_afk_launch_lock_owned; then
-      rm -rf "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || return 1
+      if ! mkdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null; then
+        sleep 0.05
+        continue
+      fi
+      claimed_identity=$(fm_afk_launch_lock_identity) || claimed_identity=
+      if [ -z "$claimed_identity" ] || [ "$claimed_identity" != "$stale_identity" ]; then
+        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+        sleep 0.05
+        continue
+      fi
+      if fm_afk_launch_lock_owned; then
+        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+        sleep 0.05
+        continue
+      fi
+      quarantine="$FM_AFK_LAUNCH_LOCK.stale.$$.$i"
+      if ! mv "$FM_AFK_LAUNCH_LOCK" "$quarantine" 2>/dev/null; then
+        rmdir "$FM_AFK_LAUNCH_LOCK/.reclaim" 2>/dev/null || true
+        sleep 0.05
+        continue
+      fi
+      if [ ! -d "$quarantine/.reclaim" ]; then
+        fm_afk_launch_log "launcher lock changed while reclaiming it"
+        return 1
+      fi
+      rm -rf "$quarantine" 2>/dev/null || return 1
       incomplete=0
       continue
     fi

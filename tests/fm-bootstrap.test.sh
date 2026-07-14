@@ -727,7 +727,7 @@ jq() {
 SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING: agent-fleet (install: command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release' "enforce mode did not report missing Agent Fleet"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "enforce mode did not report manual Agent Fleet installation"
   assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
 
   case_dir="$TMP_ROOT/account-routing-dispatch"
@@ -739,7 +739,7 @@ SH
   rm -f "$fakebin/agent-fleet"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING: agent-fleet (install: command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release' "account-routed dispatch profile did not report missing Agent Fleet"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "account-routed dispatch profile did not report manual Agent Fleet installation"
   assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
 
   case_dir="$TMP_ROOT/account-routing-observe"
@@ -753,6 +753,15 @@ SH
   assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
   assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
   pass "bootstrap reports dependencies only when configuration can enforce routing"
+}
+
+test_agent_fleet_install_requires_manual_release() {
+  local out rc
+  out=$("$ROOT/bin/fm-bootstrap.sh" install agent-fleet 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "bootstrap tried to auto-install private Agent Fleet"
+  assert_contains "$out" 'agent-fleet requires manual installation' "manual Agent Fleet install refusal was not actionable"
+  assert_contains "$out" 'docs/configuration.md#agent-fleet-account-routing' "manual Agent Fleet install refusal omitted its instructions"
+  pass "bootstrap keeps private Agent Fleet installation manual"
 }
 
 test_invalid_account_routing_policy_is_reported() {
@@ -814,5 +823,6 @@ test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
 test_account_routing_dependency_preflight
+test_agent_fleet_install_requires_manual_release
 test_invalid_account_routing_policy_is_reported
 test_enforced_dispatch_validation_rejects_poolless_quota_rules

@@ -237,6 +237,37 @@ unit_lock_initialization_grace() {
   rm -rf "$st"
 }
 
+unit_stale_lock_reclaim_is_serialized() {
+  local st marker pids="" pid failures=0 count
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-stale.XXXXXX")
+  marker="$st/acquired"
+  mkdir -p "$st/state/.afk-launch.lock"
+  printf '%s' "$$" > "$st/state/.afk-launch.lock/pid"
+  printf 'different-process-identity' > "$st/state/.afk-launch.lock/pid-identity"
+  for i in 1 2 3 4 5 6 7 8; do
+    FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" MARKER="$marker" bash -c '
+      . "$1"
+      fm_afk_launch_lock_acquire || exit 1
+      printf "%s\n" "$2" >> "$MARKER"
+      sleep 0.02
+      fm_afk_launch_lock_release
+    ' _ "$LAUNCH" "$i" &
+    pids="$pids $!"
+  done
+  for pid in $pids; do
+    wait "$pid" || failures=$((failures + 1))
+  done
+  count=$(wc -l < "$marker" 2>/dev/null | tr -d ' ')
+  [ "$failures" -eq 0 ] || fail "launcher stale-lock reclaim lost $failures contender(s)"
+  [ "$count" = 8 ] || fail "launcher stale-lock reclaim admitted only $count contenders"
+  [ ! -e "$st/state/.afk-launch.lock" ] || fail "launcher stale-lock reclaim retained the active lock"
+  if find "$st/state" -maxdepth 1 -name '.afk-launch.lock.stale.*' | grep . >/dev/null 2>&1; then
+    fail "launcher stale-lock reclaim leaked quarantine state"
+  fi
+  pass "launcher lock serializes concurrent stale-lock reclamation"
+  rm -rf "$st"
+}
+
 unit_signal_exits_with_lock_cleanup() {
   local st marker child
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-signal.XXXXXX")
@@ -966,6 +997,7 @@ unit_stop_rejects_reused_pid
 unit_failed_start_rolls_back_state
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
+unit_stale_lock_reclaim_is_serialized
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_creation_intent_reconciles

@@ -490,6 +490,31 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
   pass "unmanaged respawn preserves a legacy task's report cutover state"
 }
 
+test_failed_managed_respawn_restores_unmanaged_metadata() {
+  local id rec expected out status
+  id=account-unmanaged-rollback-z9c
+  rec=$(make_case unmanaged-rollback claude "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "pr=417" \
+    "custom_extension=preserve-me"
+  expected="$CASE_DIR/original.meta"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
+  cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "failed managed respawn did not restore the original unmanaged metadata"
+  assert_grep 'lease release ' "$AF_LOG" "failed managed respawn leaked its acquired reservation"
+  [ -n "$out" ] || true
+  pass "failed managed respawn restores every field from existing unmanaged metadata"
+}
+
 test_recovered_reservations_are_owned_until_launch_commit() {
   local id rec out status account_task session lineage
   id=account-recover-owned-z9b
@@ -1542,6 +1567,7 @@ test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_unmanaged_respawn_preserves_report_cutover_state
+test_failed_managed_respawn_restores_unmanaged_metadata
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence

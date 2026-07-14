@@ -940,6 +940,10 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
     present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
     *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
   esac
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    META_BACKUP="$STATE/.$ID.meta.rollback.$$"
+    cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
+  fi
 fi
 
 secondmate_registry_value() {

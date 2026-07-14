@@ -774,7 +774,7 @@ SH
     [ "$(fm_backend_target_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 11
     ! fm_backend_capture herdr default:w1:p2 10 fm-intended-task || exit 12
     ! fm_backend_send_key herdr default:w1:p2 Enter fm-intended-task || exit 13
-    [ "$(fm_backend_send_text_submit herdr default:w1:p2 message 1 0 0 fm-intended-task)" = unknown ] || exit 14
+    [ "$(fm_backend_send_text_submit herdr default:w1:p2 message 1 0 0 fm-intended-task)" = send-failed ] || exit 14
     ! fm_backend_kill herdr default:w1:p2 "" fm-intended-task || exit 15
     [ "$(fm_backend_agent_alive herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 16
     [ "$(fm_backend_busy_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 17

@@ -42,6 +42,10 @@ case "${1:-}" in
   kill-window) rm -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}"; exit 0 ;;
   new-window)
     case "$*" in *"${FM_FAKE_TMUX_FAIL_LABEL:-__never__}"*) exit 41 ;; esac
+    [ -z "${FM_FAKE_TMUX_NEW_WINDOW_MARKER:-}" ] || touch "$FM_FAKE_TMUX_NEW_WINDOW_MARKER"
+    if [ -n "${FM_FAKE_TMUX_NEW_WINDOW_GATE:-}" ]; then
+      while [ ! -f "$FM_FAKE_TMUX_NEW_WINDOW_GATE" ]; do sleep 0.05; done
+    fi
     touch "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}"
     printf '%%77\n'
     exit 0
@@ -52,7 +56,15 @@ case "${1:-}" in
       for arg in "$@"; do
         if [ "$prev" = -l ]; then
           printf '%s\n' "$arg" >> "$FM_FAKE_LAUNCH_LOG"
-          case "$arg" in *' resume --task '*) [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || touch "$FM_FAKE_AF_RESUME_ARM" ;; esac
+          case "$arg" in
+            *' resume --task '*) [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || touch "$FM_FAKE_AF_RESUME_ARM" ;;
+            *'account-native-launch'*)
+              [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || touch "$FM_FAKE_AF_RESUME_ARM"
+              native_path=${arg#*\'}
+              native_path=${native_path%%\'*}
+              [ -z "${FM_FAKE_NATIVE_LAUNCH_LOG:-}" ] || cat "$native_path" >> "$FM_FAKE_NATIVE_LAUNCH_LOG"
+              ;;
+          esac
         fi
         prev=$arg
       done
@@ -61,9 +73,17 @@ case "${1:-}" in
       *' Enter')
         if [ -n "${FM_FAKE_AF_RESUME_ARM:-}" ] && [ -f "$FM_FAKE_AF_RESUME_ARM" ]; then
           rm -f "$FM_FAKE_AF_RESUME_ARM"
-          if [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
-            touch "$FM_FAKE_AF_SESSION_REFRESHED"
-          fi
+          [ -z "${FM_FAKE_AF_RESUME_READY:-}" ] || touch "$FM_FAKE_AF_RESUME_READY"
+          (
+            for _ in $(seq 1 200); do
+              [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] && break
+              sleep 0.05
+            done
+            if [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] \
+              && [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
+              touch "$FM_FAKE_AF_SESSION_REFRESHED"
+            fi
+          ) </dev/null >/dev/null 2>&1 &
         fi
         ;;
     esac
@@ -115,11 +135,20 @@ case "$*" in
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
-    case "$*" in *" lease recover "*) [ -z "${FM_FAKE_AF_RECOVER_TASK:-}" ] || task=$FM_FAKE_AF_RECOVER_TASK ;; esac
+    case "$*" in
+      *" lease recover "*)
+        [ -z "${FM_FAKE_AF_RECOVER_TASK:-}" ] || task=$FM_FAKE_AF_RECOVER_TASK
+        [ "${FM_FAKE_AF_STALE_REFRESH_ON_RECOVER:-0}" != 1 ] || touch "${FM_FAKE_AF_SESSION_REFRESHED:?}"
+        ;;
+    esac
     printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$provider"
     ;;
   *" session status "*)
     [ "${FM_FAKE_AF_SESSION_MISSING:-0}" != 1 ] || exit 1
+    if [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] \
+      && [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
+      touch "$FM_FAKE_AF_SESSION_REFRESHED"
+    fi
     [ -z "${FM_FAKE_AF_SESSION_MARKER:-}" ] || touch "$FM_FAKE_AF_SESSION_MARKER"
     [ -z "${FM_FAKE_AF_SESSION_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SESSION_SLEEP"
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
@@ -131,6 +160,7 @@ case "$*" in
     ;;
   *" lease release "*)
     [ -z "${FM_FAKE_AF_RELEASE_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_MARKER"
+    [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 43
     if [ -n "${FM_FAKE_AF_RELEASE_FAIL_ONCE:-}" ] && [ ! -f "$FM_FAKE_AF_RELEASE_FAIL_ONCE" ]; then
       touch "$FM_FAKE_AF_RELEASE_FAIL_ONCE"
       exit 43
@@ -138,6 +168,7 @@ case "$*" in
     printf '{"ok":true}\n'
     ;;
   *" session remove "*)
+    [ "${FM_FAKE_AF_SESSION_REMOVE_FAIL:-0}" != 1 ] || exit 44
     if [ -n "${FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE:-}" ] && [ ! -f "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE" ]; then
       touch "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE"
       exit 44
@@ -180,15 +211,18 @@ EOF
   LIFECYCLE_LOG="$CASE_DIR/lifecycle.log"
   ORCA_LOG="$CASE_DIR/orca.log"
   LAUNCH_LOG="$CASE_DIR/launch.log"
+  NATIVE_LAUNCH_LOG="$CASE_DIR/native-launch.log"
   : > "$AF_LOG"
   : > "$TMUX_LOG"
   : > "$TREEHOUSE_LOG"
   : > "$LIFECYCLE_LOG"
   : > "$ORCA_LOG"
   : > "$LAUNCH_LOG"
+  : > "$NATIVE_LAUNCH_LOG"
 }
 
 run_spawn() {
+  local id=$1
   FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
@@ -198,6 +232,8 @@ run_spawn() {
     FM_FAKE_ORCA_LOG="$ORCA_LOG" \
     FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_AF_RESUME_ARM="$CASE_DIR/resume-arm" FM_FAKE_AF_SESSION_REFRESHED="$CASE_DIR/session-refreshed" \
+    FM_FAKE_AF_RESUME_READY="$HOME_DIR/state/.$id.account-native-ready" FM_FAKE_AF_RESUME_GO="$HOME_DIR/state/.$id.account-native-go" \
+    FM_FAKE_NATIVE_LAUNCH_LOG="$NATIVE_LAUNCH_LOG" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_ACCOUNT_SESSION_WAIT_SECONDS=0 \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$SPAWN" "$@" 2>&1
 }
@@ -235,6 +271,7 @@ clear_case_logs() {
   : > "$LIFECYCLE_LOG"
   : > "$ORCA_LOG"
   : > "$LAUNCH_LOG"
+  : > "$NATIVE_LAUNCH_LOG"
   rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/session-refreshed"
 }
 
@@ -373,13 +410,15 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   : > "$AF_LOG"
   : > "$TMUX_LOG"
   : > "$LAUNCH_LOG"
+  : > "$NATIVE_LAUNCH_LOG"
   out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" --resume-account)
   status=$?
   [ "$status" -eq 0 ] || fail "managed resume should succeed (exit $status): $out"
   assert_grep "lease recover --task $account_task" "$AF_LOG" "resume used new-task selection instead of sticky recovery reservation"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "resume ran the new-task quota path"
-  launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "--format json resume --task '$account_task' -- --dangerously-skip-permissions" "resume did not use Agent Fleet's fail-closed task mapping"
+  launch=$(cat "$LAUNCH_LOG" "$NATIVE_LAUNCH_LOG")
+  assert_contains "$launch" "--format json resume --task '$account_task' -- \"\$@\"" "resume did not use Agent Fleet's fail-closed task mapping"
+  assert_contains "$launch" "account-native-launch' --dangerously-skip-permissions" "resume did not pass provider arguments through its launch gate"
   assert_not_contains "$launch" 'cat ' "resume started a fresh prompted conversation"
   [ "$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)" = "$before_session" ] || fail "resume changed provider session identity"
 
@@ -448,6 +487,26 @@ test_native_resume_requires_fresh_sessionstart_evidence() {
   assert_regex '^kill-window ' "$TMUX_LOG" "stale native resume retained its failed endpoint"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "stale native resume changed session truth"
   pass "native resume commits only after a fresh SessionStart update"
+}
+
+test_native_resume_rejects_prelaunch_sessionstart_evidence() {
+  local id rec out status account_task session
+  id=account-resume-launch-z9d
+  rec=$(make_case resume-launch claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "launch-specific resume precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_STALE_REFRESH_ON_RECOVER=1 FM_FAKE_AF_RESUME_NO_REFRESH=1 run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "native resume accepted SessionStart evidence produced before its launch gate"
+  assert_contains "$out" "no fresh Agent Fleet SessionStart update" "prelaunch SessionStart evidence was not rejected"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "prelaunch evidence failure leaked its recovered reservation"
+  assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "prelaunch evidence failure changed durable session truth"
+  pass "native resume requires SessionStart evidence after its own launch gate"
 }
 
 make_seeded_secondmate_home() {
@@ -646,6 +705,28 @@ test_fresh_launch_requires_session_binding_and_fully_rolls_back() {
   pass "fresh managed launches commit only after provider binding and otherwise unwind"
 }
 
+test_failed_cleanup_persists_retryable_metadata() {
+  local id rec out status task
+  id=account-rollback-retry-z18b
+  rec=$(make_case rollback-retry claude "$id")
+  read_case "$rec"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed launch with failed cleanup unexpectedly succeeded"
+  task=$(logged_account_task)
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "failed cleanup did not persist a retry marker"
+  assert_grep "account_task=$task" "$HOME_DIR/state/$id.meta" "failed cleanup lost its Agent Fleet task identity"
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" "failed cleanup recycled its retained worktree"
+
+  clear_case_logs
+  run_teardown "$id" --force >/dev/null || fail "teardown could not retry failed Agent Fleet cleanup"
+  assert_grep "lease release --task $task --force" "$AF_LOG" "teardown did not retry the failed lease release"
+  assert_grep "session remove --task $task" "$AF_LOG" "teardown did not retry the failed session cleanup"
+  assert_grep 'return --force' "$TREEHOUSE_LOG" "teardown did not recycle the worktree after account cleanup"
+  assert_absent "$HOME_DIR/state/$id.meta" "teardown left failed-attempt metadata after cleanup"
+  pass "failed Agent Fleet cleanup leaves durable teardown-retry state"
+}
+
 test_observe_invalid_response_remains_advisory() {
   local id rec out status launch
   id=account-observe-invalid-z19
@@ -760,6 +841,76 @@ test_predecessor_cleanup_failure_preserves_replacement_for_retry() {
   assert_not_grep '^account_predecessor_' "$HOME_DIR/state/$id.meta" "predecessor cleanup retry left pending metadata"
   assert_grep "account_task=$new_task" "$HOME_DIR/state/$id.meta" "predecessor cleanup retry changed the healthy replacement"
   pass "predecessor cleanup retries without destroying the verified replacement"
+}
+
+test_failed_continuation_cleanup_restores_predecessor_for_retry() {
+  local id rec old_task failed_task final_task out status
+  id=account-continuation-rollback-z21c
+  rec=$(make_case continuation-rollback claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation rollback precondition spawn failed"
+  old_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unbound continuation with failed cleanup unexpectedly succeeded"
+  failed_task=$(meta_account_task "$id")
+  [ "$failed_task" != "$old_task" ] || fail "failed continuation never installed its cleanup generation"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "failed continuation cleanup lost its retry marker"
+  assert_grep "account_predecessor_task=$old_task" "$HOME_DIR/state/$id.meta" "failed continuation cleanup lost predecessor identity"
+
+  clear_case_logs
+  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -eq 0 ] || fail "continuation retry could not clean and replace its failed generation: $out"
+  final_task=$(meta_account_task "$id")
+  [ "$final_task" != "$old_task" ] && [ "$final_task" != "$failed_task" ] || fail "continuation retry did not create a fresh generation"
+  assert_grep "lease release --task $failed_task --force" "$AF_LOG" "continuation retry did not clean its failed lease"
+  assert_grep "session remove --task $failed_task" "$AF_LOG" "continuation retry did not clean its failed mapping"
+  assert_grep "lease release --task $old_task --force" "$AF_LOG" "continuation retry did not clean its restored predecessor"
+  assert_not_grep '^account_rollback_' "$HOME_DIR/state/$id.meta" "continuation retry retained rollback metadata"
+  pass "failed continuation cleanup restores predecessor state before retry"
+}
+
+test_concurrent_continuations_serialize_before_mutation() {
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
+  id=account-continuation-race-z21d
+  rec=$(make_case continuation-race claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation race precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  marker="$CASE_DIR/first-endpoint-started"
+  gate="$CASE_DIR/allow-first-endpoint"
+
+  FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_TMUX_NEW_WINDOW_MARKER="$marker" FM_FAKE_TMUX_NEW_WINDOW_GATE="$gate" \
+    run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/first.out" 2>&1 &
+  first_pid=$!
+  for _ in $(seq 1 100); do
+    [ -f "$marker" ] && break
+    sleep 0.05
+  done
+  [ -f "$marker" ] || { kill "$first_pid" 2>/dev/null || true; fail "first continuation never reached endpoint creation"; }
+  FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
+  second_pid=$!
+  sleep 0.2
+  touch "$gate"
+  wait "$first_pid"
+  first_rc=$?
+  wait "$second_pid"
+  second_rc=$?
+  [ "$first_rc" -eq 0 ] || fail "first serialized continuation failed: $(cat "$CASE_DIR/first.out")"
+  [ "$second_rc" -ne 0 ] || fail "second concurrent continuation also launched"
+  assert_grep 'generation changed before recovery mutation' "$CASE_DIR/second.out" "concurrent continuation did not fail at generation revalidation"
+  lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
+  endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
+  [ "$lease_count" -eq 1 ] || fail "concurrent continuations acquired $lease_count leases"
+  [ "$endpoint_count" -eq 1 ] || fail "concurrent continuations created $endpoint_count endpoints"
+  pass "continuation generation locking serializes before endpoint and lease mutation"
 }
 
 test_continuation_fails_closed_without_original_brief() {
@@ -898,6 +1049,7 @@ test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence
+test_native_resume_rejects_prelaunch_sessionstart_evidence
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
 test_unused_secondmate_pool_never_blocks_unmanaged_spawn
@@ -908,12 +1060,15 @@ test_raw_enforced_launch_is_rejected_before_mutation
 test_malformed_routing_mode_fails_closed
 test_invalid_selection_response_releases_reservation
 test_fresh_launch_requires_session_binding_and_fully_rolls_back
+test_failed_cleanup_persists_retryable_metadata
 test_observe_invalid_response_remains_advisory
 test_explicit_secondmate_profile_ignores_configured_pool
 test_enforced_orca_is_rejected_before_owned_resource_creation
 test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
 test_predecessor_cleanup_failure_preserves_replacement_for_retry
+test_failed_continuation_cleanup_restores_predecessor_for_retry
+test_concurrent_continuations_serialize_before_mutation
 test_continuation_fails_closed_without_original_brief
 test_session_sync_cannot_recreate_metadata_after_teardown
 test_managed_steering_audit_failure_does_not_reclassify_delivery

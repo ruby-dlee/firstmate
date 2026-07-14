@@ -115,13 +115,17 @@ release_teardown_account_locks() {
 }
 trap release_teardown_account_locks EXIT
 
-MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
-if [ -n "$MANAGED_PROFILE" ]; then
+managed_account_meta() {
+  [ -n "$(fm_meta_get "$1" account_profile)" ] || [ "$(fm_meta_get "$1" account_rollback_cleanup)" = pending ]
+}
+
+MANAGED_ACCOUNT=0
+if managed_account_meta "$META"; then
+  MANAGED_ACCOUNT=1
   ACCOUNT_DELETE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
   [ -f "$META" ] || { echo "error: task metadata disappeared while teardown waited for $ID" >&2; exit 1; }
-  MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
-  [ -n "$MANAGED_PROFILE" ] || { echo "error: managed task metadata changed while teardown waited for $ID" >&2; exit 1; }
+  managed_account_meta "$META" || { echo "error: managed task metadata changed while teardown waited for $ID" >&2; exit 1; }
 fi
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
@@ -164,7 +168,7 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
   local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} profile account_task meta_state backend target zellij_tab acquired=0
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
-  [ -n "$profile" ] || return 0
+  [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
   meta_state=$(dirname "$meta")
   if [ -z "$lock" ]; then
     lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
@@ -176,11 +180,11 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
     return 1
   }
   profile=$(fm_meta_get "$meta" account_profile)
-  [ -n "$profile" ] || {
+  if [ -z "$profile" ] && [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; then
     echo "error: managed metadata for $task changed during teardown" >&2
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
-  }
+  fi
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
@@ -195,6 +199,34 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
     echo "error: managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
+  fi
+  if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
+    fm_account_cleanup_rollback "$meta" "$DATA" "$task" || {
+      echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
+    profile=$(fm_meta_get "$meta" account_profile)
+    if [ -z "$profile" ]; then
+      MANAGED_ACCOUNT_LOCK=$lock
+      [ "$acquired" = 0 ] || TEARDOWN_ACCOUNT_LOCKS+=("$lock")
+      return 0
+    fi
+    backend=$(fm_backend_of_meta "$meta")
+    target=$(fm_backend_target_of_meta "$meta")
+    zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
+    if [ -n "$target" ]; then
+      if [ -n "$probe_home" ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" ) 2>/dev/null || true
+      else
+        fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
+      fi
+    fi
+    if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
+      echo "error: restored managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    fi
   fi
   account_task=$(fm_meta_get "$meta" account_task)
   [ -n "$account_task" ] || account_task=$task
@@ -962,13 +994,13 @@ cleanup_firstmate_home_children() {
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
     child_account_lock=
-    if [ -n "$(fm_meta_get "$child_meta" account_profile)" ]; then
+    if managed_account_meta "$child_meta"; then
       child_account_lock=$(fm_account_meta_lock_acquire "$sub_state" "$child_id") || return 1
       TEARDOWN_ACCOUNT_LOCKS+=("$child_account_lock")
-      [ -f "$child_meta" ] && [ -n "$(fm_meta_get "$child_meta" account_profile)" ] || {
+      if [ ! -f "$child_meta" ] || ! managed_account_meta "$child_meta"; then
         echo "error: managed child metadata changed while teardown waited for $child_id" >&2
         return 1
-      }
+      fi
     fi
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
@@ -986,7 +1018,7 @@ cleanup_firstmate_home_children() {
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       fi
     fi
-    if [ -n "$(fm_meta_get "$child_meta" account_profile)" ]; then
+    if managed_account_meta "$child_meta"; then
       release_managed_account "$child_meta" "$child_id" "$home" "$child_account_lock" || return 1
       child_account_lock=$MANAGED_ACCOUNT_LOCK
     else
@@ -1093,7 +1125,7 @@ fi
 
 PROBE_HOME=
 [ "$KIND" != secondmate ] || PROBE_HOME=$HOME_PATH
-if [ -n "$MANAGED_PROFILE" ]; then
+if [ "$MANAGED_ACCOUNT" = 1 ]; then
   release_managed_account "$META" "$ID" "$PROBE_HOME" "$ACCOUNT_DELETE_LOCK" || exit 1
 fi
 
@@ -1116,7 +1148,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
-  if [ -z "$MANAGED_PROFILE" ]; then
+  if [ "$MANAGED_ACCOUNT" = 0 ]; then
     [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fi
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
@@ -1143,7 +1175,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ -z "$MANAGED_PROFILE" ] && [ "$BACKEND" != orca ]; then
+if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
 if [ "$KIND" = secondmate ]; then

@@ -184,6 +184,10 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
   fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account metadata lock" >&2; return 1; }
   case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid account metadata lock wait '$wait_seconds'" >&2; return 1 ;; esac
   case "$ownerless_grace" in ''|*[!0-9]*) echo "error: invalid account metadata lock ownerless grace '$ownerless_grace'" >&2; return 1 ;; esac
+  start=$(fm_account_process_start_time "$$") || {
+    echo "error: cannot record account metadata lock owner for $task" >&2
+    return 1
+  }
   mkdir -p "$state" || return 1
   lock="$state/.account-meta-$task.lock"
   deadline=$(( $(date +%s) + wait_seconds ))
@@ -198,11 +202,6 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
     }
     sleep 0.05
   done
-  start=$(fm_account_process_start_time "$$") || {
-    rmdir "$lock" 2>/dev/null || true
-    echo "error: cannot record account metadata lock owner for $task" >&2
-    return 1
-  }
   owner_tmp="$lock/.owner.$$"
   printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
     rm -rf "$lock"
@@ -248,6 +247,68 @@ fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task
 
 fm_account_meta_value() {  # <meta> <key>
   sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
+}
+
+fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
+  local meta=$1 data=$2 task=$3 pending account_task attempt provider pool profile session preserve backup_name backup_token backup predecessor backup_task tmp
+  pending=$(fm_account_meta_value "$meta" account_rollback_cleanup)
+  [ "$pending" = pending ] || return 0
+  account_task=$(fm_account_meta_value "$meta" account_task)
+  attempt=$(fm_account_meta_value "$meta" account_attempt)
+  provider=$(fm_account_meta_value "$meta" harness)
+  pool=$(fm_account_meta_value "$meta" account_pool)
+  profile=$(fm_account_meta_value "$meta" account_profile)
+  session=$(fm_account_meta_value "$meta" provider_session_id)
+  preserve=$(fm_account_meta_value "$meta" account_rollback_preserve_session)
+  backup_name=$(fm_account_meta_value "$meta" account_rollback_backup)
+  predecessor=$(fm_account_meta_value "$meta" account_predecessor_task)
+  fm_account_valid_id "$account_task" || {
+    echo "error: invalid failed Agent Fleet attempt for $task" >&2
+    return 1
+  }
+  case "$preserve" in ''|0|1) ;; *) echo "error: invalid rollback session policy for $task" >&2; return 1 ;; esac
+  backup=
+  if [ -n "$backup_name" ]; then
+    case "$backup_name" in
+      ".$task.meta.rollback."*) ;;
+      *) echo "error: unsafe rollback backup for $task" >&2; return 1 ;;
+    esac
+    backup_token=${backup_name#".$task.meta.rollback."}
+    fm_account_valid_id "$backup_token" || { echo "error: unsafe rollback backup for $task" >&2; return 1; }
+    backup="$(dirname "$meta")/$backup_name"
+    [ -f "$backup" ] || {
+      echo "error: rollback backup is missing for $task" >&2
+      return 1
+    }
+    backup_task=$(fm_account_meta_value "$backup" account_task)
+    if [ -n "$predecessor" ]; then
+      [ "$backup_task" = "$predecessor" ] || {
+        echo "error: rollback backup does not match the predecessor for $task" >&2
+        return 1
+      }
+    elif [ "$preserve" = 1 ]; then
+      [ "$backup_task" = "$account_task" ] || {
+        echo "error: rollback backup does not match the native recovery for $task" >&2
+        return 1
+      }
+    fi
+  fi
+  fm_account_release "$account_task" --force || return 1
+  if [ "$preserve" != 1 ]; then
+    fm_account_session_remove "$account_task" || return 1
+  fi
+  if [ -n "$backup" ]; then
+    mv "$backup" "$meta" || return 1
+  else
+    tmp="$(dirname "$meta")/.$task.meta.rollback-clean.$$"
+    awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    printf 'rollback_pending=1\n' >> "$tmp"
+    mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  fi
+  [ -n "$attempt" ] || attempt=legacy
+  fm_account_lineage_append "$data" "$task" rolled-back "$attempt" "$account_task" "$provider" "$pool" "$profile" "$session" "${predecessor:-none}" || {
+    echo "warning: failed attempt cleanup completed but lineage recording failed for $task" >&2
+  }
 }
 
 fm_account_cleanup_predecessor() {  # <meta> <data-dir> <task>

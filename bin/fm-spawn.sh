@@ -222,6 +222,27 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
   RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
+    rollback_id=${POS[0]}
+    rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
+    rollback_meta_lock=$(fm_account_meta_lock_acquire "$STATE" "$rollback_id") || exit 1
+    if [ ! -f "$RESUME_META" ] || [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" != pending ] \
+      || [ "$(fm_account_meta_value "$RESUME_META" account_task)" != "$rollback_account_task" ]; then
+      fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+      echo "error: managed task generation changed before rollback cleanup for $rollback_id" >&2
+      exit 1
+    fi
+    if ! fm_account_cleanup_rollback "$RESUME_META" "$DATA" "$rollback_id"; then
+      fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+      echo "error: failed Agent Fleet attempt cleanup remains pending for $rollback_id" >&2
+      exit 1
+    fi
+    fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
+    if [ -z "$(fm_account_meta_value "$RESUME_META" account_profile)" ]; then
+      echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; tear down its retained worktree before spawning again" >&2
+      exit 1
+    fi
+  fi
   if [ "$(fm_account_meta_value "$RESUME_META" account_predecessor_cleanup)" = pending ]; then
     cleanup_id=${POS[0]}
     cleanup_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
@@ -302,6 +323,9 @@ META_INSTALLED=0
 META_BACKUP=
 META_WRITE_LOCK=
 RAW_LAUNCH=0
+ACCOUNT_NATIVE_LAUNCH_SCRIPT=
+ACCOUNT_NATIVE_LAUNCH_READY=
+ACCOUNT_NATIVE_LAUNCH_GO=
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -320,12 +344,75 @@ parse_orca_worktree_result() {
   fi
 }
 
+persist_failed_account_rollback() {
+  local meta tmp current_task backup_name rollback_window
+  mkdir -p "$STATE" || return 1
+  meta="$STATE/$ID.meta"
+  tmp="$STATE/.$ID.meta.rollback-pending.$$"
+  current_task=$(fm_account_meta_value "$meta" account_task)
+  if [ -f "$meta" ] && [ "$current_task" = "$ACCOUNT_TASK" ]; then
+    awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    rollback_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+    {
+      echo "window=$rollback_window"
+      echo "worktree=${WT:-}"
+      echo "project=${PROJ_ABS:-}"
+      echo "harness=${HARNESS:-}"
+      echo "kind=${KIND:-ship}"
+      echo "mode=${MODE:-no-mistakes}"
+      echo "yolo=${YOLO:-off}"
+      echo "tasktmp=${TASK_TMP:-}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      [ -z "${ACCOUNT_POOL:-}" ] || echo "account_pool=$ACCOUNT_POOL"
+      [ -z "${ACCOUNT_PROFILE:-}" ] || echo "account_profile=$ACCOUNT_PROFILE"
+      echo "account_task=$ACCOUNT_TASK"
+      echo "account_attempt=${ACCOUNT_ATTEMPT:-legacy}"
+      [ -z "${ACCOUNT_PREDECESSOR_TASK:-}" ] || echo "account_predecessor_task=$ACCOUNT_PREDECESSOR_TASK"
+      [ -z "${ACCOUNT_PREDECESSOR_ATTEMPT:-}" ] || echo "account_predecessor_attempt=$ACCOUNT_PREDECESSOR_ATTEMPT"
+      [ -z "${ACCOUNT_PREDECESSOR_PROVIDER:-}" ] || echo "account_predecessor_provider=$ACCOUNT_PREDECESSOR_PROVIDER"
+      [ -z "${ACCOUNT_PREDECESSOR_PROFILE:-}" ] || echo "account_predecessor_profile=$ACCOUNT_PREDECESSOR_PROFILE"
+      [ -z "${ACCOUNT_PREDECESSOR_POOL:-}" ] || echo "account_predecessor_pool=$ACCOUNT_PREDECESSOR_POOL"
+      [ -z "${ACCOUNT_PREDECESSOR_SESSION:-}" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
+      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ "${BACKEND:-tmux}" != herdr ] || {
+        echo "herdr_session=${HERDR_SES:-}"
+        echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+        echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+        echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != zellij ] || {
+        echo "zellij_session=${ZELLIJ_SES:-}"
+        echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+        echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != cmux ] || {
+        echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+        echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+      }
+      [ "${KIND:-ship}" != secondmate ] || {
+        echo "home=${PROJ_ABS:-}"
+        echo "projects=${SECONDMATE_PROJECTS:-}"
+      }
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  printf 'account_rollback_cleanup=pending\n' >> "$tmp"
+  if [ -n "$META_BACKUP" ]; then
+    backup_name=${META_BACKUP##*/}
+    printf 'account_rollback_backup=%s\n' "$backup_name" >> "$tmp"
+  fi
+  [ "$RESUME_ACCOUNT" != 1 ] || printf 'account_rollback_preserve_session=1\n' >> "$tmp"
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
 spawn_abort_cleanup() {
   local status=$? probe_home endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp
   trap - EXIT
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
   if [ -n "${META_WRITE_LOCK:-}" ]; then
-    fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
+    rollback_lock=$META_WRITE_LOCK
     META_WRITE_LOCK=
   fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
@@ -369,11 +456,16 @@ spawn_abort_cleanup() {
       echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
     fi
   fi
+  [ -z "${ACCOUNT_NATIVE_LAUNCH_GO:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
+  [ -z "${ACCOUNT_NATIVE_LAUNCH_READY:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
+  [ -z "${ACCOUNT_NATIVE_LAUNCH_SCRIPT:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
-    if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
-      :
-    else
-      account_clean=0
+    if [ -z "$rollback_lock" ]; then
+      if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
+        :
+      else
+        account_clean=0
+      fi
     fi
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
       if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
@@ -415,9 +507,21 @@ spawn_abort_cleanup() {
         rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
         [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"
       fi
+    elif [ -n "$rollback_lock" ]; then
+      persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
     fi
     [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
+    rollback_lock=
   fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
+    fi
+  fi
+  [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   return "$status"
 }
@@ -508,13 +612,15 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
   RECORDED_ACCOUNT_TASK=$(fm_meta_get "$RESUME_META" account_task)
   RECORDED_ATTEMPT=$(fm_meta_get "$RESUME_META" account_attempt)
+  RECORDED_PROJECT=$(fm_meta_get "$RESUME_META" project)
+  RECORDED_WORKTREE=$(fm_meta_get "$RESUME_META" worktree)
   [ -n "$RECORDED_ACCOUNT_TASK" ] || RECORDED_ACCOUNT_TASK=$ID
   [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
   [ -n "$RECORDED_HARNESS" ] || { echo "error: managed recovery metadata has no harness for $ID" >&2; exit 1; }
   [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
   [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    RECORDED_SESSION_UPDATED_AT=$("$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
+    "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
     RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
     [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
     if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
@@ -713,7 +819,36 @@ fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
   fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
 fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    current_recovery_task=$(fm_meta_get "$RESUME_META" account_task)
+    current_recovery_attempt=$(fm_meta_get "$RESUME_META" account_attempt)
+    [ -n "$current_recovery_task" ] || current_recovery_task=$ID
+    [ -n "$current_recovery_attempt" ] || current_recovery_attempt=legacy
+    if [ ! -f "$RESUME_META" ] \
+      || [ "$current_recovery_task" != "$RECORDED_ACCOUNT_TASK" ] \
+      || [ "$current_recovery_attempt" != "$RECORDED_ATTEMPT" ] \
+      || [ "$(fm_meta_get "$RESUME_META" harness)" != "$RECORDED_HARNESS" ] \
+      || [ "$(fm_meta_get "$RESUME_META" account_profile)" != "$RECORDED_PROFILE" ] \
+      || [ "$(fm_meta_get "$RESUME_META" account_pool)" != "$RECORDED_POOL" ] \
+      || [ "$(fm_meta_get "$RESUME_META" project)" != "$RECORDED_PROJECT" ] \
+      || [ "$(fm_meta_get "$RESUME_META" worktree)" != "$RECORDED_WORKTREE" ] \
+      || [ "$(fm_backend_of_meta "$RESUME_META")" != "$BACKEND" ] \
+      || [ -n "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] \
+      || [ -n "$(fm_meta_get "$RESUME_META" account_predecessor_cleanup)" ]; then
+      echo "error: managed task generation changed before recovery mutation for $ID" >&2
+      exit 1
+    fi
+    META_BACKUP="$STATE/.$ID.meta.rollback.$$"
+    cp -p "$RESUME_META" "$META_BACKUP" || exit 1
+  fi
+fi
 if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
+  if [ "$(fm_meta_get "$STATE/$ID.meta" rollback_pending)" = 1 ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_rollback_cleanup)" = pending ]; then
+    echo "error: rollback cleanup is pending for $ID; tear down the retained task state before spawning again" >&2
+    exit 1
+  fi
   existing_profile=$(fm_meta_get "$STATE/$ID.meta" account_profile)
   [ -z "$existing_profile" ] || {
     echo "error: managed metadata already exists for $ID; use --resume-account or --continue-account" >&2
@@ -1367,11 +1502,7 @@ fi
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-    META_BACKUP="$STATE/.$ID.meta.backup.$$"
-    cp -p "$RESUME_META" "$META_BACKUP" || exit 1
-  fi
+  [ -n "$META_WRITE_LOCK" ] || { echo "error: managed generation lock was lost before metadata install for $ID" >&2; exit 1; }
 fi
 META_TMP="$STATE/.$ID.meta.$$"
 {
@@ -1465,7 +1596,23 @@ fi
 AGENT_COMMAND=$HARNESS
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    AGENT_COMMAND=$(fm_account_resume_command "$ACCOUNT_TASK") || exit 1
+    ACCOUNT_NATIVE_LAUNCH_SCRIPT="$STATE/.$ID.account-native-launch"
+    ACCOUNT_NATIVE_LAUNCH_READY="$STATE/.$ID.account-native-ready"
+    ACCOUNT_NATIVE_LAUNCH_GO="$STATE/.$ID.account-native-go"
+    rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" "$ACCOUNT_NATIVE_LAUNCH_READY" "$ACCOUNT_NATIVE_LAUNCH_GO"
+    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK") || exit 1
+    native_ready_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_READY")
+    native_go_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_GO")
+    cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -eu
+touch $native_ready_q
+while [ ! -f $native_go_q ]; do sleep 0.05; done
+rm -f $native_ready_q $native_go_q
+exec $resume_command "\$@"
+EOF
+    chmod +x "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
+    AGENT_COMMAND=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_SCRIPT")
   else
     AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK") || exit 1
   fi
@@ -1494,12 +1641,27 @@ spawn_send_key "$T" Enter
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
   if [ "$RESUME_ACCOUNT" = 1 ]; then
+    native_ready_wait=${FM_ACCOUNT_NATIVE_READY_WAIT_SECONDS:-5}
+    case "$native_ready_wait" in ''|*[!0-9]*) echo "error: invalid native launch ready wait '$native_ready_wait'" >&2; exit 1 ;; esac
+    native_ready_deadline=$(( $(date +%s) + native_ready_wait ))
+    while [ ! -f "$ACCOUNT_NATIVE_LAUNCH_READY" ]; do
+      [ "$(date +%s)" -lt "$native_ready_deadline" ] || {
+        echo "error: native provider wrapper for $ID did not reach its launch gate" >&2
+        exit 1
+      }
+      sleep 0.05
+    done
+    RECORDED_SESSION_UPDATED_AT=$("$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
+    touch "$ACCOUNT_NATIVE_LAUNCH_GO" || exit 1
     session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
   fi
   if ! "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
+  [ -z "$ACCOUNT_NATIVE_LAUNCH_GO" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
+  [ -z "$ACCOUNT_NATIVE_LAUNCH_READY" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
+  [ -z "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
     echo "error: managed task generation changed before launch commit for $ID" >&2

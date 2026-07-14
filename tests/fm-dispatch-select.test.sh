@@ -180,6 +180,7 @@ make_fake_agent_fleet() {
 #!/usr/bin/env bash
 set -u
 [ -z "${FM_FAKE_AF_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
+[ -z "${FM_FAKE_AF_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SLEEP"
 pool=
 provider=
 prev=
@@ -197,6 +198,22 @@ printf '{"schema":1,"pool":"%s","providers":[{"provider":"%s","available":%s,"se
   "$pool" "$provider" "$available" "$mode" "$headroom"
 SH
   chmod +x "$fakebin/agent-fleet"
+}
+
+test_account_pool_query_timeout_falls_back() {
+  local fakebin pooled out started elapsed
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-timeout")
+  make_fake_agent_fleet "$fakebin"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  started=$(date +%s)
+  out=$(FM_FAKE_AF_SLEEP=10 FM_DISPATCH_AGENT_FLEET_TIMEOUT=1 \
+    FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" 2>"$TMP_ROOT/agent-fleet-timeout.err")
+  elapsed=$(( $(date +%s) - started ))
+  [ "$out" = '{"harness":"claude","account_pool":"claude-crew"}' ] || fail "timed-out pool query did not use the first profile"
+  [ "$elapsed" -lt 5 ] || fail "pool query exceeded its command timeout (${elapsed}s)"
+  assert_contains "$(cat "$TMP_ROOT/agent-fleet-timeout.err")" 'agent-fleet pool status failed' "pool timeout fallback was not logged"
+  pass "quota-balanced dispatch bounds Agent Fleet pool queries"
 }
 
 test_account_pool_summary_owns_provider_quota_choice() {
@@ -357,6 +374,7 @@ test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_backward_compatible_first_selection
 test_account_pool_summary_owns_provider_quota_choice
+test_account_pool_query_timeout_falls_back
 test_enforced_quota_balancing_rejects_poolless_candidates
 test_agent_fleet_binary_precedence_matches_routing
 test_account_fields_survive_direct_selection

@@ -297,7 +297,7 @@ fmx_context_registry_prune() {
 # never write an empty, useless record. Returns non-zero only on invalid input or
 # a write failure; callers treat the write as best-effort.
 fmx_context_registry_set() {
-  local state=$1 rid=$2 platform=${3:-} reply_max=${4:-} refresh=${5:-0} dir file tmp now recorded_at
+  local state=$1 rid=$2 platform=${3:-} reply_max=${4:-} refresh=${5:-0} dir file tmp now recorded_at existing
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
@@ -313,9 +313,6 @@ fmx_context_registry_set() {
     0|1) ;;
     *) return 1 ;;
   esac
-  if [ -z "$platform" ] && [ -z "$reply_max" ]; then
-    return 0
-  fi
   dir="$state/x-context"
   mkdir -p "$dir" 2>/dev/null || return 1
   fmx_context_registry_prune "$state"
@@ -325,6 +322,14 @@ fmx_context_registry_set() {
   esac
   [ "${#now}" -le 18 ] || return 1
   file="$dir/$rid.json"
+  if [ -f "$file" ]; then
+    existing=$(fmx_context_registry_get "$state" "$rid")
+    [ -n "$platform" ] || platform=$(printf '%s\n' "$existing" | jq -r '.platform // ""' 2>/dev/null)
+    [ -n "$reply_max" ] || reply_max=$(printf '%s\n' "$existing" | jq -r '.reply_max_chars // ""' 2>/dev/null)
+  fi
+  if [ -z "$platform" ] && [ -z "$reply_max" ]; then
+    return 0
+  fi
   recorded_at=
   if [ "$refresh" = 0 ] && [ -f "$file" ]; then
     recorded_at=$(fmx_context_registry_recorded_at "$file" "$now") || recorded_at=

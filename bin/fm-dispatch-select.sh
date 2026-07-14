@@ -51,6 +51,7 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 
 STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
+AGENT_FLEET_TIMEOUT=${FM_DISPATCH_AGENT_FLEET_TIMEOUT:-5}
 SELECT_OVERRIDE=
 QUOTA_JSON_FILE=
 ARGS=()
@@ -66,6 +67,8 @@ usage() {
 log() {
   printf 'fm-dispatch-select: %s\n' "$*" >&2
 }
+
+case "$AGENT_FLEET_TIMEOUT" in ''|*[!0-9]*|0) AGENT_FLEET_TIMEOUT=5 ;; esac
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -194,7 +197,7 @@ if [ "$pooled_count" -gt 0 ]; then
   fi
   summaries='[]'
   while IFS=$(printf '\t') read -r index harness pool; do
-    if ! pool_json=$("$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
+    if ! pool_json=$(fm_account_run_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
       log "agent-fleet pool status failed for $pool/$harness; using first profile"
       first_profile
       exit 0

@@ -482,16 +482,22 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
     "project=$PROJ_DIR" \
     "harness=claude" \
     "kind=ship" \
-    "mode=no-mistakes"
-  out=$(run_spawn "$id" "$PROJ_DIR")
+    "mode=no-mistakes" \
+    "pr=418" \
+    "x_request=req-legacy" \
+    "custom_extension=preserve-success"
+  out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -eq 0 ] || fail "pre-cutover unmanaged respawn should succeed (exit $status): $out"
   assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover unmanaged respawn silently activated the report gate"
+  assert_grep 'pr=418' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing PR pointer"
+  assert_grep 'x_request=req-legacy' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing X-mode link"
+  assert_grep 'custom_extension=preserve-success' "$HOME_DIR/state/$id.meta" "managed respawn dropped extension metadata"
   pass "unmanaged respawn preserves a legacy task's report cutover state"
 }
 
 test_failed_managed_respawn_restores_unmanaged_metadata() {
-  local id rec expected out status
+  local id rec expected out status artifact
   id=account-unmanaged-rollback-z9c
   rec=$(make_case unmanaged-rollback claude "$id")
   read_case "$rec"
@@ -506,13 +512,74 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
     "custom_extension=preserve-me"
   expected="$CASE_DIR/original.meta"
   cp "$HOME_DIR/state/$id.meta" "$expected"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
+  done
   out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
   cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "failed managed respawn did not restore the original unmanaged metadata"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
+      || fail "failed managed respawn did not restore prior $artifact state"
+  done
   assert_grep 'lease release ' "$AF_LOG" "failed managed respawn leaked its acquired reservation"
   [ -n "$out" ] || true
   pass "failed managed respawn restores every field from existing unmanaged metadata"
+}
+
+test_session_sync_bounds_agent_fleet_queries() {
+  local id rec meta_tmp started elapsed out status
+  id=account-sync-timeout-z9d
+  rec=$(make_case sync-timeout claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session timeout precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  started=$(date +%s)
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_SESSION_SLEEP=10 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --wait 0 --require 2>&1)
+  status=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -ne 0 ] || fail "timed-out session query unexpectedly succeeded"
+  [ "$elapsed" -lt 5 ] || fail "session query exceeded its command timeout (${elapsed}s)"
+  assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "timed-out session query retained the metadata lock"
+  [ -n "$out" ] || true
+  pass "session synchronization bounds every Agent Fleet query"
+}
+
+test_continuation_rejects_symlinked_charter_ancestor() {
+  local id rec outside out status
+  id=account-charter-escape-z9e
+  rec=$(make_case charter-escape claude "$id")
+  read_case "$rec"
+  outside="$CASE_DIR/outside-data"
+  mkdir -p "$outside"
+  printf 'outside charter\n' > "$outside/charter.md"
+  ln -s "$outside" "$WT_DIR/data"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=secondmate" \
+    "home=$WT_DIR" \
+    "account_pool=claude-crew" \
+    "account_profile=claude-2" \
+    "account_task=$id" \
+    "account_attempt=legacy"
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" safe-attempt 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted a charter through a symlinked ancestor"
+  assert_contains "$out" "no safe non-empty original brief or charter" "unsafe charter rejection was unclear"
+  assert_absent "$HOME_DIR/data/$id/continuation-safe-attempt.md" "unsafe charter was copied into a continuation packet"
+  pass "secondmate continuation requires a contained charter path"
 }
 
 test_recovered_reservations_are_owned_until_launch_commit() {
@@ -1568,6 +1635,8 @@ test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
+test_session_sync_bounds_agent_fleet_queries
+test_continuation_rejects_symlinked_charter_ancestor
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence

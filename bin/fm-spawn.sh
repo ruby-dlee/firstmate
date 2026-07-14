@@ -375,11 +375,34 @@ ENDPOINT_CREATED=0
 WORKTREE_CREATED=0
 META_INSTALLED=0
 META_BACKUP=
+EXISTING_ARTIFACT_BACKUP=
 META_WRITE_LOCK=
 RAW_LAUNCH=0
 ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
+
+snapshot_existing_artifacts() {
+  local backup="$STATE/.$ID.artifacts.rollback.$$" name source tasktmp="/tmp/fm-$ID"
+  mkdir "$backup" || return 1
+  for name in "$ID.status" "$ID.turn-ended" "$ID.check.sh" "$ID.pi-ext.ts" "$ID.grok-turnend-token"; do
+    source="$STATE/$name"
+    if [ -e "$source" ] || [ -L "$source" ]; then
+      if ! cp -Pp "$source" "$backup/$name"; then
+        rm -rf "$backup"
+        return 1
+      fi
+    fi
+  done
+  [ ! -e "$tasktmp" ] || : > "$backup/tasktmp-existed"
+  [ ! -e "$tasktmp/gotmp" ] || : > "$backup/gotmp-existed"
+  EXISTING_ARTIFACT_BACKUP=$backup
+}
+
+discard_existing_artifact_backup() {
+  [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
+  EXISTING_ARTIFACT_BACKUP=
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -399,7 +422,7 @@ parse_orca_worktree_result() {
 }
 
 persist_failed_account_rollback() {
-  local meta tmp current_task backup_name rollback_window
+  local meta tmp current_task backup_name artifact_backup_name rollback_window
   mkdir -p "$STATE" || return 1
   meta="$STATE/$ID.meta"
   tmp="$STATE/.$ID.meta.rollback-pending.$$"
@@ -457,13 +480,17 @@ persist_failed_account_rollback() {
     backup_name=${META_BACKUP##*/}
     printf 'account_rollback_backup=%s\n' "$backup_name" >> "$tmp"
   fi
+  if [ -n "$EXISTING_ARTIFACT_BACKUP" ]; then
+    artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+    printf 'account_rollback_artifacts=%s\n' "$artifact_backup_name" >> "$tmp"
+  fi
   [ "$RESUME_ACCOUNT" != 1 ] || printf 'account_rollback_preserve_session=1\n' >> "$tmp"
   mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
   META_INSTALLED=1
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name
   trap - EXIT
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
   if [ -n "${META_WRITE_LOCK:-}" ]; then
@@ -547,11 +574,21 @@ spawn_abort_cleanup() {
     if [ "$account_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
-          mv "$META_BACKUP" "$STATE/$ID.meta"
+          artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+          if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
+            && mv "$META_BACKUP" "$STATE/$ID.meta"; then
+            [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
+            EXISTING_ARTIFACT_BACKUP=
+            restored_existing_meta=1
+          else
+            account_clean=0
+            echo "warning: failed to restore prior task state for ${ID:-unknown}" >&2
+          fi
         else
           rm -f "$META_BACKUP"
+          discard_existing_artifact_backup
         fi
-        META_BACKUP=
+        [ -f "$META_BACKUP" ] || META_BACKUP=
       elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] && [ "$worktree_clean" = 1 ]; then
         rm -f "$STATE/$ID.meta"
       elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
@@ -560,9 +597,12 @@ spawn_abort_cleanup() {
         printf 'rollback_pending=1\n' >> "$rollback_tmp"
         mv "$rollback_tmp" "$STATE/$ID.meta"
       fi
-      if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$worktree_clean" = 1 ]; then
+      if [ "$account_clean" = 1 ] && [ "$restored_existing_meta" != 1 ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$worktree_clean" = 1 ]; then
         rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
         [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"
+      fi
+      if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
+        persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
       fi
     elif [ -n "$rollback_lock" ]; then
       persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
@@ -580,6 +620,7 @@ spawn_abort_cleanup() {
   fi
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
+  [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
   return "$status"
 }
 trap spawn_abort_cleanup EXIT
@@ -943,6 +984,7 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     META_BACKUP="$STATE/.$ID.meta.rollback.$$"
     cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
+    snapshot_existing_artifacts || exit 1
   fi
 fi
 
@@ -1672,16 +1714,23 @@ META_TMP="$STATE/.$ID.meta.$$"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$META_TMP"
-if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+if [ "$RECOVERY_ACCOUNT" = 1 ] || [ "$EXISTING_META" = 1 ]; then
   # Preserve every extension field not owned by this spawn rewrite (PR/X-mode
   # pointers and future additive metadata) while replacing endpoint identity.
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    PRESERVE_META_SOURCE=$RESUME_META
+  elif [ -n "$META_BACKUP" ]; then
+    PRESERVE_META_SOURCE=$META_BACKUP
+  else
+    PRESERVE_META_SOURCE="$STATE/$ID.meta"
+  fi
   while IFS= read -r meta_line || [ -n "$meta_line" ]; do
     meta_key=${meta_line%%=*}
     case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
     esac
     printf '%s\n' "$meta_line" >> "$META_TMP"
-  done < "$RESUME_META"
+  done < "$PRESERVE_META_SOURCE"
 fi
 mv "$META_TMP" "$STATE/$ID.meta"
 META_INSTALLED=1
@@ -1787,6 +1836,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   ACCOUNT_SPAWN_COMMITTED=1
   [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
   META_BACKUP=
+  discard_existing_artifact_backup
   if [ "$CONTINUE_ACCOUNT" = 1 ]; then
     if ! fm_account_cleanup_predecessor "$STATE/$ID.meta" "$DATA" "$ID"; then
       fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
@@ -1805,5 +1855,6 @@ fi
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
 META_BACKUP=
+discard_existing_artifact_backup
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

@@ -1277,6 +1277,24 @@ test_context_registry_preserves_first_seen_timestamp() {
   pass "context registry rewrites preserve the first-seen timestamp"
 }
 
+test_context_registry_merges_partial_updates() {
+  local home reg
+  home="$TMP_ROOT/registry-partial-update"
+  mkdir -p "$home/state"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial discord 1900' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "initial partial-update registry write failed"
+  FMX_NOW_OVERRIDE=1700000100 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial x ""' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "platform-only registry update failed"
+  reg="$home/state/x-context/req-partial.json"
+  [ "$(jq -r .platform "$reg")" = x ] || fail "platform-only update did not replace the known platform"
+  [ "$(jq -r .reply_max_chars "$reg")" = 1900 ] || fail "platform-only update erased the known reply budget"
+  FMX_NOW_OVERRIDE=1700000200 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial "" 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "budget-only registry update failed"
+  [ "$(jq -r .platform "$reg")" = x ] || fail "budget-only update erased the known platform"
+  [ "$(jq -r .reply_max_chars "$reg")" = 280 ] || fail "budget-only update did not replace the known reply budget"
+  pass "context registry merges partial relay updates"
+}
+
 test_context_registry_retention_starts_on_successful_live_answer() {
   local home fakebin out rc reg
   home="$TMP_ROOT/registry-answer-window"
@@ -2241,6 +2259,7 @@ test_reply_followup_image_dry_run_marks_endpoint_and_compacts_image
 test_poll_records_context_registry_from_relay_platform
 test_context_registry_prunes_expired_records
 test_context_registry_preserves_first_seen_timestamp
+test_context_registry_merges_partial_updates
 test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup

@@ -74,12 +74,21 @@ HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null) || { echo "error: can
 BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 
-if [ "$KIND" = secondmate ] && [ -s "$WORKTREE_REAL/data/charter.md" ] && [ ! -L "$WORKTREE_REAL/data/charter.md" ]; then
-  BRIEF="$WORKTREE_REAL/data/charter.md"
+continuation_safe_file() {
+  local file=$1 root=$2 parent root_real resolved
+  [ -s "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  parent=$(cd "$(dirname "$file")" && pwd -P) || return 1
+  root_real=$(cd "$root" && pwd -P) || return 1
+  resolved="$parent/$(basename "$file")"
+  case "$resolved" in "$root_real"/*) printf '%s\n' "$resolved" ;; *) return 1 ;; esac
+}
+
+if [ "$KIND" = secondmate ] && [ -e "$WORKTREE_REAL/data/charter.md" ]; then
+  BRIEF=$(continuation_safe_file "$WORKTREE_REAL/data/charter.md" "$WORKTREE_REAL") || BRIEF=
 else
-  BRIEF="$DATA/$ID/brief.md"
+  BRIEF=$(continuation_safe_file "$DATA/$ID/brief.md" "$DATA") || BRIEF=
 fi
-[ -s "$BRIEF" ] && [ ! -L "$BRIEF" ] || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+[ -n "$BRIEF" ] || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
 TASK_DIR="$DATA/$ID"
 mkdir -p "$TASK_DIR"

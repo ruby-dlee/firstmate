@@ -30,6 +30,21 @@ fm_account_shell_quote() {
   printf "'"
 }
 
+fm_account_run_bounded() {
+  local seconds=$1
+  shift
+  case "$seconds" in ''|*[!0-9]*|0) return 2 ;; esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
+  else
+    return 127
+  fi
+}
+
 fm_account_valid_id() {
   case "$1" in
     ''|*[!A-Za-z0-9._-]*|.*|-*) return 1 ;;
@@ -338,8 +353,36 @@ fm_account_meta_value() {  # <meta> <key>
   sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
 }
 
+fm_account_restore_artifacts() {
+  local state=$1 task=$2 backup_name=$3 tasktmp=${4:-} retain=${5:-0} backup name source
+  [ -n "$backup_name" ] || return 0
+  case "$backup_name" in
+    ".$task.artifacts.rollback."*) ;;
+    *) return 1 ;;
+  esac
+  fm_account_valid_id "${backup_name#".$task.artifacts.rollback."}" || return 1
+  backup="$state/$backup_name"
+  [ -d "$backup" ] && [ ! -L "$backup" ] || return 1
+  for name in "$task.status" "$task.turn-ended" "$task.check.sh" "$task.pi-ext.ts" "$task.grok-turnend-token"; do
+    rm -f "$state/$name" || return 1
+    source="$backup/$name"
+    if [ -e "$source" ] || [ -L "$source" ]; then
+      cp -Pp "$source" "$state/$name" || return 1
+    fi
+  done
+  if [ -n "$tasktmp" ]; then
+    [ "$tasktmp" = "/tmp/fm-$task" ] || return 1
+    if [ -e "$backup/tasktmp-existed" ]; then
+      [ -e "$backup/gotmp-existed" ] || rm -rf "$tasktmp/gotmp" || return 1
+    else
+      rm -rf "$tasktmp" || return 1
+    fi
+  fi
+  [ "$retain" = 1 ] || rm -rf "$backup"
+}
+
 fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
-  local meta=$1 data=$2 task=$3 pending account_task attempt provider pool profile session preserve backup_name backup_token backup predecessor backup_task tmp
+  local meta=$1 data=$2 task=$3 pending account_task attempt provider pool profile session preserve backup_name backup_token backup predecessor backup_task tmp artifacts_name artifacts_token artifacts tasktmp
   pending=$(fm_account_meta_value "$meta" account_rollback_cleanup)
   [ "$pending" = pending ] || return 0
   account_task=$(fm_account_meta_value "$meta" account_task)
@@ -350,6 +393,8 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
   session=$(fm_account_meta_value "$meta" provider_session_id)
   preserve=$(fm_account_meta_value "$meta" account_rollback_preserve_session)
   backup_name=$(fm_account_meta_value "$meta" account_rollback_backup)
+  artifacts_name=$(fm_account_meta_value "$meta" account_rollback_artifacts)
+  tasktmp=$(fm_account_meta_value "$meta" tasktmp)
   predecessor=$(fm_account_meta_value "$meta" account_predecessor_task)
   fm_account_valid_id "$account_task" || {
     echo "error: invalid failed Agent Fleet attempt for $task" >&2
@@ -382,10 +427,25 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
       }
     fi
   fi
+  artifacts=
+  if [ -n "$artifacts_name" ]; then
+    case "$artifacts_name" in
+      ".$task.artifacts.rollback."*) ;;
+      *) echo "error: unsafe rollback artifact backup for $task" >&2; return 1 ;;
+    esac
+    artifacts_token=${artifacts_name#".$task.artifacts.rollback."}
+    fm_account_valid_id "$artifacts_token" || { echo "error: unsafe rollback artifact backup for $task" >&2; return 1; }
+    artifacts="$(dirname "$meta")/$artifacts_name"
+    [ -d "$artifacts" ] && [ ! -L "$artifacts" ] || {
+      echo "error: rollback artifact backup is missing for $task" >&2
+      return 1
+    }
+  fi
   fm_account_release "$account_task" --force || return 1
   if [ "$preserve" != 1 ]; then
     fm_account_session_remove "$account_task" || return 1
   fi
+  fm_account_restore_artifacts "$(dirname "$meta")" "$task" "$artifacts_name" "$tasktmp" 1 || return 1
   if [ -n "$backup" ]; then
     mv "$backup" "$meta" || return 1
   else
@@ -394,6 +454,7 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
     printf 'rollback_pending=1\n' >> "$tmp"
     mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
   fi
+  [ -z "$artifacts" ] || rm -rf "$artifacts"
   [ -n "$attempt" ] || attempt=legacy
   fm_account_lineage_append "$data" "$task" rolled-back "$attempt" "$account_task" "$provider" "$pool" "$profile" "$session" "${predecessor:-none}" || {
     echo "warning: failed attempt cleanup completed but lineage recording failed for $task" >&2

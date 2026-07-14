@@ -18,6 +18,7 @@
 #   sleeper replaces the real daemon (FM_AFK_LAUNCH_ENTRY) so the test observes
 #   only the terminal lifecycle.
 set -u
+export FM_GATE_REFUSE_BYPASS=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/bin/fm-afk-launch.sh"
@@ -540,6 +541,8 @@ unit_tmux_absence_distinguishes_probe_failure() {
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     tmux() { printf "%s" "can'\''t find session: exact-session" >&2; return 1; }
+    fm_afk_launch_terminal_absent tmux exact-session
+    tmux() { printf "%s" "no server running on /tmp/tmux-501/default" >&2; return 1; }
     fm_afk_launch_terminal_absent tmux exact-session
     tmux() { printf "%s" "error connecting to /tmp/tmux.sock" >&2; return 1; }
     ! fm_afk_launch_terminal_absent tmux exact-session

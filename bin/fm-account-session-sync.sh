@@ -24,6 +24,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-backend.sh"
 
 WAIT=0
+QUERY_TIMEOUT=${FM_ACCOUNT_SESSION_QUERY_TIMEOUT:-5}
 REQUIRE=0
 ALL=0
 PRINT_UPDATED_AT=0
@@ -52,6 +53,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$WAIT" in ''|*[!0-9]*) echo "error: --wait must be a non-negative integer" >&2; exit 2 ;; esac
+case "$QUERY_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_QUERY_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
 session_timestamp_advances() {  # <candidate> <baseline>
   LC_ALL=C awk -v candidate="$1" -v baseline="$2" '
     function valid(value) {
@@ -114,7 +116,7 @@ binary=$(fm_account_fleet_bin) || exit 1
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
-  if json=$("$binary" --format json session status --task "$ACCOUNT_TASK" 2>/dev/null); then
+  if json=$(fm_account_run_bounded "$QUERY_TIMEOUT" "$binary" --format json session status --task "$ACCOUNT_TASK" 2>/dev/null); then
     mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string")' session) || exit 1
     mapped_profile=$(fm_account_json_field "$json" '.profile | select(type == "string")' session) || exit 1
     mapped_provider=$(fm_account_json_field "$json" '.provider | select(type == "string")' session) || exit 1

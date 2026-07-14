@@ -249,18 +249,23 @@ else
       exit 1
       ;;
   esac
-  if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
+  record_managed_steering() {
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
     steering_dir="$DATA/$steering_id"
-    mkdir -p "$steering_dir"
+    mkdir -p "$steering_dir" || return 1
     if [ ! -f "$steering_dir/steering.md" ]; then
-      printf '# Steering trail\n\n' > "$steering_dir/steering.md"
+      printf '# Steering trail\n\n' > "$steering_dir/steering.md" || return 1
     fi
     {
       printf -- '- %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf '%s\n' "$*" | sed 's/^/> /'
       printf '\n'
-    } >> "$steering_dir/steering.md"
+    } >> "$steering_dir/steering.md" || return 1
+  }
+  if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
+    if ! record_managed_steering "$@"; then
+      echo "warning: text was sent to $T but its managed steering trail could not be recorded" >&2
+    fi
   fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the

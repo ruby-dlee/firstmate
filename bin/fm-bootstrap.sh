@@ -97,6 +97,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -331,6 +333,7 @@ install_cmd() {
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
     gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
+    agent-fleet) echo "command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release and ensure agent-fleet is on PATH" ;;
     *) return 1 ;;
   esac
 }
@@ -499,12 +502,38 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+BOOTSTRAP_JQ_REPORTED=0
+
+account_routing_preflight() {
+  local mode needs_agent_fleet=0 dispatch
+  mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>/dev/null || true)
+  [ "$mode" != enforce ] || needs_agent_fleet=1
+  dispatch="$CONFIG/crew-dispatch.json"
+  if [ -f "$dispatch" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_agent_fleet=1
+    elif grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
+      needs_agent_fleet=1
+    fi
+  fi
+  [ "$needs_agent_fleet" = 1 ] || return 0
+  if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
+    [ -x "$FM_AGENT_FLEET_BIN" ] || echo "MISSING: agent-fleet (install: $(install_cmd agent-fleet))"
+  else
+    command -v agent-fleet >/dev/null 2>&1 || echo "MISSING: agent-fleet (install: $(install_cmd agent-fleet))"
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "MISSING: jq (install: $(install_cmd jq))"
+    BOOTSTRAP_JQ_REPORTED=1
+  fi
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
   [ -f "$file" ] || return 0
   if ! command -v jq >/dev/null 2>&1; then
-    echo "MISSING: jq (install: $(install_cmd jq))"
+    [ "$BOOTSTRAP_JQ_REPORTED" = 1 ] || echo "MISSING: jq (install: $(install_cmd jq))"
     return 0
   fi
   if ! jq -e . "$file" >/dev/null 2>&1; then
@@ -654,6 +683,7 @@ fi
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"
+account_routing_preflight
 crew_dispatch_validate
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"

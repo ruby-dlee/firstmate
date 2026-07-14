@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reconcile Agent Fleet's real SessionStart mapping into Firstmate task meta.
-# Usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]
+# Usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require] [--updated-at] [--after-updated-at <timestamp>]
 #        fm-account-session-sync.sh --all
 #
 # Only managed tasks (meta with account_profile=) are touched.
@@ -26,11 +26,20 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 WAIT=0
 REQUIRE=0
 ALL=0
+PRINT_UPDATED_AT=0
+AFTER_UPDATED_AT=
 ID=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --all) ALL=1; shift ;;
     --require) REQUIRE=1; shift ;;
+    --updated-at) PRINT_UPDATED_AT=1; shift ;;
+    --after-updated-at)
+      [ "$#" -gt 1 ] || { echo "error: --after-updated-at requires a timestamp" >&2; exit 2; }
+      AFTER_UPDATED_AT=$2
+      shift 2
+      ;;
+    --after-updated-at=*) AFTER_UPDATED_AT=${1#--after-updated-at=}; shift ;;
     --wait)
       [ "$#" -gt 1 ] || { echo "error: --wait requires seconds" >&2; exit 2; }
       WAIT=$2
@@ -56,6 +65,7 @@ if [ "$ALL" = 1 ]; then
   exit "$rc"
 fi
 [ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]" >&2; exit 2; }
+case "$AFTER_UPDATED_AT" in *$'\n'*|*=*) echo "error: unsafe --after-updated-at value" >&2; exit 2 ;; esac
 META="$STATE/$ID.meta"
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 release_meta_lock() {
@@ -77,27 +87,34 @@ binary=$(fm_account_fleet_bin) || exit 1
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
   if json=$("$binary" --format json session status --task "$ACCOUNT_TASK" 2>/dev/null); then
-    break
+    mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string")' session) || exit 1
+    mapped_profile=$(fm_account_json_field "$json" '.profile | select(type == "string")' session) || exit 1
+    mapped_provider=$(fm_account_json_field "$json" '.provider | select(type == "string")' session) || exit 1
+    mapped_pool=$(fm_account_json_field "$json" '.pool | select(type == "string")' session) || exit 1
+    session_id=$(fm_account_json_field "$json" '.session_id | select(type == "string" and length > 0)' session) || exit 1
+    updated_at=$(fm_account_json_field "$json" '.updated_at | select(type == "string" and length > 0)' session) || exit 1
+    [ "$mapped_task" = "$ACCOUNT_TASK" ] || { echo "error: Agent Fleet session task mismatch for $ID attempt $ATTEMPT" >&2; exit 1; }
+    [ "$mapped_profile" = "$PROFILE" ] || { echo "error: Agent Fleet session profile mismatch for $ID" >&2; exit 1; }
+    [ "$mapped_pool" = "$POOL" ] || { echo "error: Agent Fleet session pool mismatch for $ID" >&2; exit 1; }
+    [ "$mapped_provider" = "$HARNESS" ] || { echo "error: Agent Fleet session provider mismatch for $ID" >&2; exit 1; }
+    case "$session_id" in ''|*$'\n'*|*=*) echo "error: unsafe provider session id for $ID" >&2; exit 1 ;; esac
+    case "$updated_at" in ''|*$'\n'*|*=*) echo "error: unsafe provider session update timestamp for $ID" >&2; exit 1 ;; esac
+    if [ -z "$AFTER_UPDATED_AT" ] || [ "$updated_at" != "$AFTER_UPDATED_AT" ]; then
+      break
+    fi
   fi
   [ "$(date +%s)" -lt "$deadline" ] || {
     if [ "$REQUIRE" = 1 ]; then
-      echo "error: no Agent Fleet provider-session mapping for managed task $ID attempt $ATTEMPT; refusing recovery" >&2
+      if [ -n "$AFTER_UPDATED_AT" ]; then
+        echo "error: no fresh Agent Fleet SessionStart update for managed task $ID attempt $ATTEMPT; refusing recovery" >&2
+      else
+        echo "error: no Agent Fleet provider-session mapping for managed task $ID attempt $ATTEMPT; refusing recovery" >&2
+      fi
     fi
     exit 1
   }
   sleep 1
 done
-
-mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string")' session) || exit 1
-mapped_profile=$(fm_account_json_field "$json" '.profile | select(type == "string")' session) || exit 1
-mapped_provider=$(fm_account_json_field "$json" '.provider | select(type == "string")' session) || exit 1
-mapped_pool=$(fm_account_json_field "$json" '.pool | select(type == "string")' session) || exit 1
-session_id=$(fm_account_json_field "$json" '.session_id | select(type == "string" and length > 0)' session) || exit 1
-[ "$mapped_task" = "$ACCOUNT_TASK" ] || { echo "error: Agent Fleet session task mismatch for $ID attempt $ATTEMPT" >&2; exit 1; }
-[ "$mapped_profile" = "$PROFILE" ] || { echo "error: Agent Fleet session profile mismatch for $ID" >&2; exit 1; }
-[ "$mapped_pool" = "$POOL" ] || { echo "error: Agent Fleet session pool mismatch for $ID" >&2; exit 1; }
-[ "$mapped_provider" = "$HARNESS" ] || { echo "error: Agent Fleet session provider mismatch for $ID" >&2; exit 1; }
-case "$session_id" in ''|*$'\n'*|*=*) echo "error: unsafe provider session id for $ID" >&2; exit 1 ;; esac
 if [ -n "$EXISTING" ] && [ "$EXISTING" != "$session_id" ]; then
   echo "error: provider session id changed for managed task $ID; refusing to overwrite recovery truth" >&2
   exit 1
@@ -109,4 +126,8 @@ if [ -z "$EXISTING" ]; then
   mv "$META_TMP" "$META"
   fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)" || exit 1
 fi
-printf '%s\n' "$session_id"
+if [ "$PRINT_UPDATED_AT" = 1 ]; then
+  printf '%s\n' "$updated_at"
+else
+  printf '%s\n' "$session_id"
+fi

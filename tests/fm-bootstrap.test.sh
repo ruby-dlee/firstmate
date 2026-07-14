@@ -37,7 +37,7 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
-  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi agent-fleet
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
@@ -705,6 +705,56 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_account_routing_dependency_preflight() {
+  local case_dir fakebin out bash_env
+  case_dir="$TMP_ROOT/account-routing-enforce"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' enforce > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: agent-fleet (install: command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release' "enforce mode did not report missing Agent Fleet"
+  assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
+
+  case_dir="$TMP_ROOT/account-routing-dispatch"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' '{"rules":[{"when":"account-routed work","use":{"harness":"claude","account_pool":"claude-crew"}}]}' > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: agent-fleet (install: command -v agent-fleet >/dev/null  # install the approved private Agent Fleet release' "account-routed dispatch profile did not report missing Agent Fleet"
+  assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
+
+  case_dir="$TMP_ROOT/account-routing-observe"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' observe > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
+  assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
+  pass "bootstrap reports dependencies only when configuration can enforce routing"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -723,3 +773,4 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
+test_account_routing_dependency_preflight

@@ -158,16 +158,37 @@ fm_account_meta_lock_owner_alive() {  # <lock-dir>
   [ "$current" = "$recorded" ]
 }
 
+fm_account_path_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+fm_account_meta_lock_reclaim() {  # <lock-dir> <ownerless-grace-seconds>
+  local lock=$1 grace=$2 now mtime reclaim
+  [ -d "$lock" ] || return 1
+  if [ -f "$lock/owner" ]; then
+    fm_account_meta_lock_owner_alive "$lock" && return 1
+  else
+    mtime=$(fm_account_path_mtime "$lock") || return 1
+    now=$(date +%s)
+    [ $((now - mtime)) -ge "$grace" ] || return 1
+  fi
+  reclaim="$lock.reclaim.$$.$RANDOM"
+  mv "$lock" "$reclaim" 2>/dev/null || return 1
+  rm -rf "$reclaim"
+}
+
 fm_account_meta_lock_acquire() {  # <state-dir> <task>
-  local state=$1 task=$2 lock deadline now start owner_tmp wait_seconds=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
+  local state=$1 task=$2 lock deadline now start owner_tmp
+  local wait_seconds=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
+  local ownerless_grace=${FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS:-2}
   fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account metadata lock" >&2; return 1; }
   case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid account metadata lock wait '$wait_seconds'" >&2; return 1 ;; esac
+  case "$ownerless_grace" in ''|*[!0-9]*) echo "error: invalid account metadata lock ownerless grace '$ownerless_grace'" >&2; return 1 ;; esac
   mkdir -p "$state" || return 1
   lock="$state/.account-meta-$task.lock"
   deadline=$(( $(date +%s) + wait_seconds ))
   while ! mkdir "$lock" 2>/dev/null; do
-    if [ -d "$lock" ] && [ -f "$lock/owner" ] && ! fm_account_meta_lock_owner_alive "$lock"; then
-      rm -rf "$lock"
+    if fm_account_meta_lock_reclaim "$lock" "$ownerless_grace"; then
       continue
     fi
     now=$(date +%s)
@@ -223,6 +244,45 @@ fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task
   printf -- '- %s event=%s attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=%s predecessor=%s.\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "${session:-pending}" "${predecessor:-none}" \
     >> "$dir/account-attempts.md"
+}
+
+fm_account_meta_value() {  # <meta> <key>
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
+}
+
+fm_account_cleanup_predecessor() {  # <meta> <data-dir> <task>
+  local meta=$1 data=$2 task=$3 pending predecessor current attempt provider pool profile session tmp
+  pending=$(fm_account_meta_value "$meta" account_predecessor_cleanup)
+  [ "$pending" = pending ] || return 0
+  predecessor=$(fm_account_meta_value "$meta" account_predecessor_task)
+  current=$(fm_account_meta_value "$meta" account_task)
+  attempt=$(fm_account_meta_value "$meta" account_predecessor_attempt)
+  provider=$(fm_account_meta_value "$meta" account_predecessor_provider)
+  [ -n "$provider" ] || provider=$(fm_account_meta_value "$meta" harness)
+  pool=$(fm_account_meta_value "$meta" account_predecessor_pool)
+  profile=$(fm_account_meta_value "$meta" account_predecessor_profile)
+  session=$(fm_account_meta_value "$meta" account_predecessor_session)
+  [ -n "$predecessor" ] && [ -n "$current" ] && [ "$predecessor" != "$current" ] || {
+    echo "error: invalid predecessor cleanup metadata for $task" >&2
+    return 1
+  }
+  if ! fm_account_valid_id "$predecessor" || ! fm_account_valid_id "$current"; then
+    echo "error: unsafe predecessor cleanup identity for $task" >&2
+    return 1
+  fi
+  [ -n "$(fm_account_meta_value "$meta" provider_session_id)" ] || {
+    echo "error: current managed session is unverified for predecessor cleanup of $task" >&2
+    return 1
+  }
+  fm_account_release "$predecessor" --force || return 1
+  fm_account_session_remove "$predecessor" || return 1
+  tmp="$(dirname "$meta")/.$task.meta.predecessor.$$"
+  awk '!/^account_predecessor_/ && !/^account_predecessor_cleanup=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  [ -n "$attempt" ] || attempt=legacy
+  fm_account_lineage_append "$data" "$task" predecessor-released "$attempt" "$predecessor" "$provider" "$pool" "$profile" "$session" "$current" || {
+    echo "warning: predecessor cleanup completed but lineage recording failed for $task" >&2
+  }
 }
 
 fm_account_secondmate_pool() {  # <config-dir>
@@ -355,15 +415,24 @@ fm_account_resume_command() {  # <task>
 # sticky recovery reservation. This path intentionally bypasses new-task quota
 # reserve filtering inside Agent Fleet while still refusing a live owner.
 fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-provider>
-  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json profile pool provider
+  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json mapped_task profile pool provider
   binary=$(fm_account_fleet_bin) || return 1
   json=$("$binary" --format json lease recover --task "$task") || return 1
-  profile=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' recovery) || return 1
-  pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' recovery) || return 1
-  provider=$(fm_account_json_field "$json" '.provider | select(type == "string" and length > 0)' recovery) || return 1
-  [ "$profile" = "$expected_profile" ] || { echo "error: recovery profile mismatch for $task" >&2; return 1; }
-  [ "$pool" = "$expected_pool" ] || { echo "error: recovery pool mismatch for $task" >&2; return 1; }
-  [ "$provider" = "$expected_provider" ] || { echo "error: recovery provider mismatch for $task" >&2; return 1; }
+  if ! mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' recovery) \
+    || ! profile=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' recovery) \
+    || ! pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' recovery) \
+    || ! provider=$(fm_account_json_field "$json" '.provider | select(type == "string" and length > 0)' recovery) \
+    || [ "$mapped_task" != "$task" ] \
+    || [ "$profile" != "$expected_profile" ] \
+    || [ "$pool" != "$expected_pool" ] \
+    || [ "$provider" != "$expected_provider" ]; then
+    echo "error: agent-fleet returned mismatched recovery state for $task" >&2
+    if ! fm_account_release "$task" --force; then
+      echo "error: failed to release invalid Agent Fleet recovery reservation for $task" >&2
+      return 2
+    fi
+    return 1
+  fi
   FM_ACCOUNT_SELECTED_PROFILE=$profile
   FM_ACCOUNT_SELECTED_PROVIDER=$provider
 }

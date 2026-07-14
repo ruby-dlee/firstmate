@@ -1339,6 +1339,168 @@ test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
   pass "a failed managed release preserves the unrecycled worktree and retry ordering"
 }
 
+test_managed_teardown_locks_generation_before_endpoint_cleanup() {
+  local case_dir af_log kill_started allow_kill teardown_pid teardown_rc updater_rc
+  case_dir=$(make_case managed-generation-lock)
+  af_log="$case_dir/agent-fleet.log"
+  kill_started="$case_dir/kill-started"
+  allow_kill="$case_dir/allow-kill"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-old-attempt' \
+    'account_attempt=old-attempt' \
+    'provider_session_id=session-old' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  kill-window)
+    : > "$FM_FAKE_KILL_STARTED"
+    while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+    exit 0
+    ;;
+  display-message) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  teardown_pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$kill_started" ] && break
+    sleep 0.05
+  done
+  [ -f "$kill_started" ] || { kill "$teardown_pid" 2>/dev/null || true; fail "managed generation teardown never reached endpoint cleanup"; }
+
+  set +e
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 bash -c '
+    . "$1"
+    state=$2
+    meta=$state/task-x1.meta
+    held=$(fm_account_meta_lock_acquire "$state" task-x1) || exit 75
+    awk "!/^window=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
+    printf "%s\n" "window=firstmate:fm-task-x1-replacement" "account_task=fm-home-task-x1-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
+    mv "$state/.replacement.meta" "$meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/state" \
+    > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
+  updater_rc=$?
+  set -e
+  : > "$allow_kill"
+  set +e
+  wait "$teardown_pid"
+  teardown_rc=$?
+  set -e
+
+  [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced metadata after teardown began"
+  expect_code 0 "$teardown_rc" "managed generation teardown should complete with its original locked generation"
+  assert_grep 'lease release --task fm-home-task-x1-old-attempt --force' "$af_log" "teardown did not release its locked generation"
+  assert_not_contains "$(cat "$af_log")" 'fm-home-task-x1-new-attempt' "teardown targeted a concurrent replacement generation"
+  assert_absent "$case_dir/state/.replacement.meta" "blocked continuation left replacement scratch metadata"
+  assert_absent "$case_dir/state/task-x1.meta" "managed generation teardown left metadata"
+  pass "managed teardown serializes generation identity through account cleanup and recycling"
+}
+
+test_managed_child_teardown_locks_generation_before_snapshot() {
+  local case_dir af_log child_id child_project child_worktree kill_started allow_kill teardown_pid teardown_rc updater_rc
+  case_dir=$(make_case managed-child-generation-lock)
+  af_log="$case_dir/agent-fleet.log"
+  child_id=child-lock-x3
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  kill_started="$case_dir/kill-started"
+  allow_kill="$case_dir/allow-kill"
+  : > "$af_log"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    "window=fm-$child_id" \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=local-only' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-child-old-attempt' \
+    'account_attempt=old-attempt' \
+    'provider_session_id=session-old'
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  kill-window)
+    case "$*" in
+      *fm-child-lock-x3*)
+        : > "$FM_FAKE_KILL_STARTED"
+        while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+        ;;
+    esac
+    exit 0
+    ;;
+  display-message) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  teardown_pid=$!
+  for _ in $(seq 1 100); do
+    [ -f "$kill_started" ] && break
+    sleep 0.05
+  done
+  [ -f "$kill_started" ] || {
+    kill "$teardown_pid" 2>/dev/null || true
+    fail "managed child teardown never reached endpoint cleanup: $(cat "$case_dir/stderr")"
+  }
+
+  set +e
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 bash -c '
+    . "$1"
+    state=$2
+    meta=$state/child-lock-x3.meta
+    held=$(fm_account_meta_lock_acquire "$state" child-lock-x3) || exit 75
+    awk "!/^window=/ && !/^worktree=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
+    printf "%s\n" "window=fm-child-lock-x3-replacement" "worktree=$3" "account_task=fm-child-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
+    mv "$state/.replacement.meta" "$meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/wt/state" "$case_dir/replacement-worktree" \
+    > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
+  updater_rc=$?
+  set -e
+  : > "$allow_kill"
+  set +e
+  wait "$teardown_pid"
+  teardown_rc=$?
+  set -e
+
+  [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced managed child metadata after teardown began"
+  expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation"
+  assert_grep 'lease release --task fm-child-old-attempt --force' "$af_log" "child teardown did not release its locked generation"
+  assert_not_contains "$(cat "$af_log")" 'fm-child-new-attempt' "child teardown targeted a concurrent replacement generation"
+  assert_absent "$case_dir/wt/state/.replacement.meta" "blocked child continuation left replacement scratch metadata"
+  pass "managed child teardown locks generation before snapshot and recycling"
+}
+
 test_forced_secondmate_child_uses_child_home_for_endpoint_verification() {
   local case_dir af_log zellij_log child_project child_worktree child_id rc
   case_dir=$(make_case secondmate-child-home-probe)
@@ -1442,6 +1604,8 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_managed_force_teardown_releases_lease_and_session
 test_managed_release_failure_preserves_unrecycled_worktree_for_retry
+test_managed_teardown_locks_generation_before_endpoint_cleanup
+test_managed_child_teardown_locks_generation_before_snapshot
 test_forced_secondmate_child_uses_child_home_for_endpoint_verification
 test_herdr_teardown_clears_escalation_marker
 test_squash_merged_branch_deleted_allows

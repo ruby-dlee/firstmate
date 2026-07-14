@@ -174,8 +174,9 @@ Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools 
 Pool and profile identifiers are non-secret aliases made only of letters, digits, dot, underscore, and dash, starting with a letter or digit; account email addresses and filesystem paths are invalid.
 Managed task metadata records `account_pool=`, `account_profile=`, a home-namespaced and generation-unique `account_task=`, `account_attempt=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
 Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
-Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, and resumes the recorded provider session without replaying the brief as a new prompt.
+Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a newer SessionStart update before committing the recovered lease.
 When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
+If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
 Teardown kills and verifies the recorded endpoint, releases the Agent Fleet lease and session mapping, and only then recycles a worktree or secondmate home; any cleanup failure retains metadata and storage for retry.
 Agent Fleet routing supports the tmux, Herdr, zellij, and cmux session backends; enforced Orca launches are rejected before lease, worktree, endpoint, or metadata mutation because managed Orca recovery is not implemented.
@@ -243,7 +244,7 @@ Backend tool availability uses the adapter's own executable resolver, so bootstr
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
 Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
-Agent Fleet must be available for enforce mode and pool-aware quota balancing; observe mode degrades to the legacy launch when it is unavailable, and off mode never invokes it.
+Bootstrap reports missing Agent Fleet and `jq` whenever local routing mode or dispatch configuration can enforce routing; observe mode degrades to the legacy launch when either is unavailable, and off mode never invokes them.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.

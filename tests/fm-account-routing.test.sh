@@ -50,10 +50,23 @@ case "${1:-}" in
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
       prev=
       for arg in "$@"; do
-        if [ "$prev" = -l ]; then printf '%s\n' "$arg" >> "$FM_FAKE_LAUNCH_LOG"; fi
+        if [ "$prev" = -l ]; then
+          printf '%s\n' "$arg" >> "$FM_FAKE_LAUNCH_LOG"
+          case "$arg" in *' resume --task '*) [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || touch "$FM_FAKE_AF_RESUME_ARM" ;; esac
+        fi
         prev=$arg
       done
     fi
+    case "$*" in
+      *' Enter')
+        if [ -n "${FM_FAKE_AF_RESUME_ARM:-}" ] && [ -f "$FM_FAKE_AF_RESUME_ARM" ]; then
+          rm -f "$FM_FAKE_AF_RESUME_ARM"
+          if [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
+            touch "$FM_FAKE_AF_SESSION_REFRESHED"
+          fi
+        fi
+        ;;
+    esac
     exit 0
     ;;
 esac
@@ -102,6 +115,7 @@ case "$*" in
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
+    case "$*" in *" lease recover "*) [ -z "${FM_FAKE_AF_RECOVER_TASK:-}" ] || task=$FM_FAKE_AF_RECOVER_TASK ;; esac
     printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$provider"
     ;;
   *" session status "*)
@@ -109,7 +123,11 @@ case "$*" in
     [ -z "${FM_FAKE_AF_SESSION_MARKER:-}" ] || touch "$FM_FAKE_AF_SESSION_MARKER"
     [ -z "${FM_FAKE_AF_SESSION_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SESSION_SLEEP"
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
-    printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","session_id":"sess-%s","updated_at":"2026-07-13T00:00:00Z"}\n' "$task" "$profile" "$provider" "$pool" "$task"
+    updated_at=${FM_FAKE_AF_UPDATED_AT_BEFORE:-2026-07-13T00:00:00Z}
+    if [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; then
+      updated_at=${FM_FAKE_AF_UPDATED_AT_AFTER:-2026-07-13T00:00:01Z}
+    fi
+    printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$task" "$updated_at"
     ;;
   *" lease release "*)
     [ -z "${FM_FAKE_AF_RELEASE_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_MARKER"
@@ -119,7 +137,13 @@ case "$*" in
     fi
     printf '{"ok":true}\n'
     ;;
-  *" session remove "*) printf '{"ok":true}\n' ;;
+  *" session remove "*)
+    if [ -n "${FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE:-}" ] && [ ! -f "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE" ]; then
+      touch "$FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE"
+      exit 44
+    fi
+    printf '{"ok":true}\n'
+    ;;
   *) echo "unexpected fake agent-fleet command: $*" >&2; exit 64 ;;
 esac
 SH
@@ -173,6 +197,7 @@ run_spawn() {
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
     FM_FAKE_ORCA_LOG="$ORCA_LOG" \
     FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_AF_RESUME_ARM="$CASE_DIR/resume-arm" FM_FAKE_AF_SESSION_REFRESHED="$CASE_DIR/session-refreshed" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_ACCOUNT_SESSION_WAIT_SECONDS=0 \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$SPAWN" "$@" 2>&1
 }
@@ -210,6 +235,7 @@ clear_case_logs() {
   : > "$LIFECYCLE_LOG"
   : > "$ORCA_LOG"
   : > "$LAUNCH_LOG"
+  rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/session-refreshed"
 }
 
 test_off_is_byte_compatible_and_never_calls_agent_fleet() {
@@ -369,6 +395,61 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   pass "resume uses below-reserve sticky recovery and never deletes mapping on a failed attempt"
 }
 
+test_recovered_reservations_are_owned_until_launch_commit() {
+  local id rec out status account_task session lineage
+  id=account-recover-owned-z9b
+  rec=$(make_case recover-owned claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "recovered reservation precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_RECOVER_TASK=wrong-recovery-task run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "mismatched recovery response unexpectedly succeeded"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "mismatched recovery leaked its acquired reservation"
+  assert_not_grep "session remove --task $account_task" "$AF_LOG" "mismatched recovery removed the durable session mapping"
+  assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "mismatched recovery changed durable session metadata"
+
+  clear_case_logs
+  lineage="$HOME_DIR/data/$id/account-attempts.md"
+  rm -f "$lineage"
+  mkdir "$lineage"
+  out=$(run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "post-recovery pre-bind failure unexpectedly succeeded"
+  assert_grep "lease recover --task $account_task" "$AF_LOG" "post-recovery failure never acquired the sticky reservation"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "post-recovery failure leaked its owned reservation"
+  assert_not_grep "session remove --task $account_task" "$AF_LOG" "post-recovery rollback removed the durable session mapping"
+  assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "post-recovery rollback lost durable session metadata"
+  [ -n "$out" ] || true
+  pass "recovered reservations release on every validation and pre-bind failure"
+}
+
+test_native_resume_requires_fresh_sessionstart_evidence() {
+  local id rec out status account_task session
+  id=account-resume-fresh-z9c
+  rec=$(make_case resume-fresh claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "fresh resume precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_RESUME_NO_REFRESH=1 run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "native resume accepted a stale SessionStart mapping"
+  assert_contains "$out" "no fresh Agent Fleet SessionStart update" "stale native resume did not report its missing launch evidence"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "stale native resume leaked its recovered reservation"
+  assert_not_grep "session remove --task $account_task" "$AF_LOG" "stale native resume removed its durable mapping"
+  assert_regex '^kill-window ' "$TMUX_LOG" "stale native resume retained its failed endpoint"
+  assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "stale native resume changed session truth"
+  pass "native resume commits only after a fresh SessionStart update"
+}
+
 make_seeded_secondmate_home() {
   local home=$1 id=$2
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
@@ -413,6 +494,33 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
+}
+
+test_unused_secondmate_pool_never_blocks_unmanaged_spawn() {
+  local id rec sm out status
+  id=account-secondmate-malformed-off-z11b
+  rec=$(make_case secondmate-malformed-off claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'claude-one\nclaude-two\n' > "$HOME_DIR/config/secondmate-account-pool"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -eq 0 ] || fail "malformed unused secondmate pool blocked default-off spawn: $out"
+  [ ! -s "$AF_LOG" ] || fail "default-off malformed pool invoked Agent Fleet"
+
+  id=account-secondmate-malformed-optout-z11c
+  rec=$(make_case secondmate-malformed-optout claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  printf 'claude-one\nclaude-two\n' > "$HOME_DIR/config/secondmate-account-pool"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate --no-account-routing)
+  status=$?
+  [ "$status" -eq 0 ] || fail "malformed unused secondmate pool blocked explicit opt-out: $out"
+  [ ! -s "$AF_LOG" ] || fail "opted-out malformed pool invoked Agent Fleet"
+  pass "unused secondmate pool policy is not parsed by unmanaged spawns"
 }
 
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt() {
@@ -618,6 +726,42 @@ test_cross_profile_continuation_for_harness() {
   pass "$harness can continue safely under a different account profile"
 }
 
+test_predecessor_cleanup_failure_preserves_replacement_for_retry() {
+  local id rec old_task new_task fail_once out status
+  id=account-predecessor-retry-z21b
+  rec=$(make_case predecessor-retry claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "predecessor cleanup precondition spawn failed"
+  old_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  fail_once="$CASE_DIR/session-remove-failed"
+
+  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE="$fail_once" \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "predecessor session cleanup failure was hidden"
+  new_task=$(meta_account_task "$id")
+  [ "$new_task" != "$old_task" ] || fail "replacement attempt was not installed before predecessor cleanup"
+  assert_present "$CASE_DIR/endpoint-live" "predecessor cleanup failure killed the healthy replacement endpoint"
+  assert_grep 'account_predecessor_cleanup=pending' "$HOME_DIR/state/$id.meta" "predecessor cleanup failure lost its retry marker"
+  assert_grep "lease release --task $old_task --force" "$AF_LOG" "predecessor lease release was not attempted"
+  assert_not_grep "lease release --task $new_task --force" "$AF_LOG" "predecessor cleanup failure rolled back the healthy replacement lease"
+  assert_contains "$out" "cleanup remains pending" "predecessor cleanup failure was not explicit"
+
+  clear_case_logs
+  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_AF_SESSION_REMOVE_FAIL_ONCE="$fail_once" \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -eq 0 ] || fail "predecessor cleanup retry failed: $out"
+  assert_contains "$out" "completed predecessor Agent Fleet cleanup" "predecessor cleanup retry did not report completion"
+  assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "predecessor cleanup retry created another replacement generation"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "predecessor cleanup retry created another endpoint"
+  assert_not_grep '^account_predecessor_' "$HOME_DIR/state/$id.meta" "predecessor cleanup retry left pending metadata"
+  assert_grep "account_task=$new_task" "$HOME_DIR/state/$id.meta" "predecessor cleanup retry changed the healthy replacement"
+  pass "predecessor cleanup retries without destroying the verified replacement"
+}
+
 test_continuation_fails_closed_without_original_brief() {
   local id rec out status
   id=account-continue-nobrief-z22
@@ -673,6 +817,77 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   pass "session synchronization cannot recreate metadata after teardown"
 }
 
+test_managed_steering_audit_failure_does_not_reclassify_delivery() {
+  local id rec out status
+  id=account-steering-audit-z24
+  rec=$(make_case steering-audit claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "steering audit precondition spawn failed"
+  mkdir "$HOME_DIR/data/$id/steering.md"
+  clear_case_logs
+  touch "$CASE_DIR/endpoint-live"
+
+  out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "successful steering delivery was reclassified by audit failure: $out"
+  assert_contains "$out" "text was sent" "audit failure warning did not preserve delivery truth"
+  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not delivered before audit failure"
+  pass "steering audit failures cannot turn a delivered message into a retry signal"
+}
+
+test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
+  local case_dir state lock workers pids pid rc
+  case_dir="$TMP_ROOT/account-lock"
+  state="$case_dir/state"
+  lock="$state/.account-meta-lock-task.lock"
+  mkdir -p "$lock"
+
+  set +e
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=30 \
+    bash -c '. "$1"; fm_account_meta_lock_acquire "$2" lock-task' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" \
+    > "$case_dir/young-stdout" 2> "$case_dir/young-stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "young ownerless metadata lock was reclaimed before its grace"
+  assert_present "$lock" "young ownerless metadata lock was deleted"
+
+  touch -t 200001010000 "$lock"
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "old ownerless metadata lock was not reclaimed"
+
+  mkdir -p "$lock"
+  printf '999999\nstale-owner\n' > "$lock/owner"
+  workers="$case_dir/workers.sh"
+  cat > "$workers" <<'SH'
+#!/usr/bin/env bash
+set -eu
+. "$1"
+state=$2
+critical=$3
+overlap=$4
+held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=5 fm_account_meta_lock_acquire "$state" lock-task)
+if ! mkdir "$critical" 2>/dev/null; then
+  printf 'overlap\n' >> "$overlap"
+fi
+sleep 0.05
+rmdir "$critical" 2>/dev/null || true
+fm_account_meta_lock_release "$held"
+SH
+  chmod +x "$workers"
+  pids=
+  for _ in 1 2 3 4 5 6; do
+    "$workers" "$ROOT/bin/fm-account-routing-lib.sh" "$state" "$case_dir/critical" "$case_dir/overlap" &
+    pids="$pids $!"
+  done
+  for pid in $pids; do
+    wait "$pid" || fail "concurrent metadata lock owner lost ownership"
+  done
+  assert_absent "$case_dir/overlap" "metadata lock admitted overlapping owners"
+  assert_absent "$lock" "metadata lock remained after concurrent owners exited"
+  pass "metadata locks reclaim abandoned directories without deleting new owners"
+}
+
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session
@@ -681,8 +896,11 @@ test_enforce_failure_rolls_back_prepared_endpoint
 test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+test_recovered_reservations_are_owned_until_launch_commit
+test_native_resume_requires_fresh_sessionstart_evidence
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
 test_duplicate_spawn_preserves_original_endpoint_and_lease
 test_reservation_occurs_after_worktree_preparation
@@ -695,7 +913,10 @@ test_explicit_secondmate_profile_ignores_configured_pool
 test_enforced_orca_is_rejected_before_owned_resource_creation
 test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+test_predecessor_cleanup_failure_preserves_replacement_for_retry
 test_continuation_fails_closed_without_original_brief
 test_session_sync_cannot_recreate_metadata_after_teardown
+test_managed_steering_audit_failure_does_not_reclassify_delivery
+test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 
 echo "# all fm-account-routing tests passed"

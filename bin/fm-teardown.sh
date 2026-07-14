@@ -102,6 +102,27 @@ FORCE=${2:-}
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+TEARDOWN_ACCOUNT_LOCKS=('')
+MANAGED_ACCOUNT_LOCK=
+ACCOUNT_DELETE_LOCK=
+
+release_teardown_account_locks() {
+  local lock
+  for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
+    [ -n "$lock" ] || continue
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+  done
+}
+trap release_teardown_account_locks EXIT
+
+MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
+if [ -n "$MANAGED_PROFILE" ]; then
+  ACCOUNT_DELETE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+  [ -f "$META" ] || { echo "error: task metadata disappeared while teardown waited for $ID" >&2; exit 1; }
+  MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
+  [ -n "$MANAGED_PROFILE" ] || { echo "error: managed task metadata changed while teardown waited for $ID" >&2; exit 1; }
+fi
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
@@ -122,18 +143,6 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
-MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
-TEARDOWN_ACCOUNT_LOCKS=('')
-MANAGED_ACCOUNT_LOCK=
-
-release_teardown_account_locks() {
-  local lock
-  for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
-    [ -n "$lock" ] || continue
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
-  done
-}
-trap release_teardown_account_locks EXIT
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt
@@ -151,13 +160,37 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
   return 1
 }
 
-release_managed_account() {  # <meta> <task> <backend> <target> [probe-home]
-  local meta=$1 task=$2 backend=$3 target=$4 probe_home=${5:-} profile account_task meta_state lock
+release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
+  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} profile account_task meta_state backend target zellij_tab acquired=0
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || return 0
   meta_state=$(dirname "$meta")
-  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+  if [ -z "$lock" ]; then
+    lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+    acquired=1
+  fi
+  [ -f "$meta" ] || {
+    echo "error: managed metadata for $task disappeared during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  profile=$(fm_meta_get "$meta" account_profile)
+  [ -n "$profile" ] || {
+    echo "error: managed metadata for $task changed during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
+  if [ -n "$target" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
+    fi
+  fi
   if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
     echo "error: managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
@@ -175,8 +208,13 @@ release_managed_account() {  # <meta> <task> <backend> <target> [probe-home]
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
+  fm_account_cleanup_predecessor "$meta" "$DATA" "$task" || {
+    echo "error: failed to clean predecessor Agent Fleet state for $task; retaining metadata for retry" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
   MANAGED_ACCOUNT_LOCK=$lock
-  TEARDOWN_ACCOUNT_LOCKS+=("$lock")
+  [ "$acquired" = 0 ] || TEARDOWN_ACCOUNT_LOCKS+=("$lock")
 }
 
 default_branch() {
@@ -923,6 +961,15 @@ cleanup_firstmate_home_children() {
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
+    child_account_lock=
+    if [ -n "$(fm_meta_get "$child_meta" account_profile)" ]; then
+      child_account_lock=$(fm_account_meta_lock_acquire "$sub_state" "$child_id") || return 1
+      TEARDOWN_ACCOUNT_LOCKS+=("$child_account_lock")
+      [ -f "$child_meta" ] && [ -n "$(fm_meta_get "$child_meta" account_profile)" ] || {
+        echo "error: managed child metadata changed while teardown waited for $child_id" >&2
+        return 1
+      }
+    fi
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
     child_kind=$(meta_value "$child_meta" kind)
@@ -939,11 +986,14 @@ cleanup_firstmate_home_children() {
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       fi
     fi
-    if [ -n "$child_t" ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
+    if [ -n "$(fm_meta_get "$child_meta" account_profile)" ]; then
+      release_managed_account "$child_meta" "$child_id" "$home" "$child_account_lock" || return 1
+      child_account_lock=$MANAGED_ACCOUNT_LOCK
+    else
+      if [ -n "$child_t" ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
+      fi
     fi
-    release_managed_account "$child_meta" "$child_id" "$child_backend" "$child_t" "$home" || return 1
-    child_account_lock=$MANAGED_ACCOUNT_LOCK
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
@@ -1043,17 +1093,8 @@ fi
 
 PROBE_HOME=
 [ "$KIND" != secondmate ] || PROBE_HOME=$HOME_PATH
-ACCOUNT_DELETE_LOCK=
 if [ -n "$MANAGED_PROFILE" ]; then
-  if [ -n "$T" ]; then
-    if [ -n "$PROBE_HOME" ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" ) 2>/dev/null || true
-    else
-      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-    fi
-  fi
-  release_managed_account "$META" "$ID" "$BACKEND" "$T" "$PROBE_HOME" || exit 1
-  ACCOUNT_DELETE_LOCK=$MANAGED_ACCOUNT_LOCK
+  release_managed_account "$META" "$ID" "$PROBE_HOME" "$ACCOUNT_DELETE_LOCK" || exit 1
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then

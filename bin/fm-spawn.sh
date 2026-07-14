@@ -222,6 +222,27 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
   RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  if [ "$(fm_account_meta_value "$RESUME_META" account_predecessor_cleanup)" = pending ]; then
+    cleanup_id=${POS[0]}
+    cleanup_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
+    "$SCRIPT_DIR/fm-account-session-sync.sh" "$cleanup_id" --require >/dev/null || exit 1
+    cleanup_lock=$(fm_account_meta_lock_acquire "$STATE" "$cleanup_id") || exit 1
+    if [ ! -f "$RESUME_META" ] || [ "$(fm_account_meta_value "$RESUME_META" account_task)" != "$cleanup_account_task" ]; then
+      fm_account_meta_lock_release "$cleanup_lock" >/dev/null 2>&1 || true
+      echo "error: managed task generation changed before predecessor cleanup for $cleanup_id" >&2
+      exit 1
+    fi
+    if ! fm_account_cleanup_predecessor "$RESUME_META" "$DATA" "$cleanup_id"; then
+      fm_account_meta_lock_release "$cleanup_lock" >/dev/null 2>&1 || true
+      echo "error: predecessor Agent Fleet cleanup remains pending for $cleanup_id" >&2
+      exit 1
+    fi
+    fm_account_meta_lock_release "$cleanup_lock" || exit 1
+    if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+      echo "completed predecessor Agent Fleet cleanup for $cleanup_id"
+      exit 0
+    fi
+  fi
   recorded_backend=$(fm_backend_of_meta "$RESUME_META")
   if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
     echo "error: account recovery backend override '$BACKEND_ARG' does not match recorded backend '$recorded_backend'" >&2
@@ -269,6 +290,8 @@ ACCOUNT_EFFECTIVE_MODE=off
 ACCOUNT_TASK=
 ACCOUNT_ATTEMPT=
 ACCOUNT_PREDECESSOR_TASK=
+ACCOUNT_PREDECESSOR_ATTEMPT=
+ACCOUNT_PREDECESSOR_PROVIDER=
 ACCOUNT_PREDECESSOR_PROFILE=
 ACCOUNT_PREDECESSOR_POOL=
 ACCOUNT_PREDECESSOR_SESSION=
@@ -356,7 +379,7 @@ spawn_abort_cleanup() {
       if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
         account_clean=0
         echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown}" >&2
-      elif ! fm_account_session_remove "$ACCOUNT_TASK" 2>/dev/null; then
+      elif [ "$RESUME_ACCOUNT" != 1 ] && ! fm_account_session_remove "$ACCOUNT_TASK" 2>/dev/null; then
         account_clean=0
         echo "warning: failed to roll back Agent Fleet session for ${ID:-unknown}" >&2
       else
@@ -374,11 +397,15 @@ spawn_abort_cleanup() {
     fi
     if [ "$account_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
-        mv "$META_BACKUP" "$STATE/$ID.meta"
+        if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
+          mv "$META_BACKUP" "$STATE/$ID.meta"
+        else
+          rm -f "$META_BACKUP"
+        fi
         META_BACKUP=
-      elif [ "$META_INSTALLED" = 1 ] && [ "$worktree_clean" = 1 ]; then
+      elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] && [ "$worktree_clean" = 1 ]; then
         rm -f "$STATE/$ID.meta"
-      elif [ "$META_INSTALLED" = 1 ] && [ -f "$STATE/$ID.meta" ]; then
+      elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
         rollback_tmp="$STATE/.$ID.meta.rollback.$$"
         awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/' "$STATE/$ID.meta" > "$rollback_tmp"
         printf 'rollback_pending=1\n' >> "$rollback_tmp"
@@ -487,7 +514,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
   [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+    RECORDED_SESSION_UPDATED_AT=$("$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
     RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
     [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
     if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
@@ -516,6 +543,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       ACCOUNT_POOL_SET=1
     fi
     ACCOUNT_PREDECESSOR_TASK=$RECORDED_ACCOUNT_TASK
+    ACCOUNT_PREDECESSOR_ATTEMPT=$RECORDED_ATTEMPT
+    ACCOUNT_PREDECESSOR_PROVIDER=$RECORDED_HARNESS
     ACCOUNT_PREDECESSOR_PROFILE=$RECORDED_PROFILE
     ACCOUNT_PREDECESSOR_POOL=$RECORDED_POOL
     ACCOUNT_PREDECESSOR_SESSION=$RECORDED_SESSION
@@ -641,7 +670,7 @@ if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
-if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
     ACCOUNT_POOL=$SM_ACCOUNT_POOL
   else
@@ -1313,7 +1342,13 @@ fi
 
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS" || exit 1
+    if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS"; then
+      ACCOUNT_LEASE_CREATED=1
+    else
+      account_recover_status=$?
+      [ "$account_recover_status" -ne 2 ] || ACCOUNT_LEASE_CREATED=1
+      exit 1
+    fi
     fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
   else
     if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
@@ -1356,9 +1391,12 @@ META_TMP="$STATE/.$ID.meta.$$"
     echo "account_task=$ACCOUNT_TASK"
     echo "account_attempt=$ACCOUNT_ATTEMPT"
     [ -z "$ACCOUNT_PREDECESSOR_TASK" ] || echo "account_predecessor_task=$ACCOUNT_PREDECESSOR_TASK"
+    [ -z "$ACCOUNT_PREDECESSOR_ATTEMPT" ] || echo "account_predecessor_attempt=$ACCOUNT_PREDECESSOR_ATTEMPT"
+    [ -z "$ACCOUNT_PREDECESSOR_PROVIDER" ] || echo "account_predecessor_provider=$ACCOUNT_PREDECESSOR_PROVIDER"
     [ -z "$ACCOUNT_PREDECESSOR_PROFILE" ] || echo "account_predecessor_profile=$ACCOUNT_PREDECESSOR_PROFILE"
     [ -z "$ACCOUNT_PREDECESSOR_POOL" ] || echo "account_predecessor_pool=$ACCOUNT_PREDECESSOR_POOL"
     [ -z "$ACCOUNT_PREDECESSOR_SESSION" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
+    [ "$CONTINUE_ACCOUNT" != 1 ] || echo "account_predecessor_cleanup=pending"
     [ -z "$CONTINUATION_PACKET" ] || echo "continuation_packet=$CONTINUATION_PACKET"
     if [ "$RESUME_ACCOUNT" = 1 ]; then
       echo "provider_session_id=$RECORDED_SESSION"
@@ -1398,7 +1436,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   while IFS= read -r meta_line || [ -n "$meta_line" ]; do
     meta_key=${meta_line%%=*}
     case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
     esac
     printf '%s\n' "$meta_line" >> "$META_TMP"
   done < "$RESUME_META"
@@ -1453,24 +1491,45 @@ spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
 
-if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$RESUME_ACCOUNT" != 1 ]; then
-  if ! "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require >/dev/null; then
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
+  fi
+  if ! "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
+    echo "error: managed task generation changed before launch commit for $ID" >&2
+    exit 1
+  fi
+  probe_home=$FM_HOME
+  [ "$KIND" != secondmate ] || probe_home=$PROJ_ABS
+  if ! ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" ) 2>/dev/null; then
+    echo "error: managed endpoint disappeared before launch commit for $ID" >&2
+    exit 1
+  fi
+  ACCOUNT_SPAWN_COMMITTED=1
+  [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
+  META_BACKUP=
   if [ "$CONTINUE_ACCOUNT" = 1 ]; then
-    fm_account_release "$ACCOUNT_PREDECESSOR_TASK" --force || {
-      echo "error: failed to release predecessor Agent Fleet lease for $ID" >&2
+    if ! fm_account_cleanup_predecessor "$STATE/$ID.meta" "$DATA" "$ID"; then
+      fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
+      META_WRITE_LOCK=
+      echo "error: predecessor Agent Fleet cleanup remains pending for $ID" >&2
       exit 1
-    }
-    fm_account_session_remove "$ACCOUNT_PREDECESSOR_TASK" || {
-      echo "error: failed to remove predecessor Agent Fleet session for $ID" >&2
-      exit 1
-    }
-    fm_account_lineage_append "$DATA" "$ID" predecessor-released "$RECORDED_ATTEMPT" "$ACCOUNT_PREDECESSOR_TASK" "$RECORDED_HARNESS" "$ACCOUNT_PREDECESSOR_POOL" "$ACCOUNT_PREDECESSOR_PROFILE" "$ACCOUNT_PREDECESSOR_SESSION" "$ACCOUNT_TASK" || true
+    fi
+    fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+    META_WRITE_LOCK=
+  fi
+  if [ -n "$META_WRITE_LOCK" ]; then
+    fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+    META_WRITE_LOCK=
   fi
 fi
-ACCOUNT_SPAWN_COMMITTED=1
+[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
 META_BACKUP=
 

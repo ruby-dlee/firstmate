@@ -17,8 +17,9 @@
 # Off does not invoke Agent Fleet.
 # Observe performs only `choose --dry-run`, never creates a lease, and never
 # changes the provider launch or task metadata.
-# Enforce atomically reserves one profile before endpoint creation and fails
-# closed on every Agent Fleet or validation error.
+# Enforce atomically reserves one profile after endpoint and worktree setup,
+# immediately before provider launch, and fails closed on every Agent Fleet or
+# validation error.
 #
 # FM_AGENT_FLEET_BIN may name a deterministic fake or a pinned candidate in
 # tests/labs. Otherwise `agent-fleet` is resolved from PATH.
@@ -52,20 +53,34 @@ fm_account_fleet_bin() {
 }
 
 fm_account_read_single_value() {  # <file>
-  local file=$1 value extra
-  [ -f "$file" ] || return 1
-  value=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$file" | head -1 | tr -d '[:space:]')
-  extra=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$file" | sed -n '2p')
-  [ -z "$extra" ] || {
+  local file=$1 values count value
+  [ -e "$file" ] || return 1
+  [ -f "$file" ] && [ -r "$file" ] || {
+    echo "error: cannot read $file" >&2
+    return 2
+  }
+  values=$(awk '
+    {
+      sub(/[[:space:]]*#.*/, "")
+      gsub(/[[:space:]]/, "")
+      if (length($0) > 0) print
+    }
+  ' "$file") || {
+    echo "error: cannot read $file" >&2
+    return 2
+  }
+  count=$(printf '%s\n' "$values" | awk 'NF { count++ } END { print count + 0 }')
+  [ "$count" -le 1 ] || {
     echo "error: $file must contain exactly one value" >&2
     return 2
   }
-  [ -n "$value" ] || return 1
+  [ "$count" -eq 1 ] || return 1
+  value=$(printf '%s\n' "$values" | awk 'NF { print; exit }')
   printf '%s\n' "$value"
 }
 
 fm_account_resolve_mode() {  # <config-dir> <explicit-route:0|1> <disabled:0|1>
-  local config=$1 explicit=$2 disabled=$3 value source
+  local config=$1 explicit=$2 disabled=$3 value source status
   if [ "$disabled" = 1 ]; then
     printf 'off\n'
     return 0
@@ -77,16 +92,137 @@ fm_account_resolve_mode() {  # <config-dir> <explicit-route:0|1> <disabled:0|1>
   if [ -n "${FM_ACCOUNT_ROUTING:-}" ]; then
     value=$FM_ACCOUNT_ROUTING
     source=FM_ACCOUNT_ROUTING
-  elif value=$(fm_account_read_single_value "$config/account-routing-mode" 2>/dev/null); then
-    source=config/account-routing-mode
   else
-    value=off
-    source=default
+    if value=$(fm_account_read_single_value "$config/account-routing-mode"); then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      0) source=config/account-routing-mode ;;
+      1) value=off; source=default ;;
+      *) return "$status" ;;
+    esac
   fi
   case "$value" in
     off|observe|enforce) printf '%s\n' "$value" ;;
     *) echo "error: invalid account routing mode '$value' from $source (expected off, observe, or enforce)" >&2; return 1 ;;
   esac
+}
+
+fm_account_attempt_id() {  # <home> <task>
+  local home=$1 task=$2 seed
+  fm_account_valid_id "$task" || {
+    echo "error: invalid task id '$task' for account routing" >&2
+    return 1
+  }
+  seed=$(printf '%s\n%s\n%s\n%s\n%s\n' "$home" "$task" "$$" "$(date +%s)" "${RANDOM:-0}" | git hash-object --stdin 2>/dev/null) || {
+    echo "error: cannot generate Agent Fleet attempt identity" >&2
+    return 1
+  }
+  printf 'a%.15s\n' "$seed"
+}
+
+fm_account_task_key() {  # <home> <task> <attempt>
+  local home=$1 task=$2 attempt=$3 abs_home home_hash
+  fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account routing" >&2; return 1; }
+  fm_account_valid_id "$attempt" || { echo "error: invalid account attempt '$attempt'" >&2; return 1; }
+  abs_home=$(cd "$home" 2>/dev/null && pwd -P) || {
+    echo "error: cannot resolve firstmate home for account routing: $home" >&2
+    return 1
+  }
+  home_hash=$(printf '%s\n' "$abs_home" | git hash-object --stdin 2>/dev/null) || {
+    echo "error: cannot namespace Agent Fleet task for $abs_home" >&2
+    return 1
+  }
+  printf 'fm-%.16s-%s-%s\n' "$home_hash" "$task" "$attempt"
+}
+
+fm_account_process_start_time() {  # <pid>
+  local out
+  out=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  out=$(printf '%s\n' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+fm_account_meta_lock_owner_alive() {  # <lock-dir>
+  local owner=$1/owner pid recorded current
+  [ -f "$owner" ] || return 1
+  pid=$(sed -n '1p' "$owner" 2>/dev/null)
+  recorded=$(sed -n '2p' "$owner" 2>/dev/null)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$recorded" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  current=$(fm_account_process_start_time "$pid") || return 1
+  [ "$current" = "$recorded" ]
+}
+
+fm_account_meta_lock_acquire() {  # <state-dir> <task>
+  local state=$1 task=$2 lock deadline now start owner_tmp wait_seconds=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
+  fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account metadata lock" >&2; return 1; }
+  case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid account metadata lock wait '$wait_seconds'" >&2; return 1 ;; esac
+  mkdir -p "$state" || return 1
+  lock="$state/.account-meta-$task.lock"
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ -d "$lock" ] && [ -f "$lock/owner" ] && ! fm_account_meta_lock_owner_alive "$lock"; then
+      rm -rf "$lock"
+      continue
+    fi
+    now=$(date +%s)
+    [ "$now" -lt "$deadline" ] || {
+      echo "error: timed out waiting for account metadata lock for $task" >&2
+      return 1
+    }
+    sleep 0.05
+  done
+  start=$(fm_account_process_start_time "$$") || {
+    rmdir "$lock" 2>/dev/null || true
+    echo "error: cannot record account metadata lock owner for $task" >&2
+    return 1
+  }
+  owner_tmp="$lock/.owner.$$"
+  printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
+    rm -rf "$lock"
+    return 1
+  }
+  mv "$owner_tmp" "$lock/owner" || { rm -rf "$lock"; return 1; }
+  printf '%s\n' "$lock"
+}
+
+fm_account_meta_lock_release() {  # <lock-dir>
+  local lock=$1 pid
+  [ -d "$lock" ] || return 0
+  pid=$(sed -n '1p' "$lock/owner" 2>/dev/null)
+  [ "$pid" = "$$" ] || {
+    echo "error: refusing to release account metadata lock owned by ${pid:-unknown}" >&2
+    return 1
+  }
+  rm -f "$lock/owner"
+  rmdir "$lock"
+}
+
+fm_account_safe_lineage_value() {
+  case "$1" in *$'\t'*|*$'\n'*) return 1 ;; esac
+}
+
+fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task> <provider> <pool> <profile> <session> <predecessor>
+  local data=$1 task=$2 event=$3 attempt=$4 fleet_task=$5 provider=$6 pool=$7 profile=$8 session=$9 predecessor=${10} dir value
+  for value in "$task" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "$session" "$predecessor"; do
+    fm_account_safe_lineage_value "$value" || {
+      echo "error: unsafe account-attempt lineage value" >&2
+      return 1
+    }
+  done
+  dir="$data/$task"
+  mkdir -p "$dir" || return 1
+  if [ ! -f "$dir/account-attempts.md" ]; then
+    printf '# Account attempt lineage\n\n' > "$dir/account-attempts.md"
+  fi
+  printf -- '- %s event=%s attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=%s predecessor=%s.\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "${session:-pending}" "${predecessor:-none}" \
+    >> "$dir/account-attempts.md"
 }
 
 fm_account_secondmate_pool() {  # <config-dir>
@@ -123,7 +259,7 @@ fm_account_json_field() {  # <json> <jq-expression> <label>
 # In observe mode these are shadow values only and callers must not persist or
 # apply them.
 fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
-  local mode=$1 harness=$2 pool=$3 requested_profile=$4 task=$5 binary json status
+  local mode=$1 harness=$2 pool=$3 requested_profile=$4 task=$5 binary json status acquired=0 selected_task selected_pool
   FM_ACCOUNT_SELECTED_PROFILE=
   FM_ACCOUNT_SELECTED_PROVIDER=
   case "$harness" in
@@ -146,31 +282,50 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
     return 1
   }
   if [ "$mode" = observe ]; then
-    set +e
-    json=$("$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --dry-run 2>/dev/null)
-    status=$?
-    set -e
+    if json=$("$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --dry-run 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
     if [ "$status" -ne 0 ]; then
       echo "fm-account-routing: observe decision unavailable for pool=$pool provider=$harness; legacy launch unchanged" >&2
       return 0
     fi
   elif [ -n "$requested_profile" ] && [ "$pool" = explicit ]; then
     json=$("$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool") || return 1
+    acquired=1
   else
     if [ -n "$requested_profile" ]; then
       json=$("$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --profile "$requested_profile") || return 1
     else
       json=$("$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness") || return 1
     fi
+    acquired=1
   fi
-  FM_ACCOUNT_SELECTED_PROFILE=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' selection) || return 1
-  FM_ACCOUNT_SELECTED_PROVIDER=$(fm_account_json_field "$json" '.provider | select(type == "string" and length > 0)' selection) || return 1
-  [ "$FM_ACCOUNT_SELECTED_PROVIDER" = "$harness" ] || {
-    echo "error: agent-fleet selected provider '$FM_ACCOUNT_SELECTED_PROVIDER' for harness '$harness'" >&2
-    return 1
-  }
-  if [ -n "$requested_profile" ] && [ "$FM_ACCOUNT_SELECTED_PROFILE" != "$requested_profile" ]; then
-    echo "error: agent-fleet selected profile '$FM_ACCOUNT_SELECTED_PROFILE', expected '$requested_profile'" >&2
+  if ! selected_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' selection) \
+    || ! selected_pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' selection) \
+    || ! FM_ACCOUNT_SELECTED_PROFILE=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' selection) \
+    || ! FM_ACCOUNT_SELECTED_PROVIDER=$(fm_account_json_field "$json" '.provider | select(type == "string" and length > 0)' selection) \
+    || [ "$selected_task" != "$task" ] \
+    || [ "$selected_pool" != "$pool" ] \
+    || ! fm_account_valid_id "$FM_ACCOUNT_SELECTED_PROFILE" \
+    || [ "$FM_ACCOUNT_SELECTED_PROVIDER" != "$harness" ] \
+    || { [ -n "$requested_profile" ] && [ "$FM_ACCOUNT_SELECTED_PROFILE" != "$requested_profile" ]; }; then
+    FM_ACCOUNT_SELECTED_PROFILE=
+    FM_ACCOUNT_SELECTED_PROVIDER=
+    if [ "$mode" = observe ]; then
+      echo "fm-account-routing: observe decision invalid for pool=$pool provider=$harness; legacy launch unchanged" >&2
+      return 0
+    fi
+    echo "error: agent-fleet returned a mismatched account selection" >&2
+    if [ "$acquired" = 1 ]; then
+      if fm_account_release "$task" --force; then
+        :
+      else
+        echo "error: failed to release invalid Agent Fleet reservation for $task" >&2
+        return 2
+      fi
+    fi
     return 1
   fi
   if [ "$mode" = observe ]; then

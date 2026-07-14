@@ -79,6 +79,7 @@ make_case() {
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 # `treehouse return --force <wt>`: succeed silently.
+[ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'treehouse-return %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
 exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
@@ -509,7 +510,7 @@ test_local_only_fork_remote_allows() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "fork-allow: teardown should succeed when HEAD is on a fork remote"
+  [ "$rc" -eq 0 ] || fail "fork-allow: teardown should succeed when HEAD is on a fork remote: $(cat "$case_dir/stderr")"
   ! grep -q REFUSED "$case_dir/stderr" || fail "fork-allow: teardown printed a REFUSED line"
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
@@ -1249,7 +1250,13 @@ add_fake_agent_fleet() {
 set -u
 printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
 case "$*" in
-  *"lease release"*) [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 42 ;;
+  *"lease release"*)
+    [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'lease-release %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
+    [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 42
+    ;;
+  *"session remove"*)
+    [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'session-remove %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
+    ;;
 esac
 printf '{"ok":true}\n'
 SH
@@ -1272,6 +1279,7 @@ test_managed_force_teardown_releases_lease_and_session() {
   printf '%s\n' \
     'account_pool=claude-crew' \
     'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-attempt-a1' \
     'provider_session_id=session-123' >> "$case_dir/state/task-x1.meta"
   wt_commit "$case_dir" "managed unpushed work"
   add_fake_agent_fleet "$case_dir"
@@ -1283,36 +1291,124 @@ test_managed_force_teardown_releases_lease_and_session() {
   set -e
 
   expect_code 0 "$rc" "managed-force-release: teardown should succeed"
-  assert_grep 'lease release --task task-x1 --force' "$af_log" "managed teardown did not release the lease"
-  assert_grep 'session remove --task task-x1' "$af_log" "managed teardown did not remove the session mapping"
+  assert_grep 'lease release --task fm-home-task-x1-attempt-a1 --force' "$af_log" "managed teardown did not release the lease"
+  assert_grep 'session remove --task fm-home-task-x1-attempt-a1' "$af_log" "managed teardown did not remove the session mapping"
   assert_absent "$case_dir/state/task-x1.meta" "managed teardown left task metadata"
   pass "managed teardown releases its lease and session mapping only after endpoint removal"
 }
 
-test_managed_release_failure_preserves_retry_metadata() {
-  local case_dir af_log rc
+test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
+  local case_dir af_log order_log rc release_line session_line return_line
   case_dir=$(make_case managed-release-failure)
   af_log="$case_dir/agent-fleet.log"
+  order_log="$case_dir/teardown-order.log"
   : > "$af_log"
+  : > "$order_log"
   write_meta "$case_dir" local-only ship
   printf '%s\n' \
     'account_pool=codex-crew' \
     'account_profile=codex-2' \
+    'account_task=fm-home-task-x1-attempt-b2' \
     'provider_session_id=session-456' >> "$case_dir/state/task-x1.meta"
   add_fake_agent_fleet "$case_dir"
 
   set +e
-  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_FAKE_AF_RELEASE_FAIL=1 \
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_FAKE_AF_RELEASE_FAIL=1 FM_TEARDOWN_ORDER_LOG="$order_log" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
   expect_code 1 "$rc" "managed-release-failure: teardown should fail closed"
-  assert_grep 'lease release --task task-x1 --force' "$af_log" "managed teardown never attempted release"
-  ! grep -q 'session remove --task task-x1' "$af_log" || fail "managed teardown removed the mapping after release failed"
+  assert_grep 'lease release --task fm-home-task-x1-attempt-b2 --force' "$af_log" "managed teardown never attempted release"
+  ! grep -q 'session remove --task fm-home-task-x1-attempt-b2' "$af_log" || fail "managed teardown removed the mapping after release failed"
   assert_present "$case_dir/state/task-x1.meta" "managed teardown erased retry metadata after release failed"
   assert_grep 'account_profile=codex-2' "$case_dir/state/task-x1.meta" "managed teardown lost sticky account metadata"
-  pass "a failed managed release keeps sticky metadata and the provider-session mapping for retry"
+  assert_present "$case_dir/wt/.git" "managed teardown recycled the worktree after release failed"
+  assert_not_contains "$(cat "$order_log")" 'treehouse-return' "managed teardown returned the worktree before account cleanup succeeded"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_TEARDOWN_ORDER_LOG="$order_log" \
+    run_teardown "$case_dir" --force > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" \
+    || fail "managed-release-failure: cleanup retry should succeed"
+
+  release_line=$(grep -n 'lease-release .*fm-home-task-x1-attempt-b2' "$order_log" | tail -1 | cut -d: -f1)
+  session_line=$(grep -n 'session-remove .*fm-home-task-x1-attempt-b2' "$order_log" | tail -1 | cut -d: -f1)
+  return_line=$(grep -n 'treehouse-return' "$order_log" | tail -1 | cut -d: -f1)
+  [ "$release_line" -lt "$session_line" ] && [ "$session_line" -lt "$return_line" ] \
+    || fail "managed-release-failure: retry recycled the worktree before account cleanup"
+  assert_absent "$case_dir/state/task-x1.meta" "managed cleanup retry left task metadata"
+  pass "a failed managed release preserves the unrecycled worktree and retry ordering"
+}
+
+test_forced_secondmate_child_uses_child_home_for_endpoint_verification() {
+  local case_dir af_log zellij_log child_project child_worktree child_id rc
+  case_dir=$(make_case secondmate-child-home-probe)
+  af_log="$case_dir/agent-fleet.log"
+  zellij_log="$case_dir/zellij.log"
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  child_id=child-zellij-x2
+  : > "$af_log"
+  : > "$zellij_log"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    'window=firstmate:9' \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=zellij' \
+    'zellij_tab_id=7' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-child-home-attempt-c3' \
+    'provider_session_id=session-child'
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\t%s\n' "${FM_HOME:-}" "$*" >> "$FM_FAKE_ZELLIJ_LOG"
+if [ "${1:-}" = list-sessions ]; then
+  printf 'firstmate\n'
+  exit 0
+fi
+if [ "${FM_HOME:-}" = "${FM_FAKE_ZELLIJ_HOME:-}" ]; then
+  case "$*" in
+    *'action list-panes --json'*) printf '[{"id":9,"tab_id":7,"is_plugin":false}]\n'; exit 0 ;;
+    *'action list-tabs --json'*) printf '[{"tab_id":7,"name":"fm-child-zellij-x2","active":true}]\n'; exit 0 ;;
+    *'action close-tab-by-id 7'*) exit 0 ;;
+  esac
+fi
+case "$*" in
+  *'action list-panes --json'*|*'action list-tabs --json'*) printf '[]\n'; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/zellij"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_ZELLIJ_HOME="$case_dir/wt" FM_FAKE_ZELLIJ_LOG="$zellij_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "secondmate-child-home-probe: live child endpoint should block account release"
+  assert_grep "$case_dir/wt" "$zellij_log" "child endpoint was not verified under the child firstmate home"
+  assert_not_contains "$(cat "$af_log")" 'lease release' "live child endpoint allowed Agent Fleet release"
+  assert_present "$case_dir/wt/state/$child_id.meta" "live child endpoint lost retry metadata"
+  assert_present "$child_worktree/.git" "live child endpoint worktree was recycled"
+  assert_grep 'managed endpoint for child-zellij-x2 is still alive' "$case_dir/stderr" "child endpoint blocker was not reported"
+  pass "forced secondmate cleanup verifies managed children in the child home"
 }
 
 test_herdr_teardown_clears_escalation_marker() {
@@ -1345,7 +1441,8 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_managed_force_teardown_releases_lease_and_session
-test_managed_release_failure_preserves_retry_metadata
+test_managed_release_failure_preserves_unrecycled_worktree_for_retry
+test_forced_secondmate_child_uses_child_home_for_endpoint_verification
 test_herdr_teardown_clears_escalation_marker
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head

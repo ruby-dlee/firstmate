@@ -208,9 +208,15 @@ set -u
 case "${1:-}" in
   display-message)
     for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
-    exit 0 ;;
-  new-window|kill-window)
+    [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]
+    exit $? ;;
+  kill-window)
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    rm -f "$FM_TEST_ENDPOINT_FILE"
+    exit 0 ;;
+  new-window)
+    printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    touch "$FM_TEST_ENDPOINT_FILE"
     exit 0 ;;
   list-windows|has-session) exit 0 ;;
 esac
@@ -255,12 +261,14 @@ add_sm_home() {
     printf 'harness=%s\n' "$harness"
     printf 'home=%s\n' "$home"
   } > "$w/home/state/$id.meta"
+  touch "$w/home/state/.fake-endpoint"
 }
 
 run_bootstrap() {  # <fakebin> <home> <pane-cmd> <call-log> [extra env...] -> stdout
   local fb=$1 home=$2 cmd=$3 log=$4; shift 4
   PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" \
     FM_TEST_PANE_CMD="$cmd" FM_TMUX_CALL_LOG="$log" \
+    FM_TEST_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
 }
 
@@ -280,6 +288,22 @@ test_sweep_respawns_confirmed_dead_secondmate() {
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
+}
+
+test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-unmanaged-routing)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" FM_ACCOUNT_ROUTING=enforce)
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "an unmanaged secondmate should retain legacy recovery after routing is enabled"
+  assert_contains "$(cat "$log")" "new-window" \
+    "the unmanaged secondmate was not relaunched under its original policy"
+  pass "unmanaged secondmate recovery explicitly stays outside newly enabled account routing"
 }
 
 test_sweep_leaves_alive_secondmate_untouched() {
@@ -390,6 +414,7 @@ test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
+test_unmanaged_respawn_does_not_migrate_into_current_account_policy
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_never_acts_on_inconclusive_reading
 test_sweep_never_acts_on_unverified_harness_dead_reading

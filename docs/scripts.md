@@ -27,10 +27,11 @@ The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm
 | `fm-cd-command-policy.mjs` | Semantic owner of the cd-guard's persistent-directory-change decision (docs/cd-guard.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
-| `fm-spawn.sh`            | Spawn or sticky-resume crews on the resolved harness, account profile, and runtime backend |
+| `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crews on the resolved account and runtime backend |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule through legacy quota or Agent Fleet pool summaries |
 | `fm-account-routing-lib.sh` | Own Firstmate's shell-side Agent Fleet mode, lease, exec, resume, and release contract |
 | `fm-account-session-sync.sh` | Reconcile real Agent Fleet provider-session mappings into managed task metadata       |
+| `fm-account-continuation.sh` | Build a verified task-owned packet for fresh cross-profile continuation             |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
 | `fm-composer-lib.sh`     | Single fleet-wide owner of composer-content classification for all backends          |

@@ -122,12 +122,28 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+MANAGED_PROFILE=$(fm_meta_get "$META" account_profile)
+TEARDOWN_ACCOUNT_LOCKS=('')
+MANAGED_ACCOUNT_LOCK=
 
-managed_endpoint_is_gone() {  # <backend> <target> <expected-label>
-  local backend=$1 target=$2 expected=$3 attempt
+release_teardown_account_locks() {
+  local lock
+  for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
+    [ -n "$lock" ] || continue
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+  done
+}
+trap release_teardown_account_locks EXIT
+
+managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
+  local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt
   [ -n "$target" ] || return 0
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if ! fm_backend_target_exists "$backend" "$target" "$expected" 2>/dev/null; then
+    if [ -n "$probe_home" ]; then
+      if ! ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_exists "$backend" "$target" "$expected" ) 2>/dev/null; then
+        return 0
+      fi
+    elif ! fm_backend_target_exists "$backend" "$target" "$expected" 2>/dev/null; then
       return 0
     fi
     sleep 0.1
@@ -135,22 +151,32 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label>
   return 1
 }
 
-release_managed_account() {  # <meta> <task> <backend> <target>
-  local meta=$1 task=$2 backend=$3 target=$4 profile
+release_managed_account() {  # <meta> <task> <backend> <target> [probe-home]
+  local meta=$1 task=$2 backend=$3 target=$4 probe_home=${5:-} profile account_task meta_state lock
+  MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || return 0
-  if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task"; then
+  meta_state=$(dirname "$meta")
+  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+  if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
     echo "error: managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   fi
-  fm_account_release "$task" --force || {
+  account_task=$(fm_meta_get "$meta" account_task)
+  [ -n "$account_task" ] || account_task=$task
+  fm_account_release "$account_task" --force || {
     echo "error: failed to release Agent Fleet lease for $task; retaining metadata for retry" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
-  fm_account_session_remove "$task" || {
+  fm_account_session_remove "$account_task" || {
     echo "error: failed to remove Agent Fleet session mapping for $task; retaining metadata for retry" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
+  MANAGED_ACCOUNT_LOCK=$lock
+  TEARDOWN_ACCOUNT_LOCKS+=("$lock")
 }
 
 default_branch() {
@@ -891,7 +917,7 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_account_lock
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -914,14 +940,10 @@ cleanup_firstmate_home_children() {
       fi
     fi
     if [ -n "$child_t" ]; then
-      if [ "$child_backend" = zellij ]; then
-        # Zellij titles are scoped by the owning home tag, so forced secondmate
-        # cleanup must verify child tabs as that child home, not the parent.
-        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
-      else
-        fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
-      fi
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
     fi
+    release_managed_account "$child_meta" "$child_id" "$child_backend" "$child_t" "$home" || return 1
+    child_account_lock=$MANAGED_ACCOUNT_LOCK
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
@@ -953,8 +975,8 @@ cleanup_firstmate_home_children() {
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
-    release_managed_account "$child_meta" "$child_id" "$child_backend" "$child_t" || return 1
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
+    [ -z "$child_account_lock" ] || fm_account_meta_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done
 }
 
@@ -984,10 +1006,6 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
       exit 1
     done
   fi
-fi
-
-if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH"
 fi
 
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
@@ -1023,6 +1041,25 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+PROBE_HOME=
+[ "$KIND" != secondmate ] || PROBE_HOME=$HOME_PATH
+ACCOUNT_DELETE_LOCK=
+if [ -n "$MANAGED_PROFILE" ]; then
+  if [ -n "$T" ]; then
+    if [ -n "$PROBE_HOME" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+    fi
+  fi
+  release_managed_account "$META" "$ID" "$BACKEND" "$T" "$PROBE_HOME" || exit 1
+  ACCOUNT_DELETE_LOCK=$MANAGED_ACCOUNT_LOCK
+fi
+
+if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
+  cleanup_firstmate_home_children "$HOME_PATH"
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -1038,7 +1075,9 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
-  [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if [ -z "$MANAGED_PROFILE" ]; then
+    [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  fi
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
@@ -1063,10 +1102,9 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$BACKEND" != orca ]; then
+if [ -z "$MANAGED_PROFILE" ] && [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
-release_managed_account "$META" "$ID" "$BACKEND" "$T" || exit 1
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
@@ -1078,6 +1116,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+[ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_meta_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

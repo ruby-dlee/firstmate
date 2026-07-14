@@ -168,18 +168,19 @@ Account routing is default-off, so an unchanged installation makes no Agent Flee
 The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the first value in local `config/account-routing-mode`, then `off`.
 The valid modes are `off`, `observe`, and `enforce`.
 `observe` asks Agent Fleet for a non-leasing dry-run decision, reports the non-secret pool/provider/profile choice, and leaves launch and metadata unchanged even when Agent Fleet is unavailable.
-`enforce` atomically reserves a profile before creating the runtime endpoint, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
+`enforce` prepares the isolated runtime endpoint and worktree first, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
 Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
 `--account-profile <profile>` pins one dynamic profile, using the supplied `--account-pool` when present and the reserved `explicit` pool otherwise.
 Pool and profile identifiers are non-secret aliases made only of letters, digits, dot, underscore, and dash, starting with a letter or digit; account email addresses and filesystem paths are invalid.
-Managed task metadata records `account_pool=`, `account_profile=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
-Spawn performs a bounded initial mapping sync, and the watcher reconciles any normal early SessionStart race on later cycles through `bin/fm-account-session-sync.sh --all`.
-Recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, and resumes the recorded provider session without replaying the brief as a new prompt.
+Managed task metadata records `account_pool=`, `account_profile=`, a home-namespaced and generation-unique `account_task=`, `account_attempt=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
+Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
+Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, and resumes the recorded provider session without replaying the brief as a new prompt.
+When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
 Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
-Teardown kills and verifies the recorded endpoint before releasing the Agent Fleet lease and removing its session mapping, and it retains metadata for retry if release or mapping removal fails.
-Agent Fleet routing is independent of the runtime backend, including Herdr: backend selection decides where the endpoint lives, while Agent Fleet decides which Claude or Codex account profile owns the provider process.
+Teardown kills and verifies the recorded endpoint, releases the Agent Fleet lease and session mapping, and only then recycles a worktree or secondmate home; any cleanup failure retains metadata and storage for retry.
+Agent Fleet routing supports the tmux, Herdr, zellij, and cmux session backends; enforced Orca launches are rejected before lease, worktree, endpoint, or metadata mutation because managed Orca recovery is not implemented.
 `config/secondmate-account-pool` optionally selects the primary's dynamic pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
-An explicit per-spawn account pool or profile overrides that secondmate pool.
+An explicit per-spawn account pool or profile overrides that secondmate pool, and an explicit profile without a pool uses only the reserved `explicit` pool.
 `config/account-routing-mode` is inherited, so a secondmate can apply the same off/observe/enforce policy to its own crewmates while resolving its own pools from dispatch profiles or the standard provider defaults.
 `FM_AGENT_FLEET_BIN` is a test/lab override for the CLI path; normal operation resolves `agent-fleet` from `PATH`.
 
@@ -218,7 +219,7 @@ Absent `select` means use the first array element, or the only object in the sin
 An omitted model or effort means the selected harness uses its own default for that axis.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 `quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
-When any quota-balanced candidate has `account_pool`, every candidate must have one, pinned `account_profile` values are refused, and the selector compares only Agent Fleet `pool status` summaries before passing the winning pool to atomic selection.
+Any quota-balanced candidate carrying `account_profile` is invalid because a pinned profile is a direct per-spawn override; pool-aware candidates must all carry `account_pool`, and the selector compares only Agent Fleet `pool status` summaries before passing the winning pool to atomic selection.
 That pool-aware path never falls through to `quota-axi` default-account data, preventing one quota source from choosing a provider while a different account source chooses the concrete profile.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.

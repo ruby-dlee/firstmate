@@ -304,7 +304,11 @@ secondmate_liveness_sweep() {
         fi
         fm_backend_kill "$backend" "$target" 2>/dev/null || true
         resume_args=()
-        [ -z "$account_profile" ] || resume_args+=(--resume-account)
+        if [ -n "$account_profile" ]; then
+          resume_args+=(--resume-account)
+        else
+          resume_args+=(--no-account-routing)
+        fi
         if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
           echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
         else
@@ -548,7 +552,7 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_pool") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_pool requires claude or codex harness"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_profile requires claude or codex harness"
     elif [(.rules // [])[]? | select(.select? == "quota-balanced") | select(([use_profiles(.use?)[] | has("account_pool")] | any) and ([use_profiles(.use?)[] | has("account_pool")] | all | not))] | length > 0 then "quota-balanced account_pool candidates must all carry account_pool"
-    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | use_profiles(.use?)[] | select(has("account_pool") and has("account_profile"))] | length > 0 then "quota-balanced account_pool candidates cannot pin account_profile"
+    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | use_profiles(.use?)[] | select(has("account_profile"))] | length > 0 then "quota-balanced candidates cannot carry account_profile"
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
     elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced")] | length > 0 then
       "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced") ] | unique | join(", "))

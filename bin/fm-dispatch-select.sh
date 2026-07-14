@@ -9,6 +9,8 @@
 #
 # quota-balanced is deterministic, and this header is the single owner of its
 # contract:
+#   - Any candidate carrying account_profile is invalid because pinned profiles
+#     are direct per-spawn overrides, never inputs to quota-balanced selection.
 #   - A candidate set carrying account_pool uses only Agent Fleet's no-secret
 #     `pool status` summaries. Every candidate must then carry account_pool and
 #     use claude/codex. The best available pool's adjusted headroom wins; exact
@@ -146,6 +148,11 @@ if [ "$select_strategy" != quota-balanced ]; then
   exit 0
 fi
 
+if printf '%s\n' "$profiles_json" | jq -e 'any(.[]; (.account_profile? | type) == "string")' >/dev/null 2>&1; then
+  echo "error: quota-balanced candidates cannot carry account_profile" >&2
+  exit 2
+fi
+
 # Once any account pool participates, provider choice must come from Agent
 # Fleet's same per-account view that concrete selection will use. Never compare
 # those pools against quota-axi's default-account cache (double selection).
@@ -153,11 +160,6 @@ pooled_count=$(printf '%s\n' "$profiles_json" | jq '[.[] | select((.account_pool
 if [ "$pooled_count" -gt 0 ]; then
   if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | jq -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
     log "account_pool quota-balanced candidates must all name claude/codex pools; using first profile"
-    first_profile
-    exit 0
-  fi
-  if printf '%s\n' "$profiles_json" | jq -e 'any(.[]; (.account_profile? | type) == "string")' >/dev/null 2>&1; then
-    log "quota-balanced account pools cannot carry a pinned account_profile; using first profile"
     first_profile
     exit 0
   fi

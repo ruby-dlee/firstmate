@@ -240,7 +240,7 @@ SH
 }
 
 test_pooled_failures_degrade_without_default_account_quota() {
-  local fakebin quota_marker out err pooled pinned
+  local fakebin quota_marker out err pooled pinned status
   fakebin=$(fm_fakebin "$TMP_ROOT/account-fallback")
   quota_marker="$TMP_ROOT/account-fallback/quota-called"
   cat > "$fakebin/agent-fleet" <<'SH'
@@ -262,10 +262,18 @@ SH
   [ ! -e "$quota_marker" ] || fail "pool failure fell through to default-account quota"
 
   pinned='[{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-1"},{"harness":"codex","account_pool":"codex-crew"}]'
-  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pinned" 2>/dev/null)
-  [ "$out" = '{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-1"}' ] \
-    || fail "pinned pooled fallback dropped account_profile: $out"
-  pass "pool-summary failures and pinned candidates degrade safely without double selection"
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pinned" 2>"$TMP_ROOT/account-fallback/pinned.err")
+  status=$?
+  expect_code 2 "$status" "quota-balanced pinned candidates must be rejected"
+  [ -z "$out" ] || fail "rejected pinned selection emitted a profile: $out"
+  assert_contains "$(cat "$TMP_ROOT/account-fallback/pinned.err")" 'cannot carry account_profile' "pinned candidate error was unclear"
+
+  pinned='[{"harness":"claude","account_profile":"claude-1"},{"harness":"codex"}]'
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pinned" 2>"$TMP_ROOT/account-fallback/profile-only.err")
+  status=$?
+  expect_code 2 "$status" "profile-only quota-balanced candidates must be rejected"
+  [ -z "$out" ] || fail "rejected profile-only selection emitted a profile: $out"
+  pass "pool-summary failures degrade safely while every pinned quota-balanced candidate is rejected"
 }
 
 test_higher_min_vendor_wins

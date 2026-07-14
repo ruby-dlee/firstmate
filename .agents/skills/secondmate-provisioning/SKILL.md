@@ -73,7 +73,7 @@ This is secondmate-only: crewmate/scout model resolution is untouched by this fi
 
 `config/secondmate-account-pool` is the primary's optional Agent Fleet pool for launching secondmate agents when account routing is already enabled.
 The file contains one non-secret dynamic pool id, is re-read on every spawn, and does not activate account routing by itself.
-An explicit `--account-pool` or `--account-profile` overrides it for that spawn.
+An explicit `--account-pool` or `--account-profile` overrides it for that spawn, and an explicit profile without a pool is never constrained by this file.
 This pool is not inherited into the secondmate home because it governs the primary's secondmate launch, while `config/account-routing-mode` is inherited so the secondmate applies the same off/observe/enforce policy to its own crewmates.
 
 This section is the single owner of the secondmate sync and inheritable-config propagation contract; `AGENTS.md` sections 3 and 4 point here.
@@ -129,7 +129,8 @@ For managed `kind=secondmate` meta with `account_profile=`, preserve the sticky 
 bin/fm-spawn.sh <id> --resume-account
 ```
 
-This path requires the recorded Agent Fleet SessionStart mapping, uses `lease recover` rather than new-task quota selection, and refuses to create a fresh prompted session when mapping or sticky metadata is missing or mismatched.
+This path requires the recorded Agent Fleet SessionStart mapping and uses `lease recover` rather than new-task quota selection.
+If exact native resume is unavailable, recover the same task under a fresh Claude or Codex profile with `bin/fm-spawn.sh <id> --continue-account` after re-verifying the endpoint is dead; `bin/fm-account-continuation.sh` owns the provider-neutral packet and fail-closed state checks.
 For unmanaged `kind=secondmate` meta with no window, treat the secondmate as a dead persistent direct report and respawn it with:
 
 ```sh

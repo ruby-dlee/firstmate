@@ -27,6 +27,8 @@
 # or a status-pointed doc instead of stranding it in chat the main firstmate
 # never reads. A crewmate/scout target, an explicit backend-target escape-hatch
 # target, and the --key path are never marked - their behavior is unchanged.
+# Successful text steering for a managed account task is also appended to the
+# task-owned data/<id>/steering.md trail for provider-neutral continuation.
 # After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
 # 0 disables) before returning: submit confirmation only proves the text was
 # accepted, but the harness needs a beat to spin up the turn before its busy
@@ -50,6 +52,7 @@ if [ -z "${FM_HOME+x}" ] || [ -z "${FM_HOME:-}" ]; then
 fi
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 if [ ! -d "$FM_HOME" ]; then
   echo "error: FM_HOME '$FM_HOME' is not a directory; fm-send cannot resolve this home's state" >&2
   exit 1
@@ -246,6 +249,19 @@ else
       exit 1
       ;;
   esac
+  if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
+    steering_id=$(fm_send_id_from_meta "$TARGET_META")
+    steering_dir="$DATA/$steering_id"
+    mkdir -p "$steering_dir"
+    if [ ! -f "$steering_dir/steering.md" ]; then
+      printf '# Steering trail\n\n' > "$steering_dir/steering.md"
+    fi
+    {
+      printf -- '- %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '%s\n' "$*" | sed 's/^/> /'
+      printf '\n'
+    } >> "$steering_dir/steering.md"
+  fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the
   # turn before its busy footer shows. Pause so an immediate peek catches the

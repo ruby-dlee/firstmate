@@ -1731,6 +1731,127 @@ SH
   pass "metadata locks reclaim abandoned directories without deleting new owners"
 }
 
+test_linux_stat_selection_avoids_filesystem_stat_output() {
+  local case_dir fakebin file output
+  case_dir="$TMP_ROOT/linux-stat-selection"
+  fakebin="$case_dir/fakebin"
+  file="$case_dir/file"
+  mkdir -p "$fakebin"
+  : > "$file"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -f) printf 'File: poisoned-filesystem-output\n'; exit 0 ;;
+  -c)
+    case "${2:-}" in
+      %Y) printf '12345\n' ;;
+      %i) printf '67890\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat"
+  output=$(PATH="$fakebin:$PATH" bash -c '. "$1"; printf "%s:%s\n" "$(fm_account_path_mtime "$2")" "$(fm_account_path_inode "$2")"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$file") || fail "Linux account stat helpers failed"
+  [ "$output" = '12345:67890' ] || fail "Linux account stat helpers accepted filesystem-stat output: $output"
+  pass "account metadata stat helpers select GNU stat without probing BSD filesystem stat"
+}
+
+test_stale_reclaim_guard_is_owned_before_lock_removal() {
+  local case_dir lock output status
+  case_dir="$TMP_ROOT/reclaim-guard-ownership"
+  lock="$case_dir/meta.lock"
+  mkdir -p "$case_dir"
+  printf '999999\nstale-owner\n' > "$lock"
+  printf '999999\nstale-reclaimer\n' > "$lock.reclaiming"
+  touch -t 200001010000 "$lock.reclaiming"
+  bash -c '
+    . "$1"
+    fm_account_reclaim_guard_acquire "$2.reclaiming" 1 || exit 71
+    fm_account_reclaim_guard_owned "$2.reclaiming" || exit 72
+    fm_account_reclaim_guard_release "$2.reclaiming"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" || fail "stale reclaim guard was observed but not acquired"
+
+  printf '999999\nstale-owner\n' > "$lock"
+  set +e
+  output=$(LOCK="$lock" bash -c '
+    . "$1"
+    replaced=0
+    fm_account_reclaim_guard_acquire() { printf "%s\n%s\n" "$$" "$(fm_account_process_start_time "$$")" > "$1"; }
+    fm_account_reclaim_guard_owned() {
+      if [ "$replaced" = 0 ]; then
+        replaced=1
+        rm -f "$LOCK"
+        printf "%s\n%s\n" "$$" "$(fm_account_process_start_time "$$")" > "$LOCK"
+      fi
+      return 0
+    }
+    fm_account_reclaim_guard_release() { rm -rf "$1"; }
+    fm_account_meta_lock_reclaim "$LOCK" 1
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "metadata reclaim deleted a lock generation replaced after guard acquisition"
+  [ "$(sed -n '1p' "$lock")" != 999999 ] || fail "metadata reclaim did not install the simulated replacement lock"
+  [ -n "$output" ] || true
+  pass "stale metadata reclaim owns its guard and preserves a replaced lock generation"
+}
+
+test_task_owned_account_artifacts_reject_symlink_paths() {
+  local id rec outside original out status before
+  id=account-symlink-safety-z29
+  rec=$(make_case symlink-safety claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "symlink safety precondition spawn failed"
+  original="$HOME_DIR/data/$id"
+  outside="$CASE_DIR/outside-task"
+  mv "$original" "$outside"
+  ln -s "$outside" "$original"
+  before=$(cat "$outside/account-attempts.md")
+
+  if bash -c '. "$1"; fm_account_lineage_append "$2" "$3" unsafe attempt fleet claude pool profile session none' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$HOME_DIR/data" "$id"; then
+    fail "account lineage followed a symlinked task directory"
+  fi
+  [ "$(cat "$outside/account-attempts.md")" = "$before" ] || fail "account lineage changed a symlink target outside the data root"
+
+  out=$(run_send "$id" "Delivered without following the task symlink." 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "symlinked steering audit changed delivery truth: $out"
+  assert_absent "$outside/steering.md" "managed steering followed a symlinked task directory"
+  assert_absent "$outside/steering-pending.md" "pending steering followed a symlinked task directory"
+
+  rm -f "$CASE_DIR/endpoint-live"
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" symlink-attempt 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "continuation accepted a symlinked task directory"
+  assert_contains "$out" "task directory is unsafe" "continuation task-directory refusal was unclear"
+
+  rm -f "$original"
+  mv "$outside" "$original"
+  printf 'outside\n' > "$CASE_DIR/outside-steering"
+  ln -s "$CASE_DIR/outside-steering" "$original/steering.md"
+  touch "$CASE_DIR/endpoint-live"
+  out=$(run_send "$id" "Delivered without following the steering symlink." 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "symlinked steering file changed delivery truth: $out"
+  [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
+  assert_grep 'Delivered without following the steering symlink' "$original/steering-pending.md" \
+    "safe pending steering was not recorded after a symlinked canonical trail was rejected"
+  pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
+}
+
 test_agent_fleet_contract_is_validated_before_routing() {
   local id rec out status
   id=account-contract-z26
@@ -1903,6 +2024,9 @@ test_native_resume_rejects_regressed_sessionstart_evidence
 test_session_sync_metadata_publish_failure_is_closed
 test_oversized_continuation_stops_before_mutation
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+test_linux_stat_selection_avoids_filesystem_stat_output
+test_stale_reclaim_guard_is_owned_before_lock_removal
+test_task_owned_account_artifacts_reject_symlink_paths
 test_agent_fleet_contract_is_validated_before_routing
 test_agent_fleet_lifecycle_calls_are_bounded
 test_account_timeout_wrapper_uses_hard_kill_fallback

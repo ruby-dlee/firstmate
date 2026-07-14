@@ -290,6 +290,35 @@ unit_abandoned_reclaim_is_recovered() {
   rm -rf "$st"
 }
 
+unit_linux_stat_selection_avoids_filesystem_stat_output() {
+  local st fakebin output
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-linux-stat.XXXXXX")
+  fakebin="$st/fakebin"
+  mkdir -p "$fakebin" "$st/state/.afk-launch.lock"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -f) printf 'File: poisoned-filesystem-output\n'; exit 0 ;;
+  -c) printf '11:22:33\n' ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat"
+  output=$(PATH="$fakebin:$PATH" FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_path_identity "$2"' _ "$LAUNCH" "$st/state/.afk-launch.lock") \
+    || fail "Linux AFK lock identity selection failed"
+  if [ "$output" = '11:22:33' ]; then
+    pass "AFK lock identity selects GNU stat without probing BSD filesystem stat"
+  else
+    fail "AFK lock identity accepted filesystem-stat output: $output"
+  fi
+  rm -rf "$st"
+}
+
 unit_signal_exits_with_lock_cleanup() {
   local st marker child
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-signal.XXXXXX")
@@ -1121,6 +1150,7 @@ unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_stale_lock_reclaim_is_serialized
 unit_abandoned_reclaim_is_recovered
+unit_linux_stat_selection_avoids_filesystem_stat_output
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_creation_intent_reconciles

@@ -86,6 +86,19 @@ make_normal_repo() {
 
 GATE_WT=$(make_gate_worktree "$TMP/gate")
 NORMAL_CWD=$(make_normal_repo "$TMP/normal-cwd")
+mkdir -p "$GATE_WT/bin" "$NORMAL_CWD/bin"
+cp -R "$ROOT/bin/." "$GATE_WT/bin/"
+cp -R "$ROOT/bin/." "$NORMAL_CWD/bin/"
+GATE_LIB="$GATE_WT/bin/fm-gate-refuse-lib.sh"
+NORMAL_LIB="$NORMAL_CWD/bin/fm-gate-refuse-lib.sh"
+
+guarded_script() {
+  local cwd=$1 script=$2
+  case "$cwd" in
+    "$GATE_WT") printf '%s/bin/%s\n' "$GATE_WT" "$(basename "$script")" ;;
+    *) printf '%s/bin/%s\n' "$NORMAL_CWD" "$(basename "$script")" ;;
+  esac
+}
 
 # --- the shared helper, tested directly -------------------------------------
 
@@ -94,7 +107,7 @@ NORMAL_CWD=$(make_normal_repo "$TMP/normal-cwd")
 # a literal "set" second argument re-exports it, so callers pick the signal under
 # test. Echoes combined output; the guard's exit is the caller's $?.
 run_guard_lib() {
-  local cwd=$1 marker=${2:-unset}
+  local cwd=$1 marker=${2:-unset} library=${3:-$NORMAL_LIB}
   (
     cd "$cwd" || exit 111
     unset NO_MISTAKES_GATE FM_GATE_REFUSE_BYPASS
@@ -104,7 +117,7 @@ run_guard_lib() {
     esac
     set -eu
     # shellcheck source=bin/fm-gate-refuse-lib.sh
-    . "$GATE_LIB"
+    . "$library"
     fm_refuse_if_gate_agent
   ) 2>&1
 }
@@ -127,8 +140,7 @@ test_helper_empty_env_marker_refuses() {
 
 test_helper_path_backstop_refuses() {
   local out rc
-  # Marker UNSET: only the git-common-dir backstop can fire here.
-  out=$(run_guard_lib "$GATE_WT"); rc=$?
+  out=$(run_guard_lib "$NORMAL_CWD" unset "$GATE_LIB"); rc=$?
   expect_code 3 "$rc" "helper: gate worktree must exit 3 even with the marker unset"
   assert_contains "$out" "$PATH_MSG" "helper: path-backstop refusal message"
   assert_not_contains "$out" "$ENV_MSG" "helper: backstop must not be attributed to the env marker"
@@ -179,7 +191,7 @@ run_spawn() {
       "FM_PROJECTS_OVERRIDE=$home/projects" "FM_CONFIG_OVERRIDE=$home/config" \
       "FM_SPAWN_NO_GUARD=1" "FM_FAKE_PANE_PATH=$pane" "TMUX=fake,1,0" \
       "PATH=$fakebin:$PATH" "$@" \
-      "$SPAWN" "$id" "$proj" codex ) 2>&1
+      "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex ) 2>&1
 }
 
 test_spawn_refuses_and_admits() {
@@ -252,7 +264,7 @@ run_send() {
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "PATH=$fakebin:$PATH" "FM_HOME=$home" "FM_ROOT_OVERRIDE=$home" \
       "FM_TMUX_LOG=$log" "FM_SEND_SETTLE=0" "$@" \
-      "$SEND" "$target" "$text" ) 2>&1
+      "$(guarded_script "$cwd" "$SEND")" "$target" "$text" ) 2>&1
 }
 
 test_send_refuses_and_admits() {
@@ -340,7 +352,7 @@ run_teardown() {
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" \
       "FM_CONFIG_OVERRIDE=$case_dir/config" "PATH=$case_dir/fakebin:$PATH" "$@" \
-      "$TEARDOWN" task-x1 ) 2>&1
+      "$(guarded_script "$cwd" "$TEARDOWN")" task-x1 ) 2>&1
 }
 
 test_teardown_refuses_and_admits() {
@@ -378,7 +390,7 @@ run_pr_merge_guarded() {
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
       "FM_TEST_GH_AXI_LOG=$log" "PATH=$fakebin:$PATH" "$@" \
-      "$PR_MERGE" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+      "$(guarded_script "$cwd" "$PR_MERGE")" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
 }
 
 make_local_merge_case() {
@@ -404,7 +416,7 @@ run_local_merge_guarded() {
   shift 2
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" "$@" \
-      "$MERGE_LOCAL" task-x1 ) 2>&1
+      "$(guarded_script "$cwd" "$MERGE_LOCAL")" task-x1 ) 2>&1
 }
 
 test_merge_entrypoints_refuse_gate_contexts() {
@@ -469,7 +481,7 @@ run_promote_guarded() {
   shift 2
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
-      "FM_DATA_OVERRIDE=$home/data" "$@" "$PROMOTE" task-x1 ) 2>&1
+      "FM_DATA_OVERRIDE=$home/data" "$@" "$(guarded_script "$cwd" "$PROMOTE")" task-x1 ) 2>&1
 }
 
 test_promote_refuses_gate_contexts() {
@@ -497,39 +509,39 @@ run_primary_mutator_guarded() {
   case "$name" in
     session-start)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$SESSION_START" ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$SESSION_START")" ) 2>&1
       ;;
     home-seed)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$HOME_SEED" secondmate-x "$home/secondmate" --no-projects ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$HOME_SEED")" secondmate-x "$home/secondmate" --no-projects ) 2>&1
       ;;
     backlog-handoff)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$BACKLOG_HANDOFF" secondmate-x queued-x ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$BACKLOG_HANDOFF")" secondmate-x queued-x ) 2>&1
       ;;
     pr-check)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$PR_CHECK" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$PR_CHECK")" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
       ;;
     afk-launch)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$AFK_LAUNCH" start-native ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$AFK_LAUNCH")" start-native ) 2>&1
       ;;
     bootstrap)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$BOOTSTRAP" ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$BOOTSTRAP")" ) 2>&1
       ;;
     update)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$UPDATE" ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$UPDATE")" ) 2>&1
       ;;
     config-push)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$CONFIG_PUSH" ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$CONFIG_PUSH")" ) 2>&1
       ;;
     account-session-sync)
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$ACCOUNT_SESSION_SYNC" task-x1 ) 2>&1
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$ACCOUNT_SESSION_SYNC")" task-x1 ) 2>&1
       ;;
   esac
 }

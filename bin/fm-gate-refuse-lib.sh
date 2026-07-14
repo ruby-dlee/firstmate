@@ -74,8 +74,14 @@ fm_refuse_if_gate_agent() {
     echo "error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)" >&2
     exit "$FM_GATE_REFUSE_EXIT"
   fi
-  local common
-  common=$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)
+  local checkout common common_raw
+  checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
+  common_raw=$(git -C "$checkout" rev-parse --git-common-dir 2>/dev/null || true)
+  case "$common_raw" in
+    /*) common=$(cd "$common_raw" 2>/dev/null && pwd -P || true) ;;
+    '') common= ;;
+    *) common=$(cd "$checkout/$common_raw" 2>/dev/null && pwd -P || true) ;;
+  esac
   case "$common" in
     */.no-mistakes/repos/*.git)
       echo "error: refusing fleet lifecycle from inside a no-mistakes gate worktree ($common)" >&2

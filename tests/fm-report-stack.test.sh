@@ -200,6 +200,28 @@ test_previous_generation_is_recovered_for_readers() {
   pass "report readers recover crash-interrupted generation swaps"
 }
 
+test_index_failure_restores_previous_generation() {
+  local id=report-index-rollback-k3 entry out status
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Original generation."
+  run_stack publish "$id" >/dev/null || fail "index rollback precondition failed"
+  entry=$(run_stack path "$id")
+  mkdir -p "$STACK/entries/invalid-manifest"
+  printf '{invalid\n' > "$STACK/entries/invalid-manifest/manifest.json"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Replacement generation."
+
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "publication unexpectedly succeeded with an unreadable index manifest"
+  assert_grep 'Original generation' "$(dirname "$entry")/report.md" "failed index rendering did not restore the previous report generation"
+  if grep -F 'Replacement generation' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
+    fail "failed index rendering retained the unindexed replacement generation"
+  fi
+  rm -rf "$STACK/entries/invalid-manifest"
+  [ -n "$out" ] || true
+  pass "report publication restores the previous generation when index rendering fails"
+}
+
 test_readers_wait_for_publication_lock() {
   local started reader
   mkdir -p "$STACK/.publish.lock"
@@ -318,6 +340,7 @@ test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
 test_previous_generation_is_recovered_for_readers
+test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
 test_source_symlinks_fail_closed

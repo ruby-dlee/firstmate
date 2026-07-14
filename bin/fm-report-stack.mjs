@@ -529,8 +529,14 @@ function publish(taskId, legacy) {
       if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, destination);
       throw error;
     }
+    try {
+      renderIndex();
+    } catch (error) {
+      fs.rmSync(destination, { recursive: true, force: true });
+      if (fs.existsSync(previous)) fs.renameSync(previous, destination);
+      throw error;
+    }
     fs.rmSync(previous, { recursive: true, force: true });
-    renderIndex();
     console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
   } finally {
     fs.rmSync(staged, { recursive: true, force: true });

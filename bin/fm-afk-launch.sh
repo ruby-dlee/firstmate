@@ -71,6 +71,14 @@ fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
 FM_AFK_LAUNCH_LOCK_TOKEN=
 
+fm_afk_launch_path_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i:%B' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i:%W' "$1" 2>/dev/null
+  fi
+}
+
 fm_afk_launch_lock_owned() {
   local pid expected actual
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
@@ -81,8 +89,7 @@ fm_afk_launch_lock_owned() {
 }
 
 fm_afk_launch_lock_identity() {
-  stat -f '%d:%i:%B' "$FM_AFK_LAUNCH_LOCK" 2>/dev/null \
-    || stat -c '%d:%i:%W' "$FM_AFK_LAUNCH_LOCK" 2>/dev/null
+  fm_afk_launch_path_identity "$FM_AFK_LAUNCH_LOCK"
 }
 
 fm_afk_launch_atomic_rename() {
@@ -161,8 +168,7 @@ fm_afk_launch_lock_acquire() {
           sleep 0.05
           continue
         fi
-        reclaim_identity=$(stat -f '%d:%i:%B' "$reclaim" 2>/dev/null \
-          || stat -c '%d:%i:%W' "$reclaim" 2>/dev/null) || { sleep 0.05; continue; }
+        reclaim_identity=$(fm_afk_launch_path_identity "$reclaim") || { sleep 0.05; continue; }
         if fm_afk_launch_atomic_rename "$reclaim" "$FM_AFK_LAUNCH_LOCK/.reclaim.stale.${reclaim_identity//:/_}.$$.$RANDOM"; then
           rm -rf "$FM_AFK_LAUNCH_LOCK"/.reclaim.stale."${reclaim_identity//:/_}".$$.* 2>/dev/null || true
         fi

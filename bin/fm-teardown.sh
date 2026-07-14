@@ -142,6 +142,7 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
+SECONDMATE_ENDPOINT_QUIESCED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -176,6 +177,30 @@ managed_endpoint_blocker() {  # <status> <task> [restored]
   else
     echo "error: ${qualifier}managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
   fi
+}
+
+quiesce_secondmate_endpoint() {
+  local endpoint_home probe_home='' endpoint_status
+  endpoint_home=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
+  [ "$endpoint_home" = "$FM_HOME" ] || probe_home=$endpoint_home
+  if [ -n "$T" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$probe_home"; then
+    SECONDMATE_ENDPOINT_QUIESCED=1
+    return 0
+  fi
+  endpoint_status=$?
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "error: secondmate endpoint state for $ID is unknown; refusing child cleanup" >&2
+  else
+    echo "error: secondmate endpoint for $ID is still alive; refusing child cleanup" >&2
+  fi
+  return 1
 }
 
 release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
@@ -1091,6 +1116,7 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
+    quiesce_secondmate_endpoint || exit 1
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
   fi
 fi
@@ -1202,7 +1228,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ]; then
+if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ] && [ "$SECONDMATE_ENDPOINT_QUIESCED" = 0 ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
 if [ "$KIND" = secondmate ]; then

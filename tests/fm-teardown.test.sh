@@ -96,6 +96,10 @@ make_case() {
   echo "report missing before treehouse return: $FM_EXPECT_REPORT_PATH" >&2
   exit 97
 }
+[ -z "${FM_EXPECT_PARENT_QUIESCED:-}" ] || [ -f "$FM_EXPECT_PARENT_QUIESCED" ] || {
+  echo "secondmate parent was not quiesced before child cleanup: $FM_EXPECT_PARENT_QUIESCED" >&2
+  exit 98
+}
 [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'treehouse-return %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
 exit 0
 SH
@@ -1643,6 +1647,59 @@ SH
   pass "forced secondmate cleanup verifies managed children in the child home"
 }
 
+test_forced_secondmate_quiesces_parent_before_child_cleanup() {
+  local case_dir child_project child_worktree child_id parent_live parent_quiesced rc
+  case_dir=$(make_case secondmate-parent-quiesce)
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  child_id=child-after-quiesce-x4
+  parent_live="$case_dir/parent-live"
+  parent_quiesced="$case_dir/parent-quiesced"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    "window=fm-$child_id" \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'kind=ship' \
+    'mode=local-only'
+  : > "$parent_live"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_PARENT_LIVE" ] ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    case "$*" in
+      *fm-task-x1*) rm -f "$FM_FAKE_PARENT_LIVE"; : > "$FM_FAKE_PARENT_QUIESCED" ;;
+    esac
+    exit 0
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  set +e
+  FM_FAKE_PARENT_LIVE="$parent_live" FM_FAKE_PARENT_QUIESCED="$parent_quiesced" \
+    FM_EXPECT_PARENT_QUIESCED="$parent_quiesced" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "secondmate-parent-quiesce: forced teardown should succeed"
+  assert_present "$parent_quiesced" "forced secondmate teardown did not quiesce its parent endpoint"
+  assert_absent "$case_dir/wt" "forced secondmate teardown retained the retired home"
+  pass "forced secondmate teardown quiesces and verifies the parent before child cleanup"
+}
+
 test_herdr_teardown_clears_escalation_marker() {
   local case_dir marker
   case_dir=$(make_case herdr-marker-cleanup)
@@ -1709,6 +1766,7 @@ test_managed_release_failure_preserves_unrecycled_worktree_for_retry
 test_managed_teardown_locks_generation_before_endpoint_cleanup
 test_managed_child_teardown_locks_generation_before_snapshot
 test_forced_secondmate_child_uses_child_home_for_endpoint_verification
+test_forced_secondmate_quiesces_parent_before_child_cleanup
 test_herdr_teardown_clears_escalation_marker
 test_required_report_blocks_then_publishes_before_cleanup
 test_squash_merged_branch_deleted_allows

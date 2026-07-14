@@ -229,11 +229,19 @@ fm_account_meta_lock_owner_alive() {  # <lock-path>
 }
 
 fm_account_path_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
 }
 
 fm_account_path_inode() {
-  stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %i "$1" 2>/dev/null
+  else
+    stat -c %i "$1" 2>/dev/null
+  fi
 }
 
 fm_account_reclaim_owner_alive() {  # <reclaim-directory>
@@ -254,8 +262,30 @@ fm_account_reclaim_owner_alive() {  # <reclaim-directory>
   [ "$current" = "$recorded" ]
 }
 
+fm_account_reclaim_guard_owned() {  # <reclaim-directory>
+  local reclaim=$1 owner pid recorded current
+  if [ -f "$reclaim" ] && [ ! -L "$reclaim" ]; then
+    owner=$reclaim
+  elif [ -d "$reclaim" ] && [ ! -L "$reclaim" ]; then
+    owner=$reclaim/owner
+  else
+    return 1
+  fi
+  pid=$(sed -n '1p' "$owner" 2>/dev/null)
+  recorded=$(sed -n '2p' "$owner" 2>/dev/null)
+  [ "$pid" = "$$" ] || return 1
+  current=$(fm_account_process_start_time "$$") || return 1
+  [ -n "$recorded" ] && [ "$current" = "$recorded" ]
+}
+
+fm_account_reclaim_guard_release() {  # <reclaim-directory>
+  fm_account_reclaim_guard_owned "$1" || return 1
+  rm -rf "$1"
+}
+
 fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
   local reclaim=$1 grace=$2 start age candidate candidate_inode reclaim_inode nested nested_inode
+  local quarantine observed_inode quarantined_inode
   start=$(fm_account_process_start_time "$$") || return 1
   candidate="$reclaim.candidate.$$.$RANDOM"
   if ! printf '%s\n%s\n' "$$" "$start" > "$candidate"; then
@@ -283,105 +313,92 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
   { [ -f "$reclaim" ] || [ -d "$reclaim" ]; } && [ ! -L "$reclaim" ] || return 1
   age=$(fm_account_path_mtime "$reclaim") || return 1
   [ $(( $(date +%s) - age )) -ge "$grace" ] || return 1
-  return 2
+  observed_inode=$(fm_account_path_inode "$reclaim") || return 1
+  fm_account_reclaim_owner_alive "$reclaim" && return 1
+  [ "$(fm_account_path_inode "$reclaim" 2>/dev/null || true)" = "$observed_inode" ] || return 1
+  quarantine="$reclaim.stale.$$.$RANDOM"
+  mv "$reclaim" "$quarantine" 2>/dev/null || return 1
+  quarantined_inode=$(fm_account_path_inode "$quarantine" 2>/dev/null || true)
+  if [ "$quarantined_inode" != "$observed_inode" ]; then
+    if [ ! -e "$reclaim" ] && [ ! -L "$reclaim" ]; then
+      mv "$quarantine" "$reclaim" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  rm -rf "$quarantine" || return 1
+  fm_account_reclaim_guard_acquire "$reclaim" "$grace"
 }
 
 fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
-  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after guard_status
+  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after
   local ownerless_since baseline required_grace
   [ ! -L "$lock" ] || return 1
   required_grace=$grace
   [ "$required_grace" -ge 1 ] || required_grace=1
   if [ -f "$lock" ]; then
     guard="$lock.reclaiming"
-    if fm_account_reclaim_guard_acquire "$guard" "$required_grace"; then
-      guard_status=0
-    else
-      guard_status=$?
-    fi
-    if [ "$guard_status" -eq 2 ]; then
-      if fm_account_meta_lock_owner_alive "$lock"; then
-        rm -rf "$guard"
-        return 1
-      fi
-      reclaim="$lock.reclaim.$$.$RANDOM"
-      mv "$lock" "$reclaim" 2>/dev/null || return 1
-      rm -f "$reclaim"
-      rm -rf "$guard"
-      return 0
-    fi
-    [ "$guard_status" -eq 0 ] || return 1
-    inode_before=$(fm_account_path_inode "$lock") || { rm -rf "$guard"; return 1; }
+    fm_account_reclaim_guard_acquire "$guard" "$required_grace" || return 1
+    inode_before=$(fm_account_path_inode "$lock") || { fm_account_reclaim_guard_release "$guard"; return 1; }
     if fm_account_meta_lock_owner_alive "$lock"; then
-      rm -rf "$guard"
+      fm_account_reclaim_guard_release "$guard"
       return 1
     fi
-    inode_after=$(fm_account_path_inode "$lock") || { rm -rf "$guard"; return 1; }
+    fm_account_reclaim_guard_owned "$guard" || return 1
+    inode_after=$(fm_account_path_inode "$lock") || { fm_account_reclaim_guard_release "$guard"; return 1; }
     if [ "$inode_before" != "$inode_after" ]; then
-      rm -rf "$guard"
+      fm_account_reclaim_guard_release "$guard"
       return 1
     fi
-    rm -f "$lock" || { rm -rf "$guard"; return 1; }
-    rm -rf "$guard"
+    rm -f "$lock" || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    fm_account_reclaim_guard_release "$guard"
     return 0
   fi
   [ -d "$lock" ] || return 1
   inode_before=$(fm_account_path_inode "$lock") || return 1
   mtime=$(fm_account_path_mtime "$lock") || return 1
   guard="$lock/.reclaiming"
-  if fm_account_reclaim_guard_acquire "$guard" "$required_grace"; then
-    guard_status=0
-  else
-    guard_status=$?
-  fi
-  if [ "$guard_status" -eq 2 ]; then
-    inode_after=$(fm_account_path_inode "$lock") || return 1
-    [ "$inode_before" = "$inode_after" ] || return 1
-    fm_account_meta_lock_owner_alive "$lock" && return 1
-    reclaim="$lock.reclaim.$$.$RANDOM"
-    mv "$lock" "$reclaim" 2>/dev/null || return 1
-    rm -rf "$reclaim"
-    return 0
-  fi
-  [ "$guard_status" -eq 0 ] || return 1
-  inode_after=$(fm_account_path_inode "$lock") || { rm -rf "$guard"; return 1; }
+  fm_account_reclaim_guard_acquire "$guard" "$required_grace" || return 1
+  inode_after=$(fm_account_path_inode "$lock") || { fm_account_reclaim_guard_release "$guard"; return 1; }
   if [ "$inode_before" != "$inode_after" ]; then
-    rm -rf "$guard"
+    fm_account_reclaim_guard_release "$guard"
     return 1
   fi
   if [ -f "$lock/owner" ]; then
     if fm_account_meta_lock_owner_alive "$lock"; then
-      rm -rf "$guard"
+      fm_account_reclaim_guard_release "$guard"
       return 1
     fi
   else
     ownerless_since="$lock/.ownerless-since"
     if [ ! -f "$ownerless_since" ]; then
       printf '%s\n' "$mtime" > "$ownerless_since" || {
-        rm -rf "$guard"
+        fm_account_reclaim_guard_release "$guard"
         return 1
       }
     fi
     baseline=$(sed -n '1p' "$ownerless_since" 2>/dev/null)
     case "$baseline" in
-      ''|*[!0-9]*) rm -rf "$guard"; return 1 ;;
+      ''|*[!0-9]*) fm_account_reclaim_guard_release "$guard"; return 1 ;;
     esac
     now=$(date +%s)
     if [ $((now - baseline)) -lt "$required_grace" ]; then
       if fm_account_meta_lock_owner_alive "$lock"; then
         rm -f "$ownerless_since"
       fi
-      rm -rf "$guard"
+      fm_account_reclaim_guard_release "$guard"
       return 1
     fi
   fi
   if fm_account_meta_lock_owner_alive "$lock"; then
     rm -f "$lock/.ownerless-since"
-    rm -rf "$guard"
+    fm_account_reclaim_guard_release "$guard"
     return 1
   fi
+  fm_account_reclaim_guard_owned "$guard" || return 1
+  inode_after=$(fm_account_path_inode "$lock") || return 1
+  [ "$inode_before" = "$inode_after" ] || return 1
   reclaim="$lock.reclaim.$$.$RANDOM"
-  mv "$lock" "$reclaim" 2>/dev/null || { rm -rf "$guard"; return 1; }
+  mv "$lock" "$reclaim" 2>/dev/null || { fm_account_reclaim_guard_release "$guard"; return 1; }
   rm -rf "$reclaim"
 }
 
@@ -459,22 +476,46 @@ fm_account_safe_lineage_value() {
   case "$1" in *$'\t'*|*$'\n'*) return 1 ;; esac
 }
 
+fm_account_task_dir() {  # <data-dir> <task> [create]
+  local data=$1 task=$2 create=${3:-} data_real expected actual
+  fm_account_valid_id "$task" || return 1
+  [ -d "$data" ] || return 1
+  data_real=$(cd "$data" 2>/dev/null && pwd -P) || return 1
+  expected="$data_real/$task"
+  if [ ! -e "$expected" ] && [ ! -L "$expected" ]; then
+    [ "$create" = create ] || return 1
+    mkdir "$expected" || return 1
+  fi
+  [ -d "$expected" ] && [ ! -L "$expected" ] || return 1
+  actual=$(cd "$expected" 2>/dev/null && pwd -P) || return 1
+  [ "$actual" = "$expected" ] || return 1
+  printf '%s\n' "$expected"
+}
+
+fm_account_safe_task_file() {  # <file>
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    [ -f "$1" ] && [ ! -L "$1" ]
+  fi
+}
+
 fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task> <provider> <pool> <profile> <session> <predecessor>
-  local data=$1 task=$2 event=$3 attempt=$4 fleet_task=$5 provider=$6 pool=$7 profile=$8 session=$9 predecessor=${10} dir value
+  local data=$1 task=$2 event=$3 attempt=$4 fleet_task=$5 provider=$6 pool=$7 profile=$8 session=$9 predecessor=${10} dir file value
   for value in "$task" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "$session" "$predecessor"; do
     fm_account_safe_lineage_value "$value" || {
       echo "error: unsafe account-attempt lineage value" >&2
       return 1
     }
   done
-  dir="$data/$task"
-  mkdir -p "$dir" || return 1
-  if [ ! -f "$dir/account-attempts.md" ]; then
-    printf '# Account attempt lineage\n\n' > "$dir/account-attempts.md"
+  dir=$(fm_account_task_dir "$data" "$task" create) || return 1
+  file="$dir/account-attempts.md"
+  fm_account_safe_task_file "$file" || return 1
+  if [ ! -e "$file" ]; then
+    printf '# Account attempt lineage\n\n' > "$file"
   fi
+  fm_account_safe_task_file "$file" || return 1
   printf -- '- %s event=%s attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=%s predecessor=%s.\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "${session:-pending}" "${predecessor:-none}" \
-    >> "$dir/account-attempts.md"
+    >> "$file"
 }
 
 fm_account_meta_value() {  # <meta> <key>

@@ -64,6 +64,8 @@ fi
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-marker-lib.sh
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 
@@ -250,27 +252,32 @@ else
       ;;
   esac
   record_managed_steering() {
+    local steering_id steering_dir steering_file
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
-    steering_dir="$DATA/$steering_id"
-    mkdir -p "$steering_dir" || return 1
-    if [ ! -f "$steering_dir/steering.md" ]; then
-      printf '# Steering trail\n\n' > "$steering_dir/steering.md" || return 1
+    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
+    steering_file="$steering_dir/steering.md"
+    fm_account_safe_task_file "$steering_file" || return 1
+    if [ ! -e "$steering_file" ]; then
+      printf '# Steering trail\n\n' > "$steering_file" || return 1
     fi
+    fm_account_safe_task_file "$steering_file" || return 1
     {
       printf -- '- %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf '%s\n' "$*" | sed 's/^/> /'
       printf '\n'
-    } >> "$steering_dir/steering.md" || return 1
+    } >> "$steering_file" || return 1
   }
   record_pending_managed_steering() {
+    local steering_id steering_dir steering_file
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
-    steering_dir="$DATA/$steering_id"
-    mkdir -p "$steering_dir" || return 1
+    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
+    steering_file="$steering_dir/steering-pending.md"
+    fm_account_safe_task_file "$steering_file" || return 1
     {
       printf -- '- %s (delivered; steering trail append pending)\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf '%s\n' "$*" | sed 's/^/> /'
       printf '\n'
-    } >> "$steering_dir/steering-pending.md" || return 1
+    } >> "$steering_file" || return 1
   }
   if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
     if ! record_managed_steering "$@"; then

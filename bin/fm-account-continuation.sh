@@ -83,20 +83,22 @@ continuation_safe_file() {
   case "$resolved" in "$root_real"/*) printf '%s\n' "$resolved" ;; *) return 1 ;; esac
 }
 
+TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
+  || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
+
 if [ "$KIND" = secondmate ] && [ -e "$WORKTREE_REAL/data/charter.md" ]; then
   BRIEF=$(continuation_safe_file "$WORKTREE_REAL/data/charter.md" "$WORKTREE_REAL") || BRIEF=
 else
-  BRIEF=$(continuation_safe_file "$DATA/$ID/brief.md" "$DATA") || BRIEF=
+  BRIEF=$(continuation_safe_file "$TASK_DIR/brief.md" "$TASK_DIR") || BRIEF=
 fi
 [ -n "$BRIEF" ] || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
-TASK_DIR="$DATA/$ID"
-mkdir -p "$TASK_DIR"
-TASK_DIR_REAL=$(cd "$TASK_DIR" && pwd -P)
-DATA_REAL=$(cd "$DATA" && pwd -P)
-case "$TASK_DIR_REAL/" in "$DATA_REAL/"*) ;; *) echo "error: continuation task directory escapes the firstmate data root" >&2; exit 1 ;; esac
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
 PACKET_TMP="$TASK_DIR/.continuation-$ATTEMPT.md.$$"
+[ ! -e "$PACKET_TMP" ] && [ ! -L "$PACKET_TMP" ] \
+  || { echo "error: unsafe continuation packet staging path for $ID" >&2; exit 1; }
+( set -o noclobber; : > "$PACKET_TMP" ) 2>/dev/null \
+  || { echo "error: cannot safely stage continuation packet for $ID" >&2; exit 1; }
 
 STATUS_SNAPSHOT=$(git -C "$WORKTREE_REAL" status --short --branch 2>&1) || { echo "error: cannot snapshot continuation repository status for $ID" >&2; exit 1; }
 LOG_SNAPSHOT=$(git -C "$WORKTREE_REAL" log --oneline --decorate -20 2>&1) || { echo "error: cannot snapshot continuation repository history for $ID" >&2; exit 1; }
@@ -139,7 +141,7 @@ append_file_section() {  # <heading> <file>
   cat "$META"
   printf '```\n'
   printf "\n## No-mistakes state\n\n\`\`\`text\n%s\n\`\`\`\n" "$NO_MISTAKES_STATUS"
-} > "$PACKET_TMP"
+} >> "$PACKET_TMP"
 
 append_file_section "Original brief or charter" "$BRIEF"
 append_file_section "Wake-event and progress status" "$STATE/$ID.status"

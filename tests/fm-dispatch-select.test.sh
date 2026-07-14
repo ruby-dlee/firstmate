@@ -174,6 +174,100 @@ SH
   pass "single-object use and no-select arrays preserve first-profile selection"
 }
 
+make_fake_agent_fleet() {
+  local fakebin=$1
+  cat > "$fakebin/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ -z "${FM_FAKE_AF_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
+pool=
+provider=
+prev=
+for arg in "$@"; do
+  case "$prev" in --pool) pool=$arg ;; --provider) provider=$arg ;; esac
+  prev=$arg
+done
+case "$pool" in
+  claude-crew) available=true; mode=quota; headroom=${FM_FAKE_CLAUDE_HEADROOM:-25} ;;
+  codex-crew) available=true; mode=quota; headroom=${FM_FAKE_CODEX_HEADROOM:-70} ;;
+  stale-crew) available=true; mode=least-active-fallback; headroom=null ;;
+  *) available=false; mode=unavailable; headroom=null ;;
+esac
+printf '{"schema":1,"pool":"%s","providers":[{"provider":"%s","available":%s,"selection_mode":"%s","degraded":false,"best_adjusted_headroom_percent":%s,"eligible_profiles":1,"active_leases":0,"profiles":[]}]}\n' \
+  "$pool" "$provider" "$available" "$mode" "$headroom"
+SH
+  chmod +x "$fakebin/agent-fleet"
+}
+
+test_account_pool_summary_owns_provider_quota_choice() {
+  local fakebin af_log quota_marker out pooled
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-pools")
+  af_log="$TMP_ROOT/agent-fleet-pools/calls.log"
+  quota_marker="$TMP_ROOT/agent-fleet-pools/quota-called"
+  make_fake_agent_fleet "$fakebin"
+  cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+touch '$quota_marker'
+exit 1
+SH
+  chmod +x "$fakebin/quota-axi"
+  pooled='[{"harness":"claude","model":"sonnet","account_pool":"claude-crew"},{"harness":"codex","model":"gpt-5","account_pool":"codex-crew"}]'
+  out=$(FM_FAKE_AF_LOG="$af_log" FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled")
+  [ "$out" = '{"harness":"codex","model":"gpt-5","account_pool":"codex-crew"}' ] \
+    || fail "Agent Fleet pool headroom should choose codex, got: $out"
+  assert_grep 'pool status --pool claude-crew --provider claude' "$af_log" "claude pool summary was not queried"
+  assert_grep 'pool status --pool codex-crew --provider codex' "$af_log" "codex pool summary was not queried"
+  [ ! -e "$quota_marker" ] || fail "account_pool selection consulted default-account quota-axi"
+  pass "account_pool quota-balanced selection consumes only Agent Fleet pool summaries"
+}
+
+test_account_fields_survive_direct_selection() {
+  local fakebin marker out profile
+  fakebin=$(fm_fakebin "$TMP_ROOT/account-direct")
+  marker="$TMP_ROOT/account-direct/agent-fleet-called"
+  cat > "$fakebin/agent-fleet" <<SH
+#!/usr/bin/env bash
+touch '$marker'
+exit 1
+SH
+  chmod +x "$fakebin/agent-fleet"
+  profile='{"harness":"claude","model":"sonnet","effort":"high","account_pool":"claude-crew","account_profile":"claude-3"}'
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" "$ROOT/bin/fm-dispatch-select.sh" "$profile")
+  [ "$out" = "$profile" ] || fail "direct selection dropped account fields: $out"
+  [ ! -e "$marker" ] || fail "direct selection should not query Agent Fleet"
+  pass "direct dispatch selection preserves account_pool and account_profile"
+}
+
+test_pooled_failures_degrade_without_default_account_quota() {
+  local fakebin quota_marker out err pooled pinned
+  fakebin=$(fm_fakebin "$TMP_ROOT/account-fallback")
+  quota_marker="$TMP_ROOT/account-fallback/quota-called"
+  cat > "$fakebin/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+exit 42
+SH
+  cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+touch '$quota_marker'
+exit 1
+SH
+  chmod +x "$fakebin/agent-fleet" "$fakebin/quota-axi"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" 2>"$TMP_ROOT/account-fallback/error.log")
+  err=$(cat "$TMP_ROOT/account-fallback/error.log")
+  [ "$out" = '{"harness":"claude","account_pool":"claude-crew"}' ] || fail "pool failure should use first profile"
+  assert_contains "$err" 'agent-fleet pool status failed' "pool failure fallback was not logged"
+  [ ! -e "$quota_marker" ] || fail "pool failure fell through to default-account quota"
+
+  pinned='[{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-1"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pinned" 2>/dev/null)
+  [ "$out" = '{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-1"}' ] \
+    || fail "pinned pooled fallback dropped account_profile: $out"
+  pass "pool-summary failures and pinned candidates degrade safely without double selection"
+}
+
 test_higher_min_vendor_wins
 test_exact_tie_uses_first_profile
 test_quota_missing_falls_back_to_first
@@ -182,5 +276,8 @@ test_bad_quota_json_falls_back_to_first
 test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_backward_compatible_first_selection
+test_account_pool_summary_owns_provider_quota_choice
+test_account_fields_survive_direct_selection
+test_pooled_failures_degrade_without_default_account_quota
 
 echo "# all fm-dispatch-select tests passed"

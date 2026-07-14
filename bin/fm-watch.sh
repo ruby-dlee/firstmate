@@ -626,6 +626,12 @@ while :; do
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   touch "$STATE/.last-watcher-beat"
 
+  # A managed provider's SessionStart hook may race the initial spawn return.
+  # Reconcile only metas still missing provider_session_id; failures stay
+  # silent and retry here, while recovery itself requires the mapping and
+  # fails closed.
+  "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
+
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed

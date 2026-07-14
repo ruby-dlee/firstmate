@@ -275,7 +275,8 @@ secondmate_liveness_sweep() {
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out
+  local meta id window harness backend target verdict out account_profile
+  local -a resume_args
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -296,8 +297,15 @@ secondmate_liveness_sweep() {
         echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
         ;;
       dead)
+        account_profile=$(fm_meta_get "$meta" account_profile)
+        if [ -n "$account_profile" ] && ! "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+          echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
+          continue
+        fi
         fm_backend_kill "$backend" "$target" 2>/dev/null || true
-        if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
+        resume_args=()
+        [ -z "$account_profile" ] || resume_args+=(--resume-account)
+        if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
           echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
         else
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
@@ -501,6 +509,10 @@ crew_dispatch_validate() {
   fi
   err=$(jq -r '
     def verified($h): ["claude","codex","opencode","pi","grok"] | index($h);
+    def safe_account_id($v):
+      ($v | type) == "string"
+      and ($v | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+      and ($v | contains("@") | not);
     def effort_ok($h; $e):
       if $e == null then true
       elif ($e | type) != "string" then false
@@ -531,11 +543,21 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | select((.use? | type) == "array" and (.use | length) == 0)] | length > 0 then "each rule needs at least one use profile"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(type != "object")] | length > 0 then "each use profile must be an object"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select((.harness? | type) != "string" or (.harness | length) == 0)] | length > 0 then "each use profile needs harness"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_pool") and (safe_account_id(.account_pool) | not))] | length > 0 then "invalid account_pool"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (safe_account_id(.account_profile) | not))] | length > 0 then "invalid account_profile"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_pool") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_pool requires claude or codex harness"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_profile requires claude or codex harness"
+    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | select(([use_profiles(.use?)[] | has("account_pool")] | any) and ([use_profiles(.use?)[] | has("account_pool")] | all | not))] | length > 0 then "quota-balanced account_pool candidates must all carry account_pool"
+    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | use_profiles(.use?)[] | select(has("account_pool") and has("account_profile"))] | length > 0 then "quota-balanced account_pool candidates cannot pin account_profile"
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
     elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced")] | length > 0 then
       "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced") ] | unique | join(", "))
     elif has("default") and (.default | type) != "object" then "default must be an object"
     elif has("default") and ((.default.harness? | type) != "string" or (.default.harness | length) == 0) then "default needs harness when present"
+    elif has("default") and (.default | has("account_pool")) and (safe_account_id(.default.account_pool) | not) then "invalid default account_pool"
+    elif has("default") and (.default | has("account_profile")) and (safe_account_id(.default.account_profile) | not) then "invalid default account_profile"
+    elif has("default") and (.default | has("account_pool")) and (.default.harness != "claude" and .default.harness != "codex") then "default account_pool requires claude or codex harness"
+    elif has("default") and (.default | has("account_profile")) and (.default.harness != "claude" and .default.harness != "codex") then "default account_profile requires claude or codex harness"
     else
       ([(.rules // [])[]? | use_profiles(.use?)[]?.harness] + [.default?.harness?]
         | map(select(. != null))
@@ -557,7 +579,9 @@ crew_dispatch_validate() {
       + (if ($p.model? != null) then "/" + ($p.model | tostring)
          elif ($p.effort? != null) then "/default"
          else "" end)
-      + (if ($p.effort? != null) then "/" + ($p.effort | tostring) else "" end);
+      + (if ($p.effort? != null) then "/" + ($p.effort | tostring) else "" end)
+      + (if ($p.account_pool? != null) then "@" + ($p.account_pool | tostring) else "" end)
+      + (if ($p.account_profile? != null) then "#" + ($p.account_profile | tostring) else "" end);
     def use_label($r):
       if ($r.use | type) == "array" then
         ((if ($r.select? != null) then ($r.select | tostring) else "first" end)

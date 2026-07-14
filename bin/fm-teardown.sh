@@ -93,6 +93,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
 # down a worktree (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -120,6 +122,36 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+
+managed_endpoint_is_gone() {  # <backend> <target> <expected-label>
+  local backend=$1 target=$2 expected=$3 attempt
+  [ -n "$target" ] || return 0
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ! fm_backend_target_exists "$backend" "$target" "$expected" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+release_managed_account() {  # <meta> <task> <backend> <target>
+  local meta=$1 task=$2 backend=$3 target=$4 profile
+  profile=$(fm_meta_get "$meta" account_profile)
+  [ -n "$profile" ] || return 0
+  if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task"; then
+    echo "error: managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+    return 1
+  fi
+  fm_account_release "$task" --force || {
+    echo "error: failed to release Agent Fleet lease for $task; retaining metadata for retry" >&2
+    return 1
+  }
+  fm_account_session_remove "$task" || {
+    echo "error: failed to remove Agent Fleet session mapping for $task; retaining metadata for retry" >&2
+    return 1
+  }
+}
 
 default_branch() {
   local ref branch
@@ -921,6 +953,7 @@ cleanup_firstmate_home_children() {
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
+    release_managed_account "$child_meta" "$child_id" "$child_backend" "$child_t" || return 1
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
   done
 }
@@ -1033,6 +1066,7 @@ fi
 if [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
+release_managed_account "$META" "$ID" "$BACKEND" "$T" || exit 1
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"

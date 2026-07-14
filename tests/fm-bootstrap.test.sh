@@ -691,6 +691,15 @@ empty array use is flagged^{"rules":[{"when":"big feature","use":[]}]}^exact^CRE
 array profile without harness is flagged^{"rules":[{"when":"big feature","use":[{"model":"gpt-5.5"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each use profile needs harness
 unknown select is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"mystery"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown select: mystery
 array profile unsupported effort is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","effort":"max"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
+quota-balanced account pools are accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+direct pinned account is accepted^{"rules":[{"when":"delicate task","use":{"harness":"codex","account_pool":"codex-crew","account_profile":"codex-2"}}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+email-like account pool is flagged^{"rules":[{"when":"anything","use":{"harness":"claude","account_pool":"me@example.com"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_pool
+non-string account profile is flagged^{"rules":[{"when":"anything","use":{"harness":"codex","account_profile":2}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_profile
+account pool on unsupported harness is flagged^{"rules":[{"when":"news","use":{"harness":"grok","account_pool":"grok-crew"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - account_pool requires claude or codex harness
+account profile on unsupported harness is flagged^{"rules":[{"when":"news","use":{"harness":"grok","account_profile":"grok-1"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - account_profile requires claude or codex harness
+mixed quota-balanced pool candidates are flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex"}],"select":"quota-balanced"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - quota-balanced account_pool candidates must all carry account_pool
+pinned quota-balanced candidate is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-2"},{"harness":"codex","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - quota-balanced account_pool candidates cannot pin account_profile
+invalid default account pool is flagged^{"default":{"harness":"claude","account_pool":"-claude"}}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid default account_pool
 ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }

@@ -109,13 +109,16 @@ Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`,
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.
-The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule directly or through a supported selector, and passes only concrete `--harness`, `--model`, and `--effort` axes to `fm-spawn.sh`.
+The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule directly or through a supported selector, and passes concrete harness/model/effort plus optional Agent Fleet account-pool/profile axes to `fm-spawn.sh`.
 The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns deterministic selector behavior, but they do not parse task intent or match the natural-language rules.
 The session-start bootstrap step surfaces either the active rule block or a concise invalid-config line at startup.
 When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit harness, so `config/crew-harness` is only automatic when no dispatch profile file is active.
 Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
+The account axis is independent of the runtime-backend axis: tmux, Herdr, zellij, Orca, or cmux owns the endpoint, while Agent Fleet owns the selected Claude or Codex account profile.
+Routing remains default-off and byte-compatible until an explicit account flag or off/observe/enforce policy enables it.
+For quota-balanced account-pool candidates, dispatch compares Agent Fleet pool summaries and then atomically leases within the winning pool, never mixing that decision with quota-axi's default-account view.
 
 ## Optional secondmates
 
@@ -138,6 +141,9 @@ Idle secondmate panes are healthy; teardown is explicit and refuses while the se
 
 Secondmate homes converge conservatively to the primary's version and declared inheritable configuration at launch and during locked session start.
 The [`secondmate-provisioning` skill](../.agents/skills/secondmate-provisioning/SKILL.md) owns the full guarded sync, propagation, nudge, and mid-session configuration-push contract.
+
+`config/secondmate-account-pool` is a primary-owned, non-inherited selection knob for secondmate launches when account routing is already enabled.
+`config/account-routing-mode` is inherited so the secondmate applies the same routing policy to its own crews without inheriting the primary's secondmate-only pool.
 
 Secondmate agents can run on a different verified harness than crewmates.
 `config/secondmate-harness` controls the primary's secondmate launch harness and may also carry optional model and effort tokens as `<harness> [<model>] [<effort>]` on the first non-empty, non-comment line.

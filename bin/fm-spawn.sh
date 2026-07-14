@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -46,6 +46,23 @@
 #   the file governs the spawn, its model/effort tokens are re-resolved on every
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
+#   Account routing is independently default-off. Its precedence and off/observe/
+#   enforce behavior are owned by fm-account-routing-lib.sh. --account-pool asks
+#   Agent Fleet to atomically select one concrete profile; --account-profile pins
+#   a concrete profile (and optionally validates it belongs to --account-pool).
+#   Either explicit account flag enforces routing for this spawn even when the
+#   global mode is off/observe. --no-account-routing is the emergency per-spawn
+#   opt-out and cannot be combined with either account flag. Enforced routing is
+#   supported only for claude/codex and fails closed; it never silently launches
+#   the default account. The resolved profile wraps the provider command before
+#   backend dispatch, so tmux and Herdr receive the same launch string.
+#   config/secondmate-account-pool is the primary's durable, non-inherited pool
+#   for secondmate AGENTS. An explicit account flag overrides it. A secondmate's
+#   own crewmates use inherited crew dispatch/routing policy, not this pool.
+#   --resume-account is an internal recovery path. It requires existing sticky
+#   account/profile/session metadata plus Agent Fleet's matching SessionStart
+#   mapping, reuses the recorded worktree/home, and executes `agent-fleet resume
+#   --task`; any missing or mismatched recovery truth blocks before pane creation.
 #   A --secondmate spawn also propagates the primary's declared inheritable config
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
@@ -60,7 +77,7 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend applies to every pair.
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/account flags apply to every pair.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
@@ -102,6 +119,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -117,10 +136,16 @@ HARNESS_ARG=
 MODEL=
 EFFORT=
 BACKEND_ARG=
+ACCOUNT_POOL=
+ACCOUNT_PROFILE=
+NO_ACCOUNT_ROUTING=0
+RESUME_ACCOUNT=0
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
 BACKEND_SET=0
+ACCOUNT_POOL_SET=0
+ACCOUNT_PROFILE_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -133,6 +158,8 @@ for a in "$@"; do
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
+      account-pool) ACCOUNT_POOL=$a; ACCOUNT_POOL_SET=1 ;;
+      account-profile) ACCOUNT_PROFILE=$a; ACCOUNT_PROFILE_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -149,6 +176,12 @@ for a in "$@"; do
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
+    --account-pool) want_value=account-pool ;;
+    --account-pool=*) ACCOUNT_POOL=${a#--account-pool=}; ACCOUNT_POOL_SET=1 ;;
+    --account-profile) want_value=account-profile ;;
+    --account-profile=*) ACCOUNT_PROFILE=${a#--account-profile=}; ACCOUNT_PROFILE_SET=1 ;;
+    --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
+    --resume-account) RESUME_ACCOUNT=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -157,10 +190,34 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
+[ "$ACCOUNT_POOL_SET" -eq 0 ] || [ -n "$ACCOUNT_POOL" ] || { echo "error: --account-pool requires a non-empty value" >&2; exit 1; }
+[ "$ACCOUNT_PROFILE_SET" -eq 0 ] || [ -n "$ACCOUNT_PROFILE" ] || { echo "error: --account-profile requires a non-empty value" >&2; exit 1; }
+if [ "$NO_ACCOUNT_ROUTING" = 1 ] && { [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; }; then
+  echo "error: --no-account-routing cannot be combined with --account-pool or --account-profile" >&2
+  exit 1
+fi
+[ "$RESUME_ACCOUNT" = 0 ] || [ "$NO_ACCOUNT_ROUTING" = 0 ] || { echo "error: --resume-account cannot disable account routing" >&2; exit 1; }
+[ -z "$ACCOUNT_POOL" ] || fm_account_valid_id "$ACCOUNT_POOL" || { echo "error: invalid --account-pool '$ACCOUNT_POOL'" >&2; exit 1; }
+[ -z "$ACCOUNT_PROFILE" ] || fm_account_valid_id "$ACCOUNT_PROFILE" || { echo "error: invalid --account-profile '$ACCOUNT_PROFILE'" >&2; exit 1; }
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
+
+RESUME_META=
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  [ "${#POS[@]}" -ge 1 ] || { echo "error: --resume-account requires a task id" >&2; exit 1; }
+  case "${POS[0]}" in *=*) echo "error: --resume-account does not support batch syntax" >&2; exit 1 ;; esac
+  RESUME_META="$STATE/${POS[0]}.meta"
+  [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  recorded_backend=$(fm_backend_of_meta "$RESUME_META")
+  if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
+    echo "error: --resume-account backend override '$BACKEND_ARG' does not match recorded backend '$recorded_backend'" >&2
+    exit 1
+  fi
+  BACKEND_ARG=$recorded_backend
+  BACKEND_SET=1
+fi
 
 # Backend selection (data/fm-backend-design-d7): explicit --backend, else
 # FM_BACKEND env, else config/backend, else runtime auto-detection, else
@@ -180,6 +237,10 @@ if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=orca does not support --secondmate spawns yet" >&2
   exit 1
 fi
+if [ "$BACKEND" = orca ] && [ "$RESUME_ACCOUNT" = 1 ]; then
+  echo "error: --resume-account is not implemented for backend=orca; refusing to guess a recovery target" >&2
+  exit 1
+fi
 if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=cmux does not support --secondmate spawns yet" >&2
   exit 1
@@ -190,6 +251,9 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+ACCOUNT_LEASED=0
+ACCOUNT_SPAWN_COMMITTED=0
+ACCOUNT_EFFECTIVE_MODE=off
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -208,38 +272,60 @@ parse_orca_worktree_result() {
   fi
 }
 
-orca_spawn_abort_cleanup() {
+spawn_abort_cleanup() {
   local status=$?
-  [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
-  ORCA_ABORT_CLEANUP=0
-  if [ -n "${ORCA_TERMINAL:-}" ]; then
-    fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
-  fi
-  if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-    if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        {
-          echo "window=$W"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          echo "mode=${MODE:-no-mistakes}"
-          echo "yolo=${YOLO:-off}"
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=orca"
-          echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-          [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
+  trap - EXIT
+  [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
+  if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
+    ORCA_ABORT_CLEANUP=0
+    if [ -n "${ORCA_TERMINAL:-}" ]; then
+      fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+        mkdir -p "$STATE" 2>/dev/null || true
+        if [ -d "$STATE" ]; then
+          {
+            echo "window=${W:-fm-${ID:-unknown}}"
+            echo "worktree=${WT:-}"
+            echo "project=${PROJ_ABS:-}"
+            echo "harness=${HARNESS:-}"
+            echo "kind=${KIND:-ship}"
+            echo "mode=${MODE:-no-mistakes}"
+            echo "yolo=${YOLO:-off}"
+            echo "tasktmp=${TASK_TMP:-}"
+            echo "model=${MODEL:-default}"
+            echo "effort=${EFFORT:-default}"
+            echo "backend=orca"
+            echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+            [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+          } > "$STATE/${ID:-unknown}.meta" 2>/dev/null || true
+        fi
       fi
+    fi
+  fi
+  if [ "$ACCOUNT_LEASED" = 1 ] && [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ]; then
+    if [ -n "${T:-}" ]; then
+      fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" 2>/dev/null || true
+    fi
+    if [ -z "${T:-}" ] || ! fm_backend_target_exists "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" 2>/dev/null; then
+      if fm_account_release "${ID:-}" --force 2>/dev/null; then
+        # A new spawn has no durable conversation to retain after rollback.
+        # Recovery is different: its existing mapping is the only route back
+        # to the provider conversation and must survive every failed attempt.
+        if [ "${RESUME_ACCOUNT:-0}" != 1 ]; then
+          fm_account_session_remove "${ID:-}" 2>/dev/null || true
+        fi
+      else
+        echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown}" >&2
+      fi
+    else
+      echo "warning: retaining Agent Fleet lease for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
     fi
   fi
   return "$status"
 }
-trap orca_spawn_abort_cleanup EXIT
+trap spawn_abort_cleanup EXIT
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -260,6 +346,13 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ -z "$ACCOUNT_POOL" ] || shared_args+=(--account-pool "$ACCOUNT_POOL")
+  [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
+  [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    echo "error: batch dispatch does not support --resume-account; recover tasks individually" >&2
+    exit 1
+  fi
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -301,8 +394,60 @@ if [ "$KIND" = secondmate ]; then
       ;;
   esac
 else
-  PROJ=${POS[1]}
+  PROJ=${POS[1]:-}
   ARG3=${POS[2]:-}
+fi
+
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
+  [ -n "$RECORDED_KIND" ] || RECORDED_KIND=ship
+  if [ "$KIND" != ship ] && [ "$KIND" != "$RECORDED_KIND" ]; then
+    echo "error: --resume-account kind '$KIND' does not match recorded kind '$RECORDED_KIND'" >&2
+    exit 1
+  fi
+  KIND=$RECORDED_KIND
+  RECORDED_HARNESS=$(fm_meta_get "$RESUME_META" harness)
+  RECORDED_PROFILE=$(fm_meta_get "$RESUME_META" account_profile)
+  RECORDED_POOL=$(fm_meta_get "$RESUME_META" account_pool)
+  RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+  [ -n "$RECORDED_HARNESS" ] || { echo "error: managed recovery metadata has no harness for $ID" >&2; exit 1; }
+  [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
+  [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
+  if [ -z "$RECORDED_SESSION" ]; then
+    "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+    RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+  else
+    "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+  fi
+  [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
+  if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
+    echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+    exit 1
+  fi
+  if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
+    echo "error: --resume-account pool override '$ACCOUNT_POOL' does not match recorded pool '$RECORDED_POOL'" >&2
+    exit 1
+  fi
+  if [ "$ACCOUNT_PROFILE_SET" = 1 ] && [ "$ACCOUNT_PROFILE" != "$RECORDED_PROFILE" ]; then
+    echo "error: --resume-account profile override '$ACCOUNT_PROFILE' does not match recorded profile '$RECORDED_PROFILE'" >&2
+    exit 1
+  fi
+  HARNESS_ARG=$RECORDED_HARNESS
+  HARNESS_SET=1
+  ARG3=$RECORDED_HARNESS
+  ACCOUNT_POOL=$RECORDED_POOL
+  ACCOUNT_PROFILE=$RECORDED_PROFILE
+  ACCOUNT_POOL_SET=1
+  ACCOUNT_PROFILE_SET=1
+  MODEL=$(fm_meta_get "$RESUME_META" model)
+  EFFORT=$(fm_meta_get "$RESUME_META" effort)
+  [ "$MODEL" = default ] && MODEL=
+  [ "$EFFORT" = default ] && EFFORT=
+  if [ "$KIND" = secondmate ]; then
+    FIRSTMATE_HOME=$(fm_meta_get "$RESUME_META" home)
+  else
+    PROJ=$(fm_meta_get "$RESUME_META" project)
+  fi
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
 
@@ -321,12 +466,12 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
@@ -639,11 +784,20 @@ if [ "$KIND" = secondmate ]; then
     BRIEF="$DATA/$ID/brief.md"
   fi
 else
-  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
-  WT=""
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    PROJ_ABS=$(fm_meta_get "$RESUME_META" project)
+    WT=$(fm_meta_get "$RESUME_META" worktree)
+    [ -n "$PROJ_ABS" ] && [ -d "$PROJ_ABS" ] || { echo "error: recorded project is unavailable for managed recovery: ${PROJ_ABS:-<missing>}" >&2; exit 1; }
+    [ -n "$WT" ] && [ -d "$WT" ] || { echo "error: recorded worktree is unavailable for managed recovery: ${WT:-<missing>}" >&2; exit 1; }
+  else
+    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+    WT=""
+  fi
   BRIEF="$DATA/$ID/brief.md"
 fi
-[ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+if [ "$RESUME_ACCOUNT" != 1 ]; then
+  [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
@@ -692,7 +846,69 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+# Resolve the account axis before creating any backend endpoint.
+# A secondmate pool pin is a selection knob, not an activation knob: global
+# off still means no Agent Fleet call until the captain enables routing or an
+# explicit per-spawn account flag is passed.
+ACCOUNT_EXPLICIT=0
+if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
+  ACCOUNT_EXPLICIT=1
+fi
+ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
+if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$KIND" = secondmate ]; then
+  set +e
+  SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG" 2>/dev/null)
+  sm_pool_status=$?
+  set -e
+  if [ "$sm_pool_status" -eq 0 ]; then
+    ACCOUNT_POOL=$SM_ACCOUNT_POOL
+  elif [ "$sm_pool_status" -ne 1 ]; then
+    fm_account_secondmate_pool "$CONFIG" >/dev/null
+    exit 1
+  fi
+fi
+case "$HARNESS" in
+  claude|codex) ;;
+  *)
+    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+      echo "error: --account-pool/--account-profile requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
+    ACCOUNT_EFFECTIVE_MODE=off
+    ;;
+esac
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
+  if [ -n "$ACCOUNT_PROFILE" ]; then
+    ACCOUNT_POOL=explicit
+  else
+    ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS") || {
+      echo "error: no default account pool for harness '$HARNESS'" >&2
+      exit 1
+    }
+  fi
+fi
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
+  if [ -n "$RECORDED_TARGET" ] && fm_backend_target_exists "$BACKEND" "$RECORDED_TARGET" "fm-$ID" 2>/dev/null; then
+    echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
+    exit 1
+  fi
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    fm_account_recover "$ID" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS" || exit 1
+  else
+    fm_account_select "$ACCOUNT_EFFECTIVE_MODE" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ID" || exit 1
+  fi
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    ACCOUNT_PROFILE=$FM_ACCOUNT_SELECTED_PROFILE
+    ACCOUNT_LEASED=1
+  fi
+fi
+
 W="fm-$ID"
+SPAWN_CWD=$PROJ_ABS
+[ "$RESUME_ACCOUNT" != 1 ] || SPAWN_CWD=$WT
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -703,7 +919,7 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_CWD") || exit 1
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -722,7 +938,7 @@ case "$BACKEND" in
     if [ "$KIND" = secondmate ]; then
       HERDR_LABEL_HOME=$PROJ_ABS
     fi
-    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
+    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$SPAWN_CWD") || exit 1
     # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
     # (the second field empty when this call ADOPTED a pre-existing workspace
     # rather than creating a fresh one). Split on the guaranteed single tab
@@ -733,7 +949,7 @@ case "$BACKEND" in
     HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
     HERDR_SES=${CONTAINER%%:*}
     HERDR_WORKSPACE_ID=${CONTAINER#*:}
-    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_CWD" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
     read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -745,7 +961,7 @@ EOF
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_CWD") || exit 1
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -757,7 +973,7 @@ EOF
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_CWD") || exit 1
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -834,7 +1050,7 @@ spawn_send_key() {  # <target> <key>
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
 }
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RESUME_ACCOUNT" != 1 ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -990,6 +1206,7 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+META_TMP="$STATE/.$ID.meta.$$"
 {
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
@@ -1001,6 +1218,13 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    echo "account_pool=$ACCOUNT_POOL"
+    echo "account_profile=$ACCOUNT_PROFILE"
+    if [ "$RESUME_ACCOUNT" = 1 ]; then
+      echo "provider_session_id=$RECORDED_SESSION"
+    fi
+  fi
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
@@ -1028,7 +1252,19 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-} > "$STATE/$ID.meta"
+} > "$META_TMP"
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  # Preserve every extension field not owned by this spawn rewrite (PR/X-mode
+  # pointers and future additive metadata) while replacing endpoint identity.
+  while IFS= read -r meta_line || [ -n "$meta_line" ]; do
+    meta_key=${meta_line%%=*}
+    case "$meta_key" in
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|account_pool|account_profile|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+    esac
+    printf '%s\n' "$meta_line" >> "$META_TMP"
+  done < "$RESUME_META"
+fi
+mv "$META_TMP" "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
@@ -1038,6 +1274,23 @@ sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  case "$HARNESS:$KIND" in
+    claude:*) LAUNCH='CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__' ;;
+    codex:secondmate) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox' ;;
+    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]"' ;;
+    *) echo "error: managed recovery supports only claude and codex" >&2; exit 1 ;;
+  esac
+fi
+AGENT_COMMAND=$HARNESS
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    AGENT_COMMAND=$(fm_account_resume_command "$ID") || exit 1
+  else
+    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ID") || exit 1
+  fi
+fi
+LAUNCH=${LAUNCH//__AGENT__/$AGENT_COMMAND}
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
@@ -1057,5 +1310,15 @@ sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
+
+ACCOUNT_SPAWN_COMMITTED=1
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$RESUME_ACCOUNT" != 1 ]; then
+  # SessionStart usually lands immediately, but a slow first provider startup
+  # may race this bounded poll. Missing is non-fatal here: the watcher retries
+  # every cycle, while any later recovery requires the mapping and fails closed.
+  if ! "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-3}" >/dev/null 2>&1; then
+    echo "warning: provider session id for $ID is not recorded yet; supervision will reconcile it before any recovery" >&2
+  fi
+fi
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

@@ -1242,6 +1242,79 @@ test_local_only_force_overrides_unpushed() {
   pass "local-only worktree with unpushed work is torn down under --force (escape hatch)"
 }
 
+add_fake_agent_fleet() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
+case "$*" in
+  *"lease release"*) [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 42 ;;
+esac
+printf '{"ok":true}\n'
+SH
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/agent-fleet" "$case_dir/fakebin/tmux"
+}
+
+test_managed_force_teardown_releases_lease_and_session() {
+  local case_dir af_log rc
+  case_dir=$(make_case managed-force-release)
+  af_log="$case_dir/agent-fleet.log"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'provider_session_id=session-123' >> "$case_dir/state/task-x1.meta"
+  wt_commit "$case_dir" "managed unpushed work"
+  add_fake_agent_fleet "$case_dir"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "managed-force-release: teardown should succeed"
+  assert_grep 'lease release --task task-x1 --force' "$af_log" "managed teardown did not release the lease"
+  assert_grep 'session remove --task task-x1' "$af_log" "managed teardown did not remove the session mapping"
+  assert_absent "$case_dir/state/task-x1.meta" "managed teardown left task metadata"
+  pass "managed teardown releases its lease and session mapping only after endpoint removal"
+}
+
+test_managed_release_failure_preserves_retry_metadata() {
+  local case_dir af_log rc
+  case_dir=$(make_case managed-release-failure)
+  af_log="$case_dir/agent-fleet.log"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'account_pool=codex-crew' \
+    'account_profile=codex-2' \
+    'provider_session_id=session-456' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "managed-release-failure: teardown should fail closed"
+  assert_grep 'lease release --task task-x1 --force' "$af_log" "managed teardown never attempted release"
+  ! grep -q 'session remove --task task-x1' "$af_log" || fail "managed teardown removed the mapping after release failed"
+  assert_present "$case_dir/state/task-x1.meta" "managed teardown erased retry metadata after release failed"
+  assert_grep 'account_profile=codex-2' "$case_dir/state/task-x1.meta" "managed teardown lost sticky account metadata"
+  pass "a failed managed release keeps sticky metadata and the provider-session mapping for retry"
+}
+
 test_herdr_teardown_clears_escalation_marker() {
   local case_dir marker
   case_dir=$(make_case herdr-marker-cleanup)
@@ -1271,6 +1344,8 @@ test_local_only_merged_to_local_main_allows
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
+test_managed_force_teardown_releases_lease_and_session
+test_managed_release_failure_preserves_retry_metadata
 test_herdr_teardown_clears_escalation_marker
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head

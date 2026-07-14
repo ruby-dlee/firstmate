@@ -118,6 +118,19 @@ test_ship_completion_report_contract() {
   pass "fm-brief.sh: ship tasks require a structured completion report and visuals"
 }
 
+test_scout_completion_report_contract() {
+  local home id brief
+  home="$TMP_ROOT/scout-report-home"
+  mkdir -p "$home/data"
+  id="brief-scout-report-c2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "data/$id/report.md" "$brief" "scout brief has no durable report path"
+  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$brief" \
+    "scout brief does not name every enforced report section"
+  pass "fm-brief.sh: scout tasks receive the enforced completion-report schema"
+}
+
 test_promoted_scout_receives_completion_contract() {
   local home data id out expected_report
   home="$TMP_ROOT/promote-report-home"
@@ -302,6 +315,7 @@ test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_ship_completion_report_contract
+test_scout_completion_report_contract
 test_promoted_scout_receives_completion_contract
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

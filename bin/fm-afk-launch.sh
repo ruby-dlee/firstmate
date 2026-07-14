@@ -635,7 +635,7 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
 }
 
 fm_afk_launch_start() {
-  local captain_target captain_target_status captain_backend captain_backend_status backup artifact had_afk=0 result
+  local captain_target captain_target_status captain_backend captain_backend_status backup artifact had_afk=0 result=0
   # Capture the captain pane FIRST, before creating anything.
   if captain_target=$(discover_supervisor_target); then captain_target_status=0; else captain_target_status=$?; fi
   if captain_backend=$(discover_supervisor_backend); then captain_backend_status=0; else captain_backend_status=$?; fi
@@ -671,7 +671,7 @@ fm_afk_launch_start() {
   done
   if ! fm_afk_launch_reconcile; then
     result=1
-  else
+  elif [ "$had_afk" -eq 0 ]; then
     if fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
       result=0
     else
@@ -724,13 +724,14 @@ fm_afk_launch_start_native() {
     fi
   done
   fm_afk_launch_reconcile || result=1
-  if [ "$result" -eq 0 ]; then
+  if [ "$result" -eq 0 ] && [ "$had_afk" -eq 0 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
       result=1
-    elif ! fm_afk_launch_flag_write; then
-      result=1
     fi
+  fi
+  if [ "$result" -eq 0 ] && ! fm_afk_launch_flag_write; then
+    result=1
   fi
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_record_write none - native || result=1

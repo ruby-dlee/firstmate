@@ -597,6 +597,33 @@ unit_native_lifecycle() {
   rm -rf "$st"
 }
 
+unit_recovery_preserves_buffered_escalations() {
+  local st
+  for mode in native tmux; do
+    st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-recovery.XXXXXX")
+    mkdir -p "$st/state"
+    printf 'away-session\n' > "$st/state/.afk"
+    printf 'pending-escalation\n' > "$st/state/.subsuper-escalations"
+    if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=captain:0 \
+      FM_SUPERVISOR_BACKEND=tmux MODE="$mode" bash -c '
+        . "$1"
+        fm_afk_launch_reconcile() { return 0; }
+        fm_afk_launch_create_tmux() { return 0; }
+        if [ "$MODE" = native ]; then
+          fm_afk_launch_start_native
+        else
+          fm_afk_launch_start
+        fi
+      ' _ "$LAUNCH" && [ "$(cat "$st/state/.subsuper-escalations" 2>/dev/null)" = pending-escalation ]; then
+      :
+    else
+      fail "$mode recovery discarded a buffered escalation"
+    fi
+    rm -rf "$st"
+  done
+  pass "dead-daemon recovery preserves buffered away-mode escalations"
+}
+
 unit_native_entry_preserves_prepared_state() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-entry.XXXXXX")
@@ -1106,6 +1133,7 @@ unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
+unit_recovery_preserves_buffered_escalations
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic

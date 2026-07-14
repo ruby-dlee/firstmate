@@ -38,6 +38,11 @@ run_stack_home() {
   FM_HOME="$home" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" "$@"
 }
 
+write_required_report() {
+  local file=$1 summary=$2
+  printf '# Completion\n\n## Summary\n\n%s\n\n## What changed\n\nRecorded work.\n\n## Verification\n\nEvidence checked.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' "$summary" > "$file"
+}
+
 test_publish_ship_with_visual() {
   local id=report-ship-a1 entry count manifest report_id completed_at
   write_task "$id" ship
@@ -96,13 +101,38 @@ test_required_source_fails_closed() {
   pass "report stack refuses a required ship report with no completion source"
 }
 
+test_required_sections_fail_actionably() {
+  local id=report-headings-b3 out status before after source heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n## Summary\n\nIncomplete.\n\n## Artifacts\n\nNone.\n' > "$source"
+  while [[ "$source" == *//* ]]; do source=${source//\/\//\/}; done
+  before=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "report with missing required sections unexpectedly published"
+  assert_contains "$out" "$source" "section failure omitted the exact report source"
+  for heading in "## What changed" "## Verification" "## Visual evidence" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "section failure omitted missing heading $heading"
+  done
+  assert_contains "$out" "fm-report-stack.mjs publish $id" "section failure omitted the direct publication retry"
+  assert_contains "$out" "fm-teardown.sh $id" "section failure omitted the teardown retry"
+  assert_contains "$out" "teardown remains stopped before destructive cleanup" "section failure omitted teardown safety state"
+  after=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$before" = "$after" ] || fail "failed section validation changed the durable report stack"
+  assert_present "$HOME_DIR/state/$id.meta" "failed section validation removed task state"
+  pass "report stack rejects incomplete reports with a retry-safe actionable correction"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
-  printf '# Scout report\n\n## Summary\n\nThe investigation is complete.\n' > "$HOME_DIR/data/$scout/report.md"
+  printf '# Scout report\n\n## Summary\n\nThe investigation is complete.\n\n## What changed\n\nInvestigated.\n\n## Verification\n\nEvidence checked.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nRecommendation recorded.\n' > "$HOME_DIR/data/$scout/report.md"
   run_stack publish "$scout" >/dev/null || fail "scout report publication failed"
 
   write_task "$legacy" ship
+  grep -v '^report_required=' "$HOME_DIR/state/$legacy.meta" > "$HOME_DIR/state/$legacy.meta.precutover"
+  mv "$HOME_DIR/state/$legacy.meta.precutover" "$HOME_DIR/state/$legacy.meta"
   run_stack publish "$legacy" --legacy >/dev/null || fail "legacy compatibility publication failed"
   json=$(run_stack list --json)
   printf '%s' "$json" | grep -F '"taskId": "report-scout-c3"' >/dev/null || fail "scout is absent from report inventory"
@@ -148,6 +178,26 @@ test_abandoned_reclaim_marker_is_recovered() {
   run_stack render >/dev/null || fail "abandoned report-lock reclaim marker was not recovered"
   assert_absent "$STACK/.publish.lock" "report render retained a lock with an abandoned reclaim marker"
   pass "report stack recovers abandoned reclaim ownership by process identity and age"
+}
+
+test_previous_generation_is_recovered_for_readers() {
+  local id=report-crash-recovery-k2 entry report_id previous json
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Crash-safe report."
+  run_stack publish "$id" >/dev/null || fail "crash-recovery report failed to publish"
+  entry=$(run_stack path "$id")
+  report_id=$(basename "$(dirname "$entry")")
+  previous="$STACK/entries/.$report_id.previous"
+  mv "$STACK/entries/$report_id" "$previous"
+
+  json=$(run_stack list --json) || fail "report list did not recover the previous generation"
+  printf '%s\n' "$json" | grep -F '"taskId": "report-crash-recovery-k2"' >/dev/null \
+    || fail "recovered previous generation was absent from report inventory"
+  assert_present "$STACK/entries/$report_id/report.html" "reader recovery did not restore the durable report entry"
+  assert_absent "$previous" "reader recovery retained the hidden previous generation"
+  entry=$(run_stack path "$id") || fail "report path did not resolve after generation recovery"
+  assert_present "$entry" "recovered report path is missing"
+  pass "report readers recover crash-interrupted generation swaps"
 }
 
 test_readers_wait_for_publication_lock() {
@@ -217,13 +267,13 @@ test_ambiguous_task_ids_require_report_ids() {
   mkdir -p "$other_home/state" "$other_home/data/$id"
 
   write_task "$id" ship
-  printf '# Completion\n\n## Summary\n\nFirst home.\n' > "$HOME_DIR/data/$id/completion.md"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "First home."
   run_stack publish "$id" >/dev/null || fail "first duplicate-id report failed to publish"
 
   fm_write_meta "$other_home/state/$id.meta" "kind=ship" "report_required=1" "project=other"
   printf '# Task\n\nSecond home task.\n' > "$other_home/data/$id/brief.md"
   printf 'done: second home\n' > "$other_home/state/$id.status"
-  printf '# Completion\n\n## Summary\n\nSecond home.\n' > "$other_home/data/$id/completion.md"
+  write_required_report "$other_home/data/$id/completion.md" "Second home."
   run_stack_home "$other_home" publish "$id" >/dev/null || fail "second duplicate-id report failed to publish"
 
   ids=$(run_stack list --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).filter(r=>r.taskId===process.argv[1]).map(r=>r.reportId).join("\n")))' "$id")
@@ -244,7 +294,7 @@ test_ambiguous_task_ids_require_report_ids() {
 test_visual_symlink_fails_closed_and_cleans_staging() {
   local id=report-symlink-e5 out status staged
   write_task "$id" ship
-  printf '# Completion\n\n## Summary\n\nSymlink safety.\n' > "$HOME_DIR/data/$id/completion.md"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Symlink safety."
   mkdir -p "$TMP_ROOT/outside-visuals"
   printf 'private visual bytes\n' > "$TMP_ROOT/outside-visuals/private.png"
   ln -s "$TMP_ROOT/outside-visuals" "$HOME_DIR/data/$id/visuals"
@@ -262,10 +312,12 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
 
 test_publish_ship_with_visual
 test_required_source_fails_closed
+test_required_sections_fail_actionably
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
+test_previous_generation_is_recovered_for_readers
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
 test_source_symlinks_fail_closed

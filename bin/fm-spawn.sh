@@ -584,7 +584,8 @@ spawn_abort_cleanup() {
     fi
     if [ "$account_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
-        if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
+        if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] \
+          || cmp -s "$STATE/$ID.meta" "$META_BACKUP"; then
           artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
           if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
             && mv "$META_BACKUP" "$STATE/$ID.meta"; then

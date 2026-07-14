@@ -9,10 +9,11 @@ Set `FM_REPORT_STACK_ROOT` to relocate it.
 New task metadata carries `report_required=1`.
 A ship task writes `data/<id>/completion.md`, while a scout keeps using `data/<id>/report.md`.
 Both may attach screenshots, diagrams, or other review artifacts under `data/<id>/visuals/`.
-The ship completion report uses the sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
+Every post-cutover ship and scout report must use the level-two sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
 
 `fm-teardown.sh` publishes a required report after all non-destructive safety checks and before releasing an account lease, killing an endpoint, or removing a worktree.
-If publication fails, teardown stops and preserves the task for repair and retry.
+If a required heading is absent, publication names every missing heading, identifies the exact report source to edit, and gives the publish and teardown retry commands.
+Publication failure leaves the prior durable entry unchanged and stops teardown before destructive cleanup, preserving the task for repair and retry.
 Tasks that were already in flight at cutover lack the marker and retain the earlier teardown contract.
 An explicit `--force` teardown is a discard and does not create a completion report.
 Retiring a persistent secondmate is also not a completion; ordinary tasks completed inside its home publish to the same machine-global stack.

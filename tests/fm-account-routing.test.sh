@@ -167,6 +167,7 @@ case "$*" in
     printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-1}"
     ;;
   *" choose "*|*" lease choose "*|*" lease acquire "*|*" lease recover "*)
+    [ -z "${FM_FAKE_AF_SELECT_MUTATE_FILE:-}" ] || printf 'replacement-state\n' > "$FM_FAKE_AF_SELECT_MUTATE_FILE"
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
@@ -539,6 +540,32 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
   assert_grep 'lease release ' "$AF_LOG" "failed managed respawn leaked its acquired reservation"
   [ -n "$out" ] || true
   pass "failed managed respawn restores every field from existing unmanaged metadata"
+}
+
+test_preinstall_managed_failure_restores_artifact_snapshot() {
+  local id rec expected out status artifact
+  id=account-preinstall-rollback-z9f
+  rec=$(make_case preinstall-rollback claude "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  artifact="$HOME_DIR/state/$id.pi-ext.ts"
+  printf 'prior-state\n' > "$artifact"
+  expected="$CASE_DIR/original.meta"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+  out=$(FM_FAKE_AF_SELECT_MUTATE_FILE="$artifact" FM_FAKE_AF_SELECT_FAIL=1 \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "pre-install account selection failure unexpectedly spawned"
+  cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "pre-install failure changed retained unmanaged metadata"
+  [ "$(cat "$artifact" 2>/dev/null)" = prior-state ] || fail "pre-install failure discarded the retained artifact snapshot"
+  [ -n "$out" ] || true
+  pass "pre-install managed failures restore retained task artifacts"
 }
 
 test_session_sync_bounds_agent_fleet_queries() {
@@ -1684,6 +1711,23 @@ SH
   done
   assert_absent "$case_dir/overlap" "metadata lock admitted overlapping owners"
   assert_absent "$lock" "metadata lock remained after concurrent owners exited"
+
+  mkdir -p "$lock"
+  FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
+    . "$1"
+    fm_account_reclaim_guard_acquire "$2/.reclaiming" 1
+    [ -f "$2/.reclaiming" ] && [ "$(wc -l < "$2/.reclaiming" | tr -d "[:space:]")" -eq 2 ]
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" \
+    || fail "metadata reclaim ownership was not atomically published"
+  rm -rf "$lock"
+
+  mkdir -p "$lock/.reclaiming"
+  printf '999999\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
+  touch -t 200001010000 "$lock" "$lock/.reclaiming"
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "abandoned metadata reclaim owner blocked acquisition"
+  assert_absent "$lock" "metadata lock retained an abandoned reclaim owner"
   pass "metadata locks reclaim abandoned directories without deleting new owners"
 }
 
@@ -1729,7 +1773,7 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
 }
 
 test_account_timeout_wrapper_uses_hard_kill_fallback() {
-  local fakebin log
+  local fakebin log status perl_bin
   fakebin=$(fm_fakebin "$TMP_ROOT/hard-timeout")
   log="$TMP_ROOT/hard-timeout.args"
   cat > "$fakebin/timeout" <<'SH'
@@ -1742,6 +1786,37 @@ SH
     fm_account_run_bounded 3 true
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" || fail "account timeout wrapper invocation failed"
   assert_grep '--kill-after=1 3 true' "$log" "account timeout wrapper omitted the hard KILL fallback"
+
+  cat > "$fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+exit 137
+SH
+  chmod +x "$fakebin/timeout"
+  if PATH="$fakebin:$PATH" bash -c '. "$1"; fm_account_run_bounded 3 true' _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 124 ] || fail "hard-kill timeout status was not normalized for reconciliation (status=$status)"
+
+  perl_bin=$(command -v perl || true)
+  if [ -n "$perl_bin" ]; then
+    rm -rf "$fakebin"
+    mkdir -p "$fakebin"
+    ln -s "$perl_bin" "$fakebin/perl"
+    cat > "$fakebin/signaled" <<'SH'
+#!/bin/sh
+kill -TERM $$
+SH
+    chmod +x "$fakebin/signaled"
+    if PATH="$fakebin" /bin/bash -c '. "$1"; fm_account_run_bounded 3 "$2"' \
+      _ "$ROOT/bin/fm-account-routing-lib.sh" "$fakebin/signaled"; then
+      status=0
+    else
+      status=$?
+    fi
+    [ "$status" -eq 143 ] || fail "Perl timeout fallback converted a signaled child into success (status=$status)"
+  fi
   pass "Agent Fleet control timeouts force-kill TERM-resistant subprocesses"
 }
 
@@ -1784,6 +1859,7 @@ test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
+test_preinstall_managed_failure_restores_artifact_snapshot
 test_session_sync_bounds_agent_fleet_queries
 test_continuation_rejects_symlinked_charter_ancestor
 test_recovered_reservations_are_owned_until_launch_commit

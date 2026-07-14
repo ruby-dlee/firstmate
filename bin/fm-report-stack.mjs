@@ -32,6 +32,7 @@ const stateDir = path.resolve(process.env.FM_STATE_OVERRIDE || path.join(fmHome,
 const dataDir = path.resolve(process.env.FM_DATA_OVERRIDE || path.join(fmHome, "data"));
 const stackRoot = path.resolve(process.env.FM_REPORT_STACK_ROOT || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "firstmate", "report-stack"));
 const entriesDir = path.join(stackRoot, "entries");
+const requiredSections = ["Summary", "What changed", "Verification", "Visual evidence", "Artifacts", "Follow-ups"];
 
 function fail(message) {
   console.error(`error: ${message}`);
@@ -75,6 +76,39 @@ function firstSummary(markdown, fallback) {
     .replace(/\s+/g, " ")
     .trim();
   return (text || fallback).slice(0, 320);
+}
+
+function levelTwoHeadings(markdown) {
+  const headings = new Set();
+  const backtickFence = String.fromCharCode(96).repeat(3);
+  let fence = "";
+  for (const line of String(markdown).split(/\r?\n/)) {
+    const trimmed = line.trimStart();
+    const marker = trimmed.startsWith(backtickFence) ? backtickFence : trimmed.startsWith("~~~") ? "~~~" : "";
+    if (marker) {
+      if (!fence) fence = marker;
+      else if (marker === fence) fence = "";
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^##[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+    if (heading) headings.add(heading[1].trim().toLowerCase());
+  }
+  return headings;
+}
+
+function requireCompletionSections(markdown, sourceFile, taskId) {
+  const headings = levelTwoHeadings(markdown);
+  const missing = requiredSections.filter((section) => !headings.has(section.toLowerCase()));
+  if (missing.length === 0) return;
+  const required = requiredSections.map((section) => `## ${section}`).join(", ");
+  const absent = missing.map((section) => `## ${section}`).join(", ");
+  throw new Error(
+    `completion report at ${sourceFile} is missing required section headings: ${absent}. `
+    + `Update ${sourceFile} to include these level-two headings: ${required}. `
+    + `Then rerun ${fmRoot}/bin/fm-report-stack.mjs publish ${taskId} or ${fmRoot}/bin/fm-teardown.sh ${taskId}. `
+    + "This attempt did not replace the durable report, and teardown remains stopped before destructive cleanup.",
+  );
 }
 
 function gitValue(worktree, gitArgs) {
@@ -301,14 +335,21 @@ function acquireLock() {
                 const currentLockStat = fs.statSync(lock);
                 if (!reclaimAlive && Date.now() - reclaimStat.mtimeMs > 60_000
                   && currentLockStat.dev === lockStat.dev && currentLockStat.ino === lockStat.ino) {
-                  const currentReclaimRaw = fs.readFileSync(reclaim, "utf8").trim();
-                  let currentReclaimToken;
+                  const quarantine = path.join(lock, `.reclaim.abandoned.${process.pid}.${crypto.randomUUID()}`);
+                  fs.renameSync(reclaim, quarantine);
+                  const quarantinedReclaimStat = fs.statSync(quarantine);
+                  let quarantinedToken;
                   try {
-                    currentReclaimToken = JSON.parse(currentReclaimRaw).token;
+                    quarantinedToken = JSON.parse(fs.readFileSync(quarantine, "utf8")).token;
                   } catch {
-                    currentReclaimToken = currentReclaimRaw;
+                    quarantinedToken = fs.readFileSync(quarantine, "utf8").trim();
                   }
-                  if (currentReclaimToken === reclaimOwner.token) fs.rmSync(reclaim, { force: true });
+                  if (quarantinedReclaimStat.dev !== reclaimStat.dev || quarantinedReclaimStat.ino !== reclaimStat.ino
+                    || quarantinedToken !== reclaimOwner.token) {
+                    if (!fs.existsSync(reclaim)) fs.renameSync(quarantine, reclaim);
+                    throw new Error(`report reclaim ownership changed while recovering ${lock}`);
+                  }
+                  fs.rmSync(quarantine, { force: true });
                 }
               } catch (reclaimOwnerError) {
                 if (reclaimOwnerError.code !== "ENOENT") throw reclaimOwnerError;
@@ -339,6 +380,7 @@ function acquireLock() {
 function withLock(callback) {
   const release = acquireLock();
   try {
+    recoverPreviousEntries();
     return callback();
   } finally {
     release();
@@ -396,6 +438,18 @@ function readManifests() {
     .sort((a, b) => b.completedAt.localeCompare(a.completedAt));
 }
 
+function recoverPreviousEntries() {
+  if (!fs.existsSync(entriesDir)) return;
+  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+    const match = entry.isDirectory() && entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.previous$/);
+    if (!match) continue;
+    const previous = path.join(entriesDir, entry.name);
+    const destination = path.join(entriesDir, match[1]);
+    if (fs.existsSync(destination)) fs.rmSync(previous, { recursive: true, force: true });
+    else fs.renameSync(previous, destination);
+  }
+}
+
 function renderIndex() {
   fs.mkdirSync(entriesDir, { recursive: true, mode: 0o700 });
   const temp = path.join(stackRoot, `.index.html.${process.pid}.tmp`);
@@ -421,8 +475,10 @@ function publish(taskId, legacy) {
   const sourceFile = meta.kind === "scout" ? path.join(taskData, "report.md") : path.join(taskData, "completion.md");
   const source = readArtifact(sourceFile, dataRoot, "completion report");
   let markdown;
-  if (source !== undefined) markdown = redactSensitive(source);
-  else if (legacy) markdown = `# ${titleFromBrief(taskId, brief)}\n\n## Summary\n\n${lastStatus(status)}\n\n## Preserved trail\n\nThis compatibility report was synthesized for a task created before completion reports were required.\nSee the attached task brief and status trail for details.\n`;
+  if (source !== undefined) {
+    if (meta.report_required === "1") requireCompletionSections(source, sourceFile, taskId);
+    markdown = redactSensitive(source);
+  } else if (legacy && meta.report_required !== "1") markdown = `# ${titleFromBrief(taskId, brief)}\n\n## Summary\n\n${lastStatus(status)}\n\n## Preserved trail\n\nThis compatibility report was synthesized for a task created before completion reports were required.\nSee the attached task brief and status trail for details.\n`;
   else throw new Error(`required completion report is missing at ${sourceFile}`);
   if (!markdown.trim()) throw new Error(`completion report is empty at ${sourceFile}`);
 

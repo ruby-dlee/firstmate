@@ -419,8 +419,11 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null
   status=$?
   expect_code 0 "$status" "initial managed spawn for resume should succeed"
+  assert_grep 'report_required=1' "$HOME_DIR/state/$id.meta" "fresh spawn did not require a completion report"
   before_session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   account_task=$(meta_account_task "$id")
+  grep -v '^report_required=' "$HOME_DIR/state/$id.meta" > "$HOME_DIR/state/$id.meta.precutover"
+  mv "$HOME_DIR/state/$id.meta.precutover" "$HOME_DIR/state/$id.meta"
   rm -f "$CASE_DIR/endpoint-live"
   : > "$AF_LOG"
   : > "$TMUX_LOG"
@@ -436,6 +439,7 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   assert_contains "$launch" "account-native-launch' --dangerously-skip-permissions" "resume did not pass provider arguments through its launch gate"
   assert_not_contains "$launch" 'cat ' "resume started a fresh prompted conversation"
   [ "$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)" = "$before_session" ] || fail "resume changed provider session identity"
+  assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover recovery silently activated the report gate"
 
   : > "$AF_LOG"
   : > "$TMUX_LOG"

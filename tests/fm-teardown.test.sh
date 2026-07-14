@@ -79,6 +79,10 @@ make_case() {
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 # `treehouse return --force <wt>`: succeed silently.
+[ -z "${FM_EXPECT_REPORT_PATH:-}" ] || [ -f "$FM_EXPECT_REPORT_PATH" ] || {
+  echo "report missing before treehouse return: $FM_EXPECT_REPORT_PATH" >&2
+  exit 97
+}
 [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'treehouse-return %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
 exit 0
 SH
@@ -1631,6 +1635,37 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+test_required_report_blocks_then_publishes_before_cleanup() {
+  local case_dir data stack rc
+  case_dir=$(make_case report-publication)
+  data="$case_dir/data"
+  stack="$case_dir/report-stack"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$data/task-x1"
+  printf '# Task\n\nPublish before cleanup\n' > "$data/task-x1/brief.md"
+  printf 'done: implementation landed\n' > "$case_dir/state/task-x1.status"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+    run_teardown "$case_dir" > "$case_dir/missing-stdout" 2> "$case_dir/missing-stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "required report: teardown without completion.md must fail"
+  assert_present "$case_dir/state/task-x1.meta" "required report failure erased task metadata"
+  assert_grep 'required completion report is missing' "$case_dir/missing-stderr" \
+    "required report failure did not explain the missing artifact"
+
+  printf '# Completion\n\n## Summary\n\nPublication is ready.\n\n## What changed\n\nHooked teardown.\n\n## Verification\n\nTested.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport stack.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+    FM_EXPECT_REPORT_PATH="$stack/index.html" run_teardown "$case_dir" \
+      > "$case_dir/report-stdout" 2> "$case_dir/report-stderr" \
+    || fail "required report: teardown failed after completion report was ready: $(cat "$case_dir/report-stderr")"
+  assert_present "$stack/index.html" "required report was not published"
+  assert_absent "$case_dir/state/task-x1.meta" "successful report teardown left task metadata"
+  pass "teardown fails closed on a missing report and publishes before worktree cleanup"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1646,6 +1681,7 @@ test_managed_teardown_locks_generation_before_endpoint_cleanup
 test_managed_child_teardown_locks_generation_before_snapshot
 test_forced_secondmate_child_uses_child_home_for_endpoint_verification
 test_herdr_teardown_clears_escalation_marker
+test_required_report_blocks_then_publishes_before_cleanup
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

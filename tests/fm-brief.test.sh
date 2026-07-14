@@ -100,6 +100,24 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+test_ship_completion_report_contract() {
+  local home id brief
+  home="$TMP_ROOT/completion-report-home"
+  mkdir -p "$home/data"
+  id="brief-report-c2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "# Completion report" "$brief" "ship brief has no completion-report contract"
+  assert_grep "data/$id/completion.md" "$brief" "ship brief has no durable report path"
+  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$brief" \
+    "ship brief has no review-oriented report schema"
+  assert_grep "data/$id/visuals/" "$brief" "ship brief has no visual evidence path"
+  assert_grep "Before the final \`done:\` status" "$brief" "ship brief does not order report publication before done"
+  assert_grep "no-mistakes pipeline changes the implementation" "$brief" \
+    "ship brief does not require a post-gate report refresh"
+  pass "fm-brief.sh: ship tasks require a structured completion report and visuals"
+}
+
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
@@ -265,6 +283,7 @@ test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_ship_completion_report_contract
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout

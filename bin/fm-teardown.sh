@@ -1147,6 +1147,15 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# New tasks fail closed on their machine-global completion report before the
+# first destructive action below (managed lease release). Tasks already in
+# flight when this feature lands have no report_required marker and retain the
+# legacy teardown contract. --force is an explicit discard, not a completion.
+if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+    "$FM_ROOT/bin/fm-report-stack.mjs" publish "$ID" || exit 1
+fi
+
 PROBE_HOME=
 ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
 [ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME

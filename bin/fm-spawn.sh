@@ -1590,6 +1590,12 @@ META_TMP="$STATE/.$ID.meta.$$"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
+    [ -z "$RECORDED_REPORT_REQUIRED" ] || echo "report_required=$RECORDED_REPORT_REQUIRED"
+  else
+    echo "report_required=1"
+  fi
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     echo "account_pool=$ACCOUNT_POOL"
     echo "account_profile=$ACCOUNT_PROFILE"
@@ -1644,7 +1650,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   while IFS= read -r meta_line || [ -n "$meta_line" ]; do
     meta_key=${meta_line%%=*}
     case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
+      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
     esac
     printf '%s\n' "$meta_line" >> "$META_TMP"
   done < "$RESUME_META"

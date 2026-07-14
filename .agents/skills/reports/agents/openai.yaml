@@ -1,0 +1,4 @@
+interface:
+  display_name: "Completion Reports"
+  short_description: "Browse completed Firstmate task reports"
+  default_prompt: "Use $reports to open and summarize the Firstmate report stack."

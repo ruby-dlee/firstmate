@@ -221,6 +221,60 @@ test_previous_generation_is_recovered_for_readers() {
   pass "report readers recover crash-interrupted generation swaps"
 }
 
+test_replacement_transaction_recovery_restores_entry_and_index() {
+  local id=report-replacement-transaction-k2b entry destination report_id previous transaction staged json
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Original transaction generation."
+  run_stack publish "$id" >/dev/null || fail "replacement transaction precondition failed"
+  entry=$(run_stack path "$id")
+  destination=$(dirname "$entry")
+  report_id=$(basename "$destination")
+  previous="$STACK/entries/.$report_id.previous"
+  transaction="$STACK/entries/.$report_id.transaction"
+  staged="$STACK/entries/.$report_id.999.tmp"
+  mv "$destination" "$previous"
+  cp -R "$previous" "$destination"
+  sed -i.bak 's/Original transaction generation/Unindexed replacement generation/' "$destination/report.md"
+  rm -f "$destination/report.md.bak"
+  mkdir -p "$staged"
+  printf 'stale index\n' > "$STACK/index.html"
+  printf '{"schemaVersion":1,"reportId":"%s","hadPrevious":true}\n' "$report_id" > "$transaction"
+
+  json=$(run_stack list --json) || fail "report list did not recover an interrupted replacement transaction"
+  printf '%s\n' "$json" | grep -F '"taskId": "report-replacement-transaction-k2b"' >/dev/null \
+    || fail "replacement recovery omitted the restored report"
+  assert_grep 'Original transaction generation' "$destination/report.md" "replacement recovery did not restore the prior report"
+  assert_no_grep 'Unindexed replacement generation' "$destination/report.md" "replacement recovery retained the unindexed generation"
+  assert_no_grep 'stale index' "$STACK/index.html" "replacement recovery did not rebuild the report index"
+  assert_absent "$previous" "replacement recovery retained the rollback generation"
+  assert_absent "$transaction" "replacement recovery retained its transaction marker"
+  assert_absent "$staged" "replacement recovery retained transaction staging"
+  pass "report recovery rolls back replacement entries and their stale index"
+}
+
+test_first_publication_transaction_recovery_removes_unindexed_entry() {
+  local id=report-first-transaction-k2c entry destination report_id transaction json
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Uncommitted first publication."
+  run_stack publish "$id" >/dev/null || fail "first-publication transaction precondition failed"
+  entry=$(run_stack path "$id")
+  destination=$(dirname "$entry")
+  report_id=$(basename "$destination")
+  transaction="$STACK/entries/.$report_id.transaction"
+  printf 'stale index\n' > "$STACK/index.html"
+  printf '{"schemaVersion":1,"reportId":"%s","hadPrevious":false}\n' "$report_id" > "$transaction"
+
+  json=$(run_stack list --json) || fail "report list did not recover an interrupted first publication"
+  if printf '%s\n' "$json" | grep -F '"taskId": "report-first-transaction-k2c"' >/dev/null; then
+    fail "first-publication recovery retained an uncommitted report"
+  fi
+  assert_absent "$destination" "first-publication recovery retained the unindexed entry"
+  assert_absent "$transaction" "first-publication recovery retained its transaction marker"
+  assert_present "$STACK/index.html" "first-publication recovery did not rebuild the report index"
+  assert_no_grep 'stale index' "$STACK/index.html" "first-publication recovery retained the stale index"
+  pass "report recovery removes interrupted first publications and rebuilds the index"
+}
+
 test_index_failure_restores_previous_generation() {
   local id=report-index-rollback-k3 entry out status
   write_task "$id" ship
@@ -362,6 +416,8 @@ test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
 test_previous_generation_is_recovered_for_readers
+test_replacement_transaction_recovery_restores_entry_and_index
+test_first_publication_transaction_recovery_removes_unindexed_entry
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

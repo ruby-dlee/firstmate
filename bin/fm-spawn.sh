@@ -1657,6 +1657,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     persist_failed_account_rollback || exit 1
     fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
   else
+    persist_failed_account_rollback || exit 1
     if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
       :
     else

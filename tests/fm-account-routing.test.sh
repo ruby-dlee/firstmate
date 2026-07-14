@@ -167,6 +167,11 @@ case "$*" in
     printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-1}"
     ;;
   *" choose "*|*" lease choose "*|*" lease acquire "*|*" lease recover "*)
+    if [ -n "${FM_FAKE_AF_REQUIRE_PRELEASE_META:-}" ]; then
+      grep -qxF "account_task=$task" "$FM_FAKE_AF_REQUIRE_PRELEASE_META" \
+        && grep -qxF 'account_rollback_cleanup=pending' "$FM_FAKE_AF_REQUIRE_PRELEASE_META" \
+        || { echo "managed account identity was not durable before lease mutation" >&2; exit 91; }
+    fi
     [ -z "${FM_FAKE_AF_SELECT_MUTATE_FILE:-}" ] || printf 'replacement-state\n' > "$FM_FAKE_AF_SELECT_MUTATE_FILE"
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
@@ -890,7 +895,7 @@ test_reservation_occurs_after_worktree_preparation() {
   pass "account capacity is reserved only when the prepared endpoint can bind"
 }
 
-test_reserved_generation_is_durable_before_spawn_progresses() {
+test_reserved_generation_is_durable_before_lease_mutation() {
   local id rec real_mv marker gate installed_marker installed_gate spawn_pid status meta task
   id=account-durable-lease-z14b
   rec=$(make_case durable-lease claude "$id")
@@ -923,7 +928,8 @@ SH
 
   FM_FAKE_REAL_MV="$real_mv" FM_FAKE_PROVISIONAL_META_MARKER="$marker" \
     FM_FAKE_PROVISIONAL_META_GATE="$gate" FM_FAKE_INSTALLED_META_MARKER="$installed_marker" \
-    FM_FAKE_INSTALLED_META_GATE="$installed_gate" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
+    FM_FAKE_INSTALLED_META_GATE="$installed_gate" FM_FAKE_AF_REQUIRE_PRELEASE_META="$HOME_DIR/state/$id.meta" \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
     > "$CASE_DIR/spawn-stdout" 2> "$CASE_DIR/spawn-stderr" &
   spawn_pid=$!
   for _ in $(seq 1 100); do
@@ -933,10 +939,10 @@ SH
   done
   [ -f "$marker" ] || { touch "$gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never persisted provisional managed metadata"; }
   meta="$HOME_DIR/state/$id.meta"
-  task=$(logged_account_task)
+  task=$(meta_account_task "$id")
   assert_grep 'account_rollback_cleanup=pending' "$meta" "provisional metadata was not marked for rollback recovery"
-  assert_grep "account_task=$task" "$meta" "provisional metadata lost the reserved Agent Fleet task"
-  assert_grep 'account_profile=claude-2' "$meta" "provisional metadata lost the selected account profile"
+  assert_grep "account_task=$task" "$meta" "provisional metadata lost the pending Agent Fleet task"
+  assert_not_grep '^account_profile=' "$meta" "provisional metadata invented a profile before Agent Fleet selection"
   assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
   touch "$gate"
   for _ in $(seq 1 100); do
@@ -946,12 +952,13 @@ SH
   done
   [ -f "$installed_marker" ] || { touch "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never installed endpoint metadata"; }
   assert_grep 'account_rollback_cleanup=pending' "$meta" "endpoint metadata cleared rollback recovery before launch commit"
+  assert_grep 'account_profile=claude-2' "$meta" "endpoint metadata lost the selected account profile"
   touch "$installed_gate"
   status=0
   wait "$spawn_pid" || status=$?
   expect_code 0 "$status" "spawn should continue after its provisional generation is durable"
   assert_not_grep 'account_rollback_cleanup=pending' "$meta" "committed metadata retained the provisional rollback marker"
-  pass "managed account identity is durable immediately after reservation"
+  pass "managed account identity is durable before lease mutation and through launch commit"
 }
 
 test_raw_enforced_launch_is_rejected_before_mutation() {
@@ -1987,7 +1994,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
 
-test_reserved_generation_is_durable_before_spawn_progresses
+test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session

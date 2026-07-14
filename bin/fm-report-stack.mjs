@@ -443,15 +443,81 @@ function readManifests() {
     .sort((a, b) => b.completedAt.localeCompare(a.completedAt));
 }
 
+function reportTransactionPath(reportId) {
+  return path.join(entriesDir, `.${reportId}.transaction`);
+}
+
+function writeReportTransaction(reportId, hadPrevious) {
+  const transaction = reportTransactionPath(reportId);
+  const temp = `${transaction}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify({ schemaVersion: 1, reportId, hadPrevious })}\n`, { mode: 0o600 });
+    fs.renameSync(temp, transaction);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
+  return transaction;
+}
+
+function removeStagedReports(reportId) {
+  const prefix = `.${reportId}.`;
+  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name.startsWith(prefix) && entry.name.endsWith(".tmp")) {
+      fs.rmSync(path.join(entriesDir, entry.name), { recursive: true, force: true });
+    }
+  }
+}
+
 function recoverPreviousEntries() {
   if (!fs.existsSync(entriesDir)) return;
+  const transactions = [];
+  const transactionIds = new Set();
+  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+    const match = entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.transaction$/);
+    if (!match) continue;
+    if (!entry.isFile()) throw new Error(`invalid report transaction at ${path.join(entriesDir, entry.name)}`);
+    const transaction = path.join(entriesDir, entry.name);
+    const record = JSON.parse(fs.readFileSync(transaction, "utf8"));
+    const reportId = match[1];
+    if (record.schemaVersion !== 1 || record.reportId !== reportId || typeof record.hadPrevious !== "boolean") {
+      throw new Error(`invalid report transaction at ${transaction}`);
+    }
+    const destination = path.join(entriesDir, reportId);
+    const previous = path.join(entriesDir, `.${reportId}.previous`);
+    if (record.hadPrevious) {
+      if (fs.existsSync(previous)) {
+        fs.rmSync(destination, { recursive: true, force: true });
+        fs.renameSync(previous, destination);
+      } else if (!fs.existsSync(destination)) {
+        throw new Error(`report transaction lost both generations for ${reportId}`);
+      }
+    } else {
+      if (fs.existsSync(previous)) throw new Error(`unexpected previous report generation for ${reportId}`);
+      fs.rmSync(destination, { recursive: true, force: true });
+    }
+    transactions.push({ reportId, transaction });
+    transactionIds.add(reportId);
+  }
+
+  const recoveredPrevious = [];
   for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
     const match = entry.isDirectory() && entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.previous$/);
     if (!match) continue;
+    if (transactionIds.has(match[1])) continue;
     const previous = path.join(entriesDir, entry.name);
     const destination = path.join(entriesDir, match[1]);
-    if (fs.existsSync(destination)) fs.rmSync(previous, { recursive: true, force: true });
-    else fs.renameSync(previous, destination);
+    const discard = fs.existsSync(destination);
+    if (!discard) fs.renameSync(previous, destination);
+    recoveredPrevious.push({ previous, discard });
+  }
+
+  if (transactions.length > 0 || recoveredPrevious.length > 0) renderIndex();
+  for (const { reportId, transaction } of transactions) {
+    removeStagedReports(reportId);
+    fs.rmSync(transaction, { force: true });
+  }
+  for (const { previous, discard } of recoveredPrevious) {
+    if (discard) fs.rmSync(previous, { recursive: true, force: true });
   }
 }
 
@@ -490,16 +556,13 @@ function publish(taskId, legacy) {
   const id = stableReportId(taskId);
   const destination = path.join(entriesDir, id);
   const previous = path.join(entriesDir, `.${id}.previous`);
-  if (fs.existsSync(previous)) {
-    if (fs.existsSync(destination)) fs.rmSync(previous, { recursive: true, force: true });
-    else fs.renameSync(previous, destination);
-  }
   let previousManifest;
   if (fs.existsSync(destination)) {
     if (!fs.existsSync(path.join(destination, "manifest.json"))) throw new Error(`existing report entry is incomplete at ${destination}`);
     previousManifest = JSON.parse(fs.readFileSync(path.join(destination, "manifest.json"), "utf8"));
   }
   const staged = path.join(entriesDir, `.${id}.${process.pid}.tmp`);
+  let transaction;
   fs.rmSync(staged, { recursive: true, force: true });
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
   try {
@@ -527,7 +590,9 @@ function publish(taskId, legacy) {
     fs.writeFileSync(path.join(staged, "status.log"), status || "Status trail unavailable.\n", { mode: 0o600 });
     fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
 
-    if (fs.existsSync(destination)) fs.renameSync(destination, previous);
+    const hadPrevious = fs.existsSync(destination);
+    transaction = writeReportTransaction(id, hadPrevious);
+    if (hadPrevious) fs.renameSync(destination, previous);
     try {
       fs.renameSync(staged, destination);
     } catch (error) {
@@ -541,8 +606,19 @@ function publish(taskId, legacy) {
       if (fs.existsSync(previous)) fs.renameSync(previous, destination);
       throw error;
     }
+    fs.rmSync(transaction, { force: true });
+    transaction = undefined;
     fs.rmSync(previous, { recursive: true, force: true });
     console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
+  } catch (error) {
+    if (transaction && fs.existsSync(transaction)) {
+      try {
+        recoverPreviousEntries();
+      } catch (recoveryError) {
+        error.message = `${error.message}; report transaction recovery remains pending: ${recoveryError.message}`;
+      }
+    }
+    throw error;
   } finally {
     fs.rmSync(staged, { recursive: true, force: true });
   }

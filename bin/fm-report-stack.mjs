@@ -87,6 +87,19 @@ function gitValue(worktree, gitArgs) {
   }
 }
 
+function processStartIdentity(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().replace(/\s+/g, " ");
+  } catch {
+    return "";
+  }
+}
+
 function escapeHtml(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
@@ -149,21 +162,37 @@ function acquireLock() {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
-      fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n`, { mode: 0o600 });
+      try {
+        const startedAt = processStartIdentity(process.pid);
+        if (!startedAt) throw new Error(`cannot identify report publisher process ${process.pid}`);
+        fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify({ pid: process.pid, startedAt })}\n`, { mode: 0o600 });
+      } catch (error) {
+        fs.rmSync(lock, { recursive: true, force: true });
+        throw error;
+      }
       return () => fs.rmSync(lock, { recursive: true, force: true });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       try {
         let owner = Number.NaN;
+        let ownerStartedAt = "";
         try {
-          owner = Number.parseInt(fs.readFileSync(path.join(lock, "owner"), "utf8"), 10);
+          const rawOwner = fs.readFileSync(path.join(lock, "owner"), "utf8").trim();
+          try {
+            const parsedOwner = JSON.parse(rawOwner);
+            owner = Number(parsedOwner.pid);
+            ownerStartedAt = typeof parsedOwner.startedAt === "string" ? parsedOwner.startedAt : "";
+          } catch {
+            owner = Number.parseInt(rawOwner, 10);
+          }
         } catch (ownerError) {
           if (ownerError.code !== "ENOENT") throw ownerError;
         }
-        let ownerAlive = Number.isFinite(owner);
+        let ownerAlive = Number.isInteger(owner) && owner > 0 && Boolean(ownerStartedAt);
         if (ownerAlive) {
           try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
         }
+        if (ownerAlive) ownerAlive = processStartIdentity(owner) === ownerStartedAt;
         if (!ownerAlive && Date.now() - fs.statSync(lock).mtimeMs > 60_000) {
           fs.rmSync(lock, { recursive: true, force: true });
           continue;
@@ -236,11 +265,15 @@ function publish(taskId, legacy) {
 
   const id = stableReportId(taskId);
   const destination = path.join(entriesDir, id);
+  const previous = path.join(entriesDir, `.${id}.previous`);
+  if (fs.existsSync(previous)) {
+    if (fs.existsSync(destination)) fs.rmSync(previous, { recursive: true, force: true });
+    else fs.renameSync(previous, destination);
+  }
+  let previousManifest;
   if (fs.existsSync(destination)) {
     if (!fs.existsSync(path.join(destination, "manifest.json"))) throw new Error(`existing report entry is incomplete at ${destination}`);
-    renderIndex();
-    console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
-    return;
+    previousManifest = JSON.parse(fs.readFileSync(path.join(destination, "manifest.json"), "utf8"));
   }
   const staged = path.join(entriesDir, `.${id}.${process.pid}.tmp`);
   fs.rmSync(staged, { recursive: true, force: true });
@@ -252,7 +285,7 @@ function publish(taskId, legacy) {
     taskId,
     title: titleFromBrief(taskId, brief),
     summary: firstSummary(markdown, lastStatus(status)),
-    completedAt: new Date().toISOString(),
+    completedAt: previousManifest?.completedAt || new Date().toISOString(),
     kind: meta.kind || "ship",
     mode: meta.mode || "no-mistakes",
     project: meta.project ? path.basename(meta.project) : "unknown",
@@ -269,12 +302,15 @@ function publish(taskId, legacy) {
   fs.writeFileSync(path.join(staged, "status.log"), status || "Status trail unavailable.\n", { mode: 0o600 });
   fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
 
+  if (fs.existsSync(destination)) fs.renameSync(destination, previous);
   try {
     fs.renameSync(staged, destination);
   } catch (error) {
+    if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, destination);
     fs.rmSync(staged, { recursive: true, force: true });
     throw error;
   }
+  fs.rmSync(previous, { recursive: true, force: true });
   renderIndex();
   console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
 }

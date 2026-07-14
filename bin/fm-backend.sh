@@ -361,6 +361,7 @@ fm_backend_target_of_meta() {  # <meta-file>
   fi
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] && printf '%s' "$window"
+  return 0
 }
 
 fm_backend_meta_for_window() {  # <target> <state-dir>
@@ -662,6 +663,8 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
     tmux)
+      fm_backend_source tmux || return 1
+      fm_backend_tmux_expected_label_matches "$target" "$expected_label" || return 1
       tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
       ;;
     herdr)
@@ -712,7 +715,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 fm_backend_target_state() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} out session pane sessions panes tabs tab_id scoped count
   local workspace surface workspaces title expected_title resolved_workspace
-  [ -n "$target" ] || { printf 'absent'; return 0; }
+  [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
     printf 'present'
     return 0
@@ -878,11 +881,11 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
 # an action from it alone - the secondmate-liveness sweep gates a respawn on
 # `dead` only, precisely so a momentary read glitch can never duplicate a
 # live supervisor.
-fm_backend_agent_alive() {  # <backend> <target>
-  local backend=$1 target=$2
+fm_backend_agent_alive() {  # <backend> <target> [expected-label]
+  local backend=$1 target=$2 expected_label=${3:-}
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
-    tmux) fm_backend_tmux_agent_alive "$target" ;;
+    tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" ;;
     herdr) fm_backend_herdr_agent_alive "$target" ;;
     *) printf 'unknown' ;;
   esac

@@ -118,6 +118,20 @@ test_ship_completion_report_contract() {
   pass "fm-brief.sh: ship tasks require a structured completion report and visuals"
 }
 
+test_promoted_scout_receives_completion_contract() {
+  local home id out
+  home="$TMP_ROOT/promote-report-home"
+  id=promote-report-c3
+  mkdir -p "$home/state"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$home/state/$id.meta"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
+    || fail "scout promotion failed"
+  assert_grep 'kind=ship' "$home/state/$id.meta" "scout promotion did not update task kind"
+  assert_contains "$out" "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" \
+    "promoted scout did not receive the ship completion-report schema"
+  pass "fm-promote.sh: promoted scouts receive the ship completion-report contract"
+}
+
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
@@ -284,6 +298,7 @@ test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_ship_completion_report_contract
+test_promoted_scout_receives_completion_contract
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout

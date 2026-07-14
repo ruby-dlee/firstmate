@@ -33,7 +33,7 @@ run_stack() {
 }
 
 test_publish_ship_with_visual() {
-  local id=report-ship-a1 entry count
+  local id=report-ship-a1 entry count manifest report_id completed_at
   write_task "$id" ship
   mkdir -p "$HOME_DIR/data/$id/visuals"
   printf '# Completion\n\n## Summary\n\nA searchable report stack is ready.\n\n## What changed\n\nAdded publication.\n\n## Verification\n\nTests passed.\n\npassword=must-also-not-leak\n\n## Visual evidence\n\nSee overview.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
@@ -55,10 +55,23 @@ test_publish_ship_with_visual() {
   fi
   assert_grep 'password=[REDACTED]' "$(dirname "$entry")/report.md" "report redaction left no visible marker"
 
-  run_stack publish "$id" >/dev/null || fail "idempotent report retry failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  report_id=$(sed -n 's/.*"reportId": "\([^"]*\)".*/\1/p' "$manifest")
+  completed_at=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  rm -f "$HOME_DIR/data/$id/visuals/overview.png"
+  printf 'replacement image bytes' > "$HOME_DIR/data/$id/visuals/corrected.png"
+  printf '# Completion\n\n## Summary\n\nThe corrected searchable report is ready.\n\n## What changed\n\nRebuilt publication.\n\n## Verification\n\nRetry passed.\n\n## Visual evidence\n\nSee corrected.\n\n## Artifacts\n\nIndex.\n\n## Follow-ups\n\nNone.\n' > "$HOME_DIR/data/$id/completion.md"
+  printf 'working: implementing\ndone: corrected report stack ready\n' > "$HOME_DIR/state/$id.status"
+  run_stack publish "$id" >/dev/null || fail "corrected report retry failed"
+  assert_grep 'The corrected searchable report is ready' "$(dirname "$entry")/report.md" "report retry retained stale completion text"
+  assert_grep 'corrected report stack ready' "$(dirname "$entry")/status.log" "report retry retained a stale status trail"
+  assert_present "$(dirname "$entry")/visuals/corrected.png" "report retry lost corrected visual evidence"
+  assert_absent "$(dirname "$entry")/visuals/overview.png" "report retry retained removed visual evidence"
+  assert_grep "\"reportId\": \"$report_id\"" "$manifest" "report retry changed its stable id"
+  assert_grep "\"completedAt\": \"$completed_at\"" "$manifest" "report retry changed its original completion timestamp"
   count=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l | tr -d ' ')
   [ "$count" = 1 ] || fail "report retry created duplicate entries (count=$count)"
-  pass "report stack publishes one visual ship entry without session secrets"
+  pass "report stack replaces corrected ship reports without changing stable identity"
 }
 
 test_required_source_fails_closed() {
@@ -86,6 +99,16 @@ test_scout_and_legacy_sources() {
   pass "report stack accepts scout reports and intentional legacy synthesis"
 }
 
+test_stale_lock_rejects_reused_pid() {
+  mkdir -p "$STACK/.publish.lock"
+  printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$STACK/.publish.lock/owner"
+  touch -t 200001010000 "$STACK/.publish.lock"
+  run_stack render >/dev/null || fail "stale report lock with a reused pid was not reclaimed"
+  assert_absent "$STACK/.publish.lock" "report render retained a reclaimed publication lock"
+  pass "report stack lock verifies process-start identity before trusting a live pid"
+}
+
 test_publish_ship_with_visual
 test_required_source_fails_closed
 test_scout_and_legacy_sources
+test_stale_lock_rejects_reused_pid

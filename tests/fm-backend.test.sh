@@ -598,6 +598,39 @@ test_backend_of_selector_matches_explicit_target_meta() {
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
 }
 
+test_managed_tmux_target_identity() {
+  local log out
+  log="$TMP_ROOT/managed-tmux-target.log"
+  : > "$log"
+  tmux() {
+    printf '%s\n' "$*" >> "$log"
+    case "$*" in
+      *'#{window_name}'*) printf 'fm-other-task\n'; return 0 ;;
+      list-panes*) return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux '' fm-intended-task)" = unknown ] \
+    || fail "an empty managed endpoint target should be unknown"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = absent ] \
+    || fail "a reused tmux window id with another label should be absent for the managed task"
+  out=$(fm_backend_agent_alive tmux @77 fm-intended-task)
+  [ "$out" = unknown ] || fail "a reused tmux window id should have unknown agent liveness"
+  ! fm_backend_capture tmux @77 10 fm-intended-task \
+    || fail "capture accepted a reused tmux window id"
+  ! fm_backend_send_key tmux @77 Enter fm-intended-task \
+    || fail "send-key accepted a reused tmux window id"
+  ! fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task \
+    || fail "send-text accepted a reused tmux window id"
+  ! fm_backend_kill tmux @77 '' fm-intended-task \
+    || fail "kill accepted a reused tmux window id"
+  if grep -Eq 'capture-pane|send-keys|kill-window' "$log"; then
+    fail "a reused tmux window id reached a read or mutation command"
+  fi
+  pass "managed tmux operations reject reused window ids with another task label"
+}
+
 # --- old vs new: fm-send.sh --------------------------------------------------
 
 make_send_fakebin() {  # <dir> -> echoes fakebin dir; logs every tmux call to $FM_TMUX_LOG
@@ -1079,6 +1112,7 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_managed_tmux_target_identity
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

@@ -262,21 +262,21 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
     if [ -n "$rollback_target" ]; then
       spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
-      rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null)
-      case "$rollback_endpoint_state" in
-        absent) ;;
-        present)
-          fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
-          echo "error: failed Agent Fleet attempt endpoint is still alive for $rollback_id; retaining its lease and metadata" >&2
-          exit 1
-          ;;
-        *)
-          fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
-          echo "error: failed Agent Fleet attempt endpoint state is unknown for $rollback_id; retaining its lease and metadata" >&2
-          exit 1
-          ;;
-      esac
     fi
+    rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null)
+    case "$rollback_endpoint_state" in
+      absent) ;;
+      present)
+        fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+        echo "error: failed Agent Fleet attempt endpoint is still alive for $rollback_id; retaining its lease and metadata" >&2
+        exit 1
+        ;;
+      *)
+        fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+        echo "error: failed Agent Fleet attempt endpoint state is unknown for $rollback_id; retaining its lease and metadata" >&2
+        exit 1
+        ;;
+    esac
     if ! fm_account_cleanup_rollback "$RESUME_META" "$DATA" "$rollback_id"; then
       fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
       echo "error: failed Agent Fleet attempt cleanup remains pending for $rollback_id" >&2
@@ -922,10 +922,12 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
   }
   existing_backend=$(fm_backend_of_meta "$STATE/$ID.meta")
   existing_target=$(fm_backend_target_of_meta "$STATE/$ID.meta")
-  if [ -n "$existing_target" ] && fm_backend_target_exists "$existing_backend" "$existing_target" "fm-$ID" 2>/dev/null; then
-    echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2
-    exit 1
-  fi
+  existing_endpoint_state=$(fm_backend_target_state "$existing_backend" "$existing_target" "fm-$ID" 2>/dev/null)
+  case "$existing_endpoint_state" in
+    absent) ;;
+    present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
+    *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
+  esac
 fi
 
 secondmate_registry_value() {
@@ -1224,20 +1226,18 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
-  if [ -n "$RECORDED_TARGET" ]; then
-    RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
-    case "$RECOVERY_ENDPOINT_STATE" in
-      absent) ;;
-      present)
-        echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
-        exit 1
-        ;;
-      *)
-        echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
-        exit 1
-        ;;
-    esac
-  fi
+  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+  case "$RECOVERY_ENDPOINT_STATE" in
+    absent) ;;
+    present)
+      echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+  esac
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   CONTINUATION_PACKET=$("$SCRIPT_DIR/fm-account-continuation.sh" "$ID" "$ACCOUNT_ATTEMPT") || exit 1

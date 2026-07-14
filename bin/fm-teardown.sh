@@ -150,7 +150,7 @@ MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt state last=unknown
-  [ -n "$target" ] || return 0
+  [ -n "$target" ] || return 2
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
       state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_state "$backend" "$target" "$expected" 2>/dev/null)
@@ -178,8 +178,8 @@ managed_endpoint_blocker() {  # <status> <task> [restored]
   fi
 }
 
-release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
-  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} profile account_task meta_state backend target zellij_tab endpoint_status acquired=0
+release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
+  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status acquired=0
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
@@ -218,7 +218,7 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
     return 1
   fi
   if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
-    fm_account_cleanup_rollback "$meta" "$DATA" "$task" || {
+    fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
       echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
       fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
       return 1
@@ -260,7 +260,7 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
-  fm_account_cleanup_predecessor "$meta" "$DATA" "$task" || {
+  fm_account_cleanup_predecessor "$meta" "$owner_data" "$task" || {
     echo "error: failed to clean predecessor Agent Fleet state for $task; retaining metadata for retry" >&2
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
@@ -1031,6 +1031,11 @@ cleanup_firstmate_home_children() {
     child_proj=$(meta_value "$child_meta" project)
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
+    child_home=
+    if [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+    fi
     child_backend=$(fm_backend_of_meta "$child_meta")
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
@@ -1045,7 +1050,7 @@ cleanup_firstmate_home_children() {
     fi
     if managed_account_meta "$child_meta"; then
       child_endpoint_home=$(fm_backend_endpoint_home "$child_backend" "$child_kind" "$home" "$child_home")
-      release_managed_account "$child_meta" "$child_id" "$child_endpoint_home" "$child_account_lock" || return 1
+      release_managed_account "$child_meta" "$child_id" "$child_endpoint_home" "$child_account_lock" "$home/data" || return 1
       child_account_lock=$MANAGED_ACCOUNT_LOCK
     else
       if [ -n "$child_t" ]; then

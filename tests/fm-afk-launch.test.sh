@@ -292,6 +292,105 @@ unit_herdr_partial_create_recovery() {
   rm -rf "$st"
 }
 
+unit_herdr_creation_intent_reconciles() {
+  local st marker
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-plan.XXXXXX")
+  marker="$st/closed"
+  mkdir -p "$st/state"
+  printf 'herdr-plan\tlab\tafk-planned-label\n' > "$st/state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" CLOSED="$marker" bash -c '
+    . "$1"
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_cli() {
+      case "$2 $3" in
+        "workspace list") printf %s '\''{"result":{"workspaces":[{"workspace_id":"ws-planned","label":"afk-planned-label"}]}}'\'' ;;
+        "pane list") printf %s '\''{"result":{"panes":[{"pane_id":"pane-planned"}]}}'\'' ;;
+        "pane close") : > "$CLOSED" ;;
+        "pane get") printf %s '\''{"error":{"code":"pane_not_found"}}'\''; return 1 ;;
+        *) return 2 ;;
+      esac
+    }
+    fm_afk_launch_reconcile
+  ' _ "$LAUNCH"
+  if [ -e "$marker" ] && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr launch: a persisted creation intent recovers and closes the exact workspace after restart"
+  else
+    fail "herdr launch: planned workspace ownership was not recoverable"
+  fi
+  rm -rf "$st"
+}
+
+unit_expired_herdr_creation_intent_clears() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-plan-absent.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'herdr-plan\tlab\tafk-never-created\n' > "$st/state/.afk-daemon-terminal"
+  touch -t 200001010000 "$st/state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    seq() { printf "1\n"; }
+    sleep() { :; }
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_cli() {
+      [ "$2 $3" = "workspace list" ] || return 2
+      printf %s '\''{"result":{"workspaces":[]}}'\''
+    }
+    fm_afk_launch_reconcile
+  ' _ "$LAUNCH"
+  if [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr launch: an expired intent clears after exact label absence is confirmed"
+  else
+    fail "herdr launch: an expired never-created intent remained wedged"
+  fi
+  rm -rf "$st"
+}
+
+unit_detached_daemons_receive_state_override() {
+  local st herdr_cmd tmux_cmd
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-state-override.XXXXXX")
+  mkdir -p "$st/override-state"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/override-state" FM_AFK_LAUNCH_ENTRY=/bin/true bash -c '
+    . "$1"
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_server_ensure() { return 0; }
+    fm_afk_launch_wait_ready() { return 0; }
+    fm_backend_herdr_cli() {
+      case "$2 $3" in
+        "workspace create")
+          [ "$(cut -f1,2 "$FM_AFK_LAUNCH_RECORD")" = "$(printf "herdr-plan\tlab")" ] || return 8
+          printf %s '\''{"result":{"workspace":{"workspace_id":"ws-state"},"root_pane":{"pane_id":"pane-state"}}}'\''
+          ;;
+        "pane run") printf "%s" "$5" > "$FM_HOME/herdr-command" ;;
+        *) return 0 ;;
+      esac
+    }
+    fm_afk_launch_create_herdr lab:captain herdr
+  ' _ "$LAUNCH" || fail "herdr state-override launch fixture failed"
+  herdr_cmd=$(cat "$st/herdr-command" 2>/dev/null || true)
+  case "$herdr_cmd" in
+    *"FM_STATE_OVERRIDE=$st/override-state"*) ;;
+    *) fail "herdr daemon command lost FM_STATE_OVERRIDE" ;;
+  esac
+
+  rm -f "$st/override-state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/override-state" FM_AFK_LAUNCH_ENTRY=/bin/true bash -c '
+    . "$1"
+    fm_afk_launch_wait_ready() { return 0; }
+    tmux() {
+      if [ "$1" = new-session ]; then printf "%s" "$5" > "$FM_HOME/tmux-command"; fi
+      return 0
+    }
+    fm_afk_launch_create_tmux captain:0 tmux
+  ' _ "$LAUNCH" || fail "tmux state-override launch fixture failed"
+  tmux_cmd=$(cat "$st/tmux-command" 2>/dev/null || true)
+  case "$tmux_cmd" in
+    *"FM_STATE_OVERRIDE=$st/override-state"*) ;;
+    *) fail "tmux daemon command lost FM_STATE_OVERRIDE" ;;
+  esac
+  pass "detached away daemons receive the effective state override"
+  rm -rf "$st"
+}
+
 unit_herdr_error_with_exact_ids_closes_exact() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-error-exact.XXXXXX")
@@ -869,6 +968,9 @@ unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery
+unit_herdr_creation_intent_reconciles
+unit_expired_herdr_creation_intent_clears
+unit_detached_daemons_receive_state_override
 unit_herdr_error_with_exact_ids_closes_exact
 unit_herdr_run_failure_preserves_unconfirmed_record
 unit_record_failure_closes_terminal

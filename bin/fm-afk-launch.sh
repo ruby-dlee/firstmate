@@ -146,15 +146,14 @@ fm_afk_launch_flag_write() {
   mv "$pending" "$FM_AFK_LAUNCH_STATE/.afk" || { rm -f "$pending"; return 1; }
 }
 
-# Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET. The third
-# field (a herdr workspace id, kept for the record's own documentation) is not
-# needed to close by id, so it is discarded. Returns 1 when no record exists.
+# Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET and
+# FM_AFK_REC_EXTRA. Returns 1 when no record exists.
 fm_afk_launch_record_read() {
-  local extra record
-  FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; extra=""
+  local record
+  FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; FM_AFK_REC_EXTRA=""
   [ -f "$FM_AFK_LAUNCH_RECORD" ] || return 1
   record=$(cat "$FM_AFK_LAUNCH_RECORD" 2>/dev/null) || record=""
-  IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET extra \
+  IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA \
     < "$FM_AFK_LAUNCH_RECORD" || true
   if ! printf '%s\n' "$record" | awk -F '\t' 'NF != 3 { bad=1 } END { exit !(NR == 1 && !bad) }' \
     || [ -z "$FM_AFK_REC_BACKEND" ] || [ -z "$FM_AFK_REC_TARGET" ]; then
@@ -162,9 +161,9 @@ fm_afk_launch_record_read() {
     return 2
   fi
   case "$FM_AFK_REC_BACKEND" in
-    herdr) [ -n "$extra" ] ;;
+    herdr|herdr-plan) [ -n "$FM_AFK_REC_EXTRA" ] ;;
     tmux) : ;;
-    none) [ "$FM_AFK_REC_TARGET" = - ] && [ "$extra" = native ] ;;
+    none) [ "$FM_AFK_REC_TARGET" = - ] && [ "$FM_AFK_REC_EXTRA" = native ] ;;
     *) return 2 ;;
   esac || { fm_afk_launch_log "daemon terminal record is malformed; refusing to act on it"; return 2; }
 }
@@ -228,8 +227,40 @@ fm_afk_launch_terminal_absent() {  # <backend> <target>
   esac
 }
 
+fm_afk_launch_herdr_plan_absent() {  # <session> <label>
+  local session=$1 label=$2 workspaces
+  workspaces=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 1
+  printf '%s' "$workspaces" | jq -e --arg want "$label" \
+    '(.result.workspaces | type) == "array" and all(.result.workspaces[]?; .label != $want)' >/dev/null 2>&1
+}
+
+fm_afk_launch_plan_grace_elapsed() {
+  local mtime now
+  mtime=$(fm_path_mtime "$FM_AFK_LAUNCH_RECORD") || return 1
+  now=$(date '+%s') || return 1
+  case "$mtime:$now" in *[!0-9:]*) return 1 ;; esac
+  [ $((now - mtime)) -ge 60 ]
+}
+
 fm_afk_launch_close_recorded() {
-  local close_result=0
+  local close_result=0 recovered wsid pane
+  if [ "$FM_AFK_REC_BACKEND" = herdr-plan ]; then
+    recovered=$(fm_afk_launch_herdr_recover_created "$FM_AFK_REC_TARGET" "$FM_AFK_REC_EXTRA") || {
+      if fm_afk_launch_plan_grace_elapsed \
+        && fm_afk_launch_herdr_plan_absent "$FM_AFK_REC_TARGET" "$FM_AFK_REC_EXTRA"; then
+        rm -f "$FM_AFK_LAUNCH_RECORD" || return 1
+        fm_afk_launch_log "planned herdr daemon workspace was never created; cleared its expired intent"
+        return 0
+      fi
+      fm_afk_launch_log "planned herdr daemon workspace is not yet recoverable; preserving its unique label"
+      return 1
+    }
+    IFS=$'\t' read -r wsid pane <<< "$recovered"
+    fm_afk_launch_record_write herdr "$FM_AFK_REC_TARGET:$pane" "$wsid" || return 1
+    FM_AFK_REC_BACKEND=herdr
+    FM_AFK_REC_TARGET="$FM_AFK_REC_TARGET:$pane"
+    FM_AFK_REC_EXTRA=$wsid
+  fi
   fm_afk_launch_close_terminal "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET" || close_result=$?
   if fm_afk_launch_terminal_absent "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET"; then
     rm -f "$FM_AFK_LAUNCH_RECORD" || return 1
@@ -368,6 +399,10 @@ fm_afk_launch_create_herdr() {  # <captain-target> <captain-backend>
   fm_backend_source herdr || return 1
   fm_backend_herdr_server_ensure "$session" || { fm_afk_launch_log "herdr server not ready for session '$session'"; return 1; }
   label=${FM_AFK_LAUNCH_LABEL:-"$FM_AFK_LAUNCH_WS_LABEL-$$-${RANDOM:-0}-$(date '+%s')"}
+  if ! fm_afk_launch_record_write herdr-plan "$session" "$label"; then
+    fm_afk_launch_log "failed to persist planned herdr daemon workspace '$label'"
+    return 1
+  fi
   out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$FM_HOME" --label "$label" --no-focus 2>/dev/null)
   create_result=$?
   wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
@@ -391,8 +426,8 @@ fm_afk_launch_create_herdr() {  # <captain-target> <captain-backend>
     IFS=$'\t' read -r wsid pane <<< "$recovered"
   fi
   entry=$(fm_afk_launch_entry_cmd)
-  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
-    "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
+  cmd=$(printf 'exec env FM_HOME=%q FM_STATE_OVERRIDE=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
+    "$FM_HOME" "$FM_AFK_LAUNCH_STATE" "$captain_target" "$captain_backend" "$entry")
   if ! fm_afk_launch_record_write herdr "$session:$pane" "$wsid"; then
     fm_afk_launch_log "failed to persist herdr daemon terminal record; closing $session:$pane"
     fm_afk_launch_close_terminal herdr "$session:$pane"
@@ -418,8 +453,8 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
   nonce="$$-${RANDOM:-0}-$(date '+%s')"
   session="fm-afk-daemon-$hash-$nonce"
   entry=$(fm_afk_launch_entry_cmd)
-  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
-    "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
+  cmd=$(printf 'exec env FM_HOME=%q FM_STATE_OVERRIDE=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
+    "$FM_HOME" "$FM_AFK_LAUNCH_STATE" "$captain_target" "$captain_backend" "$entry")
   if ! fm_afk_launch_record_write tmux "$session" ""; then
     fm_afk_launch_log "failed to persist planned tmux daemon session '$session'"
     return 1

@@ -35,6 +35,14 @@ set -u
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'tmux %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  display-message*"#{window_name}"*)
+    if [ "${FM_FAKE_TMUX_RENAMED:-0}" = 1 ]; then
+      printf 'fm-renamed-task\n'
+    else
+      cat "${FM_FAKE_TMUX_LABEL_FILE:-/nonexistent}"
+    fi
+    exit $?
+    ;;
   display-message*"#{pane_id}"*)
     case "${FM_FAKE_TARGET_STATE:-auto}" in
       present) exit 0 ;;
@@ -57,6 +65,14 @@ case "${1:-}" in
     ;;
   new-window)
     case "$*" in *"${FM_FAKE_TMUX_FAIL_LABEL:-__never__}"*) exit 41 ;; esac
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = -n ]; then
+        printf '%s\n' "$arg" > "${FM_FAKE_TMUX_LABEL_FILE:-/nonexistent}"
+        break
+      fi
+      prev=$arg
+    done
     [ -z "${FM_FAKE_TMUX_NEW_WINDOW_MARKER:-}" ] || touch "$FM_FAKE_TMUX_NEW_WINDOW_MARKER"
     if [ -n "${FM_FAKE_TMUX_NEW_WINDOW_GATE:-}" ]; then
       while [ ! -f "$FM_FAKE_TMUX_NEW_WINDOW_GATE" ]; do sleep 0.05; done
@@ -245,7 +261,7 @@ run_spawn() {
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
     FM_FAKE_ORCA_LOG="$ORCA_LOG" \
-    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_FAKE_AF_RESUME_ARM="$CASE_DIR/resume-arm" FM_FAKE_AF_SESSION_REFRESHED="$CASE_DIR/session-refreshed" \
     FM_FAKE_AF_RESUME_READY="$HOME_DIR/state/.$id.account-native-ready" FM_FAKE_AF_RESUME_GO="$HOME_DIR/state/.$id.account-native-go" \
     FM_FAKE_NATIVE_LAUNCH_LOG="$NATIVE_LAUNCH_LOG" \
@@ -259,6 +275,7 @@ run_teardown() {
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
 }
@@ -267,7 +284,8 @@ run_send() {
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
-    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_SEND_RETRIES=1 FM_SEND_SLEEP=0 FM_SEND_SETTLE=0 \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
+    FM_SEND_RETRIES=1 FM_SEND_SLEEP=0 FM_SEND_SETTLE=0 \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$SEND" "$@"
 }
 
@@ -1000,7 +1018,7 @@ test_cross_provider_continuation_uses_target_default_pool() {
 }
 
 test_continuation_refuses_unknown_endpoint_state() {
-  local id rec old_task out status
+  local id rec old_task out status meta_tmp
   id=account-continuation-unknown-z21aa
   rec=$(make_case continuation-unknown claude "$id")
   read_case "$rec"
@@ -1024,7 +1042,48 @@ test_continuation_refuses_unknown_endpoint_state() {
   assert_not_grep 'lease choose\|lease acquire\|lease release' "$AF_LOG" "unknown continuation mutated Agent Fleet state"
   assert_grep "account_task=$old_task" "$HOME_DIR/state/$id.meta" "unknown continuation changed predecessor metadata"
   assert_not_grep '^new-window ' "$TMUX_LOG" "unknown continuation created a replacement endpoint"
-  pass "continuation requires confirmed predecessor endpoint absence"
+
+  meta_tmp="$HOME_DIR/state/.$id.meta.missing-target"
+  grep -Ev '^(window|tmux_window_id)=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  clear_case_logs
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" direct-missing 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation packet builder accepted missing endpoint metadata"
+  assert_contains "$out" "endpoint state is unknown" "missing continuation endpoint did not fail closed"
+
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted missing endpoint metadata"
+  assert_contains "$out" "endpoint state is unknown" "managed recovery skipped its missing endpoint"
+  assert_not_grep 'lease choose\|lease acquire\|lease release' "$AF_LOG" "missing endpoint recovery mutated Agent Fleet state"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "missing endpoint recovery created a replacement endpoint"
+  pass "continuation requires a recorded endpoint with confirmed absence"
+}
+
+test_missing_endpoint_target_retains_managed_lease() {
+  local id rec out status meta_tmp account_task
+  id=account-missing-endpoint-z21ab
+  rec=$(make_case missing-endpoint claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "missing endpoint teardown precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  meta_tmp="$HOME_DIR/state/.$id.meta.missing-target"
+  grep -Ev '^(window|tmux_window_id)=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  clear_case_logs
+
+  out=$(run_teardown "$id" --force 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "managed teardown released a lease with missing endpoint metadata"
+  assert_contains "$out" "endpoint state for $id is unknown" "missing teardown endpoint did not report its blocker"
+  assert_not_grep "lease release --task $account_task" "$AF_LOG" "missing teardown endpoint released its Agent Fleet lease"
+  assert_present "$HOME_DIR/state/$id.meta" "missing teardown endpoint lost retry metadata"
+  pass "managed teardown retains leases when endpoint identity is missing"
 }
 
 test_predecessor_cleanup_failure_preserves_replacement_for_retry() {
@@ -1400,6 +1459,7 @@ test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
 test_cross_provider_continuation_uses_target_default_pool claude codex
 test_cross_provider_continuation_uses_target_default_pool codex claude
 test_continuation_refuses_unknown_endpoint_state
+test_missing_endpoint_target_retains_managed_lease
 test_predecessor_cleanup_failure_preserves_replacement_for_retry
 test_failed_continuation_cleanup_restores_predecessor_for_retry
 test_concurrent_continuations_serialize_before_mutation

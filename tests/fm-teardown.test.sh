@@ -79,6 +79,19 @@ make_case() {
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 # `treehouse return --force <wt>`: succeed silently.
+[ -z "${FM_EXPECT_CHILD_LINEAGE_PATH:-}" ] || [ -f "$FM_EXPECT_CHILD_LINEAGE_PATH" ] || {
+  echo "child lineage missing before home removal: $FM_EXPECT_CHILD_LINEAGE_PATH" >&2
+  exit 96
+}
+[ -z "${FM_EXPECT_CHILD_LINEAGE_PATH:-}" ] || grep -F 'event=predecessor-released' "$FM_EXPECT_CHILD_LINEAGE_PATH" >/dev/null || {
+  echo "child predecessor lineage missing before home removal: $FM_EXPECT_CHILD_LINEAGE_PATH" >&2
+  exit 94
+}
+[ -z "${FM_REJECT_CHILD_LINEAGE_PATH:-}" ] || [ ! -e "$FM_REJECT_CHILD_LINEAGE_PATH" ] || {
+  echo "child lineage written outside owning home: $FM_REJECT_CHILD_LINEAGE_PATH" >&2
+  exit 95
+}
+[ -z "${FM_EXPECT_CHILD_LINEAGE_MARKER:-}" ] || touch "$FM_EXPECT_CHILD_LINEAGE_MARKER"
 [ -z "${FM_EXPECT_REPORT_PATH:-}" ] || [ -f "$FM_EXPECT_REPORT_PATH" ] || {
   echo "report missing before treehouse return: $FM_EXPECT_REPORT_PATH" >&2
   exit 97
@@ -1480,6 +1493,13 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
     'account_profile=claude-2' \
     'account_task=fm-child-old-attempt' \
     'account_attempt=old-attempt' \
+    'account_predecessor_task=fm-child-predecessor' \
+    'account_predecessor_attempt=predecessor-attempt' \
+    'account_predecessor_provider=claude' \
+    'account_predecessor_pool=claude-crew' \
+    'account_predecessor_profile=claude-1' \
+    'account_predecessor_session=session-predecessor' \
+    'account_predecessor_cleanup=pending' \
     'provider_session_id=session-old'
   add_fake_agent_fleet "$case_dir"
   cat > "$case_dir/fakebin/tmux" <<'SH'
@@ -1503,6 +1523,9 @@ SH
 
   FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    FM_EXPECT_CHILD_LINEAGE_PATH="$case_dir/wt/data/$child_id/account-attempts.md" \
+    FM_REJECT_CHILD_LINEAGE_PATH="$case_dir/data/$child_id/account-attempts.md" \
+    FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
   for _ in $(seq 1 100); do
@@ -1537,8 +1560,10 @@ SH
   [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced managed child metadata after teardown began"
   expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation"
   assert_grep 'lease release --task fm-child-old-attempt --force' "$af_log" "child teardown did not release its locked generation"
+  assert_grep 'lease release --task fm-child-predecessor --force' "$af_log" "child teardown did not clean its predecessor generation"
   assert_not_contains "$(cat "$af_log")" 'fm-child-new-attempt' "child teardown targeted a concurrent replacement generation"
   assert_absent "$case_dir/wt/state/.replacement.meta" "blocked child continuation left replacement scratch metadata"
+  assert_present "$case_dir/child-lineage-verified" "child account lineage was not verified in the owning home before retirement"
   pass "managed child teardown locks generation before snapshot and recycling"
 }
 

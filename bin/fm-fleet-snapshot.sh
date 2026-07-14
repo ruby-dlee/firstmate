@@ -350,7 +350,7 @@ task_json_lines() {
     fi
     agent_alive=not_checked
     if [ "$kind" = secondmate ] && [ -n "$target" ]; then
-      agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)
+      agent_alive=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" 2>/dev/null || printf unknown)
     fi
 
     [ -f "$report_path" ] && report_present=1 || report_present=0

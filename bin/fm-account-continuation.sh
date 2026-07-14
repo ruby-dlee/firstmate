@@ -52,18 +52,16 @@ TARGET=$(fm_backend_target_of_meta "$META")
 SECONDMATE_HOME=$(fm_meta_get "$META" home)
 [ -n "$SECONDMATE_HOME" ] || SECONDMATE_HOME=$(fm_meta_get "$META" worktree)
 PROBE_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$SECONDMATE_HOME")
-if [ -n "$TARGET" ]; then
-  if [ "$PROBE_HOME" = "$FM_HOME" ]; then
-    ENDPOINT_STATE=$(fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
-  else
-    ENDPOINT_STATE=$(unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
-  fi
-  case "$ENDPOINT_STATE" in
-    absent) ;;
-    present) echo "error: managed continuation endpoint is still alive for $ID" >&2; exit 1 ;;
-    *) echo "error: managed continuation endpoint state is unknown for $ID" >&2; exit 1 ;;
-  esac
+if [ "$PROBE_HOME" = "$FM_HOME" ]; then
+  ENDPOINT_STATE=$(fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
+else
+  ENDPOINT_STATE=$(unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
 fi
+case "$ENDPOINT_STATE" in
+  absent) ;;
+  present) echo "error: managed continuation endpoint is still alive for $ID" >&2; exit 1 ;;
+  *) echo "error: managed continuation endpoint state is unknown for $ID" >&2; exit 1 ;;
+esac
 
 WORKTREE=$(fm_meta_get "$META" worktree)
 PROJECT=$(fm_meta_get "$META" project)

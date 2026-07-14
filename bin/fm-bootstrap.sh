@@ -289,7 +289,7 @@ secondmate_liveness_sweep() {
     backend=$(fm_backend_of_meta "$meta")
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
-    verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown"
+    verdict=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" 2>/dev/null) || verdict="unknown"
     case "$harness" in
       claude|codex|opencode|pi|grok) ;;
       *) [ "$verdict" = dead ] && verdict=unknown ;;
@@ -304,7 +304,7 @@ secondmate_liveness_sweep() {
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
           continue
         fi
-        fm_backend_kill "$backend" "$target" 2>/dev/null || true
+        fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" 2>/dev/null || true
         resume_args=()
         if [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)

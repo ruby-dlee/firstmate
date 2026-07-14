@@ -222,6 +222,50 @@ SH
   pass "account_pool quota-balanced selection consumes only Agent Fleet pool summaries"
 }
 
+test_enforced_quota_balancing_rejects_poolless_candidates() {
+  local fakebin quota_marker profiles out status
+  fakebin=$(fm_fakebin "$TMP_ROOT/enforced-pool-only")
+  quota_marker="$TMP_ROOT/enforced-pool-only/quota-called"
+  cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+touch '$quota_marker'
+exit 1
+SH
+  chmod +x "$fakebin/quota-axi"
+  profiles='[{"harness":"claude"},{"harness":"codex"}]'
+  out=$(FM_ACCOUNT_ROUTING=enforce FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$profiles" 2>"$TMP_ROOT/enforced-pool-only/error.log")
+  status=$?
+  expect_code 2 "$status" "enforced poolless quota-balanced dispatch must be rejected"
+  [ -z "$out" ] || fail "rejected enforced selection emitted a profile: $out"
+  [ ! -e "$quota_marker" ] || fail "enforced poolless selection consulted ambient quota-axi"
+  assert_contains "$(cat "$TMP_ROOT/enforced-pool-only/error.log")" 'requires account_pool on every candidate' \
+    "enforced pool-only error was unclear"
+  pass "enforced quota-balanced dispatch accepts only explicit pools"
+}
+
+test_agent_fleet_binary_precedence_matches_routing() {
+  local fakebin ambient good_log ambient_marker pooled out
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-precedence")
+  ambient=$(fm_fakebin "$TMP_ROOT/agent-fleet-precedence-ambient")
+  good_log="$TMP_ROOT/agent-fleet-precedence/good.log"
+  ambient_marker="$TMP_ROOT/agent-fleet-precedence/ambient-called"
+  make_fake_agent_fleet "$fakebin"
+  cat > "$ambient/agent-fleet" <<SH
+#!/usr/bin/env bash
+touch '$ambient_marker'
+exit 1
+SH
+  chmod +x "$ambient/agent-fleet"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(PATH="$ambient:$PATH" FM_FAKE_AF_LOG="$good_log" FM_AGENT_FLEET_BIN="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled")
+  [ "$out" = '{"harness":"codex","account_pool":"codex-crew"}' ] || fail "pinned Agent Fleet selection returned: $out"
+  assert_grep 'pool status --pool claude-crew' "$good_log" "pinned Agent Fleet binary was not queried"
+  [ ! -e "$ambient_marker" ] || fail "dispatch ignored FM_AGENT_FLEET_BIN and called the ambient binary"
+  pass "dispatch and spawn honor the same pinned Agent Fleet binary"
+}
+
 test_account_fields_survive_direct_selection() {
   local fakebin marker out profile
   fakebin=$(fm_fakebin "$TMP_ROOT/account-direct")
@@ -285,6 +329,8 @@ test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_backward_compatible_first_selection
 test_account_pool_summary_owns_provider_quota_choice
+test_enforced_quota_balancing_rejects_poolless_candidates
+test_agent_fleet_binary_precedence_matches_routing
 test_account_fields_survive_direct_selection
 test_pooled_failures_degrade_without_default_account_quota
 

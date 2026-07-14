@@ -162,18 +162,58 @@ fm_account_path_mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
 }
 
+fm_account_path_inode() {
+  stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null
+}
+
 fm_account_meta_lock_reclaim() {  # <lock-dir> <ownerless-grace-seconds>
-  local lock=$1 grace=$2 now mtime reclaim
+  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after
+  local ownerless_since baseline required_grace
   [ -d "$lock" ] || return 1
+  inode_before=$(fm_account_path_inode "$lock") || return 1
+  mtime=$(fm_account_path_mtime "$lock") || return 1
+  guard="$lock/.reclaiming"
+  mkdir "$guard" 2>/dev/null || return 1
+  inode_after=$(fm_account_path_inode "$lock") || { rmdir "$guard" 2>/dev/null || true; return 1; }
+  if [ "$inode_before" != "$inode_after" ]; then
+    rmdir "$guard" 2>/dev/null || true
+    return 1
+  fi
   if [ -f "$lock/owner" ]; then
-    fm_account_meta_lock_owner_alive "$lock" && return 1
+    if fm_account_meta_lock_owner_alive "$lock"; then
+      rmdir "$guard" 2>/dev/null || true
+      return 1
+    fi
   else
-    mtime=$(fm_account_path_mtime "$lock") || return 1
+    ownerless_since="$lock/.ownerless-since"
+    if [ ! -f "$ownerless_since" ]; then
+      printf '%s\n' "$mtime" > "$ownerless_since" || {
+        rmdir "$guard" 2>/dev/null || true
+        return 1
+      }
+    fi
+    baseline=$(sed -n '1p' "$ownerless_since" 2>/dev/null)
+    case "$baseline" in
+      ''|*[!0-9]*) rmdir "$guard" 2>/dev/null || true; return 1 ;;
+    esac
+    required_grace=$grace
+    [ "$required_grace" -ge 1 ] || required_grace=1
     now=$(date +%s)
-    [ $((now - mtime)) -ge "$grace" ] || return 1
+    if [ $((now - baseline)) -lt "$required_grace" ]; then
+      if fm_account_meta_lock_owner_alive "$lock"; then
+        rm -f "$ownerless_since"
+      fi
+      rmdir "$guard" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if fm_account_meta_lock_owner_alive "$lock"; then
+    rm -f "$lock/.ownerless-since"
+    rmdir "$guard" 2>/dev/null || true
+    return 1
   fi
   reclaim="$lock.reclaim.$$.$RANDOM"
-  mv "$lock" "$reclaim" 2>/dev/null || return 1
+  mv "$lock" "$reclaim" 2>/dev/null || { rmdir "$guard" 2>/dev/null || true; return 1; }
   rm -rf "$reclaim"
 }
 
@@ -208,19 +248,21 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
     return 1
   }
   mv "$owner_tmp" "$lock/owner" || { rm -rf "$lock"; return 1; }
+  rm -f "$lock/.ownerless-since"
   printf '%s\n' "$lock"
 }
 
 fm_account_meta_lock_release() {  # <lock-dir>
-  local lock=$1 pid
+  local lock=$1 pid released
   [ -d "$lock" ] || return 0
   pid=$(sed -n '1p' "$lock/owner" 2>/dev/null)
   [ "$pid" = "$$" ] || {
     echo "error: refusing to release account metadata lock owned by ${pid:-unknown}" >&2
     return 1
   }
-  rm -f "$lock/owner"
-  rmdir "$lock"
+  released="$lock.release.$$.$RANDOM"
+  mv "$lock" "$released" || return 1
+  rm -rf "$released"
 }
 
 fm_account_safe_lineage_value() {

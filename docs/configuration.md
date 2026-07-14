@@ -165,8 +165,9 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
 Account routing is default-off, so an unchanged installation makes no Agent Fleet calls and preserves the legacy provider launch and task metadata.
-The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the first value in local `config/account-routing-mode`, then `off`.
+The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.
 The valid modes are `off`, `observe`, and `enforce`.
+Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
 `observe` asks Agent Fleet for a non-leasing dry-run decision, reports the non-secret pool/provider/profile choice, and leaves launch and metadata unchanged even when Agent Fleet is unavailable.
 `enforce` prepares the isolated runtime endpoint and worktree first, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
 Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
@@ -176,10 +177,11 @@ Managed task metadata records `account_pool=`, `account_profile=`, a home-namesp
 Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
 Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a newer SessionStart update after its local launch gate before committing the recovered lease.
 When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
+Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
 If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
 Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
-Teardown kills and verifies the recorded endpoint, releases the Agent Fleet lease and session mapping, and only then recycles a worktree or secondmate home; any cleanup failure retains metadata and storage for retry.
+Teardown kills the recorded endpoint and releases the Agent Fleet lease and session mapping only after the backend confirms absence; a live or unknown endpoint state retains metadata and storage for retry.
 Agent Fleet routing supports the tmux, Herdr, zellij, and cmux session backends; enforced Orca launches are rejected before lease, worktree, endpoint, or metadata mutation because managed Orca recovery is not implemented.
 `config/secondmate-account-pool` optionally selects the primary's dynamic pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
 An explicit per-spawn account pool or profile overrides that secondmate pool, and an explicit profile without a pool uses only the reserved `explicit` pool.
@@ -222,6 +224,7 @@ An omitted model or effort means the selected harness uses its own default for t
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 `quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
 Any quota-balanced candidate carrying `account_profile` is invalid because a pinned profile is a direct per-spawn override; pool-aware candidates must all carry `account_pool`, and the selector compares only Agent Fleet `pool status` summaries before passing the winning pool to atomic selection.
+When account routing is `enforce`, every quota-balanced candidate must carry `account_pool`; `off` and `observe` retain the legacy poolless `quota-axi` compatibility path.
 That pool-aware path never falls through to `quota-axi` default-account data, preventing one quota source from choosing a provider while a different account source chooses the concrete profile.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.

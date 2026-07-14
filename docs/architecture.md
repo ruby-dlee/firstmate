@@ -119,6 +119,7 @@ That keeps spawn launch compatible across claude, codex, grok, pi, and opencode 
 The account axis is independent across the supported tmux, Herdr, zellij, and cmux session backends, while enforced Agent Fleet routing rejects Orca until managed Orca recovery exists.
 Routing remains default-off and byte-compatible until an explicit account flag or off/observe/enforce policy enables it.
 For quota-balanced account-pool candidates, dispatch compares Agent Fleet pool summaries and then atomically leases within the winning pool, never mixing that decision with quota-axi's default-account view.
+Enforced routing rejects poolless quota-balanced candidates, while off and observe retain the legacy quota-only selector path.
 
 ## Optional secondmates
 

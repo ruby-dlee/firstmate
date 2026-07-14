@@ -18,8 +18,8 @@
 #     fallback pool; if every available pool is degraded, the first available
 #     candidate wins. Agent Fleet trouble degrades to the first element and
 #     never falls through to default-account quota-axi data.
-#   - A legacy candidate set with no account_pool runs quota-axi --json (or the
-#     --quota-json fixture) exactly as before.
+#   - Enforced account routing rejects quota-balanced candidates without pools.
+#     Off and observe retain the legacy no-pool quota-axi path.
 #   - Per candidate vendor it takes the minimum percentRemaining across that
 #     vendor's GENERAL windows only - Claude five_hour and seven_day, Codex
 #     five_hour and weekly - ignoring model-scoped windows such as model:fable
@@ -38,9 +38,17 @@
 #
 # quota-balanced uses quota-axi --json unless --quota-json supplies a fixture.
 # FM_DISPATCH_QUOTA_AXI overrides the quota command.
-# FM_DISPATCH_AGENT_FLEET overrides the Agent Fleet command.
+# FM_DISPATCH_AGENT_FLEET overrides FM_AGENT_FLEET_BIN, which overrides the
+# Agent Fleet command resolved from PATH.
 # FM_DISPATCH_STALE_CLEAR_MARGIN overrides the default 20 point stale margin.
 set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 
 STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
 SELECT_OVERRIDE=
@@ -157,13 +165,18 @@ fi
 # Fleet's same per-account view that concrete selection will use. Never compare
 # those pools against quota-axi's default-account cache (double selection).
 pooled_count=$(printf '%s\n' "$profiles_json" | jq '[.[] | select((.account_pool? | type) == "string")] | length')
+routing_mode=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 2
+if [ "$routing_mode" = enforce ] && [ "$pooled_count" -ne "$profile_count" ]; then
+  echo "error: enforced quota-balanced dispatch requires account_pool on every candidate" >&2
+  exit 2
+fi
 if [ "$pooled_count" -gt 0 ]; then
   if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | jq -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
     log "account_pool quota-balanced candidates must all name claude/codex pools; using first profile"
     first_profile
     exit 0
   fi
-  agent_fleet_cmd=${FM_DISPATCH_AGENT_FLEET:-agent-fleet}
+  agent_fleet_cmd=${FM_DISPATCH_AGENT_FLEET:-${FM_AGENT_FLEET_BIN:-agent-fleet}}
   if ! command -v "$agent_fleet_cmd" >/dev/null 2>&1; then
     log "agent-fleet missing for account_pool summaries; using first profile"
     first_profile

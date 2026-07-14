@@ -11,6 +11,7 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
+CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 TMP_ROOT=$(fm_test_tmproot fm-account-routing-tests)
 
 assert_not_grep() {
@@ -34,12 +35,23 @@ set -u
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'tmux %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
-  *"#{pane_id}"*) [ -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}" ]; exit $? ;;
+  display-message*"#{pane_id}"*)
+    case "${FM_FAKE_TARGET_STATE:-auto}" in
+      present) exit 0 ;;
+      absent|unknown) exit 1 ;;
+    esac
+    [ -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}" ]; exit $?
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
+  list-panes) [ "${FM_FAKE_TARGET_STATE:-auto}" != unknown ]; exit $? ;;
   list-windows|has-session|new-session|set-window-option) exit 0 ;;
-  kill-window) rm -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}"; exit 0 ;;
+  kill-window)
+    [ "${FM_FAKE_TMUX_KILL_FAIL:-0}" != 1 ] || exit 71
+    rm -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}"
+    exit 0
+    ;;
   new-window)
     case "$*" in *"${FM_FAKE_TMUX_FAIL_LABEL:-__never__}"*) exit 41 ;; esac
     [ -z "${FM_FAKE_TMUX_NEW_WINDOW_MARKER:-}" ] || touch "$FM_FAKE_TMUX_NEW_WINDOW_MARKER"
@@ -555,6 +567,72 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
 }
 
+test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
+  local id rec sm zellij_log out status scope
+  id=account-secondmate-zellij-z11a
+  rec=$(make_case secondmate-zellij claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  zellij_log="$CASE_DIR/zellij.log"
+  make_seeded_secondmate_home "$sm" "$id"
+  : > "$zellij_log"
+  cat > "$FAKEBIN_DIR/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s|%s|%s\n' "${FM_HOME:-}" "${FM_ROOT:-}" "$*" >> "$FM_FAKE_ZELLIJ_LOG"
+case "$*" in
+  '--version') printf 'zellij 0.44.0\n'; exit 0 ;;
+  'list-sessions --short --no-formatting') printf 'firstmate\n'; exit 0 ;;
+  *' action new-tab '*)
+    prev=
+    for arg in "$@"; do
+      [ "$prev" != --name ] || printf '%s\n' "$arg" > "$FM_FAKE_ZELLIJ_TITLE"
+      prev=$arg
+    done
+    touch "$FM_FAKE_ZELLIJ_ENDPOINT"
+    printf '7\n'
+    exit 0
+    ;;
+  *' action list-panes --json'*)
+    if [ -f "$FM_FAKE_ZELLIJ_ENDPOINT" ]; then
+      printf '[{"id":9,"tab_id":7,"is_plugin":false,"pane_cwd":"%s"}]\n' "$FM_FAKE_ZELLIJ_CWD"
+    else
+      printf '[]\n'
+    fi
+    exit 0
+    ;;
+  *' action list-tabs --json'*)
+    if [ -f "$FM_FAKE_ZELLIJ_ENDPOINT" ]; then
+      printf '[{"tab_id":7,"name":"%s","active":true}]\n' "$(cat "$FM_FAKE_ZELLIJ_TITLE")"
+    else
+      printf '[]\n'
+    fi
+    exit 0
+    ;;
+  *' action close-tab-by-id 7'*) rm -f "$FM_FAKE_ZELLIJ_ENDPOINT"; exit 0 ;;
+  *' action paste '*|*' action write-chars '*|*' action send-keys '*|*' action dump-screen '*) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$FAKEBIN_DIR/zellij"
+
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_ZELLIJ_LOG="$zellij_log" \
+    FM_FAKE_ZELLIJ_ENDPOINT="$CASE_DIR/zellij-endpoint" FM_FAKE_ZELLIJ_TITLE="$CASE_DIR/zellij-title" \
+    FM_FAKE_ZELLIJ_CWD="$sm" FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --backend zellij --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unbound managed zellij secondmate unexpectedly succeeded"
+  assert_absent "$CASE_DIR/zellij-endpoint" "zellij secondmate rollback left its live endpoint"
+  assert_not_grep "^$sm\\|" "$zellij_log" "zellij secondmate switched endpoint label scope during rollback"
+  assert_regex "^$HOME_DIR\\|" "$zellij_log" "zellij secondmate never used the primary endpoint label scope"
+  assert_grep 'lease release ' "$AF_LOG" "zellij secondmate rollback did not release after confirmed endpoint removal"
+  scope=$(FM_HOME="$HOME_DIR" FM_ROOT="$ROOT" bash -c '. "$1"; fm_backend_endpoint_home cmux secondmate "$2" "$3"' _ "$ROOT/bin/fm-backend.sh" "$HOME_DIR" "$sm")
+  [ "$scope" = "$HOME_DIR" ] || fail "cmux secondmate endpoint scope drifted from its primary owner"
+  scope=$(FM_HOME="$HOME_DIR" FM_ROOT="$ROOT" bash -c '. "$1"; fm_backend_endpoint_home herdr secondmate "$2" "$3"' _ "$ROOT/bin/fm-backend.sh" "$HOME_DIR" "$sm")
+  [ "$scope" = "$sm" ] || fail "herdr secondmate endpoint scope lost its child workspace owner"
+  pass "managed secondmates keep backend-specific endpoint ownership across cleanup"
+}
+
 test_unused_secondmate_pool_never_blocks_unmanaged_spawn() {
   local id rec sm out status
   id=account-secondmate-malformed-off-z11b
@@ -727,6 +805,78 @@ test_failed_cleanup_persists_retryable_metadata() {
   pass "failed Agent Fleet cleanup leaves durable teardown-retry state"
 }
 
+test_unknown_spawn_endpoint_retains_lease_for_retry() {
+  local id rec out status task
+  id=account-unknown-rollback-z18c
+  rec=$(make_case unknown-rollback claude "$id")
+  read_case "$rec"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_KILL_FAIL=1 \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unknown failed endpoint unexpectedly committed"
+  task=$(logged_account_task)
+  assert_not_grep "lease release --task $task" "$AF_LOG" "unknown endpoint state released its lease"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "unknown endpoint state lost retry metadata"
+  assert_contains "$out" "endpoint state is unknown" "unknown endpoint retention was not reported"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  run_teardown "$id" --force >/dev/null || fail "unknown endpoint retry state could not be torn down after absence was confirmed"
+  pass "spawn rollback retains leases while endpoint state is unknown"
+}
+
+test_rollback_retry_rechecks_live_endpoint_before_release() {
+  local id rec out status task
+  id=account-live-rollback-retry-z18d
+  rec=$(make_case live-rollback-retry claude "$id")
+  read_case "$rec"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback retry precondition unexpectedly succeeded"
+  task=$(logged_account_task)
+  touch "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  out=$(FM_FAKE_TMUX_KILL_FAIL=1 run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback retry released a live endpoint"
+  assert_not_grep "lease release --task $task" "$AF_LOG" "rollback retry released the lease before killing the endpoint"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "live rollback retry lost retry metadata"
+  assert_contains "$out" "endpoint is still alive" "live rollback retry blocker was unclear"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  run_teardown "$id" --force >/dev/null || fail "live rollback retry state could not be torn down after endpoint removal"
+  pass "rollback cleanup retries prove the retained endpoint is dead"
+}
+
+test_failed_secondmate_rollback_preserves_home_for_relaunch() {
+  local id rec sm out status
+  id=account-secondmate-rollback-z18e
+  rec=$(make_case secondmate-rollback claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed secondmate rollback precondition unexpectedly succeeded"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "failed secondmate attempt lost cleanup metadata"
+
+  clear_case_logs
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "cleanup-only secondmate retry claimed to relaunch"
+  assert_absent "$HOME_DIR/state/$id.meta" "cleaned secondmate attempt still poisoned ordinary respawn"
+  assert_present "$sm/.fm-secondmate-home" "secondmate cleanup retired the persistent home"
+  assert_contains "$out" "retry the secondmate spawn without tearing down its home" "secondmate retry guidance was unclear"
+
+  clear_case_logs
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate --account-pool claude-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "cleaned secondmate home could not relaunch: $out"
+  assert_present "$sm/.fm-secondmate-home" "secondmate relaunch lost its home marker"
+  pass "failed secondmate rollback clears task state without retiring its home"
+}
+
 test_observe_invalid_response_remains_advisory() {
   local id rec out status launch
   id=account-observe-invalid-z19
@@ -805,6 +955,60 @@ test_cross_profile_continuation_for_harness() {
   assert_grep "session remove --task $old_task" "$AF_LOG" "$harness continuation did not remove its predecessor mapping"
   assert_grep "agent_fleet_task=$new_task" "$HOME_DIR/data/$id/account-attempts.md" "$harness continuation lineage lost the new attempt"
   pass "$harness can continue safely under a different account profile"
+}
+
+test_cross_provider_continuation_uses_target_default_pool() {
+  local source=$1 target=$2 id rec old_task out status
+  id="account-continue-$source-to-$target-z21a"
+  rec=$(make_case "continue-$source-to-$target" "$source" "$id")
+  read_case "$rec"
+  out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew")
+  status=$?
+  [ "$status" -eq 0 ] || fail "$source initial managed spawn failed: $out"
+  old_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_PROVIDER="$target" FM_FAKE_AF_PROFILE="$target-2" FM_FAKE_AF_POOL="$target-crew" \
+    run_spawn "$id" --continue-account --harness "$target")
+  status=$?
+  [ "$status" -eq 0 ] || fail "$source-to-$target continuation failed: $out"
+  assert_regex "lease choose --pool $target-crew --task .*-$id-.* --provider $target" "$AF_LOG" \
+    "$source-to-$target continuation did not select the target provider's default pool"
+  assert_not_grep "lease choose --pool $source-crew" "$AF_LOG" \
+    "$source-to-$target continuation inherited the predecessor provider's pool"
+  assert_grep "predecessor=$old_task" "$HOME_DIR/data/$id/account-attempts.md" \
+    "$source-to-$target continuation lost predecessor lineage"
+  pass "$source-to-$target continuation resolves the target provider pool"
+}
+
+test_continuation_refuses_unknown_endpoint_state() {
+  local id rec old_task out status
+  id=account-continuation-unknown-z21aa
+  rec=$(make_case continuation-unknown claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "unknown continuation precondition spawn failed"
+  old_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_TARGET_STATE=unknown FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" direct-unknown 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation packet builder accepted an unknown predecessor endpoint"
+  assert_contains "$out" "endpoint state is unknown" "packet builder's unknown endpoint blocker was unclear"
+
+  out=$(FM_FAKE_TARGET_STATE=unknown run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted an unknown predecessor endpoint"
+  assert_contains "$out" "endpoint state is unknown" "unknown continuation blocker was unclear"
+  assert_not_grep 'lease choose\|lease acquire\|lease release' "$AF_LOG" "unknown continuation mutated Agent Fleet state"
+  assert_grep "account_task=$old_task" "$HOME_DIR/state/$id.meta" "unknown continuation changed predecessor metadata"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "unknown continuation created a replacement endpoint"
+  pass "continuation requires confirmed predecessor endpoint absence"
 }
 
 test_predecessor_cleanup_failure_preserves_replacement_for_retry() {
@@ -1052,6 +1256,7 @@ test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
 test_duplicate_spawn_preserves_original_endpoint_and_lease
@@ -1061,11 +1266,17 @@ test_malformed_routing_mode_fails_closed
 test_invalid_selection_response_releases_reservation
 test_fresh_launch_requires_session_binding_and_fully_rolls_back
 test_failed_cleanup_persists_retryable_metadata
+test_unknown_spawn_endpoint_retains_lease_for_retry
+test_rollback_retry_rechecks_live_endpoint_before_release
+test_failed_secondmate_rollback_preserves_home_for_relaunch
 test_observe_invalid_response_remains_advisory
 test_explicit_secondmate_profile_ignores_configured_pool
 test_enforced_orca_is_rejected_before_owned_resource_creation
 test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+test_cross_provider_continuation_uses_target_default_pool claude codex
+test_cross_provider_continuation_uses_target_default_pool codex claude
+test_continuation_refuses_unknown_endpoint_state
 test_predecessor_cleanup_failure_preserves_replacement_for_retry
 test_failed_continuation_cleanup_restores_predecessor_for_retry
 test_concurrent_continuations_serialize_before_mutation

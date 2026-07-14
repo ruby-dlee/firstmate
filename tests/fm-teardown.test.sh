@@ -1297,6 +1297,43 @@ test_managed_force_teardown_releases_lease_and_session() {
   pass "managed teardown releases its lease and session mapping only after endpoint removal"
 }
 
+test_managed_teardown_retains_lease_when_endpoint_state_is_unknown() {
+  local case_dir af_log rc
+  case_dir=$(make_case managed-unknown-endpoint)
+  af_log="$case_dir/agent-fleet.log"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-attempt-unknown' \
+    'provider_session_id=session-unknown' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  list-panes) echo 'permission denied' >&2; exit 74 ;;
+  kill-window) exit 74 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "managed-unknown-endpoint: teardown should fail closed"
+  assert_not_contains "$(cat "$af_log")" 'lease release' "unknown endpoint state released the Agent Fleet lease"
+  assert_present "$case_dir/state/task-x1.meta" "unknown endpoint state erased retry metadata"
+  assert_present "$case_dir/wt/.git" "unknown endpoint state recycled the worktree"
+  assert_grep 'managed endpoint state for task-x1 is unknown' "$case_dir/stderr" "unknown endpoint blocker was not reported"
+  pass "managed teardown releases only after confirmed endpoint absence"
+}
+
 test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
   local case_dir af_log order_log rc release_line session_line return_line
   case_dir=$(make_case managed-release-failure)
@@ -1603,6 +1640,7 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_managed_force_teardown_releases_lease_and_session
+test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
 test_managed_release_failure_preserves_unrecycled_worktree_for_retry
 test_managed_teardown_locks_generation_before_endpoint_cleanup
 test_managed_child_teardown_locks_generation_before_snapshot

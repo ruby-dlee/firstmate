@@ -149,23 +149,37 @@ MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
-  local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt
+  local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt state last=unknown
   [ -n "$target" ] || return 0
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
-      if ! ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_exists "$backend" "$target" "$expected" ) 2>/dev/null; then
-        return 0
-      fi
-    elif ! fm_backend_target_exists "$backend" "$target" "$expected" 2>/dev/null; then
-      return 0
+      state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_state "$backend" "$target" "$expected" 2>/dev/null)
+    else
+      state=$(fm_backend_target_state "$backend" "$target" "$expected" 2>/dev/null)
     fi
+    case "$state" in
+      absent) return 0 ;;
+      present|unknown) last=$state ;;
+      *) last=unknown ;;
+    esac
     sleep 0.1
   done
+  [ "$last" != unknown ] || return 2
   return 1
 }
 
+managed_endpoint_blocker() {  # <status> <task> [restored]
+  local status=$1 task=$2 restored=${3:-} qualifier=
+  [ -z "$restored" ] || qualifier='restored '
+  if [ "$status" -eq 2 ]; then
+    echo "error: ${qualifier}managed endpoint state for $task is unknown; retaining its Agent Fleet lease and metadata" >&2
+  else
+    echo "error: ${qualifier}managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+  fi
+}
+
 release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
-  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} profile account_task meta_state backend target zellij_tab acquired=0
+  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} profile account_task meta_state backend target zellij_tab endpoint_status acquired=0
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
@@ -195,8 +209,11 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
       fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
     fi
   fi
-  if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
-    echo "error: managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+  if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
+    :
+  else
+    endpoint_status=$?
+    managed_endpoint_blocker "$endpoint_status" "$task"
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   fi
@@ -222,8 +239,11 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock]
         fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
       fi
     fi
-    if ! managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
-      echo "error: restored managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+    if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
+      :
+    else
+      endpoint_status=$?
+      managed_endpoint_blocker "$endpoint_status" "$task" restored
       fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
       return 1
     fi
@@ -966,6 +986,11 @@ validate_firstmate_home_children_removal() {
     child_wt=$(meta_value "$child_meta" worktree)
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
+    child_home=
+    if [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+    fi
     child_backend=$(fm_backend_of_meta "$child_meta")
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
@@ -987,7 +1012,7 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_account_lock
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_account_lock child_endpoint_home
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1019,7 +1044,8 @@ cleanup_firstmate_home_children() {
       fi
     fi
     if managed_account_meta "$child_meta"; then
-      release_managed_account "$child_meta" "$child_id" "$home" "$child_account_lock" || return 1
+      child_endpoint_home=$(fm_backend_endpoint_home "$child_backend" "$child_kind" "$home" "$child_home")
+      release_managed_account "$child_meta" "$child_id" "$child_endpoint_home" "$child_account_lock" || return 1
       child_account_lock=$MANAGED_ACCOUNT_LOCK
     else
       if [ -n "$child_t" ]; then
@@ -1027,8 +1053,6 @@ cleanup_firstmate_home_children() {
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home"
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id"
@@ -1124,7 +1148,8 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
 fi
 
 PROBE_HOME=
-[ "$KIND" != secondmate ] || PROBE_HOME=$HOME_PATH
+ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
+[ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME
 if [ "$MANAGED_ACCOUNT" = 1 ]; then
   release_managed_account "$META" "$ID" "$PROBE_HOME" "$ACCOUNT_DELETE_LOCK" || exit 1
 fi

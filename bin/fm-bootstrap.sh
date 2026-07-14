@@ -503,11 +503,17 @@ EOF
 }
 
 BOOTSTRAP_JQ_REPORTED=0
+ACCOUNT_ROUTING_MODE=off
 
 account_routing_preflight() {
-  local mode needs_agent_fleet=0 dispatch
-  mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>/dev/null || true)
-  [ "$mode" != enforce ] || needs_agent_fleet=1
+  local mode mode_error needs_agent_fleet=0 dispatch
+  if mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>&1); then
+    ACCOUNT_ROUTING_MODE=$mode
+  else
+    mode_error=${mode#error: }
+    echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
+  fi
+  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || needs_agent_fleet=1
   dispatch="$CONFIG/crew-dispatch.json"
   if [ -f "$dispatch" ]; then
     if command -v jq >/dev/null 2>&1; then
@@ -540,7 +546,7 @@ crew_dispatch_validate() {
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - malformed JSON"
     return 0
   fi
-  err=$(jq -r '
+  err=$(jq -r --arg routing_mode "$ACCOUNT_ROUTING_MODE" '
     def verified($h): ["claude","codex","opencode","pi","grok"] | index($h);
     def safe_account_id($v):
       ($v | type) == "string"
@@ -582,6 +588,7 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_profile requires claude or codex harness"
     elif [(.rules // [])[]? | select(.select? == "quota-balanced") | select(([use_profiles(.use?)[] | has("account_pool")] | any) and ([use_profiles(.use?)[] | has("account_pool")] | all | not))] | length > 0 then "quota-balanced account_pool candidates must all carry account_pool"
     elif [(.rules // [])[]? | select(.select? == "quota-balanced") | use_profiles(.use?)[] | select(has("account_profile"))] | length > 0 then "quota-balanced candidates cannot carry account_profile"
+    elif ($routing_mode == "enforce" and (([(.rules // [])[]? | select(.select? == "quota-balanced") | select([use_profiles(.use?)[] | has("account_pool")] | all | not)] | length) > 0)) then "enforced quota-balanced candidates must all carry account_pool"
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
     elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced")] | length > 0 then
       "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced") ] | unique | join(", "))

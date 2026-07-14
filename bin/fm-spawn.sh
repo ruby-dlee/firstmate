@@ -134,6 +134,27 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+
+spawn_managed_endpoint_kill() {  # <backend> <target> <tab-id> <label> <kind> <secondmate-home>
+  local backend=$1 target=$2 tab_id=$3 label=$4 kind=$5 secondmate_home=${6:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_kill "$backend" "$target" "$tab_id" "$label" )
+  else
+    fm_backend_kill "$backend" "$target" "$tab_id" "$label"
+  fi
+}
+
+spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmate-home>
+  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_target_state "$backend" "$target" "$label" )
+  else
+    fm_backend_target_state "$backend" "$target" "$label"
+  fi
+}
+
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -232,14 +253,47 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       echo "error: managed task generation changed before rollback cleanup for $rollback_id" >&2
       exit 1
     fi
+    rollback_kind=$(fm_account_meta_value "$RESUME_META" kind)
+    [ -n "$rollback_kind" ] || rollback_kind=ship
+    rollback_backend=$(fm_backend_of_meta "$RESUME_META")
+    rollback_target=$(fm_backend_target_of_meta "$RESUME_META")
+    rollback_tab=$(fm_account_meta_value "$RESUME_META" zellij_tab_id)
+    rollback_home=$(fm_account_meta_value "$RESUME_META" home)
+    rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
+    if [ -n "$rollback_target" ]; then
+      spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
+      rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null)
+      case "$rollback_endpoint_state" in
+        absent) ;;
+        present)
+          fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+          echo "error: failed Agent Fleet attempt endpoint is still alive for $rollback_id; retaining its lease and metadata" >&2
+          exit 1
+          ;;
+        *)
+          fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+          echo "error: failed Agent Fleet attempt endpoint state is unknown for $rollback_id; retaining its lease and metadata" >&2
+          exit 1
+          ;;
+      esac
+    fi
     if ! fm_account_cleanup_rollback "$RESUME_META" "$DATA" "$rollback_id"; then
       fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
       echo "error: failed Agent Fleet attempt cleanup remains pending for $rollback_id" >&2
       exit 1
     fi
+    rollback_profile=$(fm_account_meta_value "$RESUME_META" account_profile)
+    if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ]; then
+      rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
+      [ -z "$rollback_tasktmp" ] || rm -rf "$rollback_tasktmp"
+    fi
     fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
-    if [ -z "$(fm_account_meta_value "$RESUME_META" account_profile)" ]; then
-      echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; tear down its retained worktree before spawning again" >&2
+    if [ -z "$rollback_profile" ]; then
+      if [ "$rollback_kind" = secondmate ]; then
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; retry the secondmate spawn without tearing down its home" >&2
+      else
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; tear down its retained worktree before spawning again" >&2
+      fi
       exit 1
     fi
   fi
@@ -408,7 +462,7 @@ persist_failed_account_rollback() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? probe_home endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp
   trap - EXIT
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
   if [ -n "${META_WRITE_LOCK:-}" ]; then
@@ -444,17 +498,19 @@ spawn_abort_cleanup() {
     fi
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
-    probe_home=${FM_HOME:-$FM_ROOT}
-    [ "${KIND:-ship}" != secondmate ] || probe_home=${PROJ_ABS:-$probe_home}
-    if [ "${BACKEND:-tmux}" = zellij ] && [ "${KIND:-ship}" = secondmate ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" ) 2>/dev/null || true
-    else
-      fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" 2>/dev/null || true
-    fi
-    if ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_exists "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" ) 2>/dev/null; then
-      endpoint_gone=0
-      echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
-    fi
+    spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" 2>/dev/null || true
+    endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" 2>/dev/null)
+    case "$endpoint_state" in
+      absent) ;;
+      present)
+        endpoint_gone=0
+        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
+        ;;
+      *)
+        endpoint_gone=0
+        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint state is unknown" >&2
+        ;;
+    esac
   fi
   [ -z "${ACCOUNT_NATIVE_LAUNCH_GO:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
   [ -z "${ACCOUNT_NATIVE_LAUNCH_READY:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
@@ -645,7 +701,14 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   else
     [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
     if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
-      ACCOUNT_POOL=$RECORDED_POOL
+      if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+        ACCOUNT_POOL=$RECORDED_POOL
+      else
+        ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS_ARG") || {
+          echo "error: no default account pool for continuation harness '$HARNESS_ARG'" >&2
+          exit 1
+        }
+      fi
       ACCOUNT_POOL_SET=1
     fi
     ACCOUNT_PREDECESSOR_TASK=$RECORDED_ACCOUNT_TASK
@@ -1158,11 +1221,19 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
-  RECOVERY_PROBE_HOME=$FM_HOME
-  [ "$KIND" != secondmate ] || RECOVERY_PROBE_HOME=$PROJ_ABS
-  if [ -n "$RECORDED_TARGET" ] && ( unset FM_ROOT_OVERRIDE; FM_HOME="$RECOVERY_PROBE_HOME" FM_ROOT="$RECOVERY_PROBE_HOME" fm_backend_target_exists "$BACKEND" "$RECORDED_TARGET" "fm-$ID" ) 2>/dev/null; then
-    echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
-    exit 1
+  if [ -n "$RECORDED_TARGET" ]; then
+    RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+    case "$RECOVERY_ENDPOINT_STATE" in
+      absent) ;;
+      present)
+        echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
+        exit 1
+        ;;
+      *)
+        echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
+        exit 1
+        ;;
+    esac
   fi
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
@@ -1667,12 +1738,12 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     echo "error: managed task generation changed before launch commit for $ID" >&2
     exit 1
   fi
-  probe_home=$FM_HOME
-  [ "$KIND" != secondmate ] || probe_home=$PROJ_ABS
-  if ! ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" ) 2>/dev/null; then
-    echo "error: managed endpoint disappeared before launch commit for $ID" >&2
-    exit 1
-  fi
+  COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+  case "$COMMIT_ENDPOINT_STATE" in
+    present) ;;
+    absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;
+    *) echo "error: managed endpoint state is unknown before launch commit for $ID" >&2; exit 1 ;;
+  esac
   ACCOUNT_SPAWN_COMMITTED=1
   [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
   META_BACKUP=

@@ -755,6 +755,46 @@ SH
   pass "bootstrap reports dependencies only when configuration can enforce routing"
 }
 
+test_invalid_account_routing_policy_is_reported() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/account-routing-invalid"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf 'enforce\noff\n' > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'ACCOUNT_ROUTING: invalid routing policy - ' "multi-value routing policy was silent"
+  assert_contains "$out" 'must contain exactly one value' "multi-value routing diagnostic lost its cause"
+
+  rm -f "$case_dir/home/config/account-routing-mode"
+  mkdir "$case_dir/home/config/account-routing-mode"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'ACCOUNT_ROUTING: invalid routing policy - ' "unreadable routing policy was silent"
+  assert_contains "$out" 'cannot read' "unreadable routing diagnostic lost its cause"
+  pass "bootstrap surfaces invalid account-routing policy"
+}
+
+test_enforced_dispatch_validation_rejects_poolless_quota_rules() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/account-routing-enforced-dispatch"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' enforce > "$case_dir/home/config/account-routing-mode"
+  printf '%s\n' '{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"quota-balanced"}]}' \
+    > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'CREW_DISPATCH: invalid config/crew-dispatch.json - enforced quota-balanced candidates must all carry account_pool' \
+    "enforced poolless quota rule was accepted"
+  pass "bootstrap rejects poolless quota balancing under enforcement"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -774,3 +814,5 @@ test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
 test_account_routing_dependency_preflight
+test_invalid_account_routing_policy_is_reported
+test_enforced_dispatch_validation_rejects_poolless_quota_rules

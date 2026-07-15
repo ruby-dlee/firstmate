@@ -20,25 +20,29 @@ ID=$1
 URL=$2
 
 META="$STATE/$ID.meta"
+LOOKUP_WT=
+PR_HEAD=
+if [ -f "$META" ]; then
+  LOOKUP_WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+  if [ -n "$LOOKUP_WT" ] && [ -d "$LOOKUP_WT" ]; then
+    if command -v gh >/dev/null 2>&1; then
+      if REMOTE_HEAD=$(cd "$LOOKUP_WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
+        PR_HEAD=$REMOTE_HEAD
+      fi
+    fi
+  fi
+fi
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 release_meta_lock() {
   fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
 }
 trap release_meta_lock EXIT
 if [ -f "$META" ]; then
-  WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
-  PR_HEAD=
-  if [ -n "$WT" ] && [ -d "$WT" ]; then
-    if command -v gh >/dev/null 2>&1; then
-      if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-        PR_HEAD=$REMOTE_HEAD
-      fi
-    fi
-  fi
+  CURRENT_WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   if ! grep -qxF "pr=$URL" "$META"; then
     echo "pr=$URL" >> "$META"
   fi
-  if [ -n "$PR_HEAD" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
+  if [ -n "$PR_HEAD" ] && [ "$CURRENT_WT" = "$LOOKUP_WT" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
     echo "pr_head=$PR_HEAD" >> "$META"
   fi
 fi

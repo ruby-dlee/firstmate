@@ -825,35 +825,45 @@ test_pr_check_records_remote_head_when_local_lags() {
 }
 
 test_pr_check_serializes_with_account_session_updates() {
-  local case_dir state meta ready release holder pr_check url
+  local case_dir state meta lookup_ready lookup_release pr_check url head
   case_dir=$(make_case pr-check-meta-lock)
   state="$case_dir/state"
   meta="$state/task-x1.meta"
-  ready="$case_dir/holder-ready"
-  release="$case_dir/holder-release"
+  lookup_ready="$case_dir/lookup-ready"
+  lookup_release="$case_dir/lookup-release"
   url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
   write_meta "$case_dir" no-mistakes ship
-  bash -c '
-    . "$1/bin/fm-account-routing-lib.sh"
-    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
-    touch "$3"
-    while [ ! -f "$4" ]; do sleep 0.05; done
-    printf "provider_session_id=session-new\n" >> "$2/task-x1.meta"
-    fm_account_meta_lock_release "$held"
-  ' _ "$ROOT" "$state" "$ready" "$release" &
-  holder=$!
-  while [ ! -f "$ready" ]; do sleep 0.05; done
-  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" PATH="$case_dir/fakebin:$PATH" \
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
   pr_check=$!
-  sleep 0.1
-  assert_no_grep '^pr=' "$meta" "PR recording bypassed the account metadata lock"
-  touch "$release"
-  wait "$holder" || fail "PR account session update lock holder failed"
-  wait "$pr_check" || fail "PR recording failed after the account metadata lock was released"
+  while [ ! -f "$lookup_ready" ]; do sleep 0.05; done
+  if ! bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    printf "provider_session_id=session-new\n" >> "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state"; then
+    touch "$lookup_release"
+    wait "$pr_check" || true
+    fail "PR lookup held the account metadata lock"
+  fi
+  assert_no_grep '^pr=' "$meta" "PR recording completed before the remote lookup"
   assert_grep 'provider_session_id=session-new' "$meta" "PR recording lost the concurrent provider session update"
+  touch "$lookup_release"
+  wait "$pr_check" || fail "PR recording failed after the remote lookup completed"
   assert_grep "pr=$url" "$meta" "PR recording did not publish after the account metadata lock was released"
-  pass "fm-pr-check serializes with account session updates"
+  assert_grep "pr_head=$head" "$meta" "PR recording lost the remote PR head"
+  pass "fm-pr-check keeps remote lookups outside account metadata serialization"
 }
 
 test_content_in_default_fallback_allows() {

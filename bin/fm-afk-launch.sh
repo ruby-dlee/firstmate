@@ -112,6 +112,7 @@ fm_afk_launch_copy_bounded() {  # <source> <destination>
     rm -f "$pending"
     return 1
   fi
+  touch -r "$source" "$pending" 2>/dev/null || true
   mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
 }
 
@@ -891,7 +892,7 @@ fm_afk_launch_stop_locked() {
       return 1
     fi
     if [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" = 1 ]; then
-      fm_afk_launch_log "native daemon process marker does not identify an away-mode daemon; refusing to signal pid=$(sed -n '1p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)"
+      fm_afk_launch_log "native daemon process marker does not identify an away-mode daemon; refusing to signal pid=${FM_AFK_NATIVE_RECORD_PID:-unknown}"
       return 1
     fi
     rm -f "$FM_AFK_NATIVE_PROCESS" || return 1

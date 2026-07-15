@@ -41,6 +41,9 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 FM_AFK_NATIVE_PROCESS="$FM_AFK_STATE/.afk-native-process"
 FM_AFK_NATIVE_HANDOFF_LOCK="$FM_AFK_STATE/.afk-native-handoff.lock"
 FM_AFK_NATIVE_PROCESS_UNSAFE=0
+FM_AFK_NATIVE_PROCESS_MAX_BYTES=4096
+FM_AFK_NATIVE_RECORD_PID=
+FM_AFK_NATIVE_RECORD_IDENTITY=
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$FM_AFK_START_DIR/fm-gate-refuse-lib.sh"
@@ -97,10 +100,7 @@ daemon_pid_matches() {
     return
   fi
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
-  esac
-  return 1
+  fm_afk_command_runs_script "$command" "$FM_AFK_DAEMON"
 }
 
 daemon_lock_pid() {
@@ -166,22 +166,63 @@ fm_afk_native_process_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+fm_afk_command_runs_script() {  # <command> <script>
+  local command=$1 script=$2 first second script_base
+  command=${command#"${command%%[![:space:]]*}"}
+  IFS=$' \t' read -r first second _ <<< "$command"
+  script_base=${script##*/}
+  case "$first" in
+    "$script"|"$script_base") return 0 ;;
+  esac
+  case "${first##*/}" in
+    bash|dash|ksh|sh|zsh) ;;
+    *) return 1 ;;
+  esac
+  case "$second" in
+    "$script"|"$script_base") return 0 ;;
+  esac
+  return 1
+}
+
 fm_afk_native_process_command_matches() {
   local pid=$1 command
   command=$(LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || return 1
-  case "$command" in
-    *"$FM_AFK_START_DIR/fm-afk-start.sh"*|*"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
+  fm_afk_command_runs_script "$command" "$FM_AFK_START_DIR/fm-afk-start.sh" \
+    || fm_afk_command_runs_script "$command" "$FM_AFK_DAEMON"
+}
+
+fm_afk_native_process_read() {
+  local snapshot bytes
+  FM_AFK_NATIVE_RECORD_PID=
+  FM_AFK_NATIVE_RECORD_IDENTITY=
+  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
+  snapshot=$({
+    head -c "$((FM_AFK_NATIVE_PROCESS_MAX_BYTES + 1))" "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || exit 1
+    printf '\034'
+  }) || return 1
+  case "$snapshot" in *$'\034') ;; *) return 1 ;; esac
+  snapshot=${snapshot%$'\034'}
+  bytes=$(printf '%s' "$snapshot" | LC_ALL=C wc -c | tr -d '[:space:]') || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le "$FM_AFK_NATIVE_PROCESS_MAX_BYTES" ] || return 1
+  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
+  case "$snapshot" in *$'\n') snapshot=${snapshot%$'\n'} ;; esac
+  case "$snapshot" in
+    *$'\n'*) ;;
+    *) return 1 ;;
   esac
-  return 1
+  FM_AFK_NATIVE_RECORD_PID=${snapshot%%$'\n'*}
+  FM_AFK_NATIVE_RECORD_IDENTITY=${snapshot#*$'\n'}
+  case "$FM_AFK_NATIVE_RECORD_IDENTITY" in *$'\n'*) return 1 ;; esac
+  [ -n "$FM_AFK_NATIVE_RECORD_PID" ] && [ -n "$FM_AFK_NATIVE_RECORD_IDENTITY" ]
 }
 
 fm_afk_native_process_live() {
   local pid identity current
   FM_AFK_NATIVE_PROCESS_UNSAFE=0
-  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
-  pid=$(sed -n '1p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
-  identity=$(sed -n '2p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
-  [ -n "$identity" ] || return 1
+  fm_afk_native_process_read || return 1
+  pid=$FM_AFK_NATIVE_RECORD_PID
+  identity=$FM_AFK_NATIVE_RECORD_IDENTITY
   current=$(fm_afk_native_process_identity "$pid") || return 1
   [ "$current" = "$identity" ] || return 1
   if ! fm_afk_native_process_command_matches "$pid"; then

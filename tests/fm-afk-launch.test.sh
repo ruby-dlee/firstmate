@@ -187,6 +187,75 @@ unit_stop_rejects_native_marker_for_unrelated_command() {
   rm -rf "$st"
 }
 
+unit_native_command_identity_is_anchored() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-command-shape.XXXXXX")
+  mkdir -p "$st/state"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_command_runs_script "  $FM_AFK_START_DIR/fm-afk-start.sh" "$FM_AFK_START_DIR/fm-afk-start.sh"
+    fm_afk_command_runs_script "/bin/bash $FM_AFK_DAEMON" "$FM_AFK_DAEMON"
+    fm_afk_command_runs_script "bash fm-supervise-daemon.sh" "$FM_AFK_DAEMON"
+    ! fm_afk_command_runs_script "sleep 30 --note=fm-supervise-daemon.sh" "$FM_AFK_DAEMON"
+    ! fm_afk_command_runs_script "/tmp/fm-supervise-daemon.sh" "$FM_AFK_DAEMON"
+  ' _ "$START"; then
+    pass "native process identity: direct and interpreter script shapes are anchored"
+  else
+    fail "native process identity: rejected a daemon shape or accepted a substring mention"
+  fi
+  rm -rf "$st"
+}
+
+unit_native_process_marker_is_one_bounded_snapshot() {
+  local st marker
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-marker.XXXXXX")
+  mkdir -p "$st/state"
+  marker="$st/state/.afk-native-process"
+  printf '123\noriginal-identity\n' > "$marker"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    head() {
+      command head "$@"
+      printf "999\nreplacement-identity\n" > "$FM_AFK_NATIVE_PROCESS"
+    }
+    fm_afk_native_process_identity() {
+      [ "$1" = 123 ] || return 1
+      printf "original-identity\n"
+    }
+    fm_afk_native_process_command_matches() { return 0; }
+    fm_afk_native_process_live
+    [ "$FM_AFK_NATIVE_PID" = 123 ]
+  ' _ "$START"; then
+    pass "native process marker: validation uses one bounded snapshot"
+  else
+    fail "native process marker: validation reopened or mixed marker snapshots"
+  fi
+  printf '123\nidentity\nextra\n' > "$marker"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    ! fm_afk_native_process_live
+    [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" = 0 ]
+  ' _ "$START"; then
+    pass "native process marker: malformed records keep unsafe-command state clear"
+  else
+    fail "native process marker: malformed record changed unsafe-command semantics"
+  fi
+  {
+    printf '123\nidentity\n'
+    head -c 4096 /dev/zero
+  } > "$marker"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    ! fm_afk_native_process_live
+    [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" = 0 ]
+  ' _ "$START"; then
+    pass "native process marker: oversized records are rejected before parsing"
+  else
+    fail "native process marker: oversized record was accepted or marked command-unsafe"
+  fi
+  rm -rf "$st"
+}
+
 unit_failed_start_rolls_back_state() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start.XXXXXX")
@@ -1320,6 +1389,40 @@ unit_afk_backups_reject_unsafe_or_oversized_sources() {
   rm -rf "$st"
 }
 
+unit_afk_bounded_copy_preserves_mtime() {
+  local st source backup restored source_mtime backup_mtime restored_mtime
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-backup-mtime.XXXXXX")
+  mkdir -p "$st/state" "$st/backup"
+  source="$st/state/.subsuper-inject-wedged"
+  backup="$st/backup/.subsuper-inject-wedged"
+  restored="$st/state/restored-wedge"
+  printf 'wedged\n' > "$source"
+  touch -t 200001010101 "$source"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_copy_bounded "$2" "$3"
+    fm_afk_launch_copy_bounded "$3" "$4"
+  ' _ "$LAUNCH" "$source" "$backup" "$restored"; then
+    if [ "$(uname)" = Darwin ]; then
+      source_mtime=$(stat -f '%m' "$source")
+      backup_mtime=$(stat -f '%m' "$backup")
+      restored_mtime=$(stat -f '%m' "$restored")
+    else
+      source_mtime=$(stat -c '%Y' "$source")
+      backup_mtime=$(stat -c '%Y' "$backup")
+      restored_mtime=$(stat -c '%Y' "$restored")
+    fi
+    if [ "$source_mtime" = "$backup_mtime" ] && [ "$backup_mtime" = "$restored_mtime" ]; then
+      pass "AFK backup: bounded backup and restore preserve wedge age"
+    else
+      fail "AFK backup: bounded copy reset the wedge marker age"
+    fi
+  else
+    fail "AFK backup: bounded copy failed while preserving wedge age"
+  fi
+  rm -rf "$st"
+}
+
 unit_flag_write_failure_aborts() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-flag-fail.XXXXXX")
@@ -1537,12 +1640,22 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-17 ]; then
+  unit_afk_bounded_copy_preserves_mtime
+  unit_native_command_identity_is_anchored
+  unit_native_process_marker_is_one_bounded_snapshot
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
 unit_stop_rejects_native_marker_for_unrelated_command
+unit_native_command_identity_is_anchored
+unit_native_process_marker_is_one_bounded_snapshot
 unit_failed_start_rolls_back_state
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
@@ -1587,6 +1700,7 @@ unit_clear_failure_aborts_entry
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_afk_backups_reject_unsafe_or_oversized_sources
+unit_afk_bounded_copy_preserves_mtime
 unit_flag_write_failure_aborts
 unit_flag_staging_does_not_follow_predictable_symlink
 e2e_herdr

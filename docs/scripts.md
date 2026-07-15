@@ -3,6 +3,7 @@
 The first mate drives these; interactive entrypoints work by hand too, while `*-lib.sh` files are sourced helpers.
 Each row is one purpose clause only: the script's own header comment is the authoritative description of its behavior, flags, and contracts, so read the header before first use.
 If you have changed away from the firstmate home in an interactive shell, invoke these scripts by absolute path through the repo's `bin/` directory; the scripts self-locate internally after they start.
+The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm-teardown.sh` is summarized in [architecture.md](architecture.md#no-mistakes-gate-authority-boundary); `fm-gate-refuse-lib.sh`'s header owns its exact contract.
 
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
@@ -41,11 +42,14 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-project-mode.sh`     | Resolve a project's delivery mode and `+yolo` flag from `data/projects.md`           |
 | `fm-merge-local.sh`      | Fast-forward a `local-only` project's local default branch after approval            |
 | `fm-review-diff.sh`      | Review a crewmate branch or recorded PR head against the authoritative base          |
-| `fm-marker-lib.sh`       | Shared from-firstmate request marker and detector                                    |
+| `fm-marker-lib.sh`       | Shared from-firstmate request marker, detector, and idempotent transformation         |
+| `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
-| `fm-afk-start.sh`        | Enter away mode and run the sub-supervisor daemon as a tracked foreground process    |
+| `fm-afk-start.sh`        | Run the common sourceable away-mode daemon entry in the foreground                      |
+| `fm-afk-launch.sh`       | Own away-mode entry, exit, rollback, and any backend terminal lifecycle                 |
+| `fm-supervisor-target-lib.sh` | Resolve the shared supervisor target and backend for the daemon and launcher       |
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, escalate batched digests, alert on failed delivery |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |

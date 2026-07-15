@@ -6,7 +6,7 @@
 # for a fresh cross-profile continuation.
 # It requires a dead recorded endpoint, an inspectable original worktree/home,
 # a non-empty original brief or charter, and a verified repository snapshot.
-# It carries available task-owned status, report, decisions, steering,
+# It carries available task-owned status, reports, decisions, steering,
 # checkpoint, account-lineage, PR, and no-mistakes state without reading or
 # copying provider homes, credentials, or transcripts.
 # The continuation precedence is live external state, verified repository
@@ -146,6 +146,7 @@ append_file_section() {  # <heading> <file>
 append_file_section "Original brief or charter" "$BRIEF"
 append_file_section "Wake-event and progress status" "$STATE/$ID.status"
 append_file_section "Task report" "$TASK_DIR/report.md"
+append_file_section "Completion report" "$TASK_DIR/completion.md"
 append_file_section "Decisions" "$TASK_DIR/decisions.md"
 append_file_section "Steering trail" "$TASK_DIR/steering.md"
 append_file_section "Pending steering audit" "$TASK_DIR/steering-pending.md"

@@ -1268,6 +1268,7 @@ test_cross_profile_continuation_for_harness() {
   [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
   printf 'done: external side effect alpha; do not rerun\nnext: verify beta\n' > "$HOME_DIR/state/$id.status"
+  printf '# Completion\n\nShip completion evidence for %s.\n' "$harness" > "$HOME_DIR/data/$id/completion.md"
   printf '# Decisions\n\n- Keep the existing branch.\n' > "$HOME_DIR/data/$id/decisions.md"
   run_send "$id" "Preserve the verified next action for $harness." >/dev/null \
     || fail "$harness steering trail precondition failed"
@@ -1283,6 +1284,7 @@ test_cross_profile_continuation_for_harness() {
   packet=$(sed -n 's/^continuation_packet=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   assert_present "$packet" "$harness continuation packet was not persisted"
   assert_grep 'done: external side effect alpha; do not rerun' "$packet" "$harness continuation packet lost completed side-effect state"
+  assert_grep "Ship completion evidence for $harness." "$packet" "$harness continuation packet lost ship completion evidence"
   assert_grep 'Keep the existing branch' "$packet" "$harness continuation packet lost decisions"
   assert_grep "Preserve the verified next action for $harness." "$packet" "$harness continuation packet lost steering"
   assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"

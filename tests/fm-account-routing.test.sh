@@ -93,6 +93,7 @@ case "${1:-}" in
               [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || touch "$FM_FAKE_AF_RESUME_ARM"
               native_path=${arg#*\'}
               native_path=${native_path%%\'*}
+              [ -z "${FM_FAKE_AF_RESUME_ARM:-}" ] || printf '%s\n' "${native_path%/account-native-launch}" > "$FM_FAKE_AF_RESUME_ARM.native-dir"
               [ -z "${FM_FAKE_NATIVE_LAUNCH_LOG:-}" ] || cat "$native_path" >> "$FM_FAKE_NATIVE_LAUNCH_LOG"
               ;;
           esac
@@ -104,13 +105,20 @@ case "${1:-}" in
       *' Enter')
         if [ -n "${FM_FAKE_AF_RESUME_ARM:-}" ] && [ -f "$FM_FAKE_AF_RESUME_ARM" ]; then
           rm -f "$FM_FAKE_AF_RESUME_ARM"
-          [ -z "${FM_FAKE_AF_RESUME_READY:-}" ] || touch "$FM_FAKE_AF_RESUME_READY"
+          resume_ready=${FM_FAKE_AF_RESUME_READY:-}
+          resume_go=${FM_FAKE_AF_RESUME_GO:-}
+          if [ -f "$FM_FAKE_AF_RESUME_ARM.native-dir" ]; then
+            native_dir=$(cat "$FM_FAKE_AF_RESUME_ARM.native-dir")
+            resume_ready="$native_dir/ready"
+            resume_go="$native_dir/go"
+          fi
+          [ -z "$resume_ready" ] || touch "$resume_ready"
           (
             for _ in $(seq 1 200); do
-              [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] && break
+              [ -n "$resume_go" ] && [ -f "$resume_go" ] && break
               sleep 0.05
             done
-            if [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] \
+            if [ -n "$resume_go" ] && [ -f "$resume_go" ] \
               && [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
               touch "$FM_FAKE_AF_SESSION_REFRESHED"
             fi
@@ -191,7 +199,11 @@ case "$*" in
     ;;
   *" session status "*)
     [ "${FM_FAKE_AF_SESSION_MISSING:-0}" != 1 ] || exit 1
-    if [ -n "${FM_FAKE_AF_RESUME_GO:-}" ] && [ -f "$FM_FAKE_AF_RESUME_GO" ] \
+    resume_go=${FM_FAKE_AF_RESUME_GO:-}
+    if [ -n "${FM_FAKE_AF_RESUME_ARM:-}" ] && [ -f "$FM_FAKE_AF_RESUME_ARM.native-dir" ]; then
+      resume_go="$(cat "$FM_FAKE_AF_RESUME_ARM.native-dir")/go"
+    fi
+    if [ -n "$resume_go" ] && [ -f "$resume_go" ] \
       && [ "${FM_FAKE_AF_RESUME_NO_REFRESH:-0}" != 1 ] && [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ]; then
       touch "$FM_FAKE_AF_SESSION_REFRESHED"
     fi
@@ -326,7 +338,7 @@ clear_case_logs() {
   : > "$ORCA_LOG"
   : > "$LAUNCH_LOG"
   : > "$NATIVE_LAUNCH_LOG"
-  rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/session-refreshed"
+  rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/resume-arm.native-dir" "$CASE_DIR/session-refreshed"
 }
 
 test_off_is_byte_compatible_and_never_calls_agent_fleet() {
@@ -740,6 +752,45 @@ test_native_resume_rejects_prelaunch_sessionstart_evidence() {
   assert_grep "lease release --task $account_task --force" "$AF_LOG" "prelaunch evidence failure leaked its recovered reservation"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "prelaunch evidence failure changed durable session truth"
   pass "native resume requires SessionStart evidence after its own launch gate"
+}
+
+test_native_resume_uses_private_launch_directory_and_cleans_it() {
+  local id rec out status sentinel launch wrapper native_dir
+  id=account-resume-private-z9e
+  rec=$(make_case resume-private claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "private resume precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  sentinel="$CASE_DIR/native-launch-sentinel"
+  printf 'sentinel\n' > "$sentinel"
+  ln -s "$sentinel" "$HOME_DIR/state/.$id.account-native-launch"
+  ln -s "$sentinel" "$HOME_DIR/state/.$id.account-native-ready"
+  ln -s "$sentinel" "$HOME_DIR/state/.$id.account-native-go"
+
+  out=$(run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -eq 0 ] || fail "private native resume failed (exit $status): $out"
+  launch=$(grep 'account-native-launch' "$LAUNCH_LOG" | tail -1)
+  wrapper=$(printf '%s\n' "$launch" | sed -n "s/.*'\([^']*\/account-native-launch\)'.*/\1/p")
+  [ -n "$wrapper" ] || fail "native resume did not launch a private wrapper: $launch"
+  native_dir=${wrapper%/account-native-launch}
+  [ "$native_dir" != "$HOME_DIR/state" ] || fail "native resume reused the predictable state-root wrapper"
+  assert_absent "$native_dir" "successful native resume retained its private launch directory"
+  assert_absent "$HOME_DIR/state/.$id.account-native-launch" "native resume retained the legacy launch path"
+  assert_absent "$HOME_DIR/state/.$id.account-native-ready" "native resume retained the legacy ready path"
+  assert_absent "$HOME_DIR/state/.$id.account-native-go" "native resume retained the legacy go path"
+  [ "$(cat "$sentinel")" = sentinel ] || fail "legacy native launch symlinks clobbered their target"
+
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  out=$(FM_FAKE_AF_RESUME_NO_REFRESH=1 run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed-resume cleanup precondition unexpectedly succeeded"
+  if find "$HOME_DIR/state" -mindepth 1 -maxdepth 1 -type d -name ".$id.account-native-launch.*" -print -quit | grep -q .; then
+    fail "failed native resume retained its private launch directory"
+  fi
+  pass "native resume uses private launch directories and cleans every exit path"
 }
 
 make_seeded_secondmate_home() {
@@ -2136,6 +2187,28 @@ SH
   pass "metadata locks reclaim abandoned directories without deleting new owners"
 }
 
+test_ownerless_lock_marker_rejects_symlink_clobber() {
+  local case_dir state lock marker outside out status
+  case_dir="$TMP_ROOT/account-ownerless-marker"
+  state="$case_dir/state"
+  lock="$state/.account-meta-lock-task.lock"
+  marker="$lock/.ownerless-since"
+  outside="$case_dir/outside"
+  mkdir -p "$lock"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$marker"
+
+  out=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+    bash -c '. "$1"; fm_account_meta_lock_acquire "$2" lock-task' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "ownerless metadata lock accepted a symlinked age marker"
+  [ "$(cat "$outside")" = sentinel ] || fail "ownerless metadata lock clobbered a symlink target"
+  [ -L "$marker" ] || fail "ownerless metadata lock replaced the unsafe marker"
+  [ -n "$out" ] || true
+  pass "ownerless lock recovery refuses symlinked age markers"
+}
+
 test_linux_stat_selection_avoids_filesystem_stat_output() {
   local case_dir fakebin file output
   case_dir="$TMP_ROOT/linux-stat-selection"
@@ -2386,6 +2459,14 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_native_resume_requires_fresh_sessionstart_evidence
+  test_native_resume_rejects_prelaunch_sessionstart_evidence
+  test_native_resume_uses_private_launch_directory_and_cleans_it
+  test_ownerless_lock_marker_rejects_symlink_clobber
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
@@ -2404,6 +2485,7 @@ test_continuation_rejects_symlinked_charter_ancestor
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
+test_native_resume_uses_private_launch_directory_and_cleans_it
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
 test_explicit_secondmate_route_preserves_ambient_primary_enforce
@@ -2449,6 +2531,7 @@ test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+test_ownerless_lock_marker_rejects_symlink_clobber
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal
 test_task_owned_account_artifacts_reject_symlink_paths

@@ -340,7 +340,7 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
 
 fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after
-  local ownerless_since baseline required_grace
+  local ownerless_since ownerless_tmp baseline required_grace
   [ ! -L "$lock" ] || return 1
   required_grace=$grace
   [ "$required_grace" -ge 1 ] || required_grace=1
@@ -379,12 +379,35 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
     fi
   else
     ownerless_since="$lock/.ownerless-since"
-    if [ ! -f "$ownerless_since" ]; then
-      printf '%s\n' "$mtime" > "$ownerless_since" || {
+    if [ -e "$ownerless_since" ] || [ -L "$ownerless_since" ]; then
+      [ -f "$ownerless_since" ] && [ ! -L "$ownerless_since" ] || {
         fm_account_reclaim_guard_release "$guard"
         return 1
       }
+    else
+      ownerless_tmp=$(mktemp "$lock/.ownerless-since.XXXXXX" 2>/dev/null) || {
+        fm_account_reclaim_guard_release "$guard"
+        return 1
+      }
+      if ! printf '%s\n' "$mtime" > "$ownerless_tmp"; then
+        rm -f "$ownerless_tmp"
+        fm_account_reclaim_guard_release "$guard"
+        return 1
+      fi
+      if ! ln -n "$ownerless_tmp" "$ownerless_since" 2>/dev/null; then
+        rm -f "$ownerless_tmp"
+        [ -f "$ownerless_since" ] && [ ! -L "$ownerless_since" ] || {
+          fm_account_reclaim_guard_release "$guard"
+          return 1
+        }
+      else
+        rm -f "$ownerless_tmp"
+      fi
     fi
+    [ -f "$ownerless_since" ] && [ ! -L "$ownerless_since" ] || {
+      fm_account_reclaim_guard_release "$guard"
+      return 1
+    }
     baseline=$(sed -n '1p' "$ownerless_since" 2>/dev/null)
     case "$baseline" in
       ''|*[!0-9]*) fm_account_reclaim_guard_release "$guard"; return 1 ;;

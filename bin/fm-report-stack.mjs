@@ -362,6 +362,10 @@ function acquireLock() {
     } catch (error) {
       if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
       try {
+        const lockStat = fs.lstatSync(lock);
+        if (lockStat.isSymbolicLink() || !lockStat.isDirectory()) {
+          throw new Error(`report lock must be a real directory at ${lock}`);
+        }
         let owner = Number.NaN;
         let ownerStartedAt = "";
         try {
@@ -381,9 +385,8 @@ function acquireLock() {
           try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
         }
         if (ownerAlive) ownerAlive = processStartIdentity(owner) === ownerStartedAt;
-        const lockStat = fs.statSync(lock);
         let staleMtimeMs = lockStat.mtimeMs;
-        try { staleMtimeMs = Math.min(staleMtimeMs, fs.statSync(path.join(lock, "owner")).mtimeMs); } catch (ownerStatError) { if (ownerStatError.code !== "ENOENT") throw ownerStatError; }
+        try { staleMtimeMs = Math.min(staleMtimeMs, fs.lstatSync(path.join(lock, "owner")).mtimeMs); } catch (ownerStatError) { if (ownerStatError.code !== "ENOENT") throw ownerStatError; }
         if (!ownerAlive && Date.now() - staleMtimeMs > 60_000) {
           const reclaim = path.join(lock, ".reclaim");
           const reclaimToken = crypto.randomUUID();
@@ -394,7 +397,7 @@ function acquireLock() {
             const reclaimOwner = { pid: process.pid, startedAt: reclaimStartedAt, token: reclaimToken };
             fs.writeFileSync(reclaim, `${JSON.stringify(reclaimOwner)}\n`, { flag: "wx", mode: 0o600 });
             claimed = true;
-            const claimedStat = fs.statSync(lock);
+            const claimedStat = fs.lstatSync(lock);
             if (claimedStat.dev !== lockStat.dev || claimedStat.ino !== lockStat.ino) {
               fs.rmSync(reclaim, { force: true });
               claimed = false;
@@ -411,7 +414,7 @@ function acquireLock() {
           } catch (reclaimError) {
             if (reclaimError.code === "EEXIST") {
               try {
-                const reclaimStat = fs.statSync(reclaim);
+                const reclaimStat = fs.lstatSync(reclaim);
                 const reclaimRaw = fs.readFileSync(reclaim, "utf8").trim();
                 let reclaimOwner;
                 try {
@@ -424,12 +427,12 @@ function acquireLock() {
                   try { process.kill(reclaimOwner.pid, 0); } catch (killError) { if (killError.code === "ESRCH") reclaimAlive = false; }
                 }
                 if (reclaimAlive) reclaimAlive = processStartIdentity(reclaimOwner.pid) === reclaimOwner.startedAt;
-                const currentLockStat = fs.statSync(lock);
+                const currentLockStat = fs.lstatSync(lock);
                 if (!reclaimAlive && Date.now() - reclaimStat.mtimeMs > 60_000
                   && currentLockStat.dev === lockStat.dev && currentLockStat.ino === lockStat.ino) {
                   const quarantine = path.join(lock, `.reclaim.abandoned.${process.pid}.${crypto.randomUUID()}`);
                   fs.renameSync(reclaim, quarantine);
-                  const quarantinedReclaimStat = fs.statSync(quarantine);
+                  const quarantinedReclaimStat = fs.lstatSync(quarantine);
                   let quarantinedToken;
                   try {
                     quarantinedToken = JSON.parse(fs.readFileSync(quarantine, "utf8")).token;

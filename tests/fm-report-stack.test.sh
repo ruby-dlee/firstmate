@@ -384,6 +384,25 @@ test_abandoned_reclaim_marker_is_recovered() {
   pass "report stack recovers abandoned reclaim ownership by process identity and age"
 }
 
+test_publish_lock_directory_symlink_fails_closed() {
+  local outside out status
+  outside="$TMP_ROOT/report-lock-outside"
+  mkdir -p "$STACK" "$outside"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside" "$STACK/.publish.lock"
+
+  out=$(run_stack list 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "report stack followed a symlinked publish lock directory"
+  assert_contains "$out" "report lock must be a real directory" \
+    "symlinked report lock refusal was not actionable"
+  [ "$(cat "$outside/sentinel")" = sentinel ] || fail "report lock recovery changed outside data"
+  assert_absent "$outside/.reclaim" "report lock recovery wrote through a directory symlink"
+  [ -L "$STACK/.publish.lock" ] || fail "report lock recovery replaced the unsafe lock symlink"
+  rm -f "$STACK/.publish.lock"
+  pass "report lock recovery refuses directory symlinks before child access"
+}
+
 test_previous_generation_is_recovered_for_readers() {
   local id=report-crash-recovery-k2 entry report_id previous json
   write_task "$id" ship
@@ -605,6 +624,14 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
   pass "report stack rejects symlinked visuals and removes failed staging"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_stale_lock_rejects_reused_pid
+  test_stale_lock_reclaim_is_serialized
+  test_abandoned_reclaim_marker_is_recovered
+  test_publish_lock_directory_symlink_fails_closed
+  exit 0
+fi
+
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
 test_revision_fields_distinguish_pr_head_from_worktree_head
@@ -619,6 +646,7 @@ test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
+test_publish_lock_directory_symlink_fails_closed
 test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry

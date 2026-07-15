@@ -225,7 +225,19 @@ make_liveness_tmux() {
 set -u
 case "${1:-}" in
   display-message)
-    for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
+    for a in "$@"; do
+      case "$a" in
+        *pane_current_command*)
+          [ -z "${FM_TEST_PROBE_LOG:-}" ] || printf 'probe\n' >> "$FM_TEST_PROBE_LOG"
+          if [ -n "${FM_TEST_PANE_CMD_FILE:-}" ]; then
+            cat "$FM_TEST_PANE_CMD_FILE"
+          else
+            printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"
+          fi
+          exit 0
+          ;;
+      esac
+    done
     [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]
     exit $? ;;
   kill-window)
@@ -306,6 +318,53 @@ test_sweep_respawns_confirmed_dead_secondmate() {
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
+}
+
+test_sweep_rechecks_liveness_after_lifecycle_lock() {
+  local w fb tmuxfb log out_file cmd_file probe_log lock_ready lock_release lock_pid bootstrap_pid out
+  w=$(new_world sweep-lifecycle-recheck)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  out_file="$w/bootstrap.out"
+  cmd_file="$w/pane-command"
+  probe_log="$w/probes.log"
+  lock_ready="$w/lock-ready"
+  lock_release="$w/lock-release"
+  printf 'zsh\n' > "$cmd_file"
+
+  bash -c '
+    . "$1"
+    held=$(FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 fm_account_lifecycle_lock_acquire "$2" sm1) || exit 1
+    touch "$3"
+    while [ ! -f "$4" ]; do sleep 0.05; done
+    fm_account_lifecycle_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$w/home/state" "$lock_ready" "$lock_release" &
+  lock_pid=$!
+  for _ in $(seq 1 100); do [ -f "$lock_ready" ] && break; sleep 0.05; done
+  [ -f "$lock_ready" ] || { kill "$lock_pid" 2>/dev/null || true; fail "lifecycle recheck test did not acquire its blocker lock"; }
+
+  PATH="$tmuxfb:$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$w/home" \
+    FM_TEST_PANE_CMD_FILE="$cmd_file" FM_TEST_PROBE_LOG="$probe_log" \
+    FM_TMUX_CALL_LOG="$log" FM_TEST_ENDPOINT_FILE="$w/home/state/.fake-endpoint" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=5 "$ROOT/bin/fm-bootstrap.sh" > "$out_file" 2>&1 &
+  bootstrap_pid=$!
+  for _ in $(seq 1 100); do [ -s "$probe_log" ] && break; sleep 0.05; done
+  [ -s "$probe_log" ] || {
+    kill "$bootstrap_pid" "$lock_pid" 2>/dev/null || true
+    fail "lifecycle recheck test never reached its initial dead probe"
+  }
+  printf 'claude\n' > "$cmd_file"
+  touch "$lock_release"
+  wait "$lock_pid" || fail "lifecycle recheck blocker failed"
+  wait "$bootstrap_pid" || fail "lifecycle recheck bootstrap failed"
+  out=$(cat "$out_file")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: already-live" \
+    "secondmate recovery ignored the live under-lock recheck"
+  [ ! -s "$log" ] || fail "stale pre-lock liveness killed or respawned the replacement endpoint: $(cat "$log")"
+  [ "$(wc -l < "$probe_log" | tr -d ' ')" -ge 2 ] || fail "secondmate recovery did not probe again under the lifecycle lock"
+  pass "sweep: lifecycle lock recheck prevents stale endpoint termination"
 }
 
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
@@ -487,11 +546,20 @@ test_sweep_noop_with_no_secondmate_meta() {
   pass "sweep: a silent no-op with no kind=secondmate meta present (a secondmate home's own natural scoping)"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_sweep_respawns_confirmed_dead_secondmate
+  test_sweep_rechecks_liveness_after_lifecycle_lock
+  test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+  test_pending_rollback_recovery_bypasses_session_gate_and_retries
+  exit 0
+fi
+
 test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
 test_herdr_agent_alive_preserves_identity_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
+test_sweep_rechecks_liveness_after_lifecycle_lock
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
 test_sweep_leaves_alive_secondmate_untouched

@@ -241,14 +241,31 @@ RECOVERY_ACCOUNT=0
 [ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] || RECOVERY_ACCOUNT=1
 RESUME_META=
 LIFECYCLE_LOCK=
+LIFECYCLE_LOCK_OWNED=0
+if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
+  [ "${#POS[@]}" -ge 1 ] || { echo "error: inherited account lifecycle lock requires a task id" >&2; exit 1; }
+  inherited_lock_id=${POS[0]}
+  case "$inherited_lock_id" in *=*) echo "error: inherited account lifecycle lock does not support batch syntax" >&2; exit 1 ;; esac
+  expected_lifecycle_lock="$STATE/.account-lifecycle-$inherited_lock_id.lock"
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" != "$expected_lifecycle_lock" ] \
+    || ! fm_account_lifecycle_lock_held "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
+    echo "error: invalid inherited account lifecycle lock for $inherited_lock_id" >&2
+    exit 1
+  fi
+  LIFECYCLE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+fi
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
   case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
   RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
   fm_account_safe_file_destination "$RESUME_META" || { echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2; exit 1; }
-  LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
-  trap '[ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  if [ -z "$LIFECYCLE_LOCK" ]; then
+    LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
+    LIFECYCLE_LOCK_OWNED=1
+  fi
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}
     rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
@@ -394,6 +411,7 @@ RAW_LAUNCH=0
 ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
+ACCOUNT_NATIVE_LAUNCH_DIR=
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -590,9 +608,7 @@ spawn_abort_cleanup() {
         ;;
     esac
   fi
-  [ -z "${ACCOUNT_NATIVE_LAUNCH_GO:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
-  [ -z "${ACCOUNT_NATIVE_LAUNCH_READY:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
-  [ -z "${ACCOUNT_NATIVE_LAUNCH_SCRIPT:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
+  [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
@@ -687,8 +703,9 @@ spawn_abort_cleanup() {
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
-  [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
   LIFECYCLE_LOCK=
+  LIFECYCLE_LOCK_OWNED=0
   return "$status"
 }
 trap spawn_abort_cleanup EXIT
@@ -1016,6 +1033,7 @@ fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ -z "$LIFECYCLE_LOCK" ]; then
     LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+    LIFECYCLE_LOCK_OWNED=1
   fi
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
@@ -1906,21 +1924,27 @@ fi
 AGENT_COMMAND=$HARNESS
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    ACCOUNT_NATIVE_LAUNCH_SCRIPT="$STATE/.$ID.account-native-launch"
-    ACCOUNT_NATIVE_LAUNCH_READY="$STATE/.$ID.account-native-ready"
-    ACCOUNT_NATIVE_LAUNCH_GO="$STATE/.$ID.account-native-go"
-    rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" "$ACCOUNT_NATIVE_LAUNCH_READY" "$ACCOUNT_NATIVE_LAUNCH_GO"
+    rm -rf "$STATE/.$ID.account-native-launch" "$STATE/.$ID.account-native-ready" "$STATE/.$ID.account-native-go" || exit 1
+    ACCOUNT_NATIVE_LAUNCH_DIR=$(mktemp -d "$STATE/.$ID.account-native-launch.XXXXXX") || exit 1
+    chmod 700 "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
+    ACCOUNT_NATIVE_LAUNCH_SCRIPT="$ACCOUNT_NATIVE_LAUNCH_DIR/account-native-launch"
+    ACCOUNT_NATIVE_LAUNCH_READY="$ACCOUNT_NATIVE_LAUNCH_DIR/ready"
+    ACCOUNT_NATIVE_LAUNCH_GO="$ACCOUNT_NATIVE_LAUNCH_DIR/go"
     resume_command=$(fm_account_resume_command "$ACCOUNT_TASK") || exit 1
     native_ready_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_READY")
     native_go_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_GO")
-    cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
+    if ! ( set -C; cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
 #!/usr/bin/env bash
-set -eu
-touch $native_ready_q
+set -euC
+: > $native_ready_q
 while [ ! -f $native_go_q ]; do sleep 0.05; done
 rm -f $native_ready_q $native_go_q
 exec $resume_command "\$@"
 EOF
+    ); then
+      echo "error: could not create private native provider launch wrapper for $ID" >&2
+      exit 1
+    fi
     chmod +x "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
     AGENT_COMMAND=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_SCRIPT")
   else
@@ -1962,16 +1986,18 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       sleep 0.05
     done
     RECORDED_SESSION_UPDATED_AT=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
-    touch "$ACCOUNT_NATIVE_LAUNCH_GO" || exit 1
+    ( set -C; : > "$ACCOUNT_NATIVE_LAUNCH_GO" ) || exit 1
     session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
   fi
   if ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
-  [ -z "$ACCOUNT_NATIVE_LAUNCH_GO" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
-  [ -z "$ACCOUNT_NATIVE_LAUNCH_READY" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
-  [ -z "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
+  [ -z "$ACCOUNT_NATIVE_LAUNCH_DIR" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
+  ACCOUNT_NATIVE_LAUNCH_DIR=
+  ACCOUNT_NATIVE_LAUNCH_GO=
+  ACCOUNT_NATIVE_LAUNCH_READY=
+  ACCOUNT_NATIVE_LAUNCH_SCRIPT=
   COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
   case "$COMMIT_ENDPOINT_STATE" in
     present) ;;
@@ -2001,7 +2027,8 @@ fi
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
 META_BACKUP=
 discard_existing_artifact_backup
-[ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
+[ "$LIFECYCLE_LOCK_OWNED" != 1 ] || [ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
 LIFECYCLE_LOCK=
+LIFECYCLE_LOCK_OWNED=0
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

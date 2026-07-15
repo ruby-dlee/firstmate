@@ -281,6 +281,7 @@ secondmate_liveness_sweep() {
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
   local meta id window harness backend target verdict out account_profile rollback_pending retry_profile retry_out
+  local lifecycle_lock recheck spawn_message
   local -a resume_args retry_args
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
@@ -302,9 +303,48 @@ secondmate_liveness_sweep() {
         echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
         ;;
       dead)
+        lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$id" 2>/dev/null) || {
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: lifecycle recovery lock unavailable; respawn deferred"
+          continue
+        }
+        if [ ! -f "$meta" ] || ! grep -q '^kind=secondmate$' "$meta" 2>/dev/null; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: task generation changed before recovery"
+          continue
+        fi
+        window=$(fm_meta_get "$meta" window)
+        if [ -z "$window" ]; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: task generation has no endpoint target"
+          continue
+        fi
+        harness=$(fm_meta_get "$meta" harness)
+        backend=$(fm_backend_of_meta "$meta")
+        target=$(fm_backend_target_of_meta "$meta")
+        [ -n "$target" ] || target="$window"
+        recheck=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" 2>/dev/null) || recheck=unknown
+        case "$harness" in
+          claude|codex|opencode|pi|grok) ;;
+          *) [ "$recheck" = dead ] && recheck=unknown ;;
+        esac
+        case "$recheck" in
+          alive)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
+            continue
+            ;;
+          dead) ;;
+          *)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: skipped: liveness probe inconclusive (backend=$backend)"
+            continue
+            ;;
+        esac
         account_profile=$(fm_meta_get "$meta" account_profile)
         rollback_pending=$(fm_meta_get "$meta" account_rollback_cleanup)
-        if [ "$rollback_pending" != pending ] && [ -n "$account_profile" ] && ! "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+        if [ "$rollback_pending" != pending ] && [ -n "$account_profile" ] \
+          && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
           continue
         fi
@@ -315,8 +355,9 @@ secondmate_liveness_sweep() {
         else
           resume_args+=(--no-account-routing)
         fi
-        if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
-          echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
+        if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
+          "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
+          spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawned"
         elif [ "$rollback_pending" = pending ] && { [ ! -f "$meta" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; }; then
           retry_profile=
           [ ! -f "$meta" ] || retry_profile=$(fm_meta_get "$meta" account_profile)
@@ -326,14 +367,20 @@ secondmate_liveness_sweep() {
           else
             retry_args+=(--no-account-routing)
           fi
-          if retry_out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
-            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
+          if retry_out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
+            "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
           else
-            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
           fi
         else
-          echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
+          spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
         fi
+        if ! fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1; then
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: lifecycle recovery lock release failed; inspect before retrying"
+          continue
+        fi
+        echo "$spawn_message"
         ;;
       *)
         echo "SECONDMATE_LIVENESS: secondmate $id: skipped: liveness probe inconclusive (backend=$backend)"

@@ -534,14 +534,62 @@ test_managed_recovery_accepts_inherited_lifecycle_lock() {
     || fail "inherited-lock recovery could not acquire the bootstrap-owned lock"
   out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" run_spawn "$id" --resume-account)
   status=$?
-  fm_account_lifecycle_lock_release "$held" \
-    || fail "inherited-lock recovery could not release the bootstrap-owned lock"
   [ "$status" -eq 0 ] || fail "managed recovery rejected its inherited lifecycle lock: $out"
+  assert_absent "$held" "successful inherited recovery did not release its handed-off lifecycle lock"
   assert_grep "account_task=$account_task" "$HOME_DIR/state/$id.meta" \
     "inherited-lock recovery did not complete metadata installation"
   assert_not_grep '^account_rollback_cleanup=' "$HOME_DIR/state/$id.meta" \
     "inherited-lock recovery did not commit its managed generation"
   pass "managed secondmate-style recovery installs metadata under its inherited lifecycle lock"
+}
+
+test_inherited_lifecycle_handoff_releases_on_child_abort() {
+  local id rec held out status
+  id=account-inherited-handoff-abort-z9h
+  rec=$(make_case inherited-handoff-abort claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "inherited handoff abort precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
+    || fail "inherited handoff abort test could not acquire the parent lock"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "inherited handoff abort test unexpectedly resumed"
+  assert_absent "$held" "aborting spawn did not trap-release its handed-off lifecycle lock"
+  assert_contains "$out" "no Agent Fleet provider-session mapping" \
+    "inherited handoff abort did not reach the expected post-handoff refusal"
+  pass "inherited lifecycle ownership transfers to the child and trap-releases on abort"
+}
+
+test_off_metadata_merge_waits_for_metadata_lock() {
+  local id rec marker gate out_file spawn_pid held
+  id=account-off-meta-lock-z9i
+  rec=$(make_case off-meta-lock claude "$id")
+  read_case "$rec"
+  marker="$CASE_DIR/new-window-started"
+  gate="$CASE_DIR/new-window-go"
+  out_file="$CASE_DIR/spawn.out"
+  FM_FAKE_TMUX_NEW_WINDOW_MARKER="$marker" FM_FAKE_TMUX_NEW_WINDOW_GATE="$gate" \
+    run_spawn "$id" "$PROJ_DIR" > "$out_file" &
+  spawn_pid=$!
+  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
+  [ -f "$marker" ] || { kill "$spawn_pid" 2>/dev/null || true; fail "off metadata-lock test never reached endpoint creation"; }
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_meta_lock_acquire "$HOME_DIR/state" "$id") \
+    || { kill "$spawn_pid" 2>/dev/null || true; fail "off metadata-lock test could not acquire the competing writer lock"; }
+  touch "$gate"
+  sleep 0.1
+  fm_write_meta "$HOME_DIR/state/$id.meta" "x_request=req-concurrent-off"
+  fm_account_meta_lock_release "$held" || fail "off metadata-lock test could not release the competing writer lock"
+  wait "$spawn_pid" || fail "off spawn failed after serialized metadata rewrite: $(cat "$out_file")"
+  assert_grep 'x_request=req-concurrent-off' "$HOME_DIR/state/$id.meta" \
+    "off-mode spawn discarded a metadata extension written under the metadata lock"
+  pass "off-mode metadata merge-and-replace serializes with extension writers"
 }
 
 test_inherited_lifecycle_lock_rejects_owner_aba() {
@@ -2683,6 +2731,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  test_managed_recovery_accepts_inherited_lifecycle_lock
+  test_inherited_lifecycle_handoff_releases_on_child_abort
+  test_off_metadata_merge_waits_for_metadata_lock
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
@@ -2693,8 +2748,10 @@ test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_managed_recovery_accepts_inherited_lifecycle_lock
+test_inherited_lifecycle_handoff_releases_on_child_abort
 test_inherited_lifecycle_lock_rejects_owner_aba
 test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
+test_off_metadata_merge_waits_for_metadata_lock
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot

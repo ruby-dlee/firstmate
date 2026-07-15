@@ -40,6 +40,7 @@ FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 FM_AFK_NATIVE_PROCESS="$FM_AFK_STATE/.afk-native-process"
 FM_AFK_NATIVE_HANDOFF_LOCK="$FM_AFK_STATE/.afk-native-handoff.lock"
+FM_AFK_NATIVE_PROCESS_UNSAFE=0
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$FM_AFK_START_DIR/fm-gate-refuse-lib.sh"
@@ -121,6 +122,7 @@ fm_afk_native_process_write() {
   if fm_afk_native_process_live && [ "$FM_AFK_NATIVE_PID" != "$$" ]; then
     return 1
   fi
+  [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" != 1 ] || return 1
   if [ -e "$FM_AFK_NATIVE_PROCESS" ] || [ -L "$FM_AFK_NATIVE_PROCESS" ]; then
     [ ! -d "$FM_AFK_NATIVE_PROCESS" ] || return 1
     rm -f "$FM_AFK_NATIVE_PROCESS" || return 1
@@ -164,14 +166,28 @@ fm_afk_native_process_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+fm_afk_native_process_command_matches() {
+  local pid=$1 command
+  command=$(LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || return 1
+  case "$command" in
+    *"$FM_AFK_START_DIR/fm-afk-start.sh"*|*"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
+  esac
+  return 1
+}
+
 fm_afk_native_process_live() {
   local pid identity current
+  FM_AFK_NATIVE_PROCESS_UNSAFE=0
   [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
   pid=$(sed -n '1p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
   identity=$(sed -n '2p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
   [ -n "$identity" ] || return 1
   current=$(fm_afk_native_process_identity "$pid") || return 1
   [ "$current" = "$identity" ] || return 1
+  if ! fm_afk_native_process_command_matches "$pid"; then
+    FM_AFK_NATIVE_PROCESS_UNSAFE=1
+    return 1
+  fi
   FM_AFK_NATIVE_PID=$pid
 }
 

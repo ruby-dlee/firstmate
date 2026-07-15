@@ -268,6 +268,34 @@ if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
     exit 1
   fi
   LIFECYCLE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+  if [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ]; then
+    echo "error: inherited account lifecycle lock for $inherited_lock_id cannot transfer ownership" >&2
+    exit 1
+  fi
+  lifecycle_handoff_start=$(fm_account_process_start_time "$$") || {
+    echo "error: cannot record inherited account lifecycle lock handoff for $inherited_lock_id" >&2
+    exit 1
+  }
+  lifecycle_handoff_tmp=$(mktemp "$STATE/.account-lifecycle-$inherited_lock_id.handoff.XXXXXX") || exit 1
+  if ! printf '%s\n%s\n' "$$" "$lifecycle_handoff_start" > "$lifecycle_handoff_tmp"; then
+    rm -f "$lifecycle_handoff_tmp"
+    exit 1
+  fi
+  current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
+  if [ "$current_lock_identity" != "$inherited_lock_identity" ] \
+    || [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ] \
+    || ! mv "$lifecycle_handoff_tmp" "$LIFECYCLE_LOCK"; then
+    rm -f "$lifecycle_handoff_tmp"
+    echo "error: inherited account lifecycle lock was lost before ownership handoff for $inherited_lock_id" >&2
+    exit 1
+  fi
+  LIFECYCLE_LOCK_OWNED=1
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  # The handoff replaces the lock inode while live ownership prevents reclaim until this child releases the replacement.
+  if ! fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK"; then
+    echo "error: inherited account lifecycle lock ownership handoff failed for $inherited_lock_id" >&2
+    exit 1
+  fi
 fi
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
@@ -1842,8 +1870,8 @@ if [ "$lifecycle_lock_valid" != 1 ]; then
   echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
   exit 1
 fi
+META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
     echo "error: managed task generation changed before metadata install for $ID" >&2
     exit 1

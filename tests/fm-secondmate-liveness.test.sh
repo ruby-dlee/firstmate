@@ -432,7 +432,7 @@ SH
     cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'session-sync %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
-exit 1
+exit 0
 SH
     cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
@@ -441,11 +441,20 @@ printf 'spawn %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
 count=$(grep -c '^spawn ' "$FM_ROLLBACK_CALL_LOG")
 meta="$FM_HOME/state/$1.meta"
 if [ "$count" -eq 1 ]; then
+  . "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
+  lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
+  start=$(fm_account_process_start_time "$$") || exit 1
+  handoff=$(mktemp "$FM_HOME/state/.rollback-handoff.XXXXXX") || exit 1
+  printf '%s\n%s\n' "$$" "$start" > "$handoff" || exit 1
+  mv "$handoff" "$lock" || exit 1
+  trap 'fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true' EXIT
   tmp=$(mktemp "$FM_HOME/state/.rollback-test.XXXXXX") || exit 1
   grep -v '^account_rollback_cleanup=pending$' "$meta" > "$tmp" || exit 1
   mv "$tmp" "$meta" || exit 1
   exit 1
 fi
+[ -f "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}" ] || exit 9
+printf 'fresh-lock %s\n' "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" >> "$FM_ROLLBACK_CALL_LOG"
 exit 0
 SH
     chmod +x "$fake_root/bin/"*.sh
@@ -453,23 +462,74 @@ SH
     log="$w/calls.log"; : > "$log"
 
     out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
-      FM_ROOT_OVERRIDE="$fake_root" FM_ROLLBACK_CALL_LOG="$log")
+      FM_ROOT_OVERRIDE="$fake_root" FM_ROLLBACK_CALL_LOG="$log" FM_TEST_REAL_ROOT="$ROOT")
 
     assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: rollback reconciled and respawned" \
       "$variant rollback recovery did not converge in the liveness sweep"
-    assert_not_contains "$(cat "$log")" "session-sync" \
-      "$variant rollback recovery was blocked by pre-bind session synchronization"
+    assert_contains "$(cat "$log")" "fresh-lock" \
+      "$variant rollback recovery reused the child-released lifecycle lock instead of acquiring a fresh one"
     grep -q '^spawn sm1 --secondmate --resume-account$' "$log" \
       || fail "$variant rollback recovery did not enter rollback-first resume: $(cat "$log")"
     if [ "$variant" = profile ]; then
       [ "$(grep -c '^spawn sm1 --secondmate --resume-account$' "$log")" -eq 2 ] \
         || fail "profile rollback recovery did not retry the restored managed generation"
+      [ "$(grep -c '^session-sync ' "$log")" -eq 1 ] \
+        || fail "profile rollback recovery did not redo session sync exactly once under its fresh lock"
     else
+      assert_not_contains "$(cat "$log")" "session-sync" \
+        "profileless rollback recovery unexpectedly ran managed session synchronization"
       assert_contains "$(cat "$log")" "spawn sm1 --secondmate --no-account-routing" \
         "profileless rollback recovery did not retry its restored unmanaged generation"
     fi
   done
   pass "pending secondmate rollback recovery bypasses pre-bind gating and converges"
+}
+
+test_sweep_parent_skips_release_after_spawn_handoff() {
+  local w fb tmuxfb log out fake_root sleeper_pid lock
+  w=$(new_world sweep-parent-skip-release)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+. "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
+lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid=$!
+start=$(fm_account_process_start_time "$pid") || exit 1
+handoff=$(mktemp "$FM_HOME/state/.parent-skip-handoff.XXXXXX") || exit 1
+printf '%s\n%s\n' "$pid" "$start" > "$handoff" || exit 1
+mv "$handoff" "$lock" || exit 1
+printf '%s\n' "$pid" > "$FM_PARENT_SKIP_PID"
+exit 0
+SH
+  cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake_root/bin/"*.sh
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_PARENT_SKIP_PID="$w/sleeper-pid")
+  sleeper_pid=$(cat "$w/sleeper-pid" 2>/dev/null || true)
+  lock="$w/home/state/.account-lifecycle-sm1.lock"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "parent treated a successfully handed-off lock as its own release failure"
+  [ -n "$sleeper_pid" ] && kill -0 "$sleeper_pid" 2>/dev/null \
+    || fail "handoff simulation did not leave its child owner alive"
+  [ "$(sed -n '1p' "$lock" 2>/dev/null)" = "$sleeper_pid" ] \
+    || fail "parent released or replaced the child-owned lifecycle lock"
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -f "$lock"
+  pass "sweep: parent skips release after lifecycle ownership handoff"
 }
 
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
@@ -676,6 +736,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  test_pending_rollback_recovery_bypasses_session_gate_and_retries
+  test_sweep_parent_skips_release_after_spawn_handoff
+  test_enforced_recovery_sweep_installs_meta_with_inherited_lock
+  exit 0
+fi
+
 test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
 test_herdr_agent_alive_preserves_identity_state
@@ -684,6 +751,7 @@ test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_rechecks_liveness_after_lifecycle_lock
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
+test_sweep_parent_skips_release_after_spawn_handoff
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_never_acts_on_inconclusive_reading

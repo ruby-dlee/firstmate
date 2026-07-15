@@ -165,6 +165,28 @@ unit_stop_rejects_reused_pid() {
   rm -rf "$st"
 }
 
+unit_stop_rejects_native_marker_for_unrelated_command() {
+  local st sleeper_pid identity
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-command.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  identity=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '. "$1"; fm_afk_native_process_identity "$2"' _ "$START" "$sleeper_pid")
+  printf '%s\n%s\n' "$sleeper_pid" "$identity" > "$st/state/.afk-native-process"
+  if ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1 \
+    && ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1 \
+    && kill -0 "$sleeper_pid" 2>/dev/null \
+    && [ -e "$st/state/.afk" ] && [ -e "$st/state/.afk-native-process" ]; then
+    pass "native process identity: matching PID start time cannot authorize an unrelated command"
+  else
+    fail "native process identity: unrelated command was refreshed, signaled, or cleared"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_failed_start_rolls_back_state() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start.XXXXXX")
@@ -800,7 +822,7 @@ unit_native_start_stop_handoff_is_atomic() {
   local st daemon starter stopper i
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-race.XXXXXX")
   mkdir -p "$st/state"
-  daemon="$st/fake-daemon.sh"
+  daemon="$st/fm-supervise-daemon.sh"
   cat > "$daemon" <<'SH'
 #!/usr/bin/env bash
 trap 'exit 0' INT TERM
@@ -847,7 +869,7 @@ unit_direct_native_start_stop_handoff_is_atomic() {
   local st daemon starter stopper i
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-direct-native-race.XXXXXX")
   mkdir -p "$st/state"
-  daemon="$st/fake-daemon.sh"
+  daemon="$st/fm-supervise-daemon.sh"
   cat > "$daemon" <<'SH'
 #!/usr/bin/env bash
 trap 'exit 0' INT TERM
@@ -1258,6 +1280,46 @@ unit_incomplete_restore_retains_backup() {
   rm -rf "$st"
 }
 
+unit_afk_backups_reject_unsafe_or_oversized_sources() {
+  local st outside backup
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-backup-source.XXXXXX")
+  mkdir -p "$st/state"
+  outside="$st/outside"
+  printf 'outside\n' > "$outside"
+  ln -s "$outside" "$st/state/.afk"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=captain:0 \
+    FM_SUPERVISOR_BACKEND=tmux bash -c '
+      . "$1"
+      daemon_lock_held_by_live_daemon() { return 1; }
+      ! fm_afk_launch_start
+    ' _ "$LAUNCH" && [ "$(cat "$outside")" = outside ]; then
+    pass "AFK backup: terminal startup refuses a symlinked source"
+  else
+    fail "AFK backup: terminal startup opened or altered a symlinked source"
+  fi
+  rm -f "$st/state/.afk"
+  head -c 1048577 /dev/zero > "$st/state/.subsuper-escalations"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    daemon_lock_held_by_live_daemon() { return 1; }
+    ! fm_afk_launch_start_native_locked
+  ' _ "$LAUNCH"; then
+    pass "AFK backup: native startup rejects an oversized source"
+  else
+    fail "AFK backup: native startup accepted an oversized source"
+  fi
+  rm -f "$st/state/.subsuper-escalations"
+  backup=$(mktemp -d "$st/state/.afk-launch-backup.XXXXXX")
+  ln -s "$outside" "$backup/.subsuper-escalations"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '. "$1"; ! fm_afk_launch_restore_backup "$2" 0' _ "$LAUNCH" "$backup" \
+    && [ -d "$backup" ] && [ ! -e "$st/state/.subsuper-escalations" ]; then
+    pass "AFK backup: incomplete restore refuses a symlink and retains the backup"
+  else
+    fail "AFK backup: restore followed a symlink or discarded its retry state"
+  fi
+  rm -rf "$st"
+}
+
 unit_flag_write_failure_aborts() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-flag-fail.XXXXXX")
@@ -1466,11 +1528,21 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  unit_stop_rejects_native_marker_for_unrelated_command
+  unit_afk_backups_reject_unsafe_or_oversized_sources
+  unit_native_start_stop_handoff_is_atomic
+  unit_direct_native_start_stop_handoff_is_atomic
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
+unit_stop_rejects_native_marker_for_unrelated_command
 unit_failed_start_rolls_back_state
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
@@ -1514,6 +1586,7 @@ unit_legacy_supervisor_fallback_is_usable
 unit_clear_failure_aborts_entry
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
+unit_afk_backups_reject_unsafe_or_oversized_sources
 unit_flag_write_failure_aborts
 unit_flag_staging_does_not_follow_predictable_symlink
 e2e_herdr

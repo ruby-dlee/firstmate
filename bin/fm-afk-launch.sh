@@ -84,6 +84,37 @@ fm_afk_launch_path_identity() {
   fi
 }
 
+fm_afk_launch_file_size() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%z' "$1" 2>/dev/null
+  else
+    stat -c '%s' "$1" 2>/dev/null
+  fi
+}
+
+fm_afk_launch_copy_bounded() {  # <source> <destination>
+  local source=$1 destination=$2 expected actual pending cap=1048576
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  expected=$(fm_afk_launch_file_size "$source") || return 1
+  case "$expected" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$expected" -le "$cap" ] || return 1
+  pending=$(mktemp "$destination.pending.XXXXXX") || return 1
+  if ! head -c "$((cap + 1))" "$source" > "$pending" 2>/dev/null; then
+    rm -f "$pending"
+    return 1
+  fi
+  actual=$(LC_ALL=C wc -c < "$pending" | tr -d '[:space:]') || {
+    rm -f "$pending"
+    return 1
+  }
+  if [ "$actual" != "$expected" ] || [ ! -f "$source" ] || [ -L "$source" ] \
+    || [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    rm -f "$pending"
+    return 1
+  fi
+  mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
+}
+
 fm_afk_launch_read_control() {
   local file=$1 snapshot bytes cap=4096
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -592,11 +623,11 @@ fm_afk_launch_restore_backup() {  # <backup> <had-afk>
     "$FM_AFK_LAUNCH_STATE/.subsuper-escalations.since" \
     "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" || result=1
   if [ "$had_afk" -eq 1 ]; then
-    cp "$backup/.afk" "$FM_AFK_LAUNCH_STATE/.afk" || result=1
+    fm_afk_launch_copy_bounded "$backup/.afk" "$FM_AFK_LAUNCH_STATE/.afk" || result=1
   fi
   for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
-    if [ -e "$backup/$artifact" ]; then
-      cp -p "$backup/$artifact" "$FM_AFK_LAUNCH_STATE/$artifact" || result=1
+    if [ -e "$backup/$artifact" ] || [ -L "$backup/$artifact" ]; then
+      fm_afk_launch_copy_bounded "$backup/$artifact" "$FM_AFK_LAUNCH_STATE/$artifact" || result=1
     fi
   done
   if [ "$result" -eq 0 ]; then
@@ -726,13 +757,13 @@ fm_afk_launch_start() {
   fi
 
   backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
-  if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
+  if [ -e "$FM_AFK_LAUNCH_STATE/.afk" ] || [ -L "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
-    cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+    fm_afk_launch_copy_bounded "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
   fi
   for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
-    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
-      cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
+    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ] || [ -L "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
+      fm_afk_launch_copy_bounded "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
     fi
   done
   if ! fm_afk_launch_reconcile; then
@@ -784,6 +815,10 @@ fm_afk_launch_start_native_locked() {
     fm_afk_launch_log "native daemon process already starting or active; refreshed away-mode flag"
     return 0
   fi
+  if [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" = 1 ]; then
+    fm_afk_launch_log "native daemon process marker does not identify an away-mode daemon; refusing refresh"
+    return 1
+  fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_flag_write || return 1
@@ -791,13 +826,13 @@ fm_afk_launch_start_native_locked() {
     return 0
   fi
   backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
-  if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
+  if [ -e "$FM_AFK_LAUNCH_STATE/.afk" ] || [ -L "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
-    cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+    fm_afk_launch_copy_bounded "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
   fi
   for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
-    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
-      cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
+    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ] || [ -L "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
+      fm_afk_launch_copy_bounded "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
     fi
   done
   fm_afk_launch_reconcile || result=1
@@ -853,6 +888,10 @@ fm_afk_launch_stop_locked() {
   elif [ -e "$FM_AFK_NATIVE_PROCESS" ]; then
     if fm_afk_native_process_live; then
       fm_afk_launch_log "live native daemon process conflicts with the recorded terminal; preserving lifecycle state"
+      return 1
+    fi
+    if [ "$FM_AFK_NATIVE_PROCESS_UNSAFE" = 1 ]; then
+      fm_afk_launch_log "native daemon process marker does not identify an away-mode daemon; refusing to signal pid=$(sed -n '1p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)"
       return 1
     fi
     rm -f "$FM_AFK_NATIVE_PROCESS" || return 1

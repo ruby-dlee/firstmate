@@ -1772,34 +1772,63 @@ SH
 }
 
 test_required_report_blocks_then_publishes_before_cleanup() {
-  local case_dir data stack rc
+  local case_dir data stack live quiesced rc
   case_dir=$(make_case report-publication)
   data="$case_dir/data"
   stack="$case_dir/report-stack"
+  live="$case_dir/report-endpoint-live"
+  quiesced="$case_dir/report-endpoint-quiesced"
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'report_required=1' >> "$case_dir/state/task-x1.meta"
   mkdir -p "$data/task-x1"
   printf '# Task\n\nPublish before cleanup\n' > "$data/task-x1/brief.md"
   printf 'done: implementation landed\n' > "$case_dir/state/task-x1.status"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    if [ -f "$FM_FAKE_COMPLETION_PATH" ]; then
+      printf '\nQuiesced final state.\n' >> "$FM_FAKE_COMPLETION_PATH"
+    fi
+    rm -f "$FM_FAKE_REPORT_LIVE"
+    touch "$FM_FAKE_REPORT_QUIESCED"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  touch "$live"
 
   set +e
-  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" FM_FAKE_REPORT_LIVE="$live" \
+    FM_FAKE_REPORT_QUIESCED="$quiesced" FM_FAKE_COMPLETION_PATH="$data/task-x1/completion.md" \
     run_teardown "$case_dir" > "$case_dir/missing-stdout" 2> "$case_dir/missing-stderr"
   rc=$?
   set -e
   expect_code 1 "$rc" "required report: teardown without completion.md must fail"
+  assert_present "$quiesced" "required report failure did not quiesce its endpoint before publication"
   assert_present "$case_dir/state/task-x1.meta" "required report failure erased task metadata"
   assert_grep 'required completion report is missing' "$case_dir/missing-stderr" \
     "required report failure did not explain the missing artifact"
 
   printf '# Completion\n\n## Summary\n\nPublication is ready.\n\n## What changed\n\nHooked teardown.\n\n## Verification\n\nTested.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport stack.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  rm -f "$quiesced"
+  touch "$live"
   FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
-    FM_EXPECT_REPORT_PATH="$stack/index.html" run_teardown "$case_dir" \
+    FM_FAKE_REPORT_LIVE="$live" FM_FAKE_REPORT_QUIESCED="$quiesced" \
+    FM_FAKE_COMPLETION_PATH="$data/task-x1/completion.md" FM_EXPECT_REPORT_PATH="$stack/index.html" \
+    run_teardown "$case_dir" \
       > "$case_dir/report-stdout" 2> "$case_dir/report-stderr" \
     || fail "required report: teardown failed after completion report was ready: $(cat "$case_dir/report-stderr")"
+  assert_present "$quiesced" "required report publication did not confirm endpoint quiescence"
   assert_present "$stack/index.html" "required report was not published"
+  grep -R -F 'Quiesced final state.' "$stack/entries" >/dev/null \
+    || fail "required report was published from stale pre-quiescence content"
   assert_absent "$case_dir/state/task-x1.meta" "successful report teardown left task metadata"
-  pass "teardown fails closed on a missing report and publishes before worktree cleanup"
+  pass "teardown quiesces before publishing and still publishes before cleanup"
 }
 
 test_local_only_fork_remote_allows

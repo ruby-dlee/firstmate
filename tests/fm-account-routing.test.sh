@@ -1714,6 +1714,47 @@ SH
   pass "session synchronization fails closed on metadata publication"
 }
 
+test_session_sync_lineage_failure_restores_unbound_metadata() {
+  local id rec meta_tmp lineage saved before_lineage after_lineage out status
+  id=account-sync-lineage-z27a
+  rec=$(make_case sync-lineage claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session lineage precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  lineage="$HOME_DIR/data/$id/account-attempts.md"
+  saved="$CASE_DIR/account-attempts.saved"
+  before_lineage=$(grep -c 'event=session-bound' "$lineage")
+  mv "$lineage" "$saved"
+  mkdir "$lineage"
+
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
+    FM_FAKE_AF_POOL=claude-crew FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_PROVIDER=claude \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "session sync reported success after lineage publication failed"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "failed lineage publication left durable session binding"
+  assert_contains "$out" 'restored unbound metadata' "failed lineage publication did not report metadata rollback"
+
+  rmdir "$lineage"
+  mv "$saved" "$lineage"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
+    FM_FAKE_AF_POOL=claude-crew FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_PROVIDER=claude \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require >/dev/null \
+    || fail "session sync retry could not publish binding and lineage"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "session sync retry did not restore durable binding"
+  after_lineage=$(grep -c 'event=session-bound' "$lineage")
+  [ "$after_lineage" -eq $((before_lineage + 1)) ] || fail "session sync retry did not append exactly one lineage event"
+  pass "session synchronization rolls back binding when lineage publication fails"
+}
+
 test_oversized_continuation_stops_before_mutation() {
   local id rec out status later_source
   id=account-continuation-size-z28
@@ -1812,6 +1853,32 @@ SH
   [ "$(wc -c < "$HOME_DIR/data/$id/brief.md" | tr -d '[:space:]')" = "$brief_bytes" ] \
     || fail "oversized task-owned continuation source was modified"
   pass "continuation caps informational snapshots and rejects task-owned overflow"
+}
+
+test_continuation_rejects_symlinked_packet_destination() {
+  local id rec outside packet out status
+  id=account-continuation-destination-z28c
+  rec=$(make_case continuation-destination claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation destination precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  outside="$CASE_DIR/outside-packets"
+  packet="$HOME_DIR/data/$id/continuation-symlink-destination.md"
+  mkdir "$outside"
+  ln -s "$outside" "$packet"
+
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" symlink-destination 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "continuation accepted a symlinked packet destination"
+  assert_contains "$out" 'unsafe continuation packet destination' "symlinked packet destination refusal was unclear"
+  assert_present "$packet" "continuation replaced the unsafe destination symlink"
+  [ -z "$(find "$outside" -mindepth 1 -maxdepth 1 -print -quit)" ] || fail "continuation moved its packet through the destination symlink"
+  pass "continuation rejects symlinked packet destinations"
 }
 
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
@@ -2186,9 +2253,11 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery
 test_managed_tmux_identity_survives_window_rename
 test_native_resume_rejects_regressed_sessionstart_evidence
 test_session_sync_metadata_publish_failure_is_closed
+test_session_sync_lineage_failure_restores_unbound_metadata
 test_oversized_continuation_stops_before_mutation
 test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
+test_continuation_rejects_symlinked_packet_destination
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal

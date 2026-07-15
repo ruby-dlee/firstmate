@@ -103,6 +103,8 @@ META="$STATE/$ID.meta"
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
 META_LOCK=
+META_TMP=
+META_ROLLBACK_TMP=
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   expected_lifecycle_lock="$STATE/.account-lifecycle-$ID.lock"
   if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" != "$expected_lifecycle_lock" ] \
@@ -116,6 +118,8 @@ else
   LIFECYCLE_LOCK_OWNED=1
 fi
 release_locks() {
+  [ -z "$META_TMP" ] || rm -f "$META_TMP"
+  [ -z "$META_ROLLBACK_TMP" ] || rm -f "$META_ROLLBACK_TMP"
   [ -z "$META_LOCK" ] || fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
   [ "$LIFECYCLE_LOCK_OWNED" != 1 ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
 }
@@ -195,10 +199,24 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "$session_id" ]; then
 fi
 if [ -z "$EXISTING" ]; then
   META_TMP="$STATE/.$ID.meta.sync.$$"
-  awk '!/^provider_session_id=/' "$META" > "$META_TMP" || { rm -f "$META_TMP"; exit 1; }
+  META_ROLLBACK_TMP="$STATE/.$ID.meta.sync-rollback.$$"
+  awk '!/^provider_session_id=/' "$META" > "$META_ROLLBACK_TMP" || exit 1
+  cp -p "$META_ROLLBACK_TMP" "$META_TMP" || exit 1
   printf 'provider_session_id=%s\n' "$session_id" >> "$META_TMP" || { rm -f "$META_TMP"; exit 1; }
   mv "$META_TMP" "$META" || { rm -f "$META_TMP"; exit 1; }
-  fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)" || exit 1
+  META_TMP=
+  if ! fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)"; then
+    if mv "$META_ROLLBACK_TMP" "$META"; then
+      META_ROLLBACK_TMP=
+    else
+      echo "error: session lineage failed and prior metadata could not be restored for $ID" >&2
+      exit 1
+    fi
+    echo "error: session lineage publication failed; restored unbound metadata for $ID" >&2
+    exit 1
+  fi
+  rm -f "$META_ROLLBACK_TMP"
+  META_ROLLBACK_TMP=
 fi
 fm_account_meta_lock_release "$META_LOCK" || exit 1
 if [ "$PRINT_UPDATED_AT" = 1 ]; then

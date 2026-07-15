@@ -295,6 +295,10 @@ append_file_section "Provider transcript summary" "$TASK_DIR/transcript-summary.
 append_file_section "Account attempt lineage" "$TASK_DIR/account-attempts.md"
 
 packet_check_budget
+if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then
+  echo "error: unsafe continuation packet destination for $ID" >&2
+  exit 1
+fi
 mv "$PACKET_TMP" "$PACKET" || exit 1
 PACKET_TMP=
 printf '%s\n' "$PACKET"

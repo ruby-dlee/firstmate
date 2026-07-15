@@ -203,16 +203,9 @@ quiesce_secondmate_endpoint() {
   return 1
 }
 
-release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
-  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status rollback_backup lock
-  MANAGED_ACCOUNT_LOCK=
-  profile=$(fm_meta_get "$meta" account_profile)
-  [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
+quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
+  local meta=$1 task=$2 probe_home=${3:-} meta_state lock profile backend target zellij_tab endpoint_status
   meta_state=$(dirname "$meta")
-  if [ -z "$lifecycle_lock" ]; then
-    lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$meta_state" "$task") || return 1
-    TEARDOWN_ACCOUNT_LOCKS+=("$lifecycle_lock")
-  fi
   lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
   [ -f "$meta" ] || {
     echo "error: managed metadata for $task disappeared during teardown" >&2
@@ -228,8 +221,6 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
-  account_task=$(fm_meta_get "$meta" account_task)
-  [ -n "$account_task" ] || account_task=$task
   fm_account_meta_lock_release "$lock" || return 1
   if [ -n "$target" ]; then
     if [ -n "$probe_home" ]; then
@@ -239,12 +230,40 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
     fi
   fi
   if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
-    :
+    return 0
   else
     endpoint_status=$?
-    managed_endpoint_blocker "$endpoint_status" "$task"
+  fi
+  managed_endpoint_blocker "$endpoint_status" "$task"
+  return 1
+}
+
+release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
+  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state rollback_backup lock
+  MANAGED_ACCOUNT_LOCK=
+  profile=$(fm_meta_get "$meta" account_profile)
+  [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
+  meta_state=$(dirname "$meta")
+  if [ -z "$lifecycle_lock" ]; then
+    lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$meta_state" "$task") || return 1
+    TEARDOWN_ACCOUNT_LOCKS+=("$lifecycle_lock")
+  fi
+  quiesce_managed_account_endpoint "$meta" "$task" "$probe_home" || return 1
+  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+  [ -f "$meta" ] || {
+    echo "error: managed metadata for $task disappeared during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  profile=$(fm_meta_get "$meta" account_profile)
+  if [ -z "$profile" ] && [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; then
+    echo "error: managed metadata for $task changed during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   fi
+  account_task=$(fm_meta_get "$meta" account_task)
+  [ -n "$account_task" ] || account_task=$task
+  fm_account_meta_lock_release "$lock" || return 1
   if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
     rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
     fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
@@ -1162,18 +1181,47 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-# New tasks fail closed on their machine-global completion report before the
-# first destructive action below (managed lease release). Tasks already in
-# flight when this feature lands have no report_required marker and retain the
-# legacy teardown contract. --force is an explicit discard, not a completion.
+PROBE_HOME=
+ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
+[ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME
+
+quiesce_completion_report_endpoint() {
+  local endpoint_status zellij_tab
+  if [ "$MANAGED_ACCOUNT" = 1 ]; then
+    quiesce_managed_account_endpoint "$META" "$ID" "$PROBE_HOME"
+    return $?
+  fi
+  zellij_tab=$(meta_value "$META" zellij_tab_id)
+  if [ -n "$T" ]; then
+    if [ -n "$PROBE_HOME" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME"; then
+    return 0
+  else
+    endpoint_status=$?
+  fi
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "error: completion-report endpoint state for $ID is unknown; retaining metadata" >&2
+  else
+    echo "error: completion-report endpoint for $ID is still alive; retaining metadata" >&2
+  fi
+  return 1
+}
+
+# New tasks quiesce their endpoint and fail closed on their machine-global
+# completion report before the first destructive action below. Tasks already
+# in flight when this feature lands have no report_required marker and retain
+# the legacy teardown contract. --force is an explicit discard, not a completion.
 if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
+  quiesce_completion_report_endpoint || exit 1
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
     "$FM_ROOT/bin/fm-report-stack.mjs" publish "$ID" || exit 1
 fi
 
-PROBE_HOME=
-ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
-[ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME
 if [ "$MANAGED_ACCOUNT" = 1 ]; then
   release_managed_account "$META" "$ID" "$PROBE_HOME" "$ACCOUNT_DELETE_LOCK" || exit 1
 fi

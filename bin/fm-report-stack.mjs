@@ -117,17 +117,23 @@ function firstSummary(markdown, fallback) {
 
 function levelTwoHeadings(markdown) {
   const headings = new Set();
-  const backtickFence = String.fromCharCode(96).repeat(3);
-  let fence = "";
+  let fence;
   for (const line of String(markdown).split(/\r?\n/)) {
     const trimmed = line.trimStart();
-    const marker = trimmed.startsWith(backtickFence) ? backtickFence : trimmed.startsWith("~~~") ? "~~~" : "";
-    if (marker) {
-      if (!fence) fence = marker;
-      else if (marker === fence) fence = "";
+    const marker = trimmed.match(/^(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker
+        && marker[1][0] === fence.character
+        && marker[1].length >= fence.length
+        && marker[2].trim() === "") {
+        fence = undefined;
+      }
       continue;
     }
-    if (fence) continue;
+    if (marker) {
+      fence = { character: marker[1][0], length: marker[1].length };
+      continue;
+    }
     const heading = line.match(/^##[ \t]+(.+?)[ \t]*#*[ \t]*$/);
     if (heading) headings.add(heading[1].trim().toLowerCase());
   }

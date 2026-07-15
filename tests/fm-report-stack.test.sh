@@ -384,6 +384,93 @@ test_required_sections_fail_actionably() {
   pass "report stack rejects incomplete reports with a retry-safe actionable correction"
 }
 
+test_nested_short_fences_do_not_satisfy_required_sections() {
+  local id source out status heading
+
+  id=report-four-backtick-fence-b3b
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+Incomplete.
+
+````markdown
+```
+## What changed
+
+Hidden example.
+
+## Verification
+
+Hidden example.
+
+## Visual evidence
+
+Hidden example.
+
+## Follow-ups
+
+Hidden example.
+```
+````
+
+## Artifacts
+
+None.
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "headings inside a four-backtick fence unexpectedly satisfied the report contract"
+  for heading in "## What changed" "## Verification" "## Visual evidence" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "four-backtick fence failure omitted missing heading $heading"
+  done
+
+  id=report-four-tilde-fence-b3c
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+Incomplete.
+
+~~~~markdown
+~~~
+## What changed
+
+Hidden example.
+
+## Verification
+
+Hidden example.
+
+## Visual evidence
+
+Hidden example.
+
+## Follow-ups
+
+Hidden example.
+~~~
+~~~~
+
+## Artifacts
+
+None.
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "headings inside a four-tilde fence unexpectedly satisfied the report contract"
+  for heading in "## What changed" "## Verification" "## Visual evidence" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "four-tilde fence failure omitted missing heading $heading"
+  done
+  pass "report section validation respects the opening Markdown fence length"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
@@ -767,6 +854,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
+  test_required_sections_fail_actionably
+  test_nested_short_fences_do_not_satisfy_required_sections
+  exit 0
+fi
+
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
 test_pr_url_strips_query_and_fragment
@@ -779,6 +872,7 @@ test_report_temps_are_exclusive_and_randomized
 test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
+test_nested_short_fences_do_not_satisfy_required_sections
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized

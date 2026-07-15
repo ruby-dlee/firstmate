@@ -554,7 +554,11 @@ EOF
       return 1
     fi
     remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
-      '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null)
+      '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null) || {
+      echo "error: could not parse herdr husk-removal verification listing for tab '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
+      return 1
+    }
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2

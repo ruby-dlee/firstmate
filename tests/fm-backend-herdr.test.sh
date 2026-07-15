@@ -523,6 +523,27 @@ test_create_task_closes_replacement_when_husk_verification_list_fails() {
   pass "fm_backend_herdr_create_task: closes the exact replacement when verification listing fails"
 }
 
+test_create_task_closes_replacement_when_husk_verification_list_is_malformed() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/husk-verify-list-malformed"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-verify-malformed","workspace_id":"w1"}]}}\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/3.out"
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/4.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/5.out"
+  printf '{"result":{"tabs":["malformed",{"tab_id":"w1:t3","label":"fm-verify-malformed","workspace_id":"w1"}]}}\n' > "$resp/7.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-verify-malformed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the post-removal tab listing contains a malformed record"
+  assert_contains "$out" "could not parse herdr husk-removal verification listing" \
+    "create_task did not report the malformed verification listing"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t3' \
+    "create_task did not close the exact replacement tab after parsing the malformed verification listing failed"
+  pass "fm_backend_herdr_create_task: closes the exact replacement when the verification listing is malformed"
+}
+
 test_create_task_refuses_when_agent_state_ambiguous() {
   # An unexpected error code from agent get (neither agent_not_found nor a
   # successful read) must not be misread as a husk - fail-safe toward
@@ -2094,6 +2115,7 @@ test_create_task_closes_and_replaces_no_agent_husk
 test_create_task_closes_all_duplicate_husks_after_replacement
 test_create_task_refuses_when_preexisting_husk_tab_remains
 test_create_task_closes_replacement_when_husk_verification_list_fails
+test_create_task_closes_replacement_when_husk_verification_list_is_malformed
 test_create_task_refuses_when_agent_state_ambiguous
 test_create_task_husk_replacement_creates_before_closing
 test_create_task_creates_and_parses_ids

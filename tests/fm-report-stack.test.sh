@@ -972,6 +972,73 @@ test_visual_copy_is_descriptor_bounded() {
   pass "report visual copies are descriptor-bound and byte-capped"
 }
 
+test_visual_containment_precedes_ancestor_swap() {
+  local id=report-visual-race-f7 out status parent moved outside source shim tmp_real
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Stable visual containment."
+  parent="$HOME_DIR/data/$id/visuals/nested"
+  moved="$TMP_ROOT/pinned-visual-parent"
+  outside="$TMP_ROOT/outside-visual-parent"
+  source="$parent/evidence.png"
+  shim="$TMP_ROOT/visual-swap-preload.cjs"
+  mkdir -p "$parent" "$outside"
+  tmp_real=$(cd "$TMP_ROOT" && pwd -P)
+  parent=$(cd "$parent" && pwd -P)
+  outside=$(cd "$outside" && pwd -P)
+  moved="$tmp_real/pinned-visual-parent"
+  source="$parent/evidence.png"
+  printf 'inside visual bytes\n' > "$source"
+  printf 'outside private visual bytes\n' > "$outside/evidence.png"
+  cat > "$shim" <<'JS'
+const fs = require("fs");
+const path = require("path");
+const { syncBuiltinESMExports } = require("module");
+const originalLstatSync = fs.lstatSync.bind(fs);
+const originalRealpathSync = fs.realpathSync.bind(fs);
+const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
+const wanted = normalize(process.env.FM_REPORT_VISUAL_SWAP_FILE);
+let swapped = false;
+let lstatSeen = false;
+let realpathSeen = false;
+const swap = () => {
+  if (swapped) return;
+  swapped = true;
+  fs.renameSync(process.env.FM_REPORT_VISUAL_SWAP_PARENT, process.env.FM_REPORT_VISUAL_SWAP_MOVED);
+  fs.symlinkSync(process.env.FM_REPORT_VISUAL_SWAP_OUTSIDE, process.env.FM_REPORT_VISUAL_SWAP_PARENT, "dir");
+};
+fs.lstatSync = (target, ...args) => {
+  if (normalize(target) === wanted) {
+    if (realpathSeen) swap();
+    const result = originalLstatSync(target, ...args);
+    lstatSeen = true;
+    return result;
+  }
+  return originalLstatSync(target, ...args);
+};
+fs.realpathSync = (target, ...args) => {
+  if (normalize(target) === wanted) {
+    if (lstatSeen) swap();
+    realpathSeen = true;
+  }
+  return originalRealpathSync(target, ...args);
+};
+syncBuiltinESMExports();
+JS
+  if out=$(NODE_OPTIONS="--require=$shim" \
+    FM_REPORT_VISUAL_SWAP_FILE="$source" \
+    FM_REPORT_VISUAL_SWAP_PARENT="$parent" \
+    FM_REPORT_VISUAL_SWAP_MOVED="$moved" \
+    FM_REPORT_VISUAL_SWAP_OUTSIDE="$outside" \
+    run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "ancestor-swapped visual unexpectedly published: $out"
+  assert_contains "$out" "visual evidence escapes its task directory" \
+    "ancestor-swapped visual refusal omitted its containment failure"
+  if grep -R -F 'outside private visual bytes' "$STACK" >/dev/null 2>&1; then
+    fail "ancestor-swapped outside visual escaped into the report stack"
+  fi
+  pass "report visual containment binds identity before ancestor resolution"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_stale_lock_rejects_reused_pid
   test_stale_lock_reclaim_is_serialized
@@ -1000,6 +1067,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   test_same_generation_republish_preserves_revision_without_worktree
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
+  test_visual_containment_precedes_ancestor_swap
   exit 0
 fi
 
@@ -1047,5 +1119,6 @@ test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
 test_visual_copy_is_descriptor_bounded
+test_visual_containment_precedes_ancestor_swap
 test_source_symlinks_fail_closed
 test_ambiguous_task_ids_require_report_ids

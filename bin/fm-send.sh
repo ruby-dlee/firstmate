@@ -318,8 +318,17 @@ else
   record_pending_managed_steering() {
     persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
   }
+  record_unconfirmed_managed_steering() {
+    persist_managed_steering steering-unconfirmed.md '# Unconfirmed steering' ' (delivery unconfirmed)' "$@"
+  }
   if [ -n "$MANAGED_STEERING_ID" ]; then
-    if ! record_managed_steering "$@"; then
+    if [ "$verdict" = unknown ]; then
+      if record_unconfirmed_managed_steering "$@"; then
+        echo "warning: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
+      else
+        echo "warning: text delivery to $T could not be confirmed or durably recorded" >&2
+      fi
+    elif ! record_managed_steering "$@"; then
       if record_pending_managed_steering "$@"; then
         echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
       else
@@ -328,11 +337,13 @@ else
     fi
     if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
       MANAGED_LIFECYCLE_LOCK=
+    elif [ "$verdict" = unknown ]; then
+      echo "warning: text delivery to $T was unconfirmed and its managed lifecycle lock could not be released cleanly" >&2
     else
       echo "warning: text was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
     fi
   fi
-  # Submit landed (verdict was not pending/send-failed). Confirmation only proves
+  # The submit attempt finished without a positively-confirmed pending composer. Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the
   # turn before its busy footer shows. Pause so an immediate peek catches the
   # crewmate actually working instead of the stale idle pane. FM_SEND_SETTLE=0

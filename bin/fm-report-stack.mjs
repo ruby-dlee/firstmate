@@ -596,14 +596,14 @@ function copyVisuals(source, destination, dataRoot) {
         if (dirent.isSymbolicLink()) throw new Error(`visual evidence must not contain symlinks at ${input}`);
         if (dirent.isDirectory()) visit(input, nextRelative, depth + 1);
         if (!dirent.isFile()) continue;
+        const initial = fs.lstatSync(input);
+        if (initial.isSymbolicLink() || !initial.isFile()) {
+          throw new Error(`visual evidence must contain only real files at ${input}`);
+        }
         const inputReal = fs.realpathSync(input);
         const inputRelative = path.relative(sourceReal, inputReal);
         if (inputRelative === ".." || inputRelative.startsWith(`..${path.sep}`) || path.isAbsolute(inputRelative)) {
           throw new Error(`visual evidence escapes its task directory at ${input}`);
-        }
-        const initial = fs.lstatSync(input);
-        if (initial.isSymbolicLink() || !initial.isFile()) {
-          throw new Error(`visual evidence must contain only real files at ${input}`);
         }
         const output = path.join(destination, "visuals", nextRelative);
         fs.mkdirSync(path.dirname(output), { recursive: true });

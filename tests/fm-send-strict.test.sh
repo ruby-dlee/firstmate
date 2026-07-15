@@ -50,6 +50,7 @@ case "${1:-}" in
     printf '%%1\n'
     exit 0 ;;
   capture-pane)
+    [ "${FM_FAKE_TMUX_CAPTURE_FAIL:-0}" != 1 ] || exit 1
     printf '\xe2\x94\x82 \xe2\x94\x82\n'
     exit 0 ;;
   list-windows)
@@ -215,6 +216,34 @@ test_explicit_managed_target_records_steering() {
   assert_grep "Preserve this explicit managed steer" "$trail" \
     "explicit managed target delivery was absent from the provider-neutral steering trail"
   pass "fm-send strict: explicit targets resolved to managed metadata are audited"
+}
+
+test_unknown_managed_delivery_is_recorded_unconfirmed() {
+  local dir fb home err log rc unconfirmed
+  dir="$TMP_ROOT/managed-unknown"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-unknown)
+  err="$dir/send.err"; log="$dir/tmux.log"; unconfirmed="$home/data/managed-unknown/steering-unconfirmed.md"
+  mkdir -p "$home/data/managed-unknown"
+  : > "$log"
+  fm_write_meta "$home/state/managed-unknown.meta" \
+    "window=sess:fm-managed-unknown" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-unknown:attempt-1" "account_profile=codex-2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE_FAIL=1 FM_SEND_SETTLE=0 \
+    "$SEND" managed-unknown "Preserve this unknown delivery verbatim." >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "unknown managed delivery should retain the lenient send result"
+  assert_present "$unconfirmed" "unknown managed delivery was not durably audited"
+  assert_grep 'delivery unconfirmed' "$unconfirmed" "unknown steering audit omitted its delivery verdict"
+  assert_grep '> Preserve this unknown delivery verbatim.' "$unconfirmed" \
+    "unknown steering audit changed the instruction content"
+  assert_absent "$home/data/managed-unknown/steering.md" \
+    "unknown delivery was recorded as canonical steering"
+  assert_absent "$home/data/managed-unknown/steering-pending.md" \
+    "unknown delivery was recorded as delivered pending steering"
+  assert_contains "$(cat "$err")" "durably recorded as unconfirmed" \
+    "unknown delivery warning omitted its explicit verdict"
+  pass "fm-send strict: unknown managed delivery remains explicitly unconfirmed"
 }
 
 test_concurrent_managed_steering_is_serialized_and_atomic() {
@@ -470,6 +499,11 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
+  test_unknown_managed_delivery_is_recorded_unconfirmed
+  exit 0
+fi
+
 test_exact_lane_id_send_still_works
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
@@ -478,6 +512,7 @@ test_unmatched_single_colon_target_must_exist
 test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
+test_unknown_managed_delivery_is_recorded_unconfirmed
 test_concurrent_managed_steering_is_serialized_and_atomic
 test_managed_send_revalidates_after_respawn_wait
 test_managed_send_holds_lifecycle_through_audit

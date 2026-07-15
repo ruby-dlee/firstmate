@@ -865,6 +865,16 @@ fm_account_json_field() {  # <json> <jq-expression> <label>
   printf '%s\n' "$value"
 }
 
+fm_account_reconcile_lease_mutation() {  # <binary> <task> <operation>
+  local binary=$1 task=$2 operation=$3
+  FM_ACCOUNT_RECONCILED_JSON=
+  if FM_ACCOUNT_RECONCILED_JSON=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
+    return 0
+  fi
+  echo "error: Agent Fleet $operation failed and ownership could not be reconciled for $task" >&2
+  return 2
+}
+
 # Sets FM_ACCOUNT_SELECTED_PROFILE and FM_ACCOUNT_SELECTED_PROVIDER.
 # In observe mode these are shadow values only and callers must not persist or
 # apply them.
@@ -913,13 +923,10 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
     else
       if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness"); then status=0; else status=$?; fi
     fi
-    if [ "$status" -eq 124 ]; then
-      if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
-        status=0
-      else
-        echo "error: Agent Fleet lease mutation timed out and ownership could not be reconciled for $task" >&2
-        return 2
-      fi
+    if [ "$status" -ne 0 ]; then
+      fm_account_reconcile_lease_mutation "$binary" "$task" "lease mutation" || return $?
+      json=$FM_ACCOUNT_RECONCILED_JSON
+      status=0
     fi
     [ "$status" -eq 0 ] || return "$status"
     acquired=1
@@ -983,13 +990,10 @@ fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-pr
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
   if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then status=0; else status=$?; fi
-  if [ "$status" -eq 124 ]; then
-    if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
-      status=0
-    else
-      echo "error: Agent Fleet recovery timed out and ownership could not be reconciled for $task" >&2
-      return 2
-    fi
+  if [ "$status" -ne 0 ]; then
+    fm_account_reconcile_lease_mutation "$binary" "$task" "recovery mutation" || return $?
+    json=$FM_ACCOUNT_RECONCILED_JSON
+    status=0
   fi
   [ "$status" -eq 0 ] || return "$status"
   if ! mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' recovery) \

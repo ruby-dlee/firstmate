@@ -56,6 +56,7 @@ case "$*" in
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
+  capture-pane) printf '│ │\n'; exit 0 ;;
   list-panes) [ "${FM_FAKE_TARGET_STATE:-auto}" != unknown ]; exit $? ;;
   list-windows|has-session|new-session|set-window-option) exit 0 ;;
   kill-window)
@@ -191,11 +192,16 @@ case "$*" in
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     case "$*" in
       *" lease recover "*)
+        if [ -n "${FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE:-}" ] && [ ! -e "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE" ]; then
+          : > "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE"
+          exit "${FM_FAKE_AF_RECOVER_FAIL_STATUS:-42}"
+        fi
         [ -z "${FM_FAKE_AF_RECOVER_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RECOVER_SLEEP"
         [ -z "${FM_FAKE_AF_RECOVER_TASK:-}" ] || task=$FM_FAKE_AF_RECOVER_TASK
         [ "${FM_FAKE_AF_STALE_REFRESH_ON_RECOVER:-0}" != 1 ] || touch "${FM_FAKE_AF_SESSION_REFRESHED:?}"
         ;;
       *" lease choose "*|*" lease acquire "*)
+        [ -z "${FM_FAKE_AF_CHOOSE_FAIL_STATUS:-}" ] || exit "$FM_FAKE_AF_CHOOSE_FAIL_STATUS"
         [ -z "${FM_FAKE_AF_SELECT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SELECT_SLEEP"
         ;;
     esac
@@ -604,7 +610,7 @@ test_enforce_failure_rolls_back_prepared_endpoint() {
   id=account-select-fail-z5
   rec=$(make_case select-fail claude "$id")
   read_case "$rec"
-  out=$(FM_FAKE_AF_SELECT_FAIL=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  out=$(FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "failed Agent Fleet selection should block spawn"
   assert_regex '^new-window ' "$TMUX_LOG" "selection did not happen after endpoint preparation"
@@ -930,7 +936,7 @@ test_preinstall_managed_failure_restores_artifact_snapshot() {
   printf 'prior-state\n' > "$artifact"
   expected="$CASE_DIR/original.meta"
   cp "$HOME_DIR/state/$id.meta" "$expected"
-  out=$(FM_FAKE_AF_SELECT_MUTATE_FILE="$artifact" FM_FAKE_AF_SELECT_FAIL=1 \
+  out=$(FM_FAKE_AF_SELECT_MUTATE_FILE="$artifact" FM_FAKE_AF_BAD_SELECTION=1 \
     run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "pre-install account selection failure unexpectedly spawned"
@@ -1878,10 +1884,12 @@ test_cross_profile_continuation_for_harness() {
   printf 'done: external side effect alpha; do not rerun\nnext: verify beta\n' > "$HOME_DIR/state/$id.status"
   printf '# Completion\n\nShip completion evidence for %s.\n' "$harness" > "$HOME_DIR/data/$id/completion.md"
   printf '# Decisions\n\n- Keep the existing branch.\n' > "$HOME_DIR/data/$id/decisions.md"
-  run_send "$id" "Preserve the verified next action for $harness." >/dev/null \
-    || fail "$harness steering trail precondition failed"
+  printf '# Steering trail\n\n- 2026-07-15T00:00:00Z\n\n> Preserve the verified next action for %s.\n' \
+    "$harness" > "$HOME_DIR/data/$id/steering.md"
   assert_grep "Preserve the verified next action for $harness." "$HOME_DIR/data/$id/steering.md" "$harness managed steering was not recorded"
   printf '# Pending steering audit\n\n- Preserve pending delivery for %s.\n' "$harness" > "$HOME_DIR/data/$id/steering-pending.md"
+  printf '# Unconfirmed steering\n\n- 2026-07-15T00:00:00Z (delivery unconfirmed)\n\n> Preserve unconfirmed delivery for %s.\n' \
+    "$harness" > "$HOME_DIR/data/$id/steering-unconfirmed.md"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$new_profile" FM_FAKE_AF_POOL=explicit run_spawn "$id" --continue-account --account-profile "$new_profile")
@@ -1896,6 +1904,8 @@ test_cross_profile_continuation_for_harness() {
   assert_grep 'Keep the existing branch' "$packet" "$harness continuation packet lost decisions"
   assert_grep "Preserve the verified next action for $harness." "$packet" "$harness continuation packet lost steering"
   assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"
+  assert_regex '^## Unconfirmed steering$' "$packet" "$harness continuation did not separate unconfirmed steering"
+  assert_grep "Preserve unconfirmed delivery for $harness." "$packet" "$harness continuation lost unconfirmed steering"
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "--profile '$new_profile' --task '$new_task'" "$harness continuation did not use the new profile/generation"
   assert_contains "$launch" "cat '$packet'" "$harness continuation did not seed the fresh provider from task-owned state"
@@ -2846,6 +2856,47 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
 }
 
+test_unsuccessful_lease_mutations_always_reconcile() {
+  local id rec out status
+  id=account-reconcile-failure-z27a
+  rec=$(make_case reconcile-failure claude "$id")
+  read_case "$rec"
+  if out=$(FM_FAKE_AF_CHOOSE_FAIL_STATUS=42 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "non-timeout lease failure was not recovered: $out"
+  assert_grep 'lease choose ' "$AF_LOG" "non-timeout lease failure never attempted selection"
+  assert_grep 'lease recover ' "$AF_LOG" "non-timeout lease failure skipped ownership reconciliation"
+
+  id=account-reconcile-ambiguous-z27b
+  rec=$(make_case reconcile-ambiguous claude "$id")
+  read_case "$rec"
+  if out=$(FM_FAKE_AF_SELECT_FAIL=1 FM_FAKE_AF_RELEASE_FAIL=1 \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "unreconciled lease mutation unexpectedly spawned"
+  assert_grep 'lease recover ' "$AF_LOG" "failed lease mutation skipped recovery"
+  assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease mutation discarded rollback identity"
+  assert_regex '^account_rollback_cleanup=pending$' "$HOME_DIR/state/$id.meta" \
+    "ambiguous lease mutation lost its retry marker"
+  pass "every unsuccessful lease mutation reconciles or retains rollback identity"
+}
+
+test_unsuccessful_recovery_mutation_is_retried() {
+  local id rec out status account_task recover_count marker
+  id=account-recover-reconcile-z27c
+  rec=$(make_case recover-reconcile claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "recovery reconciliation precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  marker="$CASE_DIR/recover-failed-once"
+  if out=$(FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE="$marker" run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "non-timeout recovery failure was not reconciled: $out"
+  recover_count=$(grep -F -c "lease recover --task $account_task" "$AF_LOG")
+  [ "$recover_count" -eq 2 ] || fail "recovery mutation was attempted $recover_count times instead of twice"
+  pass "unsuccessful sticky recovery mutations are reconciled before failure"
+}
+
 test_account_timeout_wrapper_uses_hard_kill_fallback() {
   local fakebin log status perl_bin
   fakebin=$(fm_fakebin "$TMP_ROOT/hard-timeout")
@@ -2972,6 +3023,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
+  test_unsuccessful_lease_mutations_always_reconcile
+  test_unsuccessful_recovery_mutation_is_retried
+  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3057,6 +3115,8 @@ test_task_owned_account_artifacts_reject_symlink_paths
 test_account_lineage_rejects_parent_swap_during_transaction
 test_agent_fleet_contract_is_validated_before_routing
 test_agent_fleet_lifecycle_calls_are_bounded
+test_unsuccessful_lease_mutations_always_reconcile
+test_unsuccessful_recovery_mutation_is_retried
 test_account_timeout_wrapper_uses_hard_kill_fallback
 test_teardown_stops_after_rollback_restores_predecessor
 

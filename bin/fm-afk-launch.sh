@@ -860,9 +860,23 @@ fm_afk_launch_start_native_locked() {
   return "$result"
 }
 
+fm_afk_launch_handoff_lock_acquire() {
+  local wait_seconds=${FM_AFK_NATIVE_HANDOFF_LOCK_WAIT_SECONDS:-10} attempts attempt=0
+  case "$wait_seconds" in ''|*[!0-9]*) wait_seconds=10 ;; esac
+  attempts=$((wait_seconds * 10))
+  while ! fm_lock_try_acquire "$FM_AFK_NATIVE_HANDOFF_LOCK"; do
+    if [ "$attempt" -ge "$attempts" ]; then
+      fm_afk_launch_log "native handoff lock remained busy at $FM_AFK_NATIVE_HANDOFF_LOCK; refusing lifecycle change, retry after the active handoff finishes"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+}
+
 fm_afk_launch_start_native() {
   local result
-  fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
+  fm_afk_launch_handoff_lock_acquire || return 1
   fm_afk_launch_start_native_locked
   result=$?
   fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
@@ -951,7 +965,7 @@ fm_afk_launch_stop_locked() {
 
 fm_afk_launch_stop() {
   local result
-  fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
+  fm_afk_launch_handoff_lock_acquire || return 1
   fm_afk_launch_stop_locked
   result=$?
   fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"

@@ -298,6 +298,50 @@ test_managed_send_revalidates_after_respawn_wait() {
   pass "fm-send strict: managed sends reject respawned generations after lifecycle waits"
 }
 
+test_managed_key_revalidates_after_respawn_wait() {
+  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  dir="$TMP_ROOT/managed-key-respawn-race"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-key-respawn-race)
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/managed-key-race.meta" \
+    "window=sess:fm-managed-key-race-old" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-key-race:attempt-1" "account_profile=codex-2"
+
+  lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-key-race) \
+    || fail "could not hold the managed lifecycle lock for the key respawn race"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" managed-key-race --key C-c >"$dir/send.out" 2>"$err" &
+  sender_pid=$!
+  owner_wait=
+  for _ in $(seq 1 100); do
+    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-key-race.owner.*' -print -quit)
+    [ -n "$owner_wait" ] && break
+    sleep 0.02
+  done
+  if [ -z "$owner_wait" ]; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    kill "$sender_pid" 2>/dev/null || true
+    wait "$sender_pid" 2>/dev/null || true
+    fail "managed key sender never waited on the lifecycle lock"
+  fi
+  staged="$home/state/.managed-key-race.meta.respawn"
+  fm_write_meta "$staged" \
+    "window=sess:fm-managed-key-race-new" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-key-race:attempt-2" "account_profile=codex-3"
+  mv "$staged" "$home/state/managed-key-race.meta"
+  fm_account_lifecycle_lock_release "$lock" || fail "could not release the key respawn race lifecycle lock"
+  set +e
+  wait "$sender_pid"
+  sender_rc=$?
+  set -e
+
+  [ "$sender_rc" -ne 0 ] || fail "managed key sender accepted replaced metadata after waiting"
+  assert_contains "$(cat "$err")" "generation or endpoint changed" \
+    "managed key sender did not diagnose the replaced generation"
+  [ ! -s "$log" ] || fail "managed key sender delivered to a replacement endpoint"
+  pass "fm-send strict: managed keys reject respawned generations after lifecycle waits"
+}
+
 test_managed_send_holds_lifecycle_through_audit() {
   local dir fb home log trail steering_lock sender_pid sender_rc teardown_pid teardown_rc delivered
   dir="$TMP_ROOT/managed-teardown-race"; mkdir -p "$dir"
@@ -352,6 +396,54 @@ test_managed_send_holds_lifecycle_through_audit() {
   pass "fm-send strict: managed sends hold lifecycle ownership through audit persistence"
 }
 
+test_managed_steering_rejects_parent_swap_during_persistence() {
+  local dir fb home log task_dir moved outside ready proceed sender_pid sender_rc before
+  dir="$TMP_ROOT/managed-steering-parent-race"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-steering-parent-race)
+  log="$dir/tmux.log"; : > "$log"
+  task_dir="$home/data/managed-steering-parent-race"
+  moved="$dir/pinned-task"
+  outside="$dir/outside-task"
+  ready="$dir/ready"
+  proceed="$dir/proceed"
+  mkdir -p "$task_dir" "$outside"
+  printf '# Steering trail\n\n- original.\n' > "$task_dir/steering.md"
+  printf 'outside steering sentinel\n' > "$outside/steering.md"
+  before=$(cat "$task_dir/steering.md")
+  fm_write_meta "$home/state/managed-steering-parent-race.meta" \
+    "window=sess:fm-managed-steering-parent-race" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-steering-parent-race:attempt-1" "account_profile=codex-2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_FILE_TRANSACTION_TEST_READY="$ready" FM_FILE_TRANSACTION_TEST_PROCEED="$proceed" \
+    "$SEND" managed-steering-parent-race "Do not persist through a replaced parent." >"$dir/send.out" 2>"$dir/send.err" &
+  sender_pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  if [ ! -e "$ready" ]; then
+    kill "$sender_pid" 2>/dev/null || true
+    wait "$sender_pid" 2>/dev/null || true
+    fail "managed steering transaction never pinned its task directory"
+  fi
+  mv "$task_dir" "$moved"
+  ln -s "$outside" "$task_dir"
+  : > "$proceed"
+  set +e
+  wait "$sender_pid"
+  sender_rc=$?
+  set -e
+  expect_code 0 "$sender_rc" "delivered managed steering should retain delivery truth after audit refusal"
+  [ "$(cat "$outside/steering.md")" = 'outside steering sentinel' ] \
+    || fail "managed steering transaction wrote through a raced task parent"
+  [ "$(cat "$moved/steering.md")" = "$before" ] \
+    || fail "failed managed steering transaction changed the pinned original trail"
+  assert_contains "$(cat "$dir/send.err")" "could not be durably recorded" \
+    "managed steering parent-race refusal did not preserve delivery-vs-audit truth"
+  pass "fm-send strict: steering persistence rejects raced task parents"
+}
+
 test_healthy_fm_id_send_still_works() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
@@ -373,6 +465,8 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_concurrent_managed_steering_is_serialized_and_atomic
   test_managed_send_revalidates_after_respawn_wait
   test_managed_send_holds_lifecycle_through_audit
+  test_managed_key_revalidates_after_respawn_wait
+  test_managed_steering_rejects_parent_swap_during_persistence
   exit 0
 fi
 
@@ -387,4 +481,6 @@ test_explicit_managed_target_records_steering
 test_concurrent_managed_steering_is_serialized_and_atomic
 test_managed_send_revalidates_after_respawn_wait
 test_managed_send_holds_lifecycle_through_audit
+test_managed_key_revalidates_after_respawn_wait
+test_managed_steering_rejects_parent_swap_during_persistence
 test_healthy_fm_id_send_still_works

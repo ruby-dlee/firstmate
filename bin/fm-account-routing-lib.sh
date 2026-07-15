@@ -617,8 +617,9 @@ fm_account_safe_task_file() {  # <file>
   fi
 }
 
-fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task> <provider> <pool> <profile> <session> <predecessor>
-  local data=$1 task=$2 event=$3 attempt=$4 fleet_task=$5 provider=$6 pool=$7 profile=$8 session=$9 predecessor=${10} dir file value
+fm_account_lineage_append() (  # <data-dir> <task> <event> <attempt> <fleet-task> <provider> <pool> <profile> <session> <predecessor>
+  local data=$1 task=$2 event=$3 attempt=$4 fleet_task=$5 provider=$6 pool=$7 profile=$8 session=$9 predecessor=${10}
+  local dir file value data_real lineage_lock lib_dir
   for value in "$task" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "$session" "$predecessor"; do
     fm_account_safe_lineage_value "$value" || {
       echo "error: unsafe account-attempt lineage value" >&2
@@ -626,16 +627,16 @@ fm_account_lineage_append() {  # <data-dir> <task> <event> <attempt> <fleet-task
     }
   done
   dir=$(fm_account_task_dir "$data" "$task" create) || return 1
+  data_real=$(dirname "$dir")
+  lineage_lock=$(fm_account_lock_acquire "$data_real" "$task" account-lineage "account lineage" "${FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS:-10}") || return 1
+  trap 'fm_account_meta_lock_release "$lineage_lock" >/dev/null 2>&1 || true' EXIT
   file="$dir/account-attempts.md"
   fm_account_safe_task_file "$file" || return 1
-  if [ ! -e "$file" ]; then
-    printf '# Account attempt lineage\n\n' > "$file"
-  fi
-  fm_account_safe_task_file "$file" || return 1
+  lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || return 1
   printf -- '- %s event=%s attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=%s predecessor=%s.\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$attempt" "$fleet_task" "$provider" "$pool" "$profile" "${session:-pending}" "${predecessor:-none}" \
-    >> "$file"
-}
+    | node "$lib_dir/fm-task-file-append.mjs" "$data_real" "$task" account-attempts.md '# Account attempt lineage'
+)
 
 fm_account_meta_value() {  # <meta> <key>
   sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1

@@ -987,6 +987,29 @@ SH
   rm -rf "$st"
 }
 
+unit_native_handoff_lock_wait_is_bounded() {
+  local st out status
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-handoff-bounded.XXXXXX")
+  mkdir -p "$st/state"
+  set +e
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_NATIVE_HANDOFF_LOCK_WAIT_SECONDS=0 \
+    bash -c '
+      . "$1"
+      fm_lock_try_acquire() { return 1; }
+      fm_afk_launch_start_native
+    ' _ "$LAUNCH" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ] \
+    && [[ "$out" == *"native handoff lock remained busy"* ]] \
+    && [[ "$out" == *"retry after the active handoff finishes"* ]]; then
+    pass "native lifecycle: busy handoff locks refuse within a bounded wait"
+  else
+    fail "native lifecycle: busy handoff lock did not return an actionable bounded refusal"
+  fi
+  rm -rf "$st"
+}
+
 unit_close_failure_preserves_record() {
   local st hash target
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-close-fail.XXXXXX")
@@ -1656,6 +1679,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-17 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
+  unit_native_handoff_lock_wait_is_bounded
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1689,6 +1718,7 @@ unit_recovery_preserves_buffered_escalations
 unit_native_entry_preserves_prepared_state
 unit_native_start_stop_handoff_is_atomic
 unit_direct_native_start_stop_handoff_is_atomic
+unit_native_handoff_lock_wait_is_bounded
 unit_close_failure_preserves_record
 unit_record_publication_atomic
 unit_publication_rejects_unsafe_destinations

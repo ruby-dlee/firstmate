@@ -577,6 +577,49 @@ EOF
   pass "summary extraction shares fence-aware ATX parsing"
 }
 
+test_list_container_fences_hide_report_headings_and_summaries() {
+  local id=report-list-fence-b3j source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- ````markdown
+  ## Summary
+
+  Fenced fake summary.
+
+  ## What changed
+
+  Hidden.
+
+  ## Verification
+
+  Hidden.
+
+  ## Visual evidence
+
+  Hidden.
+
+  ## Artifacts
+
+  Hidden.
+
+  ## Follow-ups
+
+  Hidden.
+  ```
+  ````
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "headings inside a list-container fence unexpectedly satisfied the report contract"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "list-container fence failure omitted missing heading $heading"
+  done
+  pass "report parsing ignores headings and summaries inside list-container fences"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
@@ -967,6 +1010,7 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_headings_follow_commonmark_atx_rules
   test_invalid_backtick_info_string_does_not_open_fence
   test_summary_extraction_uses_validated_markdown_structure
+  test_list_container_fences_hide_report_headings_and_summaries
   exit 0
 fi
 
@@ -987,6 +1031,7 @@ test_indented_pseudo_closers_do_not_end_fences
 test_required_headings_follow_commonmark_atx_rules
 test_invalid_backtick_info_string_does_not_open_fence
 test_summary_extraction_uses_validated_markdown_structure
+test_list_container_fences_hide_report_headings_and_summaries
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized

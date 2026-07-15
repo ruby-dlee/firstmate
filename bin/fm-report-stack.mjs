@@ -24,6 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import markdownModule from "./fm-markdown-structure.cjs";
 
 const command = process.argv[2] || "list";
 const args = process.argv.slice(3);
@@ -102,33 +103,7 @@ function lastStatus(status) {
   return lines[lines.length - 1] || "Completed task";
 }
 
-function markdownStructure(markdown) {
-  const visible = [];
-  let fence;
-  for (const line of String(markdown).split(/\r?\n/)) {
-    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (fence) {
-      if (marker
-        && marker[1][0] === fence.character
-        && marker[1].length >= fence.length
-        && marker[2].trim() === "") {
-        fence = undefined;
-      }
-      continue;
-    }
-    if (marker && !(marker[1][0] === "`" && marker[2].includes("`"))) {
-      fence = { character: marker[1][0], length: marker[1].length };
-      continue;
-    }
-    const match = line.match(/^ {0,3}(#{1,6})(?:[ \t]+(.*)|[ \t]*)$/);
-    const heading = match ? {
-      level: match[1].length,
-      content: (match[2] || "").replace(/[ \t]+#+[ \t]*$/, "").trim(),
-    } : undefined;
-    visible.push({ line, heading });
-  }
-  return visible;
-}
+const { markdownStructure } = markdownModule;
 
 function firstSummary(markdown, fallback) {
   const structure = markdownStructure(markdown);

@@ -44,88 +44,53 @@ fm_completion_report_contract_ensure() (  # <data-dir> <task-id> <brief>
     return 1
   fi
   contract=$(fm_completion_report_contract "$data" "$task") || return 1
-  FM_COMPLETION_REPORT_CONTRACT=$contract fm_completion_report_contract_file ensure "$brief_target"
+  FM_COMPLETION_REPORT_CONTRACT=$contract fm_completion_report_contract_file ensure "$brief_target" "$data_real" "$task"
 )
 
-fm_completion_report_contract_file() {  # <present|ensure> <brief>
-  node - "$1" "$2" <<'JS'
+fm_completion_report_contract_file() {  # <present|ensure> <brief> [data-dir] [task-id]
+  local lib_dir
+  lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || return 1
+  FM_MARKDOWN_STRUCTURE_LIB="$lib_dir/fm-markdown-structure.cjs" \
+    FM_FILE_TRANSACTION_LIB="$lib_dir/fm-file-transaction.cjs" \
+    node - "$1" "$2" "${3:-}" "${4:-}" <<'JS'
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const { markdownStructure } = require(process.env.FM_MARKDOWN_STRUCTURE_LIB);
+const { pinnedTaskFileTransaction } = require(process.env.FM_FILE_TRANSACTION_LIB);
 
 const action = process.argv[2];
 const brief = process.argv[3];
-let source;
-let staged;
+const dataDir = process.argv[4];
+const taskId = process.argv[5];
 
 function contractPresent(markdown) {
-  let fenceCharacter = '';
-  let fenceLength = 0;
-  for (const rawLine of markdown.split(/\r?\n/)) {
-    const marker = rawLine.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (fenceCharacter) {
-      if (marker && marker[1][0] === fenceCharacter && marker[1].length >= fenceLength && /^\s*$/.test(marker[2])) {
-        fenceCharacter = '';
-        fenceLength = 0;
-      }
-      continue;
-    }
-    if (marker && !(marker[1][0] === '`' && marker[2].includes('`'))) {
-      fenceCharacter = marker[1][0];
-      fenceLength = marker[1].length;
-      continue;
-    }
-    if (rawLine.replace(/^ {0,3}/, '') === '# Completion report') return true;
-  }
-  return false;
-}
-
-function sameSnapshot(left, right) {
-  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
-    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+  return markdownStructure(markdown).some(({ heading }) => heading?.level === 1 && heading.content === 'Completion report');
 }
 
 try {
-  source = fs.openSync(brief, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-  const initial = fs.fstatSync(source, { bigint: true });
-  if (!initial.isFile()) throw new Error('source is not a regular file');
-  const content = fs.readFileSync(source);
-  if (contractPresent(content.toString('utf8'))) {
-    process.exitCode = 0;
-  } else if (action === 'present') {
-    process.exitCode = 1;
+  if (action === 'present') {
+    const source = fs.openSync(brief, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const stat = fs.fstatSync(source, { bigint: true });
+      if (!stat.isFile()) throw new Error('source is not a regular file');
+      process.exitCode = contractPresent(fs.readFileSync(source).toString('utf8')) ? 0 : 1;
+    } finally {
+      fs.closeSync(source);
+    }
   } else if (action === 'ensure') {
     const contract = process.env.FM_COMPLETION_REPORT_CONTRACT;
     if (!contract) throw new Error('completion-report contract is empty');
-    staged = path.join(path.dirname(brief), `.brief-contract.${process.pid}.${crypto.randomBytes(8).toString('hex')}`);
-    const output = Buffer.concat([content, Buffer.from(`\n${contract}\n`)]);
-    const destination = fs.openSync(staged, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, Number(initial.mode & 0o7777n));
-    try {
-      fs.writeFileSync(destination, output);
-      fs.fchmodSync(destination, Number(initial.mode & 0o7777n));
-      fs.fsyncSync(destination);
-    } finally {
-      fs.closeSync(destination);
-    }
-    const finalSource = fs.fstatSync(source, { bigint: true });
-    const currentPath = fs.lstatSync(brief, { bigint: true });
-    if (!sameSnapshot(initial, finalSource) || !currentPath.isFile()
-      || currentPath.dev !== finalSource.dev || currentPath.ino !== finalSource.ino) {
-      throw new Error('task brief changed during completion-report upgrade');
-    }
-    fs.renameSync(staged, brief);
-    staged = undefined;
+    if (!dataDir || !taskId) throw new Error('completion-report task identity is incomplete');
+    pinnedTaskFileTransaction(dataDir, taskId, path.basename(brief), (content) => {
+      if (contractPresent(content.toString('utf8'))) return undefined;
+      return Buffer.concat([content, Buffer.from(`\n${contract}\n`)]);
+    });
   } else {
     throw new Error(`unknown completion-report brief action: ${action}`);
   }
 } catch (error) {
   console.error(`error: completion-report brief transaction failed for ${brief}: ${error.message}`);
   process.exitCode = 1;
-} finally {
-  if (source !== undefined) fs.closeSync(source);
-  if (staged !== undefined) {
-    try { fs.unlinkSync(staged); } catch {}
-  }
 }
 JS
 }

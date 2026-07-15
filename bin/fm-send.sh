@@ -210,10 +210,49 @@ fi
 # send implementation. A failed backend send is still surfaced below as a hard
 # error with the attempted resolution attached.
 
+MANAGED_LIFECYCLE_LOCK=
+MANAGED_STEERING_ID=
+EXPECTED_ACCOUNT_PROFILE=
+EXPECTED_GENERATION=
+if [ -n "$TARGET_META" ]; then
+  EXPECTED_ACCOUNT_PROFILE=$(fm_meta_get "$TARGET_META" account_profile)
+fi
+if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
+  MANAGED_STEERING_ID=$(fm_send_id_from_meta "$TARGET_META")
+  EXPECTED_GENERATION=$(fm_meta_get "$TARGET_META" generation_id)
+  [ -n "$EXPECTED_GENERATION" ] || {
+    echo "error: managed task metadata has no generation_id: $TARGET_META" >&2
+    exit 1
+  }
+  MANAGED_LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$MANAGED_STEERING_ID") || exit 1
+  cleanup_managed_send_lifecycle() {
+    [ -z "$MANAGED_LIFECYCLE_LOCK" ] \
+      || fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK" >/dev/null 2>&1 \
+      || true
+  }
+  trap cleanup_managed_send_lifecycle EXIT
+  trap 'exit 1' HUP INT TERM
+  if [ ! -f "$TARGET_META" ] || [ -L "$TARGET_META" ] \
+    || [ "$(fm_meta_get "$TARGET_META" generation_id)" != "$EXPECTED_GENERATION" ] \
+    || [ "$(fm_meta_get "$TARGET_META" account_profile)" != "$EXPECTED_ACCOUNT_PROFILE" ] \
+    || [ "$(fm_backend_of_meta "$TARGET_META")" != "$TARGET_BACKEND" ] \
+    || [ "$(fm_backend_target_of_meta "$TARGET_META")" != "$T" ]; then
+    echo "error: managed task generation or endpoint changed while fm-send waited for $MANAGED_STEERING_ID" >&2
+    exit 1
+  fi
+fi
+
 if [ "${1:-}" = "--key" ]; then
   if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL"; then
     echo "error: key '$2' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
+  fi
+  if [ -n "$MANAGED_LIFECYCLE_LOCK" ]; then
+    if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
+      MANAGED_LIFECYCLE_LOCK=
+    else
+      echo "warning: key '$2' was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
+    fi
   fi
 else
   MESSAGE=$*
@@ -237,36 +276,6 @@ else
   esac
   retries=${FM_SEND_RETRIES:-3}
   sleep_s=${FM_SEND_SLEEP:-0.4}
-  MANAGED_LIFECYCLE_LOCK=
-  MANAGED_STEERING_ID=
-  EXPECTED_ACCOUNT_PROFILE=
-  if [ -n "$TARGET_META" ]; then
-    EXPECTED_ACCOUNT_PROFILE=$(fm_meta_get "$TARGET_META" account_profile)
-  fi
-  if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
-    MANAGED_STEERING_ID=$(fm_send_id_from_meta "$TARGET_META")
-    EXPECTED_GENERATION=$(fm_meta_get "$TARGET_META" generation_id)
-    [ -n "$EXPECTED_GENERATION" ] || {
-      echo "error: managed task metadata has no generation_id: $TARGET_META" >&2
-      exit 1
-    }
-    MANAGED_LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$MANAGED_STEERING_ID") || exit 1
-    cleanup_managed_send_lifecycle() {
-      [ -z "$MANAGED_LIFECYCLE_LOCK" ] \
-        || fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK" >/dev/null 2>&1 \
-        || true
-    }
-    trap cleanup_managed_send_lifecycle EXIT
-    trap 'exit 1' HUP INT TERM
-    if [ ! -f "$TARGET_META" ] || [ -L "$TARGET_META" ] \
-      || [ "$(fm_meta_get "$TARGET_META" generation_id)" != "$EXPECTED_GENERATION" ] \
-      || [ "$(fm_meta_get "$TARGET_META" account_profile)" != "$EXPECTED_ACCOUNT_PROFILE" ] \
-      || [ "$(fm_backend_of_meta "$TARGET_META")" != "$TARGET_BACKEND" ] \
-      || [ "$(fm_backend_target_of_meta "$TARGET_META")" != "$T" ]; then
-      echo "error: managed task generation or endpoint changed while fm-send waited for $MANAGED_STEERING_ID" >&2
-      exit 1
-    fi
-  fi
   # Type once, submit, verify. Lenient: only a positively-confirmed swallow
   # (text still in the composer) is an error; an unreadable pane is assumed sent.
   if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
@@ -286,11 +295,10 @@ else
   persist_managed_steering() (  # <file-name> <header> <annotation> <message...>
     local file_name=$1 header=$2 annotation=$3
     shift 3
-    local steering_id steering_dir steering_file steering_lock temp= mode
+    local steering_id steering_dir steering_file steering_lock
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
     steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
     cleanup_managed_steering() {
-      [ -z "$temp" ] || rm -f -- "$temp"
       fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true
     }
     trap cleanup_managed_steering EXIT
@@ -298,26 +306,11 @@ else
     steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
     steering_file="$steering_dir/$file_name"
     fm_account_safe_task_file "$steering_file" || return 1
-    temp=$(mktemp "$steering_dir/.$file_name.XXXXXX") || return 1
-    if [ -e "$steering_file" ]; then
-      cat "$steering_file" > "$temp" || return 1
-      if mode=$(stat -f '%Lp' "$steering_file" 2>/dev/null); then
-        :
-      else
-        mode=$(stat -c '%a' "$steering_file") || return 1
-      fi
-      chmod "$mode" "$temp" || return 1
-    elif [ -n "$header" ]; then
-      printf '%s\n\n' "$header" > "$temp" || return 1
-    fi
     {
       printf -- '- %s%s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$annotation"
       printf '%s\n' "$*" | sed 's/^/> /'
       printf '\n'
-    } >> "$temp" || return 1
-    fm_account_safe_task_file "$steering_file" || return 1
-    mv -f -- "$temp" "$steering_file" || return 1
-    temp=
+    } | node "$SCRIPT_DIR/fm-task-file-append.mjs" "$DATA" "$steering_id" "$file_name" "$header"
   )
   record_managed_steering() {
     persist_managed_steering steering.md '# Steering trail' '' "$@"

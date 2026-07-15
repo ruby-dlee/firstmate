@@ -31,7 +31,7 @@ make_fake_curl() {
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-ofile="" method=GET data="" url="" auth=""
+ofile="" method=GET data="" url="" auth="" max_filesize=""
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -m|-w) shift 2 ;;
+    --max-filesize) max_filesize=$2; shift 2 ;;
     -s) shift ;;
     http://*|https://*) url=$1; shift ;;
     *) shift ;;
@@ -81,7 +82,11 @@ case "$url" in
     ;;
   */connector/request-context)
     if [ -n "$ofile" ] && [ "${FAKE_REQCTX_OVERSIZE:-0}" = 1 ]; then
-      dd if=/dev/zero bs=65537 count=1 2>/dev/null | tr '\0' x > "$ofile"
+      if [ -n "$max_filesize" ]; then
+        dd if=/dev/zero bs="$max_filesize" count=1 2>/dev/null | tr '\0' x > "$ofile"
+        exit 63
+      fi
+      dd if=/dev/zero bs=1048576 count=8 2>/dev/null | tr '\0' x > "$ofile"
     else
       [ -n "$ofile" ] && printf '%s' "${FAKE_REQCTX_BODY:-}" > "$ofile"
     fi
@@ -1778,6 +1783,8 @@ test_relay_context_response_is_bounded() {
   [ -z "$out" ] || fail "oversized relay context follow-up emitted a request id"
   assert_grep "url=https://relay.test/connector/request-context" "$log" \
     "oversized context test did not query the shared relay helper"
+  assert_grep '--max-filesize 65536' "$log" \
+    "relay response cap was not enforced by curl during transfer"
   assert_no_grep "url=https://relay.test/connector/followup" "$log" \
     "oversized relay context was truncated and posted instead of held"
   [ -z "$(find "$home/tmp" -type f -print 2>/dev/null)" ] \
@@ -2638,6 +2645,11 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   test_context_registry_serializes_prune_and_updates
   test_context_registry_retries_busy_request_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
+  test_relay_context_response_is_bounded
   exit 0
 fi
 

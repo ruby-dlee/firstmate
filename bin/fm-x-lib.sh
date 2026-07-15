@@ -843,7 +843,7 @@ fmx_post_json() (
   auth_header_file=$(fmx_auth_header_file) || return 3
   trap 'rm -f "$auth_header_file"' EXIT
   trap 'rm -f "$auth_header_file"; exit 143' HUP INT TERM
-  code=$(curl -m 10 -s -o "$body_file" -w '%{http_code}' \
+  code=$(curl -m 10 -s --max-filesize "$FMX_RESPONSE_BODY_MAX_BYTES" -o "$body_file" -w '%{http_code}' \
     -X POST \
     -H "@$auth_header_file" \
     -H 'Content-Type: application/json' \

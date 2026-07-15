@@ -373,6 +373,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
 
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
   local id rec brief before after outside out status heading_count real_node hook raced_size
+  local ready proceed original_task swapped_task spawn_pid spawn_rc
 
   id=contract-atomic-z1b
   rec=$(make_case contract-atomic claude "$id")
@@ -406,6 +407,24 @@ EOF
   run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "fenced completion-report example blocked contract injection"
   heading_count=$(grep -c '^# Completion report$' "$brief")
   [ "$heading_count" -eq 2 ] || fail "fenced completion-report example suppressed the real contract"
+
+  id=contract-list-fenced-example-z1bb
+  rec=$(make_case contract-list-fenced-example claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  cat > "$brief" <<'EOF'
+# Task
+
+Preserve this custom brief.
+
+- ```markdown
+  # Completion report
+  Example only.
+  ```
+EOF
+  run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "list-fenced completion-report example blocked contract injection"
+  heading_count=$(grep -c '^# Completion report$' "$brief")
+  [ "$heading_count" -eq 1 ] || fail "list-fenced completion-report example suppressed the real contract"
 
   id=contract-file-symlink-z1c
   rec=$(make_case contract-file-symlink claude "$id")
@@ -453,6 +472,41 @@ SH
   unset FM_TEST_REAL_NODE FM_TEST_SWAP_BRIEF FM_TEST_SWAP_TARGET
   [ "$status" -ne 0 ] || fail "brief symlink swap before descriptor open unexpectedly succeeded"
   [ "$(cat "$outside")" = 'outside open-race sentinel' ] || fail "descriptor open followed a raced brief symlink"
+
+  id=contract-parent-race-z1ea
+  rec=$(make_case contract-parent-race claude "$id")
+  read_case "$rec"
+  original_task="$HOME_DIR/data/$id"
+  swapped_task="$CASE_DIR/pinned-original-task"
+  outside="$CASE_DIR/outside-parent-race"
+  ready="$CASE_DIR/brief-parent-ready"
+  proceed="$CASE_DIR/brief-parent-proceed"
+  mkdir -p "$outside"
+  printf 'outside parent-race sentinel\n' > "$outside/brief.md"
+  FM_FILE_TRANSACTION_TEST_READY="$ready" FM_FILE_TRANSACTION_TEST_PROCEED="$proceed" \
+    run_spawn "$id" "$PROJ_DIR" > "$CASE_DIR/parent-race.out" 2>&1 &
+  spawn_pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  if [ ! -e "$ready" ]; then
+    kill "$spawn_pid" 2>/dev/null || true
+    wait "$spawn_pid" 2>/dev/null || true
+    fail "completion-contract transaction never pinned its task directory"
+  fi
+  mv "$original_task" "$swapped_task"
+  ln -s "$outside" "$original_task"
+  : > "$proceed"
+  set +e
+  wait "$spawn_pid"
+  spawn_rc=$?
+  set -e
+  [ "$spawn_rc" -ne 0 ] || fail "completion-contract transaction accepted a replaced task parent"
+  [ "$(cat "$outside/brief.md")" = 'outside parent-race sentinel' ] \
+    || fail "completion-contract transaction wrote through a raced task parent"
+  assert_no_grep '# Completion report' "$swapped_task/brief.md" \
+    "failed parent-race transaction changed the pinned original brief"
 
   id=contract-content-race-z1f
   rec=$(make_case contract-content-race claude "$id")
@@ -2704,6 +2758,53 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
 }
 
+test_account_lineage_rejects_parent_swap_during_transaction() {
+  local data id original moved outside ready proceed writer_pid writer_rc before
+  data="$TMP_ROOT/lineage-parent-race/data"
+  id=lineage-parent-race
+  original="$data/$id"
+  moved="$TMP_ROOT/lineage-parent-race/pinned-task"
+  outside="$TMP_ROOT/lineage-parent-race/outside-task"
+  ready="$TMP_ROOT/lineage-parent-race/ready"
+  proceed="$TMP_ROOT/lineage-parent-race/proceed"
+  mkdir -p "$original" "$outside"
+  printf '# Account attempt lineage\n\n- original.\n' > "$original/account-attempts.md"
+  printf 'outside lineage sentinel\n' > "$outside/account-attempts.md"
+  bash -c '. "$1"; fm_account_lineage_append "$2" "$3" reserved normal fleet claude pool profile pending none' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$data" "$id" \
+    || fail "normal pinned account-lineage append failed"
+  assert_grep 'event=reserved attempt=normal' "$original/account-attempts.md" \
+    "normal pinned account-lineage append lost its entry"
+  before=$(cat "$original/account-attempts.md")
+  FM_FILE_TRANSACTION_TEST_READY="$ready" FM_FILE_TRANSACTION_TEST_PROCEED="$proceed" \
+    bash -c '. "$1"; fm_account_lineage_append "$2" "$3" reserved attempt fleet claude pool profile pending none' \
+      _ "$ROOT/bin/fm-account-routing-lib.sh" "$data" "$id" > "$TMP_ROOT/lineage-parent-race/out" 2>&1 &
+  writer_pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  if [ ! -e "$ready" ]; then
+    kill "$writer_pid" 2>/dev/null || true
+    wait "$writer_pid" 2>/dev/null || true
+    fail "account-lineage transaction never pinned its task directory"
+  fi
+  mv "$original" "$moved"
+  ln -s "$outside" "$original"
+  : > "$proceed"
+  set +e
+  wait "$writer_pid"
+  writer_rc=$?
+  set -e
+  [ "$writer_rc" -ne 0 ] || fail "account-lineage transaction accepted a replaced task parent"
+  [ "$(cat "$outside/account-attempts.md")" = 'outside lineage sentinel' ] \
+    || fail "account-lineage transaction wrote through a raced task parent"
+  [ "$(cat "$moved/account-attempts.md")" = "$before" ] \
+    || fail "failed account-lineage transaction changed the pinned original file"
+  assert_absent "$data/.account-lineage-$id.lock" "failed account-lineage transaction retained its serialization lock"
+  pass "account lineage rejects parent swaps during pinned atomic persistence"
+}
+
 test_agent_fleet_contract_is_validated_before_routing() {
   local id rec out status
   id=account-contract-z26
@@ -2871,6 +2972,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
+  test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+  test_account_lineage_rejects_parent_swap_during_transaction
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
@@ -2947,6 +3054,7 @@ test_account_lock_owner_controls_reject_symlinks
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal
 test_task_owned_account_artifacts_reject_symlink_paths
+test_account_lineage_rejects_parent_swap_during_transaction
 test_agent_fleet_contract_is_validated_before_routing
 test_agent_fleet_lifecycle_calls_are_bounded
 test_account_timeout_wrapper_uses_hard_kill_fallback

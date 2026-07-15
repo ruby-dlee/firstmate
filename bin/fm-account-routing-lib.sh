@@ -348,7 +348,7 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
 }
 
 fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
-  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after
+  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after generation
   local ownerless_since ownerless_tmp baseline required_grace
   [ ! -L "$lock" ] || return 1
   required_grace=$grace
@@ -356,18 +356,40 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   if [ -f "$lock" ]; then
     guard="$lock.reclaiming"
     fm_account_reclaim_guard_acquire "$guard" "$required_grace" || return 1
-    inode_before=$(fm_account_path_inode "$lock") || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    # Pin the observed generation so unlink-and-replace cannot recycle its inode before comparison.
+    generation=$(mktemp -d "$lock.generation.XXXXXX" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    if ! ln -n "$lock" "$generation/lock" 2>/dev/null; then
+      rm -rf "$generation"
+      fm_account_reclaim_guard_release "$guard"
+      return 1
+    fi
+    inode_before=$(fm_account_path_inode "$generation/lock") || {
+      rm -rf "$generation"
+      fm_account_reclaim_guard_release "$guard"
+      return 1
+    }
     if fm_account_meta_lock_owner_alive "$lock"; then
+      rm -rf "$generation"
       fm_account_reclaim_guard_release "$guard"
       return 1
     fi
-    fm_account_reclaim_guard_owned "$guard" || return 1
-    inode_after=$(fm_account_path_inode "$lock") || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    fm_account_reclaim_guard_owned "$guard" || { rm -rf "$generation"; return 1; }
+    inode_after=$(fm_account_path_inode "$lock") || {
+      rm -rf "$generation"
+      fm_account_reclaim_guard_release "$guard"
+      return 1
+    }
     if [ "$inode_before" != "$inode_after" ]; then
+      rm -rf "$generation"
       fm_account_reclaim_guard_release "$guard"
       return 1
     fi
-    rm -f "$lock" || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    rm -f "$lock" || {
+      rm -rf "$generation"
+      fm_account_reclaim_guard_release "$guard"
+      return 1
+    }
+    rm -rf "$generation" || { fm_account_reclaim_guard_release "$guard"; return 1; }
     fm_account_reclaim_guard_release "$guard"
     return 0
   fi

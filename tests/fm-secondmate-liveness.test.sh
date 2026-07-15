@@ -522,8 +522,9 @@ SH
   lock="$w/home/state/.account-lifecycle-sm1.lock"
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "parent treated a successfully handed-off lock as its own release failure"
-  [ -n "$sleeper_pid" ] && kill -0 "$sleeper_pid" 2>/dev/null \
-    || fail "handoff simulation did not leave its child owner alive"
+  if [ -z "$sleeper_pid" ] || ! kill -0 "$sleeper_pid" 2>/dev/null; then
+    fail "handoff simulation did not leave its child owner alive"
+  fi
   [ "$(sed -n '1p' "$lock" 2>/dev/null)" = "$sleeper_pid" ] \
     || fail "parent released or replaced the child-owned lifecycle lock"
   kill "$sleeper_pid" 2>/dev/null || true

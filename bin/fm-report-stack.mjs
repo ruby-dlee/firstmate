@@ -289,6 +289,8 @@ function safeHttpUrl(value) {
   try {
     const parsed = new URL(value);
     if (parsed.username || parsed.password) return "";
+    parsed.search = "";
+    parsed.hash = "";
     return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : "";
   } catch {
     return "";
@@ -456,7 +458,7 @@ function acquireLock() {
                     if (!fs.existsSync(reclaim)) fs.renameSync(quarantine, reclaim);
                     throw new Error(`report reclaim ownership changed while recovering ${lock}`);
                   }
-                  fs.rmSync(quarantine, { force: true });
+                  fs.rmSync(quarantine, { recursive: true, force: true });
                 }
               } catch (reclaimOwnerError) {
                 if (reclaimOwnerError.code !== "ENOENT") throw reclaimOwnerError;

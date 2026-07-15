@@ -114,6 +114,23 @@ test_report_links_reject_credentials_and_encode_visual_paths() {
   pass "report links reject credentials and encode visual paths"
 }
 
+test_pr_url_strips_query_and_fragment() {
+  local id=report-pr-url-a2b entry manifest
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Sanitized pull request URL."
+  printf 'pr=https://github.com/example/repo/pull/42?token=secret-query#private-fragment\n' \
+    >> "$HOME_DIR/state/$id.meta"
+  run_stack publish "$id" >/dev/null || fail "query-bearing PR URL report publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"prUrl": "https://github.com/example/repo/pull/42"' "$manifest" \
+    "PR URL query and fragment were not stripped"
+  if grep -R -E 'secret-query|private-fragment' "$(dirname "$entry")" >/dev/null 2>&1; then
+    fail "PR URL query or fragment leaked into the report entry"
+  fi
+  pass "report PR URLs discard query strings and fragments"
+}
+
 test_revision_fields_distinguish_pr_head_from_worktree_head() {
   local id=report-revisions-a3 repo meta meta_tmp entry manifest page head short pr_head
   repo="$TMP_ROOT/revision-worktree"
@@ -382,6 +399,17 @@ test_abandoned_reclaim_marker_is_recovered() {
   run_stack render >/dev/null || fail "abandoned report-lock reclaim marker was not recovered"
   assert_absent "$STACK/.publish.lock" "report render retained a lock with an abandoned reclaim marker"
   pass "report stack recovers abandoned reclaim ownership by process identity and age"
+}
+
+test_abandoned_reclaim_directory_is_recovered() {
+  mkdir -p "$STACK/.publish.lock/.reclaim"
+  printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$STACK/.publish.lock/owner"
+  printf 'residue\n' > "$STACK/.publish.lock/.reclaim/residue"
+  touch -t 200001010000 "$STACK/.publish.lock" "$STACK/.publish.lock/owner" \
+    "$STACK/.publish.lock/.reclaim"
+  run_stack render >/dev/null || fail "abandoned report-lock reclaim directory was not recovered"
+  assert_absent "$STACK/.publish.lock" "report render retained a lock with an abandoned reclaim directory"
+  pass "report stack recursively cleans quarantined reclaim directories"
 }
 
 test_publish_lock_directory_symlink_fails_closed() {
@@ -655,8 +683,15 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  test_pr_url_strips_query_and_fragment
+  test_abandoned_reclaim_directory_is_recovered
+  exit 0
+fi
+
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
+test_pr_url_strips_query_and_fragment
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
 test_text_sources_are_bounded_before_reading
@@ -669,6 +704,7 @@ test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
+test_abandoned_reclaim_directory_is_recovered
 test_publish_lock_directory_symlink_fails_closed
 test_lock_control_files_are_bounded_and_nonfollowing
 test_previous_generation_is_recovered_for_readers

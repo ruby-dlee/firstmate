@@ -434,7 +434,11 @@ fmx_resolve_reply_context() {
     case "$source_p" in discord|x) [ -n "$p" ] || p=$source_p ;; esac
     case "$source_m" in
       ''|*[!0-9]*) ;;
-      *) [ "$source_m" -lt "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || { [ -n "$m" ] || m=$source_m; } ;;
+      *)
+        if [ "${#source_m}" -le 18 ] && [ "$source_m" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null; then
+          [ -n "$m" ] || m=$source_m
+        fi
+        ;;
     esac
     [ -n "$p" ] && [ -n "$m" ] && break
   done

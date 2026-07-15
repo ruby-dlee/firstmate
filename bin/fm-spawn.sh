@@ -758,6 +758,11 @@ PROJ=
 ARG3=
 FIRSTMATE_HOME=
 
+if [ -z "$LIFECYCLE_LOCK" ]; then
+  LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  LIFECYCLE_LOCK_OWNED=1
+fi
+
 if [ -e "$STATE/$ID.status" ] || [ -L "$STATE/$ID.status" ]; then ORIGINAL_STATUS_PRESENT=1; else ORIGINAL_STATUS_PRESENT=0; fi
 if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGINAL_TURN_ENDED_PRESENT=1; else ORIGINAL_TURN_ENDED_PRESENT=0; fi
 if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
@@ -1031,10 +1036,6 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
   fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  if [ -z "$LIFECYCLE_LOCK" ]; then
-    LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
-    LIFECYCLE_LOCK_OWNED=1
-  fi
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     current_recovery_task=$(fm_meta_get "$RESUME_META" account_task)

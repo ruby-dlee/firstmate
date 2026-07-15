@@ -339,7 +339,7 @@ fm_afk_launch_herdr_identity_state() {  # <target> <packed-identity>
 # Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET and
 # FM_AFK_REC_EXTRA. Returns 1 when no record exists.
 fm_afk_launch_record_read() {
-  local record
+  local record hash expected_prefix
   FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; FM_AFK_REC_EXTRA=""
   if [ -L "$FM_AFK_LAUNCH_RECORD" ] \
     || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
@@ -362,7 +362,14 @@ fm_afk_launch_record_read() {
   case "$FM_AFK_REC_BACKEND" in
     herdr) fm_afk_launch_herdr_identity_parse "$FM_AFK_REC_EXTRA" ;;
     herdr-plan) [ -n "$FM_AFK_REC_EXTRA" ] ;;
-    tmux) : ;;
+    tmux)
+      hash=$(printf '%s' "$FM_HOME" | cksum | cut -d' ' -f1)
+      expected_prefix="fm-afk-daemon-$hash-"
+      if ! printf '%s\n' "$FM_AFK_REC_TARGET" | grep -Eq "^${expected_prefix}[0-9]+-[0-9]+-[0-9]+$"; then
+        fm_afk_launch_log "recorded tmux target '$FM_AFK_REC_TARGET' does not belong to this Firstmate home; refusing to act on it"
+        return 2
+      fi
+      ;;
     none) [ "$FM_AFK_REC_TARGET" = - ] && [ "$FM_AFK_REC_EXTRA" = native ] ;;
     *) return 2 ;;
   esac || { fm_afk_launch_log "daemon terminal record is malformed; refusing to act on it"; return 2; }
@@ -390,7 +397,7 @@ fm_afk_launch_close_terminal() {  # <backend> <target> [extra]
       ;;
     tmux)
       # target is the dedicated daemon session name - kill exactly it.
-      tmux kill-session -t "$target" 2>/dev/null
+      tmux kill-session -t "=$target" 2>/dev/null
       ;;
     none)
       return 0
@@ -412,7 +419,7 @@ fm_afk_launch_terminal_absent() {  # <backend> <target> [extra]
       [ "$(fm_afk_launch_herdr_identity_state "$target" "$extra")" = absent ]
       ;;
     tmux)
-      out=$(tmux has-session -t "$target" 2>&1)
+      out=$(tmux has-session -t "=$target" 2>&1)
       result=$?
       [ "$result" -eq 1 ] || return 1
       printf '%s' "$out" | grep -Eqi "can't find session|no server running on|failed to connect to server|error connecting to .*\((No such file or directory|Connection refused)\)"
@@ -480,7 +487,7 @@ fm_afk_launch_terminal_alive() {  # <backend> <target> [extra]
       [ "$(fm_afk_launch_herdr_identity_state "$target" "$extra")" = match ]
       ;;
     tmux)
-      tmux has-session -t "$target" 2>/dev/null
+      tmux has-session -t "=$target" 2>/dev/null
       ;;
     *) return 1 ;;
   esac

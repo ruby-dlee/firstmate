@@ -1535,6 +1535,23 @@ test_reply_context_skips_subminimum_budget_for_later_source() {
   pass "reply context skips subminimum budgets while merging sources"
 }
 
+test_reply_context_skips_oversized_budget_for_later_source() {
+  local home context
+  home="$TMP_ROOT/reg-oversized-fallback"
+  mkdir -p "$home/state/x-context" "$home/state/x-inbox"
+  jq -cn --arg max '9999999999999999999999999999999999999999' \
+    '{request_id:"req-oversized-fallback",platform:"",reply_max_chars:$max,recorded_at:1700000000}' \
+    > "$home/state/x-context/req-oversized-fallback.json"
+  jq -cn '{request_id:"req-oversized-fallback",platform:"",reply_max_chars:"90",text:"question"}' \
+    > "$home/state/x-inbox/req-oversized-fallback.json"
+  context=$(FMX_NOW_OVERRIDE=1700000000 bash -c \
+    '. "$1"; fmx_resolve_reply_context "$2" req-oversized-fallback 0' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state")
+  [ "$(printf '%s' "$context" | jq -r .reply_max_chars)" = 90 ] \
+    || fail "oversized registry budget blocked the later valid inbox budget"
+  pass "reply context skips unrepresentable budgets while merging sources"
+}
+
 # Requirement 1 (authoritative relay recovery): a live follow-up with only a
 # registry platform recovers the missing explicit budget from the relay by
 # request_id, so a Discord reply stays one message.
@@ -2417,6 +2434,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  test_reply_context_skips_oversized_budget_for_later_source
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2473,6 +2495,7 @@ test_regression_x_followup_still_splits_after_cleanup
 test_regression_unresolved_followup_fails_safe
 test_followup_ignores_subminimum_explicit_context_limit
 test_reply_context_skips_subminimum_budget_for_later_source
+test_reply_context_skips_oversized_budget_for_later_source
 test_followup_partial_registry_uses_relay_budget_live
 test_relay_context_response_is_bounded
 test_followup_platform_only_context_uses_platform_default

@@ -338,6 +338,35 @@ unit_terminal_record_symlink_is_malformed() {
   pass "daemon terminal readers reject symlinked control records"
 }
 
+unit_tmux_record_is_home_scoped_and_exact() {
+  local st hash target rc log
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-tmux-record-scope.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'tmux\tunrelated-session\t\n' > "$st/state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_record_read >/dev/null 2>&1; [ "$?" -eq 2 ]' _ "$LAUNCH"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "foreign tmux daemon record was accepted for this home"
+
+  hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
+  target="fm-afk-daemon-$hash-123-4-1700000000"
+  printf 'tmux\t%s\t\n' "$target" > "$st/state/.afk-daemon-terminal"
+  log="$st/tmux.log"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_FAKE_TMUX_LOG="$log" bash -c '
+    . "$1"
+    tmux() { printf "%s\n" "$*" >> "$FM_FAKE_TMUX_LOG"; return 0; }
+    fm_afk_launch_record_read || exit 1
+    fm_afk_launch_close_terminal "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET" "$FM_AFK_REC_EXTRA"
+    fm_afk_launch_terminal_alive "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET" "$FM_AFK_REC_EXTRA"
+  ' _ "$LAUNCH" || fail "valid home-scoped tmux daemon record was rejected"
+  grep -Fx "kill-session -t =$target" "$log" >/dev/null \
+    || fail "tmux daemon close did not use exact-match target syntax"
+  grep -Fx "has-session -t =$target" "$log" >/dev/null \
+    || fail "tmux daemon liveness did not use exact-match target syntax"
+  rm -rf "$st"
+  pass "tmux daemon records are home-scoped and use exact targets"
+}
+
 unit_linux_stat_selection_avoids_filesystem_stat_output() {
   local st fakebin output
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-linux-stat.XXXXXX")
@@ -821,10 +850,12 @@ SH
 }
 
 unit_close_failure_preserves_record() {
-  local st
+  local st hash target
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-close-fail.XXXXXX")
   mkdir -p "$st/state"
-  printf 'tmux\texact-session\towned\n' > "$st/state/.afk-daemon-terminal"
+  hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
+  target="fm-afk-daemon-$hash-123-4-1700000000"
+  printf 'tmux\t%s\towned\n' "$target" > "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_launch_close_terminal() { return 1; }
@@ -1151,10 +1182,12 @@ unit_clear_failure_aborts_entry() {
 }
 
 unit_confirmed_absence_succeeds() {
-  local st
+  local st hash target
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-confirmed-absent.XXXXXX")
   mkdir -p "$st/state"
-  printf 'tmux\texact-session\towned\n' > "$st/state/.afk-daemon-terminal"
+  hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
+  target="fm-afk-daemon-$hash-123-4-1700000000"
+  printf 'tmux\t%s\towned\n' "$target" > "$st/state/.afk-daemon-terminal"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_launch_close_terminal() { return 1; }
@@ -1382,6 +1415,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  unit_tmux_record_is_home_scoped_and_exact
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1394,6 +1433,7 @@ unit_stale_lock_reclaim_is_serialized
 unit_abandoned_reclaim_is_recovered
 unit_launcher_lock_symlinks_are_refused
 unit_terminal_record_symlink_is_malformed
+unit_tmux_record_is_home_scoped_and_exact
 unit_linux_stat_selection_avoids_filesystem_stat_output
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery

@@ -197,7 +197,7 @@ append_snapshot_section() {
 }
 
 append_file_section() {  # <heading> <file>
-  local heading=$1 file=$2 current file_bytes framing_bytes projected
+  local heading=$1 file=$2 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc
   [ -f "$file" ] || return 0
   [ ! -L "$file" ] || { echo "error: refusing symlinked continuation source $file" >&2; return 1; }
   current=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
@@ -206,11 +206,17 @@ append_file_section() {  # <heading> <file>
   case "$file_bytes$framing_bytes" in *[!0-9]*) echo "error: cannot measure continuation source $file" >&2; return 1 ;; esac
   projected=$((current + file_bytes + framing_bytes))
   [ "$projected" -le "$MAX_PACKET_BYTES" ] || packet_size_error "$projected"
-  {
-    printf '\n## %s\n\n' "$heading"
-    cat "$file"
-    printf '\n'
-  } >> "$PACKET_TMP"
+  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || return 1
+  copy_start=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  set +e
+  head -c "$((file_bytes + 1))" "$file" >> "$PACKET_TMP"
+  copy_rc=$?
+  set -e
+  [ "$copy_rc" -eq 0 ] || { echo "error: cannot copy continuation source $file" >&2; return 1; }
+  copy_end=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  copied=$((copy_end - copy_start))
+  [ "$copied" -eq "$file_bytes" ] || packet_size_error "$((current + framing_bytes + copied))"
+  printf '\n' >> "$PACKET_TMP" || return 1
   packet_check_budget
 }
 

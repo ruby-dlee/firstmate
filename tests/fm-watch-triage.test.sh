@@ -1140,7 +1140,7 @@ test_watcher_markers_refuse_symlinks() {
   outside="$dir/outside-marker"
   mkdir -p "$fake_root/bin"
   printf 'sentinel\n' > "$outside"
-  touch -t 200001010000 "$outside"
+  touch "$outside"
   before=$(file_mtime "$outside")
   rm -f "$state/.last-account-session-sync" "$state/.last-check" \
     "$state/.last-heartbeat" "$state/.last-watcher-beat"
@@ -1156,10 +1156,12 @@ SH
   (
     export FM_STATE_OVERRIDE="$state"
     export FM_ROOT_OVERRIDE="$fake_root"
-    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=0
+    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=999999
     export FM_FAKE_ACCOUNT_SYNC_CALLS="$dir/sync.calls"
     . "$WATCH"
     sync_account_sessions_if_due
+    marker_due "$state/.last-check" 999999 "watcher check" || fail "unsafe check marker was not treated as due"
+    marker_due "$state/.last-heartbeat" 999999 "watcher heartbeat" || fail "unsafe heartbeat marker was not treated as due"
     safe_touch_marker_or_log "$state/.last-check" "watcher check" || true
     safe_touch_marker_or_log "$state/.last-heartbeat" "watcher heartbeat" || true
     safe_touch_marker_or_log "$state/.last-watcher-beat" "watcher beacon" || true
@@ -1167,10 +1169,10 @@ SH
   after=$(file_mtime "$outside")
   [ "$after" = "$before" ] || fail "watcher marker validation touched a symlink target"
   [ "$(cat "$outside")" = sentinel ] || fail "watcher marker validation changed outside content"
-  assert_absent "$dir/sync.calls" "unsafe account cadence marker still triggered session sync"
-  [ "$(grep -c 'unsafe .* marker' "$state/.watch-triage.log" 2>/dev/null || true)" -eq 1 ] \
-    || fail "unsafe watcher markers were not logged exactly once"
-  pass "watcher cadence, check, heartbeat, and beacon markers refuse symlinks"
+  assert_present "$dir/sync.calls" "unsafe account cadence marker was not treated as due"
+  [ "$(grep -c 'unsafe .* marker' "$state/.watch-triage.log" 2>/dev/null || true)" -eq 4 ] \
+    || fail "unsafe watcher markers were not each logged exactly once"
+  pass "watcher markers validate before age checks and refuse symlinks"
 }
 
 test_watcher_timeout_wrapper_uses_hard_kill_fallback() {
@@ -1193,6 +1195,11 @@ SH
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_watcher_markers_refuse_symlinks
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   test_watcher_markers_refuse_symlinks
   exit 0
 fi

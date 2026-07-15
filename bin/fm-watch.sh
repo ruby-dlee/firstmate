@@ -444,21 +444,38 @@ safe_touch_marker() {  # <path>
   touch "$marker"
 }
 
-UNSAFE_MARKER_LOGGED=0
+safe_marker_path() {  # <path>
+  local marker=$1
+  [ ! -L "$marker" ] && { [ ! -e "$marker" ] || [ -f "$marker" ]; }
+}
+
+UNSAFE_MARKERS_LOGGED='|'
 safe_touch_marker_or_log() {  # <path> <label>
   local marker=$1 label=$2
   safe_touch_marker "$marker" && return 0
-  if [ "$UNSAFE_MARKER_LOGGED" = 0 ]; then
-    triage_log "unsafe $label marker: $marker"
-    UNSAFE_MARKER_LOGGED=1
-  fi
+  case "$UNSAFE_MARKERS_LOGGED" in
+    *"|$label|"*) ;;
+    *)
+      triage_log "unsafe $label marker: $marker"
+      UNSAFE_MARKERS_LOGGED="$UNSAFE_MARKERS_LOGGED$label|"
+      ;;
+  esac
   return 1
+}
+
+marker_due() {  # <path> <interval-seconds> <label>
+  local marker=$1 interval=$2 label=$3
+  if ! safe_marker_path "$marker"; then
+    safe_touch_marker_or_log "$marker" "$label" || true
+    return 0
+  fi
+  [ "$(age_of "$marker")" -ge "$interval" ]
 }
 
 sync_account_sessions_if_due() {
   local cadence="$STATE/.last-account-session-sync"
-  [ "$(age_of "$cadence")" -ge "$ACCOUNT_SESSION_SYNC_INTERVAL" ] || return 0
-  safe_touch_marker_or_log "$cadence" "watcher cadence" || return 0
+  marker_due "$cadence" "$ACCOUNT_SESSION_SYNC_INTERVAL" "watcher cadence" || return 0
+  safe_touch_marker_or_log "$cadence" "watcher cadence" || true
   run_bounded "$ACCOUNT_SESSION_SYNC_TIMEOUT" "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
 }
 
@@ -653,7 +670,9 @@ printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
-[ -e "$STATE/.last-heartbeat" ] || safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
+if ! safe_marker_path "$STATE/.last-heartbeat" || [ ! -e "$STATE/.last-heartbeat" ]; then
+  safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
+fi
 
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -683,7 +702,7 @@ while :; do
   # keeps producing signals - the slow poll (e.g. merge detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
-  if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
+  if marker_due "$STATE/.last-check" "$CHECK_INTERVAL" "watcher check"; then
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
       out=$(run_check "$c")
@@ -918,7 +937,7 @@ EOF
   [ "$streak" -gt 12 ] && streak=12
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
-  if [ "$(age_of "$STATE/.last-heartbeat")" -ge "$hb" ]; then
+  if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
     # turns up a captain-relevant status the per-wake path missed. Absorb the
     # no-change case (advance the schedule and back off exactly as wake() would,

@@ -536,6 +536,27 @@ test_managed_recovery_accepts_inherited_lifecycle_lock() {
   pass "managed secondmate-style recovery installs metadata under its inherited lifecycle lock"
 }
 
+test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held() {
+  local id rec held out status
+  id=account-unmanaged-lifecycle-z9e
+  rec=$(make_case unmanaged-lifecycle claude "$id")
+  read_case "$rec"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
+    || { fail "unmanaged lifecycle test could not model teardown's held lifecycle lock"; return; }
+  out=$(FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 run_spawn "$id" "$PROJ_DIR")
+  status=$?
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "unmanaged lifecycle test could not release its blocker lock"
+  [ "$status" -ne 0 ] || fail "default-off spawn bypassed a held task lifecycle lock"
+  assert_contains "$out" "timed out waiting for account lifecycle lock for $id" \
+    "default-off lifecycle-lock refusal was not actionable"
+  assert_absent "$HOME_DIR/state/$id.meta" "refused default-off spawn installed metadata"
+  assert_absent "$CASE_DIR/endpoint-live" "refused default-off spawn created an endpoint"
+  pass "default-off spawns refuse while teardown's lifecycle lock is held"
+}
+
 test_unmanaged_respawn_preserves_report_cutover_state() {
   local id rec out status
   id=account-legacy-respawn-z9b
@@ -2134,6 +2155,42 @@ test_continuation_rejects_symlinked_packet_destination() {
   pass "continuation rejects symlinked packet destinations"
 }
 
+test_continuation_rejects_load_bearing_source_growth_during_copy() {
+  local id rec source real_head out status
+  id=account-continuation-copy-race-z28d
+  rec=$(make_case continuation-copy-race claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "continuation copy-race precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  source="$(cd "$HOME_DIR/data/$id" && pwd -P)/checkpoint.md"
+  printf 'load-bearing checkpoint\n' > "$source"
+  real_head=$(command -v head)
+  cat > "$FAKEBIN_DIR/head" <<'SH'
+#!/usr/bin/env bash
+last=
+for arg in "$@"; do last=$arg; done
+if [ -n "${FM_MUTATE_CONTINUATION_SOURCE:-}" ] && [ "$last" = "$FM_MUTATE_CONTINUATION_SOURCE" ] \
+  && [ ! -e "$FM_MUTATE_CONTINUATION_SOURCE.mutated" ]; then
+  printf 'x' >> "$FM_MUTATE_CONTINUATION_SOURCE"
+  : > "$FM_MUTATE_CONTINUATION_SOURCE.mutated"
+fi
+exec "$FM_REAL_HEAD" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/head"
+  export FM_REAL_HEAD="$real_head" FM_MUTATE_CONTINUATION_SOURCE="$source"
+  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  unset FM_REAL_HEAD FM_MUTATE_CONTINUATION_SOURCE
+  [ "$status" -ne 0 ] || fail "continuation accepted a load-bearing source that grew during copying"
+  assert_present "$source.mutated" "continuation copy-race hook did not run: $out"
+  assert_contains "$out" 'maximum is 65536' "continuation copy-race refusal did not use the packet size error path"
+  assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "continuation copy race acquired a replacement lease"
+  assert_not_grep '^continuation_packet=' "$HOME_DIR/state/$id.meta" "continuation copy race installed a partial packet"
+  pass "continuation load-bearing copies reject source-size changes"
+}
+
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
@@ -2494,6 +2551,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
+  test_continuation_rejects_load_bearing_source_growth_during_copy
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
@@ -2504,6 +2567,7 @@ test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_managed_recovery_accepts_inherited_lifecycle_lock
+test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot
@@ -2558,6 +2622,7 @@ test_oversized_continuation_stops_before_mutation
 test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
+test_continuation_rejects_load_bearing_source_growth_during_copy
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_ownerless_lock_marker_rejects_symlink_clobber
 test_linux_stat_selection_avoids_filesystem_stat_output

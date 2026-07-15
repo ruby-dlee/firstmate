@@ -11,7 +11,7 @@ A ship task writes `data/<id>/completion.md`, while a scout keeps using `data/<i
 Both may attach screenshots, diagrams, or other review artifacts under `data/<id>/visuals/`.
 Every post-cutover ship and scout report must use the level-two sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
 
-`fm-teardown.sh` publishes a required report after all non-destructive safety checks and before releasing an account lease, killing an endpoint, or removing a worktree.
+For `report_required` tasks, `fm-teardown.sh` runs all non-destructive safety checks, quiesces the endpoint and confirms it gone while failing closed on an alive or unknown state, then publishes before releasing an account lease or removing a worktree.
 If a required heading is absent, publication names every missing heading, identifies the exact report source to edit, and gives the publish and teardown retry commands.
 Publication failure leaves the prior durable entry unchanged and stops teardown before destructive cleanup, preserving the task for repair and retry.
 Tasks that were already in flight at cutover lack the marker and retain the earlier teardown contract.

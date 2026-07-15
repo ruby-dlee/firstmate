@@ -810,6 +810,38 @@ unit_record_publication_atomic() {
   rm -rf "$st"
 }
 
+unit_publication_rejects_unsafe_destinations() {
+  local st outside
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-publish-destination.XXXXXX")
+  outside="$st/outside"
+  mkdir -p "$st/state" "$outside"
+  ln -s "$outside" "$st/state/.afk-daemon-terminal"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    ! fm_afk_launch_record_write tmux escaped-session owned
+  ' _ "$LAUNCH" \
+    && ! find "$outside" -mindepth 1 -print -quit | grep -q . \
+    && ! find "$st/state" -name '.afk-daemon-terminal.pending.*' -print -quit | grep -q .; then
+    pass "record publication: directory symlink destination is refused and staging is cleaned"
+  else
+    fail "record publication: unsafe directory symlink accepted or staging leaked"
+  fi
+
+  rm -f "$st/state/.afk-daemon-terminal"
+  ln -s "$outside" "$st/state/.afk"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    ! fm_afk_launch_flag_write
+  ' _ "$LAUNCH" \
+    && ! find "$outside" -mindepth 1 -print -quit | grep -q . \
+    && ! find "$st/state" -name '.afk.pending.*' -print -quit | grep -q .; then
+    pass "flag publication: directory symlink destination is refused and staging is cleaned"
+  else
+    fail "flag publication: unsafe directory symlink accepted or staging leaked"
+  fi
+  rm -rf "$st"
+}
+
 unit_malformed_record_fails_closed() {
   local st acted
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-malformed.XXXXXX")
@@ -1296,6 +1328,7 @@ unit_native_start_stop_handoff_is_atomic
 unit_direct_native_start_stop_handoff_is_atomic
 unit_close_failure_preserves_record
 unit_record_publication_atomic
+unit_publication_rejects_unsafe_destinations
 unit_malformed_record_fails_closed
 unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision

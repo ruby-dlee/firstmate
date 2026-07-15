@@ -368,6 +368,7 @@ ORCA_TERMINAL=
 ACCOUNT_LEASE_CREATED=0
 ACCOUNT_SPAWN_COMMITTED=0
 ACCOUNT_EFFECTIVE_MODE=off
+ACCOUNT_PRIMARY_MODE=off
 ACCOUNT_TASK=
 ACCOUNT_ATTEMPT=
 ACCOUNT_PREDECESSOR_TASK=
@@ -387,6 +388,7 @@ RAW_LAUNCH=0
 ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
+CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
 ORIGINAL_CHECK_PRESENT=-1
@@ -573,6 +575,7 @@ spawn_abort_cleanup() {
   [ -z "${ACCOUNT_NATIVE_LAUNCH_GO:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
   [ -z "${ACCOUNT_NATIVE_LAUNCH_READY:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
   [ -z "${ACCOUNT_NATIVE_LAUNCH_SCRIPT:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
+  [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
       if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
@@ -928,6 +931,9 @@ if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
+if [ "$ACCOUNT_EXPLICIT" = 0 ]; then
+  ACCOUNT_PRIMARY_MODE=$ACCOUNT_EFFECTIVE_MODE
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
     ACCOUNT_POOL=$SM_ACCOUNT_POOL
@@ -1191,6 +1197,23 @@ validate_firstmate_home_for_spawn() {
   printf '%s\n' "$abs_home"
 }
 
+secondmate_home_supports_account_routing() {
+  local home=$1
+  [ -f "$home/bin/fm-account-routing-lib.sh" ] \
+    && [ -f "$home/bin/fm-spawn.sh" ] \
+    && grep -q '^fm_account_resolve_mode()' "$home/bin/fm-account-routing-lib.sh" \
+    && grep -Fq "ACCOUNT_EFFECTIVE_MODE=\$(fm_account_resolve_mode" "$home/bin/fm-spawn.sh"
+}
+
+secondmate_routing_config_inherited() {
+  local report=$1 status
+  status=$(awk -F '\t' '$1 == "account-routing-mode" { value=$2 } END { print value }' "$report" 2>/dev/null)
+  case "$status" in
+    pushed|unchanged) return 0 ;;
+  esac
+  return 1
+}
+
 validate_firstmate_operational_dirs() {
   local abs_home=$1 abs_active_home=$2 abs_root=$3 name dir abs_dir
   for name in data state config projects; do
@@ -1291,8 +1314,32 @@ if [ "$KIND" = secondmate ]; then
   # primary-authoritative and re-pushed on every convergence. config/secondmate-harness
   # is the primary's own knob and is deliberately NOT in the inheritable set
   # (fm-config-inherit-lib.sh). A primary with no inheritable config set is a no-op.
-  propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config" \
-    || echo "warning: secondmate $ID config inheritance failed for $PROJ_ABS/config" >&2
+  CONFIG_INHERIT_REPORT_TMP=$(mktemp "$STATE/.fm-config-inherit.$ID.XXXXXX") || exit 1
+  if ! FM_CONFIG_INHERIT_REPORT="$CONFIG_INHERIT_REPORT_TMP" \
+    propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config"; then
+    echo "warning: secondmate $ID config inheritance failed for $PROJ_ABS/config" >&2
+  fi
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    if ! secondmate_routing_config_inherited "$CONFIG_INHERIT_REPORT_TMP"; then
+      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: account-routing-mode inheritance did not succeed. Reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      exit 1
+    fi
+    if [ "$ACCOUNT_PRIMARY_MODE" = enforce ]; then
+      sm_inherited_routing_mode=$(fm_account_read_single_value "$PROJ_ABS/config/account-routing-mode" 2>/dev/null || true)
+      if [ "$sm_inherited_routing_mode" != enforce ]; then
+        echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the primary's enforced routing mode is not active in the home. Set config/account-routing-mode to enforce in the primary, run bin/fm-config-push.sh, and retry." >&2
+        exit 1
+      fi
+    fi
+    if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      exit 1
+    fi
+  elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+    echo "warning: secondmate $ID home $PROJ_ABS lacks Agent Fleet routing support; launching because account routing is $ACCOUNT_EFFECTIVE_MODE" >&2
+  fi
+  rm -f "$CONFIG_INHERIT_REPORT_TMP"
+  CONFIG_INHERIT_REPORT_TMP=
   if [ -f "$PROJ_ABS/data/charter.md" ]; then
     BRIEF="$PROJ_ABS/data/charter.md"
   else

@@ -238,8 +238,22 @@ quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
   return 1
 }
 
+reconcile_managed_account_rollback() {  # <meta> <task> [data-dir]
+  local meta=$1 task=$2 owner_data=${3:-$DATA} rollback_backup
+  [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
+  rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
+  fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
+    echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
+    return 1
+  }
+  if [ -n "$rollback_backup" ]; then
+    echo "error: rolled-back Agent Fleet state for $task was restored; rerun teardown against the restored task generation" >&2
+    return 2
+  fi
+}
+
 release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
-  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state rollback_backup lock
+  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state lock
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
@@ -265,15 +279,7 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
   [ -n "$account_task" ] || account_task=$task
   fm_account_meta_lock_release "$lock" || return 1
   if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
-    rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
-    fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
-      echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
-      return 1
-    }
-    if [ -n "$rollback_backup" ]; then
-      echo "error: rolled-back Agent Fleet state for $task was restored; rerun teardown against the restored task generation" >&2
-      return 2
-    fi
+    reconcile_managed_account_rollback "$meta" "$task" "$owner_data" || return $?
     profile=$(fm_meta_get "$meta" account_profile)
     if [ -z "$profile" ]; then
       return 0
@@ -1212,12 +1218,16 @@ quiesce_completion_report_endpoint() {
   return 1
 }
 
-# New tasks quiesce their endpoint and fail closed on their machine-global
-# completion report before the first destructive action below. Tasks already
-# in flight when this feature lands have no report_required marker and retain
-# the legacy teardown contract. --force is an explicit discard, not a completion.
+# New tasks quiesce their endpoint, restore any pending rollback generation,
+# and fail closed on their machine-global completion report before lease release
+# or worktree removal. Tasks already in flight when this feature lands have no
+# report_required marker and retain the legacy teardown contract. --force is an
+# explicit discard, not a completion.
 if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
   quiesce_completion_report_endpoint || exit 1
+  if [ "$MANAGED_ACCOUNT" = 1 ]; then
+    reconcile_managed_account_rollback "$META" "$ID" "$DATA" || exit $?
+  fi
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
     "$FM_ROOT/bin/fm-report-stack.mjs" publish "$ID" || exit 1
 fi

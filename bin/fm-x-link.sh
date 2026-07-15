@@ -24,8 +24,8 @@
 #
 # Fresh-link context resolution fills platform and explicit budget independently
 # through the durable per-request registry, inbox payload, then authoritative
-# relay lookup by request_id. If either axis remains missing, the link is still
-# recorded but a loud warning is printed and follow-ups fail closed.
+# relay lookup by request_id. A known platform or a valid explicit budget is
+# sufficient; follow-ups fail closed only when neither can be resolved.
 #
 # This is a separate step the fmx-respond skill runs AFTER fm-spawn.sh, so it
 # never changes fm-spawn's interface. The follow-up itself - detection, the
@@ -155,7 +155,7 @@ if [ -n "$CARRY_TS" ] && { [ -z "$REQ_PLATFORM" ] || [ -z "$REQ_REPLY_MAX" ]; };
 fi
 
 if [ -z "$CARRY_TS" ] && { [ -z "$REQ_PLATFORM" ] || [ -z "$REQ_REPLY_MAX" ]; }; then
-  echo "fm-x-link: WARNING: incomplete authoritative reply context for request $RID; every completion follow-up will be HELD until both platform and explicit budget can be resolved. Ensure the relay request-context lookup supplies both values." >&2
+  echo "fm-x-link: WARNING: incomplete authoritative reply context for request $RID; follow-ups remain available when either platform or a valid explicit budget of at least $FMX_REPLY_MIN_CHARS characters is known, and are held only if neither is resolvable." >&2
 fi
 
 FOLLOWUPS=0

@@ -1831,6 +1831,72 @@ SH
   pass "teardown quiesces before publishing and still publishes before cleanup"
 }
 
+test_required_report_restores_rollback_generation_before_publish() {
+  local case_dir data stack af_log live backup rc
+  case_dir=$(make_case report-rollback-generation)
+  data="$case_dir/data"
+  stack="$case_dir/report-stack"
+  af_log="$case_dir/agent-fleet.log"
+  live="$case_dir/report-endpoint-live"
+  backup="$case_dir/state/.task-x1.meta.rollback.restore1"
+  : > "$af_log"
+  mkdir -p "$data/task-x1"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'harness=codex' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  cp "$case_dir/state/task-x1.meta" "$backup"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=no-mistakes' \
+    'report_required=1' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-failed' \
+    'account_attempt=failed' \
+    'provider_session_id=session-failed' \
+    'account_rollback_cleanup=pending' \
+    'account_rollback_backup=.task-x1.meta.rollback.restore1'
+  printf '# Task\n\nRestored report generation\n' > "$data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nSettled generation.\n\n## What changed\n\nRestored metadata.\n\n## Verification\n\nTested.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window) rm -f "$FM_FAKE_REPORT_LIVE"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  : > "$live"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+    FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_REPORT_LIVE="$live" run_teardown "$case_dir" \
+      > "$case_dir/rollback-stdout" 2> "$case_dir/rollback-stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "required rollback report: restoration pass should stop before publication"
+  assert_grep 'rerun teardown against the restored task generation' "$case_dir/rollback-stderr" \
+    "required rollback report did not request a fresh settled-generation pass"
+  grep -qx 'harness=codex' "$case_dir/state/task-x1.meta" \
+    || fail "rollback did not restore predecessor metadata"
+  assert_absent "$stack/index.html" "failed generation was published before rollback restoration"
+
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" FM_FAKE_REPORT_LIVE="$live" \
+    run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" \
+    || fail "required rollback report: settled-generation retry failed: $(cat "$case_dir/retry-stderr")"
+  assert_grep '"harness": "codex"' "$(find "$stack/entries" -name manifest.json -print -quit)" \
+    "settled-generation report retained the failed generation harness"
+  assert_absent "$case_dir/state/task-x1.meta" "settled-generation teardown retained task metadata"
+  pass "teardown restores pending rollback state before required report publication"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1848,6 +1914,7 @@ test_forced_secondmate_child_uses_child_home_for_endpoint_verification
 test_forced_secondmate_quiesces_parent_before_child_cleanup
 test_herdr_teardown_clears_escalation_marker
 test_required_report_blocks_then_publishes_before_cleanup
+test_required_report_restores_rollback_generation_before_publish
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

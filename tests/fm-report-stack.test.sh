@@ -151,6 +151,40 @@ test_revision_fields_distinguish_pr_head_from_worktree_head() {
   pass "report manifests distinguish PR head from worktree HEAD compatibly"
 }
 
+test_republish_new_generation_refreshes_completion_time() {
+  local id=report-generation-a4 repo meta entry manifest staged
+  repo="$TMP_ROOT/generation-worktree"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.name fmtest
+  git -C "$repo" config user.email fmtest@example.invalid
+  git -C "$repo" commit -q --allow-empty -m first
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "First generation."
+  meta="$HOME_DIR/state/$id.meta"
+  staged="$HOME_DIR/state/.$id.meta.generation"
+  grep -v '^worktree=' "$meta" > "$staged"
+  printf 'worktree=%s\n' "$repo" >> "$staged"
+  mv "$staged" "$meta"
+  run_stack publish "$id" >/dev/null || fail "first generation report publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$manifest.tmp"
+  mv "$manifest.tmp" "$manifest"
+
+  git -C "$repo" commit -q --allow-empty -m second
+  sed 's/^harness=.*/harness=claude/; s/^account_profile=.*/account_profile=claude-3/' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Restored generation."
+  run_stack publish "$id" >/dev/null || fail "restored generation report publication failed"
+  if grep -q '"completedAt": "2000-01-01T00:00:00.000Z"' "$manifest"; then
+    fail "new generation retained the superseded completion timestamp"
+  fi
+  assert_grep '"harness": "claude"' "$manifest" "new generation report retained the superseded harness"
+  assert_grep '"accountProfile": "claude-3"' "$manifest" "new generation report retained the superseded profile"
+  pass "report republish refreshes completion time for a new task generation"
+}
+
 test_required_source_fails_closed() {
   local id=report-missing-b2 out status
   write_task "$id" ship
@@ -464,6 +498,7 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
 test_revision_fields_distinguish_pr_head_from_worktree_head
+test_republish_new_generation_refreshes_completion_time
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_scout_and_legacy_sources

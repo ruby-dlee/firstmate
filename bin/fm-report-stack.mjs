@@ -588,13 +588,18 @@ function publish(taskId, legacy) {
     const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
     const worktreeHead = gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]);
     const prHead = displaySha(meta.pr_head);
+    const previousWorktreeHead = previousManifest?.worktreeHead || previousManifest?.commit || "";
+    const sameGeneration = previousManifest
+      && (!worktreeHead || previousWorktreeHead === worktreeHead)
+      && previousManifest.harness === (meta.harness || "unknown")
+      && (previousManifest.accountProfile || "") === (meta.account_profile || "");
     const manifest = {
       schemaVersion: 1,
       reportId: id,
       taskId,
       title: titleFromBrief(taskId, brief),
       summary: firstSummary(markdown, lastStatus(status)),
-      completedAt: previousManifest?.completedAt || new Date().toISOString(),
+      completedAt: sameGeneration ? previousManifest.completedAt : new Date().toISOString(),
       kind: meta.kind || "ship",
       mode: meta.mode || "no-mistakes",
       project: meta.project ? path.basename(meta.project) : "unknown",

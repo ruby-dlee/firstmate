@@ -246,13 +246,23 @@ fm_afk_launch_record_write() {  # <backend> <target> <extra>
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   pending=$(mktemp "$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal.pending.XXXXXX") || return 1
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$pending" || { rm -f "$pending"; return 1; }
+  if [ -L "$FM_AFK_LAUNCH_RECORD" ] || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
+    fm_afk_launch_log "refusing unsafe daemon-terminal record destination: $FM_AFK_LAUNCH_RECORD"
+    rm -f "$pending"
+    return 1
+  fi
   mv "$pending" "$FM_AFK_LAUNCH_RECORD" || { rm -f "$pending"; return 1; }
 }
 
 fm_afk_launch_flag_write() {
-  local pending="$FM_AFK_LAUNCH_STATE/.afk.pending.$$"
+  local destination="$FM_AFK_LAUNCH_STATE/.afk" pending="$FM_AFK_LAUNCH_STATE/.afk.pending.$$"
   date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
-  mv "$pending" "$FM_AFK_LAUNCH_STATE/.afk" || { rm -f "$pending"; return 1; }
+  if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    fm_afk_launch_log "refusing unsafe away-mode flag destination: $destination"
+    rm -f "$pending"
+    return 1
+  fi
+  mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
 }
 
 fm_afk_launch_herdr_identity_pack() {  # <workspace-id> <label>

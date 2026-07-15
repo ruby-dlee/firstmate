@@ -738,6 +738,8 @@ test_native_resume_rejects_prelaunch_sessionstart_evidence() {
 make_seeded_secondmate_home() {
   local home=$1 id=$2
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
+  cp "$ROOT/bin/fm-account-routing-lib.sh" "$home/bin/fm-account-routing-lib.sh"
+  cp "$ROOT/bin/fm-spawn.sh" "$home/bin/fm-spawn.sh"
   printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
@@ -768,6 +770,7 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   printf 'claude-captains\n' > "$HOME_DIR/config/secondmate-account-pool"
 
@@ -779,6 +782,71 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
+}
+
+test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
+  local id rec sm out status
+  id=account-secondmate-inherit-refuse-z11d
+  rec=$(make_case secondmate-inherit-refuse claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  mkdir "$sm/config/account-routing-mode"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "enforced secondmate launched after routing-mode inheritance failed"
+  assert_contains "$out" "secondmate-home" "inheritance refusal omitted the offending secondmate home"
+  assert_contains "$out" "run bin/fm-config-push.sh" "inheritance refusal omitted the manual reconciliation step"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "inheritance refusal created an endpoint"
+
+  id=account-secondmate-incapable-refuse-z11e
+  rec=$(make_case secondmate-incapable-refuse claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+  rm -f "$sm/bin/fm-account-routing-lib.sh"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
+  assert_contains "$out" "secondmate-home" "capability refusal omitted the offending secondmate home"
+  assert_contains "$out" "lacks Agent Fleet routing support" "capability refusal omitted its reason"
+  assert_contains "$out" "run bin/fm-config-push.sh" "capability refusal omitted the manual reconciliation step"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
+  pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
+}
+
+test_unenforced_secondmate_convergence_failures_warn_and_launch() {
+  local id rec sm out status
+  id=account-secondmate-observe-inherit-z11f
+  rec=$(make_case secondmate-observe-inherit claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+  printf 'observe\n' > "$HOME_DIR/config/account-routing-mode"
+  mkdir "$sm/config/account-routing-mode"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -eq 0 ] || fail "observe secondmate did not preserve warn-and-launch behavior: $out"
+  assert_contains "$out" "config inheritance failed" "observe convergence failure was not warned"
+  assert_regex '^new-window ' "$TMUX_LOG" "observe convergence warning blocked launch"
+
+  id=account-secondmate-off-incapable-z11g
+  rec=$(make_case secondmate-off-incapable claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+  rm -f "$sm/bin/fm-account-routing-lib.sh"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"
+  assert_contains "$out" "lacks Agent Fleet routing support" "off capability gap was not warned"
+  assert_regex '^new-window ' "$TMUX_LOG" "off capability warning blocked launch"
+  pass "off and observe secondmates warn but launch through convergence gaps"
 }
 
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
@@ -2219,6 +2287,8 @@ test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+test_enforced_secondmate_requires_routing_inheritance_and_capable_home
+test_unenforced_secondmate_convergence_failures_warn_and_launch
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt

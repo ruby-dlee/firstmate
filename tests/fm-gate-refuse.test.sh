@@ -48,6 +48,14 @@ UPDATE="$ROOT/bin/fm-update.sh"
 CONFIG_PUSH="$ROOT/bin/fm-config-push.sh"
 ACCOUNT_SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 ACCOUNT_CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
+FLEET_SYNC="$ROOT/bin/fm-fleet-sync.sh"
+X_REPLY="$ROOT/bin/fm-x-reply.sh"
+X_DISMISS="$ROOT/bin/fm-x-dismiss.sh"
+X_FOLLOWUP="$ROOT/bin/fm-x-followup.sh"
+WATCH="$ROOT/bin/fm-watch.sh"
+WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
+WAKE_DRAIN="$ROOT/bin/fm-wake-drain.sh"
+REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -361,7 +369,7 @@ SH
 run_teardown() {
   local cwd=$1 case_dir=$2; shift 2
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-      "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" \
+      "FM_ROOT_OVERRIDE=$cwd" "FM_STATE_OVERRIDE=$case_dir/state" \
       "FM_CONFIG_OVERRIDE=$case_dir/config" "PATH=$case_dir/fakebin:$PATH" "$@" \
       "$(guarded_script "$cwd" "$TEARDOWN")" task-x1 ) 2>&1
 }
@@ -596,6 +604,65 @@ test_primary_mutators_refuse_gate_contexts() {
   pass "primary fleet mutators refuse both gate signals before state changes"
 }
 
+test_extended_mutating_entrypoints_refuse_gate_context() {
+  local home stack script name out rc
+  home="$TMP/extended-mutators"
+  stack="$TMP/extended-report-stack"
+  mkdir -p "$home/state" "$home/data" "$home/projects"
+
+  for name in fleet-sync x-reply x-dismiss x-followup watch watch-arm wake-drain; do
+    case "$name" in
+      fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
+      x-reply) script=$(guarded_script "$NORMAL_CWD" "$X_REPLY"); set -- request-x "reply" ;;
+      x-dismiss) script=$(guarded_script "$NORMAL_CWD" "$X_DISMISS"); set -- request-x ;;
+      x-followup) script=$(guarded_script "$NORMAL_CWD" "$X_FOLLOWUP"); set -- --check task-x ;;
+      watch) script=$(guarded_script "$NORMAL_CWD" "$WATCH"); set -- ;;
+      watch-arm) script=$(guarded_script "$NORMAL_CWD" "$WATCH_ARM"); set -- ;;
+      wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;
+    esac
+    out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
+      FM_HOME="$home" FM_ROOT_OVERRIDE="$NORMAL_CWD" FM_STATE_OVERRIDE="$home/state" \
+      "$script" "$@" 2>&1)
+    rc=$?
+    expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"
+  done
+
+  for name in publish render list path open; do
+    script=$(guarded_script "$NORMAL_CWD" "$REPORT_STACK")
+    case "$name" in
+      publish) set -- publish task-x ;;
+      render) set -- render ;;
+      list) set -- list --json ;;
+      path) set -- path task-x ;;
+      open) set -- open task-x ;;
+    esac
+    out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
+      FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" "$@" 2>&1)
+    rc=$?
+    expect_code 3 "$rc" "report $name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "report $name: env-marker refusal message"
+  done
+
+  script=$(guarded_script "$GATE_WT" "$REPORT_STACK")
+  out=$(cd "$NORMAL_CWD" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+    FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" list --json 2>&1)
+  rc=$?
+  expect_code 3 "$rc" "report list: gate script checkout must refuse with marker unset"
+  assert_contains "$out" "$PATH_MSG" "report list: script-checkout backstop refusal message"
+
+  script=$(guarded_script "$NORMAL_CWD" "$REPORT_STACK")
+  out=$(cd "$GATE_WT" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+    FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" path task-x 2>&1)
+  rc=$?
+  expect_code 3 "$rc" "report path: gate caller checkout must refuse with marker unset"
+  assert_contains "$out" "$PATH_MSG" "report path: caller-checkout backstop refusal message"
+
+  assert_absent "$stack" "refused report commands created or recovered report-stack state"
+  assert_absent "$home/state/.watch.lock" "refused watcher created its singleton lock"
+  pass "project sync, X publication, watcher, wake drain, and every report command refuse gate contexts"
+}
+
 # --- tracked .no-mistakes.yaml ----------------------------------------------
 
 test_no_mistakes_yaml_disables_project_settings() {
@@ -637,4 +704,5 @@ test_teardown_refuses_and_admits
 test_merge_entrypoints_refuse_gate_contexts
 test_promote_refuses_gate_contexts
 test_primary_mutators_refuse_gate_contexts
+test_extended_mutating_entrypoints_refuse_gate_context
 test_no_mistakes_yaml_disables_project_settings

@@ -371,6 +371,7 @@ ACCOUNT_EFFECTIVE_MODE=off
 ACCOUNT_PRIMARY_MODE=off
 ACCOUNT_TASK=
 ACCOUNT_ATTEMPT=
+SPAWN_GENERATION_ID=
 ACCOUNT_PREDECESSOR_TASK=
 ACCOUNT_PREDECESSOR_ATTEMPT=
 ACCOUNT_PREDECESSOR_PROVIDER=
@@ -457,6 +458,7 @@ persist_failed_account_rollback() {
       echo "tasktmp=${TASK_TMP:-}"
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
+      echo "generation_id=${SPAWN_GENERATION_ID:-account:$ACCOUNT_TASK:${ACCOUNT_ATTEMPT:-legacy}}"
       [ -z "${ACCOUNT_POOL:-}" ] || echo "account_pool=$ACCOUNT_POOL"
       [ -z "${ACCOUNT_PROFILE:-}" ] || echo "account_profile=$ACCOUNT_PROFILE"
       echo "account_task=$ACCOUNT_TASK"
@@ -930,10 +932,8 @@ ACCOUNT_EXPLICIT=0
 if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
+ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 "$NO_ACCOUNT_ROUTING") || exit 1
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
-if [ "$ACCOUNT_EXPLICIT" = 0 ]; then
-  ACCOUNT_PRIMARY_MODE=$ACCOUNT_EFFECTIVE_MODE
-fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
     ACCOUNT_POOL=$SM_ACCOUNT_POOL
@@ -977,6 +977,11 @@ fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$RESUME_ACCOUNT" != 1 ]; then
   ACCOUNT_ATTEMPT=$(fm_account_attempt_id "$FM_HOME" "$ID") || exit 1
   ACCOUNT_TASK=$(fm_account_task_key "$FM_HOME" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  SPAWN_GENERATION_ID="account:$ACCOUNT_TASK:$ACCOUNT_ATTEMPT"
+else
+  SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
   fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
@@ -1776,6 +1781,7 @@ META_TMP="$STATE/.$ID.meta.$$"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  echo "generation_id=$SPAWN_GENERATION_ID"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
       RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)

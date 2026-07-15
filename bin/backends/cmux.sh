@@ -380,7 +380,7 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 # focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
 # <surface_id>" on success.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid created_wsid
+  local label=$1 cwd=$2 title dup out wsid sfid created_wsid workspaces title_count title_wsid
   title=$(fm_backend_cmux_scoped_title "$label")
   dup=$(fm_backend_cmux_workspace_id_for_label "$title") || {
     echo "error: could not inspect cmux workspaces before creating '$title'" >&2
@@ -398,11 +398,40 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     | grep -Eo '[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}' \
     | awk '!seen[$0]++' 2>/dev/null || true)
   case "$created_wsid" in *$'\n'*) created_wsid='' ;; esac
-  wsid=$(fm_backend_cmux_workspace_id_for_label "$title") || {
+  workspaces=$(fm_backend_cmux_all_workspaces) || {
     [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
     echo "error: could not inspect cmux workspaces after creating '$title'" >&2
     return 1
   }
+  title_count=$(printf '%s' "$workspaces" | jq -r --arg want "$title" '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) || {
+    [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
+    echo "error: could not inspect cmux workspaces after creating '$title'" >&2
+    return 1
+  }
+  title_wsid=$(printf '%s' "$workspaces" | jq -r --arg want "$title" '[.workspaces[] | select(.title == $want)][0].id // empty' 2>/dev/null) || {
+    [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
+    echo "error: could not inspect cmux workspaces after creating '$title'" >&2
+    return 1
+  }
+  if [ -n "$created_wsid" ]; then
+    if [ "$title_count" != 1 ] || [ "$title_wsid" != "$created_wsid" ] \
+      || ! printf '%s' "$workspaces" | jq -e --arg id "$created_wsid" --arg title "$title" \
+        'any(.workspaces[]; .id == $id and .title == $title)' >/dev/null 2>&1; then
+      fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
+      echo "error: cmux creation id $created_wsid conflicts with the post-create workspace listing for '$title'" >&2
+      return 1
+    fi
+    wsid=$created_wsid
+  elif [ "$title_count" = 1 ] && [ -n "$title_wsid" ]; then
+    wsid=$title_wsid
+  else
+    if [ "$title_count" -gt 1 ] 2>/dev/null; then
+      echo "error: could not safely resolve cmux workspace '$title' after creation because the title is not unique" >&2
+    else
+      echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2
+    fi
+    return 1
+  fi
   if [ -z "$wsid" ]; then
     [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
     echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2

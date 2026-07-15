@@ -33,10 +33,40 @@ const dataDir = path.resolve(process.env.FM_DATA_OVERRIDE || path.join(fmHome, "
 const stackRoot = path.resolve(process.env.FM_REPORT_STACK_ROOT || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "firstmate", "report-stack"));
 const entriesDir = path.join(stackRoot, "entries");
 const requiredSections = ["Summary", "What changed", "Verification", "Visual evidence", "Artifacts", "Follow-ups"];
+const informationalTrailLimit = 4 * 1024 * 1024;
+const completionReportLimit = 16 * 1024 * 1024;
 
 function fail(message) {
   console.error(`error: ${message}`);
   process.exit(1);
+}
+
+function gitCommonDirectory(checkout) {
+  try {
+    const raw = execFileSync("git", ["-C", checkout, "rev-parse", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!raw) return "";
+    return fs.realpathSync(path.isAbsolute(raw) ? raw : path.resolve(checkout, raw));
+  } catch {
+    return "";
+  }
+}
+
+function refuseIfGateAgent() {
+  if (process.env.FM_GATE_REFUSE_BYPASS === "1") return;
+  if (Object.prototype.hasOwnProperty.call(process.env, "NO_MISTAKES_GATE")) {
+    console.error("error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)");
+    process.exit(3);
+  }
+  for (const checkout of [process.cwd(), fmRoot]) {
+    const common = gitCommonDirectory(checkout);
+    if (/(?:^|[\\/])\.no-mistakes[\\/]repos[\\/][^\\/]+\.git$/.test(common)) {
+      console.error(`error: refusing fleet lifecycle from inside a no-mistakes gate worktree (${common})`);
+      process.exit(3);
+    }
+  }
 }
 
 function parseMeta(content) {
@@ -169,7 +199,7 @@ function configuredRoot(directory, label) {
   return fs.realpathSync(directory);
 }
 
-function readArtifact(file, root, label) {
+function readArtifact(file, root, label, options = {}) {
   let stat;
   try {
     stat = fs.lstatSync(file);
@@ -180,6 +210,28 @@ function readArtifact(file, root, label) {
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
   const real = fs.realpathSync(file);
   if (!isContained(root, real)) throw new Error(`${label} escapes its configured root at ${file}`);
+  if (options.maxBytes) {
+    const oversized = stat.size > options.maxBytes;
+    if (oversized && !options.truncate) {
+      if (options.overflowMessage) throw new Error(options.overflowMessage(stat.size));
+      throw new Error(`${label} exceeds its ${options.maxBytes}-byte limit at ${file}`);
+    }
+    const length = oversized ? options.maxBytes : stat.size;
+    const offset = oversized && options.truncate === "tail" ? stat.size - options.maxBytes : 0;
+    const descriptor = fs.openSync(real, "r");
+    const buffer = Buffer.alloc(length);
+    let bytesRead;
+    try {
+      bytesRead = fs.readSync(descriptor, buffer, 0, length, offset);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    const content = buffer.subarray(0, bytesRead).toString("utf8");
+    if (!oversized) return content;
+    const kept = options.truncate === "tail" ? "last" : "first";
+    const marker = `[${label} truncated: original size ${stat.size} bytes; kept ${kept} ${bytesRead} bytes]`;
+    return options.truncate === "tail" ? `${marker}\n${content}` : `${content}\n${marker}\n`;
+  }
   return fs.readFileSync(real, "utf8");
 }
 
@@ -560,10 +612,22 @@ function publish(taskId, legacy) {
   realDirectory(taskData, dataRoot, "task data directory");
   const briefFile = path.join(taskData, "brief.md");
   const statusFile = path.join(stateDir, `${taskId}.status`);
-  const brief = redactSensitive(readArtifact(briefFile, dataRoot, "task brief") || "");
-  const status = redactSensitive(readArtifact(statusFile, stateRoot, "status trail") || "");
+  const brief = redactSensitive(readArtifact(briefFile, dataRoot, "task brief", {
+    maxBytes: informationalTrailLimit,
+    truncate: "head",
+  }) || "");
+  const status = redactSensitive(readArtifact(statusFile, stateRoot, "status trail", {
+    maxBytes: informationalTrailLimit,
+    truncate: "tail",
+  }) || "");
   const sourceFile = meta.kind === "scout" ? path.join(taskData, "report.md") : path.join(taskData, "completion.md");
-  const source = readArtifact(sourceFile, dataRoot, "completion report");
+  const source = readArtifact(sourceFile, dataRoot, "completion report", {
+    maxBytes: completionReportLimit,
+    overflowMessage: (size) => `completion report at ${sourceFile} is ${size} bytes and exceeds the ${completionReportLimit}-byte publication limit. `
+      + `Reduce ${sourceFile}, keeping every required section intact. `
+      + `Then rerun ${fmRoot}/bin/fm-report-stack.mjs publish ${taskId} or ${fmRoot}/bin/fm-teardown.sh ${taskId}. `
+      + "This attempt did not replace the durable report, and teardown remains stopped before destructive cleanup.",
+  });
   let markdown;
   if (source !== undefined) {
     if (meta.report_required === "1") requireCompletionSections(source, sourceFile, taskId);
@@ -588,11 +652,14 @@ function publish(taskId, legacy) {
     const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
     const worktreeHead = gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]);
     const prHead = displaySha(meta.pr_head);
+    const generationId = meta.generation_id || "";
     const previousWorktreeHead = previousManifest?.worktreeHead || previousManifest?.commit || "";
-    const sameGeneration = previousManifest
-      && (!worktreeHead || previousWorktreeHead === worktreeHead)
-      && previousManifest.harness === (meta.harness || "unknown")
-      && (previousManifest.accountProfile || "") === (meta.account_profile || "");
+    const sameGeneration = previousManifest && generationId && previousManifest.generationId
+      ? generationId === previousManifest.generationId
+      : previousManifest
+        && (!worktreeHead || previousWorktreeHead === worktreeHead)
+        && previousManifest.harness === (meta.harness || "unknown")
+        && (previousManifest.accountProfile || "") === (meta.account_profile || "");
     const manifest = {
       schemaVersion: 1,
       reportId: id,
@@ -605,6 +672,7 @@ function publish(taskId, legacy) {
       project: meta.project ? path.basename(meta.project) : "unknown",
       harness: meta.harness || "unknown",
       accountProfile: meta.account_profile || "",
+      ...(generationId ? { generationId } : {}),
       prUrl: safeHttpUrl(meta.pr),
       commit: worktreeHead,
       worktreeHead,
@@ -664,6 +732,8 @@ function resolveReportPath(taskId) {
   }
   return path.join(entriesDir, matches[0].reportId, "report.html");
 }
+
+refuseIfGateAgent();
 
 try {
   if (command === "publish") {

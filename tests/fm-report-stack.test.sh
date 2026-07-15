@@ -22,6 +22,7 @@ write_task() {
     "kind=$kind" \
     "mode=no-mistakes" \
     "report_required=1" \
+    "generation_id=generation-$id" \
     "account_profile=codex-2" \
     "provider_session_id=must-not-leak"
   printf '# Task\n\nFinish the report stack\n\n# Rules\n' > "$task_dir/brief.md"
@@ -58,6 +59,7 @@ test_publish_ship_with_visual() {
   assert_grep 'Finish the report stack' "$entry" "report page lost the task title"
   assert_grep 'overview.png' "$entry" "report page lost the visual gallery"
   assert_grep 'codex-2' "$(dirname "$entry")/manifest.json" "safe account routing label was not retained"
+  assert_grep '"generationId": "generation-report-ship-a1"' "$(dirname "$entry")/manifest.json" "stable generation identity was not published"
   if grep -R -F 'must-not-leak' "$STACK" >/dev/null 2>&1; then
     fail "provider session id leaked into the report stack"
   fi
@@ -173,7 +175,7 @@ test_republish_new_generation_refreshes_completion_time() {
   mv "$manifest.tmp" "$manifest"
 
   git -C "$repo" commit -q --allow-empty -m second
-  sed 's/^harness=.*/harness=claude/; s/^account_profile=.*/account_profile=claude-3/' "$meta" > "$staged"
+  sed 's/^harness=.*/harness=claude/; s/^account_profile=.*/account_profile=claude-3/; s/^generation_id=.*/generation_id=generation-restored/' "$meta" > "$staged"
   mv "$staged" "$meta"
   write_required_report "$HOME_DIR/data/$id/completion.md" "Restored generation."
   run_stack publish "$id" >/dev/null || fail "restored generation report publication failed"
@@ -183,6 +185,43 @@ test_republish_new_generation_refreshes_completion_time() {
   assert_grep '"harness": "claude"' "$manifest" "new generation report retained the superseded harness"
   assert_grep '"accountProfile": "claude-3"' "$manifest" "new generation report retained the superseded profile"
   pass "report republish refreshes completion time for a new task generation"
+}
+
+test_text_sources_are_bounded_before_reading() {
+  local id entry stored_brief stored_status oversized out status
+  id=report-bounded-trails-a5
+  write_task "$id" ship
+  {
+    printf '# Task\n\nBounded trail title\n\n'
+    dd if=/dev/zero bs=1048576 count=5 2>/dev/null | tr '\000' 'b'
+  } > "$HOME_DIR/data/$id/brief.md"
+  {
+    dd if=/dev/zero bs=1048576 count=5 2>/dev/null | tr '\000' 's'
+    printf '\ndone: bounded status tail survives\n'
+  } > "$HOME_DIR/state/$id.status"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Bounded informational trails."
+
+  run_stack publish "$id" >/dev/null || fail "bounded informational trails did not publish"
+  entry=$(run_stack path "$id")
+  stored_brief="$(dirname "$entry")/brief.md"
+  stored_status="$(dirname "$entry")/status.log"
+  assert_grep 'task brief truncated:' "$stored_brief" "oversized brief lacked a visible truncation marker"
+  assert_grep 'Bounded trail title' "$stored_brief" "brief head truncation lost title extraction content"
+  assert_grep 'status trail truncated:' "$stored_status" "oversized status lacked a visible truncation marker"
+  assert_grep 'done: bounded status tail survives' "$stored_status" "status tail truncation lost the latest status"
+
+  oversized=report-oversized-completion-a6
+  write_task "$oversized" ship
+  dd if=/dev/zero bs=1048576 count=17 2>/dev/null | tr '\000' 'r' > "$HOME_DIR/data/$oversized/completion.md"
+  out=$(run_stack publish "$oversized" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "oversized load-bearing completion report was silently published"
+  assert_contains "$out" "exceeds the 16777216-byte publication limit" "oversized report refusal omitted its byte limit"
+  assert_contains "$out" "This attempt did not replace the durable report" "oversized report refusal omitted retry safety"
+  if find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name "$oversized-*" -print -quit | grep -q .; then
+    fail "oversized load-bearing completion report created a durable entry"
+  fi
+  pass "report stack truncates informational trails visibly and rejects oversized completion reports"
 }
 
 test_required_source_fails_closed() {
@@ -499,6 +538,7 @@ test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
+test_text_sources_are_bounded_before_reading
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_scout_and_legacy_sources

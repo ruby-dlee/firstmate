@@ -556,6 +556,32 @@ test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails() {
   pass "fm_backend_cmux_create_task: rolls back the resolved workspace when surface resolution fails"
 }
 
+test_create_task_refuses_nonunique_post_create_title_without_adopting_foreign_workspace() {
+  local dir fb out status title created foreign log
+  dir="$TMP_ROOT/create-nonunique-post-create"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-concurrent-title)
+  created="aaaaaaaa-7777-8888-9999-bbbbbbbbbbbb"
+  foreign="cccccccc-7777-8888-9999-dddddddddddd"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  printf 'OK %s\n' "$created" > "$dir/responses/3.out"
+  cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 1
+  printf '{"workspaces":[{"id":"%s","title":"%s"},{"id":"%s","title":"%s"}]}' \
+    "$foreign" "$title" "$created" "$title" > "$dir/responses/5.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-concurrent-title /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task adopted a workspace from a nonunique post-create title"
+  assert_contains "$out" "conflicts with the post-create workspace listing" "nonunique post-create refusal was not actionable"
+  log=$(cat "$dir/log")
+  assert_contains "$log" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back its exact captured workspace"
+  assert_not_contains "$log" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$foreign" \
+    "create_task closed a foreign same-title workspace"
+  pass "fm_backend_cmux_create_task: refuses nonunique post-create titles and cleans only its captured workspace"
+}
+
 # --- target_ready / capture ---------------------------------------------------
 
 test_target_ready_fails_when_target_absent() {
@@ -1148,6 +1174,7 @@ test_create_task_refuses_failed_duplicate_query
 test_create_task_creates_and_parses_ids
 test_create_task_rolls_back_captured_workspace_when_resolution_fails
 test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails
+test_create_task_refuses_nonunique_post_create_title_without_adopting_foreign_workspace
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch

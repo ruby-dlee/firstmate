@@ -842,6 +842,27 @@ unit_publication_rejects_unsafe_destinations() {
   rm -rf "$st"
 }
 
+unit_flag_staging_does_not_follow_predictable_symlink() {
+  local st outside
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-flag-staging.XXXXXX")
+  outside="$st/outside"
+  mkdir -p "$st/state"
+  printf 'unchanged\n' > "$outside"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    ln -s "$2" "$FM_AFK_LAUNCH_STATE/.afk.pending.$$"
+    fm_afk_launch_flag_write
+  ' _ "$LAUNCH" "$outside" \
+    && [ "$(cat "$outside")" = unchanged ] \
+    && [ -f "$st/state/.afk" ] \
+    && ! find "$st/state" -name '.afk.pending.*' -type f -print -quit | grep -q .; then
+    pass "flag publication: unpredictable staging does not follow a planted pid symlink"
+  else
+    fail "flag publication: predictable staging symlink was followed or staging leaked"
+  fi
+  rm -rf "$st"
+}
+
 unit_malformed_record_fails_closed() {
   local st acted
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-malformed.XXXXXX")
@@ -1300,6 +1321,12 @@ e2e_tmux() {
   rm -rf "$home_tmp" 2>/dev/null || true
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = flag-staging ]; then
+  unit_flag_staging_does_not_follow_predictable_symlink
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1345,6 +1372,7 @@ unit_clear_failure_aborts_entry
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_flag_write_failure_aborts
+unit_flag_staging_does_not_follow_predictable_symlink
 e2e_herdr
 e2e_tmux
 

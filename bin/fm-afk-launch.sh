@@ -255,7 +255,9 @@ fm_afk_launch_record_write() {  # <backend> <target> <extra>
 }
 
 fm_afk_launch_flag_write() {
-  local destination="$FM_AFK_LAUNCH_STATE/.afk" pending="$FM_AFK_LAUNCH_STATE/.afk.pending.$$"
+  local destination="$FM_AFK_LAUNCH_STATE/.afk" pending
+  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  pending=$(mktemp "$FM_AFK_LAUNCH_STATE/.afk.pending.XXXXXX") || return 1
   date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
   if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
     fm_afk_launch_log "refusing unsafe away-mode flag destination: $destination"

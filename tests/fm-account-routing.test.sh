@@ -339,6 +339,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   [ "$launch" = "$expected" ] || fail "routing off changed the launch bytes"
   assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "routing off wrote account metadata"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "routing off wrote session metadata"
+  assert_regex '^generation_id=spawn:a[0-9a-f]{15}$' "$HOME_DIR/state/$id.meta" "routing off did not record a stable spawn generation"
   assert_grep 'report_required=1' "$HOME_DIR/state/$id.meta" "post-cutover spawn did not activate the report gate"
   assert_grep '# Completion report' "$HOME_DIR/data/$id/brief.md" "post-cutover spawn did not upgrade a legacy unspawned brief"
   assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$HOME_DIR/data/$id/brief.md" "upgraded brief omitted the completion-report sections"
@@ -365,7 +366,7 @@ test_observe_is_dry_run_only() {
 }
 
 test_enforce_pool_wraps_backend_and_records_real_session() {
-  local id rec out status launch meta account_task
+  local id rec out status launch meta account_task account_attempt
   id=account-enforce-z3
   rec=$(make_case enforce claude "$id")
   read_case "$rec"
@@ -373,6 +374,7 @@ test_enforce_pool_wraps_backend_and_records_real_session() {
   status=$?
   expect_code 0 "$status" "explicit pool spawn should enforce routing"
   account_task=$(meta_account_task "$id")
+  account_attempt=$(sed -n 's/^account_attempt=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   assert_grep "lease choose --pool claude-crew --task $account_task --provider claude" "$AF_LOG" "enforce did not atomically choose a namespaced lease"
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "'$FAKEBIN_DIR/agent-fleet' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' -- --dangerously-skip-permissions" "enforce did not build the backend-neutral Agent Fleet wrapper"
@@ -381,6 +383,7 @@ test_enforce_pool_wraps_backend_and_records_real_session() {
   assert_grep 'account_pool=claude-crew' "$meta" "meta missing account pool"
   assert_grep 'account_profile=claude-2' "$meta" "meta missing selected profile"
   assert_grep "account_task=$account_task" "$meta" "meta missing namespaced Agent Fleet task"
+  assert_grep "generation_id=account:$account_task:$account_attempt" "$meta" "managed meta did not bind the report generation to its account attempt"
   assert_grep "provider_session_id=sess-$account_task" "$meta" "meta missing real provider session id"
   assert_contains "$out" "spawned $id" "enforced spawn did not complete"
   pass "enforce leases before spawn, wraps any backend launch, and records the real session id"
@@ -782,6 +785,28 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
+}
+
+test_explicit_secondmate_route_preserves_ambient_primary_enforce() {
+  local id rec sm out status
+  id=account-secondmate-explicit-env-z11c
+  rec=$(make_case secondmate-explicit-env claude | tail -1)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+
+  out=$(FM_ACCOUNT_ROUTING=enforce FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-profile claude-2)
+  status=$?
+  [ "$status" -ne 0 ] || fail "explicit secondmate routing hid the primary's ambient enforce policy"
+  assert_contains "$out" "$sm" "ambient-enforce refusal omitted the offending secondmate home"
+  assert_contains "$out" "primary's enforced routing mode is not active in the home" \
+    "ambient-enforce refusal omitted the inherited-policy mismatch"
+  assert_contains "$out" "config/account-routing-mode" \
+    "ambient-enforce refusal omitted the durable reconciliation setting"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "ambient-enforce refusal created an endpoint"
+  pass "explicit secondmate routes preserve the ambient primary enforce policy"
 }
 
 test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
@@ -2267,6 +2292,11 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
+  test_explicit_secondmate_route_preserves_ambient_primary_enforce
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
@@ -2287,6 +2317,7 @@ test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+test_explicit_secondmate_route_preserves_ambient_primary_enforce
 test_enforced_secondmate_requires_routing_inheritance_and_capable_home
 test_unenforced_secondmate_convergence_failures_warn_and_launch
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope

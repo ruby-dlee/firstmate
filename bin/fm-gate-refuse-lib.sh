@@ -53,7 +53,16 @@
 # neutral-execution-context and the HEAD-continuity guard. The dedicated
 # tests/fm-gate-refuse.test.sh strips the bypass so it still verifies real refusal.
 #
-# Sourced by primary fleet-control and merge entrypoints, and the tests.
+# The reviewed direct-entrypoint boundary includes fm-fleet-sync.sh,
+# fm-x-reply.sh, fm-x-dismiss.sh, fm-x-followup.sh, fm-watch.sh,
+# fm-watch-arm.sh, fm-wake-drain.sh, and fm-report-stack.mjs alongside the
+# existing primary fleet lifecycle and merge commands.
+# fm-backend.sh is excluded because it is a sourced adapter library with no
+# create/kill command-line dispatch; those functions remain guarded by their
+# owning entrypoints.
+# fm-herdr-lab.sh is excluded because it accepts only isolated fm-lab-* sessions
+# and protects the live default session with its own tripwire.
+# Sourced by those guarded shell entrypoints and the tests.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a
 # gate context.

@@ -240,11 +240,14 @@ esac
 RECOVERY_ACCOUNT=0
 [ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] || RECOVERY_ACCOUNT=1
 RESUME_META=
+LIFECYCLE_LOCK=
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
   case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
   RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
+  trap '[ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}
     rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
@@ -263,6 +266,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_home=$(fm_account_meta_value "$RESUME_META" home)
     rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
     rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
+    fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
+    rollback_meta_lock=
     if [ -n "$rollback_target" ]; then
       spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
     fi
@@ -270,18 +275,15 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     case "$rollback_endpoint_state" in
       absent) ;;
       present)
-        fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
         echo "error: failed Agent Fleet attempt endpoint is still alive for $rollback_id; retaining its lease and metadata" >&2
         exit 1
         ;;
       *)
-        fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
         echo "error: failed Agent Fleet attempt endpoint state is unknown for $rollback_id; retaining its lease and metadata" >&2
         exit 1
         ;;
     esac
     if ! fm_account_cleanup_rollback "$RESUME_META" "$DATA" "$rollback_id"; then
-      fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
       echo "error: failed Agent Fleet attempt cleanup remains pending for $rollback_id" >&2
       exit 1
     fi
@@ -290,7 +292,6 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
       [ -z "$rollback_tasktmp" ] || rm -rf "$rollback_tasktmp"
     fi
-    fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
     if [ -z "$rollback_profile" ]; then
       if [ -n "$rollback_backup" ]; then
         echo "error: failed Agent Fleet attempt was cleaned for $rollback_id and the previous task state was restored; rerun against the restored task generation" >&2
@@ -305,19 +306,19 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   if [ "$(fm_account_meta_value "$RESUME_META" account_predecessor_cleanup)" = pending ]; then
     cleanup_id=${POS[0]}
     cleanup_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
-    "$SCRIPT_DIR/fm-account-session-sync.sh" "$cleanup_id" --require >/dev/null || exit 1
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$cleanup_id" --require >/dev/null || exit 1
     cleanup_lock=$(fm_account_meta_lock_acquire "$STATE" "$cleanup_id") || exit 1
     if [ ! -f "$RESUME_META" ] || [ "$(fm_account_meta_value "$RESUME_META" account_task)" != "$cleanup_account_task" ]; then
       fm_account_meta_lock_release "$cleanup_lock" >/dev/null 2>&1 || true
       echo "error: managed task generation changed before predecessor cleanup for $cleanup_id" >&2
       exit 1
     fi
+    fm_account_meta_lock_release "$cleanup_lock" || exit 1
+    cleanup_lock=
     if ! fm_account_cleanup_predecessor "$RESUME_META" "$DATA" "$cleanup_id"; then
-      fm_account_meta_lock_release "$cleanup_lock" >/dev/null 2>&1 || true
       echo "error: predecessor Agent Fleet cleanup remains pending for $cleanup_id" >&2
       exit 1
     fi
-    fm_account_meta_lock_release "$cleanup_lock" || exit 1
     if [ "$CONTINUE_ACCOUNT" = 1 ]; then
       echo "completed predecessor Agent Fleet cleanup for $cleanup_id"
       exit 0
@@ -433,7 +434,7 @@ parse_orca_worktree_result() {
 }
 
 persist_failed_account_rollback() {
-  local meta tmp current_task backup_name artifact_backup_name rollback_window
+  local meta tmp current_task backup_name artifact_backup_name rollback_window preserve_extensions=0
   mkdir -p "$STATE" || return 1
   meta="$STATE/$ID.meta"
   tmp="$STATE/.$ID.meta.rollback-pending.$$"
@@ -441,6 +442,7 @@ persist_failed_account_rollback() {
   if [ -f "$meta" ] && [ "$current_task" = "$ACCOUNT_TASK" ]; then
     awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
   else
+    [ ! -f "$meta" ] || preserve_extensions=1
     rollback_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
     {
       echo "window=$rollback_window"
@@ -486,6 +488,9 @@ persist_failed_account_rollback() {
       }
     } > "$tmp" || { rm -f "$tmp"; return 1; }
   fi
+  if [ "$preserve_extensions" = 1 ]; then
+    fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
   printf 'account_rollback_cleanup=pending\n' >> "$tmp"
   if [ -n "$META_BACKUP" ]; then
     backup_name=${META_BACKUP##*/}
@@ -504,6 +509,14 @@ clear_account_rollback_markers() {
   local meta="$STATE/$ID.meta" tmp="$STATE/.$ID.meta.rollback-commit.$$"
   awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+}
+
+persist_failed_account_rollback_short() {
+  local lock status
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
+  if persist_failed_account_rollback; then status=0; else status=$?; fi
+  fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || status=1
+  return "$status"
 }
 
 spawn_abort_cleanup() {
@@ -561,13 +574,6 @@ spawn_abort_cleanup() {
   [ -z "${ACCOUNT_NATIVE_LAUNCH_READY:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
   [ -z "${ACCOUNT_NATIVE_LAUNCH_SCRIPT:-}" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
-    if [ -z "$rollback_lock" ]; then
-      if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
-        :
-      else
-        account_clean=0
-      fi
-    fi
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
       if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
         account_clean=0
@@ -588,12 +594,20 @@ spawn_abort_cleanup() {
       fi
       [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}; retaining unmanaged cleanup metadata" >&2
     fi
+    if [ -z "$rollback_lock" ]; then
+      if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
+        :
+      else
+        account_clean=0
+      fi
+    fi
     if [ "$account_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] \
           || cmp -s "$STATE/$ID.meta" "$META_BACKUP"; then
           artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
           if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
+            && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
             && mv "$META_BACKUP" "$STATE/$ID.meta"; then
             [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
             EXISTING_ARTIFACT_BACKUP=
@@ -643,6 +657,8 @@ spawn_abort_cleanup() {
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
+  [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  LIFECYCLE_LOCK=
   return "$status"
 }
 trap spawn_abort_cleanup EXIT
@@ -747,7 +763,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
   [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
     RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
     [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
     if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
@@ -960,6 +976,9 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
   fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ -z "$LIFECYCLE_LOCK" ]; then
+    LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  fi
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     current_recovery_task=$(fm_meta_get "$RESUME_META" account_task)
@@ -983,6 +1002,8 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     META_BACKUP="$STATE/.$ID.meta.rollback.$$"
     cp -p "$RESUME_META" "$META_BACKUP" || exit 1
   fi
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
 fi
 EXISTING_META=0
 EXISTING_REPORT_REQUIRED_SET=0
@@ -1446,6 +1467,9 @@ EOF
     WORKTREE_CREATED=1
     ;;
 esac
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  persist_failed_account_rollback_short || exit 1
+fi
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
 # its rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
 # Every other backend addresses its pane/surface by the id already in $T, so default
@@ -1650,27 +1674,27 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       account_recover_status=$?
       if [ "$account_recover_status" -eq 2 ]; then
         ACCOUNT_LEASE_CREATED=1
-        persist_failed_account_rollback || true
+        persist_failed_account_rollback_short || true
       fi
       exit 1
     fi
-    persist_failed_account_rollback || exit 1
+    persist_failed_account_rollback_short || exit 1
     fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
   else
-    persist_failed_account_rollback || exit 1
+    persist_failed_account_rollback_short || exit 1
     if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
       :
     else
       account_select_status=$?
       if [ "$account_select_status" -eq 2 ]; then
         ACCOUNT_LEASE_CREATED=1
-        persist_failed_account_rollback || true
+        persist_failed_account_rollback_short || true
       fi
       exit 1
     fi
     ACCOUNT_PROFILE=$FM_ACCOUNT_SELECTED_PROFILE
     ACCOUNT_LEASE_CREATED=1
-    persist_failed_account_rollback || exit 1
+    persist_failed_account_rollback_short || exit 1
     fm_account_lineage_append "$DATA" "$ID" reserved "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" || exit 1
   fi
 fi
@@ -1678,7 +1702,15 @@ fi
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  [ -n "$META_WRITE_LOCK" ] || { echo "error: managed generation lock was lost before metadata install for $ID" >&2; exit 1; }
+  if [ -z "$LIFECYCLE_LOCK" ] || ! fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK"; then
+    echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
+    exit 1
+  fi
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
+    echo "error: managed task generation changed before metadata install for $ID" >&2
+    exit 1
+  fi
 fi
 META_TMP="$STATE/.$ID.meta.$$"
 {
@@ -1757,23 +1789,11 @@ META_TMP="$STATE/.$ID.meta.$$"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$META_TMP"
-if [ "$RECOVERY_ACCOUNT" = 1 ] || [ "$EXISTING_META" = 1 ]; then
+if [ -f "$STATE/$ID.meta" ]; then
   # Preserve every extension field not owned by this spawn rewrite (PR/X-mode
   # pointers and future additive metadata) while replacing endpoint identity.
-  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-    PRESERVE_META_SOURCE=$RESUME_META
-  elif [ -n "$META_BACKUP" ]; then
-    PRESERVE_META_SOURCE=$META_BACKUP
-  else
-    PRESERVE_META_SOURCE="$STATE/$ID.meta"
-  fi
-  while IFS= read -r meta_line || [ -n "$meta_line" ]; do
-    meta_key=${meta_line%%=*}
-    case "$meta_key" in
-      window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects) continue ;;
-    esac
-    printf '%s\n' "$meta_line" >> "$META_TMP"
-  done < "$PRESERVE_META_SOURCE"
+  PRESERVE_META_SOURCE="$STATE/$ID.meta"
+  fm_account_meta_merge_extensions "$PRESERVE_META_SOURCE" "$META_TMP" || exit 1
 fi
 mv "$META_TMP" "$STATE/$ID.meta"
 META_INSTALLED=1
@@ -1854,51 +1874,47 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       }
       sleep 0.05
     done
-    RECORDED_SESSION_UPDATED_AT=$("$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
+    RECORDED_SESSION_UPDATED_AT=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
     touch "$ACCOUNT_NATIVE_LAUNCH_GO" || exit 1
     session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
   fi
-  if ! "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
+  if ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
   [ -z "$ACCOUNT_NATIVE_LAUNCH_GO" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_GO"
   [ -z "$ACCOUNT_NATIVE_LAUNCH_READY" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_READY"
   [ -z "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" ] || rm -f "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
-  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
-    echo "error: managed task generation changed before launch commit for $ID" >&2
-    exit 1
-  fi
   COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
   case "$COMMIT_ENDPOINT_STATE" in
     present) ;;
     absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;
     *) echo "error: managed endpoint state is unknown before launch commit for $ID" >&2; exit 1 ;;
   esac
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
+    echo "error: managed task generation changed before launch commit for $ID" >&2
+    exit 1
+  fi
   clear_account_rollback_markers || { echo "error: failed to commit managed rollback metadata for $ID" >&2; exit 1; }
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
   ACCOUNT_SPAWN_COMMITTED=1
   [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
   META_BACKUP=
   discard_existing_artifact_backup
   if [ "$CONTINUE_ACCOUNT" = 1 ]; then
-    if ! fm_account_cleanup_predecessor "$STATE/$ID.meta" "$DATA" "$ID"; then
-      fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
-      META_WRITE_LOCK=
+    if ! fm_account_cleanup_predecessor_serialized "$STATE/$ID.meta" "$DATA" "$ID"; then
       echo "error: predecessor Agent Fleet cleanup remains pending for $ID" >&2
       exit 1
     fi
-    fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
-    META_WRITE_LOCK=
-  fi
-  if [ -n "$META_WRITE_LOCK" ]; then
-    fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
-    META_WRITE_LOCK=
   fi
 fi
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
 META_BACKUP=
 discard_existing_artifact_backup
+[ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
+LIFECYCLE_LOCK=
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

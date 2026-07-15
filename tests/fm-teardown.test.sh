@@ -60,6 +60,8 @@ PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
+REAL_STAT_FOR_TEST=$(command -v stat)
+export REAL_STAT_FOR_TEST
 
 # Build a fresh sandbox for one test case. Sets up:
 #   $CASE/state/        - firstmate state dir (with a fresh watcher beacon)
@@ -467,8 +469,14 @@ add_stat_error() {
   local case_dir=$1
   cat > "$case_dir/fakebin/stat" <<'SH'
 #!/usr/bin/env bash
-echo "stat: simulated failure" >&2
-exit 1
+target=${FM_FAKE_STAT_ERROR_TARGET:?}
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$last" = "$target" ]; then
+  echo "stat: simulated failure" >&2
+  exit 1
+fi
+exec "${REAL_STAT_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/stat"
 }
@@ -1128,7 +1136,7 @@ test_index_lock_mtime_read_failure_refuses() {
   touch -t 200001010000 "$lock"
 
   set +e
-  FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
+  FM_FAKE_STAT_ERROR_TARGET="$lock" FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
@@ -1484,15 +1492,15 @@ SH
   [ -f "$kill_started" ] || { kill "$teardown_pid" 2>/dev/null || true; fail "managed generation teardown never reached endpoint cleanup"; }
 
   set +e
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 bash -c '
+  FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 bash -c '
     . "$1"
     state=$2
     meta=$state/task-x1.meta
-    held=$(fm_account_meta_lock_acquire "$state" task-x1) || exit 75
+    held=$(fm_account_lifecycle_lock_acquire "$state" task-x1) || exit 75
     awk "!/^window=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
     printf "%s\n" "window=firstmate:fm-task-x1-replacement" "account_task=fm-home-task-x1-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
     mv "$state/.replacement.meta" "$meta"
-    fm_account_meta_lock_release "$held"
+    fm_account_lifecycle_lock_release "$held"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/state" \
     > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
   updater_rc=$?
@@ -1588,15 +1596,15 @@ SH
   }
 
   set +e
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 bash -c '
+  FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 bash -c '
     . "$1"
     state=$2
     meta=$state/child-lock-x3.meta
-    held=$(fm_account_meta_lock_acquire "$state" child-lock-x3) || exit 75
+    held=$(fm_account_lifecycle_lock_acquire "$state" child-lock-x3) || exit 75
     awk "!/^window=/ && !/^worktree=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
     printf "%s\n" "window=fm-child-lock-x3-replacement" "worktree=$3" "account_task=fm-child-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
     mv "$state/.replacement.meta" "$meta"
-    fm_account_meta_lock_release "$held"
+    fm_account_lifecycle_lock_release "$held"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/wt/state" "$case_dir/replacement-worktree" \
     > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
   updater_rc=$?

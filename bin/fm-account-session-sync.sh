@@ -100,14 +100,30 @@ fi
 [ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]" >&2; exit 2; }
 case "$AFTER_UPDATED_AT" in *$'\n'*|*=*) echo "error: unsafe --after-updated-at value" >&2; exit 2 ;; esac
 META="$STATE/$ID.meta"
-META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-release_meta_lock() {
-  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+LIFECYCLE_LOCK=
+LIFECYCLE_LOCK_OWNED=0
+META_LOCK=
+if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
+  expected_lifecycle_lock="$STATE/.account-lifecycle-$ID.lock"
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" != "$expected_lifecycle_lock" ] \
+    || ! fm_account_lifecycle_lock_held "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
+    echo "error: invalid inherited account lifecycle lock for $ID" >&2
+    exit 1
+  fi
+  LIFECYCLE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+else
+  LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  LIFECYCLE_LOCK_OWNED=1
+fi
+release_locks() {
+  [ -z "$META_LOCK" ] || fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+  [ "$LIFECYCLE_LOCK_OWNED" != 1 ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
 }
-trap release_meta_lock EXIT
+trap release_locks EXIT
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 PROFILE=$(fm_meta_get "$META" account_profile)
-[ -n "$PROFILE" ] || exit 0
+[ -n "$PROFILE" ] || { fm_account_meta_lock_release "$META_LOCK" || exit 1; exit 0; }
 POOL=$(fm_meta_get "$META" account_pool)
 HARNESS=$(fm_meta_get "$META" harness)
 ACCOUNT_TASK=$(fm_meta_get "$META" account_task)
@@ -115,6 +131,7 @@ ATTEMPT=$(fm_meta_get "$META" account_attempt)
 [ -n "$ACCOUNT_TASK" ] || ACCOUNT_TASK=$ID
 [ -n "$ATTEMPT" ] || ATTEMPT=legacy
 EXISTING=$(fm_meta_get "$META" provider_session_id)
+fm_account_meta_lock_release "$META_LOCK" || exit 1
 binary=$(fm_account_fleet_bin) || exit 1
 fm_account_validate_contract "$binary" || exit 1
 
@@ -155,7 +172,24 @@ while :; do
   }
   sleep 1
 done
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+current_account_task=$(fm_meta_get "$META" account_task)
+current_attempt=$(fm_meta_get "$META" account_attempt)
+[ -n "$current_account_task" ] || current_account_task=$ID
+[ -n "$current_attempt" ] || current_attempt=legacy
+if [ ! -f "$META" ] \
+  || [ "$current_account_task" != "$ACCOUNT_TASK" ] \
+  || [ "$current_attempt" != "$ATTEMPT" ] \
+  || [ "$(fm_meta_get "$META" account_profile)" != "$PROFILE" ] \
+  || [ "$(fm_meta_get "$META" account_pool)" != "$POOL" ] \
+  || [ "$(fm_meta_get "$META" harness)" != "$HARNESS" ]; then
+  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+  echo "error: managed task generation changed before session synchronization for $ID" >&2
+  exit 1
+fi
+EXISTING=$(fm_meta_get "$META" provider_session_id)
 if [ -n "$EXISTING" ] && [ "$EXISTING" != "$session_id" ]; then
+  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
   echo "error: provider session id changed for managed task $ID; refusing to overwrite recovery truth" >&2
   exit 1
 fi
@@ -166,6 +200,7 @@ if [ -z "$EXISTING" ]; then
   mv "$META_TMP" "$META" || { rm -f "$META_TMP"; exit 1; }
   fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)" || exit 1
 fi
+fm_account_meta_lock_release "$META_LOCK" || exit 1
 if [ "$PRINT_UPDATED_AT" = 1 ]; then
   printf '%s\n' "$updated_at"
 else

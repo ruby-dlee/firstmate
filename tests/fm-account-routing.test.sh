@@ -170,6 +170,7 @@ case "$*" in
     if [ -n "${FM_FAKE_AF_REQUIRE_PRELEASE_META:-}" ]; then
       grep -qxF "account_task=$task" "$FM_FAKE_AF_REQUIRE_PRELEASE_META" \
         && grep -qxF 'account_rollback_cleanup=pending' "$FM_FAKE_AF_REQUIRE_PRELEASE_META" \
+        && grep -qxF 'tmux_window_id=%77' "$FM_FAKE_AF_REQUIRE_PRELEASE_META" \
         || { echo "managed account identity was not durable before lease mutation" >&2; exit 91; }
     fi
     [ -z "${FM_FAKE_AF_SELECT_MUTATE_FILE:-}" ] || printf 'replacement-state\n' > "$FM_FAKE_AF_SELECT_MUTATE_FILE"
@@ -596,6 +597,38 @@ test_session_sync_bounds_agent_fleet_queries() {
   pass "session synchronization bounds every Agent Fleet query"
 }
 
+test_session_sync_releases_metadata_lock_during_provider_query() {
+  local id rec meta_tmp marker sync_pid sync_rc
+  id=account-sync-lock-z9e
+  rec=$(make_case sync-lock claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session lock precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  marker="$CASE_DIR/session-query-started"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_SESSION_MARKER="$marker" FM_FAKE_AF_SESSION_SLEEP=2 \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require > "$CASE_DIR/sync.out" 2>&1 &
+  sync_pid=$!
+  for _ in $(seq 1 50); do
+    [ -f "$marker" ] && break
+    sleep 0.05
+  done
+  [ -f "$marker" ] || { kill "$sync_pid" 2>/dev/null || true; fail "session query did not start"; }
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 bash -c '
+    . "$1"
+    held=$(fm_account_meta_lock_acquire "$2" "$3")
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$HOME_DIR/state" "$id" \
+    || { kill "$sync_pid" 2>/dev/null || true; fail "provider query retained the metadata lock"; }
+  wait "$sync_pid"
+  sync_rc=$?
+  expect_code 0 "$sync_rc" "session sync should complete after the unlocked provider query"
+  pass "session queries hold lifecycle ownership without blocking metadata writers"
+}
+
 test_continuation_rejects_symlinked_charter_ancestor() {
   local id rec outside out status
   id=account-charter-escape-z9e
@@ -944,6 +977,7 @@ SH
   assert_grep "account_task=$task" "$meta" "provisional metadata lost the pending Agent Fleet task"
   assert_not_grep '^account_profile=' "$meta" "provisional metadata invented a profile before Agent Fleet selection"
   assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
+  assert_regex '^tmux_window_id=%77$' "$meta" "provisional metadata lost the stable replacement endpoint identity"
   touch "$gate"
   for _ in $(seq 1 100); do
     [ -f "$installed_marker" ] && break
@@ -1497,7 +1531,7 @@ test_concurrent_continuations_serialize_before_mutation() {
   second_rc=$?
   [ "$first_rc" -eq 0 ] || fail "first serialized continuation failed: $(cat "$CASE_DIR/first.out")"
   [ "$second_rc" -ne 0 ] || fail "second concurrent continuation also launched"
-  assert_grep 'generation changed before recovery mutation' "$CASE_DIR/second.out" "concurrent continuation did not fail at generation revalidation"
+  assert_grep 'managed recovery endpoint is still alive' "$CASE_DIR/second.out" "concurrent continuation did not revalidate the serialized replacement endpoint"
   lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
   endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
   [ "$lease_count" -eq 1 ] || fail "concurrent continuations acquired $lease_count leases"
@@ -2009,6 +2043,7 @@ test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot
 test_session_sync_bounds_agent_fleet_queries
+test_session_sync_releases_metadata_lock_during_provider_query
 test_continuation_rejects_symlinked_charter_ancestor
 test_recovered_reservations_are_owned_until_launch_commit
 test_native_resume_requires_fresh_sessionstart_evidence

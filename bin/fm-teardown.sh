@@ -110,7 +110,7 @@ release_teardown_account_locks() {
   local lock
   for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
     [ -n "$lock" ] || continue
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
   done
 }
 trap release_teardown_account_locks EXIT
@@ -120,11 +120,11 @@ managed_account_meta() {
 }
 
 MANAGED_ACCOUNT=0
+ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+[ -f "$META" ] || { echo "error: task metadata disappeared while teardown waited for $ID" >&2; exit 1; }
 if managed_account_meta "$META"; then
   MANAGED_ACCOUNT=1
-  ACCOUNT_DELETE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-  TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
-  [ -f "$META" ] || { echo "error: task metadata disappeared while teardown waited for $ID" >&2; exit 1; }
   managed_account_meta "$META" || { echo "error: managed task metadata changed while teardown waited for $ID" >&2; exit 1; }
 fi
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
@@ -204,15 +204,16 @@ quiesce_secondmate_endpoint() {
 }
 
 release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
-  local meta=$1 task=$2 probe_home=${3:-} lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status rollback_backup acquired=0
+  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state backend target zellij_tab endpoint_status rollback_backup lock
   MANAGED_ACCOUNT_LOCK=
   profile=$(fm_meta_get "$meta" account_profile)
   [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
   meta_state=$(dirname "$meta")
-  if [ -z "$lock" ]; then
-    lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
-    acquired=1
+  if [ -z "$lifecycle_lock" ]; then
+    lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$meta_state" "$task") || return 1
+    TEARDOWN_ACCOUNT_LOCKS+=("$lifecycle_lock")
   fi
+  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
   [ -f "$meta" ] || {
     echo "error: managed metadata for $task disappeared during teardown" >&2
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
@@ -227,6 +228,9 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
+  account_task=$(fm_meta_get "$meta" account_task)
+  [ -n "$account_task" ] || account_task=$task
+  fm_account_meta_lock_release "$lock" || return 1
   if [ -n "$target" ]; then
     if [ -n "$probe_home" ]; then
       ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" ) 2>/dev/null || true
@@ -239,47 +243,39 @@ release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
   else
     endpoint_status=$?
     managed_endpoint_blocker "$endpoint_status" "$task"
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   fi
   if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
     rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
     fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
       echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
-      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
       return 1
     }
     if [ -n "$rollback_backup" ]; then
       echo "error: rolled-back Agent Fleet state for $task was restored; rerun teardown against the restored task generation" >&2
-      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
       return 2
     fi
     profile=$(fm_meta_get "$meta" account_profile)
     if [ -z "$profile" ]; then
-      MANAGED_ACCOUNT_LOCK=$lock
-      [ "$acquired" = 0 ] || TEARDOWN_ACCOUNT_LOCKS+=("$lock")
       return 0
     fi
   fi
-  account_task=$(fm_meta_get "$meta" account_task)
-  [ -n "$account_task" ] || account_task=$task
+  if [ "$(fm_meta_get "$meta" account_task)" != "$account_task" ]; then
+    echo "error: managed task generation changed during teardown for $task" >&2
+    return 1
+  fi
   fm_account_release "$account_task" --force || {
     echo "error: failed to release Agent Fleet lease for $task; retaining metadata for retry" >&2
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
   fm_account_session_remove "$account_task" || {
     echo "error: failed to remove Agent Fleet session mapping for $task; retaining metadata for retry" >&2
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
-  fm_account_cleanup_predecessor "$meta" "$owner_data" "$task" || {
+  fm_account_cleanup_predecessor_serialized "$meta" "$owner_data" "$task" || {
     echo "error: failed to clean predecessor Agent Fleet state for $task; retaining metadata for retry" >&2
-    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1
   }
-  MANAGED_ACCOUNT_LOCK=$lock
-  [ "$acquired" = 0 ] || TEARDOWN_ACCOUNT_LOCKS+=("$lock")
 }
 
 default_branch() {
@@ -1031,10 +1027,10 @@ cleanup_firstmate_home_children() {
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
-    child_account_lock=
+    child_account_lock=$(fm_account_lifecycle_lock_acquire "$sub_state" "$child_id") || return 1
+    TEARDOWN_ACCOUNT_LOCKS+=("$child_account_lock")
+    [ -f "$child_meta" ] || { echo "error: child metadata disappeared while teardown waited for $child_id" >&2; return 1; }
     if managed_account_meta "$child_meta"; then
-      child_account_lock=$(fm_account_meta_lock_acquire "$sub_state" "$child_id") || return 1
-      TEARDOWN_ACCOUNT_LOCKS+=("$child_account_lock")
       if [ ! -f "$child_meta" ] || ! managed_account_meta "$child_meta"; then
         echo "error: managed child metadata changed while teardown waited for $child_id" >&2
         return 1
@@ -1100,7 +1096,7 @@ cleanup_firstmate_home_children() {
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
-    [ -z "$child_account_lock" ] || fm_account_meta_lock_release "$child_account_lock" >/dev/null 2>&1 || true
+    [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done
 }
 
@@ -1242,7 +1238,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
-[ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_meta_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
+[ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

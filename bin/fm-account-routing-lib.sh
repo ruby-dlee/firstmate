@@ -402,20 +402,20 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   rm -rf "$reclaim"
 }
 
-fm_account_meta_lock_acquire() {  # <state-dir> <task>
-  local state=$1 task=$2 lock deadline now start owner_tmp owner_inode lock_inode
-  local wait_seconds=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
+fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
+  local state=$1 task=$2 name=$3 label=$4 wait_seconds=$5 lock deadline now start owner_tmp owner_inode lock_inode
   local ownerless_grace=${FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS:-2}
-  fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for account metadata lock" >&2; return 1; }
-  case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid account metadata lock wait '$wait_seconds'" >&2; return 1 ;; esac
-  case "$ownerless_grace" in ''|*[!0-9]*) echo "error: invalid account metadata lock ownerless grace '$ownerless_grace'" >&2; return 1 ;; esac
+  fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for $label lock" >&2; return 1; }
+  case "$name" in *[!A-Za-z0-9._-]*|'') echo "error: invalid account lock name '$name'" >&2; return 1 ;; esac
+  case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid $label lock wait '$wait_seconds'" >&2; return 1 ;; esac
+  case "$ownerless_grace" in ''|*[!0-9]*) echo "error: invalid $label lock ownerless grace '$ownerless_grace'" >&2; return 1 ;; esac
   start=$(fm_account_process_start_time "$$") || {
-    echo "error: cannot record account metadata lock owner for $task" >&2
+    echo "error: cannot record $label lock owner for $task" >&2
     return 1
   }
   mkdir -p "$state" || return 1
-  lock="$state/.account-meta-$task.lock"
-  owner_tmp="$state/.account-meta-$task.owner.$$.$RANDOM"
+  lock="$state/.$name-$task.lock"
+  owner_tmp="$state/.$name-$task.owner.$$.$RANDOM"
   printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
     rm -f "$owner_tmp"
     return 1
@@ -437,7 +437,7 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
     fi
     now=$(date +%s)
     [ "$now" -lt "$deadline" ] || {
-      echo "error: timed out waiting for account metadata lock for $task" >&2
+      echo "error: timed out waiting for $label lock for $task" >&2
       rm -f "$owner_tmp"
       return 1
     }
@@ -445,6 +445,22 @@ fm_account_meta_lock_acquire() {  # <state-dir> <task>
   done
   rm -f "$owner_tmp"
   printf '%s\n' "$lock"
+}
+
+fm_account_meta_lock_acquire() {  # <state-dir> <task>
+  fm_account_lock_acquire "$1" "$2" account-meta "account metadata" "${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}"
+}
+
+fm_account_lifecycle_lock_acquire() {  # <state-dir> <task>
+  fm_account_lock_acquire "$1" "$2" account-lifecycle "account lifecycle" "${FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS:-10}"
+}
+
+fm_account_lifecycle_lock_owned() {  # <lock-path>
+  fm_account_reclaim_guard_owned "$1"
+}
+
+fm_account_lifecycle_lock_held() {  # <lock-path>
+  fm_account_meta_lock_owner_alive "$1"
 }
 
 fm_account_meta_lock_release() {  # <lock-path>
@@ -472,8 +488,37 @@ fm_account_meta_lock_release() {  # <lock-path>
   rm -rf "$released"
 }
 
+fm_account_lifecycle_lock_release() {  # <lock-path>
+  fm_account_meta_lock_release "$1"
+}
+
 fm_account_safe_lineage_value() {
   case "$1" in *$'\t'*|*$'\n'*) return 1 ;; esac
+}
+
+fm_account_meta_key_owned() {  # <key>
+  case "$1" in
+    window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|backend|tmux_window_id|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_account_meta_merge_extensions() {  # <source-meta> <destination-meta>
+  local source=$1 destination=$2 line key tmp
+  [ -f "$source" ] || return 0
+  tmp="$(dirname "$destination")/.account-extensions.$$.$RANDOM"
+  : > "$tmp" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    key=${line%%=*}
+    fm_account_meta_key_owned "$key" || continue
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done < "$destination"
+  while IFS= read -r line || [ -n "$line" ]; do
+    key=${line%%=*}
+    fm_account_meta_key_owned "$key" && continue
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done < "$source"
+  mv "$tmp" "$destination" || { rm -f "$tmp"; return 1; }
 }
 
 fm_account_task_dir() {  # <data-dir> <task> [create]
@@ -551,7 +596,7 @@ fm_account_restore_artifacts() {
 }
 
 fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
-  local meta=$1 data=$2 task=$3 pending account_task attempt provider pool profile session preserve backup_name backup_token backup predecessor backup_task tmp artifacts_name artifacts_token artifacts tasktmp
+  local meta=$1 data=$2 task=$3 pending account_task attempt provider pool profile session preserve backup_name backup_token backup predecessor backup_task tmp artifacts_name artifacts_token artifacts tasktmp lock
   pending=$(fm_account_meta_value "$meta" account_rollback_cleanup)
   [ "$pending" = pending ] || return 0
   account_task=$(fm_account_meta_value "$meta" account_task)
@@ -615,14 +660,27 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
     fm_account_session_remove "$account_task" || return 1
   fi
   fm_account_restore_artifacts "$(dirname "$meta")" "$task" "$artifacts_name" "$tasktmp" 1 || return 1
+  lock=$(fm_account_meta_lock_acquire "$(dirname "$meta")" "$task") || return 1
+  if [ ! -f "$meta" ] \
+    || [ "$(fm_account_meta_value "$meta" account_task)" != "$account_task" ] \
+    || [ "$(fm_account_meta_value "$meta" account_rollback_cleanup)" != pending ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: managed task generation changed before rollback cleanup commit for $task" >&2
+    return 1
+  fi
   if [ -n "$backup" ]; then
-    mv "$backup" "$meta" || return 1
+    tmp="$(dirname "$meta")/.$task.meta.rollback-restore.$$"
+    cp -p "$backup" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
+    fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
+    mv "$tmp" "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
+    rm -f "$backup"
   else
     tmp="$(dirname "$meta")/.$task.meta.rollback-clean.$$"
-    awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     printf 'rollback_pending=1\n' >> "$tmp"
-    mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
   fi
+  fm_account_meta_lock_release "$lock" || return 1
   [ -z "$artifacts" ] || rm -rf "$artifacts"
   [ -n "$attempt" ] || attempt=legacy
   fm_account_lineage_append "$data" "$task" rolled-back "$attempt" "$account_task" "$provider" "$pool" "$profile" "$session" "${predecessor:-none}" || {
@@ -631,7 +689,11 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
 }
 
 fm_account_cleanup_predecessor() {  # <meta> <data-dir> <task>
-  local meta=$1 data=$2 task=$3 pending predecessor current attempt provider pool profile session tmp
+  fm_account_cleanup_predecessor_serialized "$@"
+}
+
+fm_account_cleanup_predecessor_serialized() {  # <meta> <data-dir> <task>
+  local meta=$1 data=$2 task=$3 pending predecessor current attempt provider pool profile session tmp lock
   pending=$(fm_account_meta_value "$meta" account_predecessor_cleanup)
   [ "$pending" = pending ] || return 0
   predecessor=$(fm_account_meta_value "$meta" account_predecessor_task)
@@ -656,9 +718,27 @@ fm_account_cleanup_predecessor() {  # <meta> <data-dir> <task>
   }
   fm_account_release "$predecessor" --force || return 1
   fm_account_session_remove "$predecessor" || return 1
+  lock=$(fm_account_meta_lock_acquire "$(dirname "$meta")" "$task") || return 1
+  if [ ! -f "$meta" ] \
+    || [ "$(fm_account_meta_value "$meta" account_task)" != "$current" ] \
+    || [ "$(fm_account_meta_value "$meta" account_predecessor_task)" != "$predecessor" ] \
+    || [ "$(fm_account_meta_value "$meta" account_predecessor_cleanup)" != pending ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: managed task generation changed before predecessor cleanup commit for $task" >&2
+    return 1
+  fi
   tmp="$(dirname "$meta")/.$task.meta.predecessor.$$"
-  awk '!/^account_predecessor_/ && !/^account_predecessor_cleanup=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  awk '!/^account_predecessor_/ && !/^account_predecessor_cleanup=/' "$meta" > "$tmp" || {
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  mv "$tmp" "$meta" || {
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  fm_account_meta_lock_release "$lock" || return 1
   [ -n "$attempt" ] || attempt=legacy
   fm_account_lineage_append "$data" "$task" predecessor-released "$attempt" "$predecessor" "$provider" "$pool" "$profile" "$session" "$current" || {
     echo "warning: predecessor cleanup completed but lineage recording failed for $task" >&2

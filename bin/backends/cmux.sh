@@ -326,15 +326,30 @@ fm_backend_cmux_scoped_title() {  # <fm-task-label>
 }
 
 fm_backend_cmux_all_workspaces() {
-  local wins wid wss all='[]'
+  local wins window_ids wid wss all='[]'
   wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>/dev/null) || return 1
-  printf '%s' "$wins" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  window_ids=$(printf '%s' "$wins" | jq -r '
+    if type == "array"
+      and all(.[]; type == "object" and (.id | type) == "string" and (.id | length) > 0)
+    then .[].id
+    else error("invalid window record")
+    end
+  ' 2>/dev/null) || return 1
   while IFS= read -r wid; do
     [ -n "$wid" ] || continue
     wss=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>/dev/null) || return 1
-    printf '%s' "$wss" | jq -e '(.workspaces | type) == "array"' >/dev/null 2>&1 || return 1
+    printf '%s' "$wss" | jq -e '
+      (.workspaces | type) == "array"
+      and all(.workspaces[];
+        type == "object"
+        and (.id | type) == "string"
+        and (.id | length) > 0
+        and (.title | type) == "string")
+    ' >/dev/null 2>&1 || return 1
     all=$(jq -cn --argjson current "$all" --argjson next "$wss" '$current + $next.workspaces') || return 1
-  done < <(printf '%s' "$wins" | jq -r '.[]? | .id' 2>/dev/null)
+  done <<EOF
+$window_ids
+EOF
   jq -cn --argjson workspaces "$all" '{workspaces:$workspaces}'
 }
 

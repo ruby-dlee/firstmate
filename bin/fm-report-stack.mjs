@@ -120,6 +120,11 @@ function gitValue(worktree, gitArgs) {
   }
 }
 
+function displaySha(value) {
+  const sha = String(value || "").trim();
+  return /^[0-9a-f]{7,64}$/i.test(sha) ? sha.toLowerCase().slice(0, 12) : "";
+}
+
 function processStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
@@ -211,6 +216,8 @@ function sharedCss() {
 }
 
 function reportPage(manifest, markdown, visuals) {
+  const worktreeHead = manifest.worktreeHead || manifest.commit || "";
+  const revisionDetails = `${manifest.prHead ? `<div><dt>PR head</dt><dd>${escapeHtml(manifest.prHead)}</dd></div>` : ""}<div><dt>Worktree HEAD</dt><dd>${escapeHtml(worktreeHead || "not recorded")}</dd></div>`;
   const gallery = visuals.length
     ? `<section><h2>Visual evidence</h2><div class="gallery">${visuals.map((visual) => {
       const label = escapeHtml(path.basename(visual));
@@ -225,7 +232,7 @@ function reportPage(manifest, markdown, visuals) {
 <title>${escapeHtml(manifest.title)} · Firstmate report</title><style>${sharedCss()}</style></head><body><main>
 <nav><a href="../../index.html">← Report stack</a></nav>
 <header><p class="eyebrow">${escapeHtml(manifest.kind)} · ${escapeHtml(manifest.mode)}</p><h1>${escapeHtml(manifest.title)}</h1><p>${escapeHtml(manifest.summary)}</p></header>
-<dl><div><dt>Task</dt><dd>${escapeHtml(manifest.taskId)}</dd></div><div><dt>Completed</dt><dd>${escapeHtml(manifest.completedAt)}</dd></div><div><dt>Project</dt><dd>${escapeHtml(manifest.project)}</dd></div><div><dt>Harness</dt><dd>${escapeHtml(manifest.harness)}</dd></div><div><dt>Account profile</dt><dd>${escapeHtml(manifest.accountProfile || "unmanaged")}</dd></div><div><dt>Commit</dt><dd>${escapeHtml(manifest.commit || "not recorded")}</dd></div></dl>
+<dl><div><dt>Task</dt><dd>${escapeHtml(manifest.taskId)}</dd></div><div><dt>Completed</dt><dd>${escapeHtml(manifest.completedAt)}</dd></div><div><dt>Project</dt><dd>${escapeHtml(manifest.project)}</dd></div><div><dt>Harness</dt><dd>${escapeHtml(manifest.harness)}</dd></div><div><dt>Account profile</dt><dd>${escapeHtml(manifest.accountProfile || "unmanaged")}</dd></div>${revisionDetails}</dl>
 ${gallery}
 <section><h2>Completion report</h2><pre class="report">${escapeHtml(markdown)}</pre></section>
 <section><h2>Trail</h2><p><a href="report.md">Report source</a> · <a href="brief.md">Task brief</a> · <a href="status.log">Status trail</a>${manifest.prUrl ? ` · <a href="${escapeHtml(manifest.prUrl)}">Pull request</a>` : ""}</p></section>
@@ -579,6 +586,8 @@ function publish(taskId, legacy) {
   fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
   try {
     const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
+    const worktreeHead = gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]);
+    const prHead = displaySha(meta.pr_head);
     const manifest = {
       schemaVersion: 1,
       reportId: id,
@@ -592,7 +601,9 @@ function publish(taskId, legacy) {
       harness: meta.harness || "unknown",
       accountProfile: meta.account_profile || "",
       prUrl: safeHttpUrl(meta.pr),
-      commit: gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]),
+      commit: worktreeHead,
+      worktreeHead,
+      ...(prHead ? { prHead } : {}),
       branch: gitValue(meta.worktree, ["branch", "--show-current"]),
       visuals,
     };

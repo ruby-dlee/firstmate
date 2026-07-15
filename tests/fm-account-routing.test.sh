@@ -1715,12 +1715,15 @@ SH
 }
 
 test_oversized_continuation_stops_before_mutation() {
-  local id rec out status
+  local id rec out status later_source
   id=account-continuation-size-z28
   rec=$(make_case continuation-size claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation size precondition spawn failed"
   dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$HOME_DIR/state/$id.status"
+  later_source="$CASE_DIR/later-report"
+  printf 'later source\n' > "$later_source"
+  ln -s "$later_source" "$HOME_DIR/data/$id/report.md"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
@@ -1730,9 +1733,43 @@ test_oversized_continuation_stops_before_mutation() {
   set -e
   [ "$status" -ne 0 ] || fail "oversized continuation packet was accepted"
   assert_contains "$out" 'maximum is 65536' "oversized continuation rejection did not report its bound"
+  assert_not_contains "$out" 'symlinked continuation source' "continuation inspected later artifacts after the packet budget was already exhausted"
   assert_not_grep '^new-window ' "$TMUX_LOG" "oversized continuation created a replacement endpoint"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "oversized continuation acquired an Agent Fleet lease"
   pass "continuation packet size is bounded before external mutation"
+}
+
+test_continuation_bounds_no_mistakes_status_snapshot() {
+  local id rec out status started elapsed packet
+  id=account-continuation-status-timeout-z28a
+  rec=$(make_case continuation-status-timeout claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation timeout precondition spawn failed"
+  cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+printf 'partial status that must not survive timeout\n'
+trap '' TERM
+sleep 10
+SH
+  chmod +x "$FAKEBIN_DIR/no-mistakes"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  started=$(date +%s)
+  out=$(FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=1 FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -eq 0 ] || fail "continuation failed instead of degrading a timed-out no-mistakes snapshot: $out"
+  [ "$elapsed" -lt 5 ] || fail "continuation no-mistakes snapshot was not bounded (elapsed ${elapsed}s)"
+  packet=$(sed -n 's/^continuation_packet=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  assert_present "$packet" "timed-out status continuation packet was not persisted"
+  assert_grep '## No-mistakes state' "$packet" "timed-out continuation packet lost the no-mistakes section"
+  if ! grep -qxF unavailable "$packet"; then
+    sed -n '/## No-mistakes state/,+6p' "$packet" >&2
+    fail "timed-out no-mistakes snapshot did not degrade to unavailable"
+  fi
+  pass "continuation bounds no-mistakes status collection and degrades on timeout"
 }
 
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
@@ -2108,6 +2145,7 @@ test_managed_tmux_identity_survives_window_rename
 test_native_resume_rejects_regressed_sessionstart_evidence
 test_session_sync_metadata_publish_failure_is_closed
 test_oversized_continuation_stops_before_mutation
+test_continuation_bounds_no_mistakes_status_snapshot
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal

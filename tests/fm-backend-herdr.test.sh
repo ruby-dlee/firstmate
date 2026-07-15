@@ -790,6 +790,38 @@ SH
   pass "managed Herdr operations reject same-labeled panes outside the recorded home workspace"
 }
 
+test_target_state_distinguishes_absent_from_malformed_panes() {
+  local dir fb identity panes out
+  dir="$TMP_ROOT/target-state-malformed"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '%s\n' "$FM_HERDR_PANES" ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  for panes in \
+    '{"result":{"panes":[{"pane_id":"w1:p2"}]}}' \
+    '{"result":{"panes":["not-a-pane-record"]}}'; do
+    out=$(PATH="$fb:$PATH" FM_HERDR_PANES="$panes" bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 11
+      [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    ' "$ROOT" "$identity" 2>&1) || fail "malformed Herdr pane record was not fail-closed: $out"
+  done
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "well-formed missing Herdr pane lost its absent/dead classification: $out"
+  pass "Herdr target state distinguishes missing panes from malformed records"
+}
+
 test_current_path_reads_cwd() {
   local dir log resp fb out
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2054,6 +2086,7 @@ test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
 test_managed_identity_rejects_reused_pane
+test_target_state_distinguishes_absent_from_malformed_panes
 test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle

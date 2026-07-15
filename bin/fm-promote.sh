@@ -22,19 +22,28 @@ fm_refuse_if_gate_agent
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 META="$STATE/$ID.meta"
-META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-release_meta_lock() {
-  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+LIFECYCLE_LOCK=
+META_LOCK=
+release_locks() {
+  [ -z "$META_LOCK" ] || fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+  [ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
 }
-trap release_meta_lock EXIT
+trap release_locks EXIT
+LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
+[ "$(fm_account_meta_value "$META" account_rollback_cleanup)" != pending ] \
+  || { echo "error: rollback cleanup is pending for $ID; refusing promotion" >&2; exit 1; }
 
 TMP="$STATE/.$ID.meta.promote.$$"
 grep -v '^kind=' "$META" > "$TMP"
 echo "kind=ship" >> "$TMP"
 mv "$TMP" "$META"
-fm_account_meta_lock_release "$META_LOCK"
+fm_account_meta_lock_release "$META_LOCK" || exit 1
+META_LOCK=
+fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
+LIFECYCLE_LOCK=
 trap - EXIT
 
 MESSAGE="<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write $DATA/$ID/completion.md with sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups; report done>"

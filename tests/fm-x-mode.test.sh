@@ -1429,6 +1429,30 @@ test_regression_unresolved_followup_fails_safe() {
   pass "every unresolved follow-up is refused before posting"
 }
 
+test_followup_ignores_subminimum_explicit_context_limit() {
+  local home out rc err reply
+  home="$TMP_ROOT/reg-subminimum-limit"; mkdir -p "$home/state/x-context"
+  err="$home/err.txt"
+  jq -cn '{request_id:"req-too-small",platform:"",reply_max_chars:"49",recorded_at:1700000000}' \
+    > "$home/state/x-context/req-too-small.json"
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 FMX_NOW_OVERRIDE=1700000000 \
+    "$ROOT/bin/fm-x-reply.sh" req-too-small --followup "Short follow-up." 2> "$err"); rc=$?
+  expect_code 8 "$rc" "subminimum-only follow-up context exit"
+  [ -z "$out" ] || fail "a refused subminimum-only follow-up must echo nothing"
+  assert_absent "$home/state/x-outbox/req-too-small.json" "a subminimum-only follow-up recorded an outbox preview"
+
+  jq -cn '{request_id:"req-small-discord",platform:"discord",reply_max_chars:"49",recorded_at:1700000000}' \
+    > "$home/state/x-context/req-small-discord.json"
+  reply="This Discord follow-up is valid because its known platform supplies the default when the recorded explicit limit is below the shared minimum."
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 FMX_NOW_OVERRIDE=1700000000 \
+    "$ROOT/bin/fm-x-reply.sh" req-small-discord --followup "$reply" 2> "$err"); rc=$?
+  expect_code 0 "$rc" "known-platform subminimum follow-up exit"
+  [ "$out" = req-small-discord ] || fail "known-platform subminimum follow-up did not complete"
+  jq -e 'has("texts") | not' "$home/state/x-outbox/req-small-discord.json" >/dev/null \
+    || fail "known Discord platform did not fall through to its default budget"
+  pass "follow-ups reject subminimum-only limits and preserve platform defaults"
+}
+
 # Requirement 1 (authoritative relay recovery): a live follow-up with only a
 # registry platform recovers the missing explicit budget from the relay by
 # request_id, so a Discord reply stays one message.
@@ -2329,6 +2353,7 @@ test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup
 test_regression_unresolved_followup_fails_safe
+test_followup_ignores_subminimum_explicit_context_limit
 test_followup_partial_registry_uses_relay_budget_live
 test_followup_platform_only_context_uses_platform_default
 test_regression_concurrent_requests_keep_own_platform

@@ -231,6 +231,7 @@ case "$REQ_PLATFORM" in
 esac
 case "$REQ_EXPLICIT_MAX" in
   ''|*[!0-9]*) REQ_EXPLICIT_MAX= ;;
+  *) [ "$REQ_EXPLICIT_MAX" -ge "$FMX_REPLY_MIN_CHARS" ] || REQ_EXPLICIT_MAX= ;;
 esac
 # Was the platform/budget authoritatively resolved by any source (override,
 # registry, inbox, or relay)? Drives the follow-up fail-safe below.

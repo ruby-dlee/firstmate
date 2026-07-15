@@ -47,6 +47,7 @@
 # Callers must have FM_HOME set before calling fmx_load_config.
 
 FMX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FMX_REPLY_MIN_CHARS=50
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$FMX_LIB_DIR/fm-account-routing-lib.sh"
 
@@ -107,12 +108,12 @@ fmx_load_config() {
   local maxraw discordraw threadraw
   if [ -n "${FMX_X_REPLY_MAX_CHARS+x}" ]; then maxraw=${FMX_X_REPLY_MAX_CHARS-}; else maxraw=$(fmx_env_get FMX_X_REPLY_MAX_CHARS "$env_file"); fi
   case "$maxraw" in ''|*[!0-9]*) maxraw=280 ;; esac
-  [ "$maxraw" -ge 50 ] 2>/dev/null || maxraw=50
+  [ "$maxraw" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || maxraw=$FMX_REPLY_MIN_CHARS
   # shellcheck disable=SC2034 # FMX_MAX is read by callers (fm-x-reply.sh) after sourcing.
   FMX_MAX=$maxraw
   if [ -n "${FMX_DISCORD_REPLY_MAX_CHARS+x}" ]; then discordraw=${FMX_DISCORD_REPLY_MAX_CHARS-}; else discordraw=$(fmx_env_get FMX_DISCORD_REPLY_MAX_CHARS "$env_file"); fi
   case "$discordraw" in ''|*[!0-9]*) discordraw=1900 ;; esac
-  [ "$discordraw" -ge 50 ] 2>/dev/null || discordraw=50
+  [ "$discordraw" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || discordraw=$FMX_REPLY_MIN_CHARS
   [ "$discordraw" -le 2000 ] 2>/dev/null || discordraw=1900
   # shellcheck disable=SC2034 # FMX_DISCORD_MAX is read by callers (fm-x-reply.sh) after sourcing.
   FMX_DISCORD_MAX=$discordraw
@@ -431,7 +432,7 @@ fmx_reply_limit_for_platform() {
   local platform=${1:-} explicit=${2:-}
   case "$explicit" in
     ''|*[!0-9]*) ;;
-    *) [ "$explicit" -ge 50 ] 2>/dev/null && { printf '%s\n' "$explicit"; return 0; } ;;
+    *) [ "$explicit" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null && { printf '%s\n' "$explicit"; return 0; } ;;
   esac
   case "$platform" in
     discord) printf '%s\n' "${FMX_DISCORD_MAX:-1900}" ;;

@@ -23,6 +23,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 fm_refuse_if_gate_agent
 PACKET_TMP=
 MAX_PACKET_BYTES=65536
+NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
 cleanup_packet_tmp() {
   [ -z "$PACKET_TMP" ] || rm -f "$PACKET_TMP"
 }
@@ -35,6 +36,9 @@ trap cleanup_packet_tmp EXIT
 ID=${1:-}
 ATTEMPT=${2:-}
 [ -n "$ID" ] && [ -n "$ATTEMPT" ] || { echo "usage: fm-account-continuation.sh <task-id> <new-attempt-id>" >&2; exit 2; }
+case "$NO_MISTAKES_STATUS_TIMEOUT" in
+  ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT must be a positive integer" >&2; exit 2 ;;
+esac
 fm_account_valid_id "$ID" || { echo "error: invalid task id '$ID'" >&2; exit 1; }
 fm_account_valid_id "$ATTEMPT" || { echo "error: invalid account attempt '$ATTEMPT'" >&2; exit 1; }
 
@@ -106,20 +110,51 @@ PACKET_TMP="$TASK_DIR/.continuation-$ATTEMPT.md.$$"
 STATUS_SNAPSHOT=$(git -C "$WORKTREE_REAL" status --short --branch 2>&1) || { echo "error: cannot snapshot continuation repository status for $ID" >&2; exit 1; }
 LOG_SNAPSHOT=$(git -C "$WORKTREE_REAL" log --oneline --decorate -20 2>&1) || { echo "error: cannot snapshot continuation repository history for $ID" >&2; exit 1; }
 NO_MISTAKES_STATUS=unavailable
-if command -v no-mistakes >/dev/null 2>&1; then
-  NO_MISTAKES_STATUS=$(cd "$WORKTREE_REAL" && no-mistakes axi status 2>&1 || true)
+if NO_MISTAKES_BIN=$(command -v no-mistakes 2>/dev/null); then
+  if NO_MISTAKES_STATUS=$(cd "$WORKTREE_REAL" \
+    && fm_account_run_bounded "$NO_MISTAKES_STATUS_TIMEOUT" "$NO_MISTAKES_BIN" axi status 2>&1); then
+    :
+  else
+    no_mistakes_status_rc=$?
+    case "$no_mistakes_status_rc" in 124|137|143) NO_MISTAKES_STATUS=unavailable ;; esac
+  fi
   [ -n "$NO_MISTAKES_STATUS" ] || NO_MISTAKES_STATUS=unavailable
 fi
 
+packet_bytes() {
+  local bytes
+  bytes=$(wc -c < "$PACKET_TMP" | tr -d '[:space:]')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$bytes"
+}
+
+packet_size_error() {
+  echo "error: continuation packet for $ID is $1 bytes; maximum is $MAX_PACKET_BYTES" >&2
+  return 1
+}
+
+packet_check_budget() {
+  local bytes
+  bytes=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  [ "$bytes" -le "$MAX_PACKET_BYTES" ] || packet_size_error "$bytes"
+}
+
 append_file_section() {  # <heading> <file>
-  local heading=$1 file=$2
+  local heading=$1 file=$2 current file_bytes framing_bytes projected
   [ -f "$file" ] || return 0
   [ ! -L "$file" ] || { echo "error: refusing symlinked continuation source $file" >&2; return 1; }
+  current=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  file_bytes=$(wc -c < "$file" | tr -d '[:space:]')
+  framing_bytes=$(printf '\n## %s\n\n\n' "$heading" | wc -c | tr -d '[:space:]')
+  case "$file_bytes$framing_bytes" in *[!0-9]*) echo "error: cannot measure continuation source $file" >&2; return 1 ;; esac
+  projected=$((current + file_bytes + framing_bytes))
+  [ "$projected" -le "$MAX_PACKET_BYTES" ] || packet_size_error "$projected"
   {
     printf '\n## %s\n\n' "$heading"
     cat "$file"
     printf '\n'
   } >> "$PACKET_TMP"
+  packet_check_budget
 }
 
 {
@@ -145,6 +180,7 @@ append_file_section() {  # <heading> <file>
   printf '```\n'
   printf "\n## No-mistakes state\n\n\`\`\`text\n%s\n\`\`\`\n" "$NO_MISTAKES_STATUS"
 } >> "$PACKET_TMP"
+packet_check_budget
 
 append_file_section "Original brief or charter" "$BRIEF"
 append_file_section "Wake-event and progress status" "$STATE/$ID.status"
@@ -162,12 +198,7 @@ append_file_section "Recalled context" "$TASK_DIR/recalled.md"
 append_file_section "Provider transcript summary" "$TASK_DIR/transcript-summary.md"
 append_file_section "Account attempt lineage" "$TASK_DIR/account-attempts.md"
 
-PACKET_BYTES=$(wc -c < "$PACKET_TMP" | tr -d '[:space:]')
-case "$PACKET_BYTES" in ''|*[!0-9]*) echo "error: cannot measure continuation packet for $ID" >&2; exit 1 ;; esac
-if [ "$PACKET_BYTES" -gt "$MAX_PACKET_BYTES" ]; then
-  echo "error: continuation packet for $ID is $PACKET_BYTES bytes; maximum is $MAX_PACKET_BYTES" >&2
-  exit 1
-fi
+packet_check_budget
 mv "$PACKET_TMP" "$PACKET" || exit 1
 PACKET_TMP=
 printf '%s\n' "$PACKET"

@@ -112,6 +112,45 @@ test_report_links_reject_credentials_and_encode_visual_paths() {
   pass "report links reject credentials and encode visual paths"
 }
 
+test_revision_fields_distinguish_pr_head_from_worktree_head() {
+  local id=report-revisions-a3 repo meta meta_tmp entry manifest page head short pr_head
+  repo="$TMP_ROOT/revision-worktree"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.name fmtest
+  git -C "$repo" config user.email fmtest@example.invalid
+  printf 'revision fixture\n' > "$repo/fixture.txt"
+  git -C "$repo" add fixture.txt
+  git -C "$repo" commit -q -m fixture
+  head=$(git -C "$repo" rev-parse HEAD)
+  short=${head:0:12}
+  pr_head=abcdef1234567890abcdef1234567890abcdef12
+
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Revision identities are precise."
+  meta="$HOME_DIR/state/$id.meta"
+  meta_tmp="$HOME_DIR/state/.$id.meta.revisions"
+  grep -v '^worktree=' "$meta" > "$meta_tmp"
+  printf 'worktree=%s\npr_head=%s\n' "$repo" "$pr_head" >> "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+
+  run_stack publish "$id" >/dev/null || fail "revision report publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  page="$entry"
+  assert_grep "\"worktreeHead\": \"$short\"" "$manifest" "manifest did not record the local worktree HEAD accurately"
+  assert_grep "\"commit\": \"$short\"" "$manifest" "schema-version-1 commit compatibility alias was not retained"
+  assert_grep '"prHead": "abcdef123456"' "$manifest" "manifest did not record the delivered PR head consistently"
+  assert_grep '<dt>PR head</dt><dd>abcdef123456</dd>' "$page" "report page mislabeled the delivered PR revision"
+  assert_grep "<dt>Worktree HEAD</dt><dd>$short</dd>" "$page" "report page mislabeled the local worktree revision"
+
+  mkdir -p "$STACK/entries/legacy-schema-v1"
+  printf '{"schemaVersion":1,"reportId":"legacy-schema-v1","taskId":"legacy-schema-v1","title":"Legacy","summary":"Legacy manifest","completedAt":"2026-07-01T00:00:00.000Z","kind":"ship","project":"example","harness":"codex","commit":"1234567890ab"}\n' \
+    > "$STACK/entries/legacy-schema-v1/manifest.json"
+  run_stack render >/dev/null || fail "report reader rejected a schema-version-1 manifest without new revision fields"
+  pass "report manifests distinguish PR head from worktree HEAD compatibly"
+}
+
 test_required_source_fails_closed() {
   local id=report-missing-b2 out status
   write_task "$id" ship
@@ -424,6 +463,7 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
 
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
+test_revision_fields_distinguish_pr_head_from_worktree_head
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_scout_and_legacy_sources

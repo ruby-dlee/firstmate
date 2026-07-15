@@ -1014,6 +1014,39 @@ test_target_state_finds_workspace_outside_current_window() {
   pass "fm_backend_target_state: finds cmux workspaces across all windows"
 }
 
+test_target_state_distinguishes_absent_from_malformed_workspaces() {
+  local dir fb out fixture workspace target window
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  window='eeeeeeee-0000-0000-0000-000000000000'
+  for fixture in missing-title non-object; do
+    dir="$TMP_ROOT/target-state-$fixture"; mkdir -p "$dir/responses"
+    cmux_windows_response "$dir" 1 "$window" 1
+    case "$fixture" in
+      missing-title) workspace='{"workspaces":[{"id":"aaaaaaaa-0000-0000-0000-000000000000"}]}' ;;
+      non-object) workspace='{"workspaces":["not-a-workspace-record"]}' ;;
+    esac
+    printf '%s\n' "$workspace" > "$dir/responses/2.out"
+    fb=$(make_cmux_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+      bash -c '
+        . "$0/bin/fm-backend.sh"
+        fm_backend_target_exists() { return 1; }
+        [ "$(fm_backend_target_state cmux "$1")" = unknown ]
+      ' "$ROOT" "$target" 2>&1) || fail "malformed cmux workspace record was not fail-closed: $out"
+  done
+  dir="$TMP_ROOT/target-state-absent"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 "$window" 1
+  printf '{"workspaces":[]}\n' > "$dir/responses/2.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      [ "$(fm_backend_target_state cmux "$1")" = absent ]
+    ' "$ROOT" "$target" 2>&1) || fail "well-formed missing cmux workspace lost its absent classification: $out"
+  pass "cmux target state distinguishes missing workspaces from malformed records"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1086,4 +1119,5 @@ test_kill_is_best_effort_when_close_workspace_fails
 test_kill_recovers_stale_target_by_label
 test_list_live_filters_by_title_prefix
 test_target_state_finds_workspace_outside_current_window
+test_target_state_distinguishes_absent_from_malformed_workspaces
 test_secondmate_spawn_refuses_cmux_backend

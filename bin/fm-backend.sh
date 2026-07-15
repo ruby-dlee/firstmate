@@ -718,8 +718,8 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # present, absent, or unknown. Callers may release an external lease only on
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes tabs tab_id scoped count
-  local workspace surface workspaces title expected_title resolved_workspace
+  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes pane_record tabs tab_id scoped count
+  local workspace surface workspaces workspace_record title_record title expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
     printf 'present'
@@ -753,7 +753,14 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         return 0
       fi
       if ! sessions=$(herdr session list --json 2>/dev/null) \
-        || ! printf '%s\n' "$sessions" | jq -e '(.sessions | type) == "array"' >/dev/null 2>&1; then
+        || ! printf '%s\n' "$sessions" | jq -e '
+          (.sessions | type) == "array"
+          and all(.sessions[];
+            type == "object"
+            and (.name | type) == "string"
+            and (.name | length) > 0
+            and (.running | type) == "boolean")
+        ' >/dev/null 2>&1; then
         printf 'unknown'
         return 0
       fi
@@ -782,22 +789,40 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         return 0
       fi
       if ! panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) \
-        || ! printf '%s\n' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        || ! printf '%s\n' "$panes" | jq -e '
+          type == "array"
+          and all(.[];
+            type == "object"
+            and has("id")
+            and .id != null
+            and (.is_plugin | type) == "boolean"
+            and (.is_plugin or (has("tab_id") and .tab_id != null)))
+        ' >/dev/null 2>&1; then
         printf 'unknown'
         return 0
       fi
-      tab_id=$(printf '%s\n' "$panes" | jq -r --arg pane "$pane" \
-        '.[]? | select((.id | tostring) == $pane and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)
-      if [ -z "$tab_id" ]; then
+      pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$pane" \
+        '[.[] | select((.id | tostring) == $pane and .is_plugin == false)] | first // null' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if [ "$pane_record" = null ]; then
         printf 'absent'
         return 0
       fi
+      tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id | tostring' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
       if [ -z "$expected_label" ]; then
         printf 'present'
         return 0
       fi
       if ! tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
-        || ! printf '%s\n' "$tabs" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        || ! printf '%s\n' "$tabs" | jq -e '
+          type == "array"
+          and all(.[];
+            type == "object"
+            and has("tab_id")
+            and .tab_id != null
+            and (.name | type) == "string")
+        ' >/dev/null 2>&1; then
         printf 'unknown'
         return 0
       fi
@@ -821,42 +846,58 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
       workspace=$FM_BACKEND_CMUX_WORKSPACE
       surface=$FM_BACKEND_CMUX_SURFACE
       if ! workspaces=$(fm_backend_cmux_all_workspaces 2>/dev/null) \
-        || ! printf '%s\n' "$workspaces" | jq -e '(.workspaces | type) == "array"' >/dev/null 2>&1; then
+        || ! printf '%s\n' "$workspaces" | jq -e '
+          (.workspaces | type) == "array"
+          and all(.workspaces[];
+            type == "object"
+            and (.id | type) == "string"
+            and (.id | length) > 0
+            and (.title | type) == "string")
+        ' >/dev/null 2>&1; then
         printf 'unknown'
         return 0
       fi
       resolved_workspace=$workspace
+      workspace_record=$(printf '%s\n' "$workspaces" | jq -cr --arg id "$workspace" \
+        '[.workspaces[] | select(.id == $id)] | first // null' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
       if [ -n "$expected_label" ]; then
         expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
-        title=$(printf '%s\n' "$workspaces" | jq -r --arg id "$workspace" \
-          '.workspaces[]? | select(.id == $id) | .title' 2>/dev/null | head -1)
-        if [ -n "$title" ] && [ "$title" != "$expected_title" ]; then
-          printf 'unknown'
-          return 0
+        if [ "$workspace_record" != null ]; then
+          title=$(printf '%s\n' "$workspace_record" | jq -r '.title' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
+          [ "$title" = "$expected_title" ] || { printf 'unknown'; return 0; }
+        else
+          title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
+            '[.workspaces[] | select(.title == $want)] | first // null' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
+          [ "$title_record" != null ] || { printf 'absent'; return 0; }
+          resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
         fi
-        if [ -z "$title" ]; then
-          resolved_workspace=$(printf '%s\n' "$workspaces" | jq -r --arg want "$expected_title" \
-            '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1)
-          [ -n "$resolved_workspace" ] || { printf 'absent'; return 0; }
-        fi
-      elif ! printf '%s\n' "$workspaces" | jq -e --arg id "$workspace" \
-        'any(.workspaces[]?; .id == $id)' >/dev/null 2>&1; then
+      elif [ "$workspace_record" = null ]; then
         printf 'absent'
         return 0
       fi
       if ! panes=$(fm_backend_cmux_cli list-panes --workspace "$resolved_workspace" --json --id-format uuids 2>/dev/null) \
-        || ! printf '%s\n' "$panes" | jq -e '(.panes | type) == "array"' >/dev/null 2>&1; then
+        || ! printf '%s\n' "$panes" | jq -e '
+          (.panes | type) == "array"
+          and all(.panes[];
+            type == "object"
+            and (.surface_ids | type) == "array"
+            and all(.surface_ids[]; type == "string" and length > 0))
+        ' >/dev/null 2>&1; then
         printf 'unknown'
         return 0
       fi
       if [ "$resolved_workspace" != "$workspace" ]; then
-        if printf '%s\n' "$panes" | jq -e 'any(.panes[]?; ((.surface_ids // []) | length) > 0)' >/dev/null 2>&1; then
+        if printf '%s\n' "$panes" | jq -e 'any(.panes[]; (.surface_ids | length) > 0)' >/dev/null 2>&1; then
           printf 'present'
         else
           printf 'absent'
         fi
       elif printf '%s\n' "$panes" | jq -e --arg surface "$surface" \
-        'any(.panes[]?; (.surface_ids // []) | index($surface))' >/dev/null 2>&1; then
+        'any(.panes[]; .surface_ids | index($surface))' >/dev/null 2>&1; then
         printf 'present'
       else
         printf 'absent'

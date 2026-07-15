@@ -643,7 +643,7 @@ fm_backend_herdr_expected_identity() {  # <target> <expected-label-or-identity>
 }
 
 fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
-  local target=$1 expected=${2:-} identity panes tabs tab_id workspaces
+  local target=$1 expected=${2:-} identity panes pane_record tabs tab_id workspaces
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   if [ -n "$expected" ]; then
     identity=$(fm_backend_herdr_expected_identity "$target" "$expected") \
@@ -652,23 +652,41 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   fi
   panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$panes" | jq -e '(.result.panes | type) == "array"' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$panes" | jq -e '
+    (.result.panes | type) == "array"
+    and all(.result.panes[];
+      type == "object"
+      and (.pane_id | type) == "string"
+      and (.pane_id | length) > 0
+      and (.tab_id | type) == "string"
+      and (.tab_id | length) > 0)
+  ' >/dev/null 2>&1; then
     printf 'unknown'
     return 0
   fi
-  tab_id=$(printf '%s\n' "$panes" | jq -r --arg pane "$FM_BACKEND_HERDR_PANE" \
-    '.result.panes[]? | select((.pane_id | tostring) == $pane) | .tab_id // empty' 2>/dev/null | head -1)
-  if [ -z "$tab_id" ]; then
+  pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$FM_BACKEND_HERDR_PANE" \
+    '[.result.panes[] | select(.pane_id == $pane)] | first // null' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if [ "$pane_record" = null ]; then
     printf 'absent'
     return 0
   fi
+  tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
   if [ -z "$expected" ]; then
     printf 'match'
     return 0
   fi
   workspaces=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" workspace list 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$workspaces" | jq -e '(.result.workspaces | type) == "array"' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$workspaces" | jq -e '
+    (.result.workspaces | type) == "array"
+    and all(.result.workspaces[];
+      type == "object"
+      and (.workspace_id | type) == "string"
+      and (.workspace_id | length) > 0
+      and (.label | type) == "string")
+  ' >/dev/null 2>&1; then
     printf 'unknown'
     return 0
   fi
@@ -681,7 +699,16 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   fi
   tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$tabs" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$tabs" | jq -e '
+    (.result.tabs | type) == "array"
+    and all(.result.tabs[];
+      type == "object"
+      and (.tab_id | type) == "string"
+      and (.tab_id | length) > 0
+      and (.workspace_id | type) == "string"
+      and (.workspace_id | length) > 0
+      and (.label | type) == "string")
+  ' >/dev/null 2>&1; then
     printf 'unknown'
     return 0
   fi

@@ -1147,8 +1147,8 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
-    quiesce_secondmate_endpoint || exit 1
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+    quiesce_secondmate_endpoint || exit 1
   fi
 fi
 

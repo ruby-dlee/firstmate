@@ -1027,6 +1027,7 @@ test_scripts_route_explicit_target_through_meta_backend() {
   zellij_pane_response "$dir" 1 7 3
   printf 'captured zellij pane\n' > "$dir/responses/2.out"
   zellij_pane_response "$dir" 3 7 3
+  zellij_tab_response "$dir" 4 3 fm-zellij-stale
   fb=$(make_zellij_fakebin "$dir")
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash

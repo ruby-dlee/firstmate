@@ -115,7 +115,13 @@ case "${1:-}" in
   tab)
     case "${2:-}" in
       list)
-        printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-feat-herdr"},{"tab_id":"w1:t3","label":"fm-feat-herdr-idle"},{"tab_id":"w1:t4","label":"fm-feat-herdr-stopped"}]}}\n'
+        printf '{"result":{"tabs":[{"tab_id":"w1:t2","workspace_id":"ws-home","label":"fm-feat-herdr"},{"tab_id":"w1:t3","workspace_id":"ws-home","label":"fm-feat-herdr-idle"},{"tab_id":"w1:t4","workspace_id":"ws-home","label":"fm-feat-herdr-stopped"}]}}\n'
+        exit 0 ;;
+    esac ;;
+  workspace)
+    case "${2:-}" in
+      list)
+        printf '{"result":{"workspaces":[{"workspace_id":"ws-home","label":"firstmate"}]}}\n'
         exit 0 ;;
     esac ;;
   agent)

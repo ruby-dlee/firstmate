@@ -168,20 +168,30 @@ SH
   chmod +x "$fakebin/tmux"
 }
 
-# make_fake_herdr <fakebin> <live-pane>: `herdr pane get <pane>` succeeds only
-# for the given pane id - the exact primitive fm_backend_target_exists uses
-# for a herdr endpoint liveness read. No version/server-start calls: a
-# liveness check must never auto-start a server (fm-backend.sh's contract).
+# make_fake_herdr <fakebin> <live-pane>: model the endpoint and its recorded
+# managed identity. No version/server-start calls: a liveness check must never
+# auto-start a server (fm-backend.sh's contract).
 make_fake_herdr() {
   local fakebin=$1 live=$2
   cat > "$fakebin/herdr" <<SH
 #!/usr/bin/env bash
 set -u
-if [ "\${1:-}" = pane ] && [ "\${2:-}" = get ]; then
-  [ "\${3:-}" = "$live" ] && exit 0
-  exit 1
-fi
-exit 1
+case "\${1:-} \${2:-}" in
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"$live","tab_id":"tab-live"}]}}\n'
+    ;;
+  "workspace list")
+    printf '{"result":{"workspaces":[{"workspace_id":"ws-home","label":"firstmate"}]}}\n'
+    ;;
+  "tab list")
+    printf '{"result":{"tabs":[{"tab_id":"tab-live","workspace_id":"ws-home","label":"fm-task-live"}]}}\n'
+    ;;
+  "pane get")
+    [ "\${3:-}" = "$live" ] && exit 0
+    exit 1
+    ;;
+  *) exit 1 ;;
+esac
 SH
   chmod +x "$fakebin/herdr"
 }
@@ -515,7 +525,7 @@ EOF
   make_fake_ps_claude "$fakebin"
   make_fake_herdr "$fakebin" "p-live"
 
-  printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-live.meta"
+  printf 'window=sess:p-live\nkind=ship\nbackend=herdr\nherdr_workspace_id=ws-home\nherdr_tab_id=tab-live\n' > "$home/state/task-live.meta"
   printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")

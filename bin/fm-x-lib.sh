@@ -376,6 +376,20 @@ fmx_context_registry_lock_release() {
   rm -rf "$lock"
 }
 
+fmx_context_registry_lock_acquire_bounded() {
+  local dir=$1 name=$2 attempt=0 lock
+  while [ "$attempt" -lt 20 ]; do
+    if lock=$(fmx_context_registry_lock_acquire "$dir" "$name"); then
+      printf '%s\n' "$lock"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 20 ] || break
+    sleep 0.05
+  done
+  return 1
+}
+
 fmx_context_registry_prune() {
   local state=$1 dir now max_age file recorded_at age lock rid_lock rid
   dir="$state/x-context"
@@ -440,7 +454,7 @@ fmx_context_registry_set() {
   mkdir -p "$dir" 2>/dev/null || return 1
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
   fmx_context_registry_prune "$state" || return 1
-  lock=$(fmx_context_registry_lock_acquire "$dir" "request-$rid") || return 0
+  lock=$(fmx_context_registry_lock_acquire_bounded "$dir" "request-$rid") || return 1
   now=${FMX_NOW_OVERRIDE:-$(date +%s)}
   case "$now" in ''|*[!0-9]*) status=1 ;; esac
   [ "${#now}" -le 18 ] || status=1

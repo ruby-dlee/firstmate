@@ -1373,7 +1373,7 @@ test_context_registry_serializes_prune_and_updates() {
     lock=$(fmx_context_registry_lock_acquire "$2/x-context" request-req-race) || exit 1
     fmx_context_registry_prune "$2" || exit 2
     [ -f "$2/x-context/req-race.json" ] || exit 3
-    fmx_context_registry_set "$2" req-race discord 1900 || exit 4
+    if fmx_context_registry_set "$2" req-race discord 1900; then exit 4; fi
     [ "$(jq -r .platform "$2/x-context/req-race.json")" = x ] || exit 5
     fmx_context_registry_lock_release "$lock" || exit 6
     fmx_context_registry_set "$2" req-race discord 1900 || exit 7
@@ -1390,7 +1390,34 @@ test_context_registry_serializes_prune_and_updates() {
     acquired=$(fmx_context_registry_lock_acquire "$2" request-stale) || exit 1
     fmx_context_registry_lock_release "$acquired"
   ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" || fail "stale registry lock was not reclaimed and released"
-  pass "context registry serializes pruning and per-request publication without blocking"
+  pass "context registry serializes pruning and reports exhausted request-lock contention"
+}
+
+test_context_registry_retries_busy_request_lock() {
+  local home dir ready holder rc
+  home="$TMP_ROOT/registry-lock-retry"
+  dir="$home/state/x-context"
+  ready="$home/holder-ready"
+  mkdir -p "$dir"
+  bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2" request-req-retry) || exit 1
+    : > "$3"
+    sleep 0.2
+    fmx_context_registry_lock_release "$lock"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" "$ready" &
+  holder=$!
+  while [ ! -f "$ready" ] && kill -0 "$holder" 2>/dev/null; do sleep 0.01; done
+  assert_present "$ready" "request-lock holder did not publish its readiness marker"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    fmx_context_registry_set "$2" req-retry discord 1900
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state"; rc=$?
+  wait "$holder" || fail "request-lock holder failed"
+  expect_code 0 "$rc" "registry retry after request-lock release"
+  [ "$(jq -r .platform "$dir/req-retry.json")" = discord ] \
+    || fail "registry retry did not persist the context after lock release"
+  pass "context registry retries boundedly while a request lock is busy"
 }
 
 test_context_registry_lock_publication_and_quarantine_are_safe() {
@@ -2608,6 +2635,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  test_context_registry_serializes_prune_and_updates
+  test_context_registry_retries_busy_request_lock
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2659,6 +2692,7 @@ test_context_registry_preserves_first_seen_timestamp
 test_context_registry_merges_partial_updates
 test_context_registry_refuses_symlinked_storage
 test_context_registry_serializes_prune_and_updates
+test_context_registry_retries_busy_request_lock
 test_context_registry_lock_publication_and_quarantine_are_safe
 test_context_registry_records_are_bounded
 test_context_registry_retention_starts_on_successful_live_answer

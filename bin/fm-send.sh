@@ -237,6 +237,36 @@ else
   esac
   retries=${FM_SEND_RETRIES:-3}
   sleep_s=${FM_SEND_SLEEP:-0.4}
+  MANAGED_LIFECYCLE_LOCK=
+  MANAGED_STEERING_ID=
+  EXPECTED_ACCOUNT_PROFILE=
+  if [ -n "$TARGET_META" ]; then
+    EXPECTED_ACCOUNT_PROFILE=$(fm_meta_get "$TARGET_META" account_profile)
+  fi
+  if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
+    MANAGED_STEERING_ID=$(fm_send_id_from_meta "$TARGET_META")
+    EXPECTED_GENERATION=$(fm_meta_get "$TARGET_META" generation_id)
+    [ -n "$EXPECTED_GENERATION" ] || {
+      echo "error: managed task metadata has no generation_id: $TARGET_META" >&2
+      exit 1
+    }
+    MANAGED_LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$MANAGED_STEERING_ID") || exit 1
+    cleanup_managed_send_lifecycle() {
+      [ -z "$MANAGED_LIFECYCLE_LOCK" ] \
+        || fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK" >/dev/null 2>&1 \
+        || true
+    }
+    trap cleanup_managed_send_lifecycle EXIT
+    trap 'exit 1' HUP INT TERM
+    if [ ! -f "$TARGET_META" ] || [ -L "$TARGET_META" ] \
+      || [ "$(fm_meta_get "$TARGET_META" generation_id)" != "$EXPECTED_GENERATION" ] \
+      || [ "$(fm_meta_get "$TARGET_META" account_profile)" != "$EXPECTED_ACCOUNT_PROFILE" ] \
+      || [ "$(fm_backend_of_meta "$TARGET_META")" != "$TARGET_BACKEND" ] \
+      || [ "$(fm_backend_target_of_meta "$TARGET_META")" != "$T" ]; then
+      echo "error: managed task generation or endpoint changed while fm-send waited for $MANAGED_STEERING_ID" >&2
+      exit 1
+    fi
+  fi
   # Type once, submit, verify. Lenient: only a positively-confirmed swallow
   # (text still in the composer) is an error; an unreadable pane is assumed sent.
   if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
@@ -295,13 +325,18 @@ else
   record_pending_managed_steering() {
     persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
   }
-  if [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
+  if [ -n "$MANAGED_STEERING_ID" ]; then
     if ! record_managed_steering "$@"; then
       if record_pending_managed_steering "$@"; then
         echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
       else
         echo "warning: text was sent to $T but its managed steering delivery could not be durably recorded" >&2
       fi
+    fi
+    if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
+      MANAGED_LIFECYCLE_LOCK=
+    else
+      echo "warning: text was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
     fi
   fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves

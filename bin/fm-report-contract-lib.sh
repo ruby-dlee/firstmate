@@ -15,45 +15,12 @@ fm_completion_report_contract() {  # <data-dir> <task-id>
 }
 
 fm_completion_report_contract_present() {  # <brief>
-  awk '
-    function marker(line,    text, character, length) {
-      text = line
-      sub(/^ {0,3}/, "", text)
-      character = substr(text, 1, 1)
-      if (character != "`" && character != "~") return 0
-      length = 0
-      while (substr(text, length + 1, 1) == character) length++
-      if (length < 3) return 0
-      marker_character = character
-      marker_length = length
-      marker_rest = substr(text, length + 1)
-      return 1
-    }
-    {
-      has_marker = marker($0)
-      if (fence_character != "") {
-        if (has_marker && marker_character == fence_character && marker_length >= fence_length && marker_rest ~ /^[[:space:]]*$/) {
-          fence_character = ""
-          fence_length = 0
-        }
-        next
-      }
-      if (has_marker && !(marker_character == "`" && marker_rest ~ /`/)) {
-        fence_character = marker_character
-        fence_length = marker_length
-        next
-      }
-      line = $0
-      sub(/^ {0,3}/, "", line)
-      if (line == "# Completion report") found = 1
-    }
-    END { exit !found }
-  ' "$1"
+  fm_completion_report_contract_file present "$1"
 }
 
 fm_completion_report_contract_ensure() (  # <data-dir> <task-id> <brief>
   local data=$1 task=$2 brief=$3 data_real task_real brief_parent brief_target
-  local source_identity current_identity mode temp=
+  local contract
 
   data_real=$(cd "$data" 2>/dev/null && pwd -P) || {
     echo "error: completion-report data directory is unavailable: $data" >&2
@@ -76,44 +43,89 @@ fm_completion_report_contract_ensure() (  # <data-dir> <task-id> <brief>
     echo "error: task brief must be a real regular file inside $task_real: $brief" >&2
     return 1
   fi
-  if fm_completion_report_contract_present "$brief_target"; then
-    return 0
-  fi
-
-  if source_identity=$(stat -f '%d:%i:%z:%m' "$brief_target" 2>/dev/null); then
-    mode=$(stat -f '%Lp' "$brief_target")
-  else
-    source_identity=$(stat -c '%d:%i:%s:%Y' "$brief_target") || return 1
-    mode=$(stat -c '%a' "$brief_target") || return 1
-  fi
-  temp=$(mktemp "$task_real/.brief-contract.XXXXXX") || {
-    echo "error: could not stage the completion-report contract inside $task_real" >&2
-    return 1
-  }
-  trap '[ -z "$temp" ] || rm -f -- "$temp"' EXIT HUP INT TERM
-  if ! cat "$brief_target" > "$temp"; then
-    echo "error: could not read task brief for completion-report upgrade: $brief" >&2
-    return 1
-  fi
-  chmod "$mode" "$temp" || return 1
-  {
-    printf '\n'
-    fm_completion_report_contract "$data" "$task"
-  } >> "$temp" || return 1
-
-  if [ -L "$brief_target" ] || [ ! -f "$brief_target" ]; then
-    echo "error: task brief changed during completion-report upgrade: $brief" >&2
-    return 1
-  fi
-  if current_identity=$(stat -f '%d:%i:%z:%m' "$brief_target" 2>/dev/null); then
-    :
-  else
-    current_identity=$(stat -c '%d:%i:%s:%Y' "$brief_target") || return 1
-  fi
-  if [ "$current_identity" != "$source_identity" ]; then
-    echo "error: task brief changed during completion-report upgrade: $brief" >&2
-    return 1
-  fi
-  mv -f -- "$temp" "$brief_target" || return 1
-  temp=
+  contract=$(fm_completion_report_contract "$data" "$task") || return 1
+  FM_COMPLETION_REPORT_CONTRACT=$contract fm_completion_report_contract_file ensure "$brief_target"
 )
+
+fm_completion_report_contract_file() {  # <present|ensure> <brief>
+  node - "$1" "$2" <<'JS'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const action = process.argv[2];
+const brief = process.argv[3];
+let source;
+let staged;
+
+function contractPresent(markdown) {
+  let fenceCharacter = '';
+  let fenceLength = 0;
+  for (const rawLine of markdown.split(/\r?\n/)) {
+    const marker = rawLine.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceCharacter) {
+      if (marker && marker[1][0] === fenceCharacter && marker[1].length >= fenceLength && /^\s*$/.test(marker[2])) {
+        fenceCharacter = '';
+        fenceLength = 0;
+      }
+      continue;
+    }
+    if (marker && !(marker[1][0] === '`' && marker[2].includes('`'))) {
+      fenceCharacter = marker[1][0];
+      fenceLength = marker[1].length;
+      continue;
+    }
+    if (rawLine.replace(/^ {0,3}/, '') === '# Completion report') return true;
+  }
+  return false;
+}
+
+function sameSnapshot(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+try {
+  source = fs.openSync(brief, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const initial = fs.fstatSync(source, { bigint: true });
+  if (!initial.isFile()) throw new Error('source is not a regular file');
+  const content = fs.readFileSync(source);
+  if (contractPresent(content.toString('utf8'))) {
+    process.exitCode = 0;
+  } else if (action === 'present') {
+    process.exitCode = 1;
+  } else if (action === 'ensure') {
+    const contract = process.env.FM_COMPLETION_REPORT_CONTRACT;
+    if (!contract) throw new Error('completion-report contract is empty');
+    staged = path.join(path.dirname(brief), `.brief-contract.${process.pid}.${crypto.randomBytes(8).toString('hex')}`);
+    const output = Buffer.concat([content, Buffer.from(`\n${contract}\n`)]);
+    const destination = fs.openSync(staged, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, Number(initial.mode & 0o7777n));
+    try {
+      fs.writeFileSync(destination, output);
+      fs.fchmodSync(destination, Number(initial.mode & 0o7777n));
+      fs.fsyncSync(destination);
+    } finally {
+      fs.closeSync(destination);
+    }
+    const finalSource = fs.fstatSync(source, { bigint: true });
+    const currentPath = fs.lstatSync(brief, { bigint: true });
+    if (!sameSnapshot(initial, finalSource) || !currentPath.isFile()
+      || currentPath.dev !== finalSource.dev || currentPath.ino !== finalSource.ino) {
+      throw new Error('task brief changed during completion-report upgrade');
+    }
+    fs.renameSync(staged, brief);
+    staged = undefined;
+  } else {
+    throw new Error(`unknown completion-report brief action: ${action}`);
+  }
+} catch (error) {
+  console.error(`error: completion-report brief transaction failed for ${brief}: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  if (source !== undefined) fs.closeSync(source);
+  if (staged !== undefined) {
+    try { fs.unlinkSync(staged); } catch {}
+  }
+}
+JS
+}

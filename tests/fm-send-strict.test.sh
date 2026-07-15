@@ -13,6 +13,9 @@ set -u
 SEND="$ROOT/bin/fm-send.sh"
 TMP_ROOT=$(fm_test_tmproot fm-send-strict)
 
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$ROOT/bin/fm-account-routing-lib.sh"
+
 make_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -203,7 +206,8 @@ test_explicit_managed_target_records_steering() {
   mkdir -p "$home/data/managed-task"
   : > "$log"
   fm_write_meta "$home/state/managed-task.meta" \
-    "window=sess:fm-managed-task" "kind=ship" "harness=codex" "account_profile=codex-2"
+    "window=sess:fm-managed-task" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-task:attempt-1" "account_profile=codex-2"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
@@ -223,7 +227,8 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
   mkdir -p "$home/data/managed-concurrent"
   : > "$log"
   fm_write_meta "$home/state/managed-concurrent.meta" \
-    "window=sess:fm-managed-concurrent" "kind=ship" "harness=codex" "account_profile=codex-2"
+    "window=sess:fm-managed-concurrent" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-concurrent:attempt-1" "account_profile=codex-2"
 
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
@@ -247,6 +252,106 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
   pass "fm-send strict: concurrent managed steering is serialized and atomic"
 }
 
+test_managed_send_revalidates_after_respawn_wait() {
+  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  dir="$TMP_ROOT/managed-respawn-race"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-respawn-race)
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/managed-race.meta" \
+    "window=sess:fm-managed-race-old" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-race:attempt-1" "account_profile=codex-2"
+
+  lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-race) \
+    || fail "could not hold the managed lifecycle lock for the respawn race"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" managed-race "Do not deliver across respawn." >"$dir/send.out" 2>"$err" &
+  sender_pid=$!
+  owner_wait=
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-race.owner.*' -print -quit)
+    [ -n "$owner_wait" ] && break
+    /bin/sleep 0.05
+  done
+  if [ -z "$owner_wait" ]; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    kill "$sender_pid" 2>/dev/null || true
+    wait "$sender_pid" 2>/dev/null || true
+    fail "managed sender never waited on the lifecycle lock"
+  fi
+  staged="$home/state/.managed-race.meta.respawn"
+  fm_write_meta "$staged" \
+    "window=sess:fm-managed-race-new" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-race:attempt-2" "account_profile=codex-3"
+  mv "$staged" "$home/state/managed-race.meta"
+  fm_account_lifecycle_lock_release "$lock" || fail "could not release the respawn race lifecycle lock"
+  set +e
+  wait "$sender_pid"
+  sender_rc=$?
+  set -e
+
+  [ "$sender_rc" -ne 0 ] || fail "managed sender accepted replaced metadata after waiting"
+  assert_contains "$(cat "$err")" "generation or endpoint changed" \
+    "managed sender did not diagnose the replaced generation"
+  [ ! -s "$log" ] || fail "managed sender delivered after its generation changed"
+  assert_absent "$home/data/managed-race/steering.md" \
+    "managed sender audited a steer that was refused before delivery"
+  pass "fm-send strict: managed sends reject respawned generations after lifecycle waits"
+}
+
+test_managed_send_holds_lifecycle_through_audit() {
+  local dir fb home log trail steering_lock sender_pid sender_rc teardown_pid teardown_rc delivered
+  dir="$TMP_ROOT/managed-teardown-race"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-teardown-race)
+  log="$dir/tmux.log"; trail="$home/data/managed-audit-race/steering.md"
+  mkdir -p "$home/data/managed-audit-race"
+  : > "$log"
+  fm_write_meta "$home/state/managed-audit-race.meta" \
+    "window=sess:fm-managed-audit-race" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-audit-race:attempt-1" "account_profile=codex-2"
+
+  steering_lock=$(fm_account_lock_acquire "$home/state" managed-audit-race account-steering \
+    "managed steering" 10) || fail "could not hold the steering lock for the teardown race"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" managed-audit-race "Audit before teardown." >"$dir/send.out" 2>"$dir/send.err" &
+  sender_pid=$!
+  delivered=
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    grep -Fq 'arg=Audit before teardown.' "$log" && { delivered=1; break; }
+    /bin/sleep 0.05
+  done
+  if [ -z "$delivered" ]; then
+    fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true
+    kill "$sender_pid" 2>/dev/null || true
+    wait "$sender_pid" 2>/dev/null || true
+    fail "managed sender never delivered before the audit gate"
+  fi
+
+  (
+    lifecycle=$(fm_account_lifecycle_lock_acquire "$home/state" managed-audit-race) || exit 1
+    grep -Fq '> Audit before teardown.' "$trail" || exit 2
+    : > "$dir/teardown-acquired"
+    fm_account_lifecycle_lock_release "$lifecycle"
+  ) &
+  teardown_pid=$!
+  /bin/sleep 0.2
+  [ ! -e "$dir/teardown-acquired" ] \
+    || fail "teardown acquired the lifecycle lock before managed audit persistence"
+
+  fm_account_meta_lock_release "$steering_lock" || fail "could not release the steering audit gate"
+  set +e
+  wait "$sender_pid"
+  sender_rc=$?
+  wait "$teardown_pid"
+  teardown_rc=$?
+  set -e
+  expect_code 0 "$sender_rc" "managed send should finish after canonical audit persistence"
+  expect_code 0 "$teardown_rc" "teardown waiter should observe the canonical audit before proceeding"
+  assert_present "$dir/teardown-acquired" "teardown waiter never acquired lifecycle ownership"
+  assert_grep '> Audit before teardown.' "$trail" \
+    "managed steering audit was not durable before lifecycle handoff"
+  pass "fm-send strict: managed sends hold lifecycle ownership through audit persistence"
+}
+
 test_healthy_fm_id_send_still_works() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
@@ -266,6 +371,8 @@ test_healthy_fm_id_send_still_works() {
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_explicit_managed_target_records_steering
   test_concurrent_managed_steering_is_serialized_and_atomic
+  test_managed_send_revalidates_after_respawn_wait
+  test_managed_send_holds_lifecycle_through_audit
   exit 0
 fi
 
@@ -278,4 +385,6 @@ test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
 test_concurrent_managed_steering_is_serialized_and_atomic
+test_managed_send_revalidates_after_respawn_wait
+test_managed_send_holds_lifecycle_through_audit
 test_healthy_fm_id_send_still_works

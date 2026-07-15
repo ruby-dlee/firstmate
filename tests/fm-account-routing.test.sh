@@ -372,7 +372,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
 }
 
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
-  local id rec brief before after outside out status heading_count
+  local id rec brief before after outside out status heading_count real_node hook raced_size
 
   id=contract-atomic-z1b
   rec=$(make_case contract-atomic claude "$id")
@@ -431,6 +431,60 @@ EOF
   [ "$status" -ne 0 ] || fail "task-directory symlink unexpectedly accepted a completion-contract write"
   [ "$(cat "$outside/brief.md")" = 'outside parent sentinel' ] || fail "completion-contract write escaped through the task directory"
   assert_contains "$out" "task directory must resolve directly inside" "task-directory containment refusal was not actionable"
+
+  id=contract-open-race-z1e
+  rec=$(make_case contract-open-race claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  outside="$CASE_DIR/outside-open-race"
+  printf 'outside open-race sentinel\n' > "$outside"
+  real_node=$(command -v node)
+  cat > "$FAKEBIN_DIR/node" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = - ] && [ "${2:-}" = ensure ]; then
+  rm -f -- "$FM_TEST_SWAP_BRIEF"
+  ln -s "$FM_TEST_SWAP_TARGET" "$FM_TEST_SWAP_BRIEF"
+fi
+exec "$FM_TEST_REAL_NODE" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/node"
+  export FM_TEST_REAL_NODE="$real_node" FM_TEST_SWAP_BRIEF="$brief" FM_TEST_SWAP_TARGET="$outside"
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  unset FM_TEST_REAL_NODE FM_TEST_SWAP_BRIEF FM_TEST_SWAP_TARGET
+  [ "$status" -ne 0 ] || fail "brief symlink swap before descriptor open unexpectedly succeeded"
+  [ "$(cat "$outside")" = 'outside open-race sentinel' ] || fail "descriptor open followed a raced brief symlink"
+
+  id=contract-content-race-z1f
+  rec=$(make_case contract-content-race claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  raced_size=$(wc -c < "$brief" | tr -d ' ')
+  hook="$CASE_DIR/mutate-after-read.cjs"
+  cat > "$hook" <<'JS'
+const fs = require('fs');
+const original = fs.readFileSync;
+let mutated = false;
+fs.readFileSync = function (...args) {
+  const content = original.apply(this, args);
+  if (!mutated && typeof args[0] === 'number') {
+    mutated = true;
+    const target = process.env.FM_TEST_MUTATE_BRIEF;
+    const stat = fs.statSync(target);
+    const prefix = Buffer.from('# Concurrent replacement\n');
+    const replacement = Buffer.alloc(Number(process.env.FM_TEST_MUTATE_SIZE), 120);
+    prefix.copy(replacement);
+    fs.writeFileSync(target, replacement);
+    fs.utimesSync(target, stat.atime, stat.mtime);
+  }
+  return content;
+};
+JS
+  export NODE_OPTIONS="--require=$hook" FM_TEST_MUTATE_BRIEF="$brief" FM_TEST_MUTATE_SIZE="$raced_size"
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  unset NODE_OPTIONS FM_TEST_MUTATE_BRIEF FM_TEST_MUTATE_SIZE
+  [ "$status" -ne 0 ] || fail "same-size same-second brief edit during descriptor copy unexpectedly succeeded"
+  assert_grep '# Concurrent replacement' "$brief" "failed brief upgrade overwrote the concurrent edit"
+  assert_no_grep '# Completion report' "$brief" "failed brief upgrade installed the contract over a concurrent edit"
   pass "completion-contract upgrades are contained, non-following, and atomic"
 }
 

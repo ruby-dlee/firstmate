@@ -206,39 +206,66 @@ function configuredRoot(directory, label) {
 }
 
 function readArtifact(file, root, label, options = {}) {
-  let stat;
+  let initial;
   try {
-    stat = fs.lstatSync(file);
+    initial = fs.lstatSync(file);
   } catch (error) {
     if (error.code === "ENOENT") return undefined;
     throw error;
   }
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
   const real = fs.realpathSync(file);
   if (!isContained(root, real)) throw new Error(`${label} escapes its configured root at ${file}`);
-  if (options.maxBytes) {
-    const oversized = stat.size > options.maxBytes;
-    if (oversized && !options.truncate) {
-      if (options.overflowMessage) throw new Error(options.overflowMessage(stat.size));
-      throw new Error(`${label} exceeds its ${options.maxBytes}-byte limit at ${file}`);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const descriptor = fs.openSync(file, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.dev !== initial.dev || stat.ino !== initial.ino) {
+      throw new Error(`${label} must be a stable real regular file at ${file}`);
     }
-    const length = oversized ? options.maxBytes : stat.size;
-    const offset = oversized && options.truncate === "tail" ? stat.size - options.maxBytes : 0;
-    const descriptor = fs.openSync(real, "r");
-    const buffer = Buffer.alloc(length);
-    let bytesRead;
-    try {
-      bytesRead = fs.readSync(descriptor, buffer, 0, length, offset);
-    } finally {
-      fs.closeSync(descriptor);
+    if (options.maxBytes) {
+      const oversized = stat.size > options.maxBytes;
+      if (oversized && !options.truncate) {
+        if (options.overflowMessage) throw new Error(options.overflowMessage(stat.size));
+        throw new Error(`${label} exceeds its ${options.maxBytes}-byte limit at ${file}`);
+      }
+      if (!options.truncate) {
+        const overflowMessage = options.overflowMessage || ((size) => `${label} exceeds its ${options.maxBytes}-byte limit at ${file}`);
+        return readDescriptorAtMost(descriptor, options.maxBytes, overflowMessage).toString("utf8");
+      }
+      const length = oversized ? options.maxBytes : stat.size;
+      const offset = oversized && options.truncate === "tail" ? stat.size - options.maxBytes : 0;
+      const buffer = Buffer.alloc(length);
+      let bytesRead = 0;
+      while (bytesRead < length) {
+        const count = fs.readSync(descriptor, buffer, bytesRead, length - bytesRead, offset + bytesRead);
+        if (count === 0) break;
+        bytesRead += count;
+      }
+      const content = buffer.subarray(0, bytesRead).toString("utf8");
+      if (!oversized) return content;
+      const kept = options.truncate === "tail" ? "last" : "first";
+      const marker = `[${label} truncated: original size ${stat.size} bytes; kept ${kept} ${bytesRead} bytes]`;
+      return options.truncate === "tail" ? `${marker}\n${content}` : `${content}\n${marker}\n`;
     }
-    const content = buffer.subarray(0, bytesRead).toString("utf8");
-    if (!oversized) return content;
-    const kept = options.truncate === "tail" ? "last" : "first";
-    const marker = `[${label} truncated: original size ${stat.size} bytes; kept ${kept} ${bytesRead} bytes]`;
-    return options.truncate === "tail" ? `${marker}\n${content}` : `${content}\n${marker}\n`;
+    return fs.readFileSync(descriptor, "utf8");
+  } finally {
+    fs.closeSync(descriptor);
   }
-  return fs.readFileSync(real, "utf8");
+}
+
+function readDescriptorAtMost(descriptor, maxBytes, overflowMessage) {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  let bytesRead = 0;
+  while (bytesRead < buffer.length) {
+    const count = fs.readSync(descriptor, buffer, bytesRead, buffer.length - bytesRead, null);
+    if (count === 0) break;
+    bytesRead += count;
+  }
+  if (bytesRead > maxBytes) {
+    throw new Error(overflowMessage(bytesRead));
+  }
+  return buffer.subarray(0, bytesRead);
 }
 
 function readBoundedRegularFile(file, maxBytes, label) {
@@ -252,7 +279,11 @@ function readBoundedRegularFile(file, maxBytes, label) {
       throw new Error(`${label} must be a stable real regular file at ${file}`);
     }
     if (stat.size > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte limit at ${file}`);
-    return fs.readFileSync(descriptor, "utf8");
+    return readDescriptorAtMost(
+      descriptor,
+      maxBytes,
+      () => `${label} exceeds its ${maxBytes}-byte limit at ${file}`,
+    ).toString("utf8");
   } finally {
     fs.closeSync(descriptor);
   }

@@ -238,6 +238,10 @@ test_text_sources_are_bounded_before_reading() {
   if find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name "$oversized-*" -print -quit | grep -q .; then
     fail "oversized load-bearing completion report created a durable entry"
   fi
+  assert_grep 'Buffer.alloc(maxBytes + 1)' "$SCRIPT" \
+    "bounded report readers do not reserve an overflow sentinel byte"
+  assert_grep 'readDescriptorAtMost(descriptor, maxBytes' "$SCRIPT" \
+    "bounded report control readers do not read through the capped descriptor helper"
   pass "report stack truncates informational trails visibly and rejects oversized completion reports"
 }
 
@@ -622,6 +626,10 @@ test_source_symlinks_fail_closed() {
   if grep -R -F 'outside artifact' "$STACK" >/dev/null 2>&1; then
     fail "symlinked source content escaped into the report stack"
   fi
+  assert_grep 'fs.openSync(file, flags)' "$SCRIPT" \
+    "report text sources are not opened through their original non-following path"
+  assert_grep 'stat.dev !== initial.dev || stat.ino !== initial.ino' "$SCRIPT" \
+    "report text sources are not identity-bound after opening"
   pass "report stack rejects symlinked report source artifacts"
 }
 
@@ -710,6 +718,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
   test_visual_copy_is_descriptor_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
+  test_text_sources_are_bounded_before_reading
+  test_source_symlinks_fail_closed
   exit 0
 fi
 

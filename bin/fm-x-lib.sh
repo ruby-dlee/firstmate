@@ -49,6 +49,7 @@
 FMX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FMX_REPLY_MIN_CHARS=50
 FMX_RESPONSE_BODY_MAX_BYTES=65536
+FMX_CONTEXT_RECORD_MAX_BYTES=131072
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$FMX_LIB_DIR/fm-account-routing-lib.sh"
 
@@ -247,8 +248,29 @@ fmx_context_registry_mtime() {
   printf '%s\n' "$mtime"
 }
 
+fmx_context_registry_file_stat() {
+  local file=$1 values size mtime
+  if [ "$(uname)" = Darwin ]; then
+    values=$(stat -f '%z %m' "$file" 2>/dev/null) || return 1
+  else
+    values=$(stat -c '%s %Y' "$file" 2>/dev/null) || return 1
+  fi
+  size=${values%% *}
+  mtime=${values#* }
+  case "$size:$mtime" in
+    *[!0-9:]*) return 1 ;;
+  esac
+  [ -n "$size" ] && [ -n "$mtime" ] || return 1
+  [ "${#size}" -le 18 ] && [ "${#mtime}" -le 18 ] || return 1
+  printf '%s %s\n' "$size" "$mtime"
+}
+
 fmx_context_registry_recorded_at() {
-  local file=$1 now=${2:-} recorded_at
+  local file=$1 now=${2:-} recorded_at file_stat size mtime
+  file_stat=$(fmx_context_registry_file_stat "$file") || return 1
+  size=${file_stat%% *}
+  mtime=${file_stat#* }
+  [ "$size" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
   recorded_at=$(jq -r '
     .recorded_at
     | if type == "number" and floor == . and . >= 0 then tostring
@@ -263,7 +285,7 @@ fmx_context_registry_recorded_at() {
     recorded_at=
   fi
   if [ -z "$recorded_at" ]; then
-    recorded_at=$(fmx_context_registry_mtime "$file") || return 1
+    recorded_at=$mtime
     if [ -n "$now" ] && [ "$recorded_at" -gt "$now" ]; then
       return 1
     fi
@@ -271,8 +293,35 @@ fmx_context_registry_recorded_at() {
   printf '%s\n' "$recorded_at"
 }
 
+fmx_context_registry_lock_owner_publish() {
+  local lock=$1 start owner tmp tmp_inode owner_inode nested nested_inode
+  start=$(fm_account_process_start_time "$$") || return 1
+  owner="$lock/owner"
+  tmp=$(mktemp "$lock/.owner.XXXXXX" 2>/dev/null) || return 1
+  if ! printf '%s\n%s\n' "$$" "$start" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  tmp_inode=$(fm_account_path_inode "$tmp") || { rm -f "$tmp"; return 1; }
+  if ln -n "$tmp" "$owner" 2>/dev/null; then
+    owner_inode=$(fm_account_path_inode "$owner" 2>/dev/null || true)
+    if [ -f "$owner" ] && [ ! -L "$owner" ] && [ "$owner_inode" = "$tmp_inode" ]; then
+      rm -f "$tmp"
+      return 0
+    fi
+    nested="$owner/${tmp##*/}"
+    nested_inode=$(fm_account_path_inode "$nested" 2>/dev/null || true)
+    if [ -d "$owner" ] && [ ! -L "$owner" ] && [ -f "$nested" ] \
+      && [ ! -L "$nested" ] && [ "$nested_inode" = "$tmp_inode" ]; then
+      rm -f "$nested" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 fmx_context_registry_lock_acquire() {
-  local dir=$1 name=$2 lock owner start now mtime observed quarantine quarantined
+  local dir=$1 name=$2 lock now mtime observed quarantine quarantined nested nested_inode
   case "$name" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   lock="$dir/.lock-$name"
   if ! mkdir "$lock" 2>/dev/null; then
@@ -285,21 +334,25 @@ fmx_context_registry_lock_acquire() {
     observed=$(fm_account_path_inode "$lock") || return 1
     fm_account_reclaim_owner_alive "$lock" && return 1
     [ "$(fm_account_path_inode "$lock" 2>/dev/null || true)" = "$observed" ] || return 1
-    quarantine="$lock.stale.$$.$RANDOM"
+    quarantine=$(mktemp -d "$lock.stale.XXXXXX" 2>/dev/null) || return 1
+    rmdir "$quarantine" 2>/dev/null || return 1
     mv "$lock" "$quarantine" 2>/dev/null || return 1
     quarantined=$(fm_account_path_inode "$quarantine" 2>/dev/null || true)
     if [ "$quarantined" != "$observed" ]; then
-      [ -e "$lock" ] || mv "$quarantine" "$lock" 2>/dev/null || true
+      nested="$quarantine/${lock##*/}"
+      nested_inode=$(fm_account_path_inode "$nested" 2>/dev/null || true)
+      if [ -d "$quarantine" ] && [ ! -L "$quarantine" ] \
+        && [ "$nested_inode" = "$observed" ] && [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+        mv "$nested" "$lock" 2>/dev/null || true
+        rmdir "$quarantine" 2>/dev/null || true
+      fi
       return 1
     fi
     rm -rf "$quarantine" 2>/dev/null || return 1
     mkdir "$lock" 2>/dev/null || return 1
   fi
-  start=$(fm_account_process_start_time "$$") || { rmdir "$lock" 2>/dev/null; return 1; }
-  owner="$lock/owner"
-  if ! printf '%s\n%s\n' "$$" "$start" > "$owner"; then
-    rm -f "$owner" 2>/dev/null
-    rmdir "$lock" 2>/dev/null
+  if ! fmx_context_registry_lock_owner_publish "$lock"; then
+    [ -d "$lock" ] && [ ! -L "$lock" ] && rm -rf "$lock" 2>/dev/null
     return 1
   fi
   printf '%s\n' "$lock"
@@ -424,7 +477,7 @@ fmx_context_registry_set() {
 # reply context as {"platform":"...","reply_max_chars":"..."} (the same shape as
 # the inbox and relay extractors), or the empty shape when no record exists.
 fmx_context_registry_get() {
-  local state=$1 rid=$2 dir file
+  local state=$1 rid=$2 dir file file_stat size
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) printf '{"platform":"","reply_max_chars":""}\n'; return 0 ;;
   esac
@@ -436,6 +489,15 @@ fmx_context_registry_get() {
   fmx_context_registry_prune "$state" || { printf '{"platform":"","reply_max_chars":""}\n'; return 0; }
   file="$dir/$rid.json"
   if [ ! -f "$file" ] || [ -L "$file" ]; then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  file_stat=$(fmx_context_registry_file_stat "$file") || {
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  }
+  size=${file_stat%% *}
+  if [ "$size" -gt "$FMX_CONTEXT_RECORD_MAX_BYTES" ]; then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi

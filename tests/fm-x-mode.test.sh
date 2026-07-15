@@ -1393,6 +1393,86 @@ test_context_registry_serializes_prune_and_updates() {
   pass "context registry serializes pruning and per-request publication without blocking"
 }
 
+test_context_registry_lock_publication_and_quarantine_are_safe() {
+  local home dir outside sentinel fakebin out rc stale_lock
+  home="$TMP_ROOT/registry-lock-publication"
+  dir="$home/state/x-context"
+  outside="$home/outside"
+  sentinel="$outside/sentinel"
+  mkdir -p "$dir" "$outside"
+  printf 'sentinel\n' > "$sentinel"
+  fakebin=$(fm_fakebin "$home/owner-race")
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+out=$(/usr/bin/mktemp "$@") || exit 1
+case "$out" in
+  */.owner.*)
+    ln -s "$FM_TEST_SENTINEL" "${out%/*}/owner" 2>/dev/null || true
+    ;;
+esac
+printf '%s\n' "$out"
+SH
+  chmod +x "$fakebin/mktemp"
+  if out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_SENTINEL="$sentinel" bash -c '
+      . "$1"
+      fmx_context_registry_lock_acquire "$2" request-owner-race
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" 2>/dev/null); then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "registry lock acquisition accepted a raced owner symlink ($out)"
+  assert_grep 'sentinel' "$sentinel" "registry lock owner publication followed a planted symlink"
+
+  stale_lock="$dir/.lock-request-quarantine-race"
+  mkdir "$stale_lock"
+  printf '999999\nstale\n' > "$stale_lock/owner"
+  touch -t 200001010000 "$stale_lock"
+  fakebin=$(fm_fakebin "$home/quarantine-race")
+  cat > "$fakebin/rmdir" <<'SH'
+#!/usr/bin/env bash
+target=$1
+/bin/rmdir "$@" || exit 1
+case "$target" in
+  *.stale.*)
+    mkdir "$target" || exit 1
+    printf 'attacker\n' > "$target/attacker"
+    ;;
+esac
+SH
+  chmod +x "$fakebin/rmdir"
+  if out=$(PATH="$fakebin:$BASE_PATH" bash -c '
+      . "$1"
+      fmx_context_registry_lock_acquire "$2" request-quarantine-race
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" 2>/dev/null); then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "registry lock acquisition accepted a raced stale quarantine ($out)"
+  assert_present "$stale_lock/owner" "stale quarantine race did not restore the original lock"
+  assert_grep '999999' "$stale_lock/owner" "stale quarantine race installed attacker state as the active lock"
+  pass "context registry lock publication and stale quarantine fail safely under races"
+}
+
+test_context_registry_records_are_bounded() {
+  local home dir file out
+  home="$TMP_ROOT/registry-record-bounds"
+  dir="$home/state/x-context"
+  file="$dir/req-oversized.json"
+  mkdir -p "$dir"
+  printf '{"request_id":"req-oversized","platform":"x","reply_max_chars":"280","recorded_at":1700000000,"padding":"' > "$file"
+  dd if=/dev/zero bs=131073 count=1 2>/dev/null | tr '\000' x >> "$file"
+  printf '"}\n' >> "$file"
+  out=$(FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2/x-context" registry) || exit 1
+    fmx_context_registry_get "$2" req-oversized
+    fmx_context_registry_lock_release "$lock" || exit 2
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state") || fail "bounded registry get failed"
+  [ "$out" = '{"platform":"","reply_max_chars":""}' ] \
+    || fail "oversized registry get did not degrade to the empty context ($out)"
+  assert_present "$file" "bounded registry get unexpectedly mutated the record while prune was locked"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    fmx_context_registry_prune "$2"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "bounded registry prune failed"
+  assert_absent "$file" "registry prune parsed rather than quarantining an oversized record"
+  pass "context registry bounds records before parsing"
+}
+
 test_context_registry_retention_starts_on_successful_live_answer() {
   local home fakebin out rc reg
   home="$TMP_ROOT/registry-answer-window"
@@ -2477,6 +2557,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
+  test_context_registry_lock_publication_and_quarantine_are_safe
+  test_context_registry_records_are_bounded
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2528,6 +2614,8 @@ test_context_registry_preserves_first_seen_timestamp
 test_context_registry_merges_partial_updates
 test_context_registry_refuses_symlinked_storage
 test_context_registry_serializes_prune_and_updates
+test_context_registry_lock_publication_and_quarantine_are_safe
+test_context_registry_records_are_bounded
 test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup

@@ -1111,6 +1111,7 @@ printf 'call\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
 sleep 10
 SH
   chmod +x "$sync_bin"
+  # shellcheck disable=SC2030,SC2031
   (
     export FM_STATE_OVERRIDE="$state"
     export FM_ROOT_OVERRIDE="$fake_root"
@@ -1153,6 +1154,7 @@ test_watcher_markers_refuse_symlinks() {
 printf 'called\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
 SH
   chmod +x "$sync_bin"
+  # shellcheck disable=SC1090,SC2030,SC2031
   (
     export FM_STATE_OVERRIDE="$state"
     export FM_ROOT_OVERRIDE="$fake_root"

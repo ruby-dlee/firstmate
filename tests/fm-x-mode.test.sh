@@ -1448,7 +1448,7 @@ SH
 }
 
 test_context_registry_records_are_bounded() {
-  local home dir file out
+  local home dir file out fakebin real_head race_file
   home="$TMP_ROOT/registry-record-bounds"
   dir="$home/state/x-context"
   file="$dir/req-oversized.json"
@@ -1470,6 +1470,46 @@ test_context_registry_records_are_bounded() {
     fmx_context_registry_prune "$2"
   ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "bounded registry prune failed"
   assert_absent "$file" "registry prune parsed rather than quarantining an oversized record"
+
+  race_file="$dir/req-raced.json"
+  jq -cn '{request_id:"req-raced",platform:"discord",reply_max_chars:"1900",recorded_at:1700000000}' > "$race_file"
+  fakebin=$(fm_fakebin "$home/raced-read")
+  real_head=$(command -v head)
+  cat > "$fakebin/head" <<'SH'
+#!/usr/bin/env bash
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$last" = "${FM_TEST_CONTEXT_RACE_FILE:-}" ] && [ ! -e "$last.mutated" ]; then
+  printf '{"request_id":"req-raced","padding":"' > "$last.replacement"
+  head -c 131073 /dev/zero | tr '\0' x >> "$last.replacement"
+  printf '"}\n' >> "$last.replacement"
+  mv "$last.replacement" "$last"
+  : > "$last.mutated"
+fi
+exec "$FM_TEST_REAL_HEAD" "$@"
+SH
+  chmod +x "$fakebin/head"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_REAL_HEAD="$real_head" \
+    FM_TEST_CONTEXT_RACE_FILE="$race_file" FMX_NOW_OVERRIDE=1700000000 bash -c '
+      . "$1"
+      lock=$(fmx_context_registry_lock_acquire "$2/x-context" registry) || exit 1
+      fmx_context_registry_get "$2" req-raced
+      fmx_context_registry_lock_release "$lock" || exit 2
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state") || fail "raced registry get failed"
+  [ "$out" = '{"platform":"","reply_max_chars":""}' ] \
+    || fail "raced registry get parsed content beyond its cap ($out)"
+  assert_present "$race_file.mutated" "registry get bounded-read race hook did not run"
+
+  jq -cn '{request_id:"req-recorded-race",platform:"x",reply_max_chars:"280",recorded_at:1700000000}' > "$race_file"
+  rm -f "$race_file.mutated"
+  if PATH="$fakebin:$BASE_PATH" FM_TEST_REAL_HEAD="$real_head" \
+    FM_TEST_CONTEXT_RACE_FILE="$race_file" bash -c '
+      . "$1"
+      fmx_context_registry_recorded_at "$2" 1700000000
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$race_file" >/dev/null 2>&1; then
+    fail "recorded-at reader accepted a record that grew beyond its cap after stat"
+  fi
+  assert_present "$race_file.mutated" "recorded-at bounded-read race hook did not run"
   pass "context registry bounds records before parsing"
 }
 
@@ -2559,6 +2599,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
   test_context_registry_lock_publication_and_quarantine_are_safe
+  test_context_registry_records_are_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   test_context_registry_records_are_bounded
   exit 0
 fi

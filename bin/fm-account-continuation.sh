@@ -196,22 +196,89 @@ append_snapshot_section() {
   packet_check_budget
 }
 
+continuation_path_identity_size() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i:%z' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i:%s' "$1" 2>/dev/null
+  fi
+}
+
+continuation_fd_identity_size() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -Lf '%i:%z' "/dev/fd/$1" 2>/dev/null
+  else
+    stat -Lc '%d:%i:%s' "/dev/fd/$1" 2>/dev/null
+  fi
+}
+
 append_file_section() {  # <heading> <file>
   local heading=$1 file=$2 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc
+  local fd_stat path_stat fd_identity path_identity
   [ -f "$file" ] || return 0
   [ ! -L "$file" ] || { echo "error: refusing symlinked continuation source $file" >&2; return 1; }
-  current=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
-  file_bytes=$(wc -c < "$file" | tr -d '[:space:]')
+  if ! exec 9< "$file"; then
+    echo "error: cannot open continuation source $file" >&2
+    return 1
+  fi
+  fd_stat=$(continuation_fd_identity_size 9) || {
+    exec 9<&-
+    echo "error: cannot inspect opened continuation source $file" >&2
+    return 1
+  }
+  [ ! -L "$file" ] || {
+    exec 9<&-
+    echo "error: refusing replaced continuation source $file" >&2
+    return 1
+  }
+  path_stat=$(continuation_path_identity_size "$file") || {
+    exec 9<&-
+    echo "error: cannot revalidate continuation source $file" >&2
+    return 1
+  }
+  path_identity=${path_stat%:*}
+  if [ "$(uname)" = Darwin ]; then
+    fd_identity=${fd_stat%:*}
+    path_identity=${path_identity#*:}
+  else
+    fd_identity=${fd_stat%:*}
+  fi
+  if [ "$fd_identity" != "$path_identity" ]; then
+    exec 9<&-
+    echo "error: continuation source changed while opening $file" >&2
+    return 1
+  fi
+  file_bytes=${fd_stat##*:}
+  current=$(packet_bytes) || {
+    exec 9<&-
+    echo "error: cannot measure continuation packet for $ID" >&2
+    return 1
+  }
   framing_bytes=$(printf '\n## %s\n\n\n' "$heading" | wc -c | tr -d '[:space:]')
-  case "$file_bytes$framing_bytes" in *[!0-9]*) echo "error: cannot measure continuation source $file" >&2; return 1 ;; esac
+  case "$file_bytes$framing_bytes" in
+    *[!0-9]*)
+      exec 9<&-
+      echo "error: cannot measure continuation source $file" >&2
+      return 1
+      ;;
+  esac
   projected=$((current + file_bytes + framing_bytes))
-  [ "$projected" -le "$MAX_PACKET_BYTES" ] || packet_size_error "$projected"
-  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || return 1
-  copy_start=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  if [ "$projected" -gt "$MAX_PACKET_BYTES" ]; then
+    exec 9<&-
+    packet_size_error "$projected"
+    return 1
+  fi
+  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || { exec 9<&-; return 1; }
+  copy_start=$(packet_bytes) || {
+    exec 9<&-
+    echo "error: cannot measure continuation packet for $ID" >&2
+    return 1
+  }
   set +e
-  head -c "$((file_bytes + 1))" "$file" >> "$PACKET_TMP"
+  head -c "$((file_bytes + 1))" <&9 >> "$PACKET_TMP"
   copy_rc=$?
   set -e
+  exec 9<&-
   [ "$copy_rc" -eq 0 ] || { echo "error: cannot copy continuation source $file" >&2; return 1; }
   copy_end=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
   copied=$((copy_end - copy_start))

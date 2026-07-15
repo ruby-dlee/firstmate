@@ -204,6 +204,41 @@ test_republish_new_generation_refreshes_completion_time() {
   pass "report republish refreshes completion time for a new task generation"
 }
 
+test_same_generation_republish_preserves_revision_without_worktree() {
+  local id=report-revision-retry-a4b repo meta staged entry manifest head short branch
+  repo="$TMP_ROOT/revision-retry-worktree"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.name fmtest
+  git -C "$repo" config user.email fmtest@example.invalid
+  git -C "$repo" commit -q --allow-empty -m first
+  head=$(git -C "$repo" rev-parse HEAD)
+  short=${head:0:12}
+  branch=$(git -C "$repo" branch --show-current)
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Revision survives retry."
+  meta="$HOME_DIR/state/$id.meta"
+  staged="$HOME_DIR/state/.$id.meta.revision-retry"
+  grep -v '^worktree=' "$meta" > "$staged"
+  printf 'worktree=%s\n' "$repo" >> "$staged"
+  mv "$staged" "$meta"
+  run_stack publish "$id" >/dev/null || fail "revision retry precondition publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+
+  grep -v '^worktree=' "$meta" > "$staged"
+  printf 'worktree=%s\n' "$TMP_ROOT/removed-revision-worktree" >> "$staged"
+  mv "$staged" "$meta"
+  run_stack publish "$id" >/dev/null || fail "same-generation retry without a worktree failed"
+  assert_grep "\"commit\": \"$short\"" "$manifest" \
+    "same-generation retry erased the compatibility commit"
+  assert_grep "\"worktreeHead\": \"$short\"" "$manifest" \
+    "same-generation retry erased the worktree HEAD"
+  assert_grep "\"branch\": \"$branch\"" "$manifest" \
+    "same-generation retry erased the branch"
+  pass "same-generation report retries preserve unavailable revision provenance"
+}
+
 test_text_sources_are_bounded_before_reading() {
   local id entry stored_brief stored_status oversized out status
   id=report-bounded-trails-a5
@@ -727,11 +762,17 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
+  test_same_generation_republish_preserves_revision_without_worktree
+  exit 0
+fi
+
 test_publish_ship_with_visual
 test_report_links_reject_credentials_and_encode_visual_paths
 test_pr_url_strips_query_and_fragment
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
+test_same_generation_republish_preserves_revision_without_worktree
 test_text_sources_are_bounded_before_reading
 test_metadata_is_bounded_before_reading
 test_report_temps_are_exclusive_and_randomized

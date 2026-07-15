@@ -265,18 +265,30 @@ fmx_context_registry_file_stat() {
   printf '%s %s\n' "$size" "$mtime"
 }
 
+fmx_context_registry_snapshot() {
+  local file=$1 size=$2 snapshot bytes sentinel=$'\036'
+  [ "$size" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
+  snapshot=$({ head -c "$((FMX_CONTEXT_RECORD_MAX_BYTES + 1))" "$file" 2>/dev/null || exit $?; printf '%s' "$sentinel"; }) || return 1
+  case "$snapshot" in *"$sentinel") ;; *) return 1 ;; esac
+  snapshot=${snapshot%"$sentinel"}
+  bytes=$(printf '%s' "$snapshot" | wc -c | tr -d '[:space:]')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
+  printf '%s' "$snapshot"
+}
+
 fmx_context_registry_recorded_at() {
-  local file=$1 now=${2:-} recorded_at file_stat size mtime
+  local file=$1 now=${2:-} recorded_at file_stat size mtime snapshot
   file_stat=$(fmx_context_registry_file_stat "$file") || return 1
   size=${file_stat%% *}
   mtime=${file_stat#* }
-  [ "$size" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
-  recorded_at=$(jq -r '
+  snapshot=$(fmx_context_registry_snapshot "$file" "$size") || return 1
+  recorded_at=$(printf '%s\n' "$snapshot" | jq -r '
     .recorded_at
     | if type == "number" and floor == . and . >= 0 then tostring
       elif type == "string" and test("^[0-9]+$") then .
       else "" end
-  ' "$file" 2>/dev/null) || recorded_at=
+  ' 2>/dev/null) || recorded_at=
   case "$recorded_at" in
     ''|*[!0-9]*) recorded_at= ;;
   esac
@@ -477,7 +489,7 @@ fmx_context_registry_set() {
 # reply context as {"platform":"...","reply_max_chars":"..."} (the same shape as
 # the inbox and relay extractors), or the empty shape when no record exists.
 fmx_context_registry_get() {
-  local state=$1 rid=$2 dir file file_stat size
+  local state=$1 rid=$2 dir file file_stat size snapshot
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) printf '{"platform":"","reply_max_chars":""}\n'; return 0 ;;
   esac
@@ -497,11 +509,12 @@ fmx_context_registry_get() {
     return 0
   }
   size=${file_stat%% *}
-  if [ "$size" -gt "$FMX_CONTEXT_RECORD_MAX_BYTES" ]; then
+  if ! snapshot=$(fmx_context_registry_snapshot "$file" "$size"); then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi
-  jq -c '{platform:(.platform // ""), reply_max_chars:(.reply_max_chars // "")}' "$file" 2>/dev/null \
+  printf '%s\n' "$snapshot" \
+    | jq -c '{platform:(.platform // ""), reply_max_chars:(.reply_max_chars // "")}' 2>/dev/null \
     || printf '{"platform":"","reply_max_chars":""}\n'
 }
 

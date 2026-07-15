@@ -102,13 +102,28 @@ case "$AFTER_UPDATED_AT" in *$'\n'*|*=*) echo "error: unsafe --after-updated-at 
 META="$STATE/$ID.meta"
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
+LIFECYCLE_LOCK_INHERITED_PID=
+LIFECYCLE_LOCK_INHERITED_START=
 META_LOCK=
 META_TMP=
 META_ROLLBACK_TMP=
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   expected_lifecycle_lock="$STATE/.account-lifecycle-$ID.lock"
-  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" != "$expected_lifecycle_lock" ] \
-    || ! fm_account_lifecycle_lock_held "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
+  inherited_lock_identity=
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_lifecycle_lock" ]; then
+    inherited_lock_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_lock_identity=
+  fi
+  case "$inherited_lock_identity" in
+    *$'\n'*)
+      LIFECYCLE_LOCK_INHERITED_PID=${inherited_lock_identity%%$'\n'*}
+      LIFECYCLE_LOCK_INHERITED_START=${inherited_lock_identity#*$'\n'}
+      ;;
+    *)
+      echo "error: invalid inherited account lifecycle lock for $ID" >&2
+      exit 1
+      ;;
+  esac
+  if [ -z "$LIFECYCLE_LOCK_INHERITED_PID" ] || [ -z "$LIFECYCLE_LOCK_INHERITED_START" ]; then
     echo "error: invalid inherited account lifecycle lock for $ID" >&2
     exit 1
   fi
@@ -178,6 +193,24 @@ while :; do
   sleep 1
 done
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+if [ "$LIFECYCLE_LOCK_OWNED" != 1 ]; then
+  current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
+  case "$current_lock_identity" in
+    *$'\n'*)
+      current_lock_pid=${current_lock_identity%%$'\n'*}
+      current_lock_start=${current_lock_identity#*$'\n'}
+      ;;
+    *) current_lock_pid=; current_lock_start= ;;
+  esac
+  if [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" != "$LIFECYCLE_LOCK" ] \
+    || [ "$current_lock_pid" != "$LIFECYCLE_LOCK_INHERITED_PID" ] \
+    || [ "$current_lock_start" != "$LIFECYCLE_LOCK_INHERITED_START" ]; then
+    fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+    META_LOCK=
+    echo "error: managed lifecycle lock was lost before session synchronization for $ID" >&2
+    exit 1
+  fi
+fi
 current_account_task=$(fm_meta_get "$META" account_task)
 current_attempt=$(fm_meta_get "$META" account_attempt)
 [ -n "$current_account_task" ] || current_account_task=$ID

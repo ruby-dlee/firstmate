@@ -217,8 +217,8 @@ fm_account_process_start_time() {  # <pid>
   printf '%s\n' "$out"
 }
 
-fm_account_meta_lock_owner_alive() {  # <lock-path>
-  local lock=$1 owner pid recorded current
+fm_account_lock_owner_identity() {  # <lock-path>
+  local lock=$1 owner identity pid recorded current
   if [ -f "$lock" ] && [ ! -L "$lock" ]; then
     owner=$lock
   elif [ -d "$lock" ] && [ ! -L "$lock" ]; then
@@ -227,13 +227,20 @@ fm_account_meta_lock_owner_alive() {  # <lock-path>
     return 1
   fi
   [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
-  pid=$(sed -n '1p' "$owner" 2>/dev/null)
-  recorded=$(sed -n '2p' "$owner" 2>/dev/null)
+  identity=$(sed -n '1p;2p' "$owner" 2>/dev/null) || return 1
+  case "$identity" in *$'\n'*) ;; *) return 1 ;; esac
+  pid=${identity%%$'\n'*}
+  recorded=${identity#*$'\n'}
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$recorded" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   current=$(fm_account_process_start_time "$pid") || return 1
-  [ "$current" = "$recorded" ]
+  [ "$current" = "$recorded" ] || return 1
+  printf '%s\n%s\n' "$pid" "$recorded"
+}
+
+fm_account_meta_lock_owner_alive() {  # <lock-path>
+  fm_account_lock_owner_identity "$1" >/dev/null
 }
 
 fm_account_path_mtime() {
@@ -497,6 +504,10 @@ fm_account_lifecycle_lock_owned() {  # <lock-path>
 
 fm_account_lifecycle_lock_held() {  # <lock-path>
   fm_account_meta_lock_owner_alive "$1"
+}
+
+fm_account_lifecycle_lock_identity() {  # <lock-path>
+  fm_account_lock_owner_identity "$1"
 }
 
 fm_account_meta_lock_release() {  # <lock-path>

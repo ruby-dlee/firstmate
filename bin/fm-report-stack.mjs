@@ -792,6 +792,10 @@ function publish(taskId, legacy) {
         && (!worktreeHead || previousWorktreeHead === worktreeHead)
         && previousManifest.harness === (meta.harness || "unknown")
         && (previousManifest.accountProfile || "") === (meta.account_profile || "");
+    const branch = gitValue(meta.worktree, ["branch", "--show-current"]);
+    const publishedWorktreeHead = worktreeHead || (sameGeneration ? previousWorktreeHead : "");
+    const publishedCommit = worktreeHead || (sameGeneration ? previousManifest?.commit || previousWorktreeHead : "");
+    const publishedBranch = branch || (sameGeneration ? previousManifest?.branch || "" : "");
     const manifest = {
       schemaVersion: 1,
       reportId: id,
@@ -806,10 +810,10 @@ function publish(taskId, legacy) {
       accountProfile: meta.account_profile || "",
       ...(generationId ? { generationId } : {}),
       prUrl: safeHttpUrl(meta.pr),
-      commit: worktreeHead,
-      worktreeHead,
+      commit: publishedCommit,
+      worktreeHead: publishedWorktreeHead,
       ...(prHead ? { prHead } : {}),
-      branch: gitValue(meta.worktree, ["branch", "--show-current"]),
+      branch: publishedBranch,
       visuals,
     };
     fs.writeFileSync(path.join(staged, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });

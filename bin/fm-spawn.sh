@@ -242,13 +242,28 @@ RECOVERY_ACCOUNT=0
 RESUME_META=
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
+LIFECYCLE_LOCK_INHERITED_PID=
+LIFECYCLE_LOCK_INHERITED_START=
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: inherited account lifecycle lock requires a task id" >&2; exit 1; }
   inherited_lock_id=${POS[0]}
   case "$inherited_lock_id" in *=*) echo "error: inherited account lifecycle lock does not support batch syntax" >&2; exit 1 ;; esac
   expected_lifecycle_lock="$STATE/.account-lifecycle-$inherited_lock_id.lock"
-  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" != "$expected_lifecycle_lock" ] \
-    || ! fm_account_lifecycle_lock_held "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
+  inherited_lock_identity=
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_lifecycle_lock" ]; then
+    inherited_lock_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_lock_identity=
+  fi
+  case "$inherited_lock_identity" in
+    *$'\n'*)
+      LIFECYCLE_LOCK_INHERITED_PID=${inherited_lock_identity%%$'\n'*}
+      LIFECYCLE_LOCK_INHERITED_START=${inherited_lock_identity#*$'\n'}
+      ;;
+    *)
+      echo "error: invalid inherited account lifecycle lock for $inherited_lock_id" >&2
+      exit 1
+      ;;
+  esac
+  if [ -z "$LIFECYCLE_LOCK_INHERITED_PID" ] || [ -z "$LIFECYCLE_LOCK_INHERITED_START" ]; then
     echo "error: invalid inherited account lifecycle lock for $inherited_lock_id" >&2
     exit 1
   fi
@@ -1805,20 +1820,29 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+lifecycle_lock_valid=0
+if [ -n "$LIFECYCLE_LOCK" ]; then
+  if [ "$LIFECYCLE_LOCK_OWNED" = 1 ]; then
+    fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK" && lifecycle_lock_valid=1
+  elif [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" = "$LIFECYCLE_LOCK" ]; then
+    current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
+    case "$current_lock_identity" in
+      *$'\n'*)
+        current_lock_pid=${current_lock_identity%%$'\n'*}
+        current_lock_start=${current_lock_identity#*$'\n'}
+        if [ "$current_lock_pid" = "$LIFECYCLE_LOCK_INHERITED_PID" ] \
+          && [ "$current_lock_start" = "$LIFECYCLE_LOCK_INHERITED_START" ]; then
+          lifecycle_lock_valid=1
+        fi
+        ;;
+    esac
+  fi
+fi
+if [ "$lifecycle_lock_valid" != 1 ]; then
+  echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
+  exit 1
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  lifecycle_lock_valid=0
-  if [ -n "$LIFECYCLE_LOCK" ]; then
-    if [ "$LIFECYCLE_LOCK_OWNED" = 1 ]; then
-      fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK" && lifecycle_lock_valid=1
-    elif [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" = "$LIFECYCLE_LOCK" ] \
-      && fm_account_lifecycle_lock_held "$LIFECYCLE_LOCK"; then
-      lifecycle_lock_valid=1
-    fi
-  fi
-  if [ "$lifecycle_lock_valid" != 1 ]; then
-    echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
-    exit 1
-  fi
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
     echo "error: managed task generation changed before metadata install for $ID" >&2

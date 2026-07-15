@@ -182,6 +182,10 @@ case "$*" in
         || { echo "managed account identity was not durable before lease mutation" >&2; exit 91; }
     fi
     [ -z "${FM_FAKE_AF_SELECT_MUTATE_FILE:-}" ] || printf 'replacement-state\n' > "$FM_FAKE_AF_SELECT_MUTATE_FILE"
+    if [ -n "${FM_FAKE_AF_REPLACE_LOCK_OWNER_FILE:-}" ]; then
+      printf '%s\n%s\n' "${FM_FAKE_AF_REPLACE_LOCK_OWNER_PID:?}" \
+        "${FM_FAKE_AF_REPLACE_LOCK_OWNER_START:?}" > "$FM_FAKE_AF_REPLACE_LOCK_OWNER_FILE"
+    fi
     [ "${FM_FAKE_AF_SELECT_FAIL:-0}" != 1 ] || exit 42
     if [ "${FM_FAKE_AF_BAD_SELECTION:-0}" = 1 ]; then printf '{bad json\n'; exit 0; fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
@@ -209,6 +213,10 @@ case "$*" in
     fi
     [ -z "${FM_FAKE_AF_SESSION_MARKER:-}" ] || touch "$FM_FAKE_AF_SESSION_MARKER"
     [ -z "${FM_FAKE_AF_SESSION_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SESSION_SLEEP"
+    if [ -n "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_FILE:-}" ]; then
+      printf '%s\n%s\n' "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_PID:?}" \
+        "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_START:?}" > "$FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_FILE"
+    fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     updated_at=${FM_FAKE_AF_UPDATED_AT_BEFORE:-2026-07-13T00:00:00Z}
     if [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; then
@@ -523,7 +531,7 @@ test_managed_recovery_accepts_inherited_lifecycle_lock() {
   # shellcheck source=bin/fm-account-routing-lib.sh
   . "$ROOT/bin/fm-account-routing-lib.sh"
   held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
-    || { fail "inherited-lock recovery could not acquire the bootstrap-owned lock"; return; }
+    || fail "inherited-lock recovery could not acquire the bootstrap-owned lock"
   out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" run_spawn "$id" --resume-account)
   status=$?
   fm_account_lifecycle_lock_release "$held" \
@@ -536,6 +544,79 @@ test_managed_recovery_accepts_inherited_lifecycle_lock() {
   pass "managed secondmate-style recovery installs metadata under its inherited lifecycle lock"
 }
 
+test_inherited_lifecycle_lock_rejects_owner_aba() {
+  local id sync_id rec held owner original replacement_pid replacement_start out status meta_tmp
+  id=account-inherited-aba-z9f
+  sync_id=account-sync-aba-z9g
+  rec=$(make_case inherited-aba claude "$id" "$sync_id")
+  read_case "$rec"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
+    || fail "inherited-lock ABA test could not acquire the parent lock"
+  owner=$held
+  [ ! -d "$held" ] || owner="$held/owner"
+  original=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "inherited-lock ABA test could not read the parent identity"
+  sleep 30 &
+  replacement_pid=$!
+  replacement_start=$(fm_account_process_start_time "$replacement_pid") \
+    || { kill "$replacement_pid" 2>/dev/null || true; fail "inherited-lock ABA test could not read the replacement identity"; }
+
+  out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" \
+    FM_FAKE_AF_REPLACE_LOCK_OWNER_FILE="$owner" \
+    FM_FAKE_AF_REPLACE_LOCK_OWNER_PID="$replacement_pid" \
+    FM_FAKE_AF_REPLACE_LOCK_OWNER_START="$replacement_start" \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  printf '%s\n' "$original" > "$owner"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "inherited-lock ABA test could not release the restored parent lock"
+  kill "$replacement_pid" 2>/dev/null || true
+  wait "$replacement_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "spawn accepted a lifecycle lock reclaimed by another live owner"
+  assert_contains "$out" 'managed lifecycle lock was lost before metadata install' \
+    "spawn did not use the lost-lock failure path after inherited-lock ABA"
+  assert_absent "$CASE_DIR/endpoint-live" "lost inherited lock left a prepared endpoint alive"
+
+  run_spawn "$sync_id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "session-sync ABA precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$sync_id.meta.aba"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$sync_id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$sync_id.meta"
+  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$sync_id") \
+    || fail "session-sync ABA test could not acquire the parent lock"
+  owner=$held
+  [ ! -d "$held" ] || owner="$held/owner"
+  original=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "session-sync ABA test could not read the parent identity"
+  sleep 30 &
+  replacement_pid=$!
+  replacement_start=$(fm_account_process_start_time "$replacement_pid") \
+    || { kill "$replacement_pid" 2>/dev/null || true; fail "session-sync ABA test could not read the replacement identity"; }
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
+    FM_FAKE_AF_POOL=claude-crew FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_PROVIDER=claude \
+    FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_FILE="$owner" \
+    FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_PID="$replacement_pid" \
+    FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_START="$replacement_start" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SESSION_SYNC" "$sync_id" --require 2>&1)
+  status=$?
+  printf '%s\n' "$original" > "$owner"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "session-sync ABA test could not release the restored parent lock"
+  kill "$replacement_pid" 2>/dev/null || true
+  wait "$replacement_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "session sync accepted a lifecycle lock reclaimed by another live owner"
+  assert_contains "$out" 'managed lifecycle lock was lost before session synchronization' \
+    "session sync did not fail closed after inherited-lock ABA"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$sync_id.meta" \
+    "session sync published metadata after inherited-lock ABA"
+  pass "inherited lifecycle locks remain pinned to one live owner identity"
+}
+
 test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held() {
   local id rec held out status
   id=account-unmanaged-lifecycle-z9e
@@ -544,7 +625,7 @@ test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held() {
   # shellcheck source=bin/fm-account-routing-lib.sh
   . "$ROOT/bin/fm-account-routing-lib.sh"
   held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
-    || { fail "unmanaged lifecycle test could not model teardown's held lifecycle lock"; return; }
+    || fail "unmanaged lifecycle test could not model teardown's held lifecycle lock"
   out=$(FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 run_spawn "$id" "$PROJ_DIR")
   status=$?
   fm_account_lifecycle_lock_release "$held" \
@@ -2155,8 +2236,8 @@ test_continuation_rejects_symlinked_packet_destination() {
   pass "continuation rejects symlinked packet destinations"
 }
 
-test_continuation_rejects_load_bearing_source_growth_during_copy() {
-  local id rec source real_head out status
+test_continuation_rejects_load_bearing_source_replacement_during_open() {
+  local id rec source real_stat out status
   id=account-continuation-copy-race-z28d
   rec=$(make_case continuation-copy-race claude "$id")
   read_case "$rec"
@@ -2165,30 +2246,33 @@ test_continuation_rejects_load_bearing_source_growth_during_copy() {
   rm -f "$CASE_DIR/endpoint-live"
   source="$(cd "$HOME_DIR/data/$id" && pwd -P)/checkpoint.md"
   printf 'load-bearing checkpoint\n' > "$source"
-  real_head=$(command -v head)
-  cat > "$FAKEBIN_DIR/head" <<'SH'
+  real_stat=$(command -v stat)
+  cat > "$FAKEBIN_DIR/stat" <<'SH'
 #!/usr/bin/env bash
 last=
 for arg in "$@"; do last=$arg; done
-if [ -n "${FM_MUTATE_CONTINUATION_SOURCE:-}" ] && [ "$last" = "$FM_MUTATE_CONTINUATION_SOURCE" ] \
+if [ -n "${FM_REPLACE_CONTINUATION_SOURCE:-}" ] && [ "$last" = "$FM_REPLACE_CONTINUATION_SOURCE" ] \
   && [ ! -e "$FM_MUTATE_CONTINUATION_SOURCE.mutated" ]; then
-  printf 'x' >> "$FM_MUTATE_CONTINUATION_SOURCE"
+  size=$(wc -c < "$FM_MUTATE_CONTINUATION_SOURCE")
+  head -c "$size" /dev/zero | tr '\0' z > "$FM_MUTATE_CONTINUATION_SOURCE.replacement"
+  mv "$FM_MUTATE_CONTINUATION_SOURCE.replacement" "$FM_MUTATE_CONTINUATION_SOURCE"
   : > "$FM_MUTATE_CONTINUATION_SOURCE.mutated"
 fi
-exec "$FM_REAL_HEAD" "$@"
+exec "$FM_REAL_STAT" "$@"
 SH
-  chmod +x "$FAKEBIN_DIR/head"
-  export FM_REAL_HEAD="$real_head" FM_MUTATE_CONTINUATION_SOURCE="$source"
+  chmod +x "$FAKEBIN_DIR/stat"
+  export FM_REAL_STAT="$real_stat" FM_REPLACE_CONTINUATION_SOURCE="$source" FM_MUTATE_CONTINUATION_SOURCE="$source"
   out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3)
   status=$?
-  unset FM_REAL_HEAD FM_MUTATE_CONTINUATION_SOURCE
-  [ "$status" -ne 0 ] || fail "continuation accepted a load-bearing source that grew during copying"
-  assert_present "$source.mutated" "continuation copy-race hook did not run: $out"
-  assert_contains "$out" 'maximum is 65536' "continuation copy-race refusal did not use the packet size error path"
+  unset FM_REAL_STAT FM_REPLACE_CONTINUATION_SOURCE FM_MUTATE_CONTINUATION_SOURCE
+  [ "$status" -ne 0 ] || fail "continuation accepted a replaced load-bearing source"
+  assert_present "$source.mutated" "continuation identity-race hook did not run: $out"
+  assert_contains "$out" 'continuation source changed while opening' \
+    "continuation replacement refusal did not report the identity change"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "continuation copy race acquired a replacement lease"
   assert_not_grep '^continuation_packet=' "$HOME_DIR/state/$id.meta" "continuation copy race installed a partial packet"
-  pass "continuation load-bearing copies reject source-size changes"
+  pass "continuation load-bearing copies bind one validated source identity"
 }
 
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
@@ -2584,12 +2668,18 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
-  test_continuation_rejects_load_bearing_source_growth_during_copy
+  test_continuation_rejects_load_bearing_source_replacement_during_open
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
   test_account_lock_owner_controls_reject_symlinks
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
+  test_inherited_lifecycle_lock_rejects_owner_aba
+  test_continuation_rejects_load_bearing_source_replacement_during_open
   exit 0
 fi
 
@@ -2603,6 +2693,7 @@ test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 test_managed_recovery_accepts_inherited_lifecycle_lock
+test_inherited_lifecycle_lock_rejects_owner_aba
 test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
@@ -2658,7 +2749,7 @@ test_oversized_continuation_stops_before_mutation
 test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
-test_continuation_rejects_load_bearing_source_growth_during_copy
+test_continuation_rejects_load_bearing_source_replacement_during_open
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_ownerless_lock_marker_rejects_symlink_clobber
 test_account_lock_owner_controls_reject_symlinks

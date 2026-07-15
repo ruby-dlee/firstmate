@@ -1445,11 +1445,8 @@ fi
 if [ "$RECOVERY_ACCOUNT" != 1 ]; then
   [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 fi
-if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ] && ! grep -q '^# Completion report$' "$BRIEF"; then
-  {
-    printf '\n'
-    fm_completion_report_contract "$DATA" "$ID"
-  } >> "$BRIEF"
+if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
+  fm_completion_report_contract_ensure "$DATA" "$ID" "$BRIEF"
 fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->

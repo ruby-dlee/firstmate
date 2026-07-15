@@ -371,6 +371,49 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   pass "routing off makes no Agent Fleet call and preserves launch/meta bytes"
 }
 
+test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
+  local id rec brief before after outside out status
+
+  id=contract-atomic-z1b
+  rec=$(make_case contract-atomic claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  before=$(stat -f '%d:%i' "$brief" 2>/dev/null || stat -c '%d:%i' "$brief")
+  run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "normal completion-contract upgrade failed"
+  after=$(stat -f '%d:%i' "$brief" 2>/dev/null || stat -c '%d:%i' "$brief")
+  [ "$before" != "$after" ] || fail "completion-contract upgrade modified the brief in place instead of replacing it atomically"
+  assert_grep '# Completion report' "$brief" "atomic completion-contract upgrade omitted the contract"
+  if find "$(dirname "$brief")" -maxdepth 1 -name '.brief-contract.*' -print -quit | grep -q .; then
+    fail "completion-contract upgrade leaked its staging file"
+  fi
+
+  id=contract-file-symlink-z1c
+  rec=$(make_case contract-file-symlink claude "$id")
+  read_case "$rec"
+  outside="$CASE_DIR/outside-brief"
+  printf 'outside sentinel\n' > "$outside"
+  rm "$HOME_DIR/data/$id/brief.md"
+  ln -s "$outside" "$HOME_DIR/data/$id/brief.md"
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "symlinked task brief unexpectedly accepted a completion-contract write"
+  [ "$(cat "$outside")" = 'outside sentinel' ] || fail "completion-contract write followed a task brief symlink"
+  assert_contains "$out" "task brief must be a real regular file inside" "brief symlink refusal was not actionable"
+
+  id=contract-parent-symlink-z1d
+  rec=$(make_case contract-parent-symlink claude "$id")
+  read_case "$rec"
+  outside="$CASE_DIR/outside-task"
+  mkdir -p "$outside"
+  printf 'outside parent sentinel\n' > "$outside/brief.md"
+  rm -rf "$HOME_DIR/data/$id"
+  ln -s "$outside" "$HOME_DIR/data/$id"
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "task-directory symlink unexpectedly accepted a completion-contract write"
+  [ "$(cat "$outside/brief.md")" = 'outside parent sentinel' ] || fail "completion-contract write escaped through the task directory"
+  assert_contains "$out" "task directory must resolve directly inside" "task-directory containment refusal was not actionable"
+  pass "completion-contract upgrades are contained, non-following, and atomic"
+}
+
 test_observe_is_dry_run_only() {
   local id rec out status launch
   id=account-observe-z2
@@ -2749,8 +2792,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
+  test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
+test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session
 test_explicit_profile_uses_explicit_pool

@@ -119,8 +119,7 @@ function levelTwoHeadings(markdown) {
   const headings = new Set();
   let fence;
   for (const line of String(markdown).split(/\r?\n/)) {
-    const trimmed = line.trimStart();
-    const marker = trimmed.match(/^(`{3,}|~{3,})(.*)$/);
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
       if (marker
         && marker[1][0] === fence.character
@@ -134,8 +133,11 @@ function levelTwoHeadings(markdown) {
       fence = { character: marker[1][0], length: marker[1].length };
       continue;
     }
-    const heading = line.match(/^##[ \t]+(.+?)[ \t]*#*[ \t]*$/);
-    if (heading) headings.add(heading[1].trim().toLowerCase());
+    const heading = line.match(/^ {0,3}##(?:[ \t]+(.*)|[ \t]*)$/);
+    if (heading) {
+      const content = (heading[1] || "").replace(/[ \t]+#+[ \t]*$/, "").trim();
+      headings.add(content.toLowerCase());
+    }
   }
   return headings;
 }

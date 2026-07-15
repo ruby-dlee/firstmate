@@ -471,6 +471,57 @@ EOF
   pass "report section validation respects the opening Markdown fence length"
 }
 
+test_indented_pseudo_closers_do_not_end_fences() {
+  local id source out status heading
+
+  for marker in backtick tilde; do
+    id="report-indented-$marker-fence-b3d"
+    write_task "$id" ship
+    source="$HOME_DIR/data/$id/completion.md"
+    if [ "$marker" = backtick ]; then
+      printf '# Completion\n\n## Summary\n\nIncomplete.\n\n```markdown\n    ```\n## What changed\n\nHidden.\n\n## Verification\n\nHidden.\n\n## Visual evidence\n\nHidden.\n\n## Follow-ups\n\nHidden.\n```\n\n## Artifacts\n\nNone.\n' > "$source"
+    else
+      printf '# Completion\n\n## Summary\n\nIncomplete.\n\n~~~markdown\n    ~~~\n## What changed\n\nHidden.\n\n## Verification\n\nHidden.\n\n## Visual evidence\n\nHidden.\n\n## Follow-ups\n\nHidden.\n~~~\n\n## Artifacts\n\nNone.\n' > "$source"
+    fi
+    out=$(run_stack publish "$id" 2>&1)
+    status=$?
+    [ "$status" -ne 0 ] || fail "four-space $marker pseudo-closer unexpectedly ended its fence"
+    for heading in "## What changed" "## Verification" "## Visual evidence" "## Follow-ups"; do
+      assert_contains "$out" "$heading" "$marker pseudo-closer failure omitted missing heading $heading"
+    done
+  done
+  pass "four-space pseudo-closers remain code inside Markdown fences"
+}
+
+test_required_headings_follow_commonmark_atx_rules() {
+  local id source out status
+
+  id=report-indented-headings-b3e
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n   ## Summary ###\n\nComplete.\n\n  ## What changed\n\nChanged.\n\n ## Verification ##\n\nVerified.\n\n   ## Visual evidence\t###\n\nNone.\n\n## Artifacts\n\nReport.\n\n   ## Follow-ups\n\nNone.\n' > "$source"
+  run_stack publish "$id" >/dev/null || fail "valid indented ATX headings were rejected"
+
+  id=report-unseparated-closing-hash-b3f
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n## Summary###\n\nInvalid.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unseparated closing hashes unexpectedly satisfied the Summary section"
+  assert_contains "$out" "## Summary" "invalid closing-hash failure omitted the missing Summary heading"
+
+  id=report-four-space-heading-b3g
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n    ## Summary\n\nIndented code.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "four-space indented code unexpectedly satisfied the Summary section"
+  assert_contains "$out" "## Summary" "four-space heading failure omitted the missing Summary heading"
+  pass "required headings follow CommonMark ATX indentation and closing-hash rules"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
@@ -857,6 +908,8 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
+  test_indented_pseudo_closers_do_not_end_fences
+  test_required_headings_follow_commonmark_atx_rules
   exit 0
 fi
 
@@ -873,6 +926,8 @@ test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_nested_short_fences_do_not_satisfy_required_sections
+test_indented_pseudo_closers_do_not_end_fences
+test_required_headings_follow_commonmark_atx_rules
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized

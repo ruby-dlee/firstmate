@@ -2224,7 +2224,9 @@ test_continuation_caps_informational_snapshots_only() {
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation snapshot cap precondition spawn failed"
   cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
 #!/usr/bin/env bash
+trap '' PIPE
 head -c 100000 /dev/zero | tr '\0' s
+exit 42
 SH
   chmod +x "$FAKEBIN_DIR/no-mistakes"
   rm -f "$CASE_DIR/endpoint-live"

@@ -151,7 +151,8 @@ capture_command_snapshot() {
   [ "$head_rc" -eq 0 ] || return "$head_rc"
   bytes=$(snapshot_bytes "$file") || return 1
   if [ "$command_rc" -eq 0 ] \
-    || { [ "$command_rc" -eq 141 ] && [ "$bytes" -gt "$MAX_SNAPSHOT_BYTES" ]; }; then
+    || { [ "$bytes" -gt "$MAX_SNAPSHOT_BYTES" ] \
+      && { [ "$command_rc" -eq 141 ] || [ "$failure_mode" = unavailable ]; }; }; then
     return 0
   fi
   [ "$failure_mode" = unavailable ] || return "$command_rc"

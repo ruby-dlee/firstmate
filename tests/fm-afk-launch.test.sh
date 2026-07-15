@@ -727,6 +727,51 @@ SH
   rm -rf "$st"
 }
 
+unit_direct_native_start_stop_handoff_is_atomic() {
+  local st daemon starter stopper i
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-direct-native-race.XXXXXX")
+  mkdir -p "$st/state"
+  daemon="$st/fake-daemon.sh"
+  cat > "$daemon" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 0' INT TERM
+while :; do sleep 0.05; done
+SH
+  chmod +x "$daemon"
+
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    START="$START" DAEMON="$daemon" REACHED="$st/reached" GO="$st/go" bash -c '
+      . "$START"
+      FM_AFK_DAEMON=$DAEMON
+      daemon_lock_pid() {
+        : > "$REACHED"
+        while [ ! -e "$GO" ]; do sleep 0.02; done
+        return 1
+      }
+      fm_afk_start_main
+    ' >/dev/null 2>&1 &
+  starter=$!
+  for i in $(seq 1 100); do
+    [ -e "$st/reached" ] && break
+    sleep 0.02
+  done
+  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "direct native entry never reached the pre-daemon handoff window"; }
+
+  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1; : > "$st/stop-done" ) &
+  stopper=$!
+  sleep 0.2
+  [ -e "$st/state/.afk" ] || fail "stop cleared away mode while a direct native entry held the handoff"
+  [ ! -e "$st/stop-done" ] || fail "stop completed before the direct native entry registered its process"
+
+  : > "$st/go"
+  wait "$stopper" || fail "stop failed after the direct native entry completed its handoff"
+  wait "$starter" 2>/dev/null || true
+  [ ! -e "$st/state/.afk" ] || fail "atomic direct native stop retained away mode"
+  [ ! -e "$st/state/.afk-native-process" ] || fail "atomic direct native stop retained the native process marker"
+  pass "native lifecycle: direct start and stop serialize across the pre-daemon handoff"
+  rm -rf "$st"
+}
+
 unit_close_failure_preserves_record() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-close-fail.XXXXXX")
@@ -934,6 +979,33 @@ unit_stop_confirms_daemon_exit() {
   fi
   kill -KILL "$daemon_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+unit_stop_confirms_native_process_exit() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-native-live.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  : > "$st/state/.afk-native-process"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_native_process_live() { FM_AFK_NATIVE_PID=4242; return 0; }
+    fm_afk_native_process_identity() { printf "native-identity\n"; }
+    fm_pid_identity() { printf "generic-identity\n"; }
+    fm_pid_alive() { return 0; }
+    kill() { return 0; }
+    seq() { printf "1\n"; }
+    sleep() { :; }
+    ! fm_afk_launch_stop
+  ' _ "$LAUNCH" && [ -e "$st/state/.afk" ] \
+    && [ -e "$st/state/.afk-native-process" ] \
+    && [ -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "stop liveness: native process identity is compared in its stored format"
+  else
+    fail "stop liveness: native process identity mismatch cleared lifecycle state"
+  fi
   rm -rf "$st"
 }
 
@@ -1221,6 +1293,7 @@ unit_native_lifecycle
 unit_recovery_preserves_buffered_escalations
 unit_native_entry_preserves_prepared_state
 unit_native_start_stop_handoff_is_atomic
+unit_direct_native_start_stop_handoff_is_atomic
 unit_close_failure_preserves_record
 unit_record_publication_atomic
 unit_malformed_record_fails_closed
@@ -1230,6 +1303,7 @@ unit_stop_validates_before_signal
 unit_lock_requires_complete_metadata
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
+unit_stop_confirms_native_process_exit
 unit_refresh_validates_record
 unit_herdr_reused_pane_identity_fails_closed
 unit_tmux_partial_create_preserves_record

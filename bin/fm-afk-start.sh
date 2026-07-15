@@ -156,7 +156,7 @@ fm_afk_native_process_live() {
 }
 
 fm_afk_start_main() {
-  local native_handoff=0
+  local prepared=0
   case "${1:-}" in
     '' ) ;;
     -h|--help) fm_afk_start_usage; return 0 ;;
@@ -164,22 +164,23 @@ fm_afk_start_main() {
   esac
 
   mkdir -p "$FM_AFK_STATE"
+  fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
-    fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
-    native_handoff=1
+    prepared=1
     if [ ! -f "$FM_AFK_STATE/.afk" ]; then
       fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
       echo "afk: launcher-prepared state is missing" >&2
       return 1
     fi
-  else
-    date '+%s' > "$FM_AFK_STATE/.afk"
+  elif ! date '+%s' > "$FM_AFK_STATE/.afk"; then
+    fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    return 1
   fi
 
   local pid
   pid=$(daemon_lock_pid 2>/dev/null || true)
   if daemon_lock_held_by_live_daemon; then
-    [ "$native_handoff" -eq 0 ] || fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
     echo "afk: daemon already running pid=$pid"
     return 0
   fi
@@ -190,18 +191,17 @@ fm_afk_start_main() {
 
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
-  if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+  if [ "$prepared" -eq 0 ] && ! fm_afk_clear_stale_artifacts "$FM_AFK_STATE"; then
+    fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    return 1
   fi
 
-  if [ "$native_handoff" -eq 1 ]; then
-    if ! fm_afk_native_process_write; then
-      fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
-      echo "afk: could not register launcher-prepared native process" >&2
-      return 1
-    fi
+  if ! fm_afk_native_process_write; then
     fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    echo "afk: could not register native process" >&2
+    return 1
   fi
+  fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"
   exec "$FM_AFK_DAEMON"

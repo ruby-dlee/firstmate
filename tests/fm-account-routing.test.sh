@@ -1539,6 +1539,29 @@ test_concurrent_continuations_serialize_before_mutation() {
   pass "continuation generation locking serializes before endpoint and lease mutation"
 }
 
+test_live_secondmate_recovery_precedes_home_convergence() {
+  local id rec sm out status
+  id=account-secondmate-live-recovery-z21e
+  rec=$(make_case secondmate-live-recovery claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  run_spawn "$id" "$sm" --secondmate --account-pool claude-crew >/dev/null \
+    || fail "live secondmate recovery precondition spawn failed"
+  [ "$(cat "$sm/config/crew-harness" 2>/dev/null)" = claude ] \
+    || fail "secondmate recovery precondition did not inherit the initial config"
+  printf 'codex\n' > "$HOME_DIR/config/crew-harness"
+  clear_case_logs
+
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "live secondmate recovery unexpectedly created a duplicate"
+  assert_contains "$out" "managed recovery endpoint is still alive" "live secondmate recovery did not fail at endpoint validation"
+  [ "$(cat "$sm/config/crew-harness" 2>/dev/null)" = claude ] \
+    || fail "live secondmate recovery converged child config before endpoint validation"
+  pass "managed secondmate recovery validates liveness before home convergence"
+}
+
 test_continuation_fails_closed_without_original_brief() {
   local id rec out status
   id=account-continue-nobrief-z22
@@ -2077,6 +2100,7 @@ test_missing_endpoint_target_retains_managed_lease
 test_predecessor_cleanup_failure_preserves_replacement_for_retry
 test_failed_continuation_cleanup_restores_predecessor_for_retry
 test_concurrent_continuations_serialize_before_mutation
+test_live_secondmate_recovery_precedes_home_convergence
 test_continuation_fails_closed_without_original_brief
 test_session_sync_cannot_recreate_metadata_after_teardown
 test_managed_steering_audit_failure_does_not_reclassify_delivery

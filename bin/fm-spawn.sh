@@ -1235,6 +1235,35 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
   PROJ_ABS=$(validate_firstmate_home_for_spawn "$ID" "$FIRSTMATE_HOME")
   WT="$PROJ_ABS"
+else
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    PROJ_ABS=$(fm_meta_get "$RESUME_META" project)
+    WT=$(fm_meta_get "$RESUME_META" worktree)
+    [ -n "$PROJ_ABS" ] && [ -d "$PROJ_ABS" ] || { echo "error: recorded project is unavailable for managed recovery: ${PROJ_ABS:-<missing>}" >&2; exit 1; }
+    [ -n "$WT" ] && [ -d "$WT" ] || { echo "error: recorded worktree is unavailable for managed recovery: ${WT:-<missing>}" >&2; exit 1; }
+  else
+    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+    WT=""
+  fi
+fi
+
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
+  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+  case "$RECOVERY_ENDPOINT_STATE" in
+    absent) ;;
+    present)
+      echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ "$KIND" = secondmate ]; then
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
   # recovery-respawned secondmate always runs the primary's version (AGENTS.md
@@ -1270,15 +1299,6 @@ if [ "$KIND" = secondmate ]; then
     BRIEF="$DATA/$ID/brief.md"
   fi
 else
-  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-    PROJ_ABS=$(fm_meta_get "$RESUME_META" project)
-    WT=$(fm_meta_get "$RESUME_META" worktree)
-    [ -n "$PROJ_ABS" ] && [ -d "$PROJ_ABS" ] || { echo "error: recorded project is unavailable for managed recovery: ${PROJ_ABS:-<missing>}" >&2; exit 1; }
-    [ -n "$WT" ] && [ -d "$WT" ] || { echo "error: recorded worktree is unavailable for managed recovery: ${WT:-<missing>}" >&2; exit 1; }
-  else
-    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
-    WT=""
-  fi
   BRIEF="$DATA/$ID/brief.md"
 fi
 if [ "$RECOVERY_ACCOUNT" != 1 ]; then
@@ -1338,21 +1358,6 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
-if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-  RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
-  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
-  case "$RECOVERY_ENDPOINT_STATE" in
-    absent) ;;
-    present)
-      echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
-      exit 1
-      ;;
-    *)
-      echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
-      exit 1
-      ;;
-  esac
-fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   CONTINUATION_PACKET=$("$SCRIPT_DIR/fm-account-continuation.sh" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
   BRIEF=$CONTINUATION_PACKET

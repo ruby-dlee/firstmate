@@ -771,7 +771,7 @@ fm_afk_launch_start_native() {
 }
 
 fm_afk_launch_stop_locked() {
-  local pid pid_identity current_identity result=0 read_result
+  local pid pid_identity current_identity native_identity=0 result=0 read_result
   fm_afk_launch_record_read
   read_result=$?
   if [ "$read_result" -eq 2 ]; then
@@ -789,6 +789,7 @@ fm_afk_launch_stop_locked() {
   elif { [ "$read_result" -eq 1 ] || [ "$FM_AFK_REC_BACKEND" = none ]; } && fm_afk_native_process_live; then
     pid=$FM_AFK_NATIVE_PID
     pid_identity=$(fm_afk_native_process_identity "$pid") || return 1
+    native_identity=1
   elif [ -e "$FM_AFK_NATIVE_PROCESS" ]; then
     if fm_afk_native_process_live; then
       fm_afk_launch_log "live native daemon process conflicts with the recorded terminal; preserving lifecycle state"
@@ -807,10 +808,21 @@ fm_afk_launch_stop_locked() {
     done
   fi
   if [ -n "$pid" ] && fm_pid_alive "$pid"; then
-    current_identity=$(fm_pid_identity "$pid" 2>/dev/null) || {
+    if [ "$native_identity" -eq 1 ]; then
+      current_identity=$(fm_afk_native_process_identity "$pid" 2>/dev/null) || {
+        fm_afk_launch_log "could not confirm away-mode daemon exit; preserving lifecycle state"
+        return 1
+      }
+    else
+      current_identity=$(fm_pid_identity "$pid" 2>/dev/null) || {
+        fm_afk_launch_log "could not confirm away-mode daemon exit; preserving lifecycle state"
+        return 1
+      }
+    fi
+    if [ -z "$current_identity" ]; then
       fm_afk_launch_log "could not confirm away-mode daemon exit; preserving lifecycle state"
       return 1
-    }
+    fi
     if [ "$current_identity" = "$pid_identity" ]; then
       fm_afk_launch_log "away-mode daemon did not exit after SIGTERM; preserving lifecycle state"
       return 1

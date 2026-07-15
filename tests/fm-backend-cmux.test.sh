@@ -477,6 +477,20 @@ test_create_task_refuses_duplicate_label() {
   pass "fm_backend_cmux_create_task: refuses a duplicate workspace title across every cmux window"
 }
 
+test_create_task_refuses_failed_duplicate_query() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-dup-query-failed"; mkdir -p "$dir/responses"
+  printf '1\n' > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-query-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse when the duplicate query fails"
+  assert_contains "$out" "could not inspect cmux workspaces before creating" "create_task did not report the failed duplicate query"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-workspace' "create_task must not create after a failed duplicate query"
+  pass "fm_backend_cmux_create_task: refuses creation when the duplicate query fails"
+}
+
 test_create_task_creates_and_parses_ids() {
   local dir fb out title
   dir="$TMP_ROOT/create-task"; mkdir -p "$dir/responses"
@@ -500,6 +514,46 @@ test_create_task_creates_and_parses_ids() {
   assert_contains "$(cat "$dir/log")" $'\x1f''--focus'$'\x1f''false' \
     "create_task did not pass --focus false"
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
+}
+
+test_create_task_rolls_back_captured_workspace_when_resolution_fails() {
+  local dir fb out status created
+  dir="$TMP_ROOT/create-workspace-resolution-failed"; mkdir -p "$dir/responses"
+  created="aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  printf 'OK %s\n' "$created" > "$dir/responses/3.out"
+  printf '1\n' > "$dir/responses/4.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-resolution-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when post-create workspace resolution fails"
+  assert_contains "$out" "could not inspect cmux workspaces after creating" "create_task did not report post-create query failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back the exact workspace id captured from new-workspace output"
+  pass "fm_backend_cmux_create_task: rolls back the captured workspace when post-create resolution fails"
+}
+
+test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails() {
+  local dir fb out status title created
+  dir="$TMP_ROOT/create-surface-resolution-failed"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-surface-failed)
+  created="aaaaaaaa-4444-5555-6666-bbbbbbbbbbbb"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 5 "$created" "$title"
+  cmux_panes_empty_response "$dir" 6
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-surface-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the new workspace's surface cannot be resolved"
+  assert_contains "$out" "could not resolve the default surface" "create_task did not report surface resolution failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back the exact resolved workspace after surface resolution failed"
+  pass "fm_backend_cmux_create_task: rolls back the resolved workspace when surface resolution fails"
 }
 
 # --- target_ready / capture ---------------------------------------------------
@@ -1090,7 +1144,10 @@ test_ensure_running_returns_immediately_when_already_ok
 test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
+test_create_task_refuses_failed_duplicate_query
 test_create_task_creates_and_parses_ids
+test_create_task_rolls_back_captured_workspace_when_resolution_fails
+test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch

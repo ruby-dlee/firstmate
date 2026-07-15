@@ -492,6 +492,36 @@ test_create_task_refuses_duplicate_label() {
   pass "fm_backend_zellij_create_task: refuses a duplicate home-scoped tab title (zellij's own new-tab has no uniqueness check)"
 }
 
+test_create_task_refuses_failed_tab_listing() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-list-failed"; mkdir -p "$dir/responses"
+  printf '1\n' > "$dir/responses/1.exit"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-list-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse when list-tabs fails"
+  assert_contains "$out" "could not list zellij tabs" "create_task did not report the failed list-tabs preflight"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-tab' "create_task must not create when list-tabs fails"
+  pass "fm_backend_zellij_create_task: refuses creation when list-tabs fails"
+}
+
+test_create_task_refuses_malformed_tab_listing() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-list-malformed"; mkdir -p "$dir/responses"
+  printf 'not-json\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-list-malformed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse malformed list-tabs output"
+  assert_contains "$out" "could not parse zellij tab list" "create_task did not report malformed list-tabs output"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-tab' "create_task must not create after malformed list-tabs output"
+  pass "fm_backend_zellij_create_task: refuses creation on malformed list-tabs output"
+}
+
 test_create_task_creates_and_parses_ids() {
   local dir fb out title
   dir="$TMP_ROOT/create-task"; mkdir -p "$dir/responses"
@@ -547,6 +577,24 @@ test_create_task_no_restore_when_new_tab_was_already_active() {
   assert_not_contains "$(cat "$dir/log")" $'\x1f''go-to-tab-by-id' \
     "create_task should not call go-to-tab-by-id when there was no previously-active tab (no attached client)"
   pass "fm_backend_zellij_create_task: skips the restore call when there was no previously-active tab"
+}
+
+test_create_task_closes_new_tab_when_pane_resolution_fails() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-pane-failed"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '12\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-pane-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the new tab's terminal pane cannot be resolved"
+  assert_contains "$out" "could not find a terminal pane" "create_task did not report pane resolution failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''12' \
+    "create_task did not close the exact new tab after pane resolution failed"
+  pass "fm_backend_zellij_create_task: closes the exact new tab when pane resolution fails"
 }
 
 # --- capture / send_key / send_literal / current_path / kill -----------------
@@ -1079,9 +1127,12 @@ test_server_ensure_skips_attach_when_already_exists
 test_dispatch_routes_zellij_backend
 test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
+test_create_task_refuses_failed_tab_listing
+test_create_task_refuses_malformed_tab_listing
 test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
+test_create_task_closes_new_tab_when_pane_resolution_fails
 test_capture_small_reads_use_viewport_and_trim
 test_capture_large_reads_use_full_scrollback_and_trim
 test_capture_fails_when_pane_absent

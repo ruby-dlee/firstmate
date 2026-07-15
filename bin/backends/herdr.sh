@@ -545,10 +545,12 @@ $dup_tab_ids
 EOF
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
       echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     }
     if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     fi
     remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
@@ -556,6 +558,7 @@ EOF
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     fi
   fi

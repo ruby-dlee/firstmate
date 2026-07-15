@@ -329,13 +329,27 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   local session=$1 label=$2 cwd=$3 title tabs dup prev_active tab_id pane_id
   fm_backend_zellij_session_exists "$session" || { echo "error: zellij session '$session' does not exist; run container_ensure first" >&2; return 1; }
   title=$(fm_backend_zellij_scoped_title "$label")
-  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
-  dup=$(printf '%s' "$tabs" | jq -r --arg want "$title" '.[]? | select(.name == $want) | .tab_id' 2>/dev/null | head -1)
+  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) || {
+    echo "error: could not list zellij tabs in session '$session' before creating '$title'" >&2
+    return 1
+  }
+  if ! printf '%s' "$tabs" | jq -e '
+    type == "array"
+    and all(.[];
+      type == "object"
+      and (.tab_id | type) == "number"
+      and (.name | type) == "string"
+      and ((.active == null) or ((.active | type) == "boolean")))
+  ' >/dev/null 2>&1; then
+    echo "error: could not parse zellij tab list output in session '$session' before creating '$title'" >&2
+    return 1
+  fi
+  dup=$(printf '%s' "$tabs" | jq -r --arg want "$title" '[.[] | select(.name == $want)][0].tab_id // empty')
   if [ -n "$dup" ]; then
     echo "error: zellij tab '$title' already exists in session '$session'" >&2
     return 1
   fi
-  prev_active=$(printf '%s' "$tabs" | jq -r '.[]? | select(.active == true) | .tab_id' 2>/dev/null | head -1)
+  prev_active=$(printf '%s' "$tabs" | jq -r '[.[] | select(.active == true)][0].tab_id // empty')
   tab_id=$(fm_backend_zellij_cli "$session" action new-tab --cwd "$cwd" --name "$title" 2>/dev/null | tr -d '[:space:]')
   case "$tab_id" in
     ''|*[!0-9]*)
@@ -346,6 +360,10 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
   if [ -z "$pane_id" ]; then
     echo "error: could not find a terminal pane for zellij tab $tab_id (session '$session')" >&2
+    fm_backend_zellij_cli "$session" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
+    if [ -n "$prev_active" ] && [ "$prev_active" != "$tab_id" ]; then
+      fm_backend_zellij_cli "$session" action go-to-tab-by-id "$prev_active" >/dev/null 2>&1 || true
+    fi
     return 1
   fi
   if [ -n "$prev_active" ] && [ "$prev_active" != "$tab_id" ]; then

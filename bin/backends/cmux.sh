@@ -358,9 +358,10 @@ EOF
 # so this adopts the FIRST match `jq` returns, mirroring herdr's/zellij's own
 # duplicate-check posture.
 fm_backend_cmux_workspace_id_for_label() {  # <label>
-  local label=$1
-  fm_backend_cmux_all_workspaces \
-    | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
+  local label=$1 workspaces
+  workspaces=$(fm_backend_cmux_all_workspaces) || return 1
+  printf '%s' "$workspaces" \
+    | jq -r --arg want "$label" '[.workspaces[] | select(.title == $want)][0].id // empty' 2>/dev/null
 }
 
 fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
@@ -379,9 +380,12 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 # focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
 # <surface_id>" on success.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid
+  local label=$1 cwd=$2 title dup out wsid sfid created_wsid
   title=$(fm_backend_cmux_scoped_title "$label")
-  dup=$(fm_backend_cmux_workspace_id_for_label "$title")
+  dup=$(fm_backend_cmux_workspace_id_for_label "$title") || {
+    echo "error: could not inspect cmux workspaces before creating '$title'" >&2
+    return 1
+  }
   if [ -n "$dup" ]; then
     echo "error: cmux workspace '$title' already exists" >&2
     return 1
@@ -390,10 +394,26 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux new-workspace failed for '$title': $out" >&2
     return 1
   }
-  wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
-  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  created_wsid=$(printf '%s\n' "$out" \
+    | grep -Eo '[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}' \
+    | awk '!seen[$0]++' 2>/dev/null || true)
+  case "$created_wsid" in *$'\n'*) created_wsid='' ;; esac
+  wsid=$(fm_backend_cmux_workspace_id_for_label "$title") || {
+    [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
+    echo "error: could not inspect cmux workspaces after creating '$title'" >&2
+    return 1
+  }
+  if [ -z "$wsid" ]; then
+    [ -z "$created_wsid" ] || fm_backend_cmux_cli close-workspace --workspace "$created_wsid" >/dev/null 2>&1 || true
+    echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2
+    return 1
+  fi
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
-  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; return 1; }
+  if [ -z "$sfid" ]; then
+    fm_backend_cmux_cli close-workspace --workspace "$wsid" >/dev/null 2>&1 || true
+    echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2
+    return 1
+  fi
   printf '%s %s' "$wsid" "$sfid"
 }
 

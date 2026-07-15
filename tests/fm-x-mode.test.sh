@@ -1361,6 +1361,38 @@ test_context_registry_refuses_symlinked_storage() {
   pass "context registry refuses symlinked directories and records"
 }
 
+test_context_registry_serializes_prune_and_updates() {
+  local home dir record stale_lock
+  home="$TMP_ROOT/registry-locking"
+  dir="$home/state/x-context"
+  mkdir -p "$dir"
+  record="$dir/req-race.json"
+  jq -cn '{request_id:"req-race",platform:"x",reply_max_chars:"280",recorded_at:1}' > "$record"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2/x-context" request-req-race) || exit 1
+    fmx_context_registry_prune "$2" || exit 2
+    [ -f "$2/x-context/req-race.json" ] || exit 3
+    fmx_context_registry_set "$2" req-race discord 1900 || exit 4
+    [ "$(jq -r .platform "$2/x-context/req-race.json")" = x ] || exit 5
+    fmx_context_registry_lock_release "$lock" || exit 6
+    fmx_context_registry_set "$2" req-race discord 1900 || exit 7
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state" \
+    || fail "context registry lock serialization failed"
+  [ "$(jq -r .platform "$record")" = discord ] || fail "uncontended registry update did not land"
+
+  stale_lock="$dir/.lock-request-stale"
+  mkdir "$stale_lock"
+  printf '999999\nstale\n' > "$stale_lock/owner"
+  touch -t 200001010000 "$stale_lock"
+  bash -c '
+    . "$1"
+    acquired=$(fmx_context_registry_lock_acquire "$2" request-stale) || exit 1
+    fmx_context_registry_lock_release "$acquired"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" || fail "stale registry lock was not reclaimed and released"
+  pass "context registry serializes pruning and per-request publication without blocking"
+}
+
 test_context_registry_retention_starts_on_successful_live_answer() {
   local home fakebin out rc reg
   home="$TMP_ROOT/registry-answer-window"
@@ -1909,9 +1941,9 @@ test_link_dry_run_never_resolves_context_over_network() {
   err="$home/err.txt"
   meta="$home/state/fix-dry-run.meta"
   printf 'window=w\nkind=ship\n' > "$meta"
-  printf 'FMX_PAIRING_TOKEN=tok-dry-run\n' > "$home/.env"
+  printf 'FMX_PAIRING_TOKEN=tok-dry-run\nFMX_DRY_RUN=1\n' > "$home/.env"
 
-  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" FMX_DRY_RUN=1 \
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FMX_NOW_OVERRIDE=1700000000 FAKE_CURL_LOG="$log" \
     "$ROOT/bin/fm-x-link.sh" fix-dry-run req-dry-run >/dev/null 2>"$err"; rc=$?
   expect_code 0 "$rc" "dry-run link exit"
@@ -2439,6 +2471,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  test_context_registry_serializes_prune_and_updates
+  test_link_dry_run_never_resolves_context_over_network
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2489,6 +2527,7 @@ test_context_registry_prunes_expired_records
 test_context_registry_preserves_first_seen_timestamp
 test_context_registry_merges_partial_updates
 test_context_registry_refuses_symlinked_storage
+test_context_registry_serializes_prune_and_updates
 test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup

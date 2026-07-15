@@ -2292,6 +2292,37 @@ test_ownerless_lock_marker_rejects_symlink_clobber() {
   pass "ownerless lock recovery refuses symlinked age markers"
 }
 
+test_account_lock_owner_controls_reject_symlinks() {
+  local case_dir state lock outside status
+  case_dir="$TMP_ROOT/account-owner-controls"
+  state="$case_dir/state"
+  lock="$state/.account-meta-lock-task.lock"
+  outside="$case_dir/outside"
+  mkdir -p "$lock"
+  printf '999999\nstale-owner\n' > "$outside"
+  ln -s "$outside" "$lock/owner"
+  touch -t 200001010000 "$lock"
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
+    . "$1"
+    held=$(fm_account_meta_lock_acquire "$2" task) || exit 1
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" \
+    || fail "symlinked stale owner blocked metadata-lock recovery"
+  [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock recovery followed a symlinked owner"
+
+  rm -rf "$lock"
+  mkdir -p "$lock"
+  ln -s "$outside" "$lock/owner"
+  bash -c '. "$1"; fm_account_meta_lock_release "$2"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" >/dev/null 2>&1
+  status=$?
+  [ "$status" -ne 0 ] || fail "metadata-lock release trusted a symlinked owner"
+  assert_present "$lock" "metadata-lock release removed a lock with an unsafe owner"
+  [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock release changed a symlink target"
+  rm -rf "$case_dir"
+  pass "account lock owner controls reject symlinks by call-site semantics"
+}
+
 test_linux_stat_selection_avoids_filesystem_stat_output() {
   local case_dir fakebin file output
   case_dir="$TMP_ROOT/linux-stat-selection"
@@ -2557,6 +2588,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  test_account_lock_owner_controls_reject_symlinks
+  exit 0
+fi
+
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_observe_is_dry_run_only
@@ -2625,6 +2661,7 @@ test_continuation_rejects_symlinked_packet_destination
 test_continuation_rejects_load_bearing_source_growth_during_copy
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_ownerless_lock_marker_rejects_symlink_clobber
+test_account_lock_owner_controls_reject_symlinks
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal
 test_task_owned_account_artifacts_reject_symlink_paths

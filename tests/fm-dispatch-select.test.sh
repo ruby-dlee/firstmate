@@ -290,6 +290,26 @@ SH
   pass "enforced quota-balanced dispatch accepts only explicit pools"
 }
 
+test_fully_pooled_dispatch_ignores_overridden_ambient_mode() {
+  local fakebin pooled mixed out status
+  fakebin=$(fm_fakebin "$TMP_ROOT/pooled-precedence")
+  make_fake_agent_fleet "$fakebin"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_ACCOUNT_ROUTING=malformed FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled") \
+    || fail "fully pooled dispatch parsed overridden ambient routing policy"
+  [ "$out" = '{"harness":"codex","account_pool":"codex-crew"}' ] \
+    || fail "fully pooled dispatch returned the wrong selection: $out"
+
+  mixed='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex"}]'
+  out=$(FM_ACCOUNT_ROUTING=malformed FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$mixed" 2>/dev/null)
+  status=$?
+  expect_code 2 "$status" "mixed pooled dispatch must still fail closed on malformed routing mode"
+  [ -z "$out" ] || fail "rejected mixed dispatch emitted a selection: $out"
+  pass "fully pooled dispatch honors explicit pool precedence over ambient routing"
+}
+
 test_agent_fleet_binary_precedence_matches_routing() {
   local fakebin ambient good_log ambient_marker pooled out
   fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-precedence")
@@ -366,6 +386,12 @@ SH
   pass "pool-summary failures degrade safely while every pinned quota-balanced candidate is rejected"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  test_enforced_quota_balancing_rejects_poolless_candidates
+  test_fully_pooled_dispatch_ignores_overridden_ambient_mode
+  exit 0
+fi
+
 test_higher_min_vendor_wins
 test_exact_tie_uses_first_profile
 test_quota_missing_falls_back_to_first
@@ -377,6 +403,7 @@ test_backward_compatible_first_selection
 test_account_pool_summary_owns_provider_quota_choice
 test_account_pool_query_timeout_falls_back
 test_enforced_quota_balancing_rejects_poolless_candidates
+test_fully_pooled_dispatch_ignores_overridden_ambient_mode
 test_agent_fleet_binary_precedence_matches_routing
 test_account_fields_survive_direct_selection
 test_pooled_failures_degrade_without_default_account_quota

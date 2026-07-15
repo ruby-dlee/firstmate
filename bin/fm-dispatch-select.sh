@@ -168,16 +168,20 @@ fi
 # Fleet's same per-account view that concrete selection will use. Never compare
 # those pools against quota-axi's default-account cache (double selection).
 pooled_count=$(printf '%s\n' "$profiles_json" | jq '[.[] | select((.account_pool? | type) == "string")] | length')
-routing_mode=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 2
+pool_ids_valid=1
+while IFS= read -r encoded_pool; do
+  case "$encoded_pool" in
+    \"*\") pool=${encoded_pool#\"}; pool=${pool%\"} ;;
+    *) pool_ids_valid=0; continue ;;
+  esac
+  fm_account_valid_id "$pool" || pool_ids_valid=0
+done < <(printf '%s\n' "$profiles_json" | jq -c '.[].account_pool')
+if [ "$pooled_count" -eq "$profile_count" ] && [ "$pool_ids_valid" = 1 ]; then
+  routing_mode=off
+else
+  routing_mode=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 2
+fi
 if [ "$routing_mode" = enforce ]; then
-  pool_ids_valid=1
-  while IFS= read -r encoded_pool; do
-    case "$encoded_pool" in
-      \"*\") pool=${encoded_pool#\"}; pool=${pool%\"} ;;
-      *) pool_ids_valid=0; continue ;;
-    esac
-    fm_account_valid_id "$pool" || pool_ids_valid=0
-  done < <(printf '%s\n' "$profiles_json" | jq -c '.[].account_pool')
   if [ "$pooled_count" -ne "$profile_count" ] || [ "$pool_ids_valid" != 1 ]; then
     echo "error: enforced quota-balanced dispatch requires a non-empty valid account_pool on every candidate" >&2
     exit 2

@@ -84,11 +84,27 @@ fm_afk_launch_path_identity() {
   fi
 }
 
+fm_afk_launch_read_control() {
+  local file=$1 snapshot bytes cap=4096
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  snapshot=$({
+    head -c "$((cap + 1))" "$file" 2>/dev/null || exit 1
+    printf '\034'
+  }) || return 1
+  case "$snapshot" in *$'\034') ;; *) return 1 ;; esac
+  snapshot=${snapshot%$'\034'}
+  bytes=$(printf '%s' "$snapshot" | LC_ALL=C wc -c | tr -d '[:space:]') || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le "$cap" ] || return 1
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  printf '%s' "$snapshot"
+}
+
 fm_afk_launch_lock_owned() {
   local pid expected actual
   [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
-  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null) || return 1
-  expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null) || return 1
+  pid=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/pid") || return 1
+  expected=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/pid-identity") || return 1
   actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$expected" ] && [ "$actual" = "$expected" ]
 }
@@ -111,8 +127,8 @@ fm_afk_launch_atomic_rename() {
 fm_afk_launch_reclaim_owned() {
   local reclaim=$1 pid expected actual
   [ -d "$reclaim" ] && [ ! -L "$reclaim" ] || return 1
-  pid=$(cat "$reclaim/pid" 2>/dev/null) || return 1
-  expected=$(cat "$reclaim/pid-identity" 2>/dev/null) || return 1
+  pid=$(fm_afk_launch_read_control "$reclaim/pid") || return 1
+  expected=$(fm_afk_launch_read_control "$reclaim/pid-identity") || return 1
   actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$expected" ] && [ "$actual" = "$expected" ]
 }
@@ -144,7 +160,7 @@ fm_afk_launch_lock_acquire() {
         return 1
       fi
       if [ ! -e "$FM_AFK_LAUNCH_LOCK" ] && fm_afk_launch_atomic_rename "$candidate" "$FM_AFK_LAUNCH_LOCK"; then
-        if [ "$(cat "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)" = "$token" ]; then
+        if [ "$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)" = "$token" ]; then
           FM_AFK_LAUNCH_LOCK_TOKEN=$token
           return 0
         fi
@@ -207,23 +223,23 @@ fm_afk_launch_lock_acquire() {
       fi
       claimed_identity=$(fm_afk_launch_lock_identity) || claimed_identity=
       if [ -z "$claimed_identity" ] || [ "$claimed_identity" != "$stale_identity" ]; then
-        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
+        [ "$(fm_afk_launch_read_control "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
       if fm_afk_launch_lock_owned; then
-        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
+        [ "$(fm_afk_launch_read_control "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
       quarantine="$FM_AFK_LAUNCH_LOCK.stale.$reclaim_token"
       if ! fm_afk_launch_atomic_rename "$FM_AFK_LAUNCH_LOCK" "$quarantine"; then
-        [ "$(cat "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
+        [ "$(fm_afk_launch_read_control "$reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ] || rm -rf "$reclaim" 2>/dev/null || true
         sleep 0.05
         continue
       fi
       [ -d "$quarantine" ] && [ ! -L "$quarantine" ] || return 1
-      if [ "$(cat "$quarantine/.reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ]; then
+      if [ "$(fm_afk_launch_read_control "$quarantine/.reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ]; then
         fm_afk_launch_log "launcher lock changed while reclaiming it"
         return 1
       fi
@@ -240,8 +256,8 @@ fm_afk_launch_lock_acquire() {
 fm_afk_launch_lock_release() {
   local pid token
   [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
-  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
-  token=$(cat "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)
+  pid=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
+  token=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)
   [ "$pid" = "$$" ] && [ -n "$FM_AFK_LAUNCH_LOCK_TOKEN" ] && [ "$token" = "$FM_AFK_LAUNCH_LOCK_TOKEN" ] || return 0
   rm -rf "$FM_AFK_LAUNCH_LOCK"
   FM_AFK_LAUNCH_LOCK_TOKEN=
@@ -347,13 +363,12 @@ fm_afk_launch_record_read() {
     return 2
   fi
   [ -f "$FM_AFK_LAUNCH_RECORD" ] || return 1
-  record=$(cat "$FM_AFK_LAUNCH_RECORD" 2>/dev/null) || record=""
-  if [ -L "$FM_AFK_LAUNCH_RECORD" ] || [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; then
+  record=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_RECORD") || record=""
+  if [ -z "$record" ] || [ -L "$FM_AFK_LAUNCH_RECORD" ] || [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; then
     fm_afk_launch_log "daemon terminal record changed while reading; refusing to act on it"
     return 2
   fi
-  IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA \
-    < "$FM_AFK_LAUNCH_RECORD" || true
+  IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA <<< "$record" || true
   if ! printf '%s\n' "$record" | awk -F '\t' 'NF != 3 { bad=1 } END { exit !(NR == 1 && !bad) }' \
     || [ -z "$FM_AFK_REC_BACKEND" ] || [ -z "$FM_AFK_REC_TARGET" ]; then
     fm_afk_launch_log "daemon terminal record is malformed; refusing to act on it"

@@ -494,6 +494,46 @@ function withLock(callback) {
   }
 }
 
+function copyBoundedVisual(input, output, initial, remaining) {
+  const inputFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const inputDescriptor = fs.openSync(input, inputFlags);
+  let outputDescriptor;
+  try {
+    const opened = fs.fstatSync(inputDescriptor);
+    if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino) {
+      throw new Error(`visual evidence changed while opening ${input}`);
+    }
+    if (opened.size > remaining) throw new Error("visual evidence exceeds the 20 MiB report limit");
+    outputDescriptor = fs.openSync(output, "wx", 0o600);
+    const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, opened.size)));
+    let copied = 0;
+    while (copied < opened.size) {
+      const wanted = Math.min(buffer.length, opened.size - copied);
+      const bytesRead = fs.readSync(inputDescriptor, buffer, 0, wanted, null);
+      if (bytesRead === 0) throw new Error(`visual evidence changed size while copying ${input}`);
+      let written = 0;
+      while (written < bytesRead) {
+        written += fs.writeSync(outputDescriptor, buffer, written, bytesRead - written);
+      }
+      copied += bytesRead;
+    }
+    if (fs.readSync(inputDescriptor, buffer, 0, 1, null) !== 0) {
+      throw new Error(`visual evidence changed size while copying ${input}`);
+    }
+    const finished = fs.fstatSync(inputDescriptor);
+    if (finished.dev !== opened.dev || finished.ino !== opened.ino || finished.size !== opened.size) {
+      throw new Error(`visual evidence changed while copying ${input}`);
+    }
+    return copied;
+  } catch (error) {
+    try { fs.rmSync(output, { force: true }); } catch {}
+    throw error;
+  } finally {
+    if (outputDescriptor !== undefined) fs.closeSync(outputDescriptor);
+    fs.closeSync(inputDescriptor);
+  }
+}
+
 function copyVisuals(source, destination, dataRoot) {
   const copied = [];
   if (!fs.existsSync(source)) return copied;
@@ -530,11 +570,13 @@ function copyVisuals(source, destination, dataRoot) {
         if (inputRelative === ".." || inputRelative.startsWith(`..${path.sep}`) || path.isAbsolute(inputRelative)) {
           throw new Error(`visual evidence escapes its task directory at ${input}`);
         }
-        total += fs.statSync(inputReal).size;
-        if (total > 20 * 1024 * 1024) throw new Error("visual evidence exceeds the 20 MiB report limit");
+        const initial = fs.lstatSync(input);
+        if (initial.isSymbolicLink() || !initial.isFile()) {
+          throw new Error(`visual evidence must contain only real files at ${input}`);
+        }
         const output = path.join(destination, "visuals", nextRelative);
         fs.mkdirSync(path.dirname(output), { recursive: true });
-        fs.copyFileSync(inputReal, output);
+        total += copyBoundedVisual(input, output, initial, 20 * 1024 * 1024 - total);
         copied.push(path.posix.join("visuals", ...nextRelative.split(path.sep)));
       }
     } finally {

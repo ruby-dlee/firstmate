@@ -674,6 +674,25 @@ test_visual_symlink_fails_closed_and_cleans_staging() {
   pass "report stack rejects symlinked visuals and removes failed staging"
 }
 
+test_visual_copy_is_descriptor_bounded() {
+  local id=report-visual-bound-f6 out status source
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Bound visual copy."
+  mkdir -p "$HOME_DIR/data/$id/visuals"
+  source="$HOME_DIR/data/$id/visuals/oversized.png"
+  dd if=/dev/zero of="$source" bs=1048576 count=20 2>/dev/null
+  printf x >> "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "oversized visual was copied into the report stack"
+  assert_contains "$out" "visual evidence exceeds the 20 MiB report limit" \
+    "oversized visual refusal omitted its byte limit"
+  assert_no_grep 'copyFileSync' "$SCRIPT" "visual publication still reopens sources with copyFileSync"
+  assert_grep 'O_NOFOLLOW' "$SCRIPT" "visual publication does not open through a non-following descriptor"
+  assert_grep 'fs.readSync(inputDescriptor' "$SCRIPT" "visual publication does not copy through its verified descriptor"
+  pass "report visual copies are descriptor-bound and byte-capped"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_stale_lock_rejects_reused_pid
   test_stale_lock_reclaim_is_serialized
@@ -686,6 +705,11 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   test_pr_url_strips_query_and_fragment
   test_abandoned_reclaim_directory_is_recovered
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  test_visual_copy_is_descriptor_bounded
   exit 0
 fi
 
@@ -714,5 +738,6 @@ test_aged_transactionless_staging_is_reclaimed
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging
+test_visual_copy_is_descriptor_bounded
 test_source_symlinks_fail_closed
 test_ambiguous_task_ids_require_report_ids

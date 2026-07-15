@@ -226,7 +226,7 @@ fm_account_meta_lock_owner_alive() {  # <lock-path>
   else
     return 1
   fi
-  [ -f "$owner" ] || return 1
+  [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
   pid=$(sed -n '1p' "$owner" 2>/dev/null)
   recorded=$(sed -n '2p' "$owner" 2>/dev/null)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -261,6 +261,7 @@ fm_account_reclaim_owner_alive() {  # <reclaim-directory>
   else
     return 1
   fi
+  [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
   pid=$(sed -n '1p' "$owner" 2>/dev/null)
   recorded=$(sed -n '2p' "$owner" 2>/dev/null)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -279,6 +280,7 @@ fm_account_reclaim_guard_owned() {  # <reclaim-directory>
   else
     return 1
   fi
+  [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
   pid=$(sed -n '1p' "$owner" 2>/dev/null)
   recorded=$(sed -n '2p' "$owner" 2>/dev/null)
   [ "$pid" = "$$" ] || return 1
@@ -508,6 +510,10 @@ fm_account_meta_lock_release() {  # <lock-path>
     echo "error: refusing to release unsafe account metadata lock $lock" >&2
     return 1
   fi
+  [ -f "$owner" ] && [ ! -L "$owner" ] || {
+    echo "error: refusing to release account metadata lock with unsafe owner control $owner" >&2
+    return 1
+  }
   pid=$(sed -n '1p' "$owner" 2>/dev/null)
   [ "$pid" = "$$" ] || {
     echo "error: refusing to release account metadata lock owned by ${pid:-unknown}" >&2

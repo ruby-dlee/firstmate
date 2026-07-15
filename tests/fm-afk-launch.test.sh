@@ -320,6 +320,45 @@ unit_launcher_lock_symlinks_are_refused() {
   pass "launcher lock acquisition refuses symlinked lock and reclaim directories"
 }
 
+unit_launcher_control_files_are_bounded_and_nonfollowing() {
+  local st outside rc marker
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-controls.XXXXXX")
+  outside=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-controls-outside.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock"
+  mkfifo "$st/state/.afk-launch.lock/pid"
+  printf 'identity\n' > "$st/state/.afk-launch.lock/pid-identity"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; ! fm_afk_launch_lock_owned' _ "$LAUNCH"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "launcher lock opened a non-regular pid control"
+
+  rm -f "$st/state/.afk-launch.lock/pid"
+  marker="$outside/cat-called"
+  mkdir -p "$outside/fakebin"
+  cat > "$outside/fakebin/cat" <<SH
+#!/usr/bin/env bash
+touch '$marker'
+exit 99
+SH
+  chmod +x "$outside/fakebin/cat"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" PATH="$outside/fakebin:$PATH" bash -c '
+    . "$1"
+    printf "%s" "$$" > "$FM_AFK_LAUNCH_LOCK/pid"
+    fm_pid_identity "$$" > "$FM_AFK_LAUNCH_LOCK/pid-identity"
+    printf "token" > "$FM_AFK_LAUNCH_LOCK/token"
+    fm_afk_launch_lock_owned
+  ' _ "$LAUNCH" || fail "bounded launcher control reader rejected valid ownership"
+  [ ! -e "$marker" ] || fail "launcher lock control reader used unbounded cat"
+
+  dd if=/dev/zero bs=4097 count=1 2>/dev/null | tr '\0' x > "$st/state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_record_read >/dev/null 2>&1; [ "$?" -eq 2 ]' _ "$LAUNCH"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "oversized daemon-terminal record was accepted"
+  rm -rf "$st" "$outside"
+  pass "launcher control records are bounded and reject non-regular inputs"
+}
+
 unit_terminal_record_symlink_is_malformed() {
   local st outside rc
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-read.XXXXXX")
@@ -1421,6 +1460,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  unit_launcher_control_files_are_bounded_and_nonfollowing
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1432,6 +1477,7 @@ unit_lock_initialization_grace
 unit_stale_lock_reclaim_is_serialized
 unit_abandoned_reclaim_is_recovered
 unit_launcher_lock_symlinks_are_refused
+unit_launcher_control_files_are_bounded_and_nonfollowing
 unit_terminal_record_symlink_is_malformed
 unit_tmux_record_is_home_scoped_and_exact
 unit_linux_stat_selection_avoids_filesystem_stat_output

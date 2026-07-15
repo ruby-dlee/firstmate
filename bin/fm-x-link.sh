@@ -142,7 +142,7 @@ fi
 
 if [ -z "$CARRY_TS" ]; then
   ALLOW_RELAY=1
-  [ -z "${FMX_DRY_RUN:-}" ] || ALLOW_RELAY=0
+  [ -z "$FMX_DRY" ] || ALLOW_RELAY=0
   REPLY_CONTEXT=$(fmx_resolve_reply_context "$STATE" "$RID" "$ALLOW_RELAY") || {
     echo "fm-x-link: failed to resolve request reply context" >&2
     exit 1

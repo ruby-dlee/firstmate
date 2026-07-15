@@ -253,33 +253,47 @@ else
       exit 1
       ;;
   esac
-  record_managed_steering() {
-    local steering_id steering_dir steering_file
+  persist_managed_steering() (  # <file-name> <header> <annotation> <message...>
+    local file_name=$1 header=$2 annotation=$3
+    shift 3
+    local steering_id steering_dir steering_file steering_lock temp= mode
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
+    steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
+    cleanup_managed_steering() {
+      [ -z "$temp" ] || rm -f -- "$temp"
+      fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true
+    }
+    trap cleanup_managed_steering EXIT
+    trap 'exit 1' HUP INT TERM
     steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
-    steering_file="$steering_dir/steering.md"
+    steering_file="$steering_dir/$file_name"
     fm_account_safe_task_file "$steering_file" || return 1
-    if [ ! -e "$steering_file" ]; then
-      printf '# Steering trail\n\n' > "$steering_file" || return 1
+    temp=$(mktemp "$steering_dir/.$file_name.XXXXXX") || return 1
+    if [ -e "$steering_file" ]; then
+      cat "$steering_file" > "$temp" || return 1
+      if mode=$(stat -f '%Lp' "$steering_file" 2>/dev/null); then
+        :
+      else
+        mode=$(stat -c '%a' "$steering_file") || return 1
+      fi
+      chmod "$mode" "$temp" || return 1
+    elif [ -n "$header" ]; then
+      printf '%s\n\n' "$header" > "$temp" || return 1
     fi
-    fm_account_safe_task_file "$steering_file" || return 1
     {
-      printf -- '- %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf -- '- %s%s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$annotation"
       printf '%s\n' "$*" | sed 's/^/> /'
       printf '\n'
-    } >> "$steering_file" || return 1
+    } >> "$temp" || return 1
+    fm_account_safe_task_file "$steering_file" || return 1
+    mv -f -- "$temp" "$steering_file" || return 1
+    temp=
+  )
+  record_managed_steering() {
+    persist_managed_steering steering.md '# Steering trail' '' "$@"
   }
   record_pending_managed_steering() {
-    local steering_id steering_dir steering_file
-    steering_id=$(fm_send_id_from_meta "$TARGET_META")
-    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
-    steering_file="$steering_dir/steering-pending.md"
-    fm_account_safe_task_file "$steering_file" || return 1
-    {
-      printf -- '- %s (delivered; steering trail append pending)\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      printf '%s\n' "$*" | sed 's/^/> /'
-      printf '\n'
-    } >> "$steering_file" || return 1
+    persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
   }
   if [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
     if ! record_managed_steering "$@"; then

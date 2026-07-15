@@ -213,6 +213,40 @@ test_explicit_managed_target_records_steering() {
   pass "fm-send strict: explicit targets resolved to managed metadata are audited"
 }
 
+test_concurrent_managed_steering_is_serialized_and_atomic() {
+  local dir fb home log trail lock pid rc=0 i count
+  local pids=()
+  dir="$TMP_ROOT/managed-concurrent"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-concurrent)
+  log="$dir/tmux.log"; trail="$home/data/managed-concurrent/steering.md"
+  lock="$home/state/.account-steering-managed-concurrent.lock"
+  mkdir -p "$home/data/managed-concurrent"
+  : > "$log"
+  fm_write_meta "$home/state/managed-concurrent.meta" \
+    "window=sess:fm-managed-concurrent" "kind=ship" "harness=codex" "account_profile=codex-2"
+
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      "$SEND" managed-concurrent "Concurrent managed steer $i." >"$dir/send-$i.out" 2>"$dir/send-$i.err" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  [ "$rc" -eq 0 ] || fail "a concurrent managed steer failed"
+  count=$(grep -c '^# Steering trail$' "$trail")
+  [ "$count" -eq 1 ] || fail "concurrent steering wrote $count trail headers"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    count=$(grep -F -c "> Concurrent managed steer $i." "$trail")
+    [ "$count" -eq 1 ] || fail "concurrent steering retained message $i $count times"
+  done
+  assert_absent "$lock" "concurrent steering left its serialization lock behind"
+  if find "$(dirname "$trail")" -maxdepth 1 -name '.steering.md.*' -print -quit | grep -q .; then
+    fail "concurrent steering leaked an atomic staging file"
+  fi
+  pass "fm-send strict: concurrent managed steering is serialized and atomic"
+}
+
 test_healthy_fm_id_send_still_works() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
@@ -229,6 +263,12 @@ test_healthy_fm_id_send_still_works() {
   pass "fm-send strict: healthy fm-<id> sends still type once and submit"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
+  test_explicit_managed_target_records_steering
+  test_concurrent_managed_steering_is_serialized_and_atomic
+  exit 0
+fi
+
 test_exact_lane_id_send_still_works
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
@@ -237,4 +277,5 @@ test_unmatched_single_colon_target_must_exist
 test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
+test_concurrent_managed_steering_is_serialized_and_atomic
 test_healthy_fm_id_send_still_works

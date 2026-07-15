@@ -102,21 +102,8 @@ function lastStatus(status) {
   return lines[lines.length - 1] || "Completed task";
 }
 
-function firstSummary(markdown, fallback) {
-  const summarySection = markdown.match(/^## Summary\s*\n+([\s\S]*?)(?=\n## |$)/mi)?.[1];
-  const text = (summarySection || markdown)
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/[*_`>#-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return (text || fallback).slice(0, 320);
-}
-
-function levelTwoHeadings(markdown) {
-  const headings = new Set();
+function markdownStructure(markdown) {
+  const visible = [];
   let fence;
   for (const line of String(markdown).split(/\r?\n/)) {
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
@@ -129,15 +116,44 @@ function levelTwoHeadings(markdown) {
       }
       continue;
     }
-    if (marker) {
+    if (marker && !(marker[1][0] === "`" && marker[2].includes("`"))) {
       fence = { character: marker[1][0], length: marker[1].length };
       continue;
     }
-    const heading = line.match(/^ {0,3}##(?:[ \t]+(.*)|[ \t]*)$/);
-    if (heading) {
-      const content = (heading[1] || "").replace(/[ \t]+#+[ \t]*$/, "").trim();
-      headings.add(content.toLowerCase());
-    }
+    const match = line.match(/^ {0,3}(#{1,6})(?:[ \t]+(.*)|[ \t]*)$/);
+    const heading = match ? {
+      level: match[1].length,
+      content: (match[2] || "").replace(/[ \t]+#+[ \t]*$/, "").trim(),
+    } : undefined;
+    visible.push({ line, heading });
+  }
+  return visible;
+}
+
+function firstSummary(markdown, fallback) {
+  const structure = markdownStructure(markdown);
+  const summaryStart = structure.findIndex(({ heading }) => heading?.level === 2 && heading.content.toLowerCase() === "summary");
+  let summaryLines;
+  if (summaryStart >= 0) {
+    const followingHeading = structure.findIndex(({ heading }, index) => index > summaryStart && heading?.level === 2);
+    summaryLines = structure.slice(summaryStart + 1, followingHeading < 0 ? undefined : followingHeading).map(({ line }) => line);
+  } else {
+    summaryLines = structure.map(({ line }) => line);
+  }
+  const text = summaryLines.join("\n")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/[*_`>#-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (text || fallback).slice(0, 320);
+}
+
+function levelTwoHeadings(markdown) {
+  const headings = new Set();
+  for (const { heading } of markdownStructure(markdown)) {
+    if (heading?.level === 2) headings.add(heading.content.toLowerCase());
   }
   return headings;
 }

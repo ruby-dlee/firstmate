@@ -372,7 +372,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
 }
 
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
-  local id rec brief before after outside out status
+  local id rec brief before after outside out status heading_count
 
   id=contract-atomic-z1b
   rec=$(make_case contract-atomic claude "$id")
@@ -386,6 +386,26 @@ test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
   if find "$(dirname "$brief")" -maxdepth 1 -name '.brief-contract.*' -print -quit | grep -q .; then
     fail "completion-contract upgrade leaked its staging file"
   fi
+
+  id=contract-fenced-example-z1ba
+  rec=$(make_case contract-fenced-example claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  cat > "$brief" <<'EOF'
+# Task
+
+Preserve this custom brief.
+
+````markdown
+# Completion report
+```
+Example only.
+```
+````
+EOF
+  run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "fenced completion-report example blocked contract injection"
+  heading_count=$(grep -c '^# Completion report$' "$brief")
+  [ "$heading_count" -eq 2 ] || fail "fenced completion-report example suppressed the real contract"
 
   id=contract-file-symlink-z1c
   rec=$(make_case contract-file-symlink claude "$id")

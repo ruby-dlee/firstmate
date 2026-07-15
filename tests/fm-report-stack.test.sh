@@ -522,6 +522,61 @@ test_required_headings_follow_commonmark_atx_rules() {
   pass "required headings follow CommonMark ATX indentation and closing-hash rules"
 }
 
+test_invalid_backtick_info_string_does_not_open_fence() {
+  local id=report-invalid-backtick-info-b3h source
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n```language`invalid\n\n## Summary\n\nComplete.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  run_stack publish "$id" >/dev/null || fail "backtick-containing info string was treated as a valid fence opener"
+  pass "invalid backtick fence info strings do not hide report headings"
+}
+
+test_summary_extraction_uses_validated_markdown_structure() {
+  local id=report-structured-summary-b3i source entry manifest
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+````markdown
+## Summary
+
+Fenced fake summary.
+```
+````
+
+   ## Summary ###
+
+Validated real summary.
+
+## What changed
+
+Changed.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null || fail "structured-summary report failed to publish"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"summary": "Validated real summary."' "$manifest" "manifest did not use the validated real Summary section"
+  assert_no_grep 'Fenced fake summary' "$manifest" "manifest summary used a fenced example"
+  pass "summary extraction shares fence-aware ATX parsing"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
@@ -910,6 +965,8 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_nested_short_fences_do_not_satisfy_required_sections
   test_indented_pseudo_closers_do_not_end_fences
   test_required_headings_follow_commonmark_atx_rules
+  test_invalid_backtick_info_string_does_not_open_fence
+  test_summary_extraction_uses_validated_markdown_structure
   exit 0
 fi
 
@@ -928,6 +985,8 @@ test_required_sections_fail_actionably
 test_nested_short_fences_do_not_satisfy_required_sections
 test_indented_pseudo_closers_do_not_end_fences
 test_required_headings_follow_commonmark_atx_rules
+test_invalid_backtick_info_string_does_not_open_fence
+test_summary_extraction_uses_validated_markdown_structure
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized

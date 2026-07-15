@@ -14,6 +14,43 @@ fm_completion_report_contract() {  # <data-dir> <task-id>
     'These completion-report paths and the status file are the only authorized writes outside the worktree.'
 }
 
+fm_completion_report_contract_present() {  # <brief>
+  awk '
+    function marker(line,    text, character, length) {
+      text = line
+      sub(/^ {0,3}/, "", text)
+      character = substr(text, 1, 1)
+      if (character != "`" && character != "~") return 0
+      length = 0
+      while (substr(text, length + 1, 1) == character) length++
+      if (length < 3) return 0
+      marker_character = character
+      marker_length = length
+      marker_rest = substr(text, length + 1)
+      return 1
+    }
+    {
+      has_marker = marker($0)
+      if (fence_character != "") {
+        if (has_marker && marker_character == fence_character && marker_length >= fence_length && marker_rest ~ /^[[:space:]]*$/) {
+          fence_character = ""
+          fence_length = 0
+        }
+        next
+      }
+      if (has_marker && !(marker_character == "`" && marker_rest ~ /`/)) {
+        fence_character = marker_character
+        fence_length = marker_length
+        next
+      }
+      line = $0
+      sub(/^ {0,3}/, "", line)
+      if (line == "# Completion report") found = 1
+    }
+    END { exit !found }
+  ' "$1"
+}
+
 fm_completion_report_contract_ensure() (  # <data-dir> <task-id> <brief>
   local data=$1 task=$2 brief=$3 data_real task_real brief_parent brief_target
   local source_identity current_identity mode temp=
@@ -39,7 +76,7 @@ fm_completion_report_contract_ensure() (  # <data-dir> <task-id> <brief>
     echo "error: task brief must be a real regular file inside $task_real: $brief" >&2
     return 1
   fi
-  if grep -q '^# Completion report$' "$brief_target"; then
+  if fm_completion_report_contract_present "$brief_target"; then
     return 0
   fi
 

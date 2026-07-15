@@ -1,7 +1,7 @@
 # Completion report stack
 
 Firstmate publishes one durable report for every task created after the report-stack cutover.
-The default store is `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
+The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 
 ## Completion contract
@@ -23,9 +23,12 @@ Retiring a persistent secondmate is also not a completion; ordinary tasks comple
 
 Each entry contains a manifest, the completion report, the original task brief, the status trail, optional visual artifacts, and a standalone HTML review page.
 The entry id is deterministic from the canonical Firstmate home path plus task id, so publication retries replace the same entry instead of duplicating it.
+The manifest's task generation identity distinguishes a same-generation retry from a replacement generation, preserving prior completion provenance only when it still belongs to the current work.
 The manifest records routing labels useful for review but never stores provider session ids, auth material, environment values, or account-home contents.
 Text artifacts receive defense-in-depth redaction for common credential assignments, private keys, and token formats before storage.
 Task briefs and completion reports must still avoid secrets because no heuristic redactor can recognize every credential shape.
+Publication reads only real files and directories contained beneath the configured task roots, refusing symlinks and path escapes.
+It limits a completion report to 16 MiB and visual evidence to 20 MiB total, 512 entries, and 24 nested directory levels; oversized or unsafe input leaves the previous durable entry unchanged for repair and retry.
 
 The generated `index.html` is an offline searchable card stack with task-type filtering and links to each report page.
 Run `bin/fm-report-stack.mjs open` or use `/reports` to regenerate and open it.

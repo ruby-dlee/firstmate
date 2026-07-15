@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Render the single completion-report prompt contract shared by ship briefs and
+# managed continuation prompts.
+# The durable publication and storage contract lives in docs/report-stack.md.
 
 fm_completion_report_contract() {  # <data-dir> <task-id>
   local data=$1 task=$2

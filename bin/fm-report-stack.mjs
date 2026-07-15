@@ -2,10 +2,10 @@
 // Publish and browse durable Firstmate completion reports.
 //
 // The report stack is machine-global and independent of FM_HOME and provider
-// account homes. New tasks record report_required=1; teardown publishes them
-// before its first destructive action. Publication is idempotent by canonical
-// Firstmate home + task id, serialized, staged, and swapped into place only
-// after every artifact is ready.
+// account homes. New tasks record report_required=1; teardown first quiesces the
+// endpoint, then publishes before account release or worktree removal.
+// Publication is idempotent by canonical Firstmate home + task id, serialized,
+// staged, and swapped into place only after every artifact is ready.
 //
 // Usage: fm-report-stack.mjs publish <task-id> [--legacy]
 //        fm-report-stack.mjs render
@@ -13,7 +13,8 @@
 //        fm-report-stack.mjs path [<task-id>]
 //        fm-report-stack.mjs open [<task-id>]
 //
-// FM_REPORT_STACK_ROOT overrides the default
+// FM_REPORT_STACK_ROOT overrides the default. When XDG_DATA_HOME is set, the
+// default is $XDG_DATA_HOME/firstmate/report-stack; otherwise it is
 // ~/.local/share/firstmate/report-stack. FM_HOME, FM_STATE_OVERRIDE, and
 // FM_DATA_OVERRIDE select the task source like the rest of Firstmate.
 

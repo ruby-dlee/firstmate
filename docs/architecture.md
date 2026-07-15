@@ -104,7 +104,15 @@ The helper's header owns the exact guarded-entrypoint decision list, signal dete
 
 ## Two task shapes
 
-Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
+Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`), then leave a completion report at `data/<id>/completion.md`.
+Scout tasks investigate, plan, reproduce bugs, or audit, then leave their report at `data/<id>/report.md` and never push.
+For tasks created after the report-stack cutover, both reports follow the same completion sections and publish through fail-closed teardown to the machine-global stack described in [report-stack.md](report-stack.md).
+
+## Durable completion reports
+
+Every post-cutover ship and scout task records `report_required=1`, produces a standalone completion report with optional visual artifacts, and publishes it before account lease release or worktree removal.
+The resulting machine-global stack is independent of Firstmate homes and Claude or Codex account profiles, so account recovery, cross-provider continuation, and home retirement do not strand the completion record.
+Publication is idempotent, fail-closed, and searchable; [report-stack.md](report-stack.md) owns the report schema, stored entry, teardown ordering, compatibility path, and browsing commands.
 
 ## Dispatch profiles
 

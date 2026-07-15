@@ -71,6 +71,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's PR from its full GitHub URL                  |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
+| `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |
 | `fm-teardown.sh`         | Fail-closed teardown of worktrees, endpoints, secondmate homes, and managed account leases |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |

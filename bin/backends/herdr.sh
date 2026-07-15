@@ -97,8 +97,8 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # that home. fm-spawn.sh briefly shadows FM_HOME to a secondmate's own home
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
-fm_backend_herdr_workspace_label() {
-  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
+fm_backend_herdr_workspace_label_for_home() {  # <home>
+  local marker="$1/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
   if [ -f "$marker" ]; then
     id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
@@ -107,6 +107,10 @@ fm_backend_herdr_workspace_label() {
     fi
   fi
   printf 'firstmate'
+}
+
+fm_backend_herdr_workspace_label() {
+  fm_backend_herdr_workspace_label_for_home "$FM_HOME"
 }
 
 # fm_backend_herdr_cli: run `herdr <args...>` scoped to <session>, setting
@@ -568,9 +572,84 @@ fm_backend_herdr_parse_target() {  # <target>
   [ -n "$FM_BACKEND_HERDR_SESSION" ] && [ -n "$FM_BACKEND_HERDR_PANE" ] && [ "$FM_BACKEND_HERDR_PANE" != "$target" ]
 }
 
-fm_backend_herdr_identity_state() {  # <target> [expected-label]
-  local target=$1 expected_label=${2:-} panes tabs tab_id
+fm_backend_herdr_identity_pack() {  # <label> <workspace-id> <workspace-label> [tab-id]
+  local label=$1 workspace=$2 workspace_label=$3 tab=${4:-}
+  case "$label$workspace$workspace_label$tab" in *'|'*|*$'\t'*|*$'\n'*) return 1 ;; esac
+  [ -n "$label" ] && [ -n "$workspace" ] && [ -n "$workspace_label" ] || return 1
+  printf '%s|%s|%s|%s' "$label" "$workspace" "$workspace_label" "$tab"
+}
+
+fm_backend_herdr_identity_parse() {  # <packed-identity>
+  local packed=$1 rest
+  case "$packed" in *'|'*'|'*'|'*) ;; *) return 1 ;; esac
+  FM_BACKEND_HERDR_EXPECTED_LABEL=${packed%%|*}
+  rest=${packed#*|}
+  FM_BACKEND_HERDR_EXPECTED_WORKSPACE=${rest%%|*}
+  rest=${rest#*|}
+  FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL=${rest%%|*}
+  FM_BACKEND_HERDR_EXPECTED_TAB=${rest#*|}
+  case "$FM_BACKEND_HERDR_EXPECTED_TAB" in *'|'*) return 1 ;; esac
+  [ -n "$FM_BACKEND_HERDR_EXPECTED_LABEL" ] \
+    && [ -n "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" ] \
+    && [ -n "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" ]
+}
+
+fm_backend_herdr_identity_from_meta() {  # <target> <expected-label>
+  local target=$1 expected_label=$2 state meta id target_of_meta workspace tab kind endpoint_home workspace_label marker_id
+  command -v fm_meta_get >/dev/null 2>&1 || return 1
+  command -v fm_backend_of_meta >/dev/null 2>&1 || return 1
+  command -v fm_backend_target_of_meta >/dev/null 2>&1 || return 1
+  state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+  for meta in "$state"/*.meta; do
+    [ -f "$meta" ] || continue
+    [ "$(fm_backend_of_meta "$meta")" = herdr ] || continue
+    target_of_meta=$(fm_backend_target_of_meta "$meta")
+    [ "$target_of_meta" = "$target" ] || continue
+    id=${meta##*/}
+    id=${id%.meta}
+    [ "$expected_label" = "fm-$id" ] || continue
+    workspace=$(fm_meta_get "$meta" herdr_workspace_id)
+    tab=$(fm_meta_get "$meta" herdr_tab_id)
+    [ -n "$workspace" ] || return 1
+    kind=$(fm_meta_get "$meta" kind)
+    endpoint_home=$FM_HOME
+    if [ "$kind" = secondmate ]; then
+      endpoint_home=$(fm_meta_get "$meta" home)
+      [ -n "$endpoint_home" ] || return 1
+      marker_id=$(tr -d '[:space:]' < "$endpoint_home/$FM_BACKEND_HERDR_SECONDMATE_MARKER" 2>/dev/null) || return 1
+      [ "$marker_id" = "$id" ] || return 1
+    fi
+    workspace_label=$(fm_backend_herdr_workspace_label_for_home "$endpoint_home")
+    fm_backend_herdr_identity_pack "$expected_label" "$workspace" "$workspace_label" "$tab"
+    return
+  done
+  return 1
+}
+
+fm_backend_herdr_expected_identity() {  # <target> <expected-label-or-identity>
+  local target=$1 expected=${2:-} workspace workspace_label
+  [ -n "$expected" ] || return 1
+  if fm_backend_herdr_identity_parse "$expected"; then
+    printf '%s' "$expected"
+    return 0
+  fi
+  if fm_backend_herdr_identity_from_meta "$target" "$expected"; then
+    return 0
+  fi
+  workspace=$(fm_backend_herdr_workspace_find "$FM_BACKEND_HERDR_SESSION") || return 1
+  [ -n "$workspace" ] || return 1
+  workspace_label=$(fm_backend_herdr_workspace_label)
+  fm_backend_herdr_identity_pack "$expected" "$workspace" "$workspace_label"
+}
+
+fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
+  local target=$1 expected=${2:-} identity panes tabs tab_id workspaces
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  if [ -n "$expected" ]; then
+    identity=$(fm_backend_herdr_expected_identity "$target" "$expected") \
+      || { printf 'unknown'; return 0; }
+    fm_backend_herdr_identity_parse "$identity" || { printf 'unknown'; return 0; }
+  fi
   panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   if ! printf '%s\n' "$panes" | jq -e '(.result.panes | type) == "array"' >/dev/null 2>&1; then
@@ -583,18 +662,39 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label]
     printf 'absent'
     return 0
   fi
-  if [ -z "$expected_label" ]; then
+  if [ -z "$expected" ]; then
     printf 'match'
     return 0
   fi
-  tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list 2>/dev/null) \
+  workspaces=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" workspace list 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$workspaces" | jq -e '(.result.workspaces | type) == "array"' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if ! printf '%s\n' "$workspaces" | jq -e \
+    --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+    --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
+    'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace and .label == $want_label)' >/dev/null 2>&1; then
+    printf 'mismatch'
+    return 0
+  fi
+  tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   if ! printf '%s\n' "$tabs" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
     printf 'unknown'
     return 0
   fi
-  if printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" --arg want "$expected_label" \
-    'any(.result.tabs[]?; (.tab_id | tostring) == $tab and .label == $want)' >/dev/null 2>&1; then
+  if printf '%s\n' "$tabs" | jq -e \
+    --arg tab "$tab_id" \
+    --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \
+    --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+    --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+    'any(.result.tabs[]?;
+      (.tab_id | tostring) == $tab
+      and ($recorded_tab == "" or (.tab_id | tostring) == $recorded_tab)
+      and (.workspace_id | tostring) == $workspace
+      and .label == $want_label)' >/dev/null 2>&1; then
     printf 'match'
   elif printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" \
     'any(.result.tabs[]?; (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then

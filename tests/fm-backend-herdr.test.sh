@@ -753,23 +753,28 @@ test_kill_is_best_effort() {
 }
 
 test_managed_identity_rejects_reused_pane() {
-  local dir log fb out
-  dir="$TMP_ROOT/managed-identity"; log="$dir/log"; mkdir -p "$dir/fakebin"; : > "$log"
+  local dir home state log fb out
+  dir="$TMP_ROOT/managed-identity"; home="$dir/home"; state="$home/state"; log="$dir/log"
+  mkdir -p "$dir/fakebin" "$state"; : > "$log"
+  fm_write_meta "$state/intended-task.meta" \
+    "window=default:w1:p2" "backend=herdr" "kind=ship" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
   cat > "$dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_HERDR_LOG"
 case "$*" in
   'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
   status\ --json*) printf '{"client":{"protocol":14},"server":{"running":true}}\n' ;;
-  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' ;;
-  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-other-task"}]}}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w2:t2","workspace_id":"w2"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"},{"workspace_id":"w2","label":"2ndmate-other"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w2:t2","label":"fm-intended-task","workspace_id":"w2"}]}}\n' ;;
   pane\ get*) printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' ;;
   agent\ get*) printf '{"result":{"agent":{"agent_status":"working"}}}\n' ;;
 esac
 SH
   chmod +x "$dir/fakebin/herdr"
   fb="$dir/fakebin"
-  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" bash -c '
+  out=$(PATH="$fb:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_HERDR_LOG="$log" bash -c '
     . "$0/bin/fm-backend.sh"
     [ "$(fm_backend_target_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 11
     ! fm_backend_capture herdr default:w1:p2 10 fm-intended-task || exit 12
@@ -782,7 +787,7 @@ SH
   if grep -Eq 'pane (read|send-text|send-keys|close)|agent get' "$log"; then
     fail "a reused Herdr pane reached a read, mutation, or agent-state command"
   fi
-  pass "managed Herdr operations reject pane ids owned by another task tab"
+  pass "managed Herdr operations reject same-labeled panes outside the recorded home workspace"
 }
 
 test_current_path_reads_cwd() {
@@ -1440,9 +1445,14 @@ test_scripts_route_explicit_target_through_meta_backend() {
   dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
   neutral="$dir/neutral-root"; mkdir -p "$neutral"
-  fm_write_meta "$state/herdr-stale.meta" "window=default:w1:p2" "backend=herdr"
+  fm_write_meta "$state/herdr-stale.meta" \
+    "window=default:w1:p2" "backend=herdr" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
   touch "$state/.last-watcher-beat"
   printf 'captured herdr pane\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' > "$resp/3.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-herdr-stale","workspace_id":"w1"}]}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash

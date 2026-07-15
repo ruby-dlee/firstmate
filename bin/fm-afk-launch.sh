@@ -282,8 +282,8 @@ fm_afk_launch_herdr_identity_state() {  # <target> <packed-identity>
     printf 'unknown'
     return 0
   fi
-  if printf '%s\n' "$workspaces" | jq -e --arg id "$FM_AFK_HERDR_WORKSPACE" --arg label "$FM_AFK_HERDR_LABEL" \
-    'any(.result.workspaces[]?; (.workspace_id | tostring) == $id and .label == $label)' >/dev/null 2>&1; then
+  if printf '%s\n' "$workspaces" | jq -e --arg id "$FM_AFK_HERDR_WORKSPACE" --arg want_label "$FM_AFK_HERDR_LABEL" \
+    'any(.result.workspaces[]?; (.workspace_id | tostring) == $id and .label == $want_label)' >/dev/null 2>&1; then
     panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$FM_AFK_HERDR_WORKSPACE" 2>/dev/null) \
       || { printf 'unknown'; return 0; }
     if ! printf '%s\n' "$panes" | jq -e '(.result.panes | type) == "array"' >/dev/null 2>&1; then

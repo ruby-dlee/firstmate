@@ -39,6 +39,10 @@ FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$FM_AFK_START_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
+
 # shellcheck source=bin/fm-wake-lib.sh
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 

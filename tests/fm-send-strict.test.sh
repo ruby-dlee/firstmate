@@ -144,6 +144,57 @@ test_unmatched_single_colon_target_must_exist() {
   pass "fm-send strict: unmatched single-colon explicit targets must verify live before sending"
 }
 
+make_herdr_identity_stub() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_HERDR_LOG"
+case "$*" in
+  status\ --json*) printf '{"client":{"protocol":14},"server":{"running":true}}\n' ;;
+  pane\ get*) printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w2:t2","workspace_id":"w2"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"},{"workspace_id":"w2","label":"2ndmate-other"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w2:t2","label":"fm-local-task","workspace_id":"w2"}]}}\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+test_explicit_herdr_target_matching_meta_is_identity_bound() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/herdr-explicit-meta"; mkdir -p "$dir"
+  fb=$(make_herdr_identity_stub "$dir"); home=$(setup_home herdr-explicit-meta)
+  err="$dir/send.err"; log="$dir/herdr.log"; : > "$log"
+  fm_write_meta "$home/state/local-task.meta" \
+    "window=default:w1:p2" "backend=herdr" "kind=ship" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_HERDR_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" default:w1:p2 --key Enter >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -ne 0 ] || fail "explicit Herdr target matched to local metadata should reject a reused pane"
+  if grep -Eq 'pane (send-text|send-keys)' "$log"; then
+    fail "identity-mismatched explicit Herdr target received a key"
+  fi
+  pass "fm-send strict: explicit Herdr targets matched to local metadata retain managed identity"
+}
+
+test_metadata_free_explicit_herdr_target_remains_unbound() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/herdr-explicit-external"; mkdir -p "$dir"
+  fb=$(make_herdr_identity_stub "$dir"); home=$(setup_home herdr-explicit-external)
+  err="$dir/send.err"; log="$dir/herdr.log"; : > "$log"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_HERDR_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" default:w1:p2 --key Enter >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "metadata-free explicit Herdr target should remain an unbound escape hatch"
+  assert_contains "$(cat "$log")" "pane send-keys w1:p2 enter" "unbound explicit Herdr target should receive the key"
+  pass "fm-send strict: metadata-free explicit Herdr targets remain unbound"
+}
+
 test_healthy_fm_id_send_still_works() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
@@ -165,4 +216,6 @@ test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
 test_prefixless_herdr_pane_id_fails
 test_unmatched_single_colon_target_must_exist
+test_explicit_herdr_target_matching_meta_is_identity_bound
+test_metadata_free_explicit_herdr_target_remains_unbound
 test_healthy_fm_id_send_still_works

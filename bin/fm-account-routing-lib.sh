@@ -60,6 +60,14 @@ fm_account_valid_id() {
   return 0
 }
 
+fm_account_real_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ]
+}
+
+fm_account_safe_file_destination() {
+  [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
+}
+
 fm_account_fleet_bin() {
   if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
     [ -x "$FM_AGENT_FLEET_BIN" ] || {
@@ -287,7 +295,7 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
   local reclaim=$1 grace=$2 start age candidate candidate_inode reclaim_inode nested nested_inode
   local quarantine observed_inode quarantined_inode
   start=$(fm_account_process_start_time "$$") || return 1
-  candidate="$reclaim.candidate.$$.$RANDOM"
+  candidate=$(mktemp "$reclaim.candidate.XXXXXX" 2>/dev/null) || return 1
   if ! printf '%s\n%s\n' "$$" "$start" > "$candidate"; then
     rm -f "$candidate"
     return 1
@@ -316,7 +324,8 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
   observed_inode=$(fm_account_path_inode "$reclaim") || return 1
   fm_account_reclaim_owner_alive "$reclaim" && return 1
   [ "$(fm_account_path_inode "$reclaim" 2>/dev/null || true)" = "$observed_inode" ] || return 1
-  quarantine="$reclaim.stale.$$.$RANDOM"
+  quarantine=$(mktemp -d "$reclaim.stale.XXXXXX" 2>/dev/null) || return 1
+  rmdir "$quarantine" || return 1
   mv "$reclaim" "$quarantine" 2>/dev/null || return 1
   quarantined_inode=$(fm_account_path_inode "$quarantine" 2>/dev/null || true)
   if [ "$quarantined_inode" != "$observed_inode" ]; then
@@ -397,7 +406,8 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   fm_account_reclaim_guard_owned "$guard" || return 1
   inode_after=$(fm_account_path_inode "$lock") || return 1
   [ "$inode_before" = "$inode_after" ] || return 1
-  reclaim="$lock.reclaim.$$.$RANDOM"
+  reclaim=$(mktemp -d "$lock.reclaim.XXXXXX" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
+  rmdir "$reclaim" || { fm_account_reclaim_guard_release "$guard"; return 1; }
   mv "$lock" "$reclaim" 2>/dev/null || { fm_account_reclaim_guard_release "$guard"; return 1; }
   rm -rf "$reclaim"
 }
@@ -414,8 +424,9 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
     return 1
   }
   mkdir -p "$state" || return 1
+  fm_account_real_directory "$state" || return 1
   lock="$state/.$name-$task.lock"
-  owner_tmp="$state/.$name-$task.owner.$$.$RANDOM"
+  owner_tmp=$(mktemp "$state/.$name-$task.owner.XXXXXX" 2>/dev/null) || return 1
   printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
     rm -f "$owner_tmp"
     return 1
@@ -483,7 +494,8 @@ fm_account_meta_lock_release() {  # <lock-path>
     rm -f "$lock"
     return
   fi
-  released="$lock.release.$$.$RANDOM"
+  released=$(mktemp -d "$lock.release.XXXXXX" 2>/dev/null) || return 1
+  rmdir "$released" || return 1
   mv "$lock" "$released" || return 1
   rm -rf "$released"
 }
@@ -506,8 +518,7 @@ fm_account_meta_key_owned() {  # <key>
 fm_account_meta_merge_extensions() {  # <source-meta> <destination-meta>
   local source=$1 destination=$2 line key tmp
   [ -f "$source" ] || return 0
-  tmp="$(dirname "$destination")/.account-extensions.$$.$RANDOM"
-  : > "$tmp" || return 1
+  tmp=$(mktemp "$(dirname "$destination")/.account-extensions.XXXXXX" 2>/dev/null) || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     key=${line%%=*}
     fm_account_meta_key_owned "$key" || continue
@@ -518,6 +529,7 @@ fm_account_meta_merge_extensions() {  # <source-meta> <destination-meta>
     fm_account_meta_key_owned "$key" && continue
     printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
   done < "$source"
+  fm_account_safe_file_destination "$destination" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$destination" || { rm -f "$tmp"; return 1; }
 }
 
@@ -669,15 +681,17 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
     return 1
   fi
   if [ -n "$backup" ]; then
-    tmp="$(dirname "$meta")/.$task.meta.rollback-restore.$$"
+    tmp=$(mktemp "$(dirname "$meta")/.$task.meta.rollback-restore.XXXXXX" 2>/dev/null) || { fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     cp -p "$backup" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
+    fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     mv "$tmp" "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     rm -f "$backup"
   else
-    tmp="$(dirname "$meta")/.$task.meta.rollback-clean.$$"
+    tmp=$(mktemp "$(dirname "$meta")/.$task.meta.rollback-clean.XXXXXX" 2>/dev/null) || { fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     printf 'rollback_pending=1\n' >> "$tmp"
+    fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     mv "$tmp" "$meta" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
   fi
   fm_account_meta_lock_release "$lock" || return 1
@@ -727,8 +741,16 @@ fm_account_cleanup_predecessor_serialized() {  # <meta> <data-dir> <task>
     echo "error: managed task generation changed before predecessor cleanup commit for $task" >&2
     return 1
   fi
-  tmp="$(dirname "$meta")/.$task.meta.predecessor.$$"
+  tmp=$(mktemp "$(dirname "$meta")/.$task.meta.predecessor.XXXXXX" 2>/dev/null) || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
   awk '!/^account_predecessor_/ && !/^account_predecessor_cleanup=/' "$meta" > "$tmp" || {
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  fm_account_safe_file_destination "$meta" || {
     rm -f "$tmp"
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     return 1

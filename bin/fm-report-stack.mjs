@@ -35,6 +35,11 @@ const entriesDir = path.join(stackRoot, "entries");
 const requiredSections = ["Summary", "What changed", "Verification", "Visual evidence", "Artifacts", "Follow-ups"];
 const informationalTrailLimit = 4 * 1024 * 1024;
 const completionReportLimit = 16 * 1024 * 1024;
+const metadataLimit = 1024 * 1024;
+const manifestLimit = 1024 * 1024;
+const transactionLimit = 64 * 1024;
+const visualEntryLimit = 512;
+const visualDepthLimit = 24;
 
 function fail(message) {
   console.error(`error: ${message}`);
@@ -190,12 +195,12 @@ function realDirectory(directory, root, label) {
 function configuredRoot(directory, label) {
   let stat;
   try {
-    stat = fs.statSync(directory);
+    stat = fs.lstatSync(directory);
   } catch (error) {
     if (error.code === "ENOENT") throw new Error(`${label} is missing at ${directory}`);
     throw error;
   }
-  if (!stat.isDirectory()) throw new Error(`${label} must be a directory at ${directory}`);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`${label} must be a real directory at ${directory}`);
   return fs.realpathSync(directory);
 }
 
@@ -233,6 +238,22 @@ function readArtifact(file, root, label, options = {}) {
     return options.truncate === "tail" ? `${marker}\n${content}` : `${content}\n${marker}\n`;
   }
   return fs.readFileSync(real, "utf8");
+}
+
+function readBoundedRegularFile(file, maxBytes, label) {
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  if (stat.size > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte limit at ${file}`);
+  return fs.readFileSync(file, "utf8");
+}
+
+function assertSafeFileDestination(file, label) {
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be absent or a real regular file at ${file}`);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 }
 
 function escapeHtml(value) {
@@ -302,6 +323,13 @@ function indexPage(rows) {
 
 function acquireLock() {
   fs.mkdirSync(stackRoot, { recursive: true, mode: 0o700 });
+  const stackReal = realDirectory(stackRoot, undefined, "report stack root");
+  try {
+    fs.mkdirSync(entriesDir, { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  realDirectory(entriesDir, stackReal, "report entries directory");
   const lock = path.join(stackRoot, ".publish.lock");
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const token = crypto.randomUUID();
@@ -463,29 +491,39 @@ function copyVisuals(source, destination, dataRoot) {
     throw new Error(`visual evidence escapes its configured data root at ${source}`);
   }
   let total = 0;
-  function visit(current, relative = "") {
+  let entries = 1;
+  function visit(current, relative = "", depth = 0) {
+    if (depth > visualDepthLimit) throw new Error(`visual evidence exceeds the ${visualDepthLimit}-level depth limit`);
     const currentReal = fs.realpathSync(current);
     const currentRelative = path.relative(sourceReal, currentReal);
     if (currentRelative === ".." || currentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(currentRelative)) {
       throw new Error(`visual evidence escapes its task directory at ${current}`);
     }
-    for (const dirent of fs.readdirSync(current, { withFileTypes: true })) {
-      const nextRelative = path.join(relative, dirent.name);
-      const input = path.join(current, dirent.name);
-      if (dirent.isSymbolicLink()) throw new Error(`visual evidence must not contain symlinks at ${input}`);
-      if (dirent.isDirectory()) visit(input, nextRelative);
-      if (!dirent.isFile()) continue;
-      const inputReal = fs.realpathSync(input);
-      const inputRelative = path.relative(sourceReal, inputReal);
-      if (inputRelative === ".." || inputRelative.startsWith(`..${path.sep}`) || path.isAbsolute(inputRelative)) {
-        throw new Error(`visual evidence escapes its task directory at ${input}`);
+    const directory = fs.opendirSync(current);
+    try {
+      let dirent;
+      while ((dirent = directory.readSync()) !== null) {
+        entries += 1;
+        if (entries > visualEntryLimit) throw new Error(`visual evidence exceeds the ${visualEntryLimit}-entry limit`);
+        const nextRelative = path.join(relative, dirent.name);
+        const input = path.join(current, dirent.name);
+        if (dirent.isSymbolicLink()) throw new Error(`visual evidence must not contain symlinks at ${input}`);
+        if (dirent.isDirectory()) visit(input, nextRelative, depth + 1);
+        if (!dirent.isFile()) continue;
+        const inputReal = fs.realpathSync(input);
+        const inputRelative = path.relative(sourceReal, inputReal);
+        if (inputRelative === ".." || inputRelative.startsWith(`..${path.sep}`) || path.isAbsolute(inputRelative)) {
+          throw new Error(`visual evidence escapes its task directory at ${input}`);
+        }
+        total += fs.statSync(inputReal).size;
+        if (total > 20 * 1024 * 1024) throw new Error("visual evidence exceeds the 20 MiB report limit");
+        const output = path.join(destination, "visuals", nextRelative);
+        fs.mkdirSync(path.dirname(output), { recursive: true });
+        fs.copyFileSync(inputReal, output);
+        copied.push(path.posix.join("visuals", ...nextRelative.split(path.sep)));
       }
-      total += fs.statSync(inputReal).size;
-      if (total > 20 * 1024 * 1024) throw new Error("visual evidence exceeds the 20 MiB report limit");
-      const output = path.join(destination, "visuals", nextRelative);
-      fs.mkdirSync(path.dirname(output), { recursive: true });
-      fs.copyFileSync(inputReal, output);
-      copied.push(path.posix.join("visuals", ...nextRelative.split(path.sep)));
+    } finally {
+      directory.closeSync();
     }
   }
   visit(source);
@@ -498,7 +536,7 @@ function readManifests() {
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
     .map((entry) => path.join(entriesDir, entry.name, "manifest.json"))
     .filter((file) => fs.existsSync(file))
-    .map((file) => JSON.parse(fs.readFileSync(file, "utf8")))
+    .map((file) => JSON.parse(readBoundedRegularFile(file, manifestLimit, "report manifest")))
     .sort((a, b) => b.completedAt.localeCompare(a.completedAt));
 }
 
@@ -508,9 +546,10 @@ function reportTransactionPath(reportId) {
 
 function writeReportTransaction(reportId, hadPrevious) {
   const transaction = reportTransactionPath(reportId);
-  const temp = `${transaction}.${process.pid}.tmp`;
+  const temp = `${transaction}.${crypto.randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify({ schemaVersion: 1, reportId, hadPrevious })}\n`, { mode: 0o600 });
+    fs.writeFileSync(temp, `${JSON.stringify({ schemaVersion: 1, reportId, hadPrevious })}\n`, { flag: "wx", mode: 0o600 });
+    assertSafeFileDestination(transaction, "report transaction destination");
     fs.renameSync(temp, transaction);
   } finally {
     fs.rmSync(temp, { force: true });
@@ -530,7 +569,7 @@ function removeStagedReports(reportId) {
 function removeAgedOrphanStaging(transactionIds) {
   const minimumAgeMs = 24 * 60 * 60 * 1000;
   for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
-    const match = entry.isDirectory() && entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.[0-9]+\.tmp$/);
+    const match = entry.isDirectory() && entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.(?:[0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.tmp$/i);
     if (!match || transactionIds.has(match[1])) continue;
     const staged = path.join(entriesDir, entry.name);
     if (Date.now() - fs.statSync(staged).mtimeMs < minimumAgeMs) continue;
@@ -547,7 +586,7 @@ function recoverPreviousEntries() {
     if (!match) continue;
     if (!entry.isFile()) throw new Error(`invalid report transaction at ${path.join(entriesDir, entry.name)}`);
     const transaction = path.join(entriesDir, entry.name);
-    const record = JSON.parse(fs.readFileSync(transaction, "utf8"));
+    const record = JSON.parse(readBoundedRegularFile(transaction, transactionLimit, "report transaction"));
     const reportId = match[1];
     if (record.schemaVersion !== 1 || record.reportId !== reportId || typeof record.hadPrevious !== "boolean") {
       throw new Error(`invalid report transaction at ${transaction}`);
@@ -593,10 +632,15 @@ function recoverPreviousEntries() {
 }
 
 function renderIndex() {
-  fs.mkdirSync(entriesDir, { recursive: true, mode: 0o700 });
-  const temp = path.join(stackRoot, `.index.html.${process.pid}.tmp`);
-  fs.writeFileSync(temp, indexPage(readManifests()), { mode: 0o600 });
-  fs.renameSync(temp, path.join(stackRoot, "index.html"));
+  const temp = path.join(stackRoot, `.index.html.${crypto.randomUUID()}.tmp`);
+  const destination = path.join(stackRoot, "index.html");
+  try {
+    fs.writeFileSync(temp, indexPage(readManifests()), { flag: "wx", mode: 0o600 });
+    assertSafeFileDestination(destination, "report index destination");
+    fs.renameSync(temp, destination);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
 }
 
 function publish(taskId, legacy) {
@@ -604,7 +648,7 @@ function publish(taskId, legacy) {
   const dataRoot = configuredRoot(dataDir, "configured data root");
   const stateRoot = configuredRoot(stateDir, "configured state root");
   const metaFile = path.join(stateDir, `${taskId}.meta`);
-  const metaSource = readArtifact(metaFile, stateRoot, "task metadata");
+  const metaSource = readArtifact(metaFile, stateRoot, "task metadata", { maxBytes: metadataLimit });
   if (metaSource === undefined) throw new Error(`no task metadata at ${metaFile}`);
   const meta = parseMeta(metaSource);
   if (meta.kind === "secondmate") throw new Error("persistent secondmate retirement is not a completion report");
@@ -641,13 +685,13 @@ function publish(taskId, legacy) {
   const previous = path.join(entriesDir, `.${id}.previous`);
   let previousManifest;
   if (fs.existsSync(destination)) {
+    realDirectory(destination, fs.realpathSync(entriesDir), "existing report entry");
     if (!fs.existsSync(path.join(destination, "manifest.json"))) throw new Error(`existing report entry is incomplete at ${destination}`);
-    previousManifest = JSON.parse(fs.readFileSync(path.join(destination, "manifest.json"), "utf8"));
+    previousManifest = JSON.parse(readBoundedRegularFile(path.join(destination, "manifest.json"), manifestLimit, "existing report manifest"));
   }
-  const staged = path.join(entriesDir, `.${id}.${process.pid}.tmp`);
+  const staged = path.join(entriesDir, `.${id}.${crypto.randomUUID()}.tmp`);
   let transaction;
-  fs.rmSync(staged, { recursive: true, force: true });
-  fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(staged, { mode: 0o700 });
   try {
     const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
     const worktreeHead = gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]);

@@ -110,10 +110,7 @@ fi
 [ -n "$BRIEF" ] || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
-PACKET_TMP="$TASK_DIR/.continuation-$ATTEMPT.md.$$"
-[ ! -e "$PACKET_TMP" ] && [ ! -L "$PACKET_TMP" ] \
-  || { echo "error: unsafe continuation packet staging path for $ID" >&2; exit 1; }
-( set -o noclobber; : > "$PACKET_TMP" ) 2>/dev/null \
+PACKET_TMP=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.XXXXXX") \
   || { echo "error: cannot safely stage continuation packet for $ID" >&2; exit 1; }
 
 packet_bytes() {
@@ -132,12 +129,6 @@ packet_check_budget() {
   local bytes
   bytes=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
   [ "$bytes" -le "$MAX_PACKET_BYTES" ] || packet_size_error "$bytes"
-}
-
-stage_snapshot_tmp() {
-  local file=$1
-  [ ! -e "$file" ] && [ ! -L "$file" ] || return 1
-  ( set -o noclobber; : > "$file" ) 2>/dev/null
 }
 
 snapshot_bytes() {
@@ -242,14 +233,12 @@ append_file_section() {  # <heading> <file>
 } >> "$PACKET_TMP"
 packet_check_budget
 
-STATUS_SNAPSHOT_TMP="$PACKET_TMP.status"
-LOG_SNAPSHOT_TMP="$PACKET_TMP.log"
-META_SNAPSHOT_TMP="$PACKET_TMP.meta"
-NO_MISTAKES_STATUS_TMP="$PACKET_TMP.no-mistakes"
-if ! stage_snapshot_tmp "$STATUS_SNAPSHOT_TMP" \
-  || ! stage_snapshot_tmp "$LOG_SNAPSHOT_TMP" \
-  || ! stage_snapshot_tmp "$META_SNAPSHOT_TMP" \
-  || ! stage_snapshot_tmp "$NO_MISTAKES_STATUS_TMP"; then
+STATUS_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-status.XXXXXX") || STATUS_SNAPSHOT_TMP=
+LOG_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-log.XXXXXX") || LOG_SNAPSHOT_TMP=
+META_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-meta.XXXXXX") || META_SNAPSHOT_TMP=
+NO_MISTAKES_STATUS_TMP=$(mktemp "$TASK_DIR/.continuation-no-mistakes.XXXXXX") || NO_MISTAKES_STATUS_TMP=
+if [ -z "$STATUS_SNAPSHOT_TMP" ] || [ -z "$LOG_SNAPSHOT_TMP" ] \
+  || [ -z "$META_SNAPSHOT_TMP" ] || [ -z "$NO_MISTAKES_STATUS_TMP" ]; then
   echo "error: cannot safely stage continuation snapshots for $ID" >&2
   exit 1
 fi

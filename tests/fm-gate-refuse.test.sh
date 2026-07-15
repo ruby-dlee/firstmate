@@ -52,10 +52,18 @@ FLEET_SYNC="$ROOT/bin/fm-fleet-sync.sh"
 X_REPLY="$ROOT/bin/fm-x-reply.sh"
 X_DISMISS="$ROOT/bin/fm-x-dismiss.sh"
 X_FOLLOWUP="$ROOT/bin/fm-x-followup.sh"
+X_LINK="$ROOT/bin/fm-x-link.sh"
+X_POLL="$ROOT/bin/fm-x-poll.sh"
 WATCH="$ROOT/bin/fm-watch.sh"
 WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
+WATCH_CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 WAKE_DRAIN="$ROOT/bin/fm-wake-drain.sh"
 REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
+BRIEF="$ROOT/bin/fm-brief.sh"
+ENSURE_AGENTS="$ROOT/bin/fm-ensure-agents-md.sh"
+LOCK="$ROOT/bin/fm-lock.sh"
+REVIEW_DIFF="$ROOT/bin/fm-review-diff.sh"
+SUPERVISE_DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -610,15 +618,23 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in fleet-sync x-reply x-dismiss x-followup watch watch-arm wake-drain; do
+  for name in fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
     case "$name" in
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
       x-reply) script=$(guarded_script "$NORMAL_CWD" "$X_REPLY"); set -- request-x "reply" ;;
       x-dismiss) script=$(guarded_script "$NORMAL_CWD" "$X_DISMISS"); set -- request-x ;;
       x-followup) script=$(guarded_script "$NORMAL_CWD" "$X_FOLLOWUP"); set -- --check task-x ;;
+      x-link) script=$(guarded_script "$NORMAL_CWD" "$X_LINK"); set -- task-x request-x ;;
+      x-poll) script=$(guarded_script "$NORMAL_CWD" "$X_POLL"); set -- ;;
       watch) script=$(guarded_script "$NORMAL_CWD" "$WATCH"); set -- ;;
       watch-arm) script=$(guarded_script "$NORMAL_CWD" "$WATCH_ARM"); set -- ;;
+      watch-checkpoint) script=$(guarded_script "$NORMAL_CWD" "$WATCH_CHECKPOINT"); set -- ;;
       wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;
+      brief) script=$(guarded_script "$NORMAL_CWD" "$BRIEF"); set -- task-x ship project-x objective ;;
+      ensure-agents) script=$(guarded_script "$NORMAL_CWD" "$ENSURE_AGENTS"); set -- "$home" ;;
+      lock) script=$(guarded_script "$NORMAL_CWD" "$LOCK"); set -- ;;
+      review-diff) script=$(guarded_script "$NORMAL_CWD" "$REVIEW_DIFF"); set -- task-x ;;
+      supervise-daemon) script=$(guarded_script "$NORMAL_CWD" "$SUPERVISE_DAEMON"); set -- ;;
     esac
     out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
       FM_HOME="$home" FM_ROOT_OVERRIDE="$NORMAL_CWD" FM_STATE_OVERRIDE="$home/state" \
@@ -660,7 +676,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
 
   assert_absent "$stack" "refused report commands created or recovered report-stack state"
   assert_absent "$home/state/.watch.lock" "refused watcher created its singleton lock"
-  pass "project sync, X publication, watcher, wake drain, and every report command refuse gate contexts"
+  pass "every directly invocable control-plane mutator and report command refuses gate contexts"
 }
 
 # --- tracked .no-mistakes.yaml ----------------------------------------------

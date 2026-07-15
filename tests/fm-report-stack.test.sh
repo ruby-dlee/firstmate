@@ -224,6 +224,77 @@ test_text_sources_are_bounded_before_reading() {
   pass "report stack truncates informational trails visibly and rejects oversized completion reports"
 }
 
+test_metadata_is_bounded_before_reading() {
+  local id=report-oversized-meta-a7 out status
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Metadata bounds."
+  dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' 'm' >> "$HOME_DIR/state/$id.meta"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "oversized task metadata was read and published"
+  assert_contains "$out" "task metadata exceeds its 1048576-byte limit" \
+    "oversized metadata refusal omitted its pre-read limit"
+  pass "report stack rejects oversized metadata before reading it"
+}
+
+test_report_temps_are_exclusive_and_randomized() {
+  local id=report-temp-safety-a8 outside entry report_id
+  id=report-temp-safety-a8
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Exclusive report staging."
+  outside="$TMP_ROOT/report-temp-sentinel"
+  printf 'sentinel\n' > "$outside"
+  mkdir -p "$STACK"
+  (
+    ln -s "$outside" "$STACK/.index.html.${BASHPID:-$$}.tmp"
+    exec env FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" publish "$id"
+  ) >/dev/null || fail "legacy predictable index temp fixture blocked randomized publication"
+  assert_grep 'sentinel' "$outside" "report index staging followed a planted temp symlink"
+  entry=$(run_stack path "$id")
+  report_id=$(basename "$(dirname "$entry")")
+  (
+    ln -s "$outside" "$STACK/entries/.$report_id.transaction.${BASHPID:-$$}.tmp"
+    exec env FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" publish "$id"
+  ) >/dev/null || fail "legacy predictable transaction temp fixture blocked randomized publication"
+  assert_grep 'sentinel' "$outside" "report transaction staging followed a planted temp symlink"
+  pass "report transactions and indexes use exclusive randomized staging"
+}
+
+test_visual_inventory_is_count_and_depth_bounded() {
+  local id out status current i
+  id=report-visual-count-a9
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Bound visual count."
+  mkdir -p "$HOME_DIR/data/$id/visuals"
+  i=1
+  while [ "$i" -le 512 ]; do
+    : > "$HOME_DIR/data/$id/visuals/file-$i.png"
+    i=$((i + 1))
+  done
+  out=$(run_stack publish "$id" 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "oversized visual entry inventory was published"
+  assert_contains "$out" "visual evidence exceeds the 512-entry limit" \
+    "visual entry refusal omitted its count limit"
+
+  id=report-visual-depth-b1
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Bound visual depth."
+  current="$HOME_DIR/data/$id/visuals"
+  mkdir -p "$current"
+  i=1
+  while [ "$i" -le 25 ]; do
+    current="$current/level-$i"
+    mkdir "$current"
+    i=$((i + 1))
+  done
+  : > "$current/evidence.png"
+  out=$(run_stack publish "$id" 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "overdeep visual inventory was published"
+  assert_contains "$out" "visual evidence exceeds the 24-level depth limit" \
+    "visual depth refusal omitted its depth limit"
+  pass "report visual traversal rejects excessive count and depth"
+}
+
 test_required_source_fails_closed() {
   local id=report-missing-b2 out status
   write_task "$id" ship
@@ -539,6 +610,9 @@ test_report_links_reject_credentials_and_encode_visual_paths
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
 test_text_sources_are_bounded_before_reading
+test_metadata_is_bounded_before_reading
+test_report_temps_are_exclusive_and_randomized
+test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_scout_and_legacy_sources

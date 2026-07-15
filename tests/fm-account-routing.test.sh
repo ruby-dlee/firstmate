@@ -1041,7 +1041,7 @@ case "${1:-}" in
     while [ ! -f "$FM_FAKE_PROVISIONAL_META_GATE" ]; do sleep 0.05; done
     exit 0
     ;;
-  *.meta.[0-9]*)
+  *.meta.*)
     "$FM_FAKE_REAL_MV" "$@" || exit $?
     touch "$FM_FAKE_INSTALLED_META_MARKER"
     while [ ! -f "$FM_FAKE_INSTALLED_META_GATE" ]; do sleep 0.05; done

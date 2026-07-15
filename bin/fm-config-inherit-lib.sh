@@ -38,6 +38,7 @@ copy_inheritable_file() {
   dest_parent=${dest%/*}
   [ -n "$dest_parent" ] && [ "$dest_parent" != "$dest" ] || return 1
   mkdir -p "$dest_parent" 2>/dev/null || return 1
+  [ -d "$dest_parent" ] && [ ! -L "$dest_parent" ] || return 1
   tmp=$(mktemp "$dest_parent/.fm-inherit.XXXXXX" 2>/dev/null) || return 1
   if ! cp "$src" "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true

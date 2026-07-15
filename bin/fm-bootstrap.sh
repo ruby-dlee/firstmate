@@ -280,8 +280,8 @@ secondmate_liveness_sweep() {
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out account_profile
-  local -a resume_args
+  local meta id window harness backend target verdict out account_profile rollback_pending retry_profile retry_out
+  local -a resume_args retry_args
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -303,19 +303,34 @@ secondmate_liveness_sweep() {
         ;;
       dead)
         account_profile=$(fm_meta_get "$meta" account_profile)
-        if [ -n "$account_profile" ] && ! "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+        rollback_pending=$(fm_meta_get "$meta" account_rollback_cleanup)
+        if [ "$rollback_pending" != pending ] && [ -n "$account_profile" ] && ! "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
           continue
         fi
         fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" 2>/dev/null || true
         resume_args=()
-        if [ -n "$account_profile" ]; then
+        if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)
         else
           resume_args+=(--no-account-routing)
         fi
         if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
           echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
+        elif [ "$rollback_pending" = pending ] && { [ ! -f "$meta" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; }; then
+          retry_profile=
+          [ ! -f "$meta" ] || retry_profile=$(fm_meta_get "$meta" account_profile)
+          retry_args=()
+          if [ -n "$retry_profile" ]; then
+            retry_args+=(--resume-account)
+          else
+            retry_args+=(--no-account-routing)
+          fi
+          if retry_out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
+          else
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
+          fi
         else
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
         fi

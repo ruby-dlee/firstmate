@@ -126,6 +126,7 @@ release_locks() {
 trap release_locks EXIT
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+fm_account_safe_file_destination "$META" || { echo "error: unsafe meta for task $ID at $META" >&2; exit 1; }
 PROFILE=$(fm_meta_get "$META" account_profile)
 [ -n "$PROFILE" ] || { fm_account_meta_lock_release "$META_LOCK" || exit 1; exit 0; }
 POOL=$(fm_meta_get "$META" account_pool)
@@ -198,15 +199,16 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "$session_id" ]; then
   exit 1
 fi
 if [ -z "$EXISTING" ]; then
-  META_TMP="$STATE/.$ID.meta.sync.$$"
-  META_ROLLBACK_TMP="$STATE/.$ID.meta.sync-rollback.$$"
+  META_TMP=$(mktemp "$STATE/.$ID.meta.sync.XXXXXX") || exit 1
+  META_ROLLBACK_TMP=$(mktemp "$STATE/.$ID.meta.sync-rollback.XXXXXX") || exit 1
   awk '!/^provider_session_id=/' "$META" > "$META_ROLLBACK_TMP" || exit 1
   cp -p "$META_ROLLBACK_TMP" "$META_TMP" || exit 1
   printf 'provider_session_id=%s\n' "$session_id" >> "$META_TMP" || { rm -f "$META_TMP"; exit 1; }
+  fm_account_safe_file_destination "$META" || { echo "error: unsafe meta for task $ID at $META" >&2; exit 1; }
   mv "$META_TMP" "$META" || { rm -f "$META_TMP"; exit 1; }
   META_TMP=
   if ! fm_account_lineage_append "$DATA" "$ID" session-bound "$ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$POOL" "$PROFILE" "$session_id" "$(fm_meta_get "$META" account_predecessor_task)"; then
-    if mv "$META_ROLLBACK_TMP" "$META"; then
+    if fm_account_safe_file_destination "$META" && mv "$META_ROLLBACK_TMP" "$META"; then
       META_ROLLBACK_TMP=
     else
       echo "error: session lineage failed and prior metadata could not be restored for $ID" >&2

@@ -53,15 +53,36 @@
 # neutral-execution-context and the HEAD-continuity guard. The dedicated
 # tests/fm-gate-refuse.test.sh strips the bypass so it still verifies real refusal.
 #
-# The reviewed direct-entrypoint boundary includes fm-fleet-sync.sh,
-# fm-x-reply.sh, fm-x-dismiss.sh, fm-x-followup.sh, fm-watch.sh,
-# fm-watch-arm.sh, fm-wake-drain.sh, and fm-report-stack.mjs alongside the
-# existing primary fleet lifecycle and merge commands.
-# fm-backend.sh is excluded because it is a sourced adapter library with no
-# create/kill command-line dispatch; those functions remain guarded by their
-# owning entrypoints.
+# Guarded direct mutators: fm-account-continuation.sh,
+# fm-account-session-sync.sh, fm-afk-launch.sh, fm-afk-start.sh,
+# fm-backlog-handoff.sh, fm-bootstrap.sh, fm-brief.sh, fm-config-push.sh,
+# fm-ensure-agents-md.sh, fm-fleet-sync.sh, fm-home-seed.sh, fm-lock.sh,
+# fm-merge-local.sh, fm-pr-check.sh, fm-pr-merge.sh, fm-promote.sh,
+# fm-report-stack.mjs, fm-review-diff.sh, fm-send.sh, fm-session-start.sh,
+# fm-spawn.sh, fm-supervise-daemon.sh, fm-teardown.sh, fm-update.sh,
+# fm-wake-drain.sh, fm-watch-arm.sh, fm-watch-checkpoint.sh, fm-watch.sh,
+# fm-x-dismiss.sh, fm-x-followup.sh, fm-x-link.sh, fm-x-poll.sh, and
+# fm-x-reply.sh.
+# Excluded read-only entrypoints: fm-arm-command-policy.mjs,
+# fm-arm-pretool-check.sh, fm-bearings-snapshot.sh, fm-cd-command-policy.mjs,
+# fm-cd-pretool-check.sh, fm-crew-state.sh, fm-dispatch-select.sh,
+# fm-fleet-snapshot.sh, fm-fleet-view.sh, fm-guard.sh, fm-harness.sh,
+# fm-peek.sh, fm-project-mode.sh, and fm-supervision-instructions.sh.
+# Excluded sourced libraries have no mutating command-line dispatch:
+# backends/cmux.sh, backends/herdr.sh, backends/orca.sh, backends/tmux.sh,
+# backends/zellij.sh, fm-account-routing-lib.sh, fm-backend-hometag-lib.sh,
+# fm-backend.sh, fm-classify-lib.sh, fm-composer-lib.sh,
+# fm-config-inherit-lib.sh, fm-ff-lib.sh, fm-gate-refuse-lib.sh,
+# fm-lock-lib.sh, fm-marker-lib.sh, fm-report-contract-lib.sh,
+# fm-supervisor-target-lib.sh, fm-tangle-lib.sh, fm-tasks-axi-lib.sh,
+# fm-tmux-lib.sh, fm-transition-lib.sh, fm-wake-lib.sh, and fm-x-lib.sh.
 # fm-herdr-lab.sh is excluded because it accepts only isolated fm-lab-* sessions
 # and protects the live default session with its own tripwire.
+# fm-install-shellcheck.sh and fm-lint.sh are excluded developer verification
+# tools and never mutate fleet, project, or captain data.
+# fm-turnend-guard.sh and fm-turnend-guard-grok.sh are excluded harness hooks:
+# the predicate is read-only, and the Grok adapter invokes that predicate rather
+# than a fleet control-plane mutation.
 # Sourced by those guarded shell entrypoints and the tests.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a

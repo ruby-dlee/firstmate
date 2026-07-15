@@ -131,7 +131,27 @@ fm_afk_native_process_write() {
     rm -f "$pending"
     return 1
   fi
+  if [ -L "$FM_AFK_NATIVE_PROCESS" ] || { [ -e "$FM_AFK_NATIVE_PROCESS" ] && [ ! -f "$FM_AFK_NATIVE_PROCESS" ]; }; then
+    rm -f "$pending"
+    return 1
+  fi
   mv "$pending" "$FM_AFK_NATIVE_PROCESS" || { rm -f "$pending"; return 1; }
+}
+
+fm_afk_start_state_prepare() {
+  mkdir -p "$FM_AFK_STATE" || return 1
+  [ -d "$FM_AFK_STATE" ] && [ ! -L "$FM_AFK_STATE" ]
+}
+
+fm_afk_start_flag_write() {
+  local destination="$FM_AFK_STATE/.afk" pending
+  pending=$(mktemp "$FM_AFK_STATE/.afk.pending.XXXXXX") || return 1
+  date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
+  if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    rm -f "$pending"
+    return 1
+  fi
+  mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
 }
 
 fm_afk_native_process_identity() {
@@ -163,7 +183,7 @@ fm_afk_start_main() {
     * ) echo "usage: $(basename "${BASH_SOURCE[1]:-fm-afk-start.sh}")" >&2; return 2 ;;
   esac
 
-  mkdir -p "$FM_AFK_STATE"
+  fm_afk_start_state_prepare || return 1
   fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     prepared=1
@@ -172,7 +192,7 @@ fm_afk_start_main() {
       echo "afk: launcher-prepared state is missing" >&2
       return 1
     fi
-  elif ! date '+%s' > "$FM_AFK_STATE/.afk"; then
+  elif ! fm_afk_start_flag_write; then
     fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
     return 1
   fi

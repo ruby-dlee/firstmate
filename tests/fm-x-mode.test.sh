@@ -250,7 +250,10 @@ test_poll_inbox_commit_failure_reports_error() {
   fakebin=$(make_fake_curl "$home")
   cat > "$fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-exit 1
+for arg in "$@"; do
+  case "$arg" in */x-inbox/*) exit 1 ;; esac
+done
+exec /bin/mv "$@"
 SH
   chmod +x "$fakebin/mv"
   printf 'FMX_PAIRING_TOKEN=tok-q\n' > "$home/.env"
@@ -263,6 +266,9 @@ SH
     || fail "poll inbox commit failure must emit an error, not a wake marker (got: $out)"
   assert_absent "$home/state/x-inbox/req-rename.json" "poll must not report a committed inbox file that was not created"
   assert_absent "$home/state/x-inbox/req-rename.json.tmp" "poll must clean up the failed inbox temp file"
+  if find "$home/state/x-inbox" -maxdepth 1 -name '.req-rename.*' -print -quit | grep -q .; then
+    fail "poll retained a randomized failed inbox staging file"
+  fi
   assert_present "$home/state/x-poll.error" "poll inbox commit failure must write a dedupe marker"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
@@ -278,6 +284,38 @@ SH
     || fail "poll must emit the mention marker once the inbox write succeeds (got: $out)"
   assert_absent "$home/state/x-poll.error" "successful inbox write must clear the diagnostic marker"
   pass "fm-x-poll reports inbox commit failures without emitting a mention wake"
+}
+
+test_poll_refuses_unsafe_inbox_publication_paths() {
+  local home fakebin outside out rc body
+  body='{"request_id":"req-safe-path","platform":"x","reply_max_chars":280,"text":"question"}'
+
+  home="$TMP_ROOT/poll-inbox-dir-symlink"; mkdir -p "$home/state"
+  outside="$TMP_ROOT/poll-inbox-outside"; mkdir -p "$outside"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside" "$home/state/x-inbox"
+  fakebin=$(make_fake_curl "$home")
+  printf 'FMX_PAIRING_TOKEN=tok-safe-path\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" "$ROOT/bin/fm-x-poll.sh"); rc=$?
+  expect_code 0 "$rc" "poll symlinked inbox directory exit"
+  [ "$out" = "x-mode-error cannot create inbox" ] \
+    || fail "symlinked inbox directory emitted an unsafe wake payload (got: $out)"
+  assert_grep 'sentinel' "$outside/sentinel" "symlinked inbox directory changed outside data"
+  assert_absent "$outside/req-safe-path.json" "symlinked inbox directory published outside state"
+
+  home="$TMP_ROOT/poll-inbox-file-symlink"; mkdir -p "$home/state/x-inbox"
+  outside="$TMP_ROOT/poll-inbox-file-outside"; printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$home/state/x-inbox/req-safe-path.json"
+  fakebin=$(make_fake_curl "$home")
+  printf 'FMX_PAIRING_TOKEN=tok-safe-path\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" "$ROOT/bin/fm-x-poll.sh"); rc=$?
+  expect_code 0 "$rc" "poll symlinked inbox destination exit"
+  [ "$out" = "x-mode-error cannot write inbox" ] \
+    || fail "symlinked inbox destination emitted an unsafe wake payload (got: $out)"
+  assert_grep 'sentinel' "$outside" "symlinked inbox destination overwrote outside data"
+  pass "fm-x-poll keeps unsafe inbox paths fail-inert and contained"
 }
 
 test_poll_rejects_unsafe_request_id() {
@@ -1295,6 +1333,30 @@ test_context_registry_merges_partial_updates() {
   pass "context registry merges partial relay updates"
 }
 
+test_context_registry_refuses_symlinked_storage() {
+  local home outside rc
+  home="$TMP_ROOT/registry-dir-symlink"; mkdir -p "$home/state"
+  outside="$TMP_ROOT/registry-dir-outside"; mkdir -p "$outside"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe x 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 0 "$rc" "registry real-directory precondition"
+  rm -rf "$home/state/x-context"
+  ln -s "$outside" "$home/state/x-context"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe x 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 1 "$rc" "registry symlinked directory refusal"
+  assert_absent "$outside/req-unsafe.json" "registry followed a symlinked directory"
+
+  rm -f "$home/state/x-context"; mkdir -p "$home/state/x-context"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside/sentinel" "$home/state/x-context/req-unsafe.json"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe discord 1900' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 1 "$rc" "registry symlinked record refusal"
+  assert_grep 'sentinel' "$outside/sentinel" "registry merged or overwrote a symlinked record"
+  pass "context registry refuses symlinked directories and records"
+}
+
 test_context_registry_retention_starts_on_successful_live_answer() {
   local home fakebin out rc reg
   home="$TMP_ROOT/registry-answer-window"
@@ -2309,6 +2371,7 @@ test_poll_auth_error_reports_once
 test_poll_question_stashes_and_marks
 test_poll_preserves_conversation_context
 test_poll_inbox_commit_failure_reports_error
+test_poll_refuses_unsafe_inbox_publication_paths
 test_poll_empty_text_is_silent
 test_poll_rejects_unsafe_request_id
 test_reply_success_posts_request_bound_only
@@ -2349,6 +2412,7 @@ test_poll_records_context_registry_from_relay_platform
 test_context_registry_prunes_expired_records
 test_context_registry_preserves_first_seen_timestamp
 test_context_registry_merges_partial_updates
+test_context_registry_refuses_symlinked_storage
 test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup

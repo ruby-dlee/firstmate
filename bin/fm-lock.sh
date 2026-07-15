@@ -13,7 +13,11 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 mkdir -p "$STATE"
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe state directory at $STATE" >&2; exit 1; }
 
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|^pi$'
@@ -48,12 +52,16 @@ lock_start_time() {
 write_lock() {
   local pid=$1 start tmp
   start=$(process_start_time "$pid") || return 1
-  tmp="$LOCK.tmp.$$"
+  tmp=$(mktemp "$STATE/.lock.XXXXXX") || return 1
   {
     printf '%s\n' "$pid"
     printf '%s\n' "$start"
   } > "$tmp" || return 1
-  mv -f "$tmp" "$LOCK"
+  if [ -L "$LOCK" ] || { [ -e "$LOCK" ] && [ ! -f "$LOCK" ]; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$LOCK" || { rm -f "$tmp"; return 1; }
 }
 
 harness_pid() {

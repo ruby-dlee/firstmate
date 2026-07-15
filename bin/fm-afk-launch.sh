@@ -69,6 +69,11 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
+fm_afk_launch_state_prepare() {
+  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  [ -d "$FM_AFK_LAUNCH_STATE" ] && [ ! -L "$FM_AFK_LAUNCH_STATE" ]
+}
+
 FM_AFK_LAUNCH_LOCK_TOKEN=
 
 fm_afk_launch_path_identity() {
@@ -116,13 +121,11 @@ fm_afk_launch_lock_acquire() {
   local candidate claim_candidate reclaim reclaim_identity token reclaim_token ownerless_grace
   ownerless_grace=${FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS:-1}
   case "$ownerless_grace" in ''|*[!0-9]*) return 1 ;; esac
-  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  fm_afk_launch_state_prepare || return 1
   for i in $(seq 1 200); do
     if [ ! -e "$FM_AFK_LAUNCH_LOCK" ]; then
-      token="$$.$RANDOM.$i"
-      candidate="$FM_AFK_LAUNCH_LOCK.candidate.$token"
-      rm -rf "$candidate" 2>/dev/null || true
-      mkdir "$candidate" 2>/dev/null || { sleep 0.05; continue; }
+      candidate=$(mktemp -d "$FM_AFK_LAUNCH_LOCK.candidate.XXXXXX" 2>/dev/null) || { sleep 0.05; continue; }
+      token=${candidate##*.candidate.}
       identity=$(fm_pid_identity "$$" 2>/dev/null) || {
         rm -rf "$candidate"
         return 1
@@ -243,7 +246,7 @@ fm_afk_launch_entry_cmd() {
 
 fm_afk_launch_record_write() {  # <backend> <target> <extra>
   local pending
-  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  fm_afk_launch_state_prepare || return 1
   pending=$(mktemp "$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal.pending.XXXXXX") || return 1
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$pending" || { rm -f "$pending"; return 1; }
   if [ -L "$FM_AFK_LAUNCH_RECORD" ] || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
@@ -256,7 +259,7 @@ fm_afk_launch_record_write() {  # <backend> <target> <extra>
 
 fm_afk_launch_flag_write() {
   local destination="$FM_AFK_LAUNCH_STATE/.afk" pending
-  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  fm_afk_launch_state_prepare || return 1
   pending=$(mktemp "$FM_AFK_LAUNCH_STATE/.afk.pending.XXXXXX") || return 1
   date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
   if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
@@ -665,7 +668,7 @@ fm_afk_launch_start() {
     fm_afk_launch_log "using legacy supervisor fallback $captain_backend:$captain_target"
   fi
 
-  mkdir -p "$FM_AFK_LAUNCH_STATE"
+  fm_afk_launch_state_prepare || return 1
 
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
@@ -724,7 +727,7 @@ fm_afk_launch_start() {
 
 fm_afk_launch_start_native_locked() {
   local backup artifact had_afk=0 result=0 record_result
-  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  fm_afk_launch_state_prepare || return 1
   if fm_afk_native_process_live; then
     fm_afk_launch_record_read
     record_result=$?

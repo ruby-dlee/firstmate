@@ -246,6 +246,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
   RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  fm_account_safe_file_destination "$RESUME_META" || { echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2; exit 1; }
   LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
   trap '[ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
@@ -398,8 +399,8 @@ ORIGINAL_GROK_TOKEN_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
 
 snapshot_existing_artifacts() {
-  local backup="$STATE/.$ID.artifacts.rollback.$$" name source tasktmp="/tmp/fm-$ID"
-  mkdir "$backup" || return 1
+  local backup name source tasktmp="/tmp/fm-$ID"
+  backup=$(mktemp -d "$STATE/.$ID.artifacts.rollback.XXXXXX") || return 1
   for name in "$ID.status" "$ID.turn-ended" "$ID.check.sh" "$ID.pi-ext.ts" "$ID.grok-turnend-token"; do
     source="$STATE/$name"
     if [ -e "$source" ] || [ -L "$source" ]; then
@@ -439,8 +440,9 @@ parse_orca_worktree_result() {
 persist_failed_account_rollback() {
   local meta tmp current_task backup_name artifact_backup_name rollback_window preserve_extensions=0
   mkdir -p "$STATE" || return 1
+  fm_account_real_directory "$STATE" || return 1
   meta="$STATE/$ID.meta"
-  tmp="$STATE/.$ID.meta.rollback-pending.$$"
+  tmp=$(mktemp "$STATE/.$ID.meta.rollback-pending.XXXXXX") || return 1
   current_task=$(fm_account_meta_value "$meta" account_task)
   if [ -f "$meta" ] && [ "$current_task" = "$ACCOUNT_TASK" ]; then
     awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -505,13 +507,16 @@ persist_failed_account_rollback() {
     printf 'account_rollback_artifacts=%s\n' "$artifact_backup_name" >> "$tmp"
   fi
   [ "$RESUME_ACCOUNT" != 1 ] || printf 'account_rollback_preserve_session=1\n' >> "$tmp"
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
   META_INSTALLED=1
 }
 
 clear_account_rollback_markers() {
-  local meta="$STATE/$ID.meta" tmp="$STATE/.$ID.meta.rollback-commit.$$"
+  local meta="$STATE/$ID.meta" tmp
+  tmp=$(mktemp "$STATE/.$ID.meta.rollback-commit.XXXXXX") || return 1
   awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
 }
 
@@ -524,7 +529,7 @@ persist_failed_account_rollback_short() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp
   trap - EXIT
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
   if [ -n "${META_WRITE_LOCK:-}" ]; then
@@ -539,7 +544,10 @@ spawn_abort_cleanup() {
     if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
       if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
         mkdir -p "$STATE" 2>/dev/null || true
-        if [ -d "$STATE" ]; then
+        if [ -d "$STATE" ] && [ ! -L "$STATE" ]; then
+          orca_meta_tmp=$(mktemp "$STATE/.${ID:-unknown}.meta.orca-cleanup.XXXXXX" 2>/dev/null) || orca_meta_tmp=
+        fi
+        if [ -n "${orca_meta_tmp:-}" ]; then
           {
             echo "window=${W:-fm-${ID:-unknown}}"
             echo "worktree=${WT:-}"
@@ -554,7 +562,11 @@ spawn_abort_cleanup() {
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-          } > "$STATE/${ID:-unknown}.meta" 2>/dev/null || true
+          } > "$orca_meta_tmp" 2>/dev/null || true
+          if fm_account_safe_file_destination "$STATE/${ID:-unknown}.meta"; then
+            mv "$orca_meta_tmp" "$STATE/${ID:-unknown}.meta" 2>/dev/null || true
+          fi
+          [ ! -e "$orca_meta_tmp" ] || rm -f "$orca_meta_tmp"
         fi
       fi
     fi
@@ -613,6 +625,7 @@ spawn_abort_cleanup() {
           artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
           if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
             && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
+            && fm_account_safe_file_destination "$STATE/$ID.meta" \
             && mv "$META_BACKUP" "$STATE/$ID.meta"; then
             [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
             EXISTING_ARTIFACT_BACKUP=
@@ -629,10 +642,18 @@ spawn_abort_cleanup() {
       elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] && [ "$worktree_clean" = 1 ]; then
         rm -f "$STATE/$ID.meta"
       elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
-        rollback_tmp="$STATE/.$ID.meta.rollback.$$"
-        awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/' "$STATE/$ID.meta" > "$rollback_tmp"
-        printf 'rollback_pending=1\n' >> "$rollback_tmp"
-        mv "$rollback_tmp" "$STATE/$ID.meta"
+        rollback_tmp=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX" 2>/dev/null) || rollback_tmp=
+        if [ -n "$rollback_tmp" ] \
+          && awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/' "$STATE/$ID.meta" > "$rollback_tmp" \
+          && printf 'rollback_pending=1\n' >> "$rollback_tmp" \
+          && fm_account_safe_file_destination "$STATE/$ID.meta" \
+          && mv "$rollback_tmp" "$STATE/$ID.meta"; then
+          rollback_tmp=
+        else
+          [ -z "$rollback_tmp" ] || rm -f "$rollback_tmp"
+          account_clean=0
+          echo "warning: failed to preserve rollback metadata for ${ID:-unknown}" >&2
+        fi
       fi
       if [ "$account_clean" = 1 ] && [ "$restored_existing_meta" != 1 ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$worktree_clean" = 1 ]; then
         [ "$ORIGINAL_STATUS_PRESENT" != 0 ] || rm -f "$STATE/$ID.status"
@@ -932,7 +953,9 @@ ACCOUNT_EXPLICIT=0
 if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
-ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 "$NO_ACCOUNT_ROUTING") || exit 1
+if [ "$KIND" = secondmate ]; then
+  ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 "$NO_ACCOUNT_ROUTING") || exit 1
+fi
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
@@ -1010,7 +1033,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       echo "error: managed task generation changed before recovery mutation for $ID" >&2
       exit 1
     fi
-    META_BACKUP="$STATE/.$ID.meta.rollback.$$"
+    META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
     cp -p "$RESUME_META" "$META_BACKUP" || exit 1
   fi
   fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
@@ -1043,7 +1066,7 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
     *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
   esac
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-    META_BACKUP="$STATE/.$ID.meta.rollback.$$"
+    META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
     cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
     snapshot_existing_artifacts || exit 1
   fi
@@ -1608,6 +1631,7 @@ mkdir -p "$TASK_TMP/gotmp"
 # agent finishes a turn. Worktree-resident hooks are kept out of git's view so
 # they never block teardown's dirty check or leak into a commit.
 mkdir -p "$STATE"
+fm_account_real_directory "$STATE" || { echo "error: unsafe state directory at $STATE" >&2; exit 1; }
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
 exclude_path() {
@@ -1769,7 +1793,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     exit 1
   fi
 fi
-META_TMP="$STATE/.$ID.meta.$$"
+META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
 {
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
@@ -1853,6 +1877,7 @@ if [ -f "$STATE/$ID.meta" ]; then
   PRESERVE_META_SOURCE="$STATE/$ID.meta"
   fm_account_meta_merge_extensions "$PRESERVE_META_SOURCE" "$META_TMP" || exit 1
 fi
+fm_account_safe_file_destination "$STATE/$ID.meta" || { echo "error: unsafe task metadata destination at $STATE/$ID.meta" >&2; exit 1; }
 mv "$META_TMP" "$STATE/$ID.meta"
 META_INSTALLED=1
 [ -z "$META_WRITE_LOCK" ] || fm_account_meta_lock_release "$META_WRITE_LOCK"

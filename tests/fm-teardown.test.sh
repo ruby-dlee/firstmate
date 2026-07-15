@@ -1897,6 +1897,48 @@ SH
   pass "teardown restores pending rollback state before required report publication"
 }
 
+test_required_report_revalidates_after_quiescence() {
+  local case_dir data live rc
+  case_dir=$(make_case report-post-quiesce-safety)
+  data="$case_dir/data"
+  live="$case_dir/report-endpoint-live"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$data/task-x1"
+  printf '# Task\n\nQuiesce before validation\n' > "$data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nReady.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    printf 'late work\n' > "$FM_FAKE_WORKTREE/late-work.txt"
+    rm -f "$FM_FAKE_REPORT_LIVE"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  : > "$live"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+    FM_FAKE_REPORT_LIVE="$live" FM_FAKE_WORKTREE="$case_dir/wt" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "required report: post-quiescence dirty work must refuse teardown"
+  assert_absent "$live" "required report validation ran before endpoint quiescence"
+  assert_present "$case_dir/wt/late-work.txt" "post-quiescence safety refusal discarded late work"
+  assert_present "$case_dir/state/task-x1.meta" "post-quiescence safety refusal removed metadata"
+  assert_grep 'endpoint has already been shut down; the worktree and task metadata are preserved' "$case_dir/stderr" \
+    "post-quiescence safety refusal did not explain the fail-safe state"
+  assert_absent "$case_dir/report-stack/index.html" "unsafe post-quiescence state was published"
+  pass "required report teardown quiesces before its final safety validation"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1915,6 +1957,7 @@ test_forced_secondmate_quiesces_parent_before_child_cleanup
 test_herdr_teardown_clears_escalation_marker
 test_required_report_blocks_then_publishes_before_cleanup
 test_required_report_restores_rollback_generation_before_publish
+test_required_report_revalidates_after_quiescence
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

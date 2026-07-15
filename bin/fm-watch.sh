@@ -47,6 +47,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 mkdir -p "$STATE"
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe watcher state directory: $STATE" >&2; exit 1; }
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -162,13 +163,19 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # size-capped so a long benign stretch cannot grow it without bound. Best-effort:
 # a logging hiccup never affects supervision.
 triage_log() {
-  local sz
+  local sz tmp
+  [ ! -L "$TRIAGE_LOG" ] && { [ ! -e "$TRIAGE_LOG" ] || [ -f "$TRIAGE_LOG" ]; } || return 0
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$TRIAGE_LOG" 2>/dev/null || return 0
   sz=$(wc -c < "$TRIAGE_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$sz" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$sz" -ge "$TRIAGE_LOG_MAX_BYTES" ]; then
-    tail -n 2000 "$TRIAGE_LOG" > "$TRIAGE_LOG.tmp" 2>/dev/null && mv -f "$TRIAGE_LOG.tmp" "$TRIAGE_LOG" 2>/dev/null
-    rm -f "$TRIAGE_LOG.tmp" 2>/dev/null || true
+    tmp=$(mktemp "$STATE/.watch-triage.pending.XXXXXX") || return 0
+    if tail -n 2000 "$TRIAGE_LOG" > "$tmp" 2>/dev/null \
+      && [ ! -L "$TRIAGE_LOG" ] \
+      && { [ ! -e "$TRIAGE_LOG" ] || [ -f "$TRIAGE_LOG" ]; }; then
+      mv -f "$tmp" "$TRIAGE_LOG" 2>/dev/null || true
+    fi
+    rm -f "$tmp" 2>/dev/null || true
   fi
 }
 

@@ -324,6 +324,65 @@ test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
   pass "unmanaged secondmate recovery explicitly stays outside newly enabled account routing"
 }
 
+test_pending_rollback_recovery_bypasses_session_gate_and_retries() {
+  local variant w fb tmuxfb log out fake_root meta
+  for variant in profile profileless; do
+    w=$(new_world "sweep-rollback-$variant")
+    add_sm_home "$w" sm1 firstmate:fm-sm1
+    meta="$w/home/state/sm1.meta"
+    printf '%s\n' 'account_rollback_cleanup=pending' >> "$meta"
+    if [ "$variant" = profile ]; then
+      printf '%s\n' 'account_profile=claude-2' >> "$meta"
+    fi
+    fake_root="$w/fake-root"
+    mkdir -p "$fake_root/bin"
+    cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'session-sync %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
+exit 1
+SH
+    cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'spawn %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
+count=$(grep -c '^spawn ' "$FM_ROLLBACK_CALL_LOG")
+meta="$FM_HOME/state/$1.meta"
+if [ "$count" -eq 1 ]; then
+  tmp=$(mktemp "$FM_HOME/state/.rollback-test.XXXXXX") || exit 1
+  grep -v '^account_rollback_cleanup=pending$' "$meta" > "$tmp" || exit 1
+  mv "$tmp" "$meta" || exit 1
+  exit 1
+fi
+exit 0
+SH
+    chmod +x "$fake_root/bin/"*.sh
+    fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+    log="$w/calls.log"; : > "$log"
+
+    out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+      FM_ROOT_OVERRIDE="$fake_root" FM_ROLLBACK_CALL_LOG="$log")
+
+    assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: rollback reconciled and respawned" \
+      "$variant rollback recovery did not converge in the liveness sweep"
+    assert_not_contains "$(cat "$log")" "session-sync" \
+      "$variant rollback recovery was blocked by pre-bind session synchronization"
+    grep -q '^spawn sm1 --secondmate --resume-account$' "$log" \
+      || fail "$variant rollback recovery did not enter rollback-first resume: $(cat "$log")"
+    if [ "$variant" = profile ]; then
+      [ "$(grep -c '^spawn sm1 --secondmate --resume-account$' "$log")" -eq 2 ] \
+        || fail "profile rollback recovery did not retry the restored managed generation"
+    else
+      assert_contains "$(cat "$log")" "spawn sm1 --secondmate --no-account-routing" \
+        "profileless rollback recovery did not retry its restored unmanaged generation"
+    fi
+  done
+  pass "pending secondmate rollback recovery bypasses pre-bind gating and converges"
+}
+
 test_sweep_leaves_alive_secondmate_untouched() {
   local w fb tmuxfb log out
   w=$(new_world sweep-alive)
@@ -434,6 +493,7 @@ test_herdr_agent_alive_preserves_identity_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+test_pending_rollback_recovery_bypasses_session_gate_and_retries
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_never_acts_on_inconclusive_reading
 test_sweep_never_acts_on_unverified_harness_dead_reading

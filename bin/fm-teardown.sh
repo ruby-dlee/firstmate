@@ -148,6 +148,10 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+REPORT_GATED=0
+if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
+  REPORT_GATED=1
+fi
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt state last=unknown
@@ -1128,8 +1132,10 @@ cleanup_firstmate_home_children() {
 remove_secondmate_registry_entry() {
   local id=$1 tmp
   [ -f "$SECONDMATE_REG" ] || return 0
-  tmp="$SECONDMATE_REG.tmp.$$"
+  fm_account_safe_file_destination "$SECONDMATE_REG" || return 1
+  tmp=$(mktemp "$DATA/.secondmates.XXXXXX") || return 1
   grep -vE "^- $id( |$)" "$SECONDMATE_REG" > "$tmp" || true
+  fm_account_safe_file_destination "$SECONDMATE_REG" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$SECONDMATE_REG"
 }
 
@@ -1160,30 +1166,6 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "REFUSED: scout task $ID has no report at $REPORT." >&2
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
-  fi
-fi
-
-if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
-  if ! inspectable_git_worktree "$WT"; then
-    echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
-    echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
-    exit 1
-  fi
-  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || exit 1
-  ORCA_PATH_MATCH_VERIFIED=1
-fi
-
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
-  if validate_worktree_teardown_safety; then
-    :
-  else
-    safety_rc=$?
-    if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
-      cleanup_stale_lock_for_safety_check "$WT" || exit 1
-      validate_worktree_teardown_safety || exit 1
-    else
-      exit 1
-    fi
   fi
 fi
 
@@ -1218,13 +1200,47 @@ quiesce_completion_report_endpoint() {
   return 1
 }
 
+report_gated_safety_refusal() {
+  [ "$REPORT_GATED" = 1 ] || return 0
+  echo "The completion-report endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
+}
+
+if [ "$REPORT_GATED" = 1 ]; then
+  quiesce_completion_report_endpoint || exit 1
+fi
+
+if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+  if ! inspectable_git_worktree "$WT"; then
+    echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
+    echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
+    report_gated_safety_refusal
+    exit 1
+  fi
+  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || { report_gated_safety_refusal; exit 1; }
+  ORCA_PATH_MATCH_VERIFIED=1
+fi
+
+if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+  if validate_worktree_teardown_safety; then
+    :
+  else
+    safety_rc=$?
+    if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
+      cleanup_stale_lock_for_safety_check "$WT" || { report_gated_safety_refusal; exit 1; }
+      validate_worktree_teardown_safety || { report_gated_safety_refusal; exit 1; }
+    else
+      report_gated_safety_refusal
+      exit 1
+    fi
+  fi
+fi
+
 # New tasks quiesce their endpoint, restore any pending rollback generation,
 # and fail closed on their machine-global completion report before lease release
 # or worktree removal. Tasks already in flight when this feature lands have no
 # report_required marker and retain the legacy teardown contract. --force is an
 # explicit discard, not a completion.
-if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
-  quiesce_completion_report_endpoint || exit 1
+if [ "$REPORT_GATED" = 1 ]; then
   if [ "$MANAGED_ACCOUNT" = 1 ]; then
     reconcile_managed_account_rollback "$META" "$ID" "$DATA" || exit $?
   fi

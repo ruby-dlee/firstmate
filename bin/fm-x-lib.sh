@@ -274,6 +274,7 @@ fmx_context_registry_prune() {
   local state=$1 dir now max_age file recorded_at age
   dir="$state/x-context"
   [ -d "$dir" ] || return 0
+  [ ! -L "$dir" ] || return 1
   now=${FMX_NOW_OVERRIDE:-$(date +%s)}
   case "$now" in
     ''|*[!0-9]*) return 0 ;;
@@ -324,13 +325,17 @@ fmx_context_registry_set() {
   esac
   dir="$state/x-context"
   mkdir -p "$dir" 2>/dev/null || return 1
-  fmx_context_registry_prune "$state"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  fmx_context_registry_prune "$state" || return 1
   now=${FMX_NOW_OVERRIDE:-$(date +%s)}
   case "$now" in
     ''|*[!0-9]*) return 1 ;;
   esac
   [ "${#now}" -le 18 ] || return 1
   file="$dir/$rid.json"
+  if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+    return 1
+  fi
   if [ -f "$file" ]; then
     existing=$(fmx_context_registry_get "$state" "$rid")
     [ -n "$platform" ] || platform=$(printf '%s\n' "$existing" | jq -r '.platform // ""' 2>/dev/null)
@@ -350,6 +355,10 @@ fmx_context_registry_set() {
   if jq -cn --arg rid "$rid" --arg platform "$platform" --arg max "$reply_max" \
       --argjson recorded_at "$recorded_at" \
       '{request_id:$rid, platform:$platform, reply_max_chars:$max, recorded_at:$recorded_at}' > "$tmp" 2>/dev/null; then
+    if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+      rm -f "$tmp"
+      return 1
+    fi
     mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
   else
     rm -f "$tmp"; return 1
@@ -360,13 +369,18 @@ fmx_context_registry_set() {
 # reply context as {"platform":"...","reply_max_chars":"..."} (the same shape as
 # the inbox and relay extractors), or the empty shape when no record exists.
 fmx_context_registry_get() {
-  local state=$1 rid=$2 file
+  local state=$1 rid=$2 dir file
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) printf '{"platform":"","reply_max_chars":""}\n'; return 0 ;;
   esac
-  fmx_context_registry_prune "$state"
-  file="$state/x-context/$rid.json"
-  if [ ! -f "$file" ]; then
+  dir="$state/x-context"
+  if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  fmx_context_registry_prune "$state" || { printf '{"platform":"","reply_max_chars":""}\n'; return 0; }
+  file="$dir/$rid.json"
+  if [ ! -f "$file" ] || [ -L "$file" ]; then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi
@@ -378,11 +392,13 @@ fmx_context_registry_get() {
 # Idempotent and best-effort; a dismiss (no follow-up will ever come) uses it so
 # a skipped mention leaves no stray context behind.
 fmx_context_registry_clear() {
-  local state=$1 rid=$2
+  local state=$1 rid=$2 dir
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) return 0 ;;
   esac
-  rm -f "$state/x-context/$rid.json" 2>/dev/null || true
+  dir="$state/x-context"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  rm -f "$dir/$rid.json" 2>/dev/null || true
   return 0
 }
 
@@ -707,6 +723,7 @@ fmx_post_json() (
 fmx_meta_get() {
   local meta=$1 key=$2 line
   [ -f "$meta" ] || return 0
+  [ ! -L "$meta" ] || return 0
   line=$(grep -E "^${key}=" "$meta" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   printf '%s' "${line#*=}"
@@ -717,7 +734,7 @@ fmx_meta_tmp() {
   dir=${meta%/*}
   base=${meta##*/}
   [ "$dir" != "$meta" ] || dir=.
-  [ -d "$dir" ] || return 1
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
   mktemp "$dir/.${base}.fm-x.XXXXXX"
 }
 
@@ -734,7 +751,7 @@ fmx_meta_link_set() {
   task=${meta##*/}
   task=${task%.meta}
   lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
-  [ -f "$meta" ] || status=1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
   if [ "$status" -eq 0 ]; then
     tmp=$(fmx_meta_tmp "$meta") || status=1
   fi
@@ -756,6 +773,9 @@ fmx_meta_link_set() {
     esac
   fi
   if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
     mv -f "$tmp" "$meta" || status=1
   fi
   if [ "$status" -ne 0 ] && [ -n "${tmp:-}" ]; then
@@ -774,7 +794,7 @@ fmx_meta_followups_set() {
   task=${meta##*/}
   task=${task%.meta}
   lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
-  [ -f "$meta" ] || status=1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
   if [ "$status" -eq 0 ]; then
     tmp=$(fmx_meta_tmp "$meta") || status=1
   fi
@@ -783,6 +803,9 @@ fmx_meta_followups_set() {
   fi
   if [ "$status" -eq 0 ]; then
     printf 'x_followups=%s\n' "$n" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
   fi
   if [ "$status" -eq 0 ]; then
     mv -f "$tmp" "$meta" || status=1
@@ -800,18 +823,21 @@ fmx_meta_followups_set() {
 # missing.
 fmx_meta_link_clear() {
   local meta=$1 tmp state task lock status=0
-  [ -f "$meta" ] || return 0
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
   state=${meta%/*}
   task=${meta##*/}
   task=${task%.meta}
   lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
-  if [ ! -f "$meta" ]; then
+  if [ ! -f "$meta" ] || [ -L "$meta" ]; then
     fm_account_meta_lock_release "$lock"
     return
   fi
   tmp=$(fmx_meta_tmp "$meta") || status=1
   if [ "$status" -eq 0 ] && ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
     rm -f "$tmp"; status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
   fi
   if [ "$status" -eq 0 ]; then
     mv -f "$tmp" "$meta" || status=1

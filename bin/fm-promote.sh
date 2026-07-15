@@ -32,13 +32,15 @@ trap release_locks EXIT
 LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+fm_account_safe_file_destination "$META" || { echo "error: unsafe meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
 [ "$(fm_account_meta_value "$META" account_rollback_cleanup)" != pending ] \
   || { echo "error: rollback cleanup is pending for $ID; refusing promotion" >&2; exit 1; }
 
-TMP="$STATE/.$ID.meta.promote.$$"
+TMP=$(mktemp "$STATE/.$ID.meta.promote.XXXXXX") || exit 1
 grep -v '^kind=' "$META" > "$TMP"
 echo "kind=ship" >> "$TMP"
+fm_account_safe_file_destination "$META" || { rm -f "$TMP"; exit 1; }
 mv "$TMP" "$META"
 fm_account_meta_lock_release "$META_LOCK" || exit 1
 META_LOCK=

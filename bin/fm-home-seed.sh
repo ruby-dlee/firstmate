@@ -746,7 +746,9 @@ sync_project_registry() {
   local home=$1 sub_reg tmp project line today names
   shift
   sub_reg="$home/data/projects.md"
-  tmp="$sub_reg.tmp.$$"
+  [ -d "$home/data" ] && [ ! -L "$home/data" ] || return 1
+  if [ -L "$sub_reg" ] || { [ -e "$sub_reg" ] && [ ! -f "$sub_reg" ]; }; then return 1; fi
+  tmp=$(mktemp "$home/data/.projects.XXXXXX") || return 1
   names=$(printf '%s\n' "$@" | awk '{ printf "%s%s", sep, $0; sep="\034" }')
   if [ -f "$sub_reg" ]; then
     awk -v names="$names" '
@@ -767,6 +769,7 @@ sync_project_registry() {
     fi
     printf '%s\n' "$line" >> "$tmp"
   done
+  if [ -L "$sub_reg" ] || { [ -e "$sub_reg" ] && [ ! -f "$sub_reg" ]; }; then rm -f "$tmp"; return 1; fi
   mv "$tmp" "$sub_reg"
 }
 
@@ -795,16 +798,19 @@ initialize_no_mistakes_project() {
 write_registry() {
   local id=$1 home=$2 projects_csv=$3 brief=$4 scope summary tmp today
   mkdir -p "$DATA"
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] || return 1
   scope=$(registry_scope_for_brief "$brief")
   summary=$(registry_summary_for_brief "$brief")
   today=$(date +%F)
-  tmp="$REG.tmp.$$"
+  if [ -L "$REG" ] || { [ -e "$REG" ] && [ ! -f "$REG" ]; }; then return 1; fi
+  tmp=$(mktemp "$DATA/.secondmates.XXXXXX") || return 1
   if [ -f "$REG" ]; then
     grep -vE "^- $id( |$)" "$REG" > "$tmp" || true
   else
     : > "$tmp"
   fi
   printf -- '- %s - %s (home: %s; scope: %s; projects: %s; added %s)\n' "$id" "$summary" "$home" "$scope" "$projects_csv" "$today" >> "$tmp"
+  if [ -L "$REG" ] || { [ -e "$REG" ] && [ ! -f "$REG" ]; }; then rm -f "$tmp"; return 1; fi
   mv "$tmp" "$REG"
 }
 

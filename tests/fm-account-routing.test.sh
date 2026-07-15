@@ -1772,6 +1772,48 @@ SH
   pass "continuation bounds no-mistakes status collection and degrades on timeout"
 }
 
+test_continuation_caps_informational_snapshots_only() {
+  local id rec out status packet packet_bytes brief_bytes
+  id=account-continuation-snapshot-cap-z28b
+  rec=$(make_case continuation-snapshot-cap claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation snapshot cap precondition spawn failed"
+  cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+head -c 100000 /dev/zero | tr '\0' s
+SH
+  chmod +x "$FAKEBIN_DIR/no-mistakes"
+  rm -f "$CASE_DIR/endpoint-live"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" capped-snapshot 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "oversized informational snapshot was not capped: $out"
+  packet=$out
+  assert_present "$packet" "capped informational snapshot packet was not installed"
+  assert_grep '[Snapshot truncated at 8192 bytes.]' "$packet" "capped informational snapshot had no visible truncation marker"
+  packet_bytes=$(wc -c < "$packet" | tr -d '[:space:]')
+  [ "$packet_bytes" -le 65536 ] || fail "capped informational snapshot exceeded the packet budget ($packet_bytes bytes)"
+
+  dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' b > "$HOME_DIR/data/$id/brief.md"
+  brief_bytes=$(wc -c < "$HOME_DIR/data/$id/brief.md" | tr -d '[:space:]')
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" oversized-brief 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "oversized task-owned continuation source was truncated instead of rejected"
+  assert_contains "$out" 'maximum is 65536' "oversized task-owned continuation rejection did not report its bound"
+  assert_absent "$HOME_DIR/data/$id/continuation-oversized-brief.md" "oversized task-owned continuation source installed a truncated packet"
+  [ "$(wc -c < "$HOME_DIR/data/$id/brief.md" | tr -d '[:space:]')" = "$brief_bytes" ] \
+    || fail "oversized task-owned continuation source was modified"
+  pass "continuation caps informational snapshots and rejects task-owned overflow"
+}
+
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
@@ -2146,6 +2188,7 @@ test_native_resume_rejects_regressed_sessionstart_evidence
 test_session_sync_metadata_publish_failure_is_closed
 test_oversized_continuation_stops_before_mutation
 test_continuation_bounds_no_mistakes_status_snapshot
+test_continuation_caps_informational_snapshots_only
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_linux_stat_selection_avoids_filesystem_stat_output
 test_stale_reclaim_guard_is_owned_before_lock_removal

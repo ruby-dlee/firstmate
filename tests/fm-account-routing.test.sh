@@ -2310,9 +2310,12 @@ exec "$FM_REAL_STAT" "$@"
 SH
   chmod +x "$FAKEBIN_DIR/stat"
   export FM_REAL_STAT="$real_stat" FM_REPLACE_CONTINUATION_SOURCE="$source" FM_MUTATE_CONTINUATION_SOURCE="$source"
-  out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
-    run_spawn "$id" --continue-account --account-profile claude-3)
-  status=$?
+  if out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3); then
+    status=0
+  else
+    status=$?
+  fi
   unset FM_REAL_STAT FM_REPLACE_CONTINUATION_SOURCE FM_MUTATE_CONTINUATION_SOURCE
   [ "$status" -ne 0 ] || fail "continuation accepted a replaced load-bearing source"
   assert_present "$source.mutated" "continuation identity-race hook did not run: $out"
@@ -2413,10 +2416,13 @@ test_ownerless_lock_marker_rejects_symlink_clobber() {
   printf 'sentinel\n' > "$outside"
   ln -s "$outside" "$marker"
 
-  out=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+  if out=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
     bash -c '. "$1"; fm_account_meta_lock_acquire "$2" lock-task' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" 2>&1)
-  status=$?
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
   [ "$status" -ne 0 ] || fail "ownerless metadata lock accepted a symlinked age marker"
   [ "$(cat "$outside")" = sentinel ] || fail "ownerless metadata lock clobbered a symlink target"
   [ -L "$marker" ] || fail "ownerless metadata lock replaced the unsafe marker"
@@ -2445,9 +2451,12 @@ test_account_lock_owner_controls_reject_symlinks() {
   rm -rf "$lock"
   mkdir -p "$lock"
   ln -s "$outside" "$lock/owner"
-  bash -c '. "$1"; fm_account_meta_lock_release "$2"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" >/dev/null 2>&1
-  status=$?
+  if bash -c '. "$1"; fm_account_meta_lock_release "$2"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
   [ "$status" -ne 0 ] || fail "metadata-lock release trusted a symlinked owner"
   assert_present "$lock" "metadata-lock release removed a lock with an unsafe owner"
   [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock release changed a symlink target"

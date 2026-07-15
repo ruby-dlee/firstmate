@@ -190,6 +190,27 @@ test_atomic_double_drain() {
   pass "two atomic drains cannot consume the same records twice"
 }
 
+test_drain_keeps_exclusive_staging_reserved_until_rename() {
+  local dir state fakebin out real_mv
+  dir=$(make_case reserved-drain)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/drain.out"
+  real_mv=$(command -v mv)
+  cat > "$fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+[ -f "$2" ] && [ ! -L "$2" ] || exit 92
+exec "$FM_REAL_MV" "$@"
+SH
+  chmod +x "$fakebin/mv"
+  append_wake "$state" signal task "signal: $state/task.status" || fail "reserved staging append failed"
+  PATH="$fakebin:$PATH" FM_REAL_MV="$real_mv" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" \
+    || fail "drain released its exclusive staging path before rename"
+  grep "$(printf '\tsignal\ttask\t')" "$out" >/dev/null \
+    || fail "reserved staging drain lost its wake record"
+  pass "wake drain keeps exclusive staging reserved through rename"
+}
+
 test_drain_dedupes_obvious_duplicates() {
   local dir state out count
   dir=$(make_case dedupe)
@@ -229,11 +250,17 @@ test_drain_asserts_watcher_liveness() {
   pass "drain asserts watcher liveness: warns on a lapse, stays silent right after a fire"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = reserved-staging ]; then
+  test_drain_keeps_exclusive_staging_reserved_until_rename
+  exit 0
+fi
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
 test_not_working_stale_enqueue_before_suppressor
 test_check_output_is_queued
 test_atomic_double_drain
+test_drain_keeps_exclusive_staging_reserved_until_rename
 test_drain_dedupes_obvious_duplicates
 test_drain_asserts_watcher_liveness

@@ -212,6 +212,10 @@ case "$*" in
       touch "$FM_FAKE_AF_RELEASE_FAIL_ONCE"
       exit 43
     fi
+    if [ -n "${FM_FAKE_AF_RELEASE_SWAP_BACKUP:-}" ]; then
+      rm -f "$FM_FAKE_AF_RELEASE_SWAP_BACKUP"
+      ln -s "${FM_FAKE_AF_RELEASE_SWAP_TARGET:?}" "$FM_FAKE_AF_RELEASE_SWAP_BACKUP"
+    fi
     printf '{"ok":true}\n'
     ;;
   *" session remove "*)
@@ -1296,6 +1300,85 @@ test_failed_secondmate_rollback_preserves_home_for_relaunch() {
   pass "failed secondmate rollback clears task state without retiring its home"
 }
 
+test_secondmate_rollback_refuses_unsafe_tasktmp() {
+  local id rec sm sentinel meta_tmp out status
+  id=account-secondmate-tasktmp-z18ea
+  rec=$(make_case secondmate-tasktmp claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  sentinel="$CASE_DIR/must-survive"
+  make_seeded_secondmate_home "$sm" "$id"
+  mkdir -p "$sentinel"
+  printf 'preserve\n' > "$sentinel/marker"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unsafe tasktmp precondition unexpectedly succeeded"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^tasktmp=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  printf 'tasktmp=%s\n' "$sentinel" >> "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+
+  clear_case_logs
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback accepted an unsafe metadata tasktmp"
+  assert_present "$sentinel/marker" "rollback deleted a metadata-selected arbitrary directory"
+  assert_not_grep 'lease release' "$AF_LOG" "unsafe tasktmp validation ran after lease release"
+  assert_contains "$out" "unsafe task temp path" "unsafe rollback tasktmp refusal was unclear"
+  pass "secondmate rollback only removes its exact task temp root"
+}
+
+test_rollback_backup_rejects_symlink_and_rechecks_under_lock() {
+  local id rec sm expected backup_name backup target out status
+  id=account-secondmate-backup-z18eb
+  rec=$(make_case secondmate-backup claude "$id")
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$sm" \
+    "project=$sm" \
+    "home=$sm" \
+    "harness=claude" \
+    "kind=secondmate" \
+    "mode=secondmate"
+  expected="$CASE_DIR/original.meta"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback backup precondition unexpectedly succeeded"
+  backup_name=$(sed -n 's/^account_rollback_backup=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  backup="$HOME_DIR/state/$backup_name"
+  assert_present "$backup" "rollback backup precondition did not create metadata backup"
+
+  rm -f "$backup"
+  ln -s "$expected" "$backup"
+  clear_case_logs
+  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback accepted a symlinked metadata backup"
+  assert_not_grep 'lease release' "$AF_LOG" "initial symlinked backup validation ran after lease release"
+  assert_contains "$out" "rollback backup is missing" "symlinked rollback backup refusal was unclear"
+
+  rm -f "$backup"
+  cp "$expected" "$backup"
+  target="$CASE_DIR/swap-target.meta"
+  cp "$expected" "$target"
+  clear_case_logs
+  out=$(FM_FAKE_AF_RELEASE_SWAP_BACKUP="$backup" FM_FAKE_AF_RELEASE_SWAP_TARGET="$target" \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -ne 0 ] || fail "rollback followed a backup swapped to a symlink after validation"
+  [ -L "$backup" ] || fail "rollback backup swap test did not install its symlink"
+  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" \
+    "post-validation backup swap restored unrelated metadata"
+  assert_contains "$out" "rollback backup is missing" "under-lock backup recheck refusal was unclear"
+  pass "rollback metadata backups reject symlinks before and under lock"
+}
+
 test_failed_secondmate_respawn_rollback_restores_prior_state() {
   local id rec sm expected out status artifact
   id=account-secondmate-restore-z18f
@@ -2291,6 +2374,12 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_grep "lease release --task $old_task" "$AF_LOG" "fresh teardown did not release the restored predecessor"
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
+  test_secondmate_rollback_refuses_unsafe_tasktmp
+  test_rollback_backup_rejects_symlink_and_rechecks_under_lock
+  exit 0
+fi
 
 if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
   test_explicit_secondmate_route_preserves_ambient_primary_enforce

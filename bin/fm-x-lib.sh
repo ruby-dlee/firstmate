@@ -431,7 +431,10 @@ fmx_resolve_reply_context() {
     source_p=$(printf '%s' "$ctx" | jq -r '.platform // ""' 2>/dev/null) || source_p=
     source_m=$(printf '%s' "$ctx" | jq -r '.reply_max_chars // ""' 2>/dev/null) || source_m=
     case "$source_p" in discord|x) [ -n "$p" ] || p=$source_p ;; esac
-    case "$source_m" in ''|*[!0-9]*) ;; *) [ -n "$m" ] || m=$source_m ;; esac
+    case "$source_m" in
+      ''|*[!0-9]*) ;;
+      *) [ "$source_m" -lt "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || { [ -n "$m" ] || m=$source_m; } ;;
+    esac
     [ -n "$p" ] && [ -n "$m" ] && break
   done
   jq -cn --arg platform "$p" --arg max "$m" \

@@ -1939,6 +1939,31 @@ SH
   pass "required report teardown quiesces before its final safety validation"
 }
 
+test_teardown_refuses_unsafe_tasktmp_metadata() {
+  local case_dir sentinel rc
+  case_dir=$(make_case unsafe-tasktmp)
+  sentinel="$case_dir/must-survive"
+  write_meta "$case_dir" local-only ship
+  mkdir -p "$sentinel"
+  printf 'preserve\n' > "$sentinel/marker"
+  printf 'tasktmp=%s\n' "$sentinel" >> "$case_dir/state/task-x1.meta"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unsafe tasktmp teardown exit"
+  assert_present "$sentinel/marker" "teardown deleted a metadata-selected arbitrary directory"
+  assert_present "$case_dir/state/task-x1.meta" "unsafe tasktmp refusal removed task metadata"
+  assert_grep 'unsafe task temp path' "$case_dir/stderr" "unsafe teardown tasktmp refusal was unclear"
+  pass "teardown only removes its exact task temp root"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
+  test_teardown_refuses_unsafe_tasktmp_metadata
+  exit 0
+fi
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1958,6 +1983,7 @@ test_herdr_teardown_clears_escalation_marker
 test_required_report_blocks_then_publishes_before_cleanup
 test_required_report_restores_rollback_generation_before_publish
 test_required_report_revalidates_after_quiescence
+test_teardown_refuses_unsafe_tasktmp_metadata
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

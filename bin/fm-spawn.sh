@@ -269,6 +269,10 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
     fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
     rollback_meta_lock=
+    if [ -n "$rollback_tasktmp" ] && [ "$rollback_tasktmp" != "/tmp/fm-$rollback_id" ]; then
+      echo "error: unsafe task temp path in rollback metadata for $rollback_id: $rollback_tasktmp" >&2
+      exit 1
+    fi
     if [ -n "$rollback_target" ]; then
       spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
     fi

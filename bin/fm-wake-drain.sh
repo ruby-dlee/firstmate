@@ -58,7 +58,6 @@ if [ ! -s "$FM_WAKE_QUEUE" ]; then
 fi
 
 DRAIN_TMP=$(mktemp "$STATE/.wake-queue.drain.XXXXXX") || exit 1
-rm -f "$DRAIN_TMP" || exit 1
 mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 if ! fm_wake_safe_file_destination "$FM_WAKE_QUEUE"; then
   exit 1

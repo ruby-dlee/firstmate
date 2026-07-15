@@ -636,7 +636,7 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
     backup_token=${backup_name#".$task.meta.rollback."}
     fm_account_valid_id "$backup_token" || { echo "error: unsafe rollback backup for $task" >&2; return 1; }
     backup="$(dirname "$meta")/$backup_name"
-    [ -f "$backup" ] || {
+    [ -f "$backup" ] && [ ! -L "$backup" ] || {
       echo "error: rollback backup is missing for $task" >&2
       return 1
     }
@@ -681,6 +681,11 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
     return 1
   fi
   if [ -n "$backup" ]; then
+    if [ ! -f "$backup" ] || [ -L "$backup" ]; then
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      echo "error: rollback backup is missing for $task" >&2
+      return 1
+    fi
     tmp=$(mktemp "$(dirname "$meta")/.$task.meta.rollback-restore.XXXXXX" 2>/dev/null) || { fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     cp -p "$backup" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }
     fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true; return 1; }

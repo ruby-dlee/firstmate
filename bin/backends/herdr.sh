@@ -441,9 +441,16 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # exactly like the husk check itself. Callers must never treat `unknown` as a
 # confirmed-dead signal.
 fm_backend_herdr_agent_alive() {  # <target> [expected-label]
-  local target=$1 expected_label=${2:-}
+  local target=$1 expected_label=${2:-} identity_state
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
-  fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'unknown'; return 0; }
+  if [ -n "$expected_label" ]; then
+    identity_state=$(fm_backend_herdr_identity_state "$target" "$expected_label")
+    case "$identity_state" in
+      absent) printf 'dead'; return 0 ;;
+      match) ;;
+      *) printf 'unknown'; return 0 ;;
+    esac
+  fi
   case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
     dead|no-agent) printf 'dead' ;;
     live) printf 'alive' ;;

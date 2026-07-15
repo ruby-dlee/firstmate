@@ -143,6 +143,24 @@ test_herdr_agent_alive_maps_pane_agent_state() {
   pass "fm_backend_herdr_agent_alive: dead/no-agent->dead, live->alive, unknown->unknown"
 }
 
+test_herdr_agent_alive_preserves_identity_state() {
+  local out
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "absent"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = dead ] || fail "a confirmed absent expected Herdr pane should classify as dead, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "match"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = alive ] || fail "a matching Herdr pane should proceed to agent-state inspection, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "mismatch"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = unknown ] || fail "a mismatched expected Herdr pane should classify as unknown, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "unknown"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = unknown ] || fail "an inconclusive expected Herdr identity should classify as unknown, got '$out'"
+
+  pass "fm_backend_herdr_agent_alive: preserves absent/match/mismatch/unknown identity states"
+}
+
 # --- unit level: the generic fm_backend_agent_alive dispatcher --------------
 
 test_agent_alive_dispatcher_routes_and_falls_back() {
@@ -412,6 +430,7 @@ test_sweep_noop_with_no_secondmate_meta() {
 
 test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
+test_herdr_agent_alive_preserves_identity_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy

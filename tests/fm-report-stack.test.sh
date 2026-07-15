@@ -275,6 +275,21 @@ test_first_publication_transaction_recovery_removes_unindexed_entry() {
   pass "report recovery removes interrupted first publications and rebuilds the index"
 }
 
+test_aged_transactionless_staging_is_reclaimed() {
+  local old fresh
+  mkdir -p "$STACK/entries"
+  old="$STACK/entries/.orphan-report.999.tmp"
+  fresh="$STACK/entries/.active-looking-report.1000.tmp"
+  mkdir -p "$old/visuals" "$fresh"
+  printf 'orphaned visual\n' > "$old/visuals/evidence.txt"
+  touch -t 200001010000 "$old"
+
+  run_stack render >/dev/null || fail "report stack could not recover transactionless staging"
+  assert_absent "$old" "aged transactionless report staging was not reclaimed"
+  assert_present "$fresh" "fresh transactionless staging was reclaimed before the conservative age threshold"
+  pass "report recovery reclaims only aged transactionless staging while locked"
+}
+
 test_index_failure_restores_previous_generation() {
   local id=report-index-rollback-k3 entry out status
   write_task "$id" ship
@@ -418,6 +433,7 @@ test_abandoned_reclaim_marker_is_recovered
 test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry
+test_aged_transactionless_staging_is_reclaimed
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

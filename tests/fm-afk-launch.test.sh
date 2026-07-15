@@ -680,6 +680,53 @@ unit_native_entry_preserves_prepared_state() {
   rm -rf "$st"
 }
 
+unit_native_start_stop_handoff_is_atomic() {
+  local st daemon starter stopper i
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-race.XXXXXX")
+  mkdir -p "$st/state"
+  daemon="$st/fake-daemon.sh"
+  cat > "$daemon" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 0' INT TERM
+while :; do sleep 0.05; done
+SH
+  chmod +x "$daemon"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1 \
+    || fail "native handoff precondition failed"
+
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_STATE_PREPARED=1 \
+    START="$START" DAEMON="$daemon" REACHED="$st/reached" GO="$st/go" bash -c '
+      . "$START"
+      FM_AFK_DAEMON=$DAEMON
+      daemon_lock_pid() {
+        : > "$REACHED"
+        while [ ! -e "$GO" ]; do sleep 0.02; done
+        return 1
+      }
+      fm_afk_start_main
+    ' >/dev/null 2>&1 &
+  starter=$!
+  for i in $(seq 1 100); do
+    [ -e "$st/reached" ] && break
+    sleep 0.02
+  done
+  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "native entry never reached the pre-daemon handoff window"; }
+
+  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1; : > "$st/stop-done" ) &
+  stopper=$!
+  sleep 0.2
+  [ -e "$st/state/.afk" ] || fail "stop cleared away mode while a prepared native entry held the handoff"
+  [ ! -e "$st/stop-done" ] || fail "stop completed before the prepared native entry registered its process"
+
+  : > "$st/go"
+  wait "$stopper" || fail "stop failed after the native entry completed its handoff"
+  wait "$starter" 2>/dev/null || true
+  [ ! -e "$st/state/.afk" ] || fail "atomic native stop retained away mode"
+  [ ! -e "$st/state/.afk-native-process" ] || fail "atomic native stop retained the native process marker"
+  pass "native lifecycle: start and stop serialize across the pre-daemon handoff"
+  rm -rf "$st"
+}
+
 unit_close_failure_preserves_record() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-close-fail.XXXXXX")
@@ -1173,6 +1220,7 @@ unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
 unit_recovery_preserves_buffered_escalations
 unit_native_entry_preserves_prepared_state
+unit_native_start_stop_handoff_is_atomic
 unit_close_failure_preserves_record
 unit_record_publication_atomic
 unit_malformed_record_fails_closed

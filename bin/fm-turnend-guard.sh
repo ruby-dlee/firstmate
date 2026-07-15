@@ -64,8 +64,8 @@ STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2
 # Return 0 when $1 (a firstmate root) carries a GENUINE secondmate-home marker.
 # bin/fm-home-seed.sh writes .fm-secondmate-home at a seeded secondmate home's
 # root (gitignored, so it never propagates into a child worktree); its content is
-# the secondmate id. Validate the marker's form so a stray/empty/symlink file
-# cannot spoof inclusion and an unmarked child is never guarded by accident: it
+# the secondmate id. Require the resolved FM_HOME to own that root and validate
+# the marker's form so a stray/empty/symlink file cannot spoof inclusion: it
 # must be a regular (non-symlink) file whose first line, with all whitespace
 # removed, is a non-empty id token (letters, digits, dot, underscore, dash only).
 # The allowlist is matched under forced C (ASCII) collation - `local LC_ALL=C`,
@@ -75,7 +75,10 @@ STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2
 # (which matches an EXPECTED id and does path-safety); the guard does not source
 # that heavier library.
 fm_root_is_secondmate_home() {
-  local marker="$1/.fm-secondmate-home" id LC_ALL=C
+  local marker="$1/.fm-secondmate-home" id root_real home_real LC_ALL=C
+  root_real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+  [ "$home_real" = "$root_real" ] || return 1
   [ -L "$marker" ] && return 1
   [ -f "$marker" ] || return 1
   IFS= read -r id < "$marker" 2>/dev/null || return 1

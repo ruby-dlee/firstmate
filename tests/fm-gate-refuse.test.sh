@@ -47,6 +47,7 @@ BOOTSTRAP="$ROOT/bin/fm-bootstrap.sh"
 UPDATE="$ROOT/bin/fm-update.sh"
 CONFIG_PUSH="$ROOT/bin/fm-config-push.sh"
 ACCOUNT_SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
+ACCOUNT_CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -146,6 +147,15 @@ test_helper_path_backstop_refuses() {
   assert_contains "$out" "$PATH_MSG" "helper: path-backstop refusal message"
   assert_not_contains "$out" "$ENV_MSG" "helper: backstop must not be attributed to the env marker"
   pass "fm-gate-refuse-lib: refuses from a gate worktree via git-common-dir (marker unset)"
+}
+
+test_helper_caller_path_backstop_refuses() {
+  local out rc
+  out=$(run_guard_lib "$GATE_WT" unset "$NORMAL_LIB"); rc=$?
+  expect_code 3 "$rc" "helper: gate caller checkout must exit 3 when using a normal checkout's script"
+  assert_contains "$out" "$PATH_MSG" "helper: caller-path backstop refusal message"
+  assert_not_contains "$out" "$ENV_MSG" "helper: caller-path refusal must not be attributed to the env marker"
+  pass "fm-gate-refuse-lib: inspects the caller checkout as well as the script checkout"
 }
 
 test_helper_normal_is_noop() {
@@ -549,6 +559,10 @@ run_primary_mutator_guarded() {
       ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
           "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$ACCOUNT_SESSION_SYNC")" task-x1 ) 2>&1
       ;;
+    account-continuation)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$ACCOUNT_CONTINUATION")" task-x1 attempt-x2 ) 2>&1
+      ;;
   esac
 }
 
@@ -559,7 +573,7 @@ test_primary_mutators_refuse_gate_contexts() {
   printf '# Backlog\n\n## In flight\n## Queued\n- [ ] queued-x - queued\n## Done\n' > "$home/data/backlog.md"
   fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship"
 
-  for name in session-start home-seed backlog-handoff pr-check afk-launch afk-start bootstrap update config-push account-session-sync; do
+  for name in session-start home-seed backlog-handoff pr-check afk-launch afk-start bootstrap update config-push account-session-sync account-continuation; do
     out=$(run_primary_mutator_guarded "$name" "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
     expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
     assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"
@@ -615,6 +629,7 @@ test_no_mistakes_yaml_disables_project_settings() {
 test_helper_env_marker_refuses
 test_helper_empty_env_marker_refuses
 test_helper_path_backstop_refuses
+test_helper_caller_path_backstop_refuses
 test_helper_normal_is_noop
 test_spawn_refuses_and_admits
 test_send_refuses_and_admits

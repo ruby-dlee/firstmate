@@ -710,9 +710,20 @@ fm_afk_launch_start() {
   return "$result"
 }
 
-fm_afk_launch_start_native() {
-  local backup artifact had_afk=0 result=0
+fm_afk_launch_start_native_locked() {
+  local backup artifact had_afk=0 result=0 record_result
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  if fm_afk_native_process_live; then
+    fm_afk_launch_record_read
+    record_result=$?
+    [ "$record_result" -ne 2 ] || return 1
+    if [ "$record_result" -eq 1 ]; then
+      fm_afk_launch_record_write none - native || return 1
+    fi
+    fm_afk_launch_flag_write || return 1
+    fm_afk_launch_log "native daemon process already starting or active; refreshed away-mode flag"
+    return 0
+  fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_flag_write || return 1
@@ -750,7 +761,16 @@ fm_afk_launch_start_native() {
   return "$result"
 }
 
-fm_afk_launch_stop() {
+fm_afk_launch_start_native() {
+  local result
+  fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
+  fm_afk_launch_start_native_locked
+  result=$?
+  fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+  return "$result"
+}
+
+fm_afk_launch_stop_locked() {
   local pid pid_identity current_identity result=0 read_result
   fm_afk_launch_record_read
   read_result=$?
@@ -766,6 +786,15 @@ fm_afk_launch_stop() {
   if daemon_lock_held_by_live_daemon; then
     pid=$(daemon_lock_pid 2>/dev/null) || return 1
     pid_identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  elif { [ "$read_result" -eq 1 ] || [ "$FM_AFK_REC_BACKEND" = none ]; } && fm_afk_native_process_live; then
+    pid=$FM_AFK_NATIVE_PID
+    pid_identity=$(fm_afk_native_process_identity "$pid") || return 1
+  elif [ -e "$FM_AFK_NATIVE_PROCESS" ]; then
+    if fm_afk_native_process_live; then
+      fm_afk_launch_log "live native daemon process conflicts with the recorded terminal; preserving lifecycle state"
+      return 1
+    fi
+    rm -f "$FM_AFK_NATIVE_PROCESS" || return 1
   fi
   if [ -n "$pid" ]; then
     if ! kill -TERM "$pid" 2>/dev/null; then
@@ -787,6 +816,7 @@ fm_afk_launch_stop() {
       return 1
     fi
   fi
+  rm -f "$FM_AFK_NATIVE_PROCESS" || result=1
   # (2) Close the daemon's own terminal by exact id.
   if [ "$read_result" -eq 0 ]; then
     fm_afk_launch_close_recorded || result=1
@@ -801,6 +831,15 @@ fm_afk_launch_stop() {
   else
     fm_afk_launch_log "away mode stopped; terminal teardown remains recorded for retry"
   fi
+  return "$result"
+}
+
+fm_afk_launch_stop() {
+  local result
+  fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
+  fm_afk_launch_stop_locked
+  result=$?
+  fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
   return "$result"
 }
 

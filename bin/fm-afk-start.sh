@@ -38,6 +38,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
+FM_AFK_NATIVE_PROCESS="$FM_AFK_STATE/.afk-native-process"
+FM_AFK_NATIVE_HANDOFF_LOCK="$FM_AFK_STATE/.afk-native-handoff.lock"
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$FM_AFK_START_DIR/fm-gate-refuse-lib.sh"
@@ -114,7 +116,47 @@ daemon_lock_held_by_live_daemon() {
   daemon_pid_matches "$pid" "$owner"
 }
 
+fm_afk_native_process_write() {
+  local pending identity
+  if fm_afk_native_process_live && [ "$FM_AFK_NATIVE_PID" != "$$" ]; then
+    return 1
+  fi
+  if [ -e "$FM_AFK_NATIVE_PROCESS" ] || [ -L "$FM_AFK_NATIVE_PROCESS" ]; then
+    [ ! -d "$FM_AFK_NATIVE_PROCESS" ] || return 1
+    rm -f "$FM_AFK_NATIVE_PROCESS" || return 1
+  fi
+  identity=$(fm_afk_native_process_identity "$$") || return 1
+  pending=$(mktemp "$FM_AFK_STATE/.afk-native-process.pending.XXXXXX") || return 1
+  if ! printf '%s\n%s\n' "$$" "$identity" > "$pending"; then
+    rm -f "$pending"
+    return 1
+  fi
+  mv "$pending" "$FM_AFK_NATIVE_PROCESS" || { rm -f "$pending"; return 1; }
+}
+
+fm_afk_native_process_identity() {
+  local pid=$1 out
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  out=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+fm_afk_native_process_live() {
+  local pid identity current
+  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
+  pid=$(sed -n '1p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
+  identity=$(sed -n '2p' "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || true)
+  [ -n "$identity" ] || return 1
+  current=$(fm_afk_native_process_identity "$pid") || return 1
+  [ "$current" = "$identity" ] || return 1
+  FM_AFK_NATIVE_PID=$pid
+}
+
 fm_afk_start_main() {
+  local native_handoff=0
   case "${1:-}" in
     '' ) ;;
     -h|--help) fm_afk_start_usage; return 0 ;;
@@ -123,7 +165,13 @@ fm_afk_start_main() {
 
   mkdir -p "$FM_AFK_STATE"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
-    [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
+    fm_lock_acquire_wait "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    native_handoff=1
+    if [ ! -f "$FM_AFK_STATE/.afk" ]; then
+      fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+      echo "afk: launcher-prepared state is missing" >&2
+      return 1
+    fi
   else
     date '+%s' > "$FM_AFK_STATE/.afk"
   fi
@@ -131,6 +179,7 @@ fm_afk_start_main() {
   local pid
   pid=$(daemon_lock_pid 2>/dev/null || true)
   if daemon_lock_held_by_live_daemon; then
+    [ "$native_handoff" -eq 0 ] || fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
     echo "afk: daemon already running pid=$pid"
     return 0
   fi
@@ -143,6 +192,15 @@ fm_afk_start_main() {
   # before the new daemon can surface them (fix for the leaked-artifact defect).
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
     fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+  fi
+
+  if [ "$native_handoff" -eq 1 ]; then
+    if ! fm_afk_native_process_write; then
+      fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+      echo "afk: could not register launcher-prepared native process" >&2
+      return 1
+    fi
+    fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

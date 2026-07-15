@@ -1754,6 +1754,26 @@ TXT
   pass "fm-x-link resolves the platform by request_id so a post-cleanup link keeps the Discord budget"
 }
 
+test_link_dry_run_never_resolves_context_over_network() {
+  local home fakebin log meta err rc
+  home="$TMP_ROOT/link-dry-run-offline"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  err="$home/err.txt"
+  meta="$home/state/fix-dry-run.meta"
+  printf 'window=w\nkind=ship\n' > "$meta"
+  printf 'FMX_PAIRING_TOKEN=tok-dry-run\n' > "$home/.env"
+
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" FMX_DRY_RUN=1 \
+    FMX_NOW_OVERRIDE=1700000000 FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-x-link.sh" fix-dry-run req-dry-run >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "dry-run link exit"
+  [ ! -s "$log" ] || fail "dry-run link contacted the relay while resolving request context"
+  assert_grep "WARNING" "$err" "offline dry-run link did not surface incomplete reply context"
+  assert_grep "x_request=req-dry-run" "$meta" "offline dry-run link was not recorded locally"
+  pass "fm-x-link dry-run keeps request-context resolution network-free"
+}
+
 # Criterion 2 loud-warning branch: when the inbox and relay cannot resolve both
 # axes, the link is still recorded but fm-x-link warns loudly and every follow-up
 # is refused.
@@ -2323,6 +2343,7 @@ test_dismiss_usage_error
 test_link_records_request_and_timestamp
 test_link_records_discord_platform_for_followups
 test_link_resolves_platform_by_request_id_after_inbox_cleanup
+test_link_dry_run_never_resolves_context_over_network
 test_link_warns_loudly_when_platform_unresolvable
 test_link_carry_count_and_ts_preserve_followup_binding
 test_link_recovery_relink_carries_discord_context_after_inbox_drain

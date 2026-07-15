@@ -281,7 +281,7 @@ else
       printf '\n'
     } >> "$steering_file" || return 1
   }
-  if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
+  if [ -n "$TARGET_META" ] && [ -n "$(fm_meta_get "$TARGET_META" account_profile)" ]; then
     if ! record_managed_steering "$@"; then
       if record_pending_managed_steering "$@"; then
         echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2

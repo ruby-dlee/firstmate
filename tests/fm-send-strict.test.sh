@@ -195,6 +195,24 @@ test_metadata_free_explicit_herdr_target_remains_unbound() {
   pass "fm-send strict: metadata-free explicit Herdr targets remain unbound"
 }
 
+test_explicit_managed_target_records_steering() {
+  local dir fb home err log rc trail
+  dir="$TMP_ROOT/managed-explicit"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-explicit)
+  err="$dir/send.err"; log="$dir/tmux.log"; trail="$home/data/managed-task/steering.md"
+  mkdir -p "$home/data/managed-task"
+  : > "$log"
+  fm_write_meta "$home/state/managed-task.meta" \
+    "window=sess:fm-managed-task" "kind=ship" "harness=codex" "account_profile=codex-2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "explicit managed target send"
+  assert_grep "Preserve this explicit managed steer" "$trail" \
+    "explicit managed target delivery was absent from the provider-neutral steering trail"
+  pass "fm-send strict: explicit targets resolved to managed metadata are audited"
+}
+
 test_healthy_fm_id_send_still_works() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
@@ -218,4 +236,5 @@ test_prefixless_herdr_pane_id_fails
 test_unmatched_single_colon_target_must_exist
 test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
+test_explicit_managed_target_records_steering
 test_healthy_fm_id_send_still_works

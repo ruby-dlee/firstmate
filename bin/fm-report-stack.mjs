@@ -468,6 +468,17 @@ function removeStagedReports(reportId) {
   }
 }
 
+function removeAgedOrphanStaging(transactionIds) {
+  const minimumAgeMs = 24 * 60 * 60 * 1000;
+  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+    const match = entry.isDirectory() && entry.name.match(/^\.([a-zA-Z0-9][a-zA-Z0-9._-]*)\.[0-9]+\.tmp$/);
+    if (!match || transactionIds.has(match[1])) continue;
+    const staged = path.join(entriesDir, entry.name);
+    if (Date.now() - fs.statSync(staged).mtimeMs < minimumAgeMs) continue;
+    fs.rmSync(staged, { recursive: true, force: true });
+  }
+}
+
 function recoverPreviousEntries() {
   if (!fs.existsSync(entriesDir)) return;
   const transactions = [];
@@ -519,6 +530,7 @@ function recoverPreviousEntries() {
   for (const { previous, discard } of recoveredPrevious) {
     if (discard) fs.rmSync(previous, { recursive: true, force: true });
   }
+  removeAgedOrphanStaging(transactionIds);
 }
 
 function renderIndex() {

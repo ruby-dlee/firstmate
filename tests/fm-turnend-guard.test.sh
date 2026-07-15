@@ -477,6 +477,21 @@ test_hook_exempts_linked_worktree_with_stray_marker() {
   pass "fm-turnend-guard: an invalid (empty) marker cannot spoof inclusion; linked worktree stays exempt"
 }
 
+test_hook_exempts_linked_worktree_with_foreign_valid_marker() {
+  local base dir home out status
+  base="$TMP_ROOT/hook-foreign-marker-base"
+  dir="$TMP_ROOT/hook-foreign-marker-wt"
+  home="$TMP_ROOT/hook-foreign-marker-home"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  mkdir -p "$home/state" "$home/config"
+  printf 'sm-copied-1\n' > "$dir/.fm-secondmate-home"
+  : > "$home/state/task1.meta"
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 0 "$status" "a valid marker outside the resolved FM_HOME must not force-include a linked worktree"
+  [ -z "$out" ] || fail "foreign valid marker wrongly force-included a linked worktree: $out"
+  pass "fm-turnend-guard: trusts a secondmate marker only for its resolved FM_HOME"
+}
+
 # Anti-spoof under any locale: a NON-ASCII marker id must be REJECTED by the
 # ASCII-only (C-collation) allowlist, so it can never force-include a linked
 # worktree even where the ambient locale's collation would treat it as a letter.
@@ -909,6 +924,7 @@ test_hook_secondmate_reinvoke_recovery_loop
 test_hook_silent_in_secondmate_child_worktree
 test_hook_blocks_in_treehouse_leased_secondmate_home
 test_hook_exempts_linked_worktree_with_stray_marker
+test_hook_exempts_linked_worktree_with_foreign_valid_marker
 test_hook_exempts_linked_worktree_with_non_ascii_marker
 test_hook_silent_in_crewmate_worktree
 test_hook_silent_without_jq

@@ -20,13 +20,13 @@
 #
 #   1. NO_MISTAKES_GATE set - the durable env marker no-mistakes stamps into every
 #      gate agent. This is the primary signal and covers a relocated NM_HOME.
-#   2. The current worktree's git-common-dir resolves under a no-mistakes gate
-#      repo (.../.no-mistakes/repos/*.git) - the UNSPOOFABLE backstop. It derives
-#      from the checkout's real filesystem location, which the agent cannot
-#      relocate without breaking the gate's own git operations, so it still
-#      refuses even if the agent tampered NO_MISTAKES_GATE away. Its limit: the
-#      literal-path match only fires for the default NM_HOME (~/.no-mistakes); a
-#      relocated NM_HOME is covered by signal 1.
+#   2. Either the caller's current checkout or this script's checkout has a
+#      git-common-dir under a no-mistakes gate repo
+#      (.../.no-mistakes/repos/*.git) - the UNSPOOFABLE backstop. Checking both
+#      preserves refusal after cd-away and when a normal checkout's script is
+#      invoked by absolute path from a gate worktree. Its limit: the literal-path
+#      match only fires for the default NM_HOME (~/.no-mistakes); a relocated
+#      NM_HOME is covered by signal 1.
 #
 # A NORMAL firstmate session - a real primary checkout, a real treehouse/Orca
 # crew worktree - has NEITHER signal and is COMPLETELY unaffected: the function
@@ -74,17 +74,21 @@ fm_refuse_if_gate_agent() {
     echo "error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)" >&2
     exit "$FM_GATE_REFUSE_EXIT"
   fi
-  local checkout common common_raw
+  local caller checkout common common_raw
+  caller=$(pwd -P 2>/dev/null || true)
   checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
-  common_raw=$(git -C "$checkout" rev-parse --git-common-dir 2>/dev/null || true)
-  case "$common_raw" in
-    /*) common=$(cd "$common_raw" 2>/dev/null && pwd -P || true) ;;
-    '') common= ;;
-    *) common=$(cd "$checkout/$common_raw" 2>/dev/null && pwd -P || true) ;;
-  esac
-  case "$common" in
-    */.no-mistakes/repos/*.git)
-      echo "error: refusing fleet lifecycle from inside a no-mistakes gate worktree ($common)" >&2
-      exit "$FM_GATE_REFUSE_EXIT" ;;
-  esac
+  for checkout in "$caller" "$checkout"; do
+    [ -n "$checkout" ] || continue
+    common_raw=$(git -C "$checkout" rev-parse --git-common-dir 2>/dev/null || true)
+    case "$common_raw" in
+      /*) common=$(cd "$common_raw" 2>/dev/null && pwd -P || true) ;;
+      '') common= ;;
+      *) common=$(cd "$checkout/$common_raw" 2>/dev/null && pwd -P || true) ;;
+    esac
+    case "$common" in
+      */.no-mistakes/repos/*.git)
+        echo "error: refusing fleet lifecycle from inside a no-mistakes gate worktree ($common)" >&2
+        exit "$FM_GATE_REFUSE_EXIT" ;;
+    esac
+  done
 }

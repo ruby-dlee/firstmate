@@ -127,9 +127,11 @@ pass "real herdr: the auto-detected spawn's launch command actually ran in the h
 
 # --- teardown completes the trivial spawn/teardown cycle --------------------
 
+printf '# Completion\n\n## Summary\n\nThe auto-detected Herdr smoke task completed.\n\n## What changed\n\nNo project files changed.\n\n## Verification\n\nThe task command ran in the isolated Herdr pane.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nThe captured pane output is the test artifact.\n\n## Follow-ups\n\nNone.\n' \
+  > "$DATA/$ID/completion.md"
 TEARDOWN_OUT="$TMP_ROOT/teardown.out"
 FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-  FM_CONFIG_OVERRIDE="$CONFIG" \
+  FM_CONFIG_OVERRIDE="$CONFIG" FM_REPORT_STACK_ROOT="$TMP_ROOT/report-stack" \
   "$ROOT/bin/fm-teardown.sh" "$ID" >"$TEARDOWN_OUT" 2>&1
 status=$?
 [ "$status" -eq 0 ] || fail "fm-teardown.sh failed for the auto-detected herdr task"$'\n'"$(cat "$TEARDOWN_OUT")"

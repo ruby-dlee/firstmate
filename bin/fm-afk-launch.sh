@@ -238,7 +238,10 @@ fm_afk_launch_lock_acquire() {
       fi
       reclaim_token="$$.$RANDOM.$i"
       claim_candidate="$FM_AFK_LAUNCH_LOCK/.reclaim-candidate.$reclaim_token"
-      [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
+      if [ ! -d "$FM_AFK_LAUNCH_LOCK" ] || [ -L "$FM_AFK_LAUNCH_LOCK" ]; then
+        sleep 0.05
+        continue
+      fi
       mkdir "$claim_candidate" 2>/dev/null || { sleep 0.05; continue; }
       identity=$(fm_pid_identity "$$" 2>/dev/null) || {
         rm -rf "$claim_candidate"

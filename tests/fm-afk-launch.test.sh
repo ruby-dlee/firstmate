@@ -919,7 +919,11 @@ SH
   done
   [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "native entry never reached the pre-daemon handoff window"; }
 
-  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1; : > "$st/stop-done" ) &
+  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
+      . "$1"
+      fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
+      fm_afk_launch_main stop
+    ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
   stopper=$!
   sleep 0.2
   [ -e "$st/state/.afk" ] || fail "stop cleared away mode while a prepared native entry held the handoff"
@@ -964,7 +968,11 @@ SH
   done
   [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "direct native entry never reached the pre-daemon handoff window"; }
 
-  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1; : > "$st/stop-done" ) &
+  ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
+      . "$1"
+      fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
+      fm_afk_launch_main stop
+    ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
   stopper=$!
   sleep 0.2
   [ -e "$st/state/.afk" ] || fail "stop cleared away mode while a direct native entry held the handoff"
@@ -1339,7 +1347,7 @@ unit_incomplete_restore_retains_backup() {
   printf 'prior\n' > "$backup/.afk"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
-    cp() { return 1; }
+    fm_afk_launch_copy_bounded() { return 1; }
     ! fm_afk_launch_restore_backup "$2" 1
   ' _ "$LAUNCH" "$backup" && [ -d "$backup" ] && [ -e "$backup/.afk" ]; then
     pass "rollback restore: incomplete restoration retains its recovery backup"

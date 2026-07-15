@@ -248,6 +248,36 @@ case "${1:-}" in
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
     touch "$FM_TEST_ENDPOINT_FILE"
     exit 0 ;;
+  send-keys)
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = -l ]; then
+        case "$arg" in
+          *account-native-launch*)
+            native_path=$(printf '%s\n' "$arg" | sed -n "s#.*'\([^']*/account-native-launch\)'.*#\1#p")
+            [ -z "$native_path" ] \
+              || printf '%s\n' "${native_path%/account-native-launch}" > "${FM_MANAGED_NATIVE_DIR_FILE:?}"
+            ;;
+        esac
+      fi
+      prev=$arg
+    done
+    case "$*" in
+      *' Enter')
+        if [ -f "${FM_MANAGED_NATIVE_DIR_FILE:-/nonexistent}" ]; then
+          native_dir=$(cat "$FM_MANAGED_NATIVE_DIR_FILE")
+          touch "$native_dir/ready"
+          (
+            for _ in $(seq 1 200); do
+              [ -f "$native_dir/go" ] && break
+              sleep 0.05
+            done
+            [ ! -f "$native_dir/go" ] || touch "${FM_MANAGED_SESSION_REFRESHED:?}"
+          ) </dev/null >/dev/null 2>&1 &
+        fi
+        ;;
+    esac
+    exit 0 ;;
   list-windows|has-session) exit 0 ;;
 esac
 exit 0
@@ -442,6 +472,97 @@ SH
   pass "pending secondmate rollback recovery bypasses pre-bind gating and converges"
 }
 
+test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
+  local w fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
+  w=$(new_world sweep-enforced-inherited-lock)
+  add_sm_home "$w" sm1 firstmate:fm-sm1 claude
+  meta="$w/home/state/sm1.meta"
+  account_task=fm-test-sm1-a1234
+  cat >> "$meta" <<EOF
+worktree=$w/sm1
+project=$w/sm1
+mode=secondmate
+yolo=off
+tasktmp=/tmp/fm-sm1
+account_pool=claude-crew
+account_profile=claude-2
+account_task=$account_task
+account_attempt=a1234
+provider_session_id=sess-$account_task
+generation_id=account:$account_task:a1234
+EOF
+  mkdir -p "$w/home/data/sm1"
+  printf 'enforce\n' > "$w/home/config/account-routing-mode"
+  cp "$ROOT/bin/fm-account-routing-lib.sh" "$w/sm1/bin/fm-account-routing-lib.sh"
+  cp "$ROOT/bin/fm-spawn.sh" "$w/sm1/bin/fm-spawn.sh"
+
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+status=$?
+cat "$FM_MANAGED_SPAWN_OUT"
+exit "$status"
+SH
+  cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
+SH
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake_root/bin/"*.sh
+
+  fake_af="$w/agent-fleet"
+  cat > "$fake_af" <<'SH'
+#!/usr/bin/env bash
+set -u
+task=
+pool=claude-crew
+profile=claude-2
+prev=
+for arg in "$@"; do
+  case "$prev" in --task) task=$arg ;; --pool) pool=$arg ;; --profile) profile=$arg ;; esac
+  prev=$arg
+done
+case "$*" in
+  '--format json contract') printf '{"contract_version":1}\n' ;;
+  *' lease recover '*)
+    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"claude","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile"
+    ;;
+  *' session status '*)
+    updated=2026-07-13T00:00:00Z
+    [ ! -f "${FM_MANAGED_SESSION_REFRESHED:-/nonexistent}" ] || updated=2026-07-13T00:00:01Z
+    printf '{"schema":1,"task":"%s","profile":"%s","provider":"claude","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$pool" "$task" "$updated"
+    ;;
+  *' lease release '*) printf '{"ok":true}\n' ;;
+  *) exit 64 ;;
+esac
+SH
+  chmod +x "$fake_af"
+
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  native_dir_file="$w/native-dir"
+  refreshed="$w/session-refreshed"
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
+    FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
+    FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \
+    FM_MANAGED_SPAWN_OUT="$w/spawn.out")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "enforced secondmate recovery did not complete through the bootstrap sweep: $(cat "$w/spawn.out" 2>/dev/null)"
+  assert_grep "account_task=$account_task" "$meta" \
+    "enforced secondmate recovery did not install the inherited-lock generation"
+  assert_no_grep '^account_rollback_cleanup=' "$meta" \
+    "enforced secondmate recovery did not commit its metadata installation"
+  assert_present "$refreshed" "enforced secondmate recovery never crossed its fresh SessionStart gate"
+  pass "sweep: enforced secondmate recovery installs metadata under the inherited lifecycle lock"
+}
+
 test_sweep_leaves_alive_secondmate_untouched() {
   local w fb tmuxfb log out
   w=$(new_world sweep-alive)
@@ -551,6 +672,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_sweep_rechecks_liveness_after_lifecycle_lock
   test_unmanaged_respawn_does_not_migrate_into_current_account_policy
   test_pending_rollback_recovery_bypasses_session_gate_and_retries
+  test_enforced_recovery_sweep_installs_meta_with_inherited_lock
   exit 0
 fi
 
@@ -562,6 +684,7 @@ test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_rechecks_liveness_after_lifecycle_lock
 test_unmanaged_respawn_does_not_migrate_into_current_account_policy
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
+test_enforced_recovery_sweep_installs_meta_with_inherited_lock
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_never_acts_on_inconclusive_reading
 test_sweep_never_acts_on_unverified_harness_dead_reading

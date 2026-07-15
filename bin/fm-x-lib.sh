@@ -48,6 +48,7 @@
 
 FMX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FMX_REPLY_MIN_CHARS=50
+FMX_RESPONSE_BODY_MAX_BYTES=65536
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$FMX_LIB_DIR/fm-account-routing-lib.sh"
 
@@ -687,7 +688,7 @@ fmx_reply_outbox_json() {
 }
 
 fmx_post_json() (
-  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} auth_header_file code rc
+  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} auth_header_file code rc body_size
   command -v curl >/dev/null 2>&1 || return 127
   [ -r "$payload_file" ] || return 2
   auth_header_file=$(fmx_auth_header_file) || return 3
@@ -703,6 +704,18 @@ fmx_post_json() (
   rm -f "$auth_header_file"
   trap - EXIT HUP INT TERM
   [ "$rc" = 0 ] || return 4
+  if [ "$body_file" != /dev/null ]; then
+    if [ "$(uname)" = Darwin ]; then
+      body_size=$(stat -f '%z' "$body_file" 2>/dev/null) || { rm -f "$body_file"; return 5; }
+    else
+      body_size=$(stat -c '%s' "$body_file" 2>/dev/null) || { rm -f "$body_file"; return 5; }
+    fi
+    case "$body_size" in ''|*[!0-9]*) rm -f "$body_file"; return 5 ;; esac
+    if [ "$body_size" -gt "$FMX_RESPONSE_BODY_MAX_BYTES" ]; then
+      rm -f "$body_file"
+      return 5
+    fi
+  fi
   printf '%s\n' "$code"
 )
 

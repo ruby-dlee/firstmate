@@ -1805,7 +1805,16 @@ fi
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  if [ -z "$LIFECYCLE_LOCK" ] || ! fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK"; then
+  lifecycle_lock_valid=0
+  if [ -n "$LIFECYCLE_LOCK" ]; then
+    if [ "$LIFECYCLE_LOCK_OWNED" = 1 ]; then
+      fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK" && lifecycle_lock_valid=1
+    elif [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" = "$LIFECYCLE_LOCK" ] \
+      && fm_account_lifecycle_lock_held "$LIFECYCLE_LOCK"; then
+      lifecycle_lock_valid=1
+    fi
+  fi
+  if [ "$lifecycle_lock_valid" != 1 ]; then
     echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
     exit 1
   fi

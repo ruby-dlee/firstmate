@@ -1132,6 +1132,47 @@ SH
   pass "watcher bounds and separately cadences account session synchronization"
 }
 
+test_watcher_markers_refuse_symlinks() {
+  local dir state fake_root sync_bin outside before after
+  dir=$(make_case watcher-marker-symlink); state="$dir/state"
+  fake_root="$dir/root"
+  sync_bin="$fake_root/bin/fm-account-session-sync.sh"
+  outside="$dir/outside-marker"
+  mkdir -p "$fake_root/bin"
+  printf 'sentinel\n' > "$outside"
+  touch -t 200001010000 "$outside"
+  before=$(file_mtime "$outside")
+  rm -f "$state/.last-account-session-sync" "$state/.last-check" \
+    "$state/.last-heartbeat" "$state/.last-watcher-beat"
+  ln -s "$outside" "$state/.last-account-session-sync"
+  for marker in .last-check .last-heartbeat .last-watcher-beat; do
+    ln -s "$outside" "$state/$marker"
+  done
+  cat > "$sync_bin" <<'SH'
+#!/usr/bin/env bash
+printf 'called\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
+SH
+  chmod +x "$sync_bin"
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_ROOT_OVERRIDE="$fake_root"
+    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=0
+    export FM_FAKE_ACCOUNT_SYNC_CALLS="$dir/sync.calls"
+    . "$WATCH"
+    sync_account_sessions_if_due
+    safe_touch_marker_or_log "$state/.last-check" "watcher check" || true
+    safe_touch_marker_or_log "$state/.last-heartbeat" "watcher heartbeat" || true
+    safe_touch_marker_or_log "$state/.last-watcher-beat" "watcher beacon" || true
+  )
+  after=$(file_mtime "$outside")
+  [ "$after" = "$before" ] || fail "watcher marker validation touched a symlink target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher marker validation changed outside content"
+  assert_absent "$dir/sync.calls" "unsafe account cadence marker still triggered session sync"
+  [ "$(grep -c 'unsafe .* marker' "$state/.watch-triage.log" 2>/dev/null || true)" -eq 1 ] \
+    || fail "unsafe watcher markers were not logged exactly once"
+  pass "watcher cadence, check, heartbeat, and beacon markers refuse symlinks"
+}
+
 test_watcher_timeout_wrapper_uses_hard_kill_fallback() {
   local dir state fakebin log
   dir=$(make_case watcher-hard-timeout); state="$dir/state"
@@ -1150,6 +1191,11 @@ SH
     || fail "watcher timeout wrapper omitted the hard KILL fallback"
   pass "watcher timeouts force-kill TERM-resistant subprocesses"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_watcher_markers_refuse_symlinks
+  exit 0
+fi
 
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
@@ -1185,4 +1231,5 @@ test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
 test_account_session_sync_is_bounded_and_cadenced
+test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback

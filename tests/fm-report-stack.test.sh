@@ -403,6 +403,28 @@ test_publish_lock_directory_symlink_fails_closed() {
   pass "report lock recovery refuses directory symlinks before child access"
 }
 
+test_lock_control_files_are_bounded_and_nonfollowing() {
+  local outside
+  rm -rf "$STACK/.publish.lock"
+  mkdir -p "$STACK/.publish.lock"
+  outside="$TMP_ROOT/report-lock-owner-target"
+  printf '{"pid":999999,"startedAt":"dead","token":"outside"}\n' > "$outside"
+  ln -s "$outside" "$STACK/.publish.lock/owner"
+  touch -t 200001010000 "$STACK/.publish.lock"
+  touch -h -t 200001010000 "$STACK/.publish.lock/owner"
+  run_stack render >/dev/null || fail "symlinked report-lock owner permanently blocked recovery"
+  [ "$(cat "$outside")" = '{"pid":999999,"startedAt":"dead","token":"outside"}' ] \
+    || fail "report-lock owner validation changed the symlink target"
+  assert_absent "$STACK/.publish.lock" "report stack retained a lock with a symlinked owner control file"
+
+  mkdir -p "$STACK/.publish.lock"
+  dd if=/dev/zero bs=8192 count=1 2>/dev/null | tr '\0' x > "$STACK/.publish.lock/owner"
+  touch -t 200001010000 "$STACK/.publish.lock" "$STACK/.publish.lock/owner"
+  run_stack render >/dev/null || fail "oversized report-lock owner permanently blocked recovery"
+  assert_absent "$STACK/.publish.lock" "report stack retained a lock with an oversized owner control file"
+  pass "report lock control reads are bounded, nonfollowing, and recoverable"
+}
+
 test_previous_generation_is_recovered_for_readers() {
   local id=report-crash-recovery-k2 entry report_id previous json
   write_task "$id" ship
@@ -629,6 +651,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_stale_lock_reclaim_is_serialized
   test_abandoned_reclaim_marker_is_recovered
   test_publish_lock_directory_symlink_fails_closed
+  test_lock_control_files_are_bounded_and_nonfollowing
   exit 0
 fi
 
@@ -647,6 +670,7 @@ test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
 test_abandoned_reclaim_marker_is_recovered
 test_publish_lock_directory_symlink_fails_closed
+test_lock_control_files_are_bounded_and_nonfollowing
 test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry

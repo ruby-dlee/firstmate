@@ -80,7 +80,11 @@ case "$url" in
     printf '%s' "${FAKE_DISMISS_CODE:-200}"
     ;;
   */connector/request-context)
-    [ -n "$ofile" ] && printf '%s' "${FAKE_REQCTX_BODY:-}" > "$ofile"
+    if [ -n "$ofile" ] && [ "${FAKE_REQCTX_OVERSIZE:-0}" = 1 ]; then
+      dd if=/dev/zero bs=65537 count=1 2>/dev/null | tr '\0' x > "$ofile"
+    else
+      [ -n "$ofile" ] && printf '%s' "${FAKE_REQCTX_BODY:-}" > "$ofile"
+    fi
     printf '%s' "${FAKE_REQCTX_CODE:-200}"
     ;;
 esac
@@ -1561,6 +1565,30 @@ TXT
   pass "a partial registry platform combines with the relay's authoritative budget"
 }
 
+test_relay_context_response_is_bounded() {
+  local home fakebin log out rc err
+  home="$TMP_ROOT/reg-relay-context-limit"
+  mkdir -p "$home/tmp"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  err="$home/err.txt"
+  printf 'FMX_PAIRING_TOKEN=tok-limit\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" TMPDIR="$home/tmp" FM_HOME="$home" \
+    FMX_RELAY_URL="https://relay.test" FAKE_CURL_LOG="$log" \
+    FAKE_REQCTX_CODE=200 FAKE_REQCTX_OVERSIZE=1 \
+    "$ROOT/bin/fm-x-reply.sh" req-oversized-context --followup "Bounded lookup." 2> "$err")
+  rc=$?
+  expect_code 8 "$rc" "oversized relay context follow-up exit"
+  [ -z "$out" ] || fail "oversized relay context follow-up emitted a request id"
+  assert_grep "url=https://relay.test/connector/request-context" "$log" \
+    "oversized context test did not query the shared relay helper"
+  assert_no_grep "url=https://relay.test/connector/followup" "$log" \
+    "oversized relay context was truncated and posted instead of held"
+  [ -z "$(find "$home/tmp" -type f -print 2>/dev/null)" ] \
+    || fail "oversized relay context left response staging files"
+  pass "relay context responses reject oversized load-bearing JSON and remain unresolved"
+}
+
 test_followup_platform_only_context_uses_platform_default() {
   local home out rc reply
   home="$TMP_ROOT/reg-platform-default"; mkdir -p "$home/state/x-context"
@@ -2384,6 +2412,11 @@ if [ "${FM_TEST_FOCUSED:-}" = subminimum-context ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_relay_context_response_is_bounded
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2441,6 +2474,7 @@ test_regression_unresolved_followup_fails_safe
 test_followup_ignores_subminimum_explicit_context_limit
 test_reply_context_skips_subminimum_budget_for_later_source
 test_followup_partial_registry_uses_relay_budget_live
+test_relay_context_response_is_bounded
 test_followup_platform_only_context_uses_platform_default
 test_regression_concurrent_requests_keep_own_platform
 test_dismiss_clears_context_registry

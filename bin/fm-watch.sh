@@ -436,10 +436,29 @@ run_check() {
   run_bounded "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
 }
 
+safe_touch_marker() {  # <path>
+  local marker=$1
+  if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+    return 1
+  fi
+  touch "$marker"
+}
+
+UNSAFE_MARKER_LOGGED=0
+safe_touch_marker_or_log() {  # <path> <label>
+  local marker=$1 label=$2
+  safe_touch_marker "$marker" && return 0
+  if [ "$UNSAFE_MARKER_LOGGED" = 0 ]; then
+    triage_log "unsafe $label marker: $marker"
+    UNSAFE_MARKER_LOGGED=1
+  fi
+  return 1
+}
+
 sync_account_sessions_if_due() {
   local cadence="$STATE/.last-account-session-sync"
   [ "$(age_of "$cadence")" -ge "$ACCOUNT_SESSION_SYNC_INTERVAL" ] || return 0
-  touch "$cadence"
+  safe_touch_marker_or_log "$cadence" "watcher cadence" || return 0
   run_bounded "$ACCOUNT_SESSION_SYNC_TIMEOUT" "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
 }
 
@@ -634,7 +653,7 @@ printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
-[ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
+[ -e "$STATE/.last-heartbeat" ] || safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
 
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -649,7 +668,7 @@ while :; do
 
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  touch "$STATE/.last-watcher-beat"
+  safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
 
   # A managed provider's SessionStart hook may race the initial spawn return.
   # Reconcile only metas still missing provider_session_id; failures stay
@@ -671,11 +690,11 @@ while :; do
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
-        touch "$STATE/.last-check"
+        safe_touch_marker_or_log "$STATE/.last-check" "watcher check" || true
         wake "$reason"
       fi
     done
-    touch "$STATE/.last-check"
+    safe_touch_marker_or_log "$STATE/.last-check" "watcher check" || true
   fi
 
   # On the first changed signal, linger one grace period and re-scan before
@@ -907,18 +926,18 @@ EOF
     # every heartbeat.
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       mark_all_captain_relevant_surfaced
       wake "heartbeat"
     else
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
       triage_log "absorbed heartbeat (no captain-relevant change)"
     fi

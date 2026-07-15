@@ -510,6 +510,32 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   pass "resume uses below-reserve sticky recovery and never deletes mapping on a failed attempt"
 }
 
+test_managed_recovery_accepts_inherited_lifecycle_lock() {
+  local id rec out status held account_task
+  id=account-inherited-recovery-z9d
+  rec=$(make_case inherited-recovery claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "inherited-lock recovery precondition spawn failed"
+  account_task=$(meta_account_task "$id")
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
+    || { fail "inherited-lock recovery could not acquire the bootstrap-owned lock"; return; }
+  out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" run_spawn "$id" --resume-account)
+  status=$?
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "inherited-lock recovery could not release the bootstrap-owned lock"
+  [ "$status" -eq 0 ] || fail "managed recovery rejected its inherited lifecycle lock: $out"
+  assert_grep "account_task=$account_task" "$HOME_DIR/state/$id.meta" \
+    "inherited-lock recovery did not complete metadata installation"
+  assert_not_grep '^account_rollback_cleanup=' "$HOME_DIR/state/$id.meta" \
+    "inherited-lock recovery did not commit its managed generation"
+  pass "managed secondmate-style recovery installs metadata under its inherited lifecycle lock"
+}
+
 test_unmanaged_respawn_preserves_report_cutover_state() {
   local id rec out status
   id=account-legacy-respawn-z9b
@@ -2460,6 +2486,7 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_managed_recovery_accepts_inherited_lifecycle_lock
   test_native_resume_requires_fresh_sessionstart_evidence
   test_native_resume_rejects_prelaunch_sessionstart_evidence
   test_native_resume_uses_private_launch_directory_and_cleans_it
@@ -2476,6 +2503,7 @@ test_enforce_failure_rolls_back_prepared_endpoint
 test_pane_failure_happens_before_account_reservation
 test_batch_partial_failure_releases_only_failed_item
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+test_managed_recovery_accepts_inherited_lifecycle_lock
 test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot

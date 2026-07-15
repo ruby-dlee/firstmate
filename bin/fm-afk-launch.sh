@@ -86,7 +86,7 @@ fm_afk_launch_path_identity() {
 
 fm_afk_launch_lock_owned() {
   local pid expected actual
-  [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
+  [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null) || return 1
   expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null) || return 1
   actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
@@ -94,6 +94,7 @@ fm_afk_launch_lock_owned() {
 }
 
 fm_afk_launch_lock_identity() {
+  [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
   fm_afk_launch_path_identity "$FM_AFK_LAUNCH_LOCK"
 }
 
@@ -109,7 +110,7 @@ fm_afk_launch_atomic_rename() {
 
 fm_afk_launch_reclaim_owned() {
   local reclaim=$1 pid expected actual
-  [ -d "$reclaim" ] || return 1
+  [ -d "$reclaim" ] && [ ! -L "$reclaim" ] || return 1
   pid=$(cat "$reclaim/pid" 2>/dev/null) || return 1
   expected=$(cat "$reclaim/pid-identity" 2>/dev/null) || return 1
   actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
@@ -123,6 +124,11 @@ fm_afk_launch_lock_acquire() {
   case "$ownerless_grace" in ''|*[!0-9]*) return 1 ;; esac
   fm_afk_launch_state_prepare || return 1
   for i in $(seq 1 200); do
+    if [ -L "$FM_AFK_LAUNCH_LOCK" ] \
+      || { [ -e "$FM_AFK_LAUNCH_LOCK" ] && [ ! -d "$FM_AFK_LAUNCH_LOCK" ]; }; then
+      fm_afk_launch_log "refusing unsafe launcher lock: $FM_AFK_LAUNCH_LOCK"
+      return 1
+    fi
     if [ ! -e "$FM_AFK_LAUNCH_LOCK" ]; then
       candidate=$(mktemp -d "$FM_AFK_LAUNCH_LOCK.candidate.XXXXXX" 2>/dev/null) || { sleep 0.05; continue; }
       token=${candidate##*.candidate.}
@@ -165,7 +171,11 @@ fm_afk_launch_lock_acquire() {
     fi
     if ! fm_afk_launch_lock_owned; then
       reclaim="$FM_AFK_LAUNCH_LOCK/.reclaim"
-      if [ -e "$reclaim" ]; then
+      if [ -L "$reclaim" ] || { [ -e "$reclaim" ] && [ ! -d "$reclaim" ]; }; then
+        fm_afk_launch_log "refusing unsafe launcher reclaim directory: $reclaim"
+        return 1
+      fi
+      if [ -d "$reclaim" ]; then
         if fm_afk_launch_reclaim_owned "$reclaim" \
           || [ "$(fm_path_age "$reclaim" 2>/dev/null || echo 0)" -lt "$ownerless_grace" ]; then
           sleep 0.05
@@ -180,6 +190,7 @@ fm_afk_launch_lock_acquire() {
       fi
       reclaim_token="$$.$RANDOM.$i"
       claim_candidate="$FM_AFK_LAUNCH_LOCK/.reclaim-candidate.$reclaim_token"
+      [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
       mkdir "$claim_candidate" 2>/dev/null || { sleep 0.05; continue; }
       identity=$(fm_pid_identity "$$" 2>/dev/null) || {
         rm -rf "$claim_candidate"
@@ -211,6 +222,7 @@ fm_afk_launch_lock_acquire() {
         sleep 0.05
         continue
       fi
+      [ -d "$quarantine" ] && [ ! -L "$quarantine" ] || return 1
       if [ "$(cat "$quarantine/.reclaim/token" 2>/dev/null || true)" != "$reclaim_token" ]; then
         fm_afk_launch_log "launcher lock changed while reclaiming it"
         return 1
@@ -227,6 +239,7 @@ fm_afk_launch_lock_acquire() {
 
 fm_afk_launch_lock_release() {
   local pid token
+  [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
   token=$(cat "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)
   [ "$pid" = "$$" ] && [ -n "$FM_AFK_LAUNCH_LOCK_TOKEN" ] && [ "$token" = "$FM_AFK_LAUNCH_LOCK_TOKEN" ] || return 0
@@ -328,8 +341,17 @@ fm_afk_launch_herdr_identity_state() {  # <target> <packed-identity>
 fm_afk_launch_record_read() {
   local record
   FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; FM_AFK_REC_EXTRA=""
+  if [ -L "$FM_AFK_LAUNCH_RECORD" ] \
+    || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
+    fm_afk_launch_log "daemon terminal record is not a real regular file; refusing to act on it"
+    return 2
+  fi
   [ -f "$FM_AFK_LAUNCH_RECORD" ] || return 1
   record=$(cat "$FM_AFK_LAUNCH_RECORD" 2>/dev/null) || record=""
+  if [ -L "$FM_AFK_LAUNCH_RECORD" ] || [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; then
+    fm_afk_launch_log "daemon terminal record changed while reading; refusing to act on it"
+    return 2
+  fi
   IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA \
     < "$FM_AFK_LAUNCH_RECORD" || true
   if ! printf '%s\n' "$record" | awk -F '\t' 'NF != 3 { bad=1 } END { exit !(NR == 1 && !bad) }' \
@@ -411,6 +433,7 @@ fm_afk_launch_herdr_plan_absent() {  # <session> <label>
 
 fm_afk_launch_plan_grace_elapsed() {
   local mtime now
+  [ -f "$FM_AFK_LAUNCH_RECORD" ] && [ ! -L "$FM_AFK_LAUNCH_RECORD" ] || return 1
   mtime=$(fm_path_mtime "$FM_AFK_LAUNCH_RECORD") || return 1
   now=$(date '+%s') || return 1
   case "$mtime:$now" in *[!0-9:]*) return 1 ;; esac

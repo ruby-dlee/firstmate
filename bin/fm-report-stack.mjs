@@ -38,6 +38,7 @@ const completionReportLimit = 16 * 1024 * 1024;
 const metadataLimit = 1024 * 1024;
 const manifestLimit = 1024 * 1024;
 const transactionLimit = 64 * 1024;
+const lockControlLimit = 4 * 1024;
 const visualEntryLimit = 512;
 const visualDepthLimit = 24;
 
@@ -241,10 +242,24 @@ function readArtifact(file, root, label, options = {}) {
 }
 
 function readBoundedRegularFile(file, maxBytes, label) {
-  const stat = fs.lstatSync(file);
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
-  if (stat.size > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte limit at ${file}`);
-  return fs.readFileSync(file, "utf8");
+  const initial = fs.lstatSync(file);
+  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const descriptor = fs.openSync(file, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.dev !== initial.dev || stat.ino !== initial.ino) {
+      throw new Error(`${label} must be a stable real regular file at ${file}`);
+    }
+    if (stat.size > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte limit at ${file}`);
+    return fs.readFileSync(descriptor, "utf8");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function readLockControl(file, label) {
+  return readBoundedRegularFile(file, lockControlLimit, label);
 }
 
 function assertSafeFileDestination(file, label) {
@@ -353,11 +368,9 @@ function acquireLock() {
       }
       return () => {
         try {
-          const owner = JSON.parse(fs.readFileSync(path.join(lock, "owner"), "utf8"));
+          const owner = JSON.parse(readLockControl(path.join(lock, "owner"), "report lock owner"));
           if (owner.token === token) fs.rmSync(lock, { recursive: true, force: true });
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
+        } catch {}
       };
     } catch (error) {
       if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
@@ -369,7 +382,7 @@ function acquireLock() {
         let owner = Number.NaN;
         let ownerStartedAt = "";
         try {
-          const rawOwner = fs.readFileSync(path.join(lock, "owner"), "utf8").trim();
+          const rawOwner = readLockControl(path.join(lock, "owner"), "report lock owner").trim();
           try {
             const parsedOwner = JSON.parse(rawOwner);
             owner = Number(parsedOwner.pid);
@@ -377,9 +390,7 @@ function acquireLock() {
           } catch {
             owner = Number.parseInt(rawOwner, 10);
           }
-        } catch (ownerError) {
-          if (ownerError.code !== "ENOENT") throw ownerError;
-        }
+        } catch {}
         let ownerAlive = Number.isInteger(owner) && owner > 0 && Boolean(ownerStartedAt);
         if (ownerAlive) {
           try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
@@ -405,7 +416,7 @@ function acquireLock() {
             }
             const quarantine = path.join(stackRoot, `.publish.lock.stale.${process.pid}.${reclaimToken}`);
             fs.renameSync(lock, quarantine);
-            const quarantinedReclaim = JSON.parse(fs.readFileSync(path.join(quarantine, ".reclaim"), "utf8"));
+            const quarantinedReclaim = JSON.parse(readLockControl(path.join(quarantine, ".reclaim"), "report reclaim marker"));
             if (quarantinedReclaim.token !== reclaimToken) {
               throw new Error(`report lock changed while reclaiming ${lock}`);
             }
@@ -415,7 +426,8 @@ function acquireLock() {
             if (reclaimError.code === "EEXIST") {
               try {
                 const reclaimStat = fs.lstatSync(reclaim);
-                const reclaimRaw = fs.readFileSync(reclaim, "utf8").trim();
+                let reclaimRaw = "";
+                try { reclaimRaw = readLockControl(reclaim, "report reclaim marker").trim(); } catch {}
                 let reclaimOwner;
                 try {
                   reclaimOwner = JSON.parse(reclaimRaw);
@@ -435,9 +447,9 @@ function acquireLock() {
                   const quarantinedReclaimStat = fs.lstatSync(quarantine);
                   let quarantinedToken;
                   try {
-                    quarantinedToken = JSON.parse(fs.readFileSync(quarantine, "utf8")).token;
+                    quarantinedToken = JSON.parse(readLockControl(quarantine, "quarantined report reclaim marker")).token;
                   } catch {
-                    quarantinedToken = fs.readFileSync(quarantine, "utf8").trim();
+                    try { quarantinedToken = readLockControl(quarantine, "quarantined report reclaim marker").trim(); } catch { quarantinedToken = ""; }
                   }
                   if (quarantinedReclaimStat.dev !== reclaimStat.dev || quarantinedReclaimStat.ino !== reclaimStat.ino
                     || quarantinedToken !== reclaimOwner.token) {
@@ -455,11 +467,9 @@ function acquireLock() {
           } finally {
             if (claimed) {
               try {
-                const reclaimOwner = JSON.parse(fs.readFileSync(reclaim, "utf8"));
+                const reclaimOwner = JSON.parse(readLockControl(reclaim, "report reclaim marker"));
                 if (reclaimOwner.token === reclaimToken) fs.rmSync(reclaim, { force: true });
-              } catch (cleanupError) {
-                if (cleanupError.code !== "ENOENT") throw cleanupError;
-              }
+              } catch {}
             }
           }
         }

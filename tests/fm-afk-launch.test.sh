@@ -27,6 +27,7 @@ START="$ROOT/bin/fm-afk-start.sh"
 FAILED=0
 fail() { printf 'not ok - %s\n' "$1" >&2; FAILED=1; }
 pass() { printf 'ok - %s\n' "$1"; }
+assert_contains() { case "$1" in *"$2"*) : ;; *) fail "$3" ;; esac; }
 
 SLEEPER=$(mktemp "${TMPDIR:-/tmp}/fm-afk-sleeper.XXXXXX")
 printf '#!/usr/bin/env bash\nexec sleep 600\n' > "$SLEEPER"
@@ -288,6 +289,53 @@ unit_abandoned_reclaim_is_recovered() {
     fail "launcher lock could not recover an abandoned reclaim owner"
   fi
   rm -rf "$st"
+}
+
+unit_launcher_lock_symlinks_are_refused() {
+  local st outside out rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-symlink.XXXXXX")
+  outside=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-outside.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside" "$st/state/.afk-launch.lock"
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_lock_acquire' _ "$LAUNCH" 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "launcher lock accepted a directory symlink"
+  assert_contains "$out" "refusing unsafe launcher lock" "launcher lock symlink refusal was not actionable"
+  [ "$(cat "$outside/sentinel")" = sentinel ] || fail "launcher lock symlink changed outside data"
+  rm -f "$st/state/.afk-launch.lock"
+  mkdir "$st/state/.afk-launch.lock"
+  printf '999999' > "$st/state/.afk-launch.lock/pid"
+  printf 'dead' > "$st/state/.afk-launch.lock/pid-identity"
+  ln -s "$outside" "$st/state/.afk-launch.lock/.reclaim"
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS=0 bash -c \
+    '. "$1"; fm_afk_launch_lock_acquire' _ "$LAUNCH" 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "launcher lock accepted a symlinked reclaim directory"
+  assert_contains "$out" "refusing unsafe launcher reclaim directory" \
+    "launcher reclaim symlink refusal was not actionable"
+  [ "$(cat "$outside/sentinel")" = sentinel ] || fail "launcher reclaim symlink changed outside data"
+  rm -rf "$st" "$outside"
+  pass "launcher lock acquisition refuses symlinked lock and reclaim directories"
+}
+
+unit_terminal_record_symlink_is_malformed() {
+  local st outside rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-read.XXXXXX")
+  outside=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-outside.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'tmux\tunrelated-session\tnative\n' > "$outside/record"
+  ln -s "$outside/record" "$st/state/.afk-daemon-terminal"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_record_read >/dev/null 2>&1; [ "$?" -eq 2 ]; ! fm_afk_launch_plan_grace_elapsed' \
+    _ "$LAUNCH"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "symlinked daemon terminal record was treated as absent or trusted"
+  [ "$(cat "$outside/record")" = $'tmux\tunrelated-session\tnative' ] \
+    || fail "terminal-record validation changed the symlink target"
+  rm -rf "$st" "$outside"
+  pass "daemon terminal readers reject symlinked control records"
 }
 
 unit_linux_stat_selection_avoids_filesystem_stat_output() {
@@ -1327,6 +1375,13 @@ if [ "${FM_TEST_FOCUSED:-}" = flag-staging ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  unit_launcher_lock_symlinks_are_refused
+  unit_terminal_record_symlink_is_malformed
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1337,6 +1392,8 @@ unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_stale_lock_reclaim_is_serialized
 unit_abandoned_reclaim_is_recovered
+unit_launcher_lock_symlinks_are_refused
+unit_terminal_record_symlink_is_malformed
 unit_linux_stat_selection_avoids_filesystem_stat_output
 unit_signal_exits_with_lock_cleanup
 unit_herdr_partial_create_recovery

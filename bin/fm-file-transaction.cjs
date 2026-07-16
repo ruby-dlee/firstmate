@@ -86,9 +86,15 @@ function pinnedTaskFileTransaction(dataDir, taskId, fileName, transform) {
     throw new Error("invalid task file name");
   }
 
+  const dataEntry = fs.lstatSync(dataDir, { bigint: true });
+  if (dataEntry.isSymbolicLink() || !dataEntry.isDirectory()) throw new Error("data directory is not a real directory");
   const expectedData = fs.realpathSync(dataDir);
   process.chdir(dataDir);
   if (fs.realpathSync(".") !== expectedData) throw new Error("data directory changed before transaction");
+  const dataDescriptor = fs.openSync(".", fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  const dataIdentity = fs.fstatSync(dataDescriptor, { bigint: true });
+  fs.closeSync(dataDescriptor);
+  if (!sameIdentity(dataEntry, dataIdentity)) throw new Error("data directory changed before transaction");
   const taskPath = path.join(expectedData, taskId);
   const taskEntry = fs.lstatSync(taskId, { bigint: true });
   if (taskEntry.isSymbolicLink() || !taskEntry.isDirectory()) throw new Error("task directory is not a real directory");
@@ -97,6 +103,10 @@ function pinnedTaskFileTransaction(dataDir, taskId, fileName, transform) {
 
   const directory = fs.openSync(".", fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
   const directoryIdentity = fs.fstatSync(directory, { bigint: true });
+  if (!sameIdentity(taskEntry, directoryIdentity)) {
+    fs.closeSync(directory);
+    throw new Error("task directory changed before transaction");
+  }
   let source;
   let sourceIdentity;
   let content = Buffer.alloc(0);

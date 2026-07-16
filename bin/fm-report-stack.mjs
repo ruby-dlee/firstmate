@@ -613,11 +613,16 @@ let lastPruneStatus = { pruned: 0, pending: false };
 function withLock(callback) {
   const release = acquireLock();
   try {
+    const retentionPolicy = nextRetentionPolicy();
+    publishRetentionPolicy(retentionPolicy);
     recoverRetentionCutover();
     recoverPreviousEntries();
     cutoverLegacyEntries();
-    const retentionPolicy = nextRetentionPolicy();
-    expireDueCohorts(retentionPolicy);
+    if (readStackControl(legacyCutoverName) !== undefined) {
+      lastPruneStatus = { pruned: 0, pending: true };
+      throw new Error("legacy report migration is pending; rerun retention");
+    }
+    expireDueCohorts();
     renderIndex(retentionPolicy);
     lastPruneStatus = pruneExpiredEntries();
     return callback();
@@ -718,30 +723,13 @@ function retentionCohortDeadline(name) {
   return Number.isSafeInteger(deadline) ? deadline : Number.NaN;
 }
 
-function readEntryManifestAt(root, entryName, label = "report manifest") {
-  const entry = pinnedDirectory(path.join(root.path, entryName), root.real, "report entry directory");
-  try {
-    if (label === "report manifest"
-      && process.env.FM_REPORT_ENTRY_TEST_READY && process.env.FM_REPORT_ENTRY_TEST_PROCEED) {
-      fs.writeFileSync(process.env.FM_REPORT_ENTRY_TEST_READY, "ready\n", { flag: "wx" });
-      const deadline = Date.now() + 5000;
-      while (!fs.existsSync(process.env.FM_REPORT_ENTRY_TEST_PROCEED)) {
-        if (Date.now() >= deadline) throw new Error("report entry test gate timed out");
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      }
-    }
-    const framed = runContainedHelper(
-      ["read-fd", "manifest.json", String(manifestLimit), "strict"],
-      [entry.descriptor],
-      manifestLimit + 1024 * 1024,
-    );
-    const item = framedItems(framed).get("source");
-    if (!item || item.missing) return undefined;
-    if (item.oversized) throw new Error(`${label} exceeds its ${manifestLimit}-byte limit`);
-    return JSON.parse(item.content.toString("utf8"));
-  } finally {
-    fs.closeSync(entry.descriptor);
-  }
+function readEntryManifestAt(root, entryName) {
+  const raw = runContainedHelper(
+    ["cat-child-fd", entryName, "manifest.json", String(manifestLimit)],
+    [root.descriptor],
+    manifestLimit + 1024 * 1024,
+  );
+  return JSON.parse(raw.toString("utf8"));
 }
 
 function currentEntriesRoot() {
@@ -755,11 +743,11 @@ function currentEntriesRoot() {
   };
 }
 
-function readEntryManifest(cohortName, entryName, label = "report manifest") {
+function readEntryManifest(cohortName, entryName) {
   const entriesRoot = currentEntriesRoot();
   const cohort = pinnedDirectory(path.join(entriesRoot.path, cohortName), entriesRoot.real, "report retention cohort");
   try {
-    return readEntryManifestAt(cohort, entryName, label);
+    return readEntryManifestAt(cohort, entryName);
   } finally {
     fs.closeSync(cohort.descriptor);
   }
@@ -841,6 +829,14 @@ function moveStackDirectoryToPrivate(name, identity, tombstoneName = `tombstone-
   );
 }
 
+function moveEntryCohortToPrivate(name, identity) {
+  runContainedHelper(
+    ["rename-noreplace-owned-fd", name, `tombstone-${crypto.randomUUID()}`, identity],
+    [entriesDescriptor, retentionTombstoneDescriptor],
+    1024 * 1024,
+  );
+}
+
 const legacyCutoverName = ".legacy-cutover.json";
 
 function recoverLegacyCutover() {
@@ -873,6 +869,70 @@ function recoverLegacyCutover() {
   if (!prepared.isDirectory() || prepared.isSymbolicLink()) throw new Error("legacy report cutover generation is not a real directory");
   if (currentIdentity === record.oldIdentity && preparedIdentity === record.replacementIdentity) {
     const replacement = pinnedDirectory(preparedPath, fs.realpathSync(configuredStackRoot), "legacy report cutover replacement");
+    let copied = 0;
+    let pending = false;
+    let preparedStale = false;
+    const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
+    const activeRoot = currentEntriesRoot();
+    for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        if (!entry.name.startsWith(".")) throw new Error(`invalid file in legacy report namespace: ${entry.name}`);
+        continue;
+      }
+      const cohortDeadline = retentionCohortDeadline(entry.name);
+      if (Number.isFinite(cohortDeadline)) {
+        if (cohortDeadline <= Date.now() + reportRetentionGuardMs) {
+          if (fs.existsSync(path.join(preparedPath, entry.name))) preparedStale = true;
+          const observed = fs.statSync(entry.name, { bigint: true });
+          moveEntryCohortToPrivate(entry.name, `${observed.dev}:${observed.ino}`);
+          continue;
+        }
+        if (fs.existsSync(path.join(preparedPath, entry.name))) continue;
+        if (copied >= reportRetentionBatch) { pending = true; continue; }
+        runContainedHelper(["copy-directory-fd", entry.name, "-", entry.name], [entriesDescriptor, replacement.descriptor], 64 * 1024 * 1024);
+        copied += 1;
+        continue;
+      }
+      if (/^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.expired$/.test(entry.name)) continue;
+      if (entry.name.startsWith(".") || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.name)) {
+        throw new Error(`invalid legacy report entry id at ${path.join(entriesDir, entry.name)}`);
+      }
+      const manifest = readEntryManifestAt(activeRoot, entry.name);
+      if (!manifest || manifest.reportId !== entry.name) {
+        throw new Error(`legacy report manifest identity mismatch at ${path.join(entriesDir, entry.name)}`);
+      }
+      const completedAt = Date.parse(manifest.completedAt);
+      if (!Number.isFinite(completedAt)) throw new Error(`invalid legacy report completion time for ${entry.name}`);
+      const cohortName = retentionCohortFor(manifest.completedAt);
+      if (completedAt <= cutoff) {
+        if (fs.existsSync(path.join(preparedPath, cohortName, entry.name))) preparedStale = true;
+        const observed = fs.statSync(entry.name, { bigint: true });
+        moveEntryCohortToPrivate(entry.name, `${observed.dev}:${observed.ino}`);
+        continue;
+      }
+      if (fs.existsSync(path.join(preparedPath, cohortName, entry.name))) continue;
+      if (copied >= reportRetentionBatch) { pending = true; continue; }
+      runContainedHelper([
+        "copy-directory-fd", entry.name, cohortName, entry.name,
+      ], [entriesDescriptor, replacement.descriptor], 64 * 1024 * 1024);
+      copied += 1;
+    }
+    if (preparedStale) {
+      fs.closeSync(replacement.descriptor);
+      moveStackDirectoryToPrivate(record.preparedName, record.replacementIdentity);
+      removeStackControl(legacyCutoverName);
+      throw new Error("legacy report migration staging expired; rerun retention");
+    }
+    if (pending) {
+      if (process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY && process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED) {
+        fs.writeFileSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY, "ready\n", { flag: "wx" });
+        while (!fs.existsSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+      }
+      fs.closeSync(replacement.descriptor);
+      return;
+    }
     const oldDescriptor = entriesDescriptor;
     runContainedHelper(
       ["exchange-directories-fd", "entries", record.preparedName, record.oldIdentity, record.replacementIdentity],
@@ -885,58 +945,19 @@ function recoverLegacyCutover() {
     fs.closeSync(oldDescriptor);
     current = fs.fstatSync(entriesDescriptor);
     currentIdentity = `${current.dev}:${current.ino}`;
+    if (process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY && process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED) {
+      fs.writeFileSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY, "ready\n", { flag: "wx" });
+      while (!fs.existsSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
+    prepared = fs.lstatSync(preparedPath);
   }
-  if (currentIdentity !== record.replacementIdentity || preparedIdentity !== record.oldIdentity) {
+  if (currentIdentity !== record.replacementIdentity || `${prepared.dev}:${prepared.ino}` !== record.oldIdentity) {
     throw new Error("legacy report cutover generations no longer match their marker");
   }
-  const retired = pinnedDirectory(preparedPath, fs.realpathSync(configuredStackRoot), "retired legacy report namespace");
-  let restored = 0;
-  let pending = false;
-  try {
-    const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
-    const retiredRoot = {
-      path: preparedPath,
-      real: fs.realpathSync(preparedPath),
-      dev: retired.dev,
-      ino: retired.ino,
-      descriptor: retired.descriptor,
-    };
-    for (const entry of fs.readdirSync(preparedPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) {
-        if (!entry.name.startsWith(".")) throw new Error(`invalid file in retired legacy report namespace: ${entry.name}`);
-        continue;
-      }
-      const cohortDeadline = retentionCohortDeadline(entry.name);
-      if (Number.isFinite(cohortDeadline)) {
-        if (cohortDeadline <= Date.now() + reportRetentionGuardMs || fs.existsSync(path.join(entriesDir, entry.name))) continue;
-        if (restored >= reportRetentionBatch) { pending = true; continue; }
-        runContainedHelper(["copy-directory-fd", entry.name, "-", entry.name], [retired.descriptor, entriesDescriptor], 64 * 1024 * 1024);
-        restored += 1;
-        continue;
-      }
-      if (/^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.expired$/.test(entry.name)) continue;
-      if (entry.name.startsWith(".") || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.name)) {
-        throw new Error(`invalid legacy report entry id at ${path.join(preparedPath, entry.name)}`);
-      }
-      const manifest = readEntryManifestAt(retiredRoot, entry.name, "legacy report manifest");
-      if (!manifest || manifest.reportId !== entry.name) {
-        throw new Error(`legacy report manifest identity mismatch at ${path.join(preparedPath, entry.name)}`);
-      }
-      const completedAt = Date.parse(manifest.completedAt);
-      if (!Number.isFinite(completedAt)) throw new Error(`invalid legacy report completion time for ${entry.name}`);
-      if (completedAt <= cutoff || findReportEntry(entry.name)) continue;
-      if (restored >= reportRetentionBatch) { pending = true; continue; }
-      const cohortName = retentionCohortFor(manifest.completedAt);
-      runContainedHelper(["copy-directory-fd", entry.name, cohortName, entry.name], [retired.descriptor, entriesDescriptor], 64 * 1024 * 1024);
-      restored += 1;
-    }
-  } finally {
-    fs.closeSync(retired.descriptor);
-  }
-  if (!pending) {
-    moveStackDirectoryToPrivate(record.preparedName, record.oldIdentity);
-    removeStackControl(legacyCutoverName);
-  }
+  moveStackDirectoryToPrivate(record.preparedName, record.oldIdentity);
+  removeStackControl(legacyCutoverName);
 }
 
 function cutoverLegacyEntries() {
@@ -950,7 +971,6 @@ function cutoverLegacyEntries() {
   const preparedPath = path.join(configuredStackRoot, preparedName);
   fs.mkdirSync(preparedPath, { mode: 0o700 });
   const prepared = pinnedDirectory(preparedPath, fs.realpathSync(configuredStackRoot), "legacy report cutover generation");
-  const oldDescriptor = entriesDescriptor;
   const old = fs.fstatSync(entriesDescriptor);
   const oldIdentity = `${old.dev}:${old.ino}`;
   const replacementIdentity = `${prepared.dev}:${prepared.ino}`;
@@ -960,35 +980,8 @@ function cutoverLegacyEntries() {
     oldIdentity,
     replacementIdentity,
   });
-  let exchanged = false;
-  let oldClosed = false;
-  try {
-    runContainedHelper(
-      ["exchange-directories-fd", "entries", preparedName, oldIdentity, replacementIdentity],
-      [stackRootDescriptor],
-      1024 * 1024,
-    );
-    exchanged = true;
-    process.chdir(path.join(configuredStackRoot, "entries"));
-    entriesDescriptor = prepared.descriptor;
-    entriesDir = ".";
-    fs.closeSync(oldDescriptor);
-    oldClosed = true;
-    if (process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY && process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED) {
-      fs.writeFileSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_READY, "ready\n", { flag: "wx" });
-      while (!fs.existsSync(process.env.FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      }
-    }
-    recoverLegacyCutover();
-  } catch (error) {
-    if (!exchanged) {
-      fs.closeSync(prepared.descriptor);
-    } else if (!oldClosed) {
-      fs.closeSync(oldDescriptor);
-    }
-    throw error;
-  }
+  fs.closeSync(prepared.descriptor);
+  recoverLegacyCutover();
 }
 
 function readRetentionPolicy() {
@@ -1149,10 +1142,16 @@ function recoverRetentionCutover() {
       || !/^\d+:\d+$/.test(item.identity))) {
     throw new Error(`invalid report retention cutover marker at ${retentionCutoverName}`);
   }
+  const activePolicy = readRetentionPolicy();
+  publishRetentionPolicy({
+    schemaVersion: 1,
+    generation: activePolicy.cutoffMs >= record.cutoffMs ? activePolicy.generation : record.policyGeneration,
+    cutoffMs: Math.max(activePolicy.cutoffMs, record.cutoffMs),
+  });
   const retiredPath = path.join(configuredStackRoot, record.retiredName);
   const tombstonePath = path.join(configuredStackRoot, ".retention-tombstones", record.tombstoneName);
-  let current = fs.fstatSync(entriesDescriptor);
-  let currentIdentity = `${current.dev}:${current.ino}`;
+  const current = fs.fstatSync(entriesDescriptor);
+  const currentIdentity = `${current.dev}:${current.ino}`;
   let retiredStat;
   try {
     retiredStat = fs.lstatSync(retiredPath);
@@ -1167,126 +1166,47 @@ function recoverRetentionCutover() {
     removeStackControl(retentionCutoverName);
     return;
   }
-  let retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
+  const retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
   if (currentIdentity === record.oldIdentity && retiredIdentity === record.replacementIdentity) {
-    const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
-    for (const item of record.freshCohorts) {
-      const target = path.join(retiredPath, item.handoff);
-      runContainedHelper(
-        ["stage-retention-cohort-fd", item.name, item.handoff, item.identity, target],
-        [entriesDescriptor, replacement.descriptor],
-        1024 * 1024,
-      );
-      if (process.env.FM_REPORT_RETENTION_STAGE_TEST_READY
-        && !fs.existsSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_READY)) {
-        fs.writeFileSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_READY, item.name, { flag: "wx" });
-        if (process.env.FM_REPORT_RETENTION_STAGE_TEST_PROCEED) {
-          while (!fs.existsSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_PROCEED)) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-          }
-        }
-        if (process.env.FM_REPORT_RETENTION_STAGE_TEST_ABORT === "1") {
-          fs.closeSync(replacement.descriptor);
-          throw new Error("report retention fresh handoff test interruption");
-        }
-      }
-    }
-    const oldDescriptor = entriesDescriptor;
+    moveStackDirectoryToPrivate(record.retiredName, record.replacementIdentity);
+    removeStackControl(retentionCutoverName);
+    return;
+  }
+  if (currentIdentity === record.replacementIdentity && retiredIdentity === record.oldIdentity) {
+    const restored = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "retired report namespace");
+    const replacementDescriptor = entriesDescriptor;
     runContainedHelper(
-      ["exchange-directories-fd", "entries", record.retiredName, record.oldIdentity, record.replacementIdentity],
+      ["exchange-directories-fd", "entries", record.retiredName, record.replacementIdentity, record.oldIdentity],
       [stackRootDescriptor],
       1024 * 1024,
     );
     process.chdir(path.join(configuredStackRoot, "entries"));
-    entriesDescriptor = replacement.descriptor;
+    entriesDescriptor = restored.descriptor;
     entriesDir = ".";
-    fs.closeSync(oldDescriptor);
-    current = fs.fstatSync(entriesDescriptor);
-    currentIdentity = `${current.dev}:${current.ino}`;
-    retiredStat = fs.lstatSync(retiredPath);
-    retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
-  }
-  if (currentIdentity !== record.replacementIdentity || retiredIdentity !== record.oldIdentity) {
-    throw new Error("report retention cutover generations no longer match their marker");
-  }
-  const retired = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "retired report namespace");
-  try {
-    for (const item of record.freshCohorts) {
-      const target = path.join(retiredPath, item.handoff);
-      runContainedHelper(
-        ["finalize-retention-cohort-fd", item.name, item.handoff, item.identity, target],
-        [entriesDescriptor, retired.descriptor],
-        1024 * 1024,
-      );
-    }
-  } finally {
-    fs.closeSync(retired.descriptor);
-  }
-  publishRetentionPolicy({ schemaVersion: 1, generation: record.policyGeneration, cutoffMs: record.cutoffMs });
-  if (process.env.FM_REPORT_RETENTION_POLICY_TEST_READY) {
-    fs.writeFileSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_READY, "ready\n", { flag: "wx" });
-    if (process.env.FM_REPORT_RETENTION_POLICY_TEST_ABORT === "1") {
-      throw new Error("report retention namespace test interruption");
-    }
-    if (process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED) {
-      while (!fs.existsSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      }
-    }
-  }
-  moveStackDirectoryToPrivate(record.retiredName, record.oldIdentity, record.tombstoneName);
-  removeStackControl(retentionCutoverName);
-}
-
-function expireDueCohorts(policy) {
-  recoverRetentionCutover();
-  const dueBefore = Date.now() + reportRetentionGuardMs;
-  const entries = fs.readdirSync(entriesDir, { withFileTypes: true });
-  const hasDue = entries.some((entry) => entry.isDirectory()
-    && Number.isFinite(retentionCohortDeadline(entry.name))
-    && retentionCohortDeadline(entry.name) <= dueBefore);
-  if (!hasDue) {
-    publishRetentionPolicy(policy);
+    fs.closeSync(replacementDescriptor);
+    moveStackDirectoryToPrivate(record.retiredName, record.replacementIdentity);
+    removeStackControl(retentionCutoverName);
     return;
   }
-  const retiredName = `.entries.retention.${crypto.randomUUID()}`;
-  const tombstoneName = `tombstone-${crypto.randomUUID()}`;
-  const retiredPath = path.join(configuredStackRoot, retiredName);
-  fs.mkdirSync(retiredPath, { mode: 0o700 });
-  const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
-  try {
-    const freshCohorts = [];
-    for (const entry of entries) {
-      const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
-      if (Number.isFinite(deadline)) {
-        if (deadline <= dueBefore) continue;
-        const observed = fs.statSync(entry.name, { bigint: true });
-        freshCohorts.push({
-          name: entry.name,
-          handoff: `.fresh.${entry.name}.${crypto.randomUUID()}`,
-          identity: `${observed.dev}:${observed.ino}`,
-        });
-        continue;
-      }
-      if (entry.name.startsWith(".")) continue;
-      throw new Error(`invalid entry in report namespace during retention: ${entry.name}`);
-    }
-    const old = fs.fstatSync(entriesDescriptor);
-    publishStackControl(retentionCutoverName, {
-      schemaVersion: 1,
-      retiredName,
-      tombstoneName,
-      oldIdentity: `${old.dev}:${old.ino}`,
-      replacementIdentity: `${replacement.dev}:${replacement.ino}`,
-      dueBefore,
-      policyGeneration: policy.generation,
-      cutoffMs: policy.cutoffMs,
-      freshCohorts,
-    });
-  } finally {
-    fs.closeSync(replacement.descriptor);
-  }
+  throw new Error("report retention cutover generations no longer match their marker");
+}
+
+function expireDueCohorts() {
   recoverRetentionCutover();
+  if (readStackControl(legacyCutoverName) !== undefined) return;
+  const dueBefore = Date.now() + reportRetentionGuardMs;
+  const entries = fs.readdirSync(entriesDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
+    if (Number.isFinite(deadline)) {
+      if (deadline > dueBefore) continue;
+      const observed = fs.statSync(entry.name, { bigint: true });
+      moveEntryCohortToPrivate(entry.name, `${observed.dev}:${observed.ino}`);
+      continue;
+    }
+    if (entry.name.startsWith(".")) continue;
+    throw new Error(`invalid entry in report namespace during retention: ${entry.name}`);
+  }
 }
 
 function pruneExpiredEntries() {

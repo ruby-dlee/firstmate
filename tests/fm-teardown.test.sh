@@ -183,7 +183,8 @@ write_meta() {
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
-    "mode=$mode"
+    "mode=$mode" \
+    "generation_id=generation-task-x1"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -872,6 +873,50 @@ SH
   assert_grep "pr=$url" "$meta" "PR recording did not publish after the account metadata lock was released"
   assert_grep "pr_head=$head" "$meta" "PR recording lost the remote PR head"
   pass "fm-pr-check keeps remote lookups outside account metadata serialization"
+}
+
+test_pr_check_rejects_reused_task_generation() {
+  local case_dir state meta lookup_ready lookup_release pr_check rc url head staged
+  case_dir=$(make_case pr-check-generation-race)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  lookup_ready="$case_dir/lookup-ready"; lookup_release="$case_dir/lookup-release"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.reused"
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  for _ in $(seq 1 100); do [ -e "$lookup_ready" ] && break; sleep 0.02; done
+  [ -e "$lookup_ready" ] || { kill -TERM "$pr_check" 2>/dev/null || true; fail "PR generation lookup gate did not open"; }
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    sed "s/^generation_id=.*/generation_id=generation-task-x1-reused/" "$2/task-x1.meta" > "$3"
+    mv "$3" "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$staged" || fail "PR generation-race setup could not replace metadata"
+  touch "$lookup_release"
+  set +e
+  wait "$pr_check"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "PR lookup attached stale results to a reused task generation"
+  assert_grep 'task generation changed' "$case_dir/pr-check.err" \
+    "PR generation mismatch failed without an actionable refusal"
+  assert_grep 'generation_id=generation-task-x1-reused' "$meta" \
+    "PR generation refusal overwrote the replacement task metadata"
+  assert_no_grep 'pr=' "$meta" "PR generation refusal attached an old PR to the replacement task"
+  assert_absent "$state/task-x1.check.sh" "PR generation refusal armed an orphaned merge poll"
+  pass "fm-pr-check binds slow lookup results to the original task generation"
 }
 
 test_content_in_default_fallback_allows() {
@@ -1995,6 +2040,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-34-report-required ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35-pr ]; then
+  test_pr_check_serializes_with_account_session_updates
+  test_pr_check_rejects_reused_task_generation
+  exit 0
+fi
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2024,6 +2075,7 @@ test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
 test_pr_check_serializes_with_account_session_updates
+test_pr_check_rejects_reused_task_generation
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses

@@ -1019,15 +1019,27 @@ fm_account_resume_command() {  # <task>
 # reserve filtering inside Agent Fleet while still refusing a live owner.
 fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-provider>
   local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json status mapped_task profile pool provider
+  FM_ACCOUNT_MUTATION_ACQUIRED=0
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
+  fm_account_mutation_defer_signals
   if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then status=0; else status=$?; fi
   if [ "$status" -ne 0 ]; then
-    fm_account_reconcile_lease_mutation "$binary" "$task" "recovery mutation" || return $?
-    json=$FM_ACCOUNT_RECONCILED_JSON
-    status=0
+    if fm_account_reconcile_lease_mutation "$binary" "$task" "recovery mutation"; then
+      json=$FM_ACCOUNT_RECONCILED_JSON
+      status=0
+    else
+      status=$?
+      fm_account_mutation_finish_handoff
+      return "$status"
+    fi
   fi
-  [ "$status" -eq 0 ] || return "$status"
+  if [ "$status" -ne 0 ]; then
+    fm_account_mutation_finish_handoff
+    return "$status"
+  fi
+  FM_ACCOUNT_MUTATION_ACQUIRED=1
+  fm_account_mutation_finish_handoff
   if ! mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' recovery) \
     || ! profile=$(fm_account_json_field "$json" '.profile | select(type == "string" and length > 0)' recovery) \
     || ! pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' recovery) \

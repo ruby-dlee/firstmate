@@ -1454,6 +1454,43 @@ unit_afk_bounded_copy_preserves_mtime() {
   rm -rf "$st"
 }
 
+unit_afk_control_reads_are_nonblocking_and_generation_pinned() {
+  local st control ready proceed output pid rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-control-read.XXXXXX")
+  mkdir -p "$st/state"
+  control="$st/state/control"
+  mkfifo "$control"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_safe_control_read "$2" 4096' _ "$START" "$control" >/dev/null 2>&1 &
+  pid=$!
+  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.01; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "AFK control reader blocked while opening a FIFO"
+  else
+    wait "$pid" 2>/dev/null; rc=$?
+    [ "$rc" -ne 0 ] || fail "AFK control reader accepted a FIFO"
+  fi
+
+  rm -f "$control"
+  printf 'first\n' > "$control"
+  ready="$st/ready"; proceed="$st/proceed"; output="$st/output"
+  FM_AFK_CONTROL_READ_TEST_READY="$ready" FM_AFK_CONTROL_READ_TEST_PROCEED="$proceed" \
+    FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+      '. "$1"; fm_afk_safe_control_read "$2" 4096' _ "$START" "$control" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.01; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "AFK control read generation gate did not open"; }
+  mv "$control" "$control.previous"
+  printf 'other\n' > "$control"
+  touch "$proceed"
+  wait "$pid" 2>/dev/null; rc=$?
+  [ "$rc" -ne 0 ] || fail "AFK control reader accepted a same-size replacement generation"
+  pass "AFK control reads reject special files and same-size generation swaps"
+  rm -rf "$st"
+}
+
 unit_flag_write_failure_aborts() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-flag-fail.XXXXXX")
@@ -1685,6 +1722,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  unit_afk_control_reads_are_nonblocking_and_generation_pinned
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1739,6 +1782,7 @@ unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_afk_backups_reject_unsafe_or_oversized_sources
 unit_afk_bounded_copy_preserves_mtime
+unit_afk_control_reads_are_nonblocking_and_generation_pinned
 unit_flag_write_failure_aborts
 unit_flag_staging_does_not_follow_predictable_symlink
 e2e_herdr

@@ -146,7 +146,7 @@ retain_candidate_fence() {
 }
 
 recover_candidate_fence() {
-  local domain job_label generation candidate_provenance candidate_nonce heartbeat_backup heartbeat_had_previous extra
+  local domain job_label generation candidate_provenance candidate_nonce heartbeat_backup heartbeat_had_previous extra canonical_label canonical_program
   [ -e "$CANDIDATE_FENCE" ] || [ -L "$CANDIDATE_FENCE" ] || return 0
   [ -f "$CANDIDATE_FENCE" ] && [ ! -L "$CANDIDATE_FENCE" ] || return 1
   domain=$(sed -n '1p' "$CANDIDATE_FENCE")
@@ -164,6 +164,16 @@ recover_candidate_fence() {
   [ -d "$generation" ] && [ ! -L "$generation" ] && [ -n "$candidate_provenance" ] \
     && [ -n "$candidate_nonce" ] && [ -z "$extra" ] \
     && { [ "$heartbeat_had_previous" = 0 ] || [ "$heartbeat_had_previous" = 1 ]; } || return 1
+  if [ -f "$PLIST" ] && [ ! -L "$PLIST" ]; then
+    canonical_label=$(plist_label "$PLIST")
+    canonical_program=$(plist_program "$PLIST")
+    if [ "$canonical_label" = "$job_label" ] \
+      && [ "$canonical_program" = "$generation/bin/fm-report-retention.sh" ]; then
+      heartbeat_matches "$candidate_provenance" "$candidate_nonce" || return 1
+      rm -f "$heartbeat_backup" "$CANDIDATE_FENCE"
+      return 0
+    fi
+  fi
   candidate_bootout_confirmed "$domain" "$job_label" || return 1
   restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$candidate_provenance" "$candidate_nonce" || return 1
   rm -rf "$generation"
@@ -464,6 +474,10 @@ install_owner() {
   fi
   domain="gui/$(id -u)"
   if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then activation_baseline=$(sed -n '4p' "$HEARTBEAT"); fi
+  retain_candidate_fence "$domain" "$job_label" "$generation" "$installed_provenance" \
+    "$activation_nonce" "$heartbeat_backup" "$heartbeat_had_previous" \
+    || { rm -f "$plist_temp" "$previous_plist"; return 1; }
+  install_test_interrupt candidate-fenced || return $?
   if "$LAUNCHCTL" bootstrap "$domain" "$generation_plist"; then
     if [ "${FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_BOOTSTRAP:-}" = 1 ]; then
       FM_REPORT_RETENTION_NODE="$node_runtime" FM_REPORT_PYTHON="$python_runtime" \
@@ -498,6 +512,7 @@ install_owner() {
     if [ "${FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER:-}" = 1 ] || ! mv -f "$plist_temp" "$PLIST"; then
       rm -f "$OWNER_HANDOFF_FENCE"
       if candidate_bootout_confirmed "$domain" "$job_label"; then
+        rm -f "$CANDIDATE_FENCE"
         restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
         rm -f "$heartbeat_backup"
         rm -rf "$generation"
@@ -510,7 +525,6 @@ install_owner() {
       rm -f "$plist_temp" "$previous_plist"
       return 1
     fi
-    rm -f "$heartbeat_backup"
     install_test_interrupt pointer-published || return $?
     if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
       if ! recover_owner_handoff_fence; then
@@ -519,6 +533,7 @@ install_owner() {
         return 1
       fi
     fi
+    rm -f "$CANDIDATE_FENCE" "$heartbeat_backup"
     rm -f "$previous_plist"
     for file in "$GENERATIONS"/*; do
       [ -d "$file" ] || continue
@@ -527,6 +542,7 @@ install_owner() {
     return 0
   fi
   if candidate_bootout_confirmed "$domain" "$job_label"; then
+    rm -f "$CANDIDATE_FENCE"
     restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
     rm -f "$heartbeat_backup"
     rm -rf "$generation"
@@ -563,8 +579,8 @@ run_with_install_lock() {
   local operation=$1 status
   install_lock_acquire || return 1
   trap 'install_lock_release >/dev/null 2>&1 || true' EXIT
-  recover_candidate_fence || { echo "error: report-retention candidate fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
   recover_owner_handoff_fence || { echo "error: report-retention previous owner fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
+  recover_candidate_fence || { echo "error: report-retention candidate fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
   "$operation"; status=$?
   install_lock_release
   trap - EXIT

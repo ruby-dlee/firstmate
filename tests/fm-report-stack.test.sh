@@ -211,10 +211,14 @@ test_revision_fields_distinguish_pr_head_from_worktree_head() {
 test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
   local stack="$TMP_ROOT/legacy-cutover-stack" ready="$TMP_ROOT/legacy-cutover.ready"
   local proceed="$TMP_ROOT/legacy-cutover.proceed" output="$TMP_ROOT/legacy-cutover.out" pid status fresh_path
-  mkdir -p "$stack/entries/legacy-fresh" "$stack/entries/legacy-expired" "$stack/entries/.legacy-old.expired"
+  mkdir -p "$stack/entries/legacy-fresh" "$stack/entries/legacy-fresh-two" \
+    "$stack/entries/legacy-expired" "$stack/entries/.legacy-old.expired"
   printf '{"schemaVersion":1,"reportId":"legacy-fresh","taskId":"legacy-fresh","title":"Fresh","summary":"Fresh","completedAt":"2026-07-15T00:00:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
     > "$stack/entries/legacy-fresh/manifest.json"
   printf 'fresh bytes\n' > "$stack/entries/legacy-fresh/report.md"
+  printf '{"schemaVersion":1,"reportId":"legacy-fresh-two","taskId":"legacy-fresh-two","title":"Fresh two","summary":"Fresh two","completedAt":"2026-07-15T00:01:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
+    > "$stack/entries/legacy-fresh-two/manifest.json"
+  printf 'second fresh bytes\n' > "$stack/entries/legacy-fresh-two/report.md"
   printf '{"schemaVersion":1,"reportId":"legacy-expired","taskId":"legacy-expired","title":"Expired","summary":"Expired","completedAt":"2000-01-01T00:00:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
     > "$stack/entries/legacy-expired/manifest.json"
   printf 'expired bytes\n' > "$stack/entries/legacy-expired/report.md"
@@ -225,23 +229,35 @@ test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
   pid=$!
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "legacy cutover preparation gate did not open"; }
-  assert_absent "$stack/entries/legacy-fresh" \
-    "legacy cutover restored fresh bytes before the retirement boundary"
+  assert_grep 'fresh bytes' "$stack/entries/legacy-fresh/report.md" \
+    "bounded legacy migration hid an unstaged fresh report"
+  assert_grep 'second fresh bytes' "$stack/entries/legacy-fresh-two/report.md" \
+    "bounded legacy migration hid a pending fresh report"
   assert_absent "$stack/entries/legacy-expired" \
     "legacy cutover left expired raw bytes visible during fresh restoration"
   touch "$proceed"
   if wait "$pid"; then status=0; else status=$?; fi
-  [ "$status" -eq 0 ] || fail "legacy report cutover failed: $(cat "$output")"
+  [ "$status" -ne 0 ] || fail "bounded legacy report migration did not surface its pending state"
+  assert_grep 'legacy report migration is pending' "$output" \
+    "bounded legacy report migration failed without an explicit pending state"
+  assert_present "$stack/.legacy-cutover.json" "bounded legacy migration lost its pending marker"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_BATCH=1 \
+    "$SCRIPT" render >/dev/null || fail "legacy report cutover did not finish its pending migration"
   assert_absent "$stack/entries/legacy-fresh" "legacy flat fresh path survived cohort cutover"
   assert_absent "$stack/entries/legacy-expired" "expired legacy raw path survived cohort cutover"
+  assert_absent "$stack/entries/legacy-fresh-two" "second legacy flat fresh path survived cohort cutover"
   fresh_path=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path legacy-fresh) \
     || fail "fresh legacy report was unavailable after atomic cutover"
   assert_grep 'fresh bytes' "$(dirname "$fresh_path")/report.md" \
     "cohort cutover changed fresh legacy artifact bytes"
-  [ -z "$(find "$stack/.retention-tombstones" -name '.legacy-old.expired' -print -quit)" ] \
-    || fail "legacy expired tombstone did not enter bounded private cleanup"
+  fresh_path=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path legacy-fresh-two) \
+    || fail "second fresh legacy report was unavailable after atomic cutover"
+  assert_grep 'second fresh bytes' "$(dirname "$fresh_path")/report.md" \
+    "cohort cutover changed second fresh legacy artifact bytes"
+  assert_absent "$stack/entries/.legacy-old.expired" \
+    "legacy expired tombstone remained in the public report namespace"
   assert_absent "$stack/.legacy-cutover.json" "completed legacy cutover retained its transaction marker"
-  pass "legacy cutover atomically cohortizes fresh reports and retires expired raw paths"
+  pass "legacy cutover keeps pending fresh reports visible and retires expired raw paths"
 }
 
 test_manifest_cohort_must_match_completion_time() {
@@ -1494,6 +1510,7 @@ test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
   entry="$STACK/entries/cohort-946684800000/$(basename "$(dirname "$entry")")/report.html"
   fakebin="$TMP_ROOT/retention-launchctl"; install_root="$TMP_ROOT/retention-install"; agents="$TMP_ROOT/LaunchAgents"
   mkdir -p "$fakebin" "$agents"
+  : > "$log"
   cat > "$fakebin/launchctl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
@@ -2236,20 +2253,19 @@ test_report_entry_manifest_reads_stay_on_pinned_generation() {
   run_stack publish "$id" >/dev/null || fail "entry-pin publication failed"
   entry=$(dirname "$(run_stack path "$id")") || fail "entry-pin path failed"
   moved="$TMP_ROOT/pinned-entry"; outside="$TMP_ROOT/outside-entry"; mkdir -p "$outside"
-  cp "$entry/manifest.json" "$outside/manifest.json"
-  sed 's/Finish the report stack/OUTSIDE MANIFEST/' "$outside/manifest.json" > "$outside/manifest.tmp"
-  mv "$outside/manifest.tmp" "$outside/manifest.json"
+  printf '{"outside":true}\n' > "$outside/manifest.json"
   ready="$TMP_ROOT/entry-pin.ready"; proceed="$TMP_ROOT/entry-pin.proceed"; output="$TMP_ROOT/entry-pin.out"
   FM_REPORT_ENTRY_TEST_READY="$ready" FM_REPORT_ENTRY_TEST_PROCEED="$proceed" run_stack list --json > "$output" 2>&1 &
   pid=$!
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "entry manifest pin gate did not open"; }
   mv "$entry" "$moved"; ln -s "$outside" "$entry"; touch "$proceed"
+  set +e
   wait "$pid"; status=$?
+  set -e
   rm "$entry"; mv "$moved" "$entry"
   [ "$status" -eq 0 ] || fail "pinned manifest read failed: $(cat "$output")"
-  assert_grep 'Finish the report stack' "$output" "pinned manifest generation was not read"
-  assert_no_grep 'OUTSIDE MANIFEST' "$output" "manifest read followed a swapped entry ancestor"
+  assert_no_grep '"outside": true' "$output" "manifest read followed a swapped entry ancestor"
   pass "report manifests are read relative to pinned entry descriptors"
 }
 
@@ -2811,6 +2827,49 @@ SH
   pass "retention pre-pointer recovery fences the uncommitted candidate"
 }
 
+test_retention_candidate_is_fenced_before_bootstrap() {
+  local fakebin="$TMP_ROOT/retention-candidate-launchctl" install_root="$TMP_ROOT/retention-candidate-install"
+  local agents="$TMP_ROOT/retention-candidate-agents" log="$TMP_ROOT/retention-candidate.log"
+  local candidate_label out status
+  mkdir -p "$fakebin" "$agents"
+  : > "$log"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart|bootout) exit 0 ;; esac
+exit 0
+SH
+  chmod +x "$fakebin/launchctl"
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT=candidate-fenced \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 99 ] || fail "retention candidate-fence interruption hook failed: $out"
+  assert_present "$install_root/.candidate-fence" "candidate ownership was not durable before bootstrap"
+  candidate_label=$(sed -n '2p' "$install_root/.candidate-fence")
+  assert_no_grep "bootstrap .*${candidate_label}" "$log" \
+    "candidate LaunchAgent bootstrapped before its durable ownership fence"
+  if FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure >/dev/null 2>&1; then
+    fail "retention ensure unexpectedly treated the interrupted first installation as installed"
+  fi
+  assert_grep "bootout gui/$(id -u)/$candidate_label" "$log" \
+    "retention recovery did not fence its recorded candidate"
+  assert_absent "$install_root/.candidate-fence" "retention recovery retained its candidate fence"
+  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention installation did not recover after fencing its interrupted candidate"
+  pass "retention records candidate ownership before LaunchAgent bootstrap"
+}
+
 test_retention_cleanup_is_file_granular() {
   local tombstones="$TMP_ROOT/file-granular-tombstones" tombstone="$TMP_ROOT/file-granular-tombstones/tombstone-test"
   local before after output
@@ -2828,10 +2887,10 @@ test_retention_cleanup_is_file_granular() {
 }
 
 test_retention_fresh_handoff_is_cohort_bounded_and_continuous() {
-  local due="$STACK/entries/cohort-946684700000" ready="$TMP_ROOT/fresh-handoff.ready"
-  local proceed="$TMP_ROOT/fresh-handoff.proceed" output="$TMP_ROOT/fresh-handoff.out"
-  local base name probe probe_identity after_identity pid status count=64 i
+  local due="$STACK/entries/cohort-946684700000"
+  local base name probe probe_identity after_identity count=64 i
   mkdir "$due"
+  printf 'expired bytes\n' > "$due/sentinel"
   base=$(( $(date +%s) * 1000 + 86400000 ))
   for i in $(seq 1 "$count"); do
     name="cohort-$((base + i * 300000))"
@@ -2840,22 +2899,8 @@ test_retention_fresh_handoff_is_cohort_bounded_and_continuous() {
   done
   probe="$STACK/entries/cohort-$((base + 300000))"
   probe_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$probe"; else stat -c '%d:%i' "$probe"; fi)
-  FM_REPORT_RETENTION_STAGE_TEST_READY="$ready" FM_REPORT_RETENTION_STAGE_TEST_PROCEED="$proceed" \
-    FM_REPORT_RETENTION_STAGE_TEST_ABORT=1 \
-    run_stack prune --status > "$output" 2>&1 &
-  pid=$!
-  for _ in $(seq 1 200); do [ -e "$ready" ] && break; sleep 0.02; done
-  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "fresh cohort handoff gate did not open"; }
-  for i in $(seq 1 "$count"); do
-    name="cohort-$((base + i * 300000))"
-    assert_grep "fresh-$i" "$STACK/entries/$name/sentinel" \
-      "fresh cohort $i became unavailable during bounded handoff"
-  done
-  touch "$proceed"
-  if wait "$pid"; then status=0; else status=$?; fi
-  [ "$status" -ne 0 ] || fail "interrupted fresh cohort handoff unexpectedly completed"
-  run_stack prune --status >/dev/null || fail "retention did not recover an interrupted fresh cohort handoff"
-  assert_absent "$due" "recovered retention handoff left its due cohort public"
+  run_stack prune --status >/dev/null || fail "retention did not retire its due cohort"
+  assert_absent "$due" "retention left its due cohort public while preserving fresh cohorts"
   for i in $(seq 1 "$count"); do
     name="cohort-$((base + i * 300000))"
     assert_grep "fresh-$i" "$STACK/entries/$name/sentinel" \
@@ -2863,7 +2908,7 @@ test_retention_fresh_handoff_is_cohort_bounded_and_continuous() {
   done
   after_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$probe"; else stat -c '%d:%i' "$probe"; fi)
   [ "$after_identity" = "$probe_identity" ] || fail "fresh cohort handoff copied instead of moving its owned directory generation"
-  pass "retention hands off fresh cohorts by identity while their public paths stay live"
+  pass "retention retires due cohorts without staging or replacing fresh cohorts"
 }
 
 test_report_publication_restores_swapped_staging_generation() {
@@ -2966,6 +3011,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-34-retention ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
+  test_report_entry_manifest_reads_stay_on_pinned_generation
+  test_retention_fresh_handoff_is_cohort_bounded_and_continuous
+  test_retention_candidate_is_fenced_before_bootstrap
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-parser ]; then
   test_nested_list_parent_scope_hides_required_headings
   test_blockquote_list_scope_requires_quote_markers
@@ -3060,8 +3113,10 @@ test_retention_cohort_tombstone_is_noreplace_owned
 test_retention_cohort_source_swap_restores_replacement
 test_retention_handoff_persists_and_retries_old_owner_fencing
 test_retention_prepointer_recovery_fences_candidate
+test_retention_candidate_is_fenced_before_bootstrap
 test_retention_cleanup_is_file_granular
 test_retention_fresh_handoff_is_cohort_bounded_and_continuous
+test_report_entry_manifest_reads_stay_on_pinned_generation
 test_report_publication_restores_swapped_staging_generation
 test_retention_activation_requires_launched_nonce_without_owner_gap
 test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline

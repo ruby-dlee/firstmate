@@ -94,12 +94,11 @@ fm_afk_launch_file_size() {
 
 fm_afk_launch_copy_bounded() {  # <source> <destination>
   local source=$1 destination=$2 expected actual pending cap=1048576
-  [ -f "$source" ] && [ ! -L "$source" ] || return 1
   expected=$(fm_afk_launch_file_size "$source") || return 1
   case "$expected" in ''|*[!0-9]*) return 1 ;; esac
   [ "$expected" -le "$cap" ] || return 1
   pending=$(mktemp "$destination.pending.XXXXXX") || return 1
-  if ! head -c "$((cap + 1))" "$source" > "$pending" 2>/dev/null; then
+  if ! fm_afk_safe_control_copy "$source" "$pending" "$cap" 2>/dev/null; then
     rm -f "$pending"
     return 1
   fi
@@ -107,20 +106,18 @@ fm_afk_launch_copy_bounded() {  # <source> <destination>
     rm -f "$pending"
     return 1
   }
-  if [ "$actual" != "$expected" ] || [ ! -f "$source" ] || [ -L "$source" ] \
+  if [ "$actual" != "$expected" ] \
     || [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
     rm -f "$pending"
     return 1
   fi
-  touch -r "$source" "$pending" 2>/dev/null || true
   mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
 }
 
 fm_afk_launch_read_control() {
   local file=$1 snapshot bytes cap=4096
-  [ -f "$file" ] && [ ! -L "$file" ] || return 1
   snapshot=$({
-    head -c "$((cap + 1))" "$file" 2>/dev/null || exit 1
+    fm_afk_safe_control_read "$file" "$cap" 2>/dev/null || exit 1
     printf '\034'
   }) || return 1
   case "$snapshot" in *$'\034') ;; *) return 1 ;; esac
@@ -128,7 +125,6 @@ fm_afk_launch_read_control() {
   bytes=$(printf '%s' "$snapshot" | LC_ALL=C wc -c | tr -d '[:space:]') || return 1
   case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
   [ "$bytes" -le "$cap" ] || return 1
-  [ -f "$file" ] && [ ! -L "$file" ] || return 1
   printf '%s' "$snapshot"
 }
 

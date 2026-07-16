@@ -11,43 +11,25 @@ path_identity() {
   python3 -c 'import os, sys; value = os.stat(sys.argv[1], follow_symlinks=False); print(f"{value.st_dev}:{value.st_ino}")' "$1"
 }
 
-test_prompt_transport_preserves_non_nul_bytes() {
+test_prompt_transport_preserves_all_bytes() {
   local transport="$TMP_ROOT/transport" prompt capture="$TMP_ROOT/capture" script="$TMP_ROOT/capture.py" command parent_id file_id
   mkdir "$transport"
   prompt="$transport/prompt"
-  printf 'prefix\377suffix\n\n' > "$prompt"
+  printf 'prefix\0middle\377suffix\n\n' > "$prompt"
   cat > "$script" <<'PY'
-import os
 import sys
 with open(sys.argv[1], "wb") as output:
-    output.write(os.fsencode(sys.argv[2]))
+    output.write(sys.stdin.buffer.read())
 PY
-  command="exec python3 '$script' '$capture' \"\$1\""
+  command="exec python3 '$script' '$capture'"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt")
   python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$command" \
-    || fail "continuation prompt transport rejected representable bytes"
-  cmp -s "$capture" <(printf 'prefix\377suffix\n\n') \
-    || fail "continuation prompt transport changed invalid UTF-8 or trailing newlines"
+    || fail "continuation prompt transport rejected byte-verbatim stdin"
+  cmp -s "$capture" <(printf 'prefix\0middle\377suffix\n\n') \
+    || fail "continuation prompt transport changed NUL, invalid UTF-8, or trailing newlines"
   assert_absent "$prompt" "continuation prompt transport retained its consumed generation"
   assert_absent "$transport" "continuation prompt transport retained its private launch directory"
-  pass "continuation prompt transport preserves every representable argument byte"
-}
-
-test_prompt_transport_rejects_nul_before_launch() {
-  local transport="$TMP_ROOT/nul" prompt marker="$TMP_ROOT/launched" output="$TMP_ROOT/nul.out" status parent_id file_id
-  mkdir "$transport"; prompt="$transport/prompt"
-  printf 'before\0after' > "$prompt"
-  parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt")
-  if python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" \
-    "printf launched > '$marker'" > "$output" 2>&1; then
-    status=0
-  else
-    status=$?
-  fi
-  [ "$status" -ne 0 ] || fail "continuation prompt transport accepted an unrepresentable NUL byte"
-  assert_absent "$marker" "continuation prompt transport launched after NUL validation failed"
-  assert_contains "$(cat "$output")" "cannot be represented" "NUL transport refusal was unclear"
-  pass "continuation prompt transport fails closed on unrepresentable NUL bytes"
+  pass "continuation prompt transport preserves every byte through stdin"
 }
 
 test_prompt_transport_rejects_replaced_generation() {
@@ -79,7 +61,6 @@ test_prompt_transport_rejects_replaced_parent() {
   pass "continuation prompt consumption requires its owned parent generation"
 }
 
-test_prompt_transport_preserves_non_nul_bytes
-test_prompt_transport_rejects_nul_before_launch
+test_prompt_transport_preserves_all_bytes
 test_prompt_transport_rejects_replaced_generation
 test_prompt_transport_rejects_replaced_parent

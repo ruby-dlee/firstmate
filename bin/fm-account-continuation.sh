@@ -232,11 +232,14 @@ cd "$WORKTREE_REAL" \
 exec 9< . \
   || { echo "error: continuation worktree cannot be pinned for $ID" >&2; exit 1; }
 cd "$ORIGINAL_CWD" || exit 1
-TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null) || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
+git_pinned() {
+  python3 "$SCRIPT_DIR/fm-contained-read.py" git-fd "$@" 3<&9
+}
+TOP=$(git_pinned rev-parse --show-toplevel 2>/dev/null) || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP_REAL=$(cd "$TOP" && pwd -P)
 [ "$TOP_REAL" = "$WORKTREE_REAL" ] || { echo "error: continuation path is not the recorded worktree root for $ID" >&2; exit 1; }
-HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null) || { echo "error: cannot verify continuation HEAD for $ID" >&2; exit 1; }
-BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
+HEAD=$(git_pinned rev-parse HEAD 2>/dev/null) || { echo "error: cannot verify continuation HEAD for $ID" >&2; exit 1; }
+BRANCH=$(git_pinned branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 STATUS_IDENTITY_TMP=$(mktemp "$STATE/.continuation-status-identity-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation repository status identity for $ID" >&2; exit 1; }
@@ -282,9 +285,9 @@ capture_repository_identity() {
   local output=$1
   {
     printf 'status\0'
-    git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z || return 1
+    git_pinned status --porcelain=v2 --branch -z || return 1
     printf '\0index\0'
-    git -C "$WORKTREE_REAL" ls-files --stage -z > "$REPOSITORY_INDEX_TMP" || return 1
+    git_pinned ls-files --stage -z > "$REPOSITORY_INDEX_TMP" || return 1
     cat "$REPOSITORY_INDEX_TMP" || return 1
     printf '\0worktree-content\0'
     split_repository_index_paths || return 1
@@ -292,7 +295,7 @@ capture_repository_identity() {
     printf '\0submodule-content\0'
     append_submodule_identities || return 1
     printf '\0untracked-content\0'
-    git -C "$WORKTREE_REAL" ls-files --others --exclude-standard -z > "$REPOSITORY_PATHS_TMP" \
+    git_pinned ls-files --others --exclude-standard -z > "$REPOSITORY_PATHS_TMP" \
       || return 1
     append_repository_path_identities || return 1
   } > "$output" 2>/dev/null
@@ -323,24 +326,19 @@ if ! node "$CONTAINED_READ" snapshot "$TASK_DIR" "$TASK_SNAPSHOT_DIR" 1048576 "$
   exit 1
 fi
 
-if [ "$KIND" = secondmate ] && [ -e "$WORKTREE_REAL/data/charter.md" ]; then
-  BRIEF_ROOT="$WORKTREE_REAL/data"
-  BRIEF="$BRIEF_ROOT/charter.md"
-else
-  BRIEF_ROOT=
-  BRIEF=
-fi
-if [ -n "$BRIEF" ]; then
+if [ "$KIND" = secondmate ]; then
   BRIEF_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-brief-$ID.XXXXXX") \
     || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
-  node "$CONTAINED_READ" "$BRIEF_ROOT" "$BRIEF" "$MAX_PACKET_BYTES" > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null \
-    && [ -s "$BRIEF_SNAPSHOT_TMP" ] \
-    || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+  if ! python3 "$SCRIPT_DIR/fm-contained-read.py" cat-fd data/charter.md "$MAX_PACKET_BYTES" 3<&9 \
+    > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null || [ ! -s "$BRIEF_SNAPSHOT_TMP" ]; then
+    rm -f "$BRIEF_SNAPSHOT_TMP"
+    BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
+  fi
 else
   BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
-  [ -s "$BRIEF_SNAPSHOT_TMP" ] \
-    || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 fi
+[ -s "$BRIEF_SNAPSHOT_TMP" ] \
+  || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
 PACKET_TMP=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.XXXXXX") \
@@ -494,10 +492,10 @@ repository_snapshot_matches() {
   local verified_worktree_real verified_worktree_id verified_top verified_top_real verified_head verified_branch
   current_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
   current_worktree_id=$(path_identity "$WORKTREE_REAL" 2>/dev/null || true)
-  current_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
+  current_top=$(git_pinned rev-parse --show-toplevel 2>/dev/null || true)
   current_top_real=$([ -n "$current_top" ] && cd "$current_top" && pwd -P || true)
-  current_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
-  current_branch=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
+  current_head=$(git_pinned rev-parse HEAD 2>/dev/null || true)
+  current_branch=$(git_pinned branch --show-current 2>/dev/null || true)
   [ -n "$current_branch" ] || current_branch=detached
   [ "$current_worktree_real" = "$WORKTREE_REAL" ] \
     && [ "$current_worktree_id" = "$WORKTREE_ID" ] \
@@ -509,10 +507,10 @@ repository_snapshot_matches() {
     || return 1
   verified_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
   verified_worktree_id=$(path_identity "$WORKTREE_REAL" 2>/dev/null || true)
-  verified_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
+  verified_top=$(git_pinned rev-parse --show-toplevel 2>/dev/null || true)
   verified_top_real=$([ -n "$verified_top" ] && cd "$verified_top" && pwd -P || true)
-  verified_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
-  verified_branch=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
+  verified_head=$(git_pinned rev-parse HEAD 2>/dev/null || true)
+  verified_branch=$(git_pinned branch --show-current 2>/dev/null || true)
   [ -n "$verified_branch" ] || verified_branch=detached
   [ "$verified_worktree_real" = "$WORKTREE_REAL" ] \
     && [ "$verified_worktree_id" = "$WORKTREE_ID" ] \
@@ -550,11 +548,11 @@ if [ -z "$STATUS_SNAPSHOT_TMP" ] || [ -z "$LOG_SNAPSHOT_TMP" ] \
   exit 1
 fi
 
-capture_command_snapshot "$STATUS_SNAPSHOT_TMP" fatal git -C "$WORKTREE_REAL" status --short --branch \
+capture_command_snapshot "$STATUS_SNAPSHOT_TMP" fatal git_pinned status --short --branch \
   || { echo "error: cannot snapshot continuation repository status for $ID" >&2; exit 1; }
 append_snapshot_section "Verified repository status" "$STATUS_SNAPSHOT_TMP"
 
-capture_command_snapshot "$LOG_SNAPSHOT_TMP" fatal git -C "$WORKTREE_REAL" log --oneline --decorate -20 \
+capture_command_snapshot "$LOG_SNAPSHOT_TMP" fatal git_pinned log --oneline --decorate -20 \
   || { echo "error: cannot snapshot continuation repository history for $ID" >&2; exit 1; }
 append_snapshot_section "Recent repository history" "$LOG_SNAPSHOT_TMP"
 
@@ -562,7 +560,11 @@ append_snapshot_section "Recorded task metadata" "$META_SNAPSHOT_TMP"
 
 if NO_MISTAKES_BIN=$(command -v no-mistakes 2>/dev/null); then
   run_no_mistakes_status() {
-    cd "$WORKTREE_REAL" && fm_account_run_bounded "$NO_MISTAKES_STATUS_TIMEOUT" "$NO_MISTAKES_BIN" axi status
+    local current_id
+    cd "$WORKTREE_REAL" || return 1
+    current_id=$(path_identity . 2>/dev/null || true)
+    [ "$current_id" = "$WORKTREE_ID" ] || return 1
+    fm_account_run_bounded "$NO_MISTAKES_STATUS_TIMEOUT" "$NO_MISTAKES_BIN" axi status
   }
   capture_command_snapshot "$NO_MISTAKES_STATUS_TMP" unavailable run_no_mistakes_status \
     || { echo "error: cannot bound continuation no-mistakes snapshot for $ID" >&2; exit 1; }

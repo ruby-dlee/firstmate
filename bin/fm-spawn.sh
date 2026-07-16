@@ -1538,8 +1538,6 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   if ! CONTINUATION_PROMPT_IDENTITIES=$(printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
 import base64, os, sys
 data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
-if b"\0" in data:
-    raise ValueError("prompt contains NUL")
 parent_path, name = os.path.split(os.path.abspath(sys.argv[1]))
 parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
@@ -2031,7 +2029,11 @@ sq_brief=$(shell_quote "$BRIEF")
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_prompt_command="\$(cat __BRIEF__)"
   continuation_prompt_marker="\"$continuation_prompt_command\""
-  continuation_prompt_reference="\"\$1\""
+  case "$HARNESS" in
+    claude) continuation_prompt_reference= ;;
+    codex) continuation_prompt_reference=- ;;
+    *) echo "error: continuation prompt stdin transport supports only claude and codex" >&2; exit 1 ;;
+  esac
   LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
   case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac
 fi

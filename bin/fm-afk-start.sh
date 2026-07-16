@@ -42,6 +42,115 @@ FM_AFK_NATIVE_PROCESS="$FM_AFK_STATE/.afk-native-process"
 FM_AFK_NATIVE_HANDOFF_LOCK="$FM_AFK_STATE/.afk-native-handoff.lock"
 FM_AFK_NATIVE_PROCESS_UNSAFE=0
 FM_AFK_NATIVE_PROCESS_MAX_BYTES=4096
+
+fm_afk_safe_control_read() {  # <path> <maximum-bytes>
+  python3 - "$1" "$2" <<'PY'
+import os
+import stat
+import sys
+import time
+
+source = os.path.abspath(sys.argv[1])
+maximum = int(sys.argv[2])
+parent_path, name = os.path.split(source)
+parent = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+descriptor = None
+try:
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise OSError("unsafe control file")
+    ready = os.environ.get("FM_AFK_CONTROL_READ_TEST_READY")
+    proceed = os.environ.get("FM_AFK_CONTROL_READ_TEST_PROCEED")
+    if ready and proceed:
+        marker = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(marker)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                raise OSError("control read test gate timed out")
+            time.sleep(0.01)
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        raise OSError("control file changed while opening")
+    data = bytearray()
+    while len(data) <= maximum:
+        chunk = os.read(descriptor, maximum + 1 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    finished = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if len(data) > maximum or not stat.S_ISREG(finished.st_mode) or (
+        finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns
+    ) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) or (
+        current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns
+    ) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+        raise OSError("control file changed while reading")
+    sys.stdout.buffer.write(data)
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    os.close(parent)
+PY
+}
+
+fm_afk_safe_control_copy() {  # <source> <destination> <maximum-bytes>
+  python3 - "$1" "$2" "$3" <<'PY'
+import os
+import stat
+import sys
+
+source = os.path.abspath(sys.argv[1])
+destination = os.path.abspath(sys.argv[2])
+maximum = int(sys.argv[3])
+source_parent_path, source_name = os.path.split(source)
+destination_parent_path, destination_name = os.path.split(destination)
+source_parent = os.open(source_parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+destination_parent = os.open(destination_parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+source_fd = destination_fd = None
+try:
+    before = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise OSError("unsafe source control file")
+    source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_parent)
+    opened = os.fstat(source_fd)
+    destination_before = os.stat(destination_name, dir_fd=destination_parent, follow_symlinks=False)
+    if not stat.S_ISREG(destination_before.st_mode):
+        raise OSError("unsafe destination control file")
+    destination_fd = os.open(destination_name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=destination_parent)
+    destination_opened = os.fstat(destination_fd)
+    if (destination_opened.st_dev, destination_opened.st_ino) != (destination_before.st_dev, destination_before.st_ino):
+        raise OSError("destination control file changed while opening")
+    os.ftruncate(destination_fd, 0)
+    copied = 0
+    while copied < opened.st_size:
+        chunk = os.pread(source_fd, min(65536, opened.st_size - copied), copied)
+        if not chunk:
+            raise OSError("source control file ended early")
+        written = 0
+        while written < len(chunk):
+            count = os.write(destination_fd, chunk[written:])
+            if count <= 0:
+                raise OSError("destination control file write failed")
+            written += count
+        copied += written
+    finished = os.fstat(source_fd)
+    current = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+    if (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns) != (
+        opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
+    ) or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns) != (
+        opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
+    ):
+        raise OSError("source control file changed while copying")
+    os.fsync(destination_fd)
+    os.utime(destination_name, ns=(opened.st_atime_ns, opened.st_mtime_ns), dir_fd=destination_parent, follow_symlinks=False)
+finally:
+    for descriptor in (source_fd, destination_fd, source_parent, destination_parent):
+        if descriptor is not None:
+            os.close(descriptor)
+PY
+}
 FM_AFK_NATIVE_RECORD_PID=
 FM_AFK_NATIVE_RECORD_IDENTITY=
 
@@ -195,9 +304,8 @@ fm_afk_native_process_read() {
   local snapshot bytes
   FM_AFK_NATIVE_RECORD_PID=
   FM_AFK_NATIVE_RECORD_IDENTITY=
-  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
   snapshot=$({
-    head -c "$((FM_AFK_NATIVE_PROCESS_MAX_BYTES + 1))" "$FM_AFK_NATIVE_PROCESS" 2>/dev/null || exit 1
+    fm_afk_safe_control_read "$FM_AFK_NATIVE_PROCESS" "$FM_AFK_NATIVE_PROCESS_MAX_BYTES" 2>/dev/null || exit 1
     printf '\034'
   }) || return 1
   case "$snapshot" in *$'\034') ;; *) return 1 ;; esac
@@ -205,7 +313,6 @@ fm_afk_native_process_read() {
   bytes=$(printf '%s' "$snapshot" | LC_ALL=C wc -c | tr -d '[:space:]') || return 1
   case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
   [ "$bytes" -le "$FM_AFK_NATIVE_PROCESS_MAX_BYTES" ] || return 1
-  [ -f "$FM_AFK_NATIVE_PROCESS" ] && [ ! -L "$FM_AFK_NATIVE_PROCESS" ] || return 1
   case "$snapshot" in *$'\n') snapshot=${snapshot%$'\n'} ;; esac
   case "$snapshot" in
     *$'\n'*) ;;

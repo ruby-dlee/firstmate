@@ -2244,8 +2244,8 @@ test_cross_profile_continuation_for_harness() {
   assert_contains "$launch" "$new_task" "$harness continuation did not use the new launch generation"
   assert_contains "$launch" "fm-prompt-exec.py" \
     "$harness continuation did not use the byte-preserving prompt transport"
-  assert_contains "$launch" "\"\$1\"" \
-    "$harness continuation launch did not bind the prompt as a direct argv value"
+  assert_not_contains "$launch" "\"\$1\"" \
+    "$harness continuation still transported prompt bytes through argv"
   assert_not_contains "$launch" "__fm_continuation_prompt" \
     "$harness continuation still round-tripped prompt bytes through a shell variable"
   assert_not_contains "$launch" "cat '$packet'" \
@@ -3023,6 +3023,7 @@ test_continuation_revalidates_dirty_submodule_content() {
   git -C "$worktree" -c protocol.file.allow=always submodule add -q "$subrepo" nested-submodule
   git -C "$worktree" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qam 'add submodule'
   printf 'first dirty nested generation\n' > "$worktree/nested-submodule/README.md"
+  ln -s README.md "$worktree/nested-submodule/untracked-link"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-submodule.ready"; proceed="$CASE_DIR/continuation-submodule.proceed"
   output="$CASE_DIR/continuation-submodule.out"; packet="$HOME_DIR/data/$id/continuation-submodule.md"
@@ -3036,12 +3037,14 @@ test_continuation_revalidates_dirty_submodule_content() {
   [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "submodule continuation gate did not open: $(cat "$output")"; }
   printf 'second dirty nested generation\n' > "$worktree/nested-submodule/README.md"
   touch "$proceed"
+  set +e
   wait "$packet_pid"; status=$?
+  set -e
   [ "$status" -ne 0 ] || fail "continuation accepted changed bytes in an already-dirty submodule"
   assert_contains "$(cat "$output")" "continuation repository snapshot changed" \
     "dirty submodule replacement refusal was unclear"
   assert_absent "$packet" "dirty submodule replacement installed a stale continuation packet"
-  pass "continuation identity includes nested bytes from dirty submodule worktrees"
+  pass "continuation accepts untracked submodule symlinks and fingerprints dirty nested bytes"
 }
 
 test_continuation_submodule_fingerprint_excludes_ignored_caches() {
@@ -4234,6 +4237,42 @@ test_lease_signal_handoff_publishes_cleanup_ownership() {
   pass "lease mutation defers signals until cleanup-visible ownership handoff"
 }
 
+test_recovery_signal_handoff_publishes_cleanup_ownership() {
+  local observed="$TMP_ROOT/recovery-signal-handoff" invalid="$TMP_ROOT/recovery-invalid-handoff" status
+  mkdir -p "${observed%/*}"
+  rm -f "$observed"
+  set +e
+  FM_TEST_LEASE_HANDOFF_OBSERVED="$observed" bash -c '
+    set -u
+    . "$1"
+    fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
+    fm_account_validate_contract() { return 0; }
+    fm_account_run_control() {
+      kill -TERM "$$"
+      printf "%s\n" "{\"task\":\"task-recover\",\"pool\":\"pool-recover\",\"profile\":\"profile-recover\",\"provider\":\"claude\"}"
+    }
+    trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
+    fm_account_recover task-recover profile-recover pool-recover claude
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "sticky recovery handoff signal unexpectedly allowed recovery to continue"
+  assert_regex '^1$' "$observed" \
+    "sticky recovery ownership was not cleanup-visible before the deferred signal was delivered"
+  FM_TEST_LEASE_HANDOFF_OBSERVED="$invalid" bash -c '
+    set -u
+    . "$1"
+    fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
+    fm_account_validate_contract() { return 0; }
+    fm_account_run_control() { printf "%s\n" "not-json"; }
+    if fm_account_recover task-recover profile-recover pool-recover claude; then rc=0; else rc=$?; fi
+    printf "%s:%s\n" "$rc" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh"
+  assert_regex '^2:1$' "$invalid" \
+    "invalid sticky recovery output lost cleanup-visible lease ownership"
+  pass "sticky recovery defers signals until cleanup-visible ownership handoff"
+}
+
 test_account_timeout_wrapper_uses_hard_kill_fallback() {
   local fakebin log status perl_bin
   fakebin=$(fm_fakebin "$TMP_ROOT/hard-timeout")
@@ -4470,6 +4509,16 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-lease ]; then
   test_lease_signal_handoff_publishes_cleanup_ownership
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  test_recovery_signal_handoff_publishes_cleanup_ownership
+  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  test_continuation_repository_fingerprint_uses_pinned_root
+  test_continuation_revalidates_dirty_submodule_content
+  test_account_lineage_rejects_parent_swap_during_transaction
   exit 0
 fi
 

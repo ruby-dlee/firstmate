@@ -288,17 +288,93 @@ def command_fingerprint_submodules_fd(arguments):
             if not item:
                 continue
             item_relative = prefix + item.decode("utf-8", "surrogateescape")
-            item_descriptor = open_relative(root, item_relative, os.O_RDONLY)
+            parts = components(item_relative)
+            parent = os.dup(root)
             try:
-                fingerprint_descriptor(item_descriptor, item_relative, records, budget)
+                for part in parts[:-1]:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    os.close(parent)
+                    parent = child
+                before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISLNK(before.st_mode):
+                    target = os.readlink(parts[-1], dir_fd=parent).encode("utf-8", "surrogateescape")
+                    after = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                    if not same_file(before, after):
+                        fail(f"repository symlink changed while fingerprinting: {item_relative}")
+                    budget.consume(len(target))
+                    records.append((item_relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+                else:
+                    flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
+                    item_descriptor = os.open(
+                        parts[-1], flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+                    )
+                    try:
+                        opened = os.fstat(item_descriptor)
+                        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                            fail(f"repository path changed while fingerprinting: {item_relative}")
+                        fingerprint_descriptor(item_descriptor, item_relative, records, budget)
+                    finally:
+                        os.close(item_descriptor)
             finally:
-                os.close(item_descriptor)
+                os.close(parent)
         output.write(b"submodule\0" + raw + b"\0")
         for value in command_output:
             output.write(value + b"\0")
         for item_relative, kind, mode, digest in records:
             output.write(item_relative.encode("utf-8", "surrogateescape"))
             output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+
+
+def command_git_fd(arguments):
+    if not arguments:
+        fail("usage: fm-contained-read.py git-fd <git-arguments>...")
+    root = checked_root(3)
+    os.fchdir(root)
+    os.execvp("git", ["git", *arguments])
+
+
+def command_cat_fd(arguments):
+    if len(arguments) != 2:
+        fail("usage: fm-contained-read.py cat-fd <relative> <maximum-bytes>")
+    relative, maximum_raw = arguments
+    maximum = int(maximum_raw)
+    if maximum < 0:
+        fail("invalid contained read limit")
+    root = checked_root(3)
+    item = read_relative(root, relative, maximum, "strict")
+    if item["oversized"]:
+        fail(f"source exceeds {maximum} bytes: {relative}")
+    sys.stdout.buffer.write(item["content"])
+
+
+def command_cat_child_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py cat-child-fd <directory> <file> <maximum-bytes>")
+    directory_name, file_name, maximum_raw = arguments
+    if len(components(directory_name)) != 1 or len(components(file_name)) != 1:
+        fail("contained child names must be single safe components")
+    maximum = int(maximum_raw)
+    if maximum < 0:
+        fail("invalid contained read limit")
+    root = checked_root(3)
+    directory = open_relative(root, directory_name, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        ready = os.environ.get("FM_REPORT_ENTRY_TEST_READY")
+        proceed = os.environ.get("FM_REPORT_ENTRY_TEST_PROCEED")
+        if ready and proceed:
+            descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.close(descriptor)
+            deadline = time.monotonic() + 5
+            while not os.path.exists(proceed):
+                if time.monotonic() >= deadline:
+                    fail("report entry test gate timed out")
+                time.sleep(0.01)
+        item = read_relative(directory, file_name, maximum, "strict")
+    finally:
+        os.close(directory)
+    if item["oversized"]:
+        fail(f"source exceeds {maximum} bytes: {directory_name}/{file_name}")
+    sys.stdout.buffer.write(item["content"])
 
 
 def read_descriptor(descriptor, maximum, mode):
@@ -1369,6 +1445,12 @@ def main():
         command_fingerprint_paths_fd(sys.argv[2:])
     elif sys.argv[1] == "fingerprint-submodules-fd":
         command_fingerprint_submodules_fd(sys.argv[2:])
+    elif sys.argv[1] == "git-fd":
+        command_git_fd(sys.argv[2:])
+    elif sys.argv[1] == "cat-fd":
+        command_cat_fd(sys.argv[2:])
+    elif sys.argv[1] == "cat-child-fd":
+        command_cat_child_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-files-fd":
         command_exchange_files_fd(sys.argv[2:])
     elif sys.argv[1] == "copy-file-fd":

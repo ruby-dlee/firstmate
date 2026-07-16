@@ -22,6 +22,7 @@ expected_parent = sys.argv[3] if cleanup_only else sys.argv[2]
 expected_file = sys.argv[4] if cleanup_only else sys.argv[3]
 parent = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 descriptor = None
+stdin_descriptor = None
 try:
     parent_stat = os.fstat(parent)
     if f"{parent_stat.st_dev}:{parent_stat.st_ino}" != expected_parent:
@@ -34,22 +35,7 @@ try:
     if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
         fail("prompt source changed while opening")
     os.unlink(name, dir_fd=parent)
-    chunks = []
-    offset = 0
-    while offset < opened.st_size:
-        chunk = os.pread(descriptor, min(1024 * 1024, opened.st_size - offset), offset)
-        if not chunk:
-            fail("prompt source ended before its recorded size")
-        chunks.append(chunk)
-        offset += len(chunk)
-    finished = os.fstat(descriptor)
-    if (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns) != (
-        opened.st_dev,
-        opened.st_ino,
-        opened.st_size,
-        opened.st_mtime_ns,
-    ):
-        fail("prompt source changed while reading")
+    stdin_descriptor = os.dup(descriptor)
 finally:
     if descriptor is not None:
         os.close(descriptor)
@@ -68,11 +54,15 @@ finally:
     os.close(grandparent)
 
 if cleanup_only:
+    if stdin_descriptor is not None:
+        os.close(stdin_descriptor)
     raise SystemExit(0)
 
-prompt = b"".join(chunks)
-if b"\0" in prompt:
-    fail("prompt contains a NUL byte that cannot be represented in an argument")
-
 command = os.fsencode(sys.argv[4])
-os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation", prompt], os.environb.copy())
+if stdin_descriptor is None:
+    fail("prompt descriptor is unavailable")
+os.lseek(stdin_descriptor, 0, os.SEEK_SET)
+os.dup2(stdin_descriptor, 0)
+if stdin_descriptor != 0:
+    os.close(stdin_descriptor)
+os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())

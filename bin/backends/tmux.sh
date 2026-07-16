@@ -60,7 +60,8 @@ fm_backend_tmux_operation_target() {  # <target> [expected-label] [recorded-scop
     recorded_label=${recorded_scoped_target#*:}
     [ -n "$recorded_session" ] && [ -n "$recorded_label" ] || return 1
     [ -z "$expected_label" ] || [ "$recorded_label" = "$expected_label" ] || return 1
-    printf '%s\n' "$recorded_scoped_target"
+    fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target" || return 1
+    printf '%s\n' "$target"
     return 0
   fi
   fm_backend_tmux_expected_label_matches "$target" "$expected_label" || return 1

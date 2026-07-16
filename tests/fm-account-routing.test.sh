@@ -2198,7 +2198,6 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 
 test_cross_profile_continuation_for_harness() {
   local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
-  local packet_b64 prompt_setup prompt_setup_end decoded_prompt verified_packet dollar
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
@@ -2240,19 +2239,17 @@ test_cross_profile_continuation_for_harness() {
   assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"
   assert_regex '^## Unconfirmed steering$' "$packet" "$harness continuation did not separate unconfirmed steering"
   assert_grep "Preserve unconfirmed delivery for $harness." "$packet" "$harness continuation lost unconfirmed steering"
-  packet_b64=$(python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1], "rb").read()).decode())' "$packet")
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "--profile '$new_profile' --task '$new_task'" "$harness continuation did not use the new profile/generation"
-  assert_contains "$launch" "$packet_b64" \
-    "$harness continuation did not bind the verified prompt snapshot into its launch"
+  assert_contains "$launch" "$new_profile" "$harness continuation did not use the new profile"
+  assert_contains "$launch" "$new_task" "$harness continuation did not use the new launch generation"
+  assert_contains "$launch" "fm-prompt-exec.py" \
+    "$harness continuation did not use the byte-preserving prompt transport"
+  assert_contains "$launch" '"$1"' \
+    "$harness continuation launch did not bind the prompt as a direct argv value"
+  assert_not_contains "$launch" "__fm_continuation_prompt" \
+    "$harness continuation still round-tripped prompt bytes through a shell variable"
   assert_not_contains "$launch" "cat '$packet'" \
     "$harness continuation launch still rereads its generation by pathname"
-  dollar='$'
-  prompt_setup_end="__fm_continuation_prompt=${dollar}{__fm_continuation_prompt%x};"
-  prompt_setup=${launch%%"$prompt_setup_end"*}$prompt_setup_end
-  decoded_prompt="$CASE_DIR/decoded-continuation-prompt"
-  verified_packet="$CASE_DIR/verified-continuation-prompt"
-  cp "$packet" "$verified_packet"
   printf 'replacement generation\n' > "$canonical.replacement"
   mv "$canonical.replacement" "$canonical"
   assert_grep 'done: external side effect alpha; do not rerun' "$packet" \
@@ -2261,11 +2258,7 @@ test_cross_profile_continuation_for_harness() {
   mv "$packet.replacement" "$packet"
   assert_not_contains "$launch" 'replacement launch generation' \
     "$harness launch consumed replacement bytes from its generation pathname"
-  bash -c "${prompt_setup}printf '%s' \"\$__fm_continuation_prompt\"" > "$decoded_prompt" \
-    || fail "$harness launch-time continuation decoding failed"
-  cmp -s "$verified_packet" "$decoded_prompt" \
-    || fail "$harness launch-time prompt lost bytes or trailing newlines after pathname replacement"
-  assert_contains "$launch" "--model '$source_model'" "$harness same-provider continuation lost its inherited model"
+  assert_contains "$launch" "$source_model" "$harness same-provider continuation lost its inherited model"
   assert_regex '^effort=high$' "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "$harness continuation did not release its predecessor after binding"
   assert_grep "session remove --task $old_task" "$AF_LOG" "$harness continuation did not remove its predecessor mapping"
@@ -3049,6 +3042,52 @@ test_continuation_revalidates_dirty_submodule_content() {
     "dirty submodule replacement refusal was unclear"
   assert_absent "$packet" "dirty submodule replacement installed a stale continuation packet"
   pass "continuation identity includes nested bytes from dirty submodule worktrees"
+}
+
+test_continuation_submodule_fingerprint_excludes_ignored_caches() {
+  local id rec ready proceed output packet_pid status packet worktree subrepo paths budget_output
+  id=account-cont-submodule-cache-z33a
+  rec=$(make_case continuation-submodule-cache claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "submodule-cache continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  subrepo="$CASE_DIR/submodule-cache-source"
+  fm_git_init_commit "$subrepo"
+  printf 'ignored-cache/\n' > "$subrepo/.gitignore"
+  git -C "$subrepo" add .gitignore
+  git -C "$subrepo" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm 'ignore build cache'
+  git -C "$worktree" -c protocol.file.allow=always submodule add -q "$subrepo" nested-submodule
+  git -C "$worktree" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qam 'add submodule'
+  mkdir -p "$worktree/nested-submodule/ignored-cache"
+  printf 'first ignored generation\n' > "$worktree/nested-submodule/ignored-cache/build.bin"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-submodule-cache.ready"; proceed="$CASE_DIR/continuation-submodule-cache.proceed"
+  output="$CASE_DIR/continuation-submodule-cache.out"; packet="$HOME_DIR/data/$id/continuation-cache.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" cache > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "submodule-cache continuation gate did not open: $(cat "$output")"; }
+  printf 'second ignored generation\n' > "$worktree/nested-submodule/ignored-cache/build.bin"
+  touch "$proceed"
+  if wait "$packet_pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "ignored submodule cache invalidated repository identity: $(cat "$output")"
+  assert_present "$packet" "stable git-relevant submodule state did not produce a continuation packet"
+  paths="$CASE_DIR/submodule-cache-paths"
+  budget_output="$CASE_DIR/submodule-cache-budget.out"
+  printf 'nested-submodule\0' > "$paths"
+  if python3 "$ROOT/bin/fm-contained-read.py" fingerprint-submodules-fd "$paths" 10 1 10 \
+    3< "$worktree" > "$budget_output" 2>&1; then
+    fail "submodule fingerprint ignored its byte budget"
+  fi
+  assert_contains "$(cat "$budget_output")" "repository fingerprint exceeds its byte limit" \
+    "submodule fingerprint byte-limit failure was unclear"
+  pass "continuation submodule identity excludes ignored caches and enforces bounds"
 }
 
 test_continuation_repository_fingerprint_uses_pinned_root() {
@@ -4289,6 +4328,14 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
   test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
   test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
+  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  test_continuation_revalidates_dirty_submodule_content
+  test_continuation_submodule_fingerprint_excludes_ignored_caches
   exit 0
 fi
 

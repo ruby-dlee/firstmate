@@ -31,6 +31,7 @@ ERROR_FILE="$STACK_ROOT/.retention-error"
 INSTALL_LOCK="$INSTALL_ROOT/.install-lock"
 INSTALL_RECLAIM="$INSTALL_ROOT/.install-lock-reclaim"
 CANDIDATE_FENCE="$INSTALL_ROOT/.candidate-fence"
+OWNER_HANDOFF_FENCE="$INSTALL_ROOT/.owner-handoff-fence"
 INSTALL_LOCK_TOKEN=
 SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.cjs fm-contained-read.py fm-gate-refuse-lib.sh)
 
@@ -167,6 +168,44 @@ recover_candidate_fence() {
   restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$candidate_provenance" "$candidate_nonce" || return 1
   rm -rf "$generation"
   rm -f "$CANDIDATE_FENCE"
+}
+
+retain_owner_handoff_fence() {
+  local domain=$1 old_label=$2 old_generation=$3 new_label=$4 temp
+  temp=$(mktemp "$INSTALL_ROOT/.owner-handoff-fence.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n%s\n' "$domain" "$old_label" "$old_generation" "$new_label" > "$temp" \
+    || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+  mv -f "$temp" "$OWNER_HANDOFF_FENCE"
+}
+
+recover_owner_handoff_fence() {
+  local domain old_label old_generation new_label extra canonical_label current_program
+  [ -e "$OWNER_HANDOFF_FENCE" ] || [ -L "$OWNER_HANDOFF_FENCE" ] || return 0
+  [ -f "$OWNER_HANDOFF_FENCE" ] && [ ! -L "$OWNER_HANDOFF_FENCE" ] || return 1
+  domain=$(sed -n '1p' "$OWNER_HANDOFF_FENCE")
+  old_label=$(sed -n '2p' "$OWNER_HANDOFF_FENCE")
+  old_generation=$(sed -n '3p' "$OWNER_HANDOFF_FENCE")
+  new_label=$(sed -n '4p' "$OWNER_HANDOFF_FENCE")
+  extra=$(sed -n '5p' "$OWNER_HANDOFF_FENCE")
+  case "$domain" in gui/*) ;; *) return 1 ;; esac
+  case "$old_label" in "$LABEL".*) ;; *) return 1 ;; esac
+  case "$new_label" in "$LABEL".*) ;; *) return 1 ;; esac
+  case "$old_generation" in -|"$GENERATIONS"/*) ;; *) return 1 ;; esac
+  [ -z "$extra" ] || return 1
+  [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || return 1
+  canonical_label=$(plist_label "$PLIST")
+  if [ "$canonical_label" = "$old_label" ]; then
+    rm -f "$OWNER_HANDOFF_FENCE"
+    return 0
+  fi
+  [ "$canonical_label" = "$new_label" ] || return 1
+  candidate_bootout_confirmed "$domain" "$old_label" || return 1
+  current_program=$(plist_program "$PLIST")
+  if [ "$old_generation" != - ] && [ "$current_program" != "$old_generation/bin/fm-report-retention.sh" ]; then
+    rm -rf "$old_generation"
+  fi
+  rm -f "$OWNER_HANDOFF_FENCE"
 }
 
 control_state() {
@@ -354,7 +393,7 @@ install_test_interrupt() {
 
 install_owner() {
   local token staging generation generation_plist plist_temp previous_plist domain file heartbeat_backup
-  local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program='' old_label=''
+  local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program='' old_label='' old_generation=''
   local job_label activation_nonce activation_started=0 activation_baseline='' activation_attempts heartbeat_had_previous=0
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent installation requires macOS" >&2; return 1; }
   command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
@@ -391,6 +430,7 @@ install_owner() {
     cp -p "$PLIST" "$previous_plist" || { rm -f "$plist_temp" "$previous_plist"; rm -rf "$generation"; return 1; }
     old_program=$(plist_program "$previous_plist")
     old_label=$(plist_label "$previous_plist")
+    case "$old_program" in "$GENERATIONS"/*/bin/fm-report-retention.sh) old_generation=${old_program%/bin/fm-report-retention.sh} ;; esac
   fi
   mkdir -p "$STACK_ROOT" || return 1
   heartbeat_backup=$(mktemp "$STACK_ROOT/.retention-heartbeat.previous.XXXXXX") || return 1
@@ -437,7 +477,12 @@ install_owner() {
     done
   fi
   if [ "$activation_started" -eq 1 ] && heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline"; then
+    if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
+      retain_owner_handoff_fence "$domain" "$old_label" "${old_generation:--}" "$job_label" \
+        || { rm -f "$plist_temp" "$previous_plist"; return 1; }
+    fi
     if [ "${FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER:-}" = 1 ] || ! mv -f "$plist_temp" "$PLIST"; then
+      rm -f "$OWNER_HANDOFF_FENCE"
       if candidate_bootout_confirmed "$domain" "$job_label"; then
         restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
         rm -f "$heartbeat_backup"
@@ -454,7 +499,11 @@ install_owner() {
     rm -f "$heartbeat_backup"
     install_test_interrupt pointer-published || return $?
     if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
-      "$LAUNCHCTL" bootout "$domain/$old_label" >/dev/null 2>&1 || true
+      if ! recover_owner_handoff_fence; then
+        rm -f "$previous_plist"
+        echo "error: report-retention previous owner fencing is pending" >&2
+        return 1
+      fi
     fi
     rm -f "$previous_plist"
     for file in "$GENERATIONS"/*; do
@@ -501,6 +550,7 @@ run_with_install_lock() {
   install_lock_acquire || return 1
   trap 'install_lock_release >/dev/null 2>&1 || true' EXIT
   recover_candidate_fence || { echo "error: report-retention candidate fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
+  recover_owner_handoff_fence || { echo "error: report-retention previous owner fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
   "$operation"; status=$?
   install_lock_release
   trap - EXIT

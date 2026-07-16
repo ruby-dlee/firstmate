@@ -653,30 +653,40 @@ test_managed_tmux_target_identity_checks_recorded_session() {
     || fail "a reused stable id blocked confident absence after the recorded-session scan"
   ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-other-task \
     || fail "managed tmux capture accepted a scoped target with the wrong task label"
-  fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
-    || fail "recorded-session capture was blocked by an unrelated reused stable id"
-  fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
-    || fail "recorded-session key send was blocked by an unrelated reused stable id"
-  fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task recorded-session:fm-intended-task >/dev/null \
-    || fail "recorded-session text send was blocked by an unrelated reused stable id"
+  ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session capture accepted an unrelated reused stable id"
+  ! fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
+    || fail "recorded-session key send accepted an unrelated reused stable id"
+  ! fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session text send accepted an unrelated reused stable id"
   [ "$(fm_backend_agent_alive tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
     || fail "session-mismatched tmux identity passed agent-liveness validation"
   ! fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
     || fail "a reused tmux window id in another session passed kill validation"
-  ! grep -Eq '^(capture-pane|send-keys) .* -t @77( |$)' "$log" \
-    || fail "managed tmux activity used a reusable stable id after session binding"
-  grep -Eq '^(capture-pane|send-keys) .* -t recorded-session:fm-intended-task( |$)' "$log" \
-    || fail "managed tmux activity did not use the recorded scoped target"
+  ! grep -Eq '^(capture-pane|send-keys) ' "$log" \
+    || fail "session-mismatched managed tmux activity reached the reused or name-based target"
 
   fake_session=recorded-session
   fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
     || fail "the recorded tmux session identity did not pass existence validation"
+  fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "session-matched capture rejected the stable tmux identity"
+  fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
+    || fail "session-matched key send rejected the stable tmux identity"
+  grep -Eq '^(capture-pane|send-keys) .* -t @77( |$)' "$log" \
+    || fail "managed tmux activity discarded the verified stable identity"
+  ! grep -Eq '^(capture-pane|send-keys) .* -t recorded-session:fm-intended-task( |$)' "$log" \
+    || fail "managed tmux activity retargeted through the mutable recorded name"
   fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
     || fail "the recorded tmux session identity did not pass kill validation"
   grep -q '^kill-window -t @77$' "$log" \
     || fail "the session-matched tmux identity did not retain its verified stable target"
   ! grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
     || fail "tmux kill discarded its stable identity for a name-based target"
+
+  fake_label=fm-renamed-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a renamed live stable id in the recorded session was classified absent"
   pass "managed tmux activity is scoped while lifecycle kill retains verified identity"
 }
 
@@ -1200,6 +1210,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   exit 0
 fi

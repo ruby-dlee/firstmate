@@ -2209,8 +2209,10 @@ test_repository_fingerprint_recurses_through_submodule_worktrees() {
 }
 
 test_retention_cutoff_is_authoritative_before_cleanup() {
-  local id=report-retention-cutoff-k2q fresh=report-retention-fresh-k2q entry fresh_entry manifest temp ready output policy cutoff
+  local id=report-retention-cutoff-k2q second=report-retention-cutoff-k2r fresh=report-retention-fresh-k2q
+  local entry second_entry fresh_entry manifest second_manifest temp ready output policy cutoff
   local expired_cohort="$STACK/entries/cohort-946684800000"
+  local second_expired_cohort="$STACK/entries/cohort-946598400000"
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cutoff-visible report."
   run_stack publish "$id" >/dev/null || fail "cutoff precondition publication failed"
@@ -2227,6 +2229,18 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   mkdir "$expired_cohort"
   mv "$(dirname "$entry")" "$expired_cohort/"
   entry="$expired_cohort/$(basename "$(dirname "$entry")")/report.html"
+  write_task "$second" ship
+  write_required_report "$HOME_DIR/data/$second/completion.md" "Second cutoff-visible report."
+  run_stack publish "$second" >/dev/null || fail "second cutoff precondition publication failed"
+  second_entry=$(run_stack path "$second") || fail "second cutoff precondition path failed"
+  second_manifest="$(dirname "$second_entry")/manifest.json"
+  temp="$second_manifest.tmp"
+  sed -e 's/"completedAt": "[^"]*"/"completedAt": "1999-12-31T00:00:00.000Z"/' \
+    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946598400000"/' "$second_manifest" > "$temp"
+  mv "$temp" "$second_manifest"
+  mkdir "$second_expired_cohort"
+  mv "$(dirname "$second_entry")" "$second_expired_cohort/"
+  second_entry="$second_expired_cohort/$(basename "$(dirname "$second_entry")")/report.html"
   ready="$TMP_ROOT/retention-policy.ready"; output="$TMP_ROOT/retention-policy.out"
   if FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_ABORT=1 \
     run_stack prune --status > "$output" 2>&1; then
@@ -2234,6 +2248,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   fi
   assert_present "$ready" "retention cutoff publication hook did not run"
   assert_absent "$(dirname "$entry")" "expired raw artifacts remained in the public namespace after the cutoff milestone"
+  assert_absent "$(dirname "$second_entry")" "a later due cohort remained public after the atomic cutoff milestone"
   assert_present "$(dirname "$fresh_entry")" "fresh report became unavailable while an expired cohort was retired"
   policy="$STACK/.retention-policy.js"
   assert_present "$policy" "retention did not atomically publish its cutoff generation and index"
@@ -2243,6 +2258,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   [ -n "$cutoff" ] && [ "$cutoff" -gt 946684800000 ] \
     || fail "retention authority did not hide the expired report before scanning manifests"
   assert_absent "$(dirname "$entry")" "interrupted retention restored expired raw artifacts"
+  assert_absent "$(dirname "$second_entry")" "interrupted retention restored a later expired cohort"
   run_stack prune --status >/dev/null || fail "retention did not recover its interrupted namespace generation"
   assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
   assert_present "$(dirname "$fresh_entry")" "retention cleanup removed an unrelated fresh cohort"
@@ -2251,7 +2267,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
 }
 
 test_retention_cohort_tombstone_is_noreplace_owned() {
-  local id=report-retention-cohort-race-k2s entry manifest temp source tombstone ready proceed output pid status
+  local id=report-retention-cohort-race-k2s entry manifest temp source retired retired_name tombstone ready proceed output pid status
   id=report-retention-cohort-race-k2s
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cohort rename race."
@@ -2271,14 +2287,83 @@ test_retention_cohort_tombstone_is_noreplace_owned() {
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "cohort no-replace gate did not open"; }
   tombstone="$STACK/.retention-tombstones/$(cat "$ready")"
+  retired_name=$(sed -n 's/.*"retiredName":"\([^"]*\)".*/\1/p' "$STACK/.retention-cutover.json")
+  retired="$STACK/$retired_name"
+  [ -n "$retired_name" ] || fail "cohort retirement did not retain its cutover identity"
   mkdir "$tombstone"; printf 'replacement\n' > "$tombstone/sentinel"
   touch "$proceed"
   if wait "$pid"; then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "cohort retirement replaced a concurrently created tombstone"
-  assert_present "$source" "failed cohort retirement moved its uncommitted source"
+  assert_present "$retired" "failed cohort retirement lost its uncommitted retired namespace"
   assert_grep replacement "$tombstone/sentinel" "cohort retirement mutated a replacement tombstone"
-  rm -rf "$source" "$tombstone"
+  rm -rf "$retired" "$tombstone" "$source"
   pass "retention cohort retirement is no-replace and generation-owned"
+}
+
+test_retention_cohort_source_swap_restores_replacement() {
+  local source="$TMP_ROOT/cohort-source-swap" original="$TMP_ROOT/cohort-source-original"
+  local tombstones="$TMP_ROOT/cohort-source-tombstones" ready="$TMP_ROOT/cohort-source.ready"
+  local proceed="$TMP_ROOT/cohort-source.proceed" output="$TMP_ROOT/cohort-source.out" pid status identity
+  mkdir -p "$source" "$tombstones"
+  printf 'original\n' > "$source/sentinel"
+  identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$source"; else stat -c '%d:%i' "$source"; fi)
+  FM_CONTAINED_RENAME_TEST_READY="$ready" FM_CONTAINED_RENAME_TEST_PROCEED="$proceed" \
+    python3 "$ROOT/bin/fm-contained-read.py" rename-noreplace-owned-fd \
+      "$(basename "$source")" tombstone "$identity" 3< "$(dirname "$source")" 4< "$tombstones" \
+      > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "owned source-swap gate did not open"; }
+  mv "$source" "$original"
+  mkdir "$source"
+  printf 'replacement\n' > "$source/sentinel"
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "owned cohort rename accepted a swapped source generation"
+  assert_grep replacement "$source/sentinel" "swapped source generation was not restored to its public name"
+  assert_grep original "$original/sentinel" "original owned generation was changed during the race"
+  assert_absent "$tombstones/tombstone" "swapped source generation remained stranded in tombstones"
+  pass "owned cohort retirement restores a replacement raced through rename"
+}
+
+test_retention_handoff_persists_and_retries_old_owner_fencing() {
+  local fakebin="$TMP_ROOT/retention-handoff-launchctl" install_root="$TMP_ROOT/retention-handoff-install"
+  local agents="$TMP_ROOT/retention-handoff-agents" log="$TMP_ROOT/retention-handoff.log" output status old_label
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in
+  print|bootstrap|kickstart) exit 0 ;;
+  bootout) [ "${FM_FAKE_BOOTOUT_FAIL:-0}" != 1 ] || exit 1; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install \
+    || fail "retention handoff precondition installation failed"
+  old_label=$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' \
+    "$agents/com.firstmate.report-retention.plist")
+  if output=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" FM_FAKE_BOOTOUT_FAIL=1 \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention handoff completed while the previous owner remained loaded"
+  assert_contains "$output" "previous owner fencing is pending" "unfenced previous owner failure was unclear"
+  assert_present "$install_root/.owner-handoff-fence" "unfenced previous owner lacked a durable retry record"
+  assert_grep "bootout gui/$(id -u)/$old_label" "$log" "retention handoff did not attempt to fence the previous owner"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 \
+    FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" \
+    FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" \
+    FM_FAKE_LAUNCHCTL_LOG="$log" "$ROOT/bin/fm-report-retention.sh" ensure \
+    || fail "retention ensure did not retry previous-owner fencing"
+  assert_absent "$install_root/.owner-handoff-fence" "successful retry retained the previous-owner fence"
+  pass "retention handoff persists and retries previous-owner fencing"
 }
 
 test_failed_initial_retention_activation_disarms_plist() {
@@ -2673,6 +2758,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
   test_retention_generations_survive_install_interruptions
   test_nested_list_parent_scope_hides_required_headings
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_cohort_source_swap_restores_replacement
+  test_retention_handoff_persists_and_retries_old_owner_fencing
   exit 0
 fi
 

@@ -170,6 +170,8 @@ ACCOUNT_PROFILE=
 NO_ACCOUNT_ROUTING=0
 RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
+CONTINUATION_LAUNCH_DIR=
+CONTINUATION_PROMPT_FILE=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -655,6 +657,7 @@ spawn_abort_cleanup() {
     esac
   fi
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
+  [ -z "${CONTINUATION_LAUNCH_DIR:-}" ] || rm -rf "$CONTINUATION_LAUNCH_DIR"
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
@@ -1512,9 +1515,27 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   case "$CONTINUATION_RESULT" in *$'\n'*) ;; *) echo "error: continuation prompt snapshot is incomplete for $ID" >&2; exit 1 ;; esac
   CONTINUATION_PACKET=${CONTINUATION_RESULT%%$'\n'*}
   CONTINUATION_PROMPT_B64=${CONTINUATION_RESULT#*$'\n'}
-  printf '%s' "$CONTINUATION_PROMPT_B64" \
-    | python3 -c 'import base64,sys; base64.b64decode(sys.stdin.buffer.read(), validate=True)' \
-    || { echo "error: continuation prompt snapshot is invalid for $ID" >&2; exit 1; }
+  CONTINUATION_LAUNCH_DIR=$(mktemp -d "$STATE/.$ID.continuation-launch.XXXXXX") \
+    || { echo "error: cannot stage continuation prompt transport for $ID" >&2; exit 1; }
+  chmod 700 "$CONTINUATION_LAUNCH_DIR" || exit 1
+  CONTINUATION_PROMPT_FILE="$CONTINUATION_LAUNCH_DIR/prompt"
+  if ! printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
+import base64, os, sys
+data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+if b"\0" in data:
+    raise ValueError("prompt contains NUL")
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$CONTINUATION_PROMPT_FILE"; then
+    echo "error: continuation prompt snapshot cannot be transported byte-verbatim for $ID" >&2
+    exit 1
+  fi
   BRIEF=$CONTINUATION_PACKET
 fi
 
@@ -1983,14 +2004,9 @@ sq_brief=$(shell_quote "$BRIEF")
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_prompt_command="\$(cat __BRIEF__)"
   continuation_prompt_marker="\"$continuation_prompt_command\""
-  continuation_prompt_dollar='$'
-  continuation_prompt_reference="\"${continuation_prompt_dollar}__fm_continuation_prompt\""
-  sq_continuation_b64=$(shell_quote "$CONTINUATION_PROMPT_B64")
-  sq_continuation_decoder=$(shell_quote 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read(), validate=True)+b"x")')
-  continuation_prompt_setup="__fm_continuation_prompt=\$(printf '%s' $sq_continuation_b64 | python3 -c $sq_continuation_decoder); __fm_continuation_prompt=\${__fm_continuation_prompt%x}; "
+  continuation_prompt_reference='"$1"'
   LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
   case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac
-  LAUNCH="$continuation_prompt_setup$LAUNCH"
 fi
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
@@ -2047,6 +2063,10 @@ LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
+fi
+if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+  continuation_launch_command=$LAUNCH
+  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$continuation_launch_command")"
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
@@ -2110,6 +2130,8 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   fi
 fi
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
+CONTINUATION_LAUNCH_DIR=
+CONTINUATION_PROMPT_FILE=
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
 META_BACKUP=
 discard_existing_artifact_backup

@@ -6,7 +6,9 @@ import ctypes
 import hashlib
 import json
 import os
+import selectors
 import stat
+import subprocess
 import sys
 import time
 
@@ -71,15 +73,43 @@ def same_file(first, second):
     )
 
 
-def fingerprint_descriptor(descriptor, relative, records):
+class FingerprintBudget:
+    def __init__(self, maximum_files, maximum_bytes, maximum_seconds=None):
+        self.maximum_files = maximum_files
+        self.maximum_bytes = maximum_bytes
+        self.deadline = time.monotonic() + maximum_seconds if maximum_seconds is not None else None
+        self.files = 0
+        self.bytes = 0
+
+    def check_time(self):
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            fail("repository fingerprint exceeds its time limit")
+
+    def consume(self, size=0):
+        self.check_time()
+        self.files += 1
+        if self.files > self.maximum_files:
+            fail("repository fingerprint exceeds its file-count limit")
+        self.consume_bytes(size)
+
+    def consume_bytes(self, size):
+        self.check_time()
+        self.bytes += size
+        if self.bytes > self.maximum_bytes:
+            fail("repository fingerprint exceeds its byte limit")
+
+
+def fingerprint_descriptor(descriptor, relative, records, budget):
     opened = os.fstat(descriptor)
     if stat.S_ISREG(opened.st_mode):
+        budget.consume(opened.st_size)
         digest = hashlib.sha256()
         offset = 0
         while offset < opened.st_size:
             chunk = os.pread(descriptor, min(64 * 1024, opened.st_size - offset), offset)
             if not chunk:
                 fail(f"repository file ended while fingerprinting: {relative}")
+            budget.check_time()
             digest.update(chunk)
             offset += len(chunk)
         if not same_file(opened, os.fstat(descriptor)):
@@ -87,8 +117,10 @@ def fingerprint_descriptor(descriptor, relative, records):
         records.append((relative, "file", opened.st_mode, digest.hexdigest()))
         return
     if not stat.S_ISDIR(opened.st_mode):
+        budget.consume(0)
         records.append((relative, "special", opened.st_mode, "special"))
         return
+    budget.consume(0)
     records.append((relative, "directory", opened.st_mode, "directory"))
     for name in sorted(os.listdir(descriptor)):
         child_relative = f"{relative}/{name}" if relative else name
@@ -98,6 +130,7 @@ def fingerprint_descriptor(descriptor, relative, records):
             after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             if not same_file(before, after):
                 fail(f"repository symlink changed while fingerprinting: {child_relative}")
+            budget.consume(len(target))
             records.append((child_relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
             continue
         flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
@@ -106,16 +139,21 @@ def fingerprint_descriptor(descriptor, relative, records):
             actual = os.fstat(child)
             if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
                 fail(f"repository path changed while fingerprinting: {child_relative}")
-            fingerprint_descriptor(child, child_relative, records)
+            fingerprint_descriptor(child, child_relative, records, budget)
         finally:
             os.close(child)
 
 
 def command_fingerprint_paths_fd(arguments):
-    if len(arguments) != 1:
-        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file>")
+    if len(arguments) not in (1, 3):
+        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file> [max-files max-bytes]")
     root = checked_root(3)
     paths = open(arguments[0], "rb").read().split(b"\0")
+    maximum_files = int(arguments[1]) if len(arguments) == 3 else 100000
+    maximum_bytes = int(arguments[2]) if len(arguments) == 3 else 1073741824
+    if maximum_files <= 0 or maximum_bytes <= 0:
+        fail("repository fingerprint limits must be positive")
+    budget = FingerprintBudget(maximum_files, maximum_bytes)
     records = []
     for raw in paths:
         if not raw:
@@ -135,6 +173,7 @@ def command_fingerprint_paths_fd(arguments):
                     after = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
                     if not same_file(before, after):
                         fail(f"repository symlink changed while fingerprinting: {relative}")
+                    budget.consume(len(target))
                     records.append((relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
                 else:
                     flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
@@ -143,7 +182,7 @@ def command_fingerprint_paths_fd(arguments):
                         actual = os.fstat(item)
                         if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
                             fail(f"repository path changed while fingerprinting: {relative}")
-                        fingerprint_descriptor(item, relative, records)
+                        fingerprint_descriptor(item, relative, records, budget)
                     finally:
                         os.close(item)
             finally:
@@ -154,6 +193,93 @@ def command_fingerprint_paths_fd(arguments):
     for relative, kind, mode, digest in records:
         output.write(relative.encode("utf-8", "surrogateescape"))
         output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+
+
+def bounded_command_output(command, budget):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    selector = selectors.DefaultSelector()
+    output = []
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            budget.check_time()
+            for key, _ in selector.select(timeout=0.1):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if chunk:
+                    budget.consume_bytes(len(chunk))
+                    output.append(chunk)
+                else:
+                    selector.unregister(key.fileobj)
+            if process.poll() is not None and not selector.get_map():
+                break
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command)
+        return b"".join(output)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+
+def command_fingerprint_submodules_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py fingerprint-submodules-fd <paths-file> <max-files> <max-bytes> <max-seconds>")
+    root = checked_root(3)
+    maximum_files = int(arguments[1])
+    maximum_bytes = int(arguments[2])
+    maximum_seconds = int(arguments[3])
+    if maximum_files <= 0 or maximum_bytes <= 0 or maximum_seconds <= 0:
+        fail("repository fingerprint limits must be positive")
+    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+    paths = [item for item in open(arguments[0], "rb").read().split(b"\0") if item]
+    output = sys.stdout.buffer
+    for raw in paths:
+        relative = raw.decode("utf-8", "surrogateescape")
+        descriptor = open_relative(root, relative, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fchdir(descriptor)
+            command_output = []
+            try:
+                for command in (
+                    ["git", "rev-parse", "HEAD"],
+                    ["git", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=no"],
+                    ["git", "diff", "--no-ext-diff", "--binary", "--submodule=diff", "HEAD", "--"],
+                ):
+                    budget.consume()
+                    command_output.append(bounded_command_output(command, budget))
+                budget.consume()
+                untracked = bounded_command_output(
+                    ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                    budget,
+                ).split(b"\0")
+            except subprocess.CalledProcessError:
+                output.write(b"submodule\0" + raw + b"\0unavailable\0")
+                continue
+        finally:
+            os.fchdir(root)
+            os.close(descriptor)
+        records = []
+        prefix = f"{relative}/"
+        for item in untracked:
+            if not item:
+                continue
+            item_relative = prefix + item.decode("utf-8", "surrogateescape")
+            item_descriptor = open_relative(root, item_relative, os.O_RDONLY)
+            try:
+                fingerprint_descriptor(item_descriptor, item_relative, records, budget)
+            finally:
+                os.close(item_descriptor)
+        output.write(b"submodule\0" + raw + b"\0")
+        for value in command_output:
+            output.write(value + b"\0")
+        for item_relative, kind, mode, digest in records:
+            output.write(item_relative.encode("utf-8", "surrogateescape"))
+            output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
 
 
 def read_descriptor(descriptor, maximum, mode):
@@ -698,7 +824,36 @@ def command_rename_noreplace_owned_fd(arguments):
     rename_noreplace(source_root, destination_root, source_name, destination_name)
     moved = os.stat(destination_name, dir_fd=destination_root, follow_symlinks=False)
     if moved.st_dev != source.st_dev or moved.st_ino != source.st_ino:
-        fail("owned directory generation changed during rename")
+        try:
+            rename_noreplace(destination_root, source_root, destination_name, source_name)
+            restored = os.stat(source_name, dir_fd=source_root, follow_symlinks=False)
+            if restored.st_dev != moved.st_dev or restored.st_ino != moved.st_ino:
+                fail("unowned directory generation could not be restored after rename")
+        except OSError as error:
+            fail(f"unowned directory generation remains quarantined after rename: {error}")
+        fail("owned directory generation changed during rename and the moved replacement was restored")
+
+
+def command_rename_noreplace_owned_entry_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py rename-noreplace-owned-entry-fd <source> <destination> <source-id>")
+    source_name, destination_name, source_id = arguments
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("rename names must be single safe components")
+    source_root = checked_root(3)
+    destination_root = checked_root(4)
+    source = os.stat(source_name, dir_fd=source_root, follow_symlinks=False)
+    if stat.S_ISLNK(source.st_mode) or not (stat.S_ISDIR(source.st_mode) or stat.S_ISREG(source.st_mode)) \
+            or f"{source.st_dev}:{source.st_ino}" != source_id:
+        fail("owned entry generation changed before rename")
+    rename_noreplace(source_root, destination_root, source_name, destination_name)
+    moved = os.stat(destination_name, dir_fd=destination_root, follow_symlinks=False)
+    if moved.st_dev != source.st_dev or moved.st_ino != source.st_ino:
+        try:
+            rename_noreplace(destination_root, source_root, destination_name, source_name)
+        except OSError as error:
+            fail(f"unowned entry generation remains quarantined after rename: {error}")
+        fail("owned entry generation changed during rename and the moved replacement was restored")
 
 
 def command_prune_tombstones_fd(arguments):
@@ -928,12 +1083,16 @@ def main():
         command_remove_owned_directory_fd(sys.argv[2:])
     elif sys.argv[1] == "fingerprint-paths-fd":
         command_fingerprint_paths_fd(sys.argv[2:])
+    elif sys.argv[1] == "fingerprint-submodules-fd":
+        command_fingerprint_submodules_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-files-fd":
         command_exchange_files_fd(sys.argv[2:])
     elif sys.argv[1] == "copy-file-fd":
         command_copy_file_fd(sys.argv[2:])
     elif sys.argv[1] == "rename-noreplace-owned-fd":
         command_rename_noreplace_owned_fd(sys.argv[2:])
+    elif sys.argv[1] == "rename-noreplace-owned-entry-fd":
+        command_rename_noreplace_owned_entry_fd(sys.argv[2:])
     elif sys.argv[1] == "prune-tombstones-fd":
         command_prune_tombstones_fd(sys.argv[2:])
     elif sys.argv[1] == "copy-directory-fd":

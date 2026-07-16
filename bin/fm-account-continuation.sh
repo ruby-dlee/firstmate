@@ -31,6 +31,8 @@ STATUS_SNAPSHOT_TMP=
 STATUS_IDENTITY_TMP=
 STATUS_REVALIDATION_TMP=
 REPOSITORY_PATHS_TMP=
+REPOSITORY_INDEX_TMP=
+SUBMODULE_PATHS_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
@@ -38,6 +40,9 @@ NO_MISTAKES_STATUS_TMP=
 TASK_SNAPSHOT_DIR=
 MAX_PACKET_BYTES=65536
 MAX_SNAPSHOT_BYTES=8192
+MAX_REPOSITORY_FINGERPRINT_FILES=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES:-100000}
+MAX_REPOSITORY_FINGERPRINT_BYTES=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES:-268435456}
+MAX_REPOSITORY_FINGERPRINT_SECONDS=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS:-30}
 NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
 path_identity() {
   if [ "$(uname)" = Darwin ]; then
@@ -136,6 +141,8 @@ cleanup_packet_tmp() {
   [ -z "$STATUS_IDENTITY_TMP" ] || rm -f "$STATUS_IDENTITY_TMP"
   [ -z "$STATUS_REVALIDATION_TMP" ] || rm -f "$STATUS_REVALIDATION_TMP"
   [ -z "$REPOSITORY_PATHS_TMP" ] || rm -f "$REPOSITORY_PATHS_TMP"
+  [ -z "$REPOSITORY_INDEX_TMP" ] || rm -f "$REPOSITORY_INDEX_TMP"
+  [ -z "$SUBMODULE_PATHS_TMP" ] || rm -f "$SUBMODULE_PATHS_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
@@ -154,6 +161,15 @@ ATTEMPT=${2:-}
 [ -n "$ID" ] && [ -n "$ATTEMPT" ] || { echo "usage: fm-account-continuation.sh <task-id> <new-attempt-id>" >&2; exit 2; }
 case "$NO_MISTAKES_STATUS_TIMEOUT" in
   ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT must be a positive integer" >&2; exit 2 ;;
+esac
+case "$MAX_REPOSITORY_FINGERPRINT_FILES" in
+  ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES must be a positive integer" >&2; exit 2 ;;
+esac
+case "$MAX_REPOSITORY_FINGERPRINT_BYTES" in
+  ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES must be a positive integer" >&2; exit 2 ;;
+esac
+case "$MAX_REPOSITORY_FINGERPRINT_SECONDS" in
+  ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS must be a positive integer" >&2; exit 2 ;;
 esac
 fm_account_valid_id "$ID" || { echo "error: invalid task id '$ID'" >&2; exit 1; }
 fm_account_valid_id "$ATTEMPT" || { echo "error: invalid account attempt '$ATTEMPT'" >&2; exit 1; }
@@ -226,9 +242,40 @@ STATUS_IDENTITY_TMP=$(mktemp "$STATE/.continuation-status-identity-$ID.XXXXXX") 
   || { echo "error: cannot stage continuation repository status identity for $ID" >&2; exit 1; }
 REPOSITORY_PATHS_TMP=$(mktemp "$STATE/.continuation-repository-paths-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation repository paths for $ID" >&2; exit 1; }
+REPOSITORY_INDEX_TMP=$(mktemp "$STATE/.continuation-repository-index-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation repository index for $ID" >&2; exit 1; }
+SUBMODULE_PATHS_TMP=$(mktemp "$STATE/.continuation-submodules-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation submodule paths for $ID" >&2; exit 1; }
 
 append_repository_path_identities() {
-  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-paths-fd "$REPOSITORY_PATHS_TMP" 3<&9
+  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-paths-fd "$REPOSITORY_PATHS_TMP" \
+    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" 3<&9
+}
+
+split_repository_index_paths() {
+  python3 - "$REPOSITORY_INDEX_TMP" "$REPOSITORY_PATHS_TMP" "$SUBMODULE_PATHS_TMP" <<'PY'
+import sys
+source, tracked, submodules = sys.argv[1:]
+tracked_output = open(tracked, "wb")
+submodule_output = open(submodules, "wb")
+try:
+    for record in open(source, "rb").read().split(b"\0"):
+        if not record:
+            continue
+        metadata, path = record.split(b"\t", 1)
+        mode = metadata.split(b" ", 1)[0]
+        destination = submodule_output if mode == b"160000" else tracked_output
+        destination.write(path + b"\0")
+finally:
+    tracked_output.close()
+    submodule_output.close()
+PY
+}
+
+append_submodule_identities() {
+  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-submodules-fd "$SUBMODULE_PATHS_TMP" \
+    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
+    "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9
 }
 
 capture_repository_identity() {
@@ -237,10 +284,13 @@ capture_repository_identity() {
     printf 'status\0'
     git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z || return 1
     printf '\0index\0'
-    git -C "$WORKTREE_REAL" ls-files --stage -z || return 1
+    git -C "$WORKTREE_REAL" ls-files --stage -z > "$REPOSITORY_INDEX_TMP" || return 1
+    cat "$REPOSITORY_INDEX_TMP" || return 1
     printf '\0worktree-content\0'
-    git -C "$WORKTREE_REAL" ls-files --cached -z > "$REPOSITORY_PATHS_TMP" || return 1
+    split_repository_index_paths || return 1
     append_repository_path_identities || return 1
+    printf '\0submodule-content\0'
+    append_submodule_identities || return 1
     printf '\0untracked-content\0'
     git -C "$WORKTREE_REAL" ls-files --others --exclude-standard -z > "$REPOSITORY_PATHS_TMP" \
       || return 1

@@ -83,11 +83,27 @@ test_managed_tmux_send_rejects_reused_id_in_other_session() {
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
     FM_FAKE_TMUX_SESSION=other FM_FAKE_TMUX_LABEL=fm-tmux-session-bound FM_SEND_SETTLE=0 \
     "$SEND" tmux-session-bound "wrong-session steer" >/dev/null 2>"$err"; rc=$?
-  [ "$rc" -eq 0 ] || fail "fm-send did not use the recorded session when a stable id was reused"
-  assert_grep 'target=recorded:fm-tmux-session-bound ' "$log" \
-    "fm-send did not bind every steering operation to the recorded session"
-  ! grep -q 'target=@77 ' "$log" || fail "fm-send steered through a reusable stable tmux id"
-  pass "fm-send performs managed tmux steering through the recorded session target"
+  [ "$rc" -ne 0 ] || fail "fm-send accepted a stable id reused in another session"
+  ! grep -q '^send-keys ' "$log" || fail "fm-send steered after stable tmux identity validation failed"
+  pass "fm-send rejects managed stable ids reused in another tmux session"
+}
+
+test_managed_tmux_send_retains_verified_stable_id() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/tmux-stable-target"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home tmux-stable-target); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/tmux-stable-target.meta" \
+    "window=recorded:fm-tmux-stable-target" "tmux_window_id=@78" \
+    "tmux_session_target=recorded:fm-tmux-stable-target" "kind=ship" "harness=codex"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_SESSION=recorded FM_FAKE_TMUX_LABEL=fm-tmux-stable-target FM_SEND_SETTLE=0 \
+    "$SEND" tmux-stable-target "stable steer" >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -eq 0 ] || fail "fm-send rejected a verified stable tmux identity"
+  assert_grep 'target=@78 ' "$log" "fm-send discarded the verified stable tmux id"
+  ! grep -q 'target=recorded:fm-tmux-stable-target ' "$log" \
+    || fail "fm-send retargeted through the mutable session label"
+  pass "fm-send retains the verified stable tmux identity"
 }
 
 setup_home() {  # <name> -> echoes home dir
@@ -531,6 +547,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
+  test_managed_tmux_send_rejects_reused_id_in_other_session
+  test_managed_tmux_send_retains_verified_stable_id
+  exit 0
+fi
+
 test_exact_lane_id_send_still_works
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
@@ -547,3 +569,4 @@ test_managed_key_revalidates_after_respawn_wait
 test_managed_steering_rejects_parent_swap_during_persistence
 test_healthy_fm_id_send_still_works
 test_managed_tmux_send_rejects_reused_id_in_other_session
+test_managed_tmux_send_retains_verified_stable_id

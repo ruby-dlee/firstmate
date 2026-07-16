@@ -613,10 +613,11 @@ let lastPruneStatus = { pruned: 0, pending: false };
 function withLock(callback) {
   const release = acquireLock();
   try {
+    recoverRetentionCutover();
     recoverPreviousEntries();
     cutoverLegacyEntries();
-    const retentionPolicy = advanceRetentionPolicy();
-    expireDueCohorts();
+    const retentionPolicy = nextRetentionPolicy();
+    expireDueCohorts(retentionPolicy);
     renderIndex(retentionPolicy);
     lastPruneStatus = pruneExpiredEntries();
     return callback();
@@ -832,8 +833,7 @@ function removeStackControl(name) {
   );
 }
 
-function moveStackDirectoryToPrivate(name, identity) {
-  const tombstoneName = `tombstone-${crypto.randomUUID()}`;
+function moveStackDirectoryToPrivate(name, identity, tombstoneName = `tombstone-${crypto.randomUUID()}`) {
   runContainedHelper(
     ["rename-noreplace-owned-fd", name, tombstoneName, identity],
     [stackRootDescriptor, retentionTombstoneDescriptor],
@@ -1113,7 +1113,7 @@ function recoverPreviousEntries() {
   removeAgedOrphanStaging(transactionIds);
 }
 
-function advanceRetentionPolicy() {
+function nextRetentionPolicy() {
   if (!Number.isSafeInteger(reportRetentionGuardMs) || reportRetentionGuardMs < 0 || reportRetentionGuardMs >= reportRetentionMs) {
     throw new Error("FM_REPORT_RETENTION_GUARD_MS must be a non-negative integer below 30 days");
   }
@@ -1130,38 +1130,124 @@ function advanceRetentionPolicy() {
     generation: crypto.randomUUID(),
     cutoffMs: Math.max(currentPolicy.cutoffMs, Date.now() - reportRetentionMs + reportRetentionGuardMs),
   };
-  publishRetentionPolicy(policy);
   return policy;
 }
 
-function expireDueCohorts() {
-  const dueBefore = Date.now() + reportRetentionGuardMs;
-  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
-    const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
-    if (!Number.isFinite(deadline) || deadline > dueBefore) continue;
-    const source = path.join(entriesDir, entry.name);
-    const tombstoneName = `tombstone-${crypto.randomUUID()}`;
-    const sourceStat = fs.lstatSync(source);
-    if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
-      throw new Error(`report retention cohort must be a real directory at ${source}`);
+const retentionCutoverName = ".retention-cutover.json";
+
+function recoverRetentionCutover() {
+  const raw = readStackControl(retentionCutoverName);
+  if (raw === undefined) return;
+  const record = JSON.parse(raw);
+  if (record.schemaVersion !== 1 || !/^\.entries\.retention\.[0-9a-f-]+$/.test(record.retiredName)
+    || !/^tombstone-[0-9a-f-]+$/.test(record.tombstoneName)
+    || !/^\d+:\d+$/.test(record.oldIdentity) || !/^\d+:\d+$/.test(record.replacementIdentity)
+    || !Number.isFinite(record.dueBefore) || typeof record.policyGeneration !== "string"
+    || !Number.isFinite(record.cutoffMs)) {
+    throw new Error(`invalid report retention cutover marker at ${retentionCutoverName}`);
+  }
+  const retiredPath = path.join(configuredStackRoot, record.retiredName);
+  const tombstonePath = path.join(configuredStackRoot, ".retention-tombstones", record.tombstoneName);
+  let current = fs.fstatSync(entriesDescriptor);
+  let currentIdentity = `${current.dev}:${current.ino}`;
+  let retiredStat;
+  try {
+    retiredStat = fs.lstatSync(retiredPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const tombstone = fs.lstatSync(tombstonePath);
+    if (!tombstone.isDirectory() || tombstone.isSymbolicLink()
+      || `${tombstone.dev}:${tombstone.ino}` !== record.oldIdentity
+      || currentIdentity !== record.replacementIdentity) {
+      throw new Error("report retention cutover lost its retired namespace");
     }
+    removeStackControl(retentionCutoverName);
+    return;
+  }
+  let retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
+  if (currentIdentity === record.oldIdentity && retiredIdentity === record.replacementIdentity) {
+    const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
+    const oldDescriptor = entriesDescriptor;
     runContainedHelper(
-      ["rename-noreplace-owned-fd", entry.name, tombstoneName, `${sourceStat.dev}:${sourceStat.ino}`],
-      [entriesDescriptor, retentionTombstoneDescriptor],
+      ["exchange-directories-fd", "entries", record.retiredName, record.oldIdentity, record.replacementIdentity],
+      [stackRootDescriptor],
       1024 * 1024,
     );
-    if (process.env.FM_REPORT_RETENTION_POLICY_TEST_READY) {
-      fs.writeFileSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_READY, "ready\n", { flag: "wx" });
-      if (process.env.FM_REPORT_RETENTION_POLICY_TEST_ABORT === "1") {
-        throw new Error("report retention cohort test interruption");
+    process.chdir(path.join(configuredStackRoot, "entries"));
+    entriesDescriptor = replacement.descriptor;
+    entriesDir = ".";
+    fs.closeSync(oldDescriptor);
+    current = fs.fstatSync(entriesDescriptor);
+    currentIdentity = `${current.dev}:${current.ino}`;
+    retiredStat = fs.lstatSync(retiredPath);
+    retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
+  }
+  if (currentIdentity !== record.replacementIdentity || retiredIdentity !== record.oldIdentity) {
+    throw new Error("report retention cutover generations no longer match their marker");
+  }
+  const retired = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "retired report namespace");
+  try {
+    for (const entry of fs.readdirSync(retiredPath, { withFileTypes: true })) {
+      const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
+      if (Number.isFinite(deadline) && deadline <= record.dueBefore) continue;
+      const source = fs.lstatSync(path.join(retiredPath, entry.name));
+      if (source.isSymbolicLink() || (!source.isDirectory() && !source.isFile())) {
+        throw new Error(`invalid entry in retired report namespace: ${entry.name}`);
       }
-      if (process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED) {
-        while (!fs.existsSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED)) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-        }
+      runContainedHelper(
+        ["rename-noreplace-owned-entry-fd", entry.name, entry.name, `${source.dev}:${source.ino}`],
+        [retired.descriptor, entriesDescriptor],
+        1024 * 1024,
+      );
+    }
+  } finally {
+    fs.closeSync(retired.descriptor);
+  }
+  publishRetentionPolicy({ schemaVersion: 1, generation: record.policyGeneration, cutoffMs: record.cutoffMs });
+  if (process.env.FM_REPORT_RETENTION_POLICY_TEST_READY) {
+    fs.writeFileSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_READY, "ready\n", { flag: "wx" });
+    if (process.env.FM_REPORT_RETENTION_POLICY_TEST_ABORT === "1") {
+      throw new Error("report retention namespace test interruption");
+    }
+    if (process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED) {
+      while (!fs.existsSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       }
     }
   }
+  moveStackDirectoryToPrivate(record.retiredName, record.oldIdentity, record.tombstoneName);
+  removeStackControl(retentionCutoverName);
+}
+
+function expireDueCohorts(policy) {
+  recoverRetentionCutover();
+  const dueBefore = Date.now() + reportRetentionGuardMs;
+  const hasDue = fs.readdirSync(entriesDir, { withFileTypes: true }).some((entry) => {
+    const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
+    return Number.isFinite(deadline) && deadline <= dueBefore;
+  });
+  if (!hasDue) {
+    publishRetentionPolicy(policy);
+    return;
+  }
+  const retiredName = `.entries.retention.${crypto.randomUUID()}`;
+  const tombstoneName = `tombstone-${crypto.randomUUID()}`;
+  const retiredPath = path.join(configuredStackRoot, retiredName);
+  fs.mkdirSync(retiredPath, { mode: 0o700 });
+  const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
+  const old = fs.fstatSync(entriesDescriptor);
+  publishStackControl(retentionCutoverName, {
+    schemaVersion: 1,
+    retiredName,
+    tombstoneName,
+    oldIdentity: `${old.dev}:${old.ino}`,
+    replacementIdentity: `${replacement.dev}:${replacement.ino}`,
+    dueBefore,
+    policyGeneration: policy.generation,
+    cutoffMs: policy.cutoffMs,
+  });
+  fs.closeSync(replacement.descriptor);
+  recoverRetentionCutover();
 }
 
 function pruneExpiredEntries() {

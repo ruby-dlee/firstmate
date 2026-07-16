@@ -721,6 +721,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-scoped-target]
   local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
+  local tmux_identity tmux_identity_session tmux_identity_label
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then
@@ -745,7 +746,20 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
         if [ -n "$expected_label" ]; then
           count=$(printf '%s\n' "$windows" | awk -v want="$expected_label" '$0 == want { count += 1 } END { print count + 0 }')
           case "$count" in
-            0) printf 'absent' ;;
+            0)
+              tmux_identity=
+              case "$target" in
+                @*) tmux_identity=$(tmux display-message -p -t "$target" $'#{session_name}\t#{window_name}' 2>/dev/null || true) ;;
+              esac
+              tmux_identity_session=${tmux_identity%%$'\t'*}
+              tmux_identity_label=${tmux_identity#*$'\t'}
+              if [ -n "$tmux_identity" ] && [ "$tmux_identity" != "$tmux_identity_session" ] \
+                && [ "$tmux_identity_session" = "$session" ] && [ "$tmux_identity_label" != "$expected_label" ]; then
+                printf 'unknown'
+              else
+                printf 'absent'
+              fi
+              ;;
             1) printf 'present' ;;
             *) printf 'unknown' ;;
           esac

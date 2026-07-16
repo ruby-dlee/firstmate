@@ -887,7 +887,10 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
           '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) \
           || { printf 'unknown'; return 0; }
         case "$title_count" in
-          0) printf 'absent'; return 0 ;;
+          0)
+            if [ "$workspace_record" = null ]; then printf 'absent'; else printf 'unknown'; fi
+            return 0
+            ;;
           1) ;;
           *) printf 'unknown'; return 0 ;;
         esac

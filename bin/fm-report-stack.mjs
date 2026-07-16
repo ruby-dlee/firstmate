@@ -53,6 +53,7 @@ const reportRetentionMs = 30 * 24 * 60 * 60 * 1000;
 const reportRetentionGuardMs = Number.parseInt(process.env.FM_REPORT_RETENTION_GUARD_MS || String(5 * 60 * 1000), 10);
 const reportRetentionBatch = Number.parseInt(process.env.FM_REPORT_RETENTION_BATCH || "4", 10);
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
+const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
 
 function fail(message) {
   console.error(`error: ${message}`);
@@ -265,7 +266,7 @@ function framedItems(buffer) {
 
 function runContainedHelper(arguments_, descriptors, maxBuffer) {
   try {
-    return execFileSync("python3", [containedReadHelper, ...arguments_], {
+    return execFileSync(pythonRuntime, [containedReadHelper, ...arguments_], {
       encoding: null,
       maxBuffer,
       stdio: ["ignore", "pipe", "pipe", ...descriptors],

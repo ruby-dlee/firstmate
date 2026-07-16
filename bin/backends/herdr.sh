@@ -715,12 +715,10 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   fi
   if [ "$pane_record" = null ]; then
     if printf '%s\n' "$tabs" | jq -e \
-      --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \
       --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
       --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
       'any(.result.tabs[]?;
-        ($recorded_tab == "" or (.tab_id | tostring) == $recorded_tab)
-        and (.workspace_id | tostring) == $workspace
+        (.workspace_id | tostring) == $workspace
         and .label == $want_label)' >/dev/null 2>&1; then
       printf 'unknown'
     else

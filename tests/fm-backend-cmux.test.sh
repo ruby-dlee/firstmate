@@ -1171,6 +1171,24 @@ test_target_state_refuses_duplicate_title_when_recorded_workspace_remains() {
   pass "cmux target recovery refuses duplicate titles even when the recorded workspace remains"
 }
 
+test_target_state_refuses_absence_for_renamed_recorded_workspace() {
+  local dir fb out target
+  dir="$TMP_ROOT/target-state-recorded-title-mismatch"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 "e1111111-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "renamed-task"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-recorded-task
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "renamed recorded cmux workspace was classified as absent (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 2 ] || fail "title mismatch inspected or mutated the ambiguous recorded workspace"
+  pass "cmux target recovery fails closed when the recorded workspace title disagrees"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1196,6 +1214,11 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
   test_target_state_refuses_duplicate_recovery_titles
   test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_target_state_refuses_absence_for_renamed_recorded_workspace
   exit 0
 fi
 
@@ -1261,4 +1284,5 @@ test_target_state_finds_workspace_outside_current_window
 test_target_state_distinguishes_absent_from_malformed_workspaces
 test_target_state_refuses_duplicate_recovery_titles
 test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
+test_target_state_refuses_absence_for_renamed_recorded_workspace
 test_secondmate_spawn_refuses_cmux_backend

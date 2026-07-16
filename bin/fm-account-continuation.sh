@@ -23,6 +23,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 fm_refuse_if_gate_agent
 PACKET_TMP=
 STATUS_SNAPSHOT_TMP=
+STATUS_IDENTITY_TMP=
+STATUS_REVALIDATION_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
@@ -34,6 +36,8 @@ NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
 cleanup_packet_tmp() {
   [ -z "$PACKET_TMP" ] || rm -f "$PACKET_TMP"
   [ -z "$STATUS_SNAPSHOT_TMP" ] || rm -f "$STATUS_SNAPSHOT_TMP"
+  [ -z "$STATUS_IDENTITY_TMP" ] || rm -f "$STATUS_IDENTITY_TMP"
+  [ -z "$STATUS_REVALIDATION_TMP" ] || rm -f "$STATUS_REVALIDATION_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
@@ -112,6 +116,10 @@ TOP_REAL=$(cd "$TOP" && pwd -P)
 HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null) || { echo "error: cannot verify continuation HEAD for $ID" >&2; exit 1; }
 BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
+STATUS_IDENTITY_TMP=$(mktemp "$STATE/.continuation-status-identity-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation repository status identity for $ID" >&2; exit 1; }
+git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_IDENTITY_TMP" 2>/dev/null \
+  || { echo "error: cannot verify continuation repository status for $ID" >&2; exit 1; }
 
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
@@ -381,12 +389,19 @@ CURRENT_TOP_REAL=$([ -n "$CURRENT_TOP" ] && cd "$CURRENT_TOP" && pwd -P || true)
 CURRENT_HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
 CURRENT_BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
 [ -n "$CURRENT_BRANCH" ] || CURRENT_BRANCH=detached
-[ "$CURRENT_WORKTREE_REAL" = "$WORKTREE_REAL" ] \
+STATUS_REVALIDATION_TMP=$(mktemp "$STATE/.continuation-status-revalidation-$ID.XXXXXX") \
+  || { echo "error: cannot restage continuation repository status identity for $ID" >&2; exit 1; }
+git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_REVALIDATION_TMP" 2>/dev/null \
+  || { echo "error: cannot revalidate continuation repository status for $ID" >&2; exit 1; }
+if ! { [ "$CURRENT_WORKTREE_REAL" = "$WORKTREE_REAL" ] \
   && [ "$CURRENT_WORKTREE_ID" = "$WORKTREE_ID" ] \
   && [ "$CURRENT_TOP_REAL" = "$WORKTREE_REAL" ] \
   && [ "$CURRENT_HEAD" = "$HEAD" ] \
   && [ "$CURRENT_BRANCH" = "$BRANCH" ] \
-  || { echo "error: continuation repository snapshot changed for $ID" >&2; exit 1; }
+  && cmp -s "$STATUS_IDENTITY_TMP" "$STATUS_REVALIDATION_TMP"; }; then
+  echo "error: continuation repository snapshot changed for $ID" >&2
+  exit 1
+fi
 if [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY:-}" ] \
   && [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED:-}" ]; then
   : > "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY"

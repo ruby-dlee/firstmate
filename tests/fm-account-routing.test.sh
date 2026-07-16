@@ -2844,6 +2844,38 @@ test_continuation_revalidates_repository_anchor_before_install() {
   pass "continuation revalidates worktree identity, branch, and HEAD before installation"
 }
 
+test_continuation_revalidates_exact_repository_status_before_install() {
+  local id rec ready proceed output packet_pid status packet worktree
+  id=account-continuation-status-race-z28h
+  rec=$(make_case continuation-status-race claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "continuation status-race precondition spawn failed"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-status.ready"
+  proceed="$CASE_DIR/continuation-status.proceed"
+  output="$CASE_DIR/continuation-status.out"
+  packet="$HOME_DIR/data/$id/continuation-status-race.md"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" status-race > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "continuation status race gate did not open"; }
+  printf 'late uncommitted bytes\n' > "$worktree/late-uncommitted.txt"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation installed a packet after repository status changed"
+  assert_contains "$(cat "$output")" "continuation repository snapshot changed" \
+    "repository status replacement refusal was unclear"
+  assert_absent "$packet" "repository status replacement installed a stale continuation packet"
+  pass "continuation revalidates the exact index and worktree status before installation"
+}
+
 test_continuation_rejects_load_bearing_source_replacement_during_open() {
   local id rec source hook out status
   id=account-continuation-copy-race-z28d
@@ -3687,6 +3719,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_continuation_revalidates_exact_repository_status_before_install
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3768,6 +3805,7 @@ test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
 test_continuation_pins_packet_destination_directory
 test_continuation_revalidates_repository_anchor_before_install
+test_continuation_revalidates_exact_repository_status_before_install
 test_continuation_rejects_load_bearing_source_replacement_during_open
 test_continuation_rejects_task_source_ancestor_swap
 test_continuation_rejects_metadata_ancestor_swap

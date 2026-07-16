@@ -834,6 +834,7 @@ test_list_lazy_continuations_do_not_satisfy_required_sections() {
 # Completion
 
 - list paragraph
+ ## Sacrificial heading
  ## Summary
  ## What changed
  ## Verification
@@ -1285,7 +1286,7 @@ test_retention_batches_make_interruption_safe_progress() {
 }
 
 test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
-  local id=report-retention-owner-k2m entry manifest temp fakebin install_root agents heartbeat out status
+  local id=report-retention-owner-k2m entry manifest temp fakebin install_root agents heartbeat out status bash_runtime node_runtime python_runtime plist
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Persistent-owner expiry."
   run_stack publish "$id" >/dev/null || fail "persistent retention owner precondition failed"
@@ -1315,8 +1316,16 @@ SH
     FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
     "$ROOT/bin/fm-bootstrap.sh" install report-retention >/dev/null \
     || fail "retention LaunchAgent installation through bootstrap failed"
-  FM_GATE_REFUSE_BYPASS=1 FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
-    "$install_root/bin/fm-report-retention.sh" run-once || fail "installed retention owner failed to prune"
+  node_runtime=$(command -v node)
+  python_runtime=$(command -v python3)
+  bash_runtime=$(command -v bash)
+  plist="$agents/com.firstmate.report-retention.plist"
+  assert_grep "<string>$bash_runtime</string>" "$plist" \
+    "retention LaunchAgent did not persist the absolute Bash runtime"
+  assert_grep "<key>FM_REPORT_RETENTION_NODE</key><string>$node_runtime</string>" "$plist" \
+    "retention LaunchAgent did not persist the absolute Node runtime"
+  assert_grep "<key>FM_REPORT_PYTHON</key><string>$python_runtime</string>" "$plist" \
+    "retention LaunchAgent did not persist the absolute Python runtime"
   assert_absent "$(dirname "$entry")" "installed retention owner did not enforce retention"
   heartbeat="$STACK/.retention-heartbeat"
   assert_present "$heartbeat" "installed retention owner did not record a successful-prune heartbeat"
@@ -1338,6 +1347,102 @@ SH
   assert_grep 'bootstrap' "$TMP_ROOT/launchctl.log" "retention install did not bootstrap its LaunchAgent"
   assert_grep 'kickstart' "$TMP_ROOT/launchctl.log" "retention install did not start its LaunchAgent"
   pass "restart-capable retention installation is stable, task-independent, and health-checked"
+}
+
+test_retention_activation_restores_previous_generation_on_failure() {
+  local fakebin install_root agents marker plist saved_plist out status failure failure_command node_runtime fail_marker fake_node log
+  fakebin="$TMP_ROOT/retention-transaction-launchctl"
+  install_root="$TMP_ROOT/retention-transaction-install"
+  agents="$TMP_ROOT/retention-transaction-agents"
+  marker="$install_root/bin/previous-generation-marker"
+  plist="$agents/com.firstmate.report-retention.plist"
+  saved_plist="$TMP_ROOT/retention-transaction-previous.plist"
+  fake_node="$TMP_ROOT/retention-transaction-failing-node"
+  log="$TMP_ROOT/retention-transaction.log"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+if [ "${1:-}" = "${FM_FAKE_LAUNCHCTL_FAIL_COMMAND:-none}" ] \
+  && [ ! -e "$FM_FAKE_LAUNCHCTL_FAIL_MARKER" ]; then
+  : > "$FM_FAKE_LAUNCHCTL_FAIL_MARKER"
+  exit 1
+fi
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  cat > "$fake_node" <<'SH'
+#!/usr/bin/env bash
+echo 'synthetic first-prune failure'
+exit 1
+SH
+  chmod +x "$fake_node"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_FAKE_LAUNCHCTL_FAIL_COMMAND=none FM_FAKE_LAUNCHCTL_FAIL_MARKER="$TMP_ROOT/unused-retention-failure" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention transaction precondition installation failed"
+  printf 'previous generation\n' > "$marker"
+  cp "$plist" "$saved_plist"
+  for failure in bootstrap kickstart prune; do
+    fail_marker="$TMP_ROOT/retention-$failure.failure-used"
+    rm -f "$fail_marker"
+    : > "$log"
+    failure_command=$failure
+    node_runtime=
+    if [ "$failure" = prune ]; then
+      failure_command=none
+      node_runtime=$fake_node
+    fi
+    if out=$(FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+      FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+      FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+      FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+      FM_FAKE_LAUNCHCTL_FAIL_COMMAND="$failure_command" FM_FAKE_LAUNCHCTL_FAIL_MARKER="$fail_marker" \
+      FM_REPORT_RETENTION_NODE="$node_runtime" "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "$failure retention activation unexpectedly succeeded"
+    assert_contains "$out" "previous generation restored" "$failure retention activation rollback was not reported"
+    assert_present "$marker" "$failure retention activation discarded the previous owner bundle"
+    cmp -s "$saved_plist" "$plist" || fail "$failure retention activation did not restore the previous LaunchAgent"
+    assert_grep 'bootstrap' "$log" "$failure retention rollback did not re-bootstrap the prior LaunchAgent"
+    assert_grep 'kickstart' "$log" "$failure retention rollback did not restart the prior LaunchAgent"
+  done
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_FAKE_LAUNCHCTL_FAIL_COMMAND=none FM_FAKE_LAUNCHCTL_FAIL_MARKER="$TMP_ROOT/unused-retention-failure" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "healthy retention replacement failed after rollback checks"
+  assert_absent "$marker" "healthy retention replacement kept the superseded generation after its first prune"
+  assert_present "$STACK/.retention-heartbeat" "healthy retention replacement removed the previous generation before its first-prune heartbeat"
+  pass "retention activation keeps and restores the prior healthy generation"
+}
+
+test_retention_error_publication_is_atomic_and_nonfollowing() {
+  local stack fake_node outside out status
+  stack="$TMP_ROOT/retention-error-stack"
+  fake_node="$TMP_ROOT/retention-failing-node"
+  outside="$TMP_ROOT/retention-error-outside"
+  mkdir -p "$stack"
+  printf 'outside bytes\n' > "$outside"
+  ln -s "$outside" "$stack/.retention-error"
+  cat > "$fake_node" <<'SH'
+#!/usr/bin/env bash
+echo 'synthetic prune failure'
+exit 1
+SH
+  chmod +x "$fake_node"
+  if out=$(FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_NODE="$fake_node" \
+    FM_REPORT_RETENTION_INTERVAL=1 "$ROOT/bin/fm-report-retention.sh" run-once 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention error publication unexpectedly accepted a symlink control path"
+  assert_contains "$out" "unsafe report-retention error control file" "unsafe retention error refusal was unclear"
+  [ "$(cat "$outside")" = "outside bytes" ] \
+    || fail "retention error publication followed and changed a symlink target"
+  [ -L "$stack/.retention-error" ] || fail "retention error publication replaced an unsafe control symlink"
+  pass "retention errors publish atomically without following control symlinks"
 }
 
 test_report_destination_roots_remain_pinned_during_ancestor_swap() {
@@ -1716,6 +1821,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_list_lazy_continuations_do_not_satisfy_required_sections
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_activation_restores_previous_generation_on_failure
+  test_retention_error_publication_is_atomic_and_nonfollowing
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1768,6 +1881,8 @@ test_retention_binds_manifests_to_entry_directories
 test_watcher_periodically_owns_idle_report_retention
 test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
+test_retention_activation_restores_previous_generation_on_failure
+test_retention_error_publication_is_atomic_and_nonfollowing
 test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock

@@ -891,6 +891,29 @@ SH
   pass "Herdr target state refuses absence while the recorded task tab has a replacement pane"
 }
 
+test_target_state_refuses_missing_recorded_tab_with_same_label_replacement() {
+  local dir fb identity out
+  dir="$TMP_ROOT/target-state-tab-replacement"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t9"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t9","workspace_id":"w1","label":"fm-task"}]}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  out=$(PATH="$fb:$PATH" bash -c '
+    . "$0/bin/fm-backend.sh"
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "Herdr same-label replacement tab was classified as absent: $out"
+  pass "Herdr recovery refuses absence while a same-label replacement tab remains"
+}
+
 test_current_path_reads_cwd() {
   local dir log resp fb out
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2121,6 +2144,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_target_state_refuses_missing_recorded_tab_with_same_label_replacement
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
@@ -2165,6 +2193,7 @@ test_kill_is_best_effort
 test_managed_identity_rejects_reused_pane
 test_target_state_distinguishes_absent_from_malformed_panes
 test_target_state_refuses_missing_recorded_pane_with_replacement
+test_target_state_refuses_missing_recorded_tab_with_same_label_replacement
 test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle

@@ -129,7 +129,7 @@ function markdownStructure(markdown) {
 
       const candidate = containerCandidate(line);
       const lazyListContinuation = candidate.containers.length === 0 && lazyList
-        && paragraphOpen && initialIndent(line) > 0 && !/^[ \t]*$/.test(line);
+        && initialIndent(line) > 0 && !/^[ \t]*$/.test(line);
       const marker = fenceMarker(candidate.text);
       if (marker) {
         fence = {
@@ -155,7 +155,7 @@ function markdownStructure(markdown) {
       visible.push({ line, heading: lazyListContinuation ? undefined : parsedHeading });
       if (candidate.containers.some(({ type }) => type === "list")) {
         lazyList = candidate.containers.filter(({ type }) => type === "list");
-      } else if (!lazyListContinuation) {
+      } else if (!lazyListContinuation && !/^[ \t]*$/.test(line)) {
         lazyList = undefined;
       }
       paragraphOpen = !(/^[ \t]*$/.test(candidate.text) || heading(candidate.text));

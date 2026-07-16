@@ -7,6 +7,7 @@ function listContainerCandidate(line) {
     const rest = line.slice(offset);
     const blockquote = rest.match(/^>[ \t]?/);
     if (blockquote) {
+      found = true;
       offset += blockquote[0].length;
       offset += (line.slice(offset).match(/^ {0,3}/) || [""])[0].length;
       continue;
@@ -58,23 +59,23 @@ function markdownStructure(markdown) {
   let htmlBlock;
   let paragraphOpen = false;
   for (const line of String(markdown).split(/\r?\n/)) {
+    const container = listContainerCandidate(line);
+    const candidates = [{ text: line, indent: 0 }];
+    if (container) candidates.push(container);
+    const activeIndent = fence?.indent || htmlBlock?.indent || 0;
+    if (activeIndent > 0 && /^ +/.test(line)) {
+      const spaces = line.match(/^ +/)[0].length;
+      if (spaces >= activeIndent) candidates.push({ text: line.slice(activeIndent), indent: activeIndent });
+    }
     if (htmlBlock) {
       if (htmlBlock.blank) {
-        if (/^[ \t]*$/.test(line)) htmlBlock = undefined;
-      } else if (htmlBlock.end.test(line)) {
+        if (candidates.some(({ text }) => /^[ \t]*$/.test(text))) htmlBlock = undefined;
+      } else if (candidates.some(({ text }) => htmlBlock.end.test(text))) {
         htmlBlock = undefined;
       }
       paragraphOpen = false;
       continue;
     }
-    const container = listContainerCandidate(line);
-    const candidates = [{ text: line, indent: 0 }];
-    if (container) candidates.push(container);
-    if (fence && fence.indent > 0 && /^ +/.test(line)) {
-      const spaces = line.match(/^ +/)[0].length;
-      if (spaces >= fence.indent) candidates.push({ text: line.slice(fence.indent), indent: fence.indent });
-    }
-
     if (fence) {
       const closing = candidates.map(({ text }) => fenceMarker(text)).find((marker) => marker
         && marker.character === fence.character
@@ -96,9 +97,11 @@ function markdownStructure(markdown) {
       paragraphOpen = false;
       continue;
     }
-    const htmlStart = htmlBlockStart(line, paragraphOpen);
-    if (htmlStart) {
-      if (htmlStart.blank || !htmlStart.end.test(line.slice(line.indexOf("<") + 1))) htmlBlock = htmlStart;
+    const htmlOpening = candidates.map(({ text, indent }) => ({ block: htmlBlockStart(text, paragraphOpen), text, indent }))
+      .find(({ block }) => block);
+    if (htmlOpening) {
+      const htmlStart = { ...htmlOpening.block, indent: htmlOpening.indent };
+      if (htmlStart.blank || !htmlStart.end.test(htmlOpening.text.slice(htmlOpening.text.indexOf("<") + 1))) htmlBlock = htmlStart;
       paragraphOpen = false;
       continue;
     }

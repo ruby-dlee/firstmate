@@ -1067,6 +1067,38 @@ test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
   pass "sync-all gives every task an independent bounded mapping attempt"
 }
 
+test_session_sync_all_has_one_total_task_timeout_budget() {
+  local rec out status started elapsed id
+  rec=$(make_case sync-all-total-bound claude account-sync-batch-a1 account-sync-batch-d4)
+  read_case "$rec"
+  for id in account-sync-batch-a1 account-sync-batch-b2 account-sync-batch-c3 account-sync-batch-d4; do
+    fm_write_meta "$HOME_DIR/state/$id.meta" \
+      "window=firstmate:fm-$id" \
+      "worktree=$WT_DIR" \
+      "project=$PROJ_DIR" \
+      "harness=claude" \
+      "kind=ship" \
+      "account_pool=claude-crew" \
+      "account_profile=claude-2" \
+      "account_task=$id" \
+      "account_attempt=attempt-$id"
+  done
+  started=$(date +%s)
+  if out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 \
+    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=2 \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all 2>&1); then status=0; else status=$?; fi
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -ne 0 ] || fail "fully timed-out sync sweep unexpectedly succeeded"
+  [ "$elapsed" -lt 5 ] || fail "sync-all multiplied its timeout across tasks (${elapsed}s)"
+  for id in account-sync-batch-a1 account-sync-batch-b2 account-sync-batch-c3 account-sync-batch-d4; do
+    assert_grep "session status --task $id" "$AF_LOG" "sync-all did not fairly attempt $id"
+  done
+  [ -n "$out" ] || true
+  pass "sync-all bounds the fair sweep to one task timeout window"
+}
+
 test_session_sync_releases_metadata_lock_during_provider_query() {
   local id rec meta_tmp marker sync_pid sync_rc
   id=account-sync-lock-z9e
@@ -2611,6 +2643,33 @@ JS
   pass "continuation load-bearing copies bind one validated source identity"
 }
 
+test_continuation_appends_the_validated_brief_snapshot() {
+  local id rec brief packet
+  id=account-continuation-brief-snapshot-z28g
+  rec=$(make_case continuation-brief-snapshot claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "brief snapshot continuation precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  brief="$HOME_DIR/data/$id/brief.md"
+  printf 'validated original brief bytes\n' > "$brief"
+  cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+printf 'replacement brief bytes\n' > "$FM_MUTATE_CONTINUATION_BRIEF"
+printf 'status after mutation\n'
+SH
+  chmod +x "$FAKEBIN_DIR/no-mistakes"
+  packet=$(FM_MUTATE_CONTINUATION_BRIEF="$brief" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LOG="$TMUX_LOG" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" brief-snapshot) \
+    || fail "continuation could not publish its validated brief snapshot"
+  assert_grep 'validated original brief bytes' "$packet" "continuation discarded the validated brief snapshot"
+  assert_not_grep 'replacement brief bytes' "$packet" "continuation reopened the replaced brief"
+  assert_grep 'replacement brief bytes' "$brief" "brief snapshot race hook did not mutate the source"
+  pass "continuation appends the exact validated brief snapshot"
+}
+
 test_continuation_rejects_task_source_ancestor_swap() {
   local id rec task_dir moved outside source hook marker out status
   id=account-continuation-task-parent-z28e
@@ -3226,6 +3285,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-20 ]; then
   test_continuation_rejects_metadata_ancestor_swap
   test_session_sync_all_bounds_each_task_and_reaches_later_mappings
   test_completion_contract_ignores_raw_html_headings
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
+  test_continuation_appends_the_validated_brief_snapshot
+  test_session_sync_all_has_one_total_task_timeout_budget
   exit 0
 fi
 

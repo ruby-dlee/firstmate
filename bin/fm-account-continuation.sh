@@ -25,6 +25,7 @@ PACKET_TMP=
 STATUS_SNAPSHOT_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
+BRIEF_SNAPSHOT_TMP=
 NO_MISTAKES_STATUS_TMP=
 MAX_PACKET_BYTES=65536
 MAX_SNAPSHOT_BYTES=8192
@@ -34,6 +35,7 @@ cleanup_packet_tmp() {
   [ -z "$STATUS_SNAPSHOT_TMP" ] || rm -f "$STATUS_SNAPSHOT_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
+  [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
   [ -z "$NO_MISTAKES_STATUS_TMP" ] || rm -f "$NO_MISTAKES_STATUS_TMP"
 }
 trap cleanup_packet_tmp EXIT
@@ -99,12 +101,6 @@ HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null) || { echo "error: can
 BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 
-continuation_source_nonempty() {
-  local root=$1 file=$2
-  node "$CONTAINED_READ" "$root" "$file" "$MAX_PACKET_BYTES" >/dev/null 2>&1 \
-    && [ -s "$file" ]
-}
-
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 
@@ -115,7 +111,10 @@ else
   BRIEF_ROOT=$TASK_DIR
   BRIEF="$TASK_DIR/brief.md"
 fi
-continuation_source_nonempty "$BRIEF_ROOT" "$BRIEF" \
+BRIEF_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-brief.XXXXXX") \
+  || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
+node "$CONTAINED_READ" "$BRIEF_ROOT" "$BRIEF" "$MAX_PACKET_BYTES" > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null \
+  && [ -s "$BRIEF_SNAPSHOT_TMP" ] \
   || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
@@ -206,8 +205,44 @@ append_snapshot_section() {
   packet_check_budget
 }
 
+append_staged_file_section() {  # <heading> <snapshot>
+  local heading=$1 source_tmp=$2 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc
+  file_bytes=$(snapshot_bytes "$source_tmp") || return 1
+  current=$(packet_bytes) || {
+    echo "error: cannot measure continuation packet for $ID" >&2
+    return 1
+  }
+  framing_bytes=$(printf '\n## %s\n\n\n' "$heading" | wc -c | tr -d '[:space:]')
+  case "$file_bytes$framing_bytes" in
+    *[!0-9]*)
+      echo "error: cannot measure staged continuation source" >&2
+      return 1
+      ;;
+  esac
+  projected=$((current + file_bytes + framing_bytes))
+  if [ "$projected" -gt "$MAX_PACKET_BYTES" ]; then
+    packet_size_error "$projected"
+    return 1
+  fi
+  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || return 1
+  copy_start=$(packet_bytes) || {
+    echo "error: cannot measure continuation packet for $ID" >&2
+    return 1
+  }
+  set +e
+  head -c "$file_bytes" "$source_tmp" >> "$PACKET_TMP"
+  copy_rc=$?
+  set -e
+  [ "$copy_rc" -eq 0 ] || { echo "error: cannot copy staged continuation source" >&2; return 1; }
+  copy_end=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
+  copied=$((copy_end - copy_start))
+  [ "$copied" -eq "$file_bytes" ] || packet_size_error "$((current + framing_bytes + copied))"
+  printf '\n' >> "$PACKET_TMP" || return 1
+  packet_check_budget
+}
+
 append_file_section() {  # <heading> <root> <file>
-  local heading=$1 root=$2 file=$3 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc source_tmp
+  local heading=$1 root=$2 file=$3 source_tmp rc
   [ -f "$file" ] || return 0
   [ ! -L "$file" ] || { echo "error: refusing symlinked continuation source $file" >&2; return 1; }
   source_tmp=$(mktemp "$TASK_DIR/.continuation-source.XXXXXX") \
@@ -217,43 +252,10 @@ append_file_section() {  # <heading> <root> <file>
     echo "error: cannot safely read continuation source $file" >&2
     return 1
   fi
-  file_bytes=$(snapshot_bytes "$source_tmp") || { rm -f "$source_tmp"; return 1; }
-  current=$(packet_bytes) || {
-    rm -f "$source_tmp"
-    echo "error: cannot measure continuation packet for $ID" >&2
-    return 1
-  }
-  framing_bytes=$(printf '\n## %s\n\n\n' "$heading" | wc -c | tr -d '[:space:]')
-  case "$file_bytes$framing_bytes" in
-    *[!0-9]*)
-      rm -f "$source_tmp"
-      echo "error: cannot measure continuation source $file" >&2
-      return 1
-      ;;
-  esac
-  projected=$((current + file_bytes + framing_bytes))
-  if [ "$projected" -gt "$MAX_PACKET_BYTES" ]; then
-    rm -f "$source_tmp"
-    packet_size_error "$projected"
-    return 1
-  fi
-  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || { rm -f "$source_tmp"; return 1; }
-  copy_start=$(packet_bytes) || {
-    rm -f "$source_tmp"
-    echo "error: cannot measure continuation packet for $ID" >&2
-    return 1
-  }
-  set +e
-  head -c "$file_bytes" "$source_tmp" >> "$PACKET_TMP"
-  copy_rc=$?
-  set -e
+  append_staged_file_section "$heading" "$source_tmp"
+  rc=$?
   rm -f "$source_tmp"
-  [ "$copy_rc" -eq 0 ] || { echo "error: cannot copy continuation source $file" >&2; return 1; }
-  copy_end=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
-  copied=$((copy_end - copy_start))
-  [ "$copied" -eq "$file_bytes" ] || packet_size_error "$((current + framing_bytes + copied))"
-  printf '\n' >> "$PACKET_TMP" || return 1
-  packet_check_budget
+  return "$rc"
 }
 
 {
@@ -306,7 +308,7 @@ else
 fi
 append_snapshot_section "No-mistakes state" "$NO_MISTAKES_STATUS_TMP"
 
-append_file_section "Original brief or charter" "$BRIEF_ROOT" "$BRIEF"
+append_staged_file_section "Original brief or charter" "$BRIEF_SNAPSHOT_TMP"
 append_file_section "Wake-event and progress status" "$STATE" "$STATE/$ID.status"
 append_file_section "Task report" "$TASK_DIR" "$TASK_DIR/report.md"
 append_file_section "Completion report" "$TASK_DIR" "$TASK_DIR/completion.md"

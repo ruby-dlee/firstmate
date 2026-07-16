@@ -193,6 +193,41 @@ function realDirectory(directory, root, label) {
   return real;
 }
 
+function pinnedDirectory(directory, root, label) {
+  const initial = fs.lstatSync(directory);
+  if (initial.isSymbolicLink() || !initial.isDirectory()) throw new Error(`${label} must be a real directory at ${directory}`);
+  const descriptor = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isDirectory() || opened.dev !== initial.dev || opened.ino !== initial.ino) {
+      throw new Error(`${label} changed while opening ${directory}`);
+    }
+    const real = fs.realpathSync(directory);
+    if (root && !isContained(root, real)) throw new Error(`${label} escapes its configured root at ${directory}`);
+    const current = fs.lstatSync(directory);
+    if (current.isSymbolicLink() || !current.isDirectory()
+      || current.dev !== opened.dev || current.ino !== opened.ino) {
+      throw new Error(`${label} changed while opening ${directory}`);
+    }
+    return { path: directory, real, dev: opened.dev, ino: opened.ino, descriptor, label };
+  } catch (error) {
+    fs.closeSync(descriptor);
+    throw error;
+  }
+}
+
+function inspectPinnedDirectory(directory) {
+  const stat = fs.lstatSync(directory.path);
+  const opened = fs.fstatSync(directory.descriptor);
+  if (!opened.isDirectory() || opened.dev !== directory.dev || opened.ino !== directory.ino
+    || stat.isSymbolicLink() || !stat.isDirectory()
+    || stat.dev !== directory.dev || stat.ino !== directory.ino
+    || fs.realpathSync(directory.path) !== directory.real) {
+    throw new Error(`${directory.label} changed while reading ${directory.path}`);
+  }
+  return directory.real;
+}
+
 function configuredRoot(directory, label) {
   let stat;
   try {
@@ -206,6 +241,8 @@ function configuredRoot(directory, label) {
 }
 
 function readArtifact(file, root, label, options = {}) {
+  const pinnedRoot = typeof root === "string" ? undefined : root;
+  const containmentRoot = pinnedRoot ? inspectPinnedDirectory(pinnedRoot) : root;
   let initial;
   try {
     initial = fs.lstatSync(file);
@@ -215,7 +252,7 @@ function readArtifact(file, root, label, options = {}) {
   }
   if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
   const real = fs.realpathSync(file);
-  if (!isContained(root, real)) throw new Error(`${label} escapes its configured root at ${file}`);
+  if (!isContained(containmentRoot, real)) throw new Error(`${label} escapes its configured root at ${file}`);
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
   const descriptor = fs.openSync(file, flags);
   try {
@@ -223,6 +260,7 @@ function readArtifact(file, root, label, options = {}) {
     if (!stat.isFile() || stat.dev !== initial.dev || stat.ino !== initial.ino) {
       throw new Error(`${label} must be a stable real regular file at ${file}`);
     }
+    if (pinnedRoot) inspectPinnedDirectory(pinnedRoot);
     if (options.maxBytes) {
       const oversized = stat.size > options.maxBytes;
       if (oversized && !options.truncate) {
@@ -565,21 +603,24 @@ function copyBoundedVisual(input, output, initial, remaining) {
   }
 }
 
-function copyVisuals(source, destination, dataRoot) {
+function copyVisuals(source, destination, taskRoot) {
   const copied = [];
+  const taskReal = inspectPinnedDirectory(taskRoot);
   if (!fs.existsSync(source)) return copied;
   const sourceStat = fs.lstatSync(source);
   if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
     throw new Error(`visual evidence root must be a real directory at ${source}`);
   }
   const sourceReal = fs.realpathSync(source);
-  if (!isContained(dataRoot, sourceReal)) {
-    throw new Error(`visual evidence escapes its configured data root at ${source}`);
+  if (!isContained(taskReal, sourceReal)) {
+    throw new Error(`visual evidence escapes its task directory at ${source}`);
   }
+  inspectPinnedDirectory(taskRoot);
   let total = 0;
   let entries = 1;
   function visit(current, relative = "", depth = 0) {
     if (depth > visualDepthLimit) throw new Error(`visual evidence exceeds the ${visualDepthLimit}-level depth limit`);
+    inspectPinnedDirectory(taskRoot);
     const currentReal = fs.realpathSync(current);
     const currentRelative = path.relative(sourceReal, currentReal);
     if (currentRelative === ".." || currentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(currentRelative)) {
@@ -608,6 +649,7 @@ function copyVisuals(source, destination, dataRoot) {
         const output = path.join(destination, "visuals", nextRelative);
         fs.mkdirSync(path.dirname(output), { recursive: true });
         total += copyBoundedVisual(input, output, initial, 20 * 1024 * 1024 - total);
+        inspectPinnedDirectory(taskRoot);
         copied.push(path.posix.join("visuals", ...nextRelative.split(path.sep)));
       }
     } finally {
@@ -741,10 +783,11 @@ function publish(taskId, legacy) {
   const meta = parseMeta(metaSource);
   if (meta.kind === "secondmate") throw new Error("persistent secondmate retirement is not a completion report");
   const taskData = path.join(dataDir, taskId);
-  realDirectory(taskData, dataRoot, "task data directory");
+  const taskRoot = pinnedDirectory(taskData, dataRoot, "task data directory");
+  try {
   const briefFile = path.join(taskData, "brief.md");
   const statusFile = path.join(stateDir, `${taskId}.status`);
-  const brief = redactSensitive(readArtifact(briefFile, dataRoot, "task brief", {
+  const brief = redactSensitive(readArtifact(briefFile, taskRoot, "task brief", {
     maxBytes: informationalTrailLimit,
     truncate: "head",
   }) || "");
@@ -753,7 +796,7 @@ function publish(taskId, legacy) {
     truncate: "tail",
   }) || "");
   const sourceFile = meta.kind === "scout" ? path.join(taskData, "report.md") : path.join(taskData, "completion.md");
-  const source = readArtifact(sourceFile, dataRoot, "completion report", {
+  const source = readArtifact(sourceFile, taskRoot, "completion report", {
     maxBytes: completionReportLimit,
     overflowMessage: (size) => `completion report at ${sourceFile} is ${size} bytes and exceeds the ${completionReportLimit}-byte publication limit. `
       + `Reduce ${sourceFile}, keeping every required section intact. `
@@ -781,7 +824,7 @@ function publish(taskId, legacy) {
   let transaction;
   fs.mkdirSync(staged, { mode: 0o700 });
   try {
-    const visuals = copyVisuals(path.join(taskData, "visuals"), staged, dataRoot);
+    const visuals = copyVisuals(path.join(taskData, "visuals"), staged, taskRoot);
     const worktreeHead = gitValue(meta.worktree, ["rev-parse", "--short=12", "HEAD"]);
     const prHead = displaySha(meta.pr_head);
     const generationId = meta.generation_id || "";
@@ -853,6 +896,9 @@ function publish(taskId, legacy) {
     throw error;
   } finally {
     fs.rmSync(staged, { recursive: true, force: true });
+  }
+  } finally {
+    fs.closeSync(taskRoot.descriptor);
   }
 }
 

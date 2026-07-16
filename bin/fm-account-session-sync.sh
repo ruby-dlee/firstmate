@@ -92,13 +92,17 @@ session_timestamp_advances() {  # <candidate> <baseline>
 }
 if [ "$ALL" = 1 ]; then
   [ -z "$ID" ] || { echo "error: --all does not accept a task id" >&2; exit 2; }
-  rc=0
+  rc=0 pids=
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     [ -n "$(fm_meta_get "$meta" account_profile)" ] || continue
     [ -z "$(fm_meta_get "$meta" provider_session_id)" ] || continue
     task=$(basename "$meta" .meta)
-    fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1 || rc=1
+    fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1 &
+    pids="$pids $!"
+  done
+  for pid in $pids; do
+    wait "$pid" || rc=1
   done
   exit "$rc"
 fi

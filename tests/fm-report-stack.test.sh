@@ -514,6 +514,31 @@ EOF
   pass "report parsing excludes CommonMark raw HTML blocks and comments"
 }
 
+test_nested_html_containers_do_not_satisfy_required_sections() {
+  local id=report-nested-html-b3l source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- <!--
+  ## Summary
+  ## What changed
+  ## Verification
+  ## Visual evidence
+  ## Artifacts
+  ## Follow-ups
+  -->
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "headings inside nested raw HTML unexpectedly satisfied the report contract"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "nested raw HTML failure omitted missing heading $heading"
+  done
+  pass "report parsing excludes raw HTML nested in Markdown containers"
+}
+
 test_indented_pseudo_closers_do_not_end_fences() {
   local id source out status heading
 
@@ -1139,6 +1164,53 @@ JS
   pass "report visual containment binds identity before ancestor resolution"
 }
 
+test_task_directory_identity_is_pinned_for_all_artifacts() {
+  local id=report-task-root-race-f8 out status parent moved outside source shim marker
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Inside task report."
+  parent=$(cd "$HOME_DIR/data/$id" && pwd -P)
+  moved="$TMP_ROOT/pinned-task-root"
+  outside="$TMP_ROOT/outside-task-root"
+  source="$parent/brief.md"
+  shim="$TMP_ROOT/task-root-swap-preload.cjs"
+  marker="$TMP_ROOT/task-root-swapped"
+  mkdir -p "$outside/visuals"
+  ln "$source" "$outside/brief.md"
+  write_required_report "$outside/completion.md" "Outside private report."
+  printf 'outside private visual bytes\n' > "$outside/visuals/evidence.png"
+  cat > "$shim" <<'JS'
+const fs = require("fs");
+const path = require("path");
+const { syncBuiltinESMExports } = require("module");
+const originalOpenSync = fs.openSync.bind(fs);
+const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
+const target = normalize(process.env.FM_REPORT_TASK_SWAP_FILE);
+let swapped = false;
+fs.openSync = (file, ...args) => {
+  if (!swapped && normalize(file) === target) {
+    swapped = true;
+    fs.renameSync(process.env.FM_REPORT_TASK_SWAP_PARENT, process.env.FM_REPORT_TASK_SWAP_MOVED);
+    fs.renameSync(process.env.FM_REPORT_TASK_SWAP_OUTSIDE, process.env.FM_REPORT_TASK_SWAP_PARENT);
+    fs.writeFileSync(process.env.FM_REPORT_TASK_SWAP_MARKER, "swapped\n");
+  }
+  return originalOpenSync(file, ...args);
+};
+syncBuiltinESMExports();
+JS
+  if out=$(NODE_OPTIONS="--require=$shim" \
+    FM_REPORT_TASK_SWAP_FILE="$source" FM_REPORT_TASK_SWAP_PARENT="$parent" \
+    FM_REPORT_TASK_SWAP_MOVED="$moved" FM_REPORT_TASK_SWAP_OUTSIDE="$outside" \
+    FM_REPORT_TASK_SWAP_MARKER="$marker" run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "ancestor-swapped sibling task unexpectedly published: $out"
+  assert_present "$marker" "task-directory swap hook did not run: $out"
+  assert_contains "$out" "task data directory changed while reading" \
+    "task-directory swap did not fail against the pinned root"
+  if grep -R -E 'Outside private (task|report)|outside private visual bytes' "$STACK" >/dev/null 2>&1; then
+    fail "sibling task artifacts escaped into the report stack"
+  fi
+  pass "report publication pins one exact task directory for every artifact"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_stale_lock_rejects_reused_pid
   test_stale_lock_reclaim_is_serialized
@@ -1177,6 +1249,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-20 ]; then
   test_raw_html_does_not_satisfy_required_sections
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
+  test_nested_html_containers_do_not_satisfy_required_sections
+  test_task_directory_identity_is_pinned_for_all_artifacts
   exit 0
 fi
 

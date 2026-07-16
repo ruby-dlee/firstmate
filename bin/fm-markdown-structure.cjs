@@ -3,7 +3,8 @@ function initialIndent(line, offset = 0) {
 }
 
 function containerCandidate(line) {
-  let offset = initialIndent(line);
+  let prefixIndent = initialIndent(line);
+  let offset = prefixIndent;
   const containers = [];
   while (offset < line.length) {
     const rest = line.slice(offset);
@@ -11,14 +12,16 @@ function containerCandidate(line) {
     if (blockquote) {
       containers.push({ type: "blockquote" });
       offset += blockquote[0].length;
-      offset += initialIndent(line, offset);
+      prefixIndent = initialIndent(line, offset);
+      offset += prefixIndent;
       continue;
     }
     const list = rest.match(/^((?:[*+-]|\d{1,9}[.)]))([ \t]{1,4})/);
     if (!list) break;
-    containers.push({ type: "list", indent: list[0].length });
+    containers.push({ type: "list", indent: prefixIndent + list[0].length });
     offset += list[0].length;
-    offset += initialIndent(line, offset);
+    prefixIndent = initialIndent(line, offset);
+    offset += prefixIndent;
   }
   return { text: line.slice(offset), containers };
 }
@@ -129,7 +132,7 @@ function markdownStructure(markdown) {
 
       const candidate = containerCandidate(line);
       const lazyListContinuation = candidate.containers.length === 0 && lazyList
-        && initialIndent(line) > 0 && !/^[ \t]*$/.test(line);
+        && scopedLine(line, lazyList) !== undefined && !/^[ \t]*$/.test(line);
       const marker = fenceMarker(candidate.text);
       if (marker) {
         fence = {

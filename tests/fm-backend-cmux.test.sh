@@ -1212,6 +1212,25 @@ test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement() {
   pass "cmux target recovery keeps renamed recorded identities fail-closed beside replacements"
 }
 
+test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced() {
+  local dir fb out target title
+  dir="$TMP_ROOT/target-state-replaced-surface"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  title=$(cmux_expected_scoped_title fm-replaced-surface)
+  cmux_windows_response "$dir" 1 "e1111111-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_panes_response "$dir" 3 "cccccccc-2222-2222-2222-222222222222"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-replaced-surface
+    ' "$ROOT" "$target")
+  [ "$out" = present ] || fail "a cmux task workspace with a replacement surface was classified as $out"
+  pass "cmux target state stays present when the expected task workspace has a replacement surface"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1247,6 +1266,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
+  test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced
   exit 0
 fi
 
@@ -1314,4 +1338,5 @@ test_target_state_refuses_duplicate_recovery_titles
 test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
 test_target_state_refuses_absence_for_renamed_recorded_workspace
 test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
+test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced
 test_secondmate_spawn_refuses_cmux_backend

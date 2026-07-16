@@ -635,25 +635,37 @@ test_managed_tmux_target_identity() {
 }
 
 test_managed_tmux_target_state_finds_replacement_window() {
-  local window_names
+  local log window_names
+  log="$TMP_ROOT/managed-tmux-replacement.log"
+  : > "$log"
   window_names=fm-intended-task
   tmux() {
+    printf '%s\n' "$*" >> "$log"
     case "${1:-}" in
       display-message) return 1 ;;
-      list-windows) printf '%s\n' "$window_names" ;;
+      list-windows)
+        [ "${2:-}" = -t ] && [ "${3:-}" = recorded-session ] || return 1
+        printf '%s\n' "$window_names"
+        ;;
       *) return 1 ;;
     esac
   }
 
-  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = present ] \
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = present ] \
     || fail "a uniquely labeled replacement tmux window was classified as absent"
   window_names=$'fm-intended-task\nfm-intended-task'
-  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = unknown ] \
     || fail "duplicate plausible tmux replacements were not fail-closed"
   window_names=fm-other-task
-  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = absent ] \
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = absent ] \
     || fail "tmux target state did not retain confident absence without a replacement label"
-  pass "managed tmux target state finds plausible replacement windows"
+  grep -q '^list-windows -t recorded-session ' "$log" \
+    || fail "tmux replacement discovery did not scan the recorded session"
+  ! grep -q '^list-windows -a ' "$log" \
+    || fail "tmux replacement discovery crossed session boundaries"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+    || fail "a missing stable tmux id without a recoverable session was not fail-closed"
+  pass "managed tmux target state scopes plausible replacement windows to the recorded session"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------

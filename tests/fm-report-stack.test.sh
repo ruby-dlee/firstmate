@@ -834,13 +834,13 @@ test_list_lazy_continuations_do_not_satisfy_required_sections() {
 # Completion
 
 - list paragraph
- ## Sacrificial heading
- ## Summary
- ## What changed
- ## Verification
- ## Visual evidence
- ## Artifacts
- ## Follow-ups
+  ## Sacrificial heading
+  ## Summary
+  ## What changed
+  ## Verification
+  ## Visual evidence
+  ## Artifacts
+  ## Follow-ups
 EOF
   if out=$(run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "lazy list-continuation headings unexpectedly satisfied the report contract"
@@ -848,6 +848,47 @@ EOF
     assert_contains "$out" "$heading" "lazy list-continuation failure omitted missing heading $heading"
   done
   pass "report parsing excludes headings in lazy list continuations"
+}
+
+test_underindented_list_headings_exit_lazy_continuation() {
+  local id=report-list-underindent-b3l source entry manifest
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+ - list paragraph
+  ## Summary
+
+Accepted top-level summary.
+
+## What changed
+
+Changed.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+None.
+
+## Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null \
+    || fail "a heading indented less than its list item's required content indent stayed hidden"
+  entry=$(run_stack path "$id") || fail "underindented-list report path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"summary": "Accepted top level summary."' "$manifest" \
+    "underindented list heading did not become the visible Summary section"
+  pass "report parsing exits lazy list continuation below the actual required content indent"
 }
 
 test_container_scopes_preserve_commonmark_blank_and_exit_rules() {
@@ -1476,6 +1517,81 @@ SH
   pass "retention install transactions recover the prior generation after interruption"
 }
 
+test_retention_install_and_recovery_share_owned_generation_lock() {
+  local fakebin install_root agents log transaction snapshot ready release used
+  local installer ensure_pid second_pid owner generation token unchanged=1 live_ensure=1 live_second=1
+  local installer_status ensure_status second_status
+  fakebin="$TMP_ROOT/retention-race-launchctl"
+  install_root="$TMP_ROOT/retention-race-install"
+  agents="$TMP_ROOT/retention-race-agents"
+  log="$TMP_ROOT/retention-race.log"
+  transaction="$install_root/.install-transaction"
+  snapshot="$TMP_ROOT/retention-race.transaction"
+  ready="$TMP_ROOT/retention-race.ready"
+  release="$TMP_ROOT/retention-race.release"
+  used="$TMP_ROOT/retention-race.used"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+if [ "${1:-}" = bootstrap ] && [ ! -e "$FM_FAKE_BLOCK_USED" ]; then
+  : > "$FM_FAKE_BLOCK_USED"
+  : > "$FM_FAKE_BLOCK_READY"
+  while [ ! -e "$FM_FAKE_BLOCK_RELEASE" ]; do sleep 0.05; done
+fi
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_FAKE_BLOCK_USED="$used" FM_FAKE_BLOCK_READY="$ready" FM_FAKE_BLOCK_RELEASE="$release" \
+    "$ROOT/bin/fm-report-retention.sh" install > "$TMP_ROOT/retention-race-first.out" 2>&1 &
+  installer=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] && [ -f "$transaction" ] \
+    || { touch "$release"; wait "$installer" 2>/dev/null || true; fail "live retention installer did not reach its owned transaction"; }
+  cp "$transaction" "$snapshot"
+  owner=$(sed -n '5p' "$transaction")
+  generation=$(sed -n '7p' "$transaction")
+  token=$(sed -n '2p' "$transaction")
+
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_FAKE_BLOCK_USED="$used" FM_FAKE_BLOCK_READY="$ready" FM_FAKE_BLOCK_RELEASE="$release" \
+    "$ROOT/bin/fm-report-retention.sh" ensure > "$TMP_ROOT/retention-race-ensure.out" 2>&1 &
+  ensure_pid=$!
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_FAKE_BLOCK_USED="$used" FM_FAKE_BLOCK_READY="$ready" FM_FAKE_BLOCK_RELEASE="$release" \
+    "$ROOT/bin/fm-report-retention.sh" install > "$TMP_ROOT/retention-race-second.out" 2>&1 &
+  second_pid=$!
+  sleep 0.2
+  cmp -s "$snapshot" "$transaction" || unchanged=0
+  kill -0 "$ensure_pid" 2>/dev/null || live_ensure=0
+  kill -0 "$second_pid" 2>/dev/null || live_second=0
+  touch "$release"
+  if wait "$installer"; then installer_status=0; else installer_status=$?; fi
+  if wait "$ensure_pid"; then ensure_status=0; else ensure_status=$?; fi
+  if wait "$second_pid"; then second_status=0; else second_status=$?; fi
+
+  [ "$owner" = "$installer" ] || fail "retention transaction did not record its installer owner"
+  [ "$generation" = "$token" ] || fail "retention transaction generation did not bind its backup token"
+  [ "$unchanged" -eq 1 ] || fail "a concurrent install overwrote the live installer's transaction generation"
+  [ "$live_ensure" -eq 1 ] || fail "ensure raced through recovery while the installer was live"
+  [ "$live_second" -eq 1 ] || fail "a concurrent install bypassed global serialization"
+  [ "$installer_status" -eq 0 ] && [ "$ensure_status" -eq 0 ] && [ "$second_status" -eq 0 ] \
+    || fail "serialized retention install/ensure operations did not all complete successfully"
+  assert_absent "$transaction" "serialized retention operations left a transaction marker"
+  assert_absent "$install_root/.install-lock" "serialized retention operations left the global install lock"
+  pass "retention install and recovery serialize on one owned transaction generation"
+}
+
 test_retention_error_publication_is_atomic_and_nonfollowing() {
   local stack fake_node outside out status
   stack="$TMP_ROOT/retention-error-stack"
@@ -1890,6 +2006,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
+  test_list_lazy_continuations_do_not_satisfy_required_sections
+  test_underindented_list_headings_exit_lazy_continuation
+  test_retention_install_and_recovery_share_owned_generation_lock
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1923,6 +2046,7 @@ test_invalid_backtick_info_string_does_not_open_fence
 test_summary_extraction_uses_validated_markdown_structure
 test_list_container_fences_hide_report_headings_and_summaries
 test_list_lazy_continuations_do_not_satisfy_required_sections
+test_underindented_list_headings_exit_lazy_continuation
 test_container_scopes_preserve_commonmark_blank_and_exit_rules
 test_large_non_utf8_text_artifacts_are_stored_verbatim
 test_large_visual_inventory_does_not_share_text_buffer_headroom
@@ -1944,6 +2068,7 @@ test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
 test_retention_activation_restores_previous_generation_on_failure
 test_retention_install_recovers_interrupted_generation_transaction
+test_retention_install_and_recovery_share_owned_generation_lock
 test_retention_error_publication_is_atomic_and_nonfollowing
 test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation

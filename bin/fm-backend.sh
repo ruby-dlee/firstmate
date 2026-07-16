@@ -736,7 +736,12 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
           fi
           ;;
       esac
-      if windows=$(tmux list-windows -a -F '#{window_name}' 2>&1); then
+      case "$target" in
+        *:*) session=${target%%:*} ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      [ -n "$session" ] || { printf 'unknown'; return 0; }
+      if windows=$(tmux list-windows -t "$session" -F '#{window_name}' 2>&1); then
         if [ -n "$expected_label" ]; then
           count=$(printf '%s\n' "$windows" | awk -v want="$expected_label" '$0 == want { count += 1 } END { print count + 0 }')
           case "$count" in
@@ -749,7 +754,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         fi
       else
         case "$windows" in
-          *'no server running on '*|*'failed to connect to server: No such file or directory'*) printf 'absent' ;;
+          *'no server running on '*|*'failed to connect to server: No such file or directory'*|*'can'\''t find session:'*) printf 'absent' ;;
           *) printf 'unknown' ;;
         esac
       fi
@@ -935,6 +940,8 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         fi
       elif printf '%s\n' "$panes" | jq -e --arg surface "$surface" \
         'any(.panes[]; .surface_ids | index($surface))' >/dev/null 2>&1; then
+        printf 'present'
+      elif printf '%s\n' "$panes" | jq -e 'any(.panes[]; (.surface_ids | length) > 0)' >/dev/null 2>&1; then
         printf 'present'
       else
         printf 'absent'

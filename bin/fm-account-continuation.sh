@@ -22,9 +22,13 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 PACKET_TMP=
+PACKET_PRIOR_TMP=
+PACKET_PRIOR_ID=
+PUBLISHED_PACKET_ID=
 STATUS_SNAPSHOT_TMP=
 STATUS_IDENTITY_TMP=
 STATUS_REVALIDATION_TMP=
+REPOSITORY_PATHS_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
@@ -33,11 +37,28 @@ TASK_SNAPSHOT_DIR=
 MAX_PACKET_BYTES=65536
 MAX_SNAPSHOT_BYTES=8192
 NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
+path_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
+remove_owned_path() {
+  local path=$1 identity=$2
+  [ -n "$path" ] && [ -n "$identity" ] || return 0
+  [ "$(path_identity "$path" 2>/dev/null || true)" = "$identity" ] || return 0
+  rm -f -- "$path"
+}
+
 cleanup_packet_tmp() {
   [ -z "$PACKET_TMP" ] || rm -f "$PACKET_TMP"
+  remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
   [ -z "$STATUS_SNAPSHOT_TMP" ] || rm -f "$STATUS_SNAPSHOT_TMP"
   [ -z "$STATUS_IDENTITY_TMP" ] || rm -f "$STATUS_IDENTITY_TMP"
   [ -z "$STATUS_REVALIDATION_TMP" ] || rm -f "$STATUS_REVALIDATION_TMP"
+  [ -z "$REPOSITORY_PATHS_TMP" ] || rm -f "$REPOSITORY_PATHS_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
@@ -58,14 +79,6 @@ case "$NO_MISTAKES_STATUS_TIMEOUT" in
 esac
 fm_account_valid_id "$ID" || { echo "error: invalid task id '$ID'" >&2; exit 1; }
 fm_account_valid_id "$ATTEMPT" || { echo "error: invalid account attempt '$ATTEMPT'" >&2; exit 1; }
-
-task_dir_identity() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f '%d:%i' "$1" 2>/dev/null
-  else
-    stat -c '%d:%i' "$1" 2>/dev/null
-  fi
-}
 
 CONTAINED_READ="$SCRIPT_DIR/fm-contained-read.cjs"
 META_SOURCE="$STATE/$ID.meta"
@@ -108,7 +121,7 @@ WORKTREE=$(fm_meta_get "$META" worktree)
 PROJECT=$(fm_meta_get "$META" project)
 [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ] || { echo "error: recorded continuation worktree/home is unavailable for $ID" >&2; exit 1; }
 WORKTREE_REAL=$(cd "$WORKTREE" && pwd -P)
-WORKTREE_ID=$(task_dir_identity "$WORKTREE_REAL") \
+WORKTREE_ID=$(path_identity "$WORKTREE_REAL") \
   || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null) || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP_REAL=$(cd "$TOP" && pwd -P)
@@ -118,16 +131,100 @@ BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 STATUS_IDENTITY_TMP=$(mktemp "$STATE/.continuation-status-identity-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation repository status identity for $ID" >&2; exit 1; }
-git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_IDENTITY_TMP" 2>/dev/null \
+REPOSITORY_PATHS_TMP=$(mktemp "$STATE/.continuation-repository-paths-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation repository paths for $ID" >&2; exit 1; }
+
+append_repository_path_identities() {
+  node - "$WORKTREE_REAL" "$REPOSITORY_PATHS_TMP" <<'JS'
+const crypto = require("crypto");
+const fs = require("fs");
+
+const root = Buffer.from(`${fs.realpathSync.native(process.argv[2])}/`);
+const list = fs.readFileSync(process.argv[3]);
+const records = [];
+let start = 0;
+
+function fingerprint(stat) {
+  return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
+}
+
+function append(path, type, mode, hash) {
+  records.push(path, Buffer.from(`\0${type}:${mode.toString(8)}:${hash}\0`));
+}
+
+for (let end = 0; end <= list.length; end += 1) {
+  if (end !== list.length && list[end] !== 0) continue;
+  if (end === start) {
+    start = end + 1;
+    continue;
+  }
+  const relative = list.subarray(start, end);
+  const absolute = Buffer.concat([root, relative]);
+  let before;
+  try {
+    before = fs.lstatSync(absolute, { bigint: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    append(relative, "missing", 0n, "missing");
+    start = end + 1;
+    continue;
+  }
+  if (before.isSymbolicLink()) {
+    const target = fs.readlinkSync(absolute, { encoding: "buffer" });
+    const after = fs.lstatSync(absolute, { bigint: true });
+    if (fingerprint(before) !== fingerprint(after)) throw new Error("repository symlink changed during snapshot");
+    append(relative, "symlink", before.mode, crypto.createHash("sha256").update(target).digest("hex"));
+  } else if (before.isFile()) {
+    const fd = fs.openSync(absolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("repository file changed during open");
+      const hash = crypto.createHash("sha256");
+      const buffer = Buffer.allocUnsafe(65536);
+      let bytes;
+      while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) !== 0) hash.update(buffer.subarray(0, bytes));
+      const after = fs.fstatSync(fd, { bigint: true });
+      if (fingerprint(opened) !== fingerprint(after)) throw new Error("repository file changed during snapshot");
+      append(relative, "file", opened.mode, hash.digest("hex"));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } else {
+    append(relative, "special", before.mode, fingerprint(before));
+  }
+  start = end + 1;
+}
+process.stdout.write(Buffer.concat(records));
+JS
+}
+
+capture_repository_identity() {
+  local output=$1
+  {
+    printf 'status\0'
+    git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z || return 1
+    printf '\0index\0'
+    git -C "$WORKTREE_REAL" ls-files --stage -z || return 1
+    printf '\0worktree-content\0'
+    git -C "$WORKTREE_REAL" ls-files --cached -z > "$REPOSITORY_PATHS_TMP" || return 1
+    append_repository_path_identities || return 1
+    printf '\0untracked-content\0'
+    git -C "$WORKTREE_REAL" ls-files --others --exclude-standard -z > "$REPOSITORY_PATHS_TMP" \
+      || return 1
+    append_repository_path_identities || return 1
+  } > "$output" 2>/dev/null
+}
+
+capture_repository_identity "$STATUS_IDENTITY_TMP" \
   || { echo "error: cannot verify continuation repository status for $ID" >&2; exit 1; }
 
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 TASK_DIR_PATH=$TASK_DIR
-TASK_DIR_ID=$(task_dir_identity "$TASK_DIR_PATH") \
+TASK_DIR_ID=$(path_identity "$TASK_DIR_PATH") \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 cd "$TASK_DIR_PATH" || { echo "error: continuation task directory is unavailable for $ID" >&2; exit 1; }
-[ "$(task_dir_identity .)" = "$TASK_DIR_ID" ] \
+[ "$(path_identity .)" = "$TASK_DIR_ID" ] \
   || { echo "error: continuation task directory changed for $ID" >&2; exit 1; }
 TASK_DIR=.
 
@@ -313,7 +410,7 @@ repository_snapshot_matches() {
   local current_worktree_real current_worktree_id current_top current_top_real current_head current_branch
   local verified_worktree_real verified_worktree_id verified_top verified_top_real verified_head verified_branch
   current_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
-  current_worktree_id=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
+  current_worktree_id=$(path_identity "$WORKTREE_REAL" 2>/dev/null || true)
   current_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
   current_top_real=$([ -n "$current_top" ] && cd "$current_top" && pwd -P || true)
   current_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
@@ -325,10 +422,10 @@ repository_snapshot_matches() {
     && [ "$current_head" = "$HEAD" ] \
     && [ "$current_branch" = "$BRANCH" ] \
     || return 1
-  git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_REVALIDATION_TMP" 2>/dev/null \
+  capture_repository_identity "$STATUS_REVALIDATION_TMP" \
     || return 1
   verified_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
-  verified_worktree_id=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
+  verified_worktree_id=$(path_identity "$WORKTREE_REAL" 2>/dev/null || true)
   verified_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
   verified_top_real=$([ -n "$verified_top" ] && cd "$verified_top" && pwd -P || true)
   verified_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
@@ -421,14 +518,82 @@ if ! repository_snapshot_matches; then
   echo "error: continuation repository snapshot changed for $ID" >&2
   exit 1
 fi
+
+rollback_published_packet() {
+  local current_id prior_id preserved_id preserved_path
+  current_id=$(path_identity "$PACKET" 2>/dev/null || true)
+  if [ "$current_id" != "$PUBLISHED_PACKET_ID" ]; then
+    echo "error: continuation packet generation changed before rollback for $ID" >&2
+    if [ -n "$PACKET_PRIOR_TMP" ]; then
+      prior_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+      if [ "$prior_id" = "$PACKET_PRIOR_ID" ]; then
+        preserved_id=${PACKET_PRIOR_ID//:/-}
+        preserved_path="$TASK_DIR/continuation-$ATTEMPT.displaced-$preserved_id.md"
+        if [ ! -e "$preserved_path" ] && ln -- "$PACKET_PRIOR_TMP" "$preserved_path" 2>/dev/null; then
+          remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
+          echo "error: displaced continuation packet preserved at $TASK_DIR_PATH/${preserved_path#./}" >&2
+        else
+          echo "error: displaced continuation packet preserved at $TASK_DIR_PATH/${PACKET_PRIOR_TMP#./}" >&2
+        fi
+      fi
+      PACKET_PRIOR_TMP=
+      PACKET_PRIOR_ID=
+    fi
+    return 1
+  fi
+  if [ -n "$PACKET_PRIOR_TMP" ]; then
+    prior_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+    [ "$prior_id" = "$PACKET_PRIOR_ID" ] \
+      || { echo "error: displaced continuation packet generation changed for $ID" >&2; return 1; }
+    mv -f -- "$PACKET_PRIOR_TMP" "$PACKET" || return 1
+    PACKET_PRIOR_TMP=
+    PACKET_PRIOR_ID=
+  else
+    rm -f -- "$PACKET" || return 1
+  fi
+  PUBLISHED_PACKET_ID=
+}
+
+publish_packet() {
+  local placeholder_id
+  PUBLISHED_PACKET_ID=$(path_identity "$PACKET_TMP" 2>/dev/null || true)
+  [ -n "$PUBLISHED_PACKET_ID" ] || return 1
+  if [ -e "$PACKET" ]; then
+    PACKET_PRIOR_TMP=$(mktemp "$TASK_DIR/.continuation-prior-$ATTEMPT.XXXXXX") || return 1
+    placeholder_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+    PACKET_PRIOR_ID=$placeholder_id
+    mv -f -- "$PACKET" "$PACKET_PRIOR_TMP" || return 1
+    PACKET_PRIOR_ID=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+    [ -n "$PACKET_PRIOR_ID" ] || return 1
+  fi
+  if ! mv -- "$PACKET_TMP" "$PACKET"; then
+    if [ -n "$PACKET_PRIOR_TMP" ] && [ ! -e "$PACKET" ] \
+      && [ "$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)" = "$PACKET_PRIOR_ID" ]; then
+      mv -- "$PACKET_PRIOR_TMP" "$PACKET" || true
+      PACKET_PRIOR_TMP=
+      PACKET_PRIOR_ID=
+    fi
+    return 1
+  fi
+  PACKET_TMP=
+  [ "$(path_identity "$PACKET" 2>/dev/null || true)" = "$PUBLISHED_PACKET_ID" ]
+}
+
+fail_after_publish() {
+  local message=$1
+  rollback_published_packet || true
+  echo "$message" >&2
+  exit 1
+}
+
 if [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY:-}" ] \
   && [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED:-}" ]; then
   : > "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY"
   while [ ! -e "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED" ]; do sleep 0.01; done
 fi
 [ -d "$TASK_DIR_PATH" ] && [ ! -L "$TASK_DIR_PATH" ] \
-  && [ "$(task_dir_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
-  && [ "$(task_dir_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  && [ "$(path_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  && [ "$(path_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
   || { echo "error: continuation task directory changed for $ID" >&2; exit 1; }
 if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then
   echo "error: unsafe continuation packet destination for $ID" >&2
@@ -438,20 +603,20 @@ if ! repository_snapshot_matches; then
   echo "error: continuation repository snapshot changed for $ID" >&2
   exit 1
 fi
-mv "$PACKET_TMP" "$PACKET" || exit 1
-PACKET_TMP=
+publish_packet || { echo "error: cannot safely publish continuation packet for $ID" >&2; exit 1; }
 if [ -n "${FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY:-}" ] \
   && [ -n "${FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED:-}" ]; then
   : > "$FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY"
   while [ ! -e "$FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED" ]; do sleep 0.01; done
 fi
 if ! repository_snapshot_matches; then
-  rm -f "$PACKET"
-  echo "error: continuation repository snapshot changed for $ID" >&2
-  exit 1
+  fail_after_publish "error: continuation repository snapshot changed for $ID"
 fi
 [ -d "$TASK_DIR_PATH" ] && [ ! -L "$TASK_DIR_PATH" ] \
-  && [ "$(task_dir_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
-  && [ "$(task_dir_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
-  || { rm -f "$PACKET"; echo "error: continuation task directory changed for $ID" >&2; exit 1; }
+  && [ "$(path_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  && [ "$(path_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  || fail_after_publish "error: continuation task directory changed for $ID"
+remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
+PACKET_PRIOR_TMP=
+PACKET_PRIOR_ID=
 printf '%s\n' "$TASK_DIR_PATH/continuation-$ATTEMPT.md"

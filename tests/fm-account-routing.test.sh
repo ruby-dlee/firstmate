@@ -398,6 +398,13 @@ clear_case_logs() {
   rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/resume-arm.native-dir" "$CASE_DIR/session-refreshed"
 }
 
+use_named_fake_tmux_target() {
+  local id=$1 meta="$HOME_DIR/state/$1.meta" staged
+  staged=$(mktemp "$HOME_DIR/state/.named-target-$id.XXXXXX") || fail "could not stage fake tmux target metadata"
+  grep -v '^tmux_window_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+}
+
 test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   local id rec out status launch expected
   id=account-off-z1
@@ -2876,6 +2883,96 @@ test_continuation_revalidates_exact_repository_status_before_install() {
   pass "continuation revalidates the exact index and worktree status before installation"
 }
 
+test_continuation_revalidates_dirty_tracked_content_before_install() {
+  local id rec ready proceed output packet_pid status packet worktree
+  id=account-cont-tracked-z28k
+  rec=$(make_case continuation-tracked-content claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "tracked-content continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  printf 'first dirty tracked generation\n' > "$worktree/README.md"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-tracked-content.ready"
+  proceed="$CASE_DIR/continuation-tracked-content.proceed"
+  output="$CASE_DIR/continuation-tracked-content.out"
+  packet="$HOME_DIR/data/$id/continuation-tracked-content.md"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" tracked-content > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "tracked-content continuation gate did not open: $(cat "$output")"; }
+  printf 'second dirty tracked generation\n' > "$worktree/README.md"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted changed bytes for an already-dirty tracked file"
+  assert_contains "$(cat "$output")" "continuation repository snapshot changed" \
+    "tracked content replacement refusal was unclear"
+  assert_absent "$packet" "tracked content replacement installed a stale continuation packet"
+  pass "continuation identity includes bytes of already-dirty tracked files"
+}
+
+test_continuation_revalidates_dirty_untracked_content_before_install() {
+  local id rec ready proceed output packet_pid status packet worktree dirty
+  id=account-cont-untracked-z28m
+  rec=$(make_case continuation-untracked-content claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "untracked-content continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  dirty="$worktree/already-untracked.txt"
+  printf 'first dirty untracked generation\n' > "$dirty"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-untracked-content.ready"
+  proceed="$CASE_DIR/continuation-untracked-content.proceed"
+  output="$CASE_DIR/continuation-untracked-content.out"
+  packet="$HOME_DIR/data/$id/continuation-untracked-content.md"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" untracked-content > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "untracked-content continuation gate did not open: $(cat "$output")"; }
+  printf 'second dirty untracked generation\n' > "$dirty"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted changed bytes for an already-dirty untracked file"
+  assert_contains "$(cat "$output")" "continuation repository snapshot changed" \
+    "untracked content replacement refusal was unclear"
+  assert_absent "$packet" "untracked content replacement installed a stale continuation packet"
+  pass "continuation identity includes bytes of already-dirty untracked files"
+}
+
+test_continuation_accepts_stable_tracked_deletion() {
+  local id rec packet worktree
+  id=account-cont-deleted-z28q
+  rec=$(make_case continuation-deleted claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "deleted-file continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  rm "$worktree/README.md" "$CASE_DIR/endpoint-live"
+
+  packet=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" tracked-deletion) \
+    || fail "continuation rejected a stable tracked deletion"
+  assert_present "$packet" "stable tracked deletion did not produce a continuation packet"
+  assert_absent "$worktree/README.md" "continuation altered the stable tracked deletion"
+  pass "continuation identity represents stable tracked deletions explicitly"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -2907,6 +3004,85 @@ test_continuation_removes_packet_when_repository_changes_during_install() {
     "repository change during installation was not reported"
   assert_absent "$packet" "repository change during installation left a stale continuation packet"
   pass "continuation validates repository state around installation and removes stale packets"
+}
+
+test_continuation_restores_prior_packet_after_failed_postcheck() {
+  local id rec ready proceed output packet_pid status packet prior worktree
+  id=account-cont-prior-z28n
+  rec=$(make_case continuation-prior-restore claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "prior-restore continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-prior-restore.ready"
+  proceed="$CASE_DIR/continuation-prior-restore.proceed"
+  output="$CASE_DIR/continuation-prior-restore.out"
+  packet="$HOME_DIR/data/$id/continuation-prior-restore.md"
+  prior="$CASE_DIR/prior-packet.bytes"
+  printf 'valid prior packet\000with exact bytes' > "$packet"
+  cp "$packet" "$prior"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" prior-restore > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "prior-restore continuation gate did not open"; }
+  cmp -s "$packet" "$prior" && fail "new continuation packet was not published before the postcheck"
+  printf 'changed during prior packet installation\n' > "$worktree/prior-restore-race.txt"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation retained a stale replacement over a prior packet"
+  cmp -s "$packet" "$prior" || fail "failed postcheck did not restore the prior packet byte-verbatim"
+  pass "failed continuation postchecks restore a displaced prior packet generation"
+}
+
+test_continuation_rollback_preserves_concurrent_packet_replacement() {
+  local id rec ready proceed output packet_pid status packet worktree replacement prior preserved
+  id=account-cont-owned-z28p
+  rec=$(make_case continuation-owned-rollback claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "owned-rollback continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-owned-rollback.ready"
+  proceed="$CASE_DIR/continuation-owned-rollback.proceed"
+  output="$CASE_DIR/continuation-owned-rollback.out"
+  packet="$HOME_DIR/data/$id/continuation-owned-rollback.md"
+  replacement="$CASE_DIR/concurrent-packet.bytes"
+  prior="$CASE_DIR/prior-owned-packet.bytes"
+  printf 'concurrent replacement\000must survive' > "$replacement"
+  printf 'displaced prior\000must remain recoverable' > "$packet"
+  cp "$packet" "$prior"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" owned-rollback > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "owned-rollback continuation gate did not open"; }
+  rm -f "$packet"
+  cp "$replacement" "$packet"
+  printf 'changed during owned packet rollback\n' > "$worktree/owned-rollback-race.txt"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted a repository change after concurrent packet replacement"
+  cmp -s "$packet" "$replacement" || fail "rollback deleted or overwrote a concurrent packet generation"
+  preserved=$(find "$HOME_DIR/data/$id" -maxdepth 1 -type f \
+    -name 'continuation-owned-rollback.displaced-*.md' -print -quit)
+  [ -n "$preserved" ] || fail "rollback lost the prior packet after a concurrent replacement"
+  cmp -s "$preserved" "$prior" || fail "durably preserved prior packet changed bytes"
+  assert_contains "$(cat "$output")" "continuation packet generation changed before rollback" \
+    "concurrent packet ownership loss was not reported"
+  pass "continuation rollback preserves concurrent and displaced prior packet generations"
 }
 
 test_continuation_rejects_load_bearing_source_replacement_during_open() {
@@ -3762,6 +3938,15 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
+  test_continuation_revalidates_dirty_tracked_content_before_install
+  test_continuation_revalidates_dirty_untracked_content_before_install
+  test_continuation_accepts_stable_tracked_deletion
+  test_continuation_restores_prior_packet_after_failed_postcheck
+  test_continuation_rollback_preserves_concurrent_packet_replacement
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3844,7 +4029,12 @@ test_continuation_rejects_symlinked_packet_destination
 test_continuation_pins_packet_destination_directory
 test_continuation_revalidates_repository_anchor_before_install
 test_continuation_revalidates_exact_repository_status_before_install
+test_continuation_revalidates_dirty_tracked_content_before_install
+test_continuation_revalidates_dirty_untracked_content_before_install
+test_continuation_accepts_stable_tracked_deletion
 test_continuation_removes_packet_when_repository_changes_during_install
+test_continuation_restores_prior_packet_after_failed_postcheck
+test_continuation_rollback_preserves_concurrent_packet_replacement
 test_continuation_rejects_load_bearing_source_replacement_during_open
 test_continuation_rejects_task_source_ancestor_swap
 test_continuation_rejects_metadata_ancestor_swap

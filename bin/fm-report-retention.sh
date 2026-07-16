@@ -32,6 +32,11 @@ LAUNCHCTL=${FM_REPORT_RETENTION_LAUNCHCTL:-launchctl}
 HEARTBEAT="$STACK_ROOT/.retention-heartbeat"
 ERROR_FILE="$STACK_ROOT/.retention-error"
 INSTALL_TRANSACTION="$INSTALL_ROOT/.install-transaction"
+INSTALL_LOCK="$INSTALL_ROOT/.install-lock"
+INSTALL_RECLAIM="$INSTALL_ROOT/.install-lock-reclaim"
+INSTALL_LOCK_GENERATION=
+INSTALL_OWNER_PID=${BASHPID:-$$}
+INSTALL_OWNER_START=
 SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.cjs fm-contained-read.py fm-gate-refuse-lib.sh)
 
 case "$INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
@@ -103,15 +108,121 @@ write_heartbeat() {
   mv "$temp" "$HEARTBEAT"
 }
 
+process_start_time() {
+  local out
+  out=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  out=$(printf '%s\n' "$out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+install_generation_valid() {
+  case "$1" in
+    ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+install_owner_state() {
+  local owner=$1 pid recorded generation extra current
+  [ -f "$owner" ] && [ ! -L "$owner" ] || { printf 'unknown'; return 0; }
+  [ "$(wc -c < "$owner" | tr -d '[:space:]')" -le 256 ] || { printf 'unknown'; return 0; }
+  pid=$(sed -n '1p' "$owner")
+  recorded=$(sed -n '2p' "$owner")
+  generation=$(sed -n '3p' "$owner")
+  extra=$(sed -n '4p' "$owner")
+  case "$pid" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  [ -n "$recorded" ] && install_generation_valid "$generation" && [ -z "$extra" ] \
+    || { printf 'unknown'; return 0; }
+  if ! kill -0 "$pid" 2>/dev/null; then
+    printf 'stale'
+    return 0
+  fi
+  current=$(process_start_time "$pid") || { printf 'unknown'; return 0; }
+  if [ "$current" = "$recorded" ]; then printf 'live'; else printf 'stale'; fi
+}
+
+install_lock_acquire() {
+  local temp deadline state wait_seconds
+  wait_seconds=${FM_REPORT_RETENTION_INSTALL_LOCK_WAIT_SECONDS:-10}
+  case "$wait_seconds" in ''|*[!0-9]*|0) echo "error: invalid report-retention install lock wait" >&2; return 1 ;; esac
+  mkdir -p "$INSTALL_ROOT" "$LAUNCH_AGENTS_DIR" || return 1
+  [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] \
+    && [ -d "$LAUNCH_AGENTS_DIR" ] && [ ! -L "$LAUNCH_AGENTS_DIR" ] \
+    || { echo "error: unsafe report-retention installation directories" >&2; return 1; }
+  INSTALL_OWNER_START=$(process_start_time "$INSTALL_OWNER_PID") \
+    || { echo "error: cannot identify report-retention installer" >&2; return 1; }
+  INSTALL_LOCK_GENERATION="$(date +%s).$INSTALL_OWNER_PID.$RANDOM"
+  temp=$(mktemp "$INSTALL_ROOT/.install-lock.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n' "$INSTALL_OWNER_PID" "$INSTALL_OWNER_START" "$INSTALL_LOCK_GENERATION" > "$temp" \
+    || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if [ -L "$INSTALL_RECLAIM" ] || { [ -e "$INSTALL_RECLAIM" ] && [ ! -d "$INSTALL_RECLAIM" ]; }; then
+      rm -f "$temp"
+      echo "error: unsafe report-retention install lock reclaim" >&2
+      return 1
+    fi
+    if [ ! -e "$INSTALL_RECLAIM" ] && ln "$temp" "$INSTALL_LOCK" 2>/dev/null; then
+      rm -f "$temp"
+      return 0
+    fi
+    if [ -L "$INSTALL_LOCK" ] || { [ -e "$INSTALL_LOCK" ] && [ ! -f "$INSTALL_LOCK" ]; }; then
+      rm -f "$temp"
+      echo "error: unsafe report-retention install lock" >&2
+      return 1
+    fi
+    if [ -f "$INSTALL_LOCK" ]; then
+      state=$(install_owner_state "$INSTALL_LOCK")
+      if [ "$state" = stale ] && mkdir "$INSTALL_RECLAIM" 2>/dev/null; then
+        state=$(install_owner_state "$INSTALL_LOCK")
+        [ "$state" != stale ] || rm -f "$INSTALL_LOCK"
+        rmdir "$INSTALL_RECLAIM" 2>/dev/null || true
+        [ "$state" != stale ] || continue
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      rm -f "$temp"
+      echo "error: timed out waiting for report-retention install lock" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
+install_lock_release() {
+  local pid recorded generation extra
+  [ -e "$INSTALL_LOCK" ] || return 0
+  [ -f "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ] \
+    || { echo "error: unsafe report-retention install lock" >&2; return 1; }
+  pid=$(sed -n '1p' "$INSTALL_LOCK")
+  recorded=$(sed -n '2p' "$INSTALL_LOCK")
+  generation=$(sed -n '3p' "$INSTALL_LOCK")
+  extra=$(sed -n '4p' "$INSTALL_LOCK")
+  [ "$pid" = "$INSTALL_OWNER_PID" ] && [ "$recorded" = "$INSTALL_OWNER_START" ] \
+    && [ "$generation" = "$INSTALL_LOCK_GENERATION" ] && [ -z "$extra" ] \
+    || { echo "error: refusing to release another report-retention installer's lock" >&2; return 1; }
+  rm -f "$INSTALL_LOCK"
+}
+
 write_install_transaction() {
-  local phase=$1 token=$2 had_bundle=$3 had_plist=$4 temp
+  local phase=$1 token=$2 had_bundle=$3 had_plist=$4 temp owner_pid owner_start owner_generation extra
   temp=$(mktemp "$INSTALL_ROOT/.install-transaction.XXXXXX") || return 1
-  printf '%s\n%s\n%s\n%s\n' "$phase" "$token" "$had_bundle" "$had_plist" > "$temp" \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$phase" "$token" "$had_bundle" "$had_plist" \
+    "$INSTALL_OWNER_PID" "$INSTALL_OWNER_START" "$INSTALL_LOCK_GENERATION" > "$temp" \
     || { rm -f "$temp"; return 1; }
   chmod 600 "$temp" || { rm -f "$temp"; return 1; }
   if [ -e "$INSTALL_TRANSACTION" ] || [ -L "$INSTALL_TRANSACTION" ]; then
     [ -f "$INSTALL_TRANSACTION" ] && [ ! -L "$INSTALL_TRANSACTION" ] \
       || { rm -f "$temp"; echo "error: unsafe report-retention install transaction" >&2; return 1; }
+    owner_pid=$(sed -n '5p' "$INSTALL_TRANSACTION")
+    owner_start=$(sed -n '6p' "$INSTALL_TRANSACTION")
+    owner_generation=$(sed -n '7p' "$INSTALL_TRANSACTION")
+    extra=$(sed -n '8p' "$INSTALL_TRANSACTION")
+    [ "$owner_pid" = "$INSTALL_OWNER_PID" ] && [ "$owner_start" = "$INSTALL_OWNER_START" ] \
+      && [ "$owner_generation" = "$INSTALL_LOCK_GENERATION" ] && [ -z "$extra" ] \
+      || { rm -f "$temp"; echo "error: refusing to overwrite another report-retention install transaction" >&2; return 1; }
   fi
   mv -f "$temp" "$INSTALL_TRANSACTION"
 }
@@ -135,7 +246,7 @@ remove_installed_plist() {
 }
 
 recover_install_transaction() {
-  local phase token had_bundle had_plist extra token_a token_b token_c token_extra
+  local phase token had_bundle had_plist owner_pid owner_start owner_generation extra token_a token_b token_c token_extra owner_state current
   local bundle="$INSTALL_ROOT/bin" bundle_previous plist_previous domain
   [ -e "$INSTALL_TRANSACTION" ] || [ -L "$INSTALL_TRANSACTION" ] || return 0
   [ -f "$INSTALL_TRANSACTION" ] && [ ! -L "$INSTALL_TRANSACTION" ] \
@@ -146,14 +257,34 @@ recover_install_transaction() {
   token=$(sed -n '2p' "$INSTALL_TRANSACTION")
   had_bundle=$(sed -n '3p' "$INSTALL_TRANSACTION")
   had_plist=$(sed -n '4p' "$INSTALL_TRANSACTION")
-  extra=$(sed -n '5p' "$INSTALL_TRANSACTION")
+  owner_pid=$(sed -n '5p' "$INSTALL_TRANSACTION")
+  owner_start=$(sed -n '6p' "$INSTALL_TRANSACTION")
+  owner_generation=$(sed -n '7p' "$INSTALL_TRANSACTION")
+  extra=$(sed -n '8p' "$INSTALL_TRANSACTION")
   IFS=. read -r token_a token_b token_c token_extra <<< "$token"
   case "$phase:$had_bundle:$had_plist" in prepared:0:0|prepared:0:1|prepared:1:0|prepared:1:1|committed:0:0|committed:0:1|committed:1:0|committed:1:1) ;; *) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
   case "$token_a" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
   case "$token_b" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
   case "$token_c" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
-  [ -z "$token_extra" ] && [ -z "$extra" ] \
+  [ -z "$token_extra" ] && [ -z "$extra" ] && [ "$owner_generation" = "$token" ] \
     || { echo "error: invalid report-retention install transaction" >&2; return 1; }
+  case "$owner_pid" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
+  [ -n "$owner_start" ] || { echo "error: invalid report-retention install transaction" >&2; return 1; }
+  if [ "$owner_pid" = "$INSTALL_OWNER_PID" ] && [ "$owner_start" = "$INSTALL_OWNER_START" ] \
+    && [ "$owner_generation" = "$INSTALL_LOCK_GENERATION" ]; then
+    owner_state=owned
+  elif ! kill -0 "$owner_pid" 2>/dev/null; then
+    owner_state=stale
+  elif current=$(process_start_time "$owner_pid"); then
+    if [ "$current" = "$owner_start" ]; then owner_state=live; else owner_state=stale; fi
+  else
+    owner_state=unknown
+  fi
+  case "$owner_state" in
+    owned|stale) ;;
+    live) echo "error: report-retention install transaction is owned by a live installer" >&2; return 1 ;;
+    *) echo "error: cannot prove report-retention install transaction is stale" >&2; return 1 ;;
+  esac
   bundle_previous="$INSTALL_ROOT/.bin.previous.$token"
   plist_previous="$LAUNCH_AGENTS_DIR/.$LABEL.previous.$token.plist"
   if [ "$phase" = committed ]; then
@@ -281,7 +412,7 @@ install_owner() {
 </dict></plist>
 EOF
   chmod 600 "$plist_temp" || { rm -rf "$staging"; rm -f "$plist_temp"; return 1; }
-  token="$(date +%s).$$.$RANDOM"
+  token=$INSTALL_LOCK_GENERATION
   bundle_previous="$INSTALL_ROOT/.bin.previous.$token"
   plist_previous="$LAUNCH_AGENTS_DIR/.$LABEL.previous.$token.plist"
   if [ -e "$bundle" ] || [ -L "$bundle" ]; then
@@ -378,9 +509,22 @@ ensure_owner() {
     || { echo "error: report-retention successful-prune heartbeat is stale" >&2; return 1; }
 }
 
+run_with_install_lock() {
+  local operation=$1 status release_status
+  install_lock_acquire || return 1
+  trap 'install_lock_release >/dev/null 2>&1 || true' EXIT
+  "$operation"
+  status=$?
+  install_lock_release
+  release_status=$?
+  trap - EXIT
+  [ "$status" -ne 0 ] && return "$status"
+  return "$release_status"
+}
+
 case "${1:-}" in
-  ensure) ensure_owner ;;
-  install) install_owner ;;
+  ensure) run_with_install_lock ensure_owner ;;
+  install) run_with_install_lock install_owner ;;
   run-once) run_once ;;
   *) echo "usage: fm-report-retention.sh ensure|install|run-once" >&2; exit 2 ;;
 esac

@@ -98,6 +98,8 @@ if [ "$ALL" = 1 ]; then
   ALL_CURSOR="$STATE/.account-session-sync.cursor"
   ALL_CURSOR_TMP=
   ALL_PIDS=()
+  ALL_REAP_COUNT=0
+  # shellcheck disable=SC2329
   cleanup_all() {
     local pid
     for pid in "${ALL_PIDS[@]}"; do
@@ -147,6 +149,26 @@ if [ "$ALL" = 1 ]; then
       exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
     ' "$@" </dev/null >/dev/null 2>&1 &
     ALL_PIDS+=("$!")
+    [ -z "${FM_ACCOUNT_SESSION_WORKER_TEST_LOG:-}" ] \
+      || printf '%s\n' "$!" >> "$FM_ACCOUNT_SESSION_WORKER_TEST_LOG"
+  }
+  reap_all_worker() {
+    local target=$1 wait_status=0 index
+    wait "$target" || wait_status=$?
+    for index in "${!ALL_PIDS[@]}"; do
+      if [ "${ALL_PIDS[$index]}" = "$target" ]; then
+        unset 'ALL_PIDS[index]'
+        break
+      fi
+    done
+    ALL_PIDS=("${ALL_PIDS[@]}")
+    ALL_REAP_COUNT=$((ALL_REAP_COUNT + 1))
+    if [ "$ALL_REAP_COUNT" -eq 1 ] && [ -n "${FM_ACCOUNT_SESSION_REAP_TEST_READY:-}" ] \
+      && [ -n "${FM_ACCOUNT_SESSION_REAP_TEST_PROCEED:-}" ]; then
+      printf '%s\n' "${ALL_PIDS[@]}" > "$FM_ACCOUNT_SESSION_REAP_TEST_READY"
+      while [ ! -e "$FM_ACCOUNT_SESSION_REAP_TEST_PROCEED" ]; do sleep 0.01; done
+    fi
+    return "$wait_status"
   }
   tasks=()
   for meta in "$STATE"/*.meta; do
@@ -191,10 +213,10 @@ if [ "$ALL" = 1 ]; then
   mv "$ALL_CURSOR_TMP" "$ALL_CURSOR" || exit 1
   ALL_CURSOR_TMP=
   rc=0
-  for pid in "${ALL_PIDS[@]}"; do
-    wait "$pid" || rc=1
+  while [ "${#ALL_PIDS[@]}" -gt 0 ]; do
+    pid=${ALL_PIDS[0]}
+    reap_all_worker "$pid" || rc=1
   done
-  ALL_PIDS=()
   exit "$rc"
 fi
 [ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]" >&2; exit 2; }

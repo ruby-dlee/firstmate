@@ -45,7 +45,10 @@ const lockControlLimit = 4 * 1024;
 const visualEntryLimit = 512;
 const visualDepthLimit = 24;
 const visualBytesLimit = 20 * 1024 * 1024;
+const visualInventoryLimit = visualEntryLimit * visualDepthLimit * 255 * 6 + visualEntryLimit * 32 + 1024;
 const reportRetentionMs = 30 * 24 * 60 * 60 * 1000;
+const reportRetentionGuardMs = Number.parseInt(process.env.FM_REPORT_RETENTION_GUARD_MS || String(5 * 60 * 1000), 10);
+const reportRetentionBatch = Number.parseInt(process.env.FM_REPORT_RETENTION_BATCH || "4", 10);
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
 
 function fail(message) {
@@ -548,11 +551,13 @@ function acquireLock() {
   throw new Error(`report stack is busy at ${lock}`);
 }
 
+let lastPruneStatus = { pruned: 0, pending: false };
+
 function withLock(callback) {
   const release = acquireLock();
   try {
     recoverPreviousEntries();
-    pruneExpiredEntries();
+    lastPruneStatus = pruneExpiredEntries();
     return callback();
   } finally {
     release();
@@ -588,22 +593,50 @@ function snapshotTaskArtifacts(dataRoot, taskId, sourceName, staged, sourceFile)
     const items = framedItems(buffer);
     const briefItem = items.get("brief");
     const sourceItem = items.get("source");
-    const visualsItem = items.get("visuals");
-    let brief = briefItem && !briefItem.missing ? briefItem.content.toString("utf8") : "";
-    if (briefItem?.oversized) {
-      brief += `\n[task brief truncated: original size ${briefItem.size} bytes; kept first ${briefItem.bytes} bytes]\n`;
-    }
     if (sourceItem?.oversized) {
       throw new Error(`completion report at ${sourceFile} is ${sourceItem.size} bytes and exceeds the ${completionReportLimit}-byte publication limit. `
         + `Reduce ${sourceFile}, keeping every required section intact. `
         + `Then rerun ${fmRoot}/bin/fm-report-stack.mjs publish ${taskId} or ${fmRoot}/bin/fm-teardown.sh ${taskId}. `
         + "This attempt did not replace the durable report, and teardown remains stopped before destructive cleanup.");
     }
+    const inventoryFile = path.join(staged, ".visuals.json");
+    const visuals = JSON.parse(readBoundedRegularFile(inventoryFile, visualInventoryLimit, "visual inventory"));
+    fs.rmSync(inventoryFile, { force: true });
     return {
-      brief,
+      brief: briefItem && !briefItem.missing ? briefItem.content.toString("utf8") : "",
       source: sourceItem && !sourceItem.missing ? sourceItem.content.toString("utf8") : undefined,
-      visuals: visualsItem && !visualsItem.missing ? JSON.parse(visualsItem.content.toString("utf8")) : [],
+      briefPresent: Boolean(briefItem && !briefItem.missing),
+      sourcePresent: Boolean(sourceItem && !sourceItem.missing),
+      visuals,
     };
+  } finally {
+    fs.closeSync(stagedDescriptor);
+  }
+}
+
+function snapshotStateArtifact(stateRoot, file, staged, destinationName, viewLimit, mode, label) {
+  inspectPinnedDirectory(stateRoot);
+  const relative = path.relative(stateRoot.path, file);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} escapes its configured root at ${file}`);
+  }
+  const stagedDescriptor = fs.openSync(staged, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    let buffer;
+    try {
+      buffer = runContainedHelper(
+        ["snapshot-file-fd", relative, String(viewLimit), mode, destinationName],
+        [stateRoot.descriptor, stagedDescriptor],
+        viewLimit + 1024 * 1024,
+      );
+    } catch (error) {
+      if (error.message.includes(`source is a symlink: ${path.basename(relative)}`)) {
+        throw new Error(`${label} must be a real regular file at ${file}`);
+      }
+      throw error;
+    }
+    const source = framedItems(buffer).get("source");
+    return source && !source.missing ? { present: true, view: source.content.toString("utf8") } : { present: false, view: "" };
   } finally {
     fs.closeSync(stagedDescriptor);
   }
@@ -720,32 +753,60 @@ function recoverPreviousEntries() {
   removeAgedOrphanStaging(transactionIds);
 }
 
+function retentionTombstones() {
+  if (!fs.existsSync(entriesDir)) return [];
+  return fs.readdirSync(entriesDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.expired$/.test(entry.name))
+    .map((entry) => path.join(entriesDir, entry.name));
+}
+
 function pruneExpiredEntries() {
-  const cutoff = Date.now() - reportRetentionMs;
-  const expired = readManifests().filter((manifest) => {
-    const completedAt = Date.parse(manifest.completedAt);
-    return Number.isFinite(completedAt) && completedAt <= cutoff;
-  });
-  if (expired.length === 0) return;
-  const moved = [];
-  try {
-    for (const manifest of expired) {
-      const destination = path.join(entriesDir, manifest.reportId);
-      const previous = path.join(entriesDir, `.${manifest.reportId}.previous`);
-      if (!fs.existsSync(destination)) continue;
-      if (fs.existsSync(previous)) throw new Error(`report retention found an active previous generation for ${manifest.reportId}`);
-      realDirectory(destination, fs.realpathSync(entriesDir), "expired report entry");
-      fs.renameSync(destination, previous);
-      moved.push({ destination, previous });
-    }
-    renderIndex();
-  } catch (error) {
-    for (const { destination, previous } of moved.reverse()) {
-      if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, destination);
-    }
-    throw error;
+  if (!Number.isSafeInteger(reportRetentionGuardMs) || reportRetentionGuardMs < 0 || reportRetentionGuardMs >= reportRetentionMs) {
+    throw new Error("FM_REPORT_RETENTION_GUARD_MS must be a non-negative integer below 30 days");
   }
-  for (const { previous } of moved) fs.rmSync(previous, { recursive: true, force: true });
+  if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
+    throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
+  }
+  let remaining = reportRetentionBatch;
+  let pruned = 0;
+  const existingTombstones = retentionTombstones();
+  if (existingTombstones.length > 0) renderIndex();
+  for (const tombstone of existingTombstones) {
+    if (remaining === 0) return { pruned, pending: true };
+    fs.rmSync(tombstone, { recursive: true, force: true });
+    pruned += 1;
+    remaining -= 1;
+  }
+  if (remaining === 0) return { pruned, pending: true };
+
+  const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
+  let moved = 0;
+  for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.name)) {
+      throw new Error(`invalid report entry id at ${path.join(entriesDir, entry.name)}`);
+    }
+    const destination = path.join(entriesDir, entry.name);
+    const manifestFile = path.join(destination, "manifest.json");
+    if (!fs.existsSync(manifestFile)) continue;
+    const manifest = JSON.parse(readBoundedRegularFile(manifestFile, manifestLimit, "report manifest"));
+    if (manifest.reportId !== entry.name) throw new Error(`report manifest identity mismatch at ${manifestFile}`);
+    const completedAt = Date.parse(manifest.completedAt);
+    if (!Number.isFinite(completedAt) || completedAt > cutoff) continue;
+    if (remaining === 0) return { pruned, pending: true };
+    const tombstone = path.join(entriesDir, `.${entry.name}.expired`);
+    if (fs.existsSync(tombstone)) throw new Error(`report retention found an active deletion tombstone for ${entry.name}`);
+    realDirectory(destination, fs.realpathSync(entriesDir), "expired report entry");
+    fs.renameSync(destination, tombstone);
+    moved += 1;
+    remaining -= 1;
+    if (remaining === 0) {
+      renderIndex();
+      return { pruned, pending: true };
+    }
+  }
+  if (moved > 0) renderIndex();
+  return { pruned, pending: moved > 0 };
 }
 
 function renderIndex() {
@@ -774,10 +835,6 @@ function publish(taskId, legacy) {
     const sourceName = meta.kind === "scout" ? "report.md" : "completion.md";
     const sourceFile = path.join(taskData, sourceName);
     const statusFile = path.join(stateDir, `${taskId}.status`);
-    const status = readArtifact(statusFile, stateRoot, "status trail", {
-      maxBytes: informationalTrailLimit,
-      truncate: "tail",
-    }) || "";
     const id = stableReportId(taskId);
     const destination = path.join(entriesDir, id);
     const previous = path.join(entriesDir, `.${id}.previous`);
@@ -791,6 +848,16 @@ function publish(taskId, legacy) {
     let transaction;
     fs.mkdirSync(staged, { mode: 0o700 });
     try {
+      const statusArtifact = snapshotStateArtifact(
+        stateRoot,
+        statusFile,
+        staged,
+        "status.log",
+        informationalTrailLimit,
+        "tail",
+        "status trail",
+      );
+      const status = statusArtifact.view;
       const taskArtifacts = snapshotTaskArtifacts(dataRoot, taskId, sourceName, staged, sourceFile);
       const brief = taskArtifacts.brief;
       const source = taskArtifacts.source;
@@ -838,9 +905,9 @@ function publish(taskId, legacy) {
         visuals,
       };
       fs.writeFileSync(path.join(staged, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-      fs.writeFileSync(path.join(staged, "report.md"), markdown, { mode: 0o600 });
-      fs.writeFileSync(path.join(staged, "brief.md"), brief || "Task brief unavailable.\n", { mode: 0o600 });
-      fs.writeFileSync(path.join(staged, "status.log"), status || "Status trail unavailable.\n", { mode: 0o600 });
+      if (!taskArtifacts.sourcePresent) fs.writeFileSync(path.join(staged, "report.md"), markdown, { mode: 0o600 });
+      if (!taskArtifacts.briefPresent) fs.writeFileSync(path.join(staged, "brief.md"), "Task brief unavailable.\n", { mode: 0o600 });
+      if (!statusArtifact.present) fs.writeFileSync(path.join(staged, "status.log"), "Status trail unavailable.\n", { mode: 0o600 });
       fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
 
       const hadPrevious = fs.existsSync(destination);
@@ -917,6 +984,7 @@ try {
     console.log(target);
   } else if (command === "prune") {
     withLock(() => {});
+    if (args.includes("--status")) console.log(JSON.stringify(lastPruneStatus));
   } else {
     fail(`unknown command: ${command}`);
   }

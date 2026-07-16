@@ -719,7 +719,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id
-  local workspace surface workspaces workspace_record title_record title expected_title resolved_workspace
+  local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
     printf 'present'
@@ -888,10 +888,17 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
             || { printf 'unknown'; return 0; }
           [ "$title" = "$expected_title" ] || { printf 'unknown'; return 0; }
         else
-          title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
-            '[.workspaces[] | select(.title == $want)] | first // null' 2>/dev/null) \
+          title_count=$(printf '%s\n' "$workspaces" | jq -r --arg want "$expected_title" \
+            '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) \
             || { printf 'unknown'; return 0; }
-          [ "$title_record" != null ] || { printf 'absent'; return 0; }
+          case "$title_count" in
+            0) printf 'absent'; return 0 ;;
+            1) ;;
+            *) printf 'unknown'; return 0 ;;
+          esac
+          title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
+            '[.workspaces[] | select(.title == $want)] | first' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
           resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
             || { printf 'unknown'; return 0; }
         fi

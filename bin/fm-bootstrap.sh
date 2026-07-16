@@ -13,6 +13,7 @@
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
+#                 "REPORT_RETENTION: unavailable: <reason>",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
@@ -65,7 +66,7 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the four MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
 #          (secondmate_sync, secondmate_liveness_sweep, x_mode_setup,
 #          fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
@@ -102,6 +103,17 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-gate-refuse-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
+
+report_retention_ensure() {
+  local out
+  if [ "${FM_GATE_REFUSE_BYPASS:-0}" = 1 ] && [ -z "${FM_REPORT_STACK_ROOT:-}" ]; then
+    return 0
+  fi
+  if ! out=$("$SCRIPT_DIR/fm-report-retention.sh" ensure 2>&1); then
+    [ -n "$out" ] || out="persistent owner did not start"
+    echo "REPORT_RETENTION: unavailable: ${out%%$'\n'*}"
+  fi
+}
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -776,6 +788,7 @@ if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+  report_retention_ensure
   secondmate_sync
   secondmate_liveness_sweep
   x_mode_setup

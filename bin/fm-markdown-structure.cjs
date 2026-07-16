@@ -1,24 +1,58 @@
-function listContainerCandidate(line) {
-  let offset = 0;
-  let found = false;
-  const initial = line.match(/^ {0,3}/)[0].length;
-  offset += initial;
+function initialIndent(line, offset = 0) {
+  return (line.slice(offset).match(/^ {0,3}/) || [""])[0].length;
+}
+
+function containerCandidate(line) {
+  let offset = initialIndent(line);
+  const containers = [];
   while (offset < line.length) {
     const rest = line.slice(offset);
     const blockquote = rest.match(/^>[ \t]?/);
     if (blockquote) {
-      found = true;
+      containers.push({ type: "blockquote" });
       offset += blockquote[0].length;
-      offset += (line.slice(offset).match(/^ {0,3}/) || [""])[0].length;
+      offset += initialIndent(line, offset);
       continue;
     }
-    const list = rest.match(/^(?:[*+-]|\d{1,9}[.)])([ \t]{1,4})/);
+    const list = rest.match(/^((?:[*+-]|\d{1,9}[.)]))([ \t]{1,4})/);
     if (!list) break;
-    found = true;
+    containers.push({ type: "list", indent: list[0].length });
     offset += list[0].length;
-    offset += (line.slice(offset).match(/^ {0,3}/) || [""])[0].length;
+    offset += initialIndent(line, offset);
   }
-  return found ? { text: line.slice(offset), indent: offset } : undefined;
+  return { text: line.slice(offset), containers };
+}
+
+function scopedLine(line, containers) {
+  if (containers.length === 0) return { text: line };
+  if (/^[ \t]*$/.test(line)) {
+    return containers.every(({ type }) => type === "list") ? { text: "" } : undefined;
+  }
+  let offset = 0;
+  for (const container of containers) {
+    if (container.type === "blockquote") {
+      offset += initialIndent(line, offset);
+      const match = line.slice(offset).match(/^>[ \t]?/);
+      if (!match) return undefined;
+      offset += match[0].length;
+      offset += initialIndent(line, offset);
+      continue;
+    }
+    let columns = 0;
+    while (offset < line.length && columns < container.indent) {
+      if (line[offset] === " ") {
+        offset += 1;
+        columns += 1;
+      } else if (line[offset] === "\t") {
+        offset += 1;
+        columns += 4 - (columns % 4);
+      } else {
+        break;
+      }
+    }
+    if (columns < container.indent) return undefined;
+  }
+  return { text: line.slice(offset) };
 }
 
 function fenceMarker(line) {
@@ -61,18 +95,15 @@ function markdownStructure(markdown) {
   for (const line of String(markdown).split(/\r?\n/)) {
     let consumed = false;
     while (!consumed) {
-      const container = listContainerCandidate(line);
-      const candidates = [{ text: line, indent: 0 }];
-      if (container) candidates.push(container);
-      const activeIndent = fence?.indent || htmlBlock?.indent || 0;
-      if (activeIndent > 0 && /^ +/.test(line)) {
-        const spaces = line.match(/^ +/)[0].length;
-        if (spaces >= activeIndent) candidates.push({ text: line.slice(activeIndent), indent: activeIndent });
-      }
       if (htmlBlock) {
+        const scoped = scopedLine(line, htmlBlock.containers);
+        if (!scoped) {
+          htmlBlock = undefined;
+          continue;
+        }
         if (htmlBlock.blank) {
-          if (candidates.some(({ text }) => /^[ \t]*$/.test(text))) htmlBlock = undefined;
-        } else if (candidates.some(({ text }) => htmlBlock.end.test(text))) {
+          if (/^[ \t]*$/.test(scoped.text)) htmlBlock = undefined;
+        } else if (htmlBlock.end.test(scoped.text)) {
           htmlBlock = undefined;
         }
         paragraphOpen = false;
@@ -80,45 +111,46 @@ function markdownStructure(markdown) {
         continue;
       }
       if (fence) {
-        const scoped = candidates.filter(({ indent }) => indent === fence.indent);
-        if (fence.indent > 0 && scoped.length === 0) {
+        const scoped = scopedLine(line, fence.containers);
+        if (!scoped) {
           fence = undefined;
           continue;
         }
-        const closing = scoped.map(({ text }) => fenceMarker(text)).find((marker) => marker
-          && marker.character === fence.character
-          && marker.length >= fence.length
-          && marker.suffix.trim() === "");
-        if (closing) fence = undefined;
+        const closing = fenceMarker(scoped.text);
+        if (closing && closing.character === fence.character
+          && closing.length >= fence.length && closing.suffix.trim() === "") {
+          fence = undefined;
+        }
         paragraphOpen = false;
         consumed = true;
         continue;
       }
 
-      const opening = candidates.map(({ text, indent }) => ({ marker: fenceMarker(text), indent }))
-        .find(({ marker }) => marker);
-      if (opening) {
+      const candidate = containerCandidate(line);
+      const marker = fenceMarker(candidate.text);
+      if (marker) {
         fence = {
-          character: opening.marker.character,
-          length: opening.marker.length,
-          indent: opening.indent,
+          character: marker.character,
+          length: marker.length,
+          containers: candidate.containers,
         };
         paragraphOpen = false;
         consumed = true;
         continue;
       }
-      const htmlOpening = candidates.map(({ text, indent }) => ({ block: htmlBlockStart(text, paragraphOpen), text, indent }))
-        .find(({ block }) => block);
+      const htmlOpening = htmlBlockStart(candidate.text, paragraphOpen && candidate.containers.length === 0);
       if (htmlOpening) {
-        const htmlStart = { ...htmlOpening.block, indent: htmlOpening.indent };
-        if (htmlStart.blank || !htmlStart.end.test(htmlOpening.text.slice(htmlOpening.text.indexOf("<") + 1))) htmlBlock = htmlStart;
+        const htmlStart = { ...htmlOpening, containers: candidate.containers };
+        if (htmlStart.blank || !htmlStart.end.test(candidate.text.slice(candidate.text.indexOf("<") + 1))) {
+          htmlBlock = htmlStart;
+        }
         paragraphOpen = false;
         consumed = true;
         continue;
       }
-      const parsedHeading = heading(line);
+      const parsedHeading = candidate.containers.length === 0 ? heading(line) : undefined;
       visible.push({ line, heading: parsedHeading });
-      paragraphOpen = !(/^[ \t]*$/.test(line) || parsedHeading);
+      paragraphOpen = candidate.containers.length === 0 && !(/^[ \t]*$/.test(line) || parsedHeading);
       consumed = true;
     }
   }

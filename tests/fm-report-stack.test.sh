@@ -275,7 +275,7 @@ test_same_generation_republish_preserves_revision_without_worktree() {
   pass "same-generation report retries preserve unavailable revision provenance"
 }
 
-test_text_sources_are_bounded_before_reading() {
+test_text_sources_are_stored_verbatim_and_completion_is_bounded() {
   local id entry stored_brief stored_status oversized out status
   id=report-bounded-trails-a5
   write_task "$id" ship
@@ -293,10 +293,8 @@ test_text_sources_are_bounded_before_reading() {
   entry=$(run_stack path "$id")
   stored_brief="$(dirname "$entry")/brief.md"
   stored_status="$(dirname "$entry")/status.log"
-  assert_grep 'task brief truncated:' "$stored_brief" "oversized brief lacked a visible truncation marker"
-  assert_grep 'Bounded trail title' "$stored_brief" "brief head truncation lost title extraction content"
-  assert_grep 'status trail truncated:' "$stored_status" "oversized status lacked a visible truncation marker"
-  assert_grep 'done: bounded status tail survives' "$stored_status" "status tail truncation lost the latest status"
+  cmp -s "$HOME_DIR/data/$id/brief.md" "$stored_brief" || fail "oversized brief was truncated or re-encoded"
+  cmp -s "$HOME_DIR/state/$id.status" "$stored_status" || fail "oversized status trail was truncated or re-encoded"
 
   oversized=report-oversized-completion-a6
   write_task "$oversized" ship
@@ -313,7 +311,7 @@ test_text_sources_are_bounded_before_reading() {
     "bounded report readers do not reserve an overflow sentinel byte"
   assert_grep 'readDescriptorAtMost(descriptor, maxBytes' "$SCRIPT" \
     "bounded report control readers do not read through the capped descriptor helper"
-  pass "report stack truncates informational trails visibly and rejects oversized completion reports"
+  pass "report stack preserves informational trails and rejects oversized completion reports"
 }
 
 test_metadata_is_bounded_before_reading() {
@@ -828,6 +826,107 @@ EOF
   pass "report parsing ignores headings and summaries inside list-container fences"
 }
 
+test_container_scopes_preserve_commonmark_blank_and_exit_rules() {
+  local valid=report-container-exit-b3n invalid=report-list-blank-b3o source out status heading
+  write_task "$valid" ship
+  source="$HOME_DIR/data/$valid/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+> ```text
+> Quoted code.
+  ## Summary
+
+  Valid summary.
+
+  ## What changed
+
+  Changed.
+
+  ## Verification
+
+  Verified.
+
+  ## Visual evidence
+
+  None.
+
+  ## Artifacts
+
+  Report.
+
+  ## Follow-ups
+
+  None.
+EOF
+  run_stack publish "$valid" >/dev/null || fail "top-level headings after a blockquote fence stayed trapped in the old container"
+
+  write_task "$invalid" ship
+  source="$HOME_DIR/data/$invalid/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- ```text
+
+  ## Summary
+  ## What changed
+  ## Verification
+  ## Visual evidence
+  ## Artifacts
+  ## Follow-ups
+  ```
+EOF
+  if out=$(run_stack publish "$invalid" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "a blank line ended a list-scoped fence and exposed nested headings"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "list blank-line scope failure omitted missing heading $heading"
+  done
+  pass "report parsing tracks CommonMark containers independently from indentation"
+}
+
+test_large_non_utf8_text_artifacts_are_stored_verbatim() {
+  local id=report-verbatim-bytes-b3p entry source brief status
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  brief="$HOME_DIR/data/$id/brief.md"
+  status="$HOME_DIR/state/$id.status"
+  write_required_report "$source" "Binary-safe report."
+  printf '\377\376\375' >> "$source"
+  dd if=/dev/zero bs=1048576 count=4 >> "$brief" 2>/dev/null
+  printf '\377brief-tail\n' >> "$brief"
+  dd if=/dev/zero bs=1048576 count=4 >> "$status" 2>/dev/null
+  printf '\376status-tail\n' >> "$status"
+
+  run_stack publish "$id" >/dev/null || fail "large non-UTF-8 artifact publication failed"
+  entry=$(run_stack path "$id")
+  cmp -s "$source" "$(dirname "$entry")/report.md" || fail "report bytes changed during publication"
+  cmp -s "$brief" "$(dirname "$entry")/brief.md" || fail "large brief bytes were truncated or re-encoded"
+  cmp -s "$status" "$(dirname "$entry")/status.log" || fail "large status bytes were truncated or re-encoded"
+  pass "report publication stores raw text artifact bytes independently from decoded views"
+}
+
+test_large_visual_inventory_does_not_share_text_buffer_headroom() {
+  local id=report-visual-inventory-b3q entry count
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Large visual inventory."
+  mkdir -p "$HOME_DIR/data/$id/visuals"
+  python3 - "$HOME_DIR/data/$id/visuals" <<'PY'
+import os
+import sys
+
+root = os.fsencode(sys.argv[1])
+for index in range(503):
+    name = f"{index:04d}".encode() + bytes([1 + index % 31]) * 240
+    descriptor = os.open(os.path.join(root, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+PY
+  run_stack publish "$id" >/dev/null || fail "valid large visual inventory exhausted text helper headroom"
+  entry=$(run_stack path "$id")
+  count=$(find "$(dirname "$entry")/visuals" -type f -print0 | tr -cd '\000' | wc -c | tr -d ' ')
+  [ "$count" = 503 ] || fail "large visual inventory lost entries (count=$count)"
+  pass "visual inventory transport has independently bounded capacity"
+}
+
 test_scout_and_legacy_sources() {
   local scout=report-scout-c3 legacy=report-legacy-d4 json
   write_task "$scout" scout
@@ -1108,7 +1207,7 @@ test_watcher_periodically_owns_idle_report_retention() {
 }
 
 test_retention_restores_expired_entries_when_index_swap_fails() {
-  local id=report-retention-rollback-k2f entry manifest temp out status previous
+  local id=report-retention-rollback-k2f entry manifest temp out status tombstone
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Retention rollback content."
   run_stack publish "$id" >/dev/null || fail "retention rollback precondition publication failed"
@@ -1121,11 +1220,79 @@ test_retention_restores_expired_entries_when_index_swap_fails() {
   mkdir "$STACK/index.html"
   if out=$(run_stack render 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "retention unexpectedly replaced an unsafe report index destination"
-  assert_present "$entry" "failed retention index swap did not restore the expired entry"
-  previous="$STACK/entries/.$(basename "$(dirname "$entry")").previous"
-  assert_absent "$previous" "failed retention index swap retained a rollback generation"
+  assert_absent "$(dirname "$entry")" "failed retention index swap restored an expired entry"
+  tombstone="$STACK/entries/.$(basename "$(dirname "$entry")").expired"
+  assert_present "$tombstone" "failed retention index swap lost its durable deletion tombstone"
+  rmdir "$STACK/index.html"
+  run_stack prune >/dev/null || fail "retention could not resume a deletion tombstone"
+  assert_absent "$tombstone" "resumed retention kept a completed deletion tombstone"
   [ -n "$out" ] || true
-  pass "report retention rolls back entry pruning when index publication fails"
+  pass "report retention preserves deletion tombstones across index failures"
+}
+
+test_retention_batches_make_interruption_safe_progress() {
+  local id entry manifest temp output index tombstone report_id
+  for index in 1 2 3; do
+    id="report-retention-batch-$index-k2l"
+    write_task "$id" ship
+    write_required_report "$HOME_DIR/data/$id/completion.md" "Expired batch $index."
+    run_stack publish "$id" >/dev/null || fail "retention batch precondition $index failed"
+    entry=$(run_stack path "$id") || fail "retention batch path $index failed"
+    manifest="$(dirname "$entry")/manifest.json"
+    temp="$manifest.tmp"
+    sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+    mv "$temp" "$manifest"
+  done
+  output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "first bounded retention batch failed"
+  assert_contains "$output" '"pending":true' "bounded retention did not advertise remaining work"
+  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "bounded retention did not leave one durable tombstone"
+  tombstone=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' -print -quit)
+  report_id=$(basename "$tombstone")
+  report_id=${report_id#.}
+  report_id=${report_id%.expired}
+  assert_no_grep "$report_id" "$STACK/index.html" "bounded retention left a tombstoned report in the current index"
+  for index in 1 2 3 4 5 6 7 8; do
+    output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "retention progress batch $index failed"
+    case "$output" in *'"pending":false'*) break ;; esac
+  done
+  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*report-retention-batch-*' | wc -l | tr -d ' ')" -eq 0 ] \
+    || fail "bounded retention did not finish all expired entries and tombstones"
+  pass "report retention advances through bounded durable deletion tombstones"
+}
+
+test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
+  local id=report-retention-owner-k2m entry manifest temp owner pid
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Persistent-owner expiry."
+  run_stack publish "$id" >/dev/null || fail "persistent retention owner precondition failed"
+  entry=$(run_stack path "$id") || fail "persistent retention owner path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  temp="$manifest.tmp"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    value.completedAt = new Date(Date.now() - 30 * 86400000 + 500).toISOString();
+    fs.writeFileSync(process.argv[2], `${JSON.stringify(value, null, 2)}\n`);
+  ' "$manifest" "$temp"
+  mv "$temp" "$manifest"
+  FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    "$ROOT/bin/fm-report-retention.sh" ensure || fail "persistent retention owner did not start"
+  owner="$STACK/.retention-owner/owner"
+  for _ in $(seq 1 80); do
+    [ ! -d "$(dirname "$entry")" ] && break
+    sleep 0.05
+  done
+  assert_absent "$(dirname "$entry")" "persistent owner did not enforce retention without active tasks"
+  pid=$(sed -n '1p' "$owner" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+  for _ in $(seq 1 40); do
+    [ ! -e "$STACK/.retention-owner" ] && break
+    sleep 0.05
+  done
+  pass "machine-global retention ownership is persistent and task-independent"
 }
 
 test_index_failure_restores_previous_generation() {
@@ -1420,7 +1587,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
-  test_text_sources_are_bounded_before_reading
+  test_text_sources_are_stored_verbatim_and_completion_is_bounded
   test_source_symlinks_fail_closed
   exit 0
 fi
@@ -1461,6 +1628,16 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
+  test_large_non_utf8_text_artifacts_are_stored_verbatim
+  test_large_visual_inventory_does_not_share_text_buffer_headroom
+  test_container_scopes_preserve_commonmark_blank_and_exit_rules
+  test_retention_restores_expired_entries_when_index_swap_fails
+  test_retention_batches_make_interruption_safe_progress
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1479,7 +1656,7 @@ test_pr_url_strips_query_and_fragment
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
 test_same_generation_republish_preserves_revision_without_worktree
-test_text_sources_are_bounded_before_reading
+test_text_sources_are_stored_verbatim_and_completion_is_bounded
 test_metadata_is_bounded_before_reading
 test_report_temps_are_exclusive_and_randomized
 test_visual_inventory_is_count_and_depth_bounded
@@ -1493,6 +1670,9 @@ test_required_headings_follow_commonmark_atx_rules
 test_invalid_backtick_info_string_does_not_open_fence
 test_summary_extraction_uses_validated_markdown_structure
 test_list_container_fences_hide_report_headings_and_summaries
+test_container_scopes_preserve_commonmark_blank_and_exit_rules
+test_large_non_utf8_text_artifacts_are_stored_verbatim
+test_large_visual_inventory_does_not_share_text_buffer_headroom
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
@@ -1507,6 +1687,8 @@ test_aged_transactionless_staging_is_reclaimed
 test_completed_reports_have_a_thirty_day_retention_ceiling
 test_retention_binds_manifests_to_entry_directories
 test_watcher_periodically_owns_idle_report_retention
+test_retention_batches_make_interruption_safe_progress
+test_persistent_retention_owner_prunes_without_tasks_or_watcher
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

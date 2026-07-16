@@ -105,6 +105,20 @@ BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
+TASK_DIR_PATH=$TASK_DIR
+task_dir_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+TASK_DIR_ID=$(task_dir_identity "$TASK_DIR_PATH") \
+  || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
+cd "$TASK_DIR_PATH" || { echo "error: continuation task directory is unavailable for $ID" >&2; exit 1; }
+[ "$(task_dir_identity .)" = "$TASK_DIR_ID" ] \
+  || { echo "error: continuation task directory changed for $ID" >&2; exit 1; }
+TASK_DIR=.
 
 TASK_SNAPSHOT_DIR=$(mktemp -d "$STATE/.continuation-task-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation task snapshot for $ID" >&2; exit 1; }
@@ -352,10 +366,23 @@ append_task_snapshot "Provider transcript summary" 13
 append_task_snapshot "Account attempt lineage" 14
 
 packet_check_budget
+if [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY:-}" ] \
+  && [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED:-}" ]; then
+  : > "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY"
+  while [ ! -e "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED" ]; do sleep 0.01; done
+fi
+[ -d "$TASK_DIR_PATH" ] && [ ! -L "$TASK_DIR_PATH" ] \
+  && [ "$(task_dir_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  && [ "$(task_dir_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  || { echo "error: continuation task directory changed for $ID" >&2; exit 1; }
 if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then
   echo "error: unsafe continuation packet destination for $ID" >&2
   exit 1
 fi
 mv "$PACKET_TMP" "$PACKET" || exit 1
 PACKET_TMP=
-printf '%s\n' "$PACKET"
+[ -d "$TASK_DIR_PATH" ] && [ ! -L "$TASK_DIR_PATH" ] \
+  && [ "$(task_dir_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  && [ "$(task_dir_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
+  || { rm -f "$PACKET"; echo "error: continuation task directory changed for $ID" >&2; exit 1; }
+printf '%s\n' "$TASK_DIR_PATH/continuation-$ATTEMPT.md"

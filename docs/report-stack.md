@@ -3,8 +3,10 @@
 Firstmate publishes one durable report for every task created after the report-stack cutover.
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
-Every locked report-stack operation prunes completed entries whose recorded completion time is at least 30 days old.
-The normal supervision watcher also runs a bounded daily `prune` operation, so idle report stacks retain the same ceiling without requiring report access.
+Every locked report-stack operation performs one bounded retention batch.
+Session-start bootstrap ensures one detached machine-global `fm-report-retention.sh` owner independent of active tasks, and that owner repeats every five minutes by default.
+The stack begins pruning two owner intervals before a report reaches 30 days, so the bounded cadence cannot carry an entry beyond the ceiling.
+Expired entries are renamed to deletion tombstones before the index changes, and interrupted recursive deletion resumes from those tombstones without restoring partial entries.
 
 ## Completion contract
 
@@ -28,6 +30,7 @@ The entry id is deterministic from the canonical Firstmate home path plus task i
 The manifest's task generation identity distinguishes a same-generation retry from a replacement generation, preserving prior completion provenance only when it still belongs to the current work.
 The manifest records routing labels useful for review but never stores provider session ids, auth material, environment values, or account-home contents.
 Task briefs, status trails, completion reports, and attachments are trusted internal artifacts preserved verbatim without content inspection or heuristic transformation.
+Bounded decoded views are used only for validation and HTML metadata; the stored source files retain their original bytes.
 Publication reads only real files and directories contained beneath the configured task roots, refusing symlinks and path escapes.
 It limits a completion report to 16 MiB and visual evidence to 20 MiB total, 512 entries, and 24 nested directory levels; oversized or unsafe input leaves the previous durable entry unchanged for repair and retry.
 

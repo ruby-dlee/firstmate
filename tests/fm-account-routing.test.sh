@@ -264,6 +264,13 @@ case "$*" in
     if [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; then
       updated_at=${FM_FAKE_AF_UPDATED_AT_AFTER:-2026-07-13T00:00:01Z}
     fi
+    if [ -n "${FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE:-}" ]; then
+      if [ ! -f "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE" ] \
+        || { [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; }; then
+        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE"
+      fi
+      updated_at=$(cat "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE")
+    fi
     printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$task" "$updated_at"
     ;;
   *" lease release "*)
@@ -1187,6 +1194,50 @@ test_session_sync_all_signals_terminate_worker_groups() {
   pass "sync-all signals terminate and reap complete worker groups"
 }
 
+test_session_sync_removes_reaped_workers_from_cleanup_state() {
+  local rec id sync_pid ready proceed worker_log first_pid second_pid status
+  rec=$(make_case sync-reaped-workers claude account-sync-reap-a1 account-sync-reap-z9)
+  read_case "$rec"
+  for id in account-sync-reap-a1 account-sync-reap-z9; do
+    fm_write_meta "$HOME_DIR/state/$id.meta" \
+      "window=firstmate:fm-$id" \
+      "worktree=$WT_DIR" \
+      "project=$PROJ_DIR" \
+      "harness=claude" \
+      "kind=ship" \
+      "account_pool=claude-crew" \
+      "account_profile=claude-2" \
+      "account_task=$id" \
+      "account_attempt=attempt-$id"
+  done
+  ready="$CASE_DIR/reaped-workers.active"
+  proceed="$CASE_DIR/reaped-workers.proceed"
+  worker_log="$CASE_DIR/reaped-workers.launched"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_SESSION_SLEEP=10 FM_FAKE_AF_SESSION_SLEEP_TASK=account-sync-reap-z9 \
+    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5 FM_ACCOUNT_SESSION_TASK_TIMEOUT=8 \
+    FM_ACCOUNT_SESSION_MAX_PARALLEL=2 FM_ACCOUNT_SESSION_WORKER_TEST_LOG="$worker_log" \
+    FM_ACCOUNT_SESSION_REAP_TEST_READY="$ready" FM_ACCOUNT_SESSION_REAP_TEST_PROCEED="$proceed" \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all >/dev/null 2>&1 &
+  sync_pid=$!
+  for _ in $(seq 1 100); do
+    [ -s "$ready" ] && [ "$(wc -l < "$worker_log" 2>/dev/null | tr -d ' ')" -eq 2 ] && break
+    sleep 0.05
+  done
+  [ -s "$ready" ] || { kill -TERM "$sync_pid" 2>/dev/null || true; fail "sync-all never exposed post-reap active state"; }
+  first_pid=$(sed -n '1p' "$worker_log")
+  second_pid=$(sed -n '2p' "$worker_log")
+  ! grep -Fxq "$first_pid" "$ready" || fail "reaped worker remained eligible for cleanup"
+  grep -Fxq "$second_pid" "$ready" || fail "live worker disappeared from cleanup state"
+  touch "$proceed"
+  kill -TERM "$sync_pid"
+  wait "$sync_pid"
+  status=$?
+  [ "$status" -eq 143 ] || fail "post-reap sync cleanup did not exit on TERM (exit $status)"
+  pass "sync-all removes each worker from cleanup state immediately after reaping"
+}
+
 test_session_sync_releases_metadata_lock_during_provider_query() {
   local id rec meta_tmp marker sync_pid sync_rc
   id=account-sync-lock-z9e
@@ -1323,6 +1374,22 @@ test_native_resume_rejects_prelaunch_sessionstart_evidence() {
   assert_grep "lease release --task $account_task --force" "$AF_LOG" "prelaunch evidence failure leaked its recovered reservation"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "prelaunch evidence failure changed durable session truth"
   pass "native resume requires SessionStart evidence after its own launch gate"
+}
+
+test_native_resume_separates_whole_second_sessionstart_evidence() {
+  local id rec out status timestamp_file
+  id=account-resume-whole-second-z9e
+  rec=$(make_case resume-whole-second claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "whole-second resume precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
+  clear_case_logs
+  timestamp_file="$CASE_DIR/session-updated-at"
+
+  if out=$(FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE="$timestamp_file" run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "whole-second SessionStart evidence was rejected after the launch gate: $out"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "whole-second native resume lost its provider session binding"
+  pass "native resume separates whole-second SessionStart evidence across its launch gate"
 }
 
 test_native_resume_uses_private_launch_directory_and_cleans_it() {
@@ -2706,6 +2773,45 @@ test_continuation_rejects_symlinked_packet_destination() {
   pass "continuation rejects symlinked packet destinations"
 }
 
+test_continuation_pins_packet_destination_directory() {
+  local id rec ready proceed output moved outside packet_pid status
+  id=account-continuation-destination-race-z28f
+  rec=$(make_case continuation-destination-race claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation destination-race precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-destination.ready"
+  proceed="$CASE_DIR/continuation-destination.proceed"
+  output="$CASE_DIR/continuation-destination.out"
+  moved="$HOME_DIR/data/$id.original"
+  outside="$CASE_DIR/continuation-outside"
+  mkdir "$outside"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" destination-race > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.05
+  done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "continuation destination race gate did not open"; }
+  mv "$HOME_DIR/data/$id" "$moved"
+  ln -s "$outside" "$HOME_DIR/data/$id"
+  touch "$proceed"
+  wait "$packet_pid"
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation installed a packet after its task directory was replaced"
+  assert_contains "$(cat "$output")" 'continuation task directory changed' "destination replacement refusal was unclear"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "continuation redirected packet bytes outside the pinned task directory"
+  assert_absent "$moved/continuation-destination-race.md" "continuation left a packet in a disconnected task generation"
+  rm "$HOME_DIR/data/$id"
+  mv "$moved" "$HOME_DIR/data/$id"
+  pass "continuation stages and installs packets through one pinned task directory"
+}
+
 test_continuation_rejects_load_bearing_source_replacement_during_open() {
   local id rec source hook out status
   id=account-continuation-copy-race-z28d
@@ -3537,6 +3643,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
+  test_native_resume_separates_whole_second_sessionstart_evidence
+  test_session_sync_removes_reaped_workers_from_cleanup_state
+  test_continuation_pins_packet_destination_directory
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3564,11 +3677,13 @@ test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot
 test_session_sync_bounds_agent_fleet_queries
 test_session_sync_all_bounds_each_task_and_reaches_later_mappings
+test_session_sync_removes_reaped_workers_from_cleanup_state
 test_session_sync_releases_metadata_lock_during_provider_query
 test_continuation_rejects_symlinked_charter_ancestor
 test_recovered_reservations_are_owned_only_after_validated_recovery
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
+test_native_resume_separates_whole_second_sessionstart_evidence
 test_native_resume_uses_private_launch_directory_and_cleans_it
 test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
@@ -3614,6 +3729,7 @@ test_oversized_continuation_stops_before_mutation
 test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
+test_continuation_pins_packet_destination_directory
 test_continuation_rejects_load_bearing_source_replacement_during_open
 test_continuation_rejects_task_source_ancestor_swap
 test_continuation_rejects_metadata_ancestor_swap

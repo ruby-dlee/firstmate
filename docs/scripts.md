@@ -73,6 +73,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |
+| `fm-report-retention.sh` | Maintain bounded, interruption-safe 30-day report retention independently of tasks   |
 | `fm-teardown.sh`         | Fail-closed teardown of worktrees, endpoints, secondmate homes, and managed account leases |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |

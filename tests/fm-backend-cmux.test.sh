@@ -1127,6 +1127,28 @@ test_target_state_distinguishes_absent_from_malformed_workspaces() {
   pass "cmux target state distinguishes missing workspaces from malformed records"
 }
 
+test_target_state_refuses_duplicate_recovery_titles() {
+  local dir fb out title target
+  dir="$TMP_ROOT/target-state-duplicate-title"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-duplicate)
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "c1111111-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-duplicate
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "duplicate cmux recovery titles were not fail-closed (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] || fail "duplicate title recovery inspected an arbitrary matching workspace"
+  pass "cmux target recovery refuses ambiguous workspace titles"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1143,6 +1165,11 @@ test_secondmate_spawn_refuses_cmux_backend() {
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
+  test_target_state_refuses_duplicate_recovery_titles
+  exit 0
+fi
 
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
@@ -1204,4 +1231,5 @@ test_kill_recovers_stale_target_by_label
 test_list_live_filters_by_title_prefix
 test_target_state_finds_workspace_outside_current_window
 test_target_state_distinguishes_absent_from_malformed_workspaces
+test_target_state_refuses_duplicate_recovery_titles
 test_secondmate_spawn_refuses_cmux_backend

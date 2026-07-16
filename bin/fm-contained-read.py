@@ -194,6 +194,63 @@ def copy_regular(source_parent, destination_parent, name, remaining):
         os.close(source)
 
 
+def snapshot_artifact(source_parent, destination_parent, source_name, destination_name, view_limit, mode, copy_limit=None, optional=False):
+    try:
+        source = open_relative(source_parent, source_name, os.O_RDONLY)
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    destination = None
+    try:
+        opened = os.fstat(source)
+        item = read_descriptor(source, view_limit, mode)
+        if copy_limit is not None and opened.st_size > copy_limit:
+            return item
+        destination = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=destination_parent,
+        )
+        os.lseek(source, 0, os.SEEK_SET)
+        copied = 0
+        while copied < opened.st_size:
+            chunk = os.read(source, min(64 * 1024, opened.st_size - copied))
+            if not chunk:
+                fail(f"source ended before its recorded size: {source_name}")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination, view)
+                view = view[written:]
+            copied += len(chunk)
+        if os.read(source, 1):
+            fail(f"source changed size while copying: {source_name}")
+        if not same_file(opened, os.fstat(source)):
+            fail(f"source changed while copying: {source_name}")
+        return item
+    finally:
+        if destination is not None:
+            os.close(destination)
+        os.close(source)
+
+
+def write_artifact(destination, name, content):
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=destination,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+
+
 def copy_visuals(task_descriptor, destination_descriptor, maximum, entry_limit, depth_limit):
     try:
         source = open_verified_directory(task_descriptor, "visuals")
@@ -262,12 +319,31 @@ def command_snapshot_task_fd(arguments):
     try:
         if not stat.S_ISDIR(os.fstat(task).st_mode):
             fail("task data source is not a real directory")
-        brief = read_relative(task, "brief.md", int(brief_raw), "head", optional=True)
-        source = read_relative(task, source_name, int(source_raw), "strict", optional=True)
+        brief = snapshot_artifact(task, destination, "brief.md", "brief.md", int(brief_raw), "head", optional=True)
+        source = snapshot_artifact(task, destination, source_name, "report.md", int(source_raw), "strict", copy_limit=int(source_raw), optional=True)
         visuals = copy_visuals(task, destination, int(visual_raw), int(entry_raw), int(depth_raw))
-        write_framed([("brief", brief), ("source", source), ("visuals", {"oversized": False, "size": 0, "content": json.dumps(visuals, separators=(",", ":")).encode("utf-8")})])
+        write_artifact(destination, ".visuals.json", json.dumps(visuals, separators=(",", ":")).encode("utf-8"))
+        write_framed([("brief", brief), ("source", source)])
     finally:
         os.close(task)
+
+
+def command_snapshot_file_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py snapshot-file-fd <relative> <view-limit> <head|tail> <destination-name>")
+    relative, maximum_raw, mode, destination_name = arguments
+    maximum = int(maximum_raw)
+    if maximum < 0 or mode not in ("head", "tail") or len(components(destination_name)) != 1:
+        fail("invalid contained snapshot arguments")
+    root = checked_root(3)
+    destination = checked_root(4)
+    parent_name = os.path.dirname(relative)
+    source_parent = open_relative(root, parent_name, os.O_RDONLY | os.O_DIRECTORY) if parent_name else os.dup(root)
+    try:
+        item = snapshot_artifact(source_parent, destination, os.path.basename(relative), destination_name, maximum, mode, optional=True)
+    finally:
+        os.close(source_parent)
+    write_framed([("source", item)])
 
 
 def command_snapshot_files_fd(arguments):
@@ -311,6 +387,8 @@ def main():
         command_snapshot_task_fd(sys.argv[2:])
     elif sys.argv[1] == "snapshot-files-fd":
         command_snapshot_files_fd(sys.argv[2:])
+    elif sys.argv[1] == "snapshot-file-fd":
+        command_snapshot_file_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

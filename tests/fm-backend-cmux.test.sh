@@ -1189,6 +1189,29 @@ test_target_state_refuses_absence_for_renamed_recorded_workspace() {
   pass "cmux target recovery fails closed when the recorded workspace title disagrees"
 }
 
+test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement() {
+  local dir fb out target title
+  dir="$TMP_ROOT/target-state-recorded-and-replacement"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  title=$(cmux_expected_scoped_title fm-recorded-task)
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "renamed-task"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-recorded-task
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "a renamed recorded cmux workspace was ignored in favor of an empty replacement (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] \
+    || fail "ambiguous recorded and replacement cmux workspaces reached an arbitrary pane inspection"
+  pass "cmux target recovery keeps renamed recorded identities fail-closed beside replacements"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1219,6 +1242,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
   test_target_state_refuses_absence_for_renamed_recorded_workspace
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
+  test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
   exit 0
 fi
 
@@ -1285,4 +1313,5 @@ test_target_state_distinguishes_absent_from_malformed_workspaces
 test_target_state_refuses_duplicate_recovery_titles
 test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
 test_target_state_refuses_absence_for_renamed_recorded_workspace
+test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
 test_secondmate_spawn_refuses_cmux_backend

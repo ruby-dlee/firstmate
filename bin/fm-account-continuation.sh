@@ -309,6 +309,39 @@ append_task_snapshot() {  # <heading> <snapshot-index>
   append_staged_file_section "$heading" "$source_tmp"
 }
 
+repository_snapshot_matches() {
+  local current_worktree_real current_worktree_id current_top current_top_real current_head current_branch
+  local verified_worktree_real verified_worktree_id verified_top verified_top_real verified_head verified_branch
+  current_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
+  current_worktree_id=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
+  current_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
+  current_top_real=$([ -n "$current_top" ] && cd "$current_top" && pwd -P || true)
+  current_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
+  current_branch=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
+  [ -n "$current_branch" ] || current_branch=detached
+  [ "$current_worktree_real" = "$WORKTREE_REAL" ] \
+    && [ "$current_worktree_id" = "$WORKTREE_ID" ] \
+    && [ "$current_top_real" = "$WORKTREE_REAL" ] \
+    && [ "$current_head" = "$HEAD" ] \
+    && [ "$current_branch" = "$BRANCH" ] \
+    || return 1
+  git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_REVALIDATION_TMP" 2>/dev/null \
+    || return 1
+  verified_worktree_real=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
+  verified_worktree_id=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
+  verified_top=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
+  verified_top_real=$([ -n "$verified_top" ] && cd "$verified_top" && pwd -P || true)
+  verified_head=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
+  verified_branch=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
+  [ -n "$verified_branch" ] || verified_branch=detached
+  [ "$verified_worktree_real" = "$WORKTREE_REAL" ] \
+    && [ "$verified_worktree_id" = "$WORKTREE_ID" ] \
+    && [ "$verified_top_real" = "$WORKTREE_REAL" ] \
+    && [ "$verified_head" = "$HEAD" ] \
+    && [ "$verified_branch" = "$BRANCH" ] \
+    && cmp -s "$STATUS_IDENTITY_TMP" "$STATUS_REVALIDATION_TMP"
+}
+
 {
   printf '# Provider-neutral continuation for %s\n\n' "$ID"
   printf 'This is a fresh provider session for the same Firstmate task, not a replay from the beginning.\n'
@@ -377,28 +410,14 @@ append_task_snapshot "Provider transcript summary" 13
 append_task_snapshot "Account attempt lineage" 14
 
 packet_check_budget
+STATUS_REVALIDATION_TMP=$(mktemp "$STATE/.continuation-status-revalidation-$ID.XXXXXX") \
+  || { echo "error: cannot restage continuation repository status identity for $ID" >&2; exit 1; }
 if [ -n "${FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY:-}" ] \
   && [ -n "${FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED:-}" ]; then
   : > "$FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY"
   while [ ! -e "$FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED" ]; do sleep 0.01; done
 fi
-CURRENT_WORKTREE_REAL=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
-CURRENT_WORKTREE_ID=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
-CURRENT_TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
-CURRENT_TOP_REAL=$([ -n "$CURRENT_TOP" ] && cd "$CURRENT_TOP" && pwd -P || true)
-CURRENT_HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
-CURRENT_BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
-[ -n "$CURRENT_BRANCH" ] || CURRENT_BRANCH=detached
-STATUS_REVALIDATION_TMP=$(mktemp "$STATE/.continuation-status-revalidation-$ID.XXXXXX") \
-  || { echo "error: cannot restage continuation repository status identity for $ID" >&2; exit 1; }
-git -C "$WORKTREE_REAL" status --porcelain=v2 --branch -z > "$STATUS_REVALIDATION_TMP" 2>/dev/null \
-  || { echo "error: cannot revalidate continuation repository status for $ID" >&2; exit 1; }
-if ! { [ "$CURRENT_WORKTREE_REAL" = "$WORKTREE_REAL" ] \
-  && [ "$CURRENT_WORKTREE_ID" = "$WORKTREE_ID" ] \
-  && [ "$CURRENT_TOP_REAL" = "$WORKTREE_REAL" ] \
-  && [ "$CURRENT_HEAD" = "$HEAD" ] \
-  && [ "$CURRENT_BRANCH" = "$BRANCH" ] \
-  && cmp -s "$STATUS_IDENTITY_TMP" "$STATUS_REVALIDATION_TMP"; }; then
+if ! repository_snapshot_matches; then
   echo "error: continuation repository snapshot changed for $ID" >&2
   exit 1
 fi
@@ -415,8 +434,22 @@ if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then
   echo "error: unsafe continuation packet destination for $ID" >&2
   exit 1
 fi
+if ! repository_snapshot_matches; then
+  echo "error: continuation repository snapshot changed for $ID" >&2
+  exit 1
+fi
 mv "$PACKET_TMP" "$PACKET" || exit 1
 PACKET_TMP=
+if [ -n "${FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY:-}" ] \
+  && [ -n "${FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED:-}" ]; then
+  : > "$FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY"
+  while [ ! -e "$FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED" ]; do sleep 0.01; done
+fi
+if ! repository_snapshot_matches; then
+  rm -f "$PACKET"
+  echo "error: continuation repository snapshot changed for $ID" >&2
+  exit 1
+fi
 [ -d "$TASK_DIR_PATH" ] && [ ! -L "$TASK_DIR_PATH" ] \
   && [ "$(task_dir_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
   && [ "$(task_dir_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \

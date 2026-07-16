@@ -31,6 +31,7 @@ PLIST="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL=${FM_REPORT_RETENTION_LAUNCHCTL:-launchctl}
 HEARTBEAT="$STACK_ROOT/.retention-heartbeat"
 ERROR_FILE="$STACK_ROOT/.retention-error"
+INSTALL_TRANSACTION="$INSTALL_ROOT/.install-transaction"
 SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.cjs fm-contained-read.py fm-gate-refuse-lib.sh)
 
 case "$INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
@@ -102,6 +103,110 @@ write_heartbeat() {
   mv "$temp" "$HEARTBEAT"
 }
 
+write_install_transaction() {
+  local phase=$1 token=$2 had_bundle=$3 had_plist=$4 temp
+  temp=$(mktemp "$INSTALL_ROOT/.install-transaction.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n%s\n' "$phase" "$token" "$had_bundle" "$had_plist" > "$temp" \
+    || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+  if [ -e "$INSTALL_TRANSACTION" ] || [ -L "$INSTALL_TRANSACTION" ]; then
+    [ -f "$INSTALL_TRANSACTION" ] && [ ! -L "$INSTALL_TRANSACTION" ] \
+      || { rm -f "$temp"; echo "error: unsafe report-retention install transaction" >&2; return 1; }
+  fi
+  mv -f "$temp" "$INSTALL_TRANSACTION"
+}
+
+remove_installed_bundle() {
+  local bundle=$1
+  if [ -e "$bundle" ] || [ -L "$bundle" ]; then
+    [ -d "$bundle" ] && [ ! -L "$bundle" ] \
+      || { echo "error: installed report-retention bundle is unsafe" >&2; return 1; }
+    rm -rf "$bundle"
+  fi
+}
+
+remove_installed_plist() {
+  local plist=$1
+  if [ -e "$plist" ] || [ -L "$plist" ]; then
+    [ -f "$plist" ] && [ ! -L "$plist" ] \
+      || { echo "error: installed report-retention LaunchAgent is unsafe" >&2; return 1; }
+    rm -f "$plist"
+  fi
+}
+
+recover_install_transaction() {
+  local phase token had_bundle had_plist extra token_a token_b token_c token_extra
+  local bundle="$INSTALL_ROOT/bin" bundle_previous plist_previous domain
+  [ -e "$INSTALL_TRANSACTION" ] || [ -L "$INSTALL_TRANSACTION" ] || return 0
+  [ -f "$INSTALL_TRANSACTION" ] && [ ! -L "$INSTALL_TRANSACTION" ] \
+    || { echo "error: unsafe report-retention install transaction" >&2; return 1; }
+  [ "$(wc -c < "$INSTALL_TRANSACTION" | tr -d '[:space:]')" -le 256 ] \
+    || { echo "error: invalid report-retention install transaction" >&2; return 1; }
+  phase=$(sed -n '1p' "$INSTALL_TRANSACTION")
+  token=$(sed -n '2p' "$INSTALL_TRANSACTION")
+  had_bundle=$(sed -n '3p' "$INSTALL_TRANSACTION")
+  had_plist=$(sed -n '4p' "$INSTALL_TRANSACTION")
+  extra=$(sed -n '5p' "$INSTALL_TRANSACTION")
+  IFS=. read -r token_a token_b token_c token_extra <<< "$token"
+  case "$phase:$had_bundle:$had_plist" in prepared:0:0|prepared:0:1|prepared:1:0|prepared:1:1|committed:0:0|committed:0:1|committed:1:0|committed:1:1) ;; *) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
+  case "$token_a" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
+  case "$token_b" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
+  case "$token_c" in ''|*[!0-9]*) echo "error: invalid report-retention install transaction" >&2; return 1 ;; esac
+  [ -z "$token_extra" ] && [ -z "$extra" ] \
+    || { echo "error: invalid report-retention install transaction" >&2; return 1; }
+  bundle_previous="$INSTALL_ROOT/.bin.previous.$token"
+  plist_previous="$LAUNCH_AGENTS_DIR/.$LABEL.previous.$token.plist"
+  if [ "$phase" = committed ]; then
+    [ -d "$bundle" ] && [ ! -L "$bundle" ] && [ -f "$PLIST" ] && [ ! -L "$PLIST" ] \
+      || { echo "error: committed report-retention installation is incomplete" >&2; return 1; }
+    remove_installed_bundle "$bundle_previous" || return 1
+    remove_installed_plist "$plist_previous" || return 1
+    rm -f "$INSTALL_TRANSACTION"
+    return 0
+  fi
+
+  domain="gui/$(id -u)"
+  "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
+  if [ "$had_bundle" -eq 1 ]; then
+    if [ -e "$bundle_previous" ] || [ -L "$bundle_previous" ]; then
+      [ -d "$bundle_previous" ] && [ ! -L "$bundle_previous" ] \
+        || { echo "error: previous report-retention bundle is unsafe" >&2; return 1; }
+      remove_installed_bundle "$bundle" || return 1
+      mv "$bundle_previous" "$bundle" || return 1
+    else
+      [ -d "$bundle" ] && [ ! -L "$bundle" ] \
+        || { echo "error: report-retention transaction lost its previous bundle" >&2; return 1; }
+    fi
+  else
+    [ ! -e "$bundle_previous" ] && [ ! -L "$bundle_previous" ] \
+      || { echo "error: unexpected previous report-retention bundle" >&2; return 1; }
+    remove_installed_bundle "$bundle" || return 1
+  fi
+  if [ "$had_plist" -eq 1 ]; then
+    if [ -e "$plist_previous" ] || [ -L "$plist_previous" ]; then
+      [ -f "$plist_previous" ] && [ ! -L "$plist_previous" ] \
+        || { echo "error: previous report-retention LaunchAgent is unsafe" >&2; return 1; }
+      remove_installed_plist "$PLIST" || return 1
+      mv "$plist_previous" "$PLIST" || return 1
+    else
+      [ -f "$PLIST" ] && [ ! -L "$PLIST" ] \
+        || { echo "error: report-retention transaction lost its previous LaunchAgent" >&2; return 1; }
+    fi
+    "$LAUNCHCTL" bootstrap "$domain" "$PLIST" >/dev/null 2>&1 \
+      && "$LAUNCHCTL" kickstart "$domain/$LABEL" >/dev/null 2>&1 \
+      || return 1
+  else
+    [ ! -e "$plist_previous" ] && [ ! -L "$plist_previous" ] \
+      || { echo "error: unexpected previous report-retention LaunchAgent" >&2; return 1; }
+    remove_installed_plist "$PLIST" || return 1
+  fi
+  rm -f "$INSTALL_TRANSACTION"
+}
+
+install_test_interrupt() {
+  [ "${FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT:-}" != "$1" ] || return 99
+}
+
 run_once() {
   local output pending guard_ms provenance_value node_runtime
   provenance_value=$(provenance "$SCRIPT_DIR") || { echo "error: retention owner bundle is incomplete" >&2; return 1; }
@@ -125,9 +230,11 @@ run_once() {
 install_owner() {
   local bundle="$INSTALL_ROOT/bin" staging plist_temp file source_provenance installed_provenance domain
   local bash_runtime node_runtime python_runtime git_runtime runtime_path token bundle_previous plist_previous
-  local had_bundle=0 had_plist=0 new_bundle=0 new_plist=0 activation_ok=0
+  local had_bundle=0 had_plist=0 activation_ok=0
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent installation requires macOS" >&2; return 1; }
   command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
+  mkdir -p "$INSTALL_ROOT" "$LAUNCH_AGENTS_DIR" || return 1
+  recover_install_transaction || return 1
   bash_runtime=$(resolve_runtime "${FM_REPORT_RETENTION_BASH:-}" bash) \
     || { echo "error: report-retention Bash runtime is unavailable" >&2; return 1; }
   node_runtime=$(resolve_runtime "${FM_REPORT_RETENTION_NODE:-}" node) \
@@ -137,7 +244,6 @@ install_owner() {
   git_runtime=$(resolve_runtime "${FM_REPORT_GIT:-}" git) \
     || { echo "error: report-retention Git runtime is unavailable" >&2; return 1; }
   runtime_path="$(dirname "$node_runtime"):$(dirname "$python_runtime"):$(dirname "$git_runtime"):/usr/bin:/bin:/usr/sbin:/sbin"
-  mkdir -p "$INSTALL_ROOT" "$LAUNCH_AGENTS_DIR" || return 1
   staging=$(mktemp -d "$INSTALL_ROOT/.bin.XXXXXX") || return 1
   plist_temp=$(mktemp "$LAUNCH_AGENTS_DIR/.$LABEL.XXXXXX") || { rm -rf "$staging"; return 1; }
   for file in "${SOURCE_FILES[@]}"; do
@@ -181,30 +287,30 @@ EOF
   if [ -e "$bundle" ] || [ -L "$bundle" ]; then
     [ -d "$bundle" ] && [ ! -L "$bundle" ] \
       || { rm -rf "$staging"; rm -f "$plist_temp"; echo "error: installed report-retention bundle is unsafe" >&2; return 1; }
-    mv "$bundle" "$bundle_previous" || { rm -rf "$staging"; rm -f "$plist_temp"; return 1; }
     had_bundle=1
   fi
   if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then
-    [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || {
-      [ "$had_bundle" -eq 0 ] || mv "$bundle_previous" "$bundle"
-      rm -rf "$staging"
-      rm -f "$plist_temp"
-      echo "error: installed report-retention LaunchAgent is unsafe" >&2
-      return 1
-    }
-    mv "$PLIST" "$plist_previous" || {
-      [ "$had_bundle" -eq 0 ] || mv "$bundle_previous" "$bundle"
-      rm -rf "$staging"
-      rm -f "$plist_temp"
-      return 1
-    }
+    [ -f "$PLIST" ] && [ ! -L "$PLIST" ] \
+      || { rm -rf "$staging"; rm -f "$plist_temp"; echo "error: installed report-retention LaunchAgent is unsafe" >&2; return 1; }
     had_plist=1
   fi
+  write_install_transaction prepared "$token" "$had_bundle" "$had_plist" \
+    || { rm -rf "$staging"; rm -f "$plist_temp"; return 1; }
+  if [ "$had_bundle" -eq 1 ]; then
+    mv "$bundle" "$bundle_previous" \
+      || { recover_install_transaction || true; rm -rf "$staging"; rm -f "$plist_temp"; return 1; }
+  fi
+  install_test_interrupt bundle-backed-up || return $?
+  if [ "$had_plist" -eq 1 ]; then
+    mv "$PLIST" "$plist_previous" \
+      || { recover_install_transaction || true; rm -rf "$staging"; rm -f "$plist_temp"; return 1; }
+  fi
+  install_test_interrupt plist-backed-up || return $?
   if mv "$staging" "$bundle"; then
-    new_bundle=1
+    install_test_interrupt bundle-published || return $?
     if mv "$plist_temp" "$PLIST"; then
-      new_plist=1
       activation_ok=1
+      install_test_interrupt plist-published || return $?
     fi
   fi
   domain="gui/$(id -u)"
@@ -218,28 +324,26 @@ EOF
       || activation_ok=0
   fi
   if [ "$activation_ok" -ne 1 ]; then
-    "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
-    [ "$new_bundle" -eq 0 ] || rm -rf "$bundle"
-    [ "$new_plist" -eq 0 ] || rm -f "$PLIST"
-    [ "$had_bundle" -eq 0 ] || mv "$bundle_previous" "$bundle" || true
-    [ "$had_plist" -eq 0 ] || mv "$plist_previous" "$PLIST" || true
-    if [ "$had_plist" -eq 1 ] && [ -f "$PLIST" ]; then
-      "$LAUNCHCTL" bootstrap "$domain" "$PLIST" >/dev/null 2>&1 || true
-      "$LAUNCHCTL" kickstart "$domain/$LABEL" >/dev/null 2>&1 || true
-    fi
+    recover_install_transaction || true
     rm -rf "$staging"
     rm -f "$plist_temp"
     echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
     return 1
   fi
-  rm -rf "$bundle_previous"
-  rm -f "$plist_previous"
+  if ! write_install_transaction committed "$token" "$had_bundle" "$had_plist"; then
+    recover_install_transaction || true
+    echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
+    return 1
+  fi
+  recover_install_transaction
 }
 
 ensure_owner() {
   local now heartbeat_epoch heartbeat_provenance installed_provenance source_provenance max_age domain
   local plist_arguments plist_bash plist_program plist_node plist_python
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent requires macOS" >&2; return 1; }
+  command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
+  recover_install_transaction || return 1
   [ -f "$PLIST" ] && [ ! -L "$PLIST" ] \
     || { echo "error: report-retention LaunchAgent is not installed; run bin/fm-bootstrap.sh install report-retention after captain approval" >&2; return 1; }
   plist_arguments=$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s/.*<string>\([^<]*\)<\/string>.*/\1/p' "$PLIST")

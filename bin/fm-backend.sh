@@ -718,7 +718,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # present, absent, or unknown. Callers may release an external lease only on
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id
+  local backend=$1 target=$2 expected_label=${3:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
@@ -736,10 +736,19 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
           fi
           ;;
       esac
-      if out=$(tmux list-panes -a -F '#{pane_id}' 2>&1); then
-        printf 'absent'
+      if windows=$(tmux list-windows -a -F '#{window_name}' 2>&1); then
+        if [ -n "$expected_label" ]; then
+          count=$(printf '%s\n' "$windows" | awk -v want="$expected_label" '$0 == want { count += 1 } END { print count + 0 }')
+          case "$count" in
+            0) printf 'absent' ;;
+            1) printf 'present' ;;
+            *) printf 'unknown' ;;
+          esac
+        else
+          printf 'absent'
+        fi
       else
-        case "$out" in
+        case "$windows" in
           *'no server running on '*|*'failed to connect to server: No such file or directory'*) printf 'absent' ;;
           *) printf 'unknown' ;;
         esac
@@ -899,6 +908,10 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
           || { printf 'unknown'; return 0; }
         resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
           || { printf 'unknown'; return 0; }
+        if [ "$workspace_record" != null ] && [ "$resolved_workspace" != "$workspace" ]; then
+          printf 'unknown'
+          return 0
+        fi
       elif [ "$workspace_record" = null ]; then
         printf 'absent'
         return 0

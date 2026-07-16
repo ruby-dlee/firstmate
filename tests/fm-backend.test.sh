@@ -634,6 +634,28 @@ test_managed_tmux_target_identity() {
   pass "managed tmux operations reject reused window ids with another task label"
 }
 
+test_managed_tmux_target_state_finds_replacement_window() {
+  local window_names
+  window_names=fm-intended-task
+  tmux() {
+    case "${1:-}" in
+      display-message) return 1 ;;
+      list-windows) printf '%s\n' "$window_names" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = present ] \
+    || fail "a uniquely labeled replacement tmux window was classified as absent"
+  window_names=$'fm-intended-task\nfm-intended-task'
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+    || fail "duplicate plausible tmux replacements were not fail-closed"
+  window_names=fm-other-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = absent ] \
+    || fail "tmux target state did not retain confident absence without a replacement label"
+  pass "managed tmux target state finds plausible replacement windows"
+}
+
 # --- old vs new: fm-send.sh --------------------------------------------------
 
 make_send_fakebin() {  # <dir> -> echoes fakebin dir; logs every tmux call to $FM_TMUX_LOG
@@ -1097,6 +1119,11 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   rm -rf "/tmp/fm-$id"
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
+  test_managed_tmux_target_state_finds_replacement_window
+  exit 0
+fi
 
 test_backend_name_precedence
 test_backend_detect_precedence

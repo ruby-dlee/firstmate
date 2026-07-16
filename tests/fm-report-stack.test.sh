@@ -1255,34 +1255,37 @@ test_retention_restores_expired_entries_when_index_swap_fails() {
 }
 
 test_retention_batches_make_interruption_safe_progress() {
-  local id entry manifest temp output index tombstone report_id
+  local id entry manifest temp output index
+  local -a manifests
   for index in 1 2 3; do
     id="report-retention-batch-$index-k2l"
     write_task "$id" ship
     write_required_report "$HOME_DIR/data/$id/completion.md" "Expired batch $index."
     run_stack publish "$id" >/dev/null || fail "retention batch precondition $index failed"
     entry=$(run_stack path "$id") || fail "retention batch path $index failed"
-    manifest="$(dirname "$entry")/manifest.json"
+    manifests[index]="$(dirname "$entry")/manifest.json"
+  done
+  for index in 1 2 3; do
+    manifest=${manifests[index]}
     temp="$manifest.tmp"
     sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
     mv "$temp" "$manifest"
   done
   output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "first bounded retention batch failed"
   assert_contains "$output" '"pending":true' "bounded retention did not advertise remaining work"
-  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' | wc -l | tr -d ' ')" -eq 1 ] \
-    || fail "bounded retention did not leave one durable tombstone"
-  tombstone=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' -print -quit)
-  report_id=$(basename "$tombstone")
-  report_id=${report_id#.}
-  report_id=${report_id%.expired}
-  assert_no_grep "$report_id" "$STACK/index.html" "bounded retention left a tombstoned report in the current index"
+  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' | wc -l | tr -d ' ')" -eq 2 ] \
+    || fail "bounded retention did not tombstone every due report before physical cleanup"
+  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -name '*report-retention-batch-*' | wc -l | tr -d ' ')" -eq 0 ] \
+    || fail "bounded retention left due reports live after its first visibility transaction"
+  assert_no_grep 'report-retention-batch-' "$STACK/index.html" \
+    "bounded retention left a due report in the current index"
   for index in 1 2 3 4 5 6 7 8; do
     output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "retention progress batch $index failed"
     case "$output" in *'"pending":false'*) break ;; esac
   done
   [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*report-retention-batch-*' | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "bounded retention did not finish all expired entries and tombstones"
-  pass "report retention advances through bounded durable deletion tombstones"
+  pass "report retention removes every due report before bounded tombstone cleanup"
 }
 
 test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
@@ -1419,6 +1422,58 @@ SH
   assert_absent "$marker" "healthy retention replacement kept the superseded generation after its first prune"
   assert_present "$STACK/.retention-heartbeat" "healthy retention replacement removed the previous generation before its first-prune heartbeat"
   pass "retention activation keeps and restores the prior healthy generation"
+}
+
+test_retention_install_recovers_interrupted_generation_transaction() {
+  local fakebin install_root agents marker plist saved_plist log out status transaction
+  fakebin="$TMP_ROOT/retention-crash-launchctl"
+  install_root="$TMP_ROOT/retention-crash-install"
+  agents="$TMP_ROOT/retention-crash-agents"
+  marker="$install_root/bin/previous-generation-marker"
+  plist="$agents/com.firstmate.report-retention.plist"
+  saved_plist="$TMP_ROOT/retention-crash-previous.plist"
+  log="$TMP_ROOT/retention-crash.log"
+  transaction="$install_root/.install-transaction"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention crash-recovery precondition installation failed"
+  printf 'previous generation\n' > "$marker"
+  cp "$plist" "$saved_plist"
+
+  if out=$(FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT=plist-published \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 99 ] || fail "retention installation interruption hook did not strand its transaction: $out"
+  assert_present "$transaction" "interrupted retention installation did not persist its recovery transaction"
+  assert_absent "$marker" "interrupted retention installation did not replace the canonical bundle before recovery"
+
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure \
+    || fail "retention ensure did not recover an interrupted installation"
+  assert_present "$marker" "retention recovery did not restore the previous owner bundle"
+  cmp -s "$saved_plist" "$plist" || fail "retention recovery did not restore the previous LaunchAgent"
+  assert_absent "$transaction" "retention recovery left its completed install transaction"
+  [ -z "$(find "$install_root" "$agents" -maxdepth 1 -name '*.previous.*' -print -quit)" ] \
+    || fail "retention recovery left previous-generation backups"
+  assert_grep 'bootstrap' "$log" "retention recovery did not re-bootstrap the previous LaunchAgent"
+  assert_grep 'kickstart' "$log" "retention recovery did not restart the previous LaunchAgent"
+  pass "retention install transactions recover the prior generation after interruption"
 }
 
 test_retention_error_publication_is_atomic_and_nonfollowing() {
@@ -1829,6 +1884,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
+  test_retention_batches_make_interruption_safe_progress
+  test_retention_install_recovers_interrupted_generation_transaction
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1882,6 +1943,7 @@ test_watcher_periodically_owns_idle_report_retention
 test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
 test_retention_activation_restores_previous_generation_on_failure
+test_retention_install_recovers_interrupted_generation_transaction
 test_retention_error_publication_is_atomic_and_nonfollowing
 test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation

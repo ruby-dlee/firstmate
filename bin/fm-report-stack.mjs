@@ -804,20 +804,9 @@ function pruneExpiredEntries() {
   if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
   }
-  let remaining = reportRetentionBatch;
-  let pruned = 0;
   const existingTombstones = retentionTombstones();
-  if (existingTombstones.length > 0) renderIndex();
-  for (const tombstone of existingTombstones) {
-    if (remaining === 0) return { pruned, pending: true };
-    fs.rmSync(tombstone, { recursive: true, force: true });
-    pruned += 1;
-    remaining -= 1;
-  }
-  if (remaining === 0) return { pruned, pending: true };
-
   const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
-  let moved = 0;
+  const expired = [];
   for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.name)) {
@@ -830,20 +819,20 @@ function pruneExpiredEntries() {
     if (manifest.reportId !== entry.name) throw new Error(`report manifest identity mismatch at ${manifestFile}`);
     const completedAt = Date.parse(manifest.completedAt);
     if (!Number.isFinite(completedAt) || completedAt > cutoff) continue;
-    if (remaining === 0) return { pruned, pending: true };
     const tombstone = path.join(entriesDir, `.${entry.name}.expired`);
     if (fs.existsSync(tombstone)) throw new Error(`report retention found an active deletion tombstone for ${entry.name}`);
     realDirectory(destination, fs.realpathSync(entriesDir), "expired report entry");
-    fs.renameSync(destination, tombstone);
-    moved += 1;
-    remaining -= 1;
-    if (remaining === 0) {
-      renderIndex();
-      return { pruned, pending: true };
-    }
+    expired.push({ destination, tombstone });
   }
-  if (moved > 0) renderIndex();
-  return { pruned, pending: moved > 0 };
+  for (const { destination, tombstone } of expired) {
+    fs.renameSync(destination, tombstone);
+  }
+  if (existingTombstones.length > 0 || expired.length > 0) renderIndex();
+
+  const tombstones = retentionTombstones();
+  const cleanup = tombstones.slice(0, reportRetentionBatch);
+  for (const tombstone of cleanup) fs.rmSync(tombstone, { recursive: true, force: true });
+  return { pruned: cleanup.length, pending: tombstones.length > cleanup.length };
 }
 
 function renderIndex() {

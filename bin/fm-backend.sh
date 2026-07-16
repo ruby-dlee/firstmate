@@ -883,25 +883,19 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         || { printf 'unknown'; return 0; }
       if [ -n "$expected_label" ]; then
         expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
-        if [ "$workspace_record" != null ]; then
-          title=$(printf '%s\n' "$workspace_record" | jq -r '.title' 2>/dev/null) \
-            || { printf 'unknown'; return 0; }
-          [ "$title" = "$expected_title" ] || { printf 'unknown'; return 0; }
-        else
-          title_count=$(printf '%s\n' "$workspaces" | jq -r --arg want "$expected_title" \
-            '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) \
-            || { printf 'unknown'; return 0; }
-          case "$title_count" in
-            0) printf 'absent'; return 0 ;;
-            1) ;;
-            *) printf 'unknown'; return 0 ;;
-          esac
-          title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
-            '[.workspaces[] | select(.title == $want)] | first' 2>/dev/null) \
-            || { printf 'unknown'; return 0; }
-          resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
-            || { printf 'unknown'; return 0; }
-        fi
+        title_count=$(printf '%s\n' "$workspaces" | jq -r --arg want "$expected_title" \
+          '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+        case "$title_count" in
+          0) printf 'absent'; return 0 ;;
+          1) ;;
+          *) printf 'unknown'; return 0 ;;
+        esac
+        title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
+          '[.workspaces[] | select(.title == $want)] | first' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+        resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
       elif [ "$workspace_record" = null ]; then
         printf 'absent'
         return 0

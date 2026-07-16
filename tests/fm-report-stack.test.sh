@@ -826,6 +826,29 @@ EOF
   pass "report parsing ignores headings and summaries inside list-container fences"
 }
 
+test_list_lazy_continuations_do_not_satisfy_required_sections() {
+  local id=report-list-lazy-b3k source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- list paragraph
+ ## Summary
+ ## What changed
+ ## Verification
+ ## Visual evidence
+ ## Artifacts
+ ## Follow-ups
+EOF
+  if out=$(run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "lazy list-continuation headings unexpectedly satisfied the report contract"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "lazy list-continuation failure omitted missing heading $heading"
+  done
+  pass "report parsing excludes headings in lazy list continuations"
+}
+
 test_container_scopes_preserve_commonmark_blank_and_exit_rules() {
   local valid=report-container-exit-b3n invalid=report-list-blank-b3o source out status heading
   write_task "$valid" ship
@@ -1262,7 +1285,7 @@ test_retention_batches_make_interruption_safe_progress() {
 }
 
 test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
-  local id=report-retention-owner-k2m entry manifest temp owner pid
+  local id=report-retention-owner-k2m entry manifest temp fakebin install_root agents heartbeat out status
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Persistent-owner expiry."
   run_stack publish "$id" >/dev/null || fail "persistent retention owner precondition failed"
@@ -1278,21 +1301,69 @@ test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
     fs.writeFileSync(process.argv[2], `${JSON.stringify(value, null, 2)}\n`);
   ' "$manifest" "$temp"
   mv "$temp" "$manifest"
-  FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
-    "$ROOT/bin/fm-report-retention.sh" ensure || fail "persistent retention owner did not start"
-  owner="$STACK/.retention-owner/owner"
-  for _ in $(seq 1 80); do
-    [ ! -d "$(dirname "$entry")" ] && break
-    sleep 0.05
-  done
-  assert_absent "$(dirname "$entry")" "persistent owner did not enforce retention without active tasks"
-  pid=$(sed -n '1p' "$owner" 2>/dev/null || true)
-  case "$pid" in ''|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
-  for _ in $(seq 1 40); do
-    [ ! -e "$STACK/.retention-owner" ] && break
-    sleep 0.05
-  done
-  pass "machine-global retention ownership is persistent and task-independent"
+  fakebin="$TMP_ROOT/retention-launchctl"; install_root="$TMP_ROOT/retention-install"; agents="$TMP_ROOT/LaunchAgents"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    "$ROOT/bin/fm-bootstrap.sh" install report-retention >/dev/null \
+    || fail "retention LaunchAgent installation through bootstrap failed"
+  FM_GATE_REFUSE_BYPASS=1 FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    "$install_root/bin/fm-report-retention.sh" run-once || fail "installed retention owner failed to prune"
+  assert_absent "$(dirname "$entry")" "installed retention owner did not enforce retention"
+  heartbeat="$STACK/.retention-heartbeat"
+  assert_present "$heartbeat" "installed retention owner did not record a successful-prune heartbeat"
+  FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure || fail "healthy installed retention owner was rejected"
+  temp="$heartbeat.tmp"
+  { printf '1\n'; sed -n '2p' "$heartbeat"; } > "$temp"
+  mv "$temp" "$heartbeat"
+  if out=$(FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "stale successful-prune heartbeat was accepted"
+  assert_contains "$out" "heartbeat is stale" "stale retention heartbeat refusal was unclear"
+  assert_grep 'bootstrap' "$TMP_ROOT/launchctl.log" "retention install did not bootstrap its LaunchAgent"
+  assert_grep 'kickstart' "$TMP_ROOT/launchctl.log" "retention install did not start its LaunchAgent"
+  pass "restart-capable retention installation is stable, task-independent, and health-checked"
+}
+
+test_report_destination_roots_remain_pinned_during_ancestor_swap() {
+  local id=report-destination-race-k2n ready proceed output moved outside pid status
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Pinned destination roots."
+  ready="$TMP_ROOT/report-destination.ready"; proceed="$TMP_ROOT/report-destination.proceed"
+  output="$TMP_ROOT/report-destination.out"; moved="$TMP_ROOT/stack-original"; outside="$TMP_ROOT/stack-outside"
+  mkdir -p "$STACK" "$outside"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_STACK_DESTINATION_TEST_READY="$ready" FM_REPORT_STACK_DESTINATION_TEST_PROCEED="$proceed" \
+    "$SCRIPT" publish "$id" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "report destination race gate did not open"; }
+  mv "$STACK" "$moved"
+  ln -s "$outside" "$STACK"
+  touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -eq 0 ] || fail "pinned report publication failed after ancestor swap: $(cat "$output")"
+  assert_grep 'Pinned destination roots.' "$(find "$moved/entries" -name report.md -print -quit)" \
+    "report publication left the originally pinned destination"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "report publication was redirected through the swapped stack path"
+  rm "$STACK"
+  mv "$moved" "$STACK"
+  pass "report stack serializes and publishes through pinned destination roots"
 }
 
 test_index_failure_restores_previous_generation() {
@@ -1638,6 +1709,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
+  test_list_lazy_continuations_do_not_satisfy_required_sections
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_report_destination_roots_remain_pinned_during_ancestor_swap
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1670,6 +1748,7 @@ test_required_headings_follow_commonmark_atx_rules
 test_invalid_backtick_info_string_does_not_open_fence
 test_summary_extraction_uses_validated_markdown_structure
 test_list_container_fences_hide_report_headings_and_summaries
+test_list_lazy_continuations_do_not_satisfy_required_sections
 test_container_scopes_preserve_commonmark_blank_and_exit_rules
 test_large_non_utf8_text_artifacts_are_stored_verbatim
 test_large_visual_inventory_does_not_share_text_buffer_headroom
@@ -1689,6 +1768,7 @@ test_retention_binds_manifests_to_entry_directories
 test_watcher_periodically_owns_idle_report_retention
 test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
+test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

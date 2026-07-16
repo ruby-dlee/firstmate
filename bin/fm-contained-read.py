@@ -378,6 +378,98 @@ def command_snapshot_files_fd(arguments):
             os.close(descriptor)
 
 
+def remove_directory_contents(descriptor):
+    for entry in os.scandir(descriptor):
+        before = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(before.st_mode):
+            child = os.open(
+                entry.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                opened = os.fstat(child)
+                if opened.st_dev != before.st_dev or opened.st_ino != before.st_ino:
+                    fail(f"directory changed while removing {entry.name}")
+                remove_directory_contents(child)
+                current = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+                if current.st_dev != opened.st_dev or current.st_ino != opened.st_ino:
+                    fail(f"directory changed while removing {entry.name}")
+                os.rmdir(entry.name, dir_fd=descriptor)
+            finally:
+                os.close(child)
+        else:
+            os.unlink(entry.name, dir_fd=descriptor)
+
+
+def command_replace_file_fd(arguments):
+    if len(arguments) != 2:
+        fail("usage: fm-contained-read.py replace-file-fd <source-name> <destination-name>")
+    source_name, destination_name = arguments
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("replacement names must be single safe components")
+    source_root = checked_root(3)
+    destination_root = checked_root(4)
+    source = os.stat(source_name, dir_fd=source_root, follow_symlinks=False)
+    if not stat.S_ISREG(source.st_mode):
+        fail("replacement source is not a real regular file")
+    try:
+        destination = os.stat(destination_name, dir_fd=destination_root, follow_symlinks=False)
+        if not stat.S_ISREG(destination.st_mode):
+            fail("replacement destination is not a real regular file")
+    except FileNotFoundError:
+        pass
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=source_root,
+        dst_dir_fd=destination_root,
+    )
+
+
+def command_remove_owned_directory_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py remove-owned-directory-fd <directory-name> <control-name> <token>")
+    directory_name, control_name, token = arguments
+    if len(components(directory_name)) != 1 or len(components(control_name)) != 1:
+        fail("owned directory names must be single safe components")
+    root = checked_root(3)
+    before = os.stat(directory_name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        fail("owned path is not a real directory")
+    directory = os.open(
+        directory_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=root,
+    )
+    try:
+        opened = os.fstat(directory)
+        if opened.st_dev != before.st_dev or opened.st_ino != before.st_ino:
+            fail("owned directory changed while opening")
+        control = read_relative(directory, control_name, 4096, "strict")
+        if control["oversized"]:
+            fail("owned directory control file is too large")
+        raw = control["content"].decode("utf-8").strip()
+        try:
+            owner_token = json.loads(raw).get("token", "")
+        except json.JSONDecodeError:
+            owner_token = raw.splitlines()[-1] if raw else ""
+        if owner_token != token:
+            fail("owned directory token changed")
+        current = os.stat(directory_name, dir_fd=root, follow_symlinks=False)
+        if current.st_dev != opened.st_dev or current.st_ino != opened.st_ino:
+            fail("owned directory changed before removal")
+        quarantine = f".{directory_name}.released.{os.getpid()}.{token}"
+        os.rename(directory_name, quarantine, src_dir_fd=root, dst_dir_fd=root)
+        quarantined = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        if quarantined.st_dev != opened.st_dev or quarantined.st_ino != opened.st_ino:
+            fail("owned directory changed during removal")
+        remove_directory_contents(directory)
+        os.rmdir(quarantine, dir_fd=root)
+    finally:
+        os.close(directory)
+
+
 def main():
     if len(sys.argv) < 2:
         fail("contained read command is required")
@@ -389,6 +481,10 @@ def main():
         command_snapshot_files_fd(sys.argv[2:])
     elif sys.argv[1] == "snapshot-file-fd":
         command_snapshot_file_fd(sys.argv[2:])
+    elif sys.argv[1] == "replace-file-fd":
+        command_replace_file_fd(sys.argv[2:])
+    elif sys.argv[1] == "remove-owned-directory-fd":
+        command_remove_owned_directory_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

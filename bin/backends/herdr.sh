@@ -674,14 +674,8 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$FM_BACKEND_HERDR_PANE" \
     '[.result.panes[] | select(.pane_id == $pane)] | first // null' 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if [ "$pane_record" = null ]; then
-    printf 'absent'
-    return 0
-  fi
-  tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id' 2>/dev/null) \
-    || { printf 'unknown'; return 0; }
   if [ -z "$expected" ]; then
-    printf 'match'
+    if [ "$pane_record" = null ]; then printf 'absent'; else printf 'match'; fi
     return 0
   fi
   workspaces=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" workspace list 2>/dev/null) \
@@ -719,6 +713,23 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     printf 'unknown'
     return 0
   fi
+  if [ "$pane_record" = null ]; then
+    if printf '%s\n' "$tabs" | jq -e \
+      --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \
+      --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+      --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+      'any(.result.tabs[]?;
+        ($recorded_tab == "" or (.tab_id | tostring) == $recorded_tab)
+        and (.workspace_id | tostring) == $workspace
+        and .label == $want_label)' >/dev/null 2>&1; then
+      printf 'unknown'
+    else
+      printf 'absent'
+    fi
+    return 0
+  fi
+  tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
   if printf '%s\n' "$tabs" | jq -e \
     --arg tab "$tab_id" \
     --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \

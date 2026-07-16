@@ -92,6 +92,7 @@ function markdownStructure(markdown) {
   let fence;
   let htmlBlock;
   let paragraphOpen = false;
+  let lazyList;
   for (const line of String(markdown).split(/\r?\n/)) {
     let consumed = false;
     while (!consumed) {
@@ -127,6 +128,8 @@ function markdownStructure(markdown) {
       }
 
       const candidate = containerCandidate(line);
+      const lazyListContinuation = candidate.containers.length === 0 && lazyList
+        && paragraphOpen && initialIndent(line) > 0 && !/^[ \t]*$/.test(line);
       const marker = fenceMarker(candidate.text);
       if (marker) {
         fence = {
@@ -149,8 +152,13 @@ function markdownStructure(markdown) {
         continue;
       }
       const parsedHeading = candidate.containers.length === 0 ? heading(line) : undefined;
-      visible.push({ line, heading: parsedHeading });
-      paragraphOpen = candidate.containers.length === 0 && !(/^[ \t]*$/.test(line) || parsedHeading);
+      visible.push({ line, heading: lazyListContinuation ? undefined : parsedHeading });
+      if (candidate.containers.some(({ type }) => type === "list")) {
+        lazyList = candidate.containers.filter(({ type }) => type === "list");
+      } else if (!lazyListContinuation) {
+        lazyList = undefined;
+      }
+      paragraphOpen = !(/^[ \t]*$/.test(candidate.text) || heading(candidate.text));
       consumed = true;
     }
   }

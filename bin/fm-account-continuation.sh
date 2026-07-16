@@ -55,6 +55,14 @@ esac
 fm_account_valid_id "$ID" || { echo "error: invalid task id '$ID'" >&2; exit 1; }
 fm_account_valid_id "$ATTEMPT" || { echo "error: invalid account attempt '$ATTEMPT'" >&2; exit 1; }
 
+task_dir_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 CONTAINED_READ="$SCRIPT_DIR/fm-contained-read.cjs"
 META_SOURCE="$STATE/$ID.meta"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe continuation state directory at $STATE" >&2; exit 1; }
@@ -96,6 +104,8 @@ WORKTREE=$(fm_meta_get "$META" worktree)
 PROJECT=$(fm_meta_get "$META" project)
 [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ] || { echo "error: recorded continuation worktree/home is unavailable for $ID" >&2; exit 1; }
 WORKTREE_REAL=$(cd "$WORKTREE" && pwd -P)
+WORKTREE_ID=$(task_dir_identity "$WORKTREE_REAL") \
+  || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null) || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP_REAL=$(cd "$TOP" && pwd -P)
 [ "$TOP_REAL" = "$WORKTREE_REAL" ] || { echo "error: continuation path is not the recorded worktree root for $ID" >&2; exit 1; }
@@ -106,13 +116,6 @@ BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 TASK_DIR_PATH=$TASK_DIR
-task_dir_identity() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f '%d:%i' "$1" 2>/dev/null
-  else
-    stat -c '%d:%i' "$1" 2>/dev/null
-  fi
-}
 TASK_DIR_ID=$(task_dir_identity "$TASK_DIR_PATH") \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 cd "$TASK_DIR_PATH" || { echo "error: continuation task directory is unavailable for $ID" >&2; exit 1; }
@@ -366,6 +369,24 @@ append_task_snapshot "Provider transcript summary" 13
 append_task_snapshot "Account attempt lineage" 14
 
 packet_check_budget
+if [ -n "${FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY:-}" ] \
+  && [ -n "${FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED:-}" ]; then
+  : > "$FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY"
+  while [ ! -e "$FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED" ]; do sleep 0.01; done
+fi
+CURRENT_WORKTREE_REAL=$(cd "$WORKTREE" && pwd -P 2>/dev/null || true)
+CURRENT_WORKTREE_ID=$(task_dir_identity "$WORKTREE_REAL" 2>/dev/null || true)
+CURRENT_TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null || true)
+CURRENT_TOP_REAL=$([ -n "$CURRENT_TOP" ] && cd "$CURRENT_TOP" && pwd -P || true)
+CURRENT_HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null || true)
+CURRENT_BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null || true)
+[ -n "$CURRENT_BRANCH" ] || CURRENT_BRANCH=detached
+[ "$CURRENT_WORKTREE_REAL" = "$WORKTREE_REAL" ] \
+  && [ "$CURRENT_WORKTREE_ID" = "$WORKTREE_ID" ] \
+  && [ "$CURRENT_TOP_REAL" = "$WORKTREE_REAL" ] \
+  && [ "$CURRENT_HEAD" = "$HEAD" ] \
+  && [ "$CURRENT_BRANCH" = "$BRANCH" ] \
+  || { echo "error: continuation repository snapshot changed for $ID" >&2; exit 1; }
 if [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY:-}" ] \
   && [ -n "${FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_PROCEED:-}" ]; then
   : > "$FM_ACCOUNT_CONTINUATION_DESTINATION_TEST_READY"

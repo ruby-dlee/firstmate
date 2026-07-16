@@ -33,8 +33,11 @@ const fmRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fmHome = path.resolve(process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || fmRoot);
 const stateDir = path.resolve(process.env.FM_STATE_OVERRIDE || path.join(fmHome, "state"));
 const dataDir = path.resolve(process.env.FM_DATA_OVERRIDE || path.join(fmHome, "data"));
-const stackRoot = path.resolve(process.env.FM_REPORT_STACK_ROOT || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "firstmate", "report-stack"));
-const entriesDir = path.join(stackRoot, "entries");
+const configuredStackRoot = path.resolve(process.env.FM_REPORT_STACK_ROOT || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "firstmate", "report-stack"));
+let stackRoot = configuredStackRoot;
+let entriesDir = path.join(stackRoot, "entries");
+let stackRootDescriptor;
+let entriesDescriptor;
 const requiredSections = ["Summary", "What changed", "Verification", "Visual evidence", "Artifacts", "Follow-ups"];
 const informationalTrailLimit = 4 * 1024 * 1024;
 const completionReportLimit = 16 * 1024 * 1024;
@@ -235,6 +238,13 @@ function inspectPinnedDirectory(directory) {
   return directory.real;
 }
 
+function sameDirectoryIdentity(descriptor, directory = ".") {
+  const opened = fs.fstatSync(descriptor);
+  const current = fs.statSync(directory);
+  return opened.isDirectory() && current.isDirectory()
+    && opened.dev === current.dev && opened.ino === current.ino;
+}
+
 function framedItems(buffer) {
   const newline = buffer.indexOf(10);
   if (newline < 0) throw new Error("contained reader returned an invalid response");
@@ -406,14 +416,22 @@ function indexPage(rows) {
 }
 
 function acquireLock() {
-  fs.mkdirSync(stackRoot, { recursive: true, mode: 0o700 });
-  const stackReal = realDirectory(stackRoot, undefined, "report stack root");
+  fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
+  const pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
+  process.chdir(configuredStackRoot);
+  if (!sameDirectoryIdentity(pinnedStackRoot.descriptor)) {
+    fs.closeSync(pinnedStackRoot.descriptor);
+    throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
+  }
+  stackRootDescriptor = pinnedStackRoot.descriptor;
+  stackRoot = ".";
+  entriesDir = "entries";
   try {
     fs.mkdirSync(entriesDir, { mode: 0o700 });
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
   }
-  realDirectory(entriesDir, stackReal, "report entries directory");
+  const pinnedEntries = pinnedDirectory(entriesDir, pinnedStackRoot.real, "report entries directory");
   const lock = path.join(stackRoot, ".publish.lock");
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const token = crypto.randomUUID();
@@ -435,10 +453,28 @@ function acquireLock() {
         fs.rmSync(candidate, { recursive: true, force: true });
         throw error;
       }
+      process.chdir(entriesDir);
+      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
+        fs.closeSync(pinnedEntries.descriptor);
+        throw new Error("report entries directory changed while entering it");
+      }
+      entriesDir = ".";
+      entriesDescriptor = pinnedEntries.descriptor;
+      if (process.env.FM_REPORT_STACK_DESTINATION_TEST_READY && process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED) {
+        fs.writeFileSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_READY, "ready\n", { flag: "wx" });
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED)) {
+          if (Date.now() >= deadline) throw new Error("report destination test gate timed out");
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+      }
       return () => {
         try {
-          const owner = JSON.parse(readLockControl(path.join(lock, "owner"), "report lock owner"));
-          if (owner.token === token) fs.rmSync(lock, { recursive: true, force: true });
+          runContainedHelper(
+            ["remove-owned-directory-fd", ".publish.lock", "owner", token],
+            [stackRootDescriptor],
+            1024 * 1024,
+          );
         } catch {}
       };
     } catch (error) {
@@ -810,12 +846,15 @@ function pruneExpiredEntries() {
 }
 
 function renderIndex() {
-  const temp = path.join(stackRoot, `.index.html.${crypto.randomUUID()}.tmp`);
-  const destination = path.join(stackRoot, "index.html");
+  const tempName = `.index.html.${crypto.randomUUID()}.tmp`;
+  const temp = path.join(entriesDir, tempName);
   try {
     fs.writeFileSync(temp, indexPage(readManifests()), { flag: "wx", mode: 0o600 });
-    assertSafeFileDestination(destination, "report index destination");
-    fs.renameSync(temp, destination);
+    runContainedHelper(
+      ["replace-file-fd", tempName, "index.html"],
+      [entriesDescriptor, stackRootDescriptor],
+      1024 * 1024,
+    );
   } finally {
     fs.rmSync(temp, { force: true });
   }
@@ -929,7 +968,7 @@ function publish(taskId, legacy) {
       fs.rmSync(transaction, { force: true });
       transaction = undefined;
       fs.rmSync(previous, { recursive: true, force: true });
-      console.log(`published ${taskId} ${path.join(destination, "report.html")}`);
+      console.log(`published ${taskId} ${path.join(configuredStackRoot, "entries", id, "report.html")}`);
     } catch (error) {
       if (transaction && fs.existsSync(transaction)) {
         try {
@@ -949,16 +988,16 @@ function publish(taskId, legacy) {
 }
 
 function resolveReportPath(taskId) {
-  if (!taskId) return path.join(stackRoot, "index.html");
+  if (!taskId) return path.join(configuredStackRoot, "index.html");
   const rows = readManifests();
   const exact = rows.find((row) => row.reportId === taskId);
-  if (exact) return path.join(entriesDir, exact.reportId, "report.html");
+  if (exact) return path.join(configuredStackRoot, "entries", exact.reportId, "report.html");
   const matches = rows.filter((row) => row.taskId === taskId);
   if (matches.length === 0) throw new Error(`no report found for ${taskId}`);
   if (matches.length > 1) {
     throw new Error(`task id ${taskId} is ambiguous; use one of these report ids: ${matches.map((row) => row.reportId).join(", ")}`);
   }
-  return path.join(entriesDir, matches[0].reportId, "report.html");
+  return path.join(configuredStackRoot, "entries", matches[0].reportId, "report.html");
 }
 
 refuseIfGateAgent();
@@ -968,7 +1007,7 @@ try {
     withLock(() => publish(args.find((arg) => !arg.startsWith("--")), args.includes("--legacy")));
   } else if (command === "render") {
     withLock(renderIndex);
-    console.log(path.join(stackRoot, "index.html"));
+    console.log(path.join(configuredStackRoot, "index.html"));
   } else if (command === "list") {
     const rows = withLock(readManifests);
     if (args.includes("--json")) console.log(JSON.stringify(rows, null, 2));

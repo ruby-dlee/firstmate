@@ -1149,6 +1149,28 @@ test_target_state_refuses_duplicate_recovery_titles() {
   pass "cmux target recovery refuses ambiguous workspace titles"
 }
 
+test_target_state_refuses_duplicate_title_when_recorded_workspace_remains() {
+  local dir fb out title target
+  dir="$TMP_ROOT/target-state-recorded-duplicate-title"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-duplicate-recorded)
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-duplicate-recorded
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "recorded cmux workspace bypassed duplicate-title refusal (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] || fail "duplicate recorded title inspected an arbitrary workspace"
+  pass "cmux target recovery refuses duplicate titles even when the recorded workspace remains"
+}
+
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
 test_secondmate_spawn_refuses_cmux_backend() {
@@ -1168,6 +1190,12 @@ test_secondmate_spawn_refuses_cmux_backend() {
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
   test_target_state_refuses_duplicate_recovery_titles
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
+  test_target_state_refuses_duplicate_recovery_titles
+  test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
   exit 0
 fi
 
@@ -1232,4 +1260,5 @@ test_list_live_filters_by_title_prefix
 test_target_state_finds_workspace_outside_current_window
 test_target_state_distinguishes_absent_from_malformed_workspaces
 test_target_state_refuses_duplicate_recovery_titles
+test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
 test_secondmate_spawn_refuses_cmux_backend

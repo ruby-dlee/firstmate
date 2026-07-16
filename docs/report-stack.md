@@ -4,7 +4,9 @@ Firstmate publishes one durable report for every task created after the report-s
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation performs one bounded retention batch.
-Session-start bootstrap ensures one detached machine-global `fm-report-retention.sh` owner independent of active tasks, and that owner repeats every five minutes by default.
+Report retention is enforced by a per-user macOS LaunchAgent installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
+The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, retries failed runs, and records a successful-prune heartbeat that session bootstrap validates.
+Merging the code does not install or activate the owner.
 The stack begins pruning two owner intervals before a report reaches 30 days, so the bounded cadence cannot carry an entry beyond the ceiling.
 Expired entries are renamed to deletion tombstones before the index changes, and interrupted recursive deletion resumes from those tombstones without restoring partial entries.
 

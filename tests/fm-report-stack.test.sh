@@ -318,6 +318,43 @@ test_retention_cohort_never_precedes_exact_expiry() {
   pass "report retention cohorts never expire reports before the published cutoff"
 }
 
+test_retention_guard_cannot_advance_minimum_age() {
+  local stack="$TMP_ROOT/retention-minimum-age-stack" before after completed deadline cohort cutoff
+  local retention_ms=2592000000 id legacy_id
+  id=minimum-age-cohort
+  legacy_id=minimum-age-legacy
+  mkdir -p "$stack/entries"
+  before=$(node -e 'process.stdout.write(String(Date.now()))')
+  completed=$(node -e 'process.stdout.write(new Date(Number(process.argv[1]) - 30 * 24 * 60 * 60 * 1000 + 60000).toISOString())' "$before")
+  deadline=$(node -e 'process.stdout.write(String(Math.ceil((Date.parse(process.argv[1]) + 30 * 24 * 60 * 60 * 1000) / 300000) * 300000))' "$completed")
+  cohort="cohort-$deadline"
+  mkdir -p "$stack/entries/$cohort/$id" "$stack/entries/$legacy_id"
+  printf '{"schemaVersion":1,"reportId":"%s","taskId":"%s","title":"Minimum age","summary":"Minimum age","completedAt":"%s","retentionCohort":"%s","kind":"ship","project":"example","harness":"codex"}\n' \
+    "$id" "$id" "$completed" "$cohort" > "$stack/entries/$cohort/$id/manifest.json"
+  printf '{"schemaVersion":1,"reportId":"%s","taskId":"%s","title":"Legacy minimum age","summary":"Legacy minimum age","completedAt":"%s","kind":"ship","project":"example","harness":"codex"}\n' \
+    "$legacy_id" "$legacy_id" "$completed" > "$stack/entries/$legacy_id/manifest.json"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_GUARD_MS=600000 \
+    FM_REPORT_RETENTION_INTERVAL=300 FM_REPORT_RETENTION_NODE="$(command -v node)" \
+    "$ROOT/bin/fm-report-retention.sh" run-once >/dev/null \
+    || fail "retention owner rejected reports inside the minimum age"
+  after=$(node -e 'process.stdout.write(String(Date.now()))')
+  cutoff=$(node -e '
+const source = require("fs").readFileSync(process.argv[1], "utf8");
+process.stdout.write(String(JSON.parse(source.match(/=(\{.*\});/)[1]).cutoffMs));
+' "$stack/.retention-policy.js")
+
+  [ "$cutoff" -ge $((before - retention_ms)) ] \
+    || fail "retention visibility cutoff preceded the exact 30-day boundary"
+  [ "$cutoff" -le $((after - retention_ms)) ] \
+    || fail "retention visibility cutoff advanced past the exact 30-day boundary"
+  assert_present "$stack/entries/$cohort/$id/manifest.json" \
+    "cohort cleanup retired a report before its 30-day minimum age"
+  assert_present "$stack/entries/$cohort/$legacy_id/manifest.json" \
+    "legacy migration retired a report before its 30-day minimum age"
+  pass "retention guard cannot advance visibility or cleanup before 30 days"
+}
+
 test_republish_new_generation_refreshes_completion_time() {
   local id=report-generation-a4 repo meta entry manifest staged
   repo="$TMP_ROOT/generation-worktree"
@@ -3129,6 +3166,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
   test_owned_tree_cleanup_quarantines_before_deletion
   test_interrupted_owned_tree_cleanup_enters_retention_recovery
   test_retention_cohort_never_precedes_exact_expiry
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-minimum-age ]; then
+  test_retention_guard_cannot_advance_minimum_age
   exit 0
 fi
 

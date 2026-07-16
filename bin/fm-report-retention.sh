@@ -349,13 +349,12 @@ install_lock_release() {
 }
 
 run_once() {
-  local output pending guard_ms provenance_value node_runtime
+  local output pending provenance_value node_runtime
   provenance_value=$(provenance "$SCRIPT_DIR") || { echo "error: retention owner bundle is incomplete" >&2; return 1; }
   node_runtime=$(resolve_runtime "${FM_REPORT_RETENTION_NODE:-}" node) \
     || { echo "error: report-retention Node runtime is unavailable" >&2; return 1; }
-  guard_ms=$((INTERVAL * 2000))
   while :; do
-    if output=$(FM_REPORT_RETENTION_GUARD_MS="$guard_ms" "$node_runtime" "$SCRIPT_DIR/fm-report-stack.mjs" prune --status 2>&1); then
+    if output=$("$node_runtime" "$SCRIPT_DIR/fm-report-stack.mjs" prune --status 2>&1); then
       rm -f "$ERROR_FILE"
       write_heartbeat "$provenance_value" || return 1
       case "$output" in *'"pending":true'*) pending=1 ;; *) pending=0 ;; esac

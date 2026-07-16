@@ -51,7 +51,6 @@ const visualDepthLimit = 24;
 const visualBytesLimit = 20 * 1024 * 1024;
 const visualInventoryLimit = visualEntryLimit * visualDepthLimit * 255 * 6 + visualEntryLimit * 32 + 1024;
 const reportRetentionMs = 30 * 24 * 60 * 60 * 1000;
-const reportRetentionGuardMs = Number.parseInt(process.env.FM_REPORT_RETENTION_GUARD_MS || String(5 * 60 * 1000), 10);
 const reportRetentionBatch = Number.parseInt(process.env.FM_REPORT_RETENTION_BATCH || "4", 10);
 const reportRetentionCohortMs = Number.parseInt(process.env.FM_REPORT_RETENTION_COHORT_MS || String(5 * 60 * 1000), 10);
 const retentionPolicyName = ".retention-policy.js";
@@ -872,7 +871,7 @@ function recoverLegacyCutover() {
     let copied = 0;
     let pending = false;
     let preparedStale = false;
-    const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
+    const cutoff = Date.now() - reportRetentionMs;
     const activeRoot = currentEntriesRoot();
     for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) {
@@ -881,7 +880,7 @@ function recoverLegacyCutover() {
       }
       const cohortDeadline = retentionCohortDeadline(entry.name);
       if (Number.isFinite(cohortDeadline)) {
-        if (cohortDeadline <= Date.now() + reportRetentionGuardMs) {
+        if (cohortDeadline <= Date.now()) {
           if (fs.existsSync(path.join(preparedPath, entry.name))) preparedStale = true;
           const observed = fs.statSync(entry.name, { bigint: true });
           moveEntryCohortToPrivate(entry.name, `${observed.dev}:${observed.ino}`);
@@ -1113,9 +1112,6 @@ function recoverPreviousEntries() {
 }
 
 function nextRetentionPolicy() {
-  if (!Number.isSafeInteger(reportRetentionGuardMs) || reportRetentionGuardMs < 0 || reportRetentionGuardMs >= reportRetentionMs) {
-    throw new Error("FM_REPORT_RETENTION_GUARD_MS must be a non-negative integer below 30 days");
-  }
   if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
   }
@@ -1123,11 +1119,10 @@ function nextRetentionPolicy() {
     || reportRetentionCohortMs > reportRetentionMs) {
     throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer no greater than 30 days");
   }
-  const currentPolicy = readRetentionPolicy();
   const policy = {
     schemaVersion: 1,
     generation: crypto.randomUUID(),
-    cutoffMs: Math.max(currentPolicy.cutoffMs, Date.now() - reportRetentionMs + reportRetentionGuardMs),
+    cutoffMs: Date.now() - reportRetentionMs,
   };
   return policy;
 }
@@ -1236,7 +1231,7 @@ function recoverRetentionCutover() {
 function expireDueCohorts(policy) {
   recoverRetentionCutover();
   if (readStackControl(legacyCutoverName) !== undefined) return;
-  const dueBefore = Date.now() + reportRetentionGuardMs;
+  const dueBefore = Date.now();
   const entries = fs.readdirSync(entriesDir, { withFileTypes: true });
   const hasDue = entries.some((entry) => entry.isDirectory()
     && Number.isFinite(retentionCohortDeadline(entry.name))

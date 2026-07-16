@@ -31,11 +31,26 @@ if [ ! -f "$META" ]; then
 fi
 LOOKUP_WT=$(fm_account_meta_value "$META" worktree)
 LOOKUP_GENERATION=$(fm_account_meta_value "$META" generation_id)
-[ -n "$LOOKUP_GENERATION" ] || {
-  fm_account_meta_lock_release "$META_LOCK"
-  echo "error: task metadata has no generation_id for $ID" >&2
-  exit 1
-}
+if [ -z "$LOOKUP_GENERATION" ]; then
+  LEGACY_ATTEMPT=$(fm_account_attempt_id "$FM_HOME" "$ID") || {
+    fm_account_meta_lock_release "$META_LOCK"
+    exit 1
+  }
+  LOOKUP_GENERATION="legacy:$LEGACY_ATTEMPT"
+  META_TMP=$(mktemp "$STATE/.$ID.meta.generation.XXXXXX") || {
+    fm_account_meta_lock_release "$META_LOCK"
+    exit 1
+  }
+  if ! awk '{ print }' "$META" > "$META_TMP" \
+    || ! printf 'generation_id=%s\n' "$LOOKUP_GENERATION" >> "$META_TMP" \
+    || ! fm_account_safe_file_destination "$META" \
+    || ! mv "$META_TMP" "$META"; then
+    rm -f "$META_TMP"
+    fm_account_meta_lock_release "$META_LOCK"
+    echo "error: could not backfill legacy task generation for $ID" >&2
+    exit 1
+  fi
+fi
 fm_account_meta_lock_release "$META_LOCK"
 if [ -n "$LOOKUP_WT" ] && [ -d "$LOOKUP_WT" ]; then
   if command -v gh >/dev/null 2>&1; then

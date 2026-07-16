@@ -919,6 +919,85 @@ SH
   pass "fm-pr-check binds slow lookup results to the original task generation"
 }
 
+test_pr_check_backfills_legacy_generation_and_records_state() {
+  local case_dir state meta url head staged count
+  case_dir=$(make_case pr-check-legacy-generation-success)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.legacy"
+  write_meta "$case_dir" no-mistakes ship
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' '$head'
+SH
+  chmod +x "$case_dir/fakebin/gh"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" >/dev/null \
+    || fail "PR check rejected legacy task metadata without a generation identity"
+  grep -Eq '^generation_id=legacy:a[0-9a-f]{15}$' "$meta" \
+    || fail "successful PR check did not backfill a legacy generation identity"
+  count=$(grep -c '^generation_id=' "$meta" || true)
+  expect_code 1 "$count" "successful legacy PR generation backfill count"
+  assert_grep "pr=$url" "$meta" "successful legacy PR check did not record the PR URL"
+  assert_grep "pr_head=$head" "$meta" "successful legacy PR check did not record the PR head"
+  assert_present "$state/task-x1.check.sh" "successful legacy PR check did not arm the merge poll"
+  pass "fm-pr-check upgrades legacy task metadata without breaking PR handling"
+}
+
+test_pr_check_backfills_legacy_generation_before_race_check() {
+  local case_dir state meta lookup_ready lookup_release pr_check rc url head staged count
+  case_dir=$(make_case pr-check-legacy-generation-race)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  lookup_ready="$case_dir/lookup-ready"; lookup_release="$case_dir/lookup-release"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.reused"
+  write_meta "$case_dir" no-mistakes ship
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  for _ in $(seq 1 100); do [ -e "$lookup_ready" ] && break; sleep 0.02; done
+  [ -e "$lookup_ready" ] || { kill -TERM "$pr_check" 2>/dev/null || true; fail "legacy PR generation lookup gate did not open"; }
+  grep -Eq '^generation_id=legacy:a[0-9a-f]{15}$' "$meta" \
+    || fail "PR check did not atomically backfill a legacy generation identity"
+  count=$(grep -c '^generation_id=' "$meta" || true)
+  expect_code 1 "$count" "legacy PR generation backfill count"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    sed "s/^generation_id=.*/generation_id=generation-task-x1-reused/" "$2/task-x1.meta" > "$3"
+    mv "$3" "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$staged" || fail "legacy PR generation-race setup could not replace metadata"
+  touch "$lookup_release"
+  set +e
+  wait "$pr_check"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "legacy PR lookup attached stale results to a reused task generation"
+  assert_grep 'task generation changed' "$case_dir/pr-check.err" \
+    "legacy PR generation mismatch failed without an actionable refusal"
+  assert_grep 'generation_id=generation-task-x1-reused' "$meta" \
+    "legacy PR generation refusal overwrote replacement task metadata"
+  assert_no_grep 'pr=' "$meta" "legacy PR generation refusal attached an old PR to the replacement task"
+  assert_absent "$state/task-x1.check.sh" "legacy PR generation refusal armed an orphaned merge poll"
+  pass "fm-pr-check backfills legacy identity before generation race checks"
+}
+
 test_content_in_default_fallback_allows() {
   local case_dir rc
   case_dir=$(make_case content-landed)
@@ -2043,6 +2122,12 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-35-pr ]; then
   test_pr_check_serializes_with_account_session_updates
   test_pr_check_rejects_reused_task_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = legacy-pr-generation ]; then
+  test_pr_check_backfills_legacy_generation_and_records_state
+  test_pr_check_backfills_legacy_generation_before_race_check
   exit 0
 fi
 

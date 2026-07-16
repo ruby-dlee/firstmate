@@ -157,14 +157,14 @@ if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$
   REPORT_GATED=1
 fi
 
-managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
-  local backend=$1 target=$2 expected=$3 probe_home=${4:-} attempt state last=unknown
+managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]
+  local backend=$1 target=$2 expected=$3 probe_home=${4:-} recorded_scoped_target=${5:-} attempt state last=unknown
   [ -n "$target" ] || return 2
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
-      state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_state "$backend" "$target" "$expected" 2>/dev/null)
+      state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_state "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
     else
-      state=$(fm_backend_target_state "$backend" "$target" "$expected" 2>/dev/null)
+      state=$(fm_backend_target_state "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
     fi
     case "$state" in
       absent) return 0 ;;
@@ -198,7 +198,7 @@ quiesce_secondmate_endpoint() {
       fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
     fi
   fi
-  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$probe_home"; then
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$probe_home" "$(meta_value "$META" tmux_session_target)"; then
     SECONDMATE_ENDPOINT_QUIESCED=1
     return 0
   fi
@@ -212,7 +212,7 @@ quiesce_secondmate_endpoint() {
 }
 
 quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
-  local meta=$1 task=$2 probe_home=${3:-} meta_state lock profile backend target zellij_tab endpoint_status
+  local meta=$1 task=$2 probe_home=${3:-} meta_state lock profile backend target zellij_tab tmux_session_target endpoint_status
   meta_state=$(dirname "$meta")
   lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
   [ -f "$meta" ] || {
@@ -229,6 +229,8 @@ quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
+  tmux_session_target=$(fm_meta_get "$meta" tmux_session_target)
+  [ -n "$tmux_session_target" ] || tmux_session_target=$(fm_meta_get "$meta" window)
   fm_account_meta_lock_release "$lock" || return 1
   if [ -n "$target" ]; then
     if [ -n "$probe_home" ]; then
@@ -237,7 +239,7 @@ quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
       fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
     fi
   fi
-  if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home"; then
+  if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home" "$tmux_session_target"; then
     return 0
   else
     endpoint_status=$?
@@ -1191,7 +1193,7 @@ quiesce_completion_report_endpoint() {
       fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" 2>/dev/null || true
     fi
   fi
-  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME"; then
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME" "$(meta_value "$META" tmux_session_target)"; then
     return 0
   else
     endpoint_status=$?

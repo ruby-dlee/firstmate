@@ -133,21 +133,24 @@ function markdownStructure(markdown) {
       const candidate = containerCandidate(line);
       const lazyListContinuation = candidate.containers.length === 0 && lazyList
         && scopedLine(line, lazyList) !== undefined && !/^[ \t]*$/.test(line);
-      const marker = fenceMarker(candidate.text);
+      const activeCandidate = lazyListContinuation
+        ? { text: scopedLine(line, lazyList).text, containers: lazyList }
+        : candidate;
+      const marker = fenceMarker(activeCandidate.text);
       if (marker) {
         fence = {
           character: marker.character,
           length: marker.length,
-          containers: candidate.containers,
+          containers: activeCandidate.containers,
         };
         paragraphOpen = false;
         consumed = true;
         continue;
       }
-      const htmlOpening = htmlBlockStart(candidate.text, paragraphOpen && candidate.containers.length === 0);
+      const htmlOpening = htmlBlockStart(activeCandidate.text, paragraphOpen && activeCandidate.containers.length === 0);
       if (htmlOpening) {
-        const htmlStart = { ...htmlOpening, containers: candidate.containers };
-        if (htmlStart.blank || !htmlStart.end.test(candidate.text.slice(candidate.text.indexOf("<") + 1))) {
+        const htmlStart = { ...htmlOpening, containers: activeCandidate.containers };
+        if (htmlStart.blank || !htmlStart.end.test(activeCandidate.text.slice(activeCandidate.text.indexOf("<") + 1))) {
           htmlBlock = htmlStart;
         }
         paragraphOpen = false;

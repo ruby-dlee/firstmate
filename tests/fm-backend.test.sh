@@ -665,6 +665,12 @@ test_managed_tmux_target_state_finds_replacement_window() {
     || fail "tmux replacement discovery crossed session boundaries"
   [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
     || fail "a missing stable tmux id without a recoverable session was not fail-closed"
+  window_names=fm-other-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
+    || fail "stable tmux metadata could not establish absence through its recorded session identity"
+  window_names=fm-intended-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = present ] \
+    || fail "stable tmux metadata did not find a replacement in its recorded session"
   pass "managed tmux target state scopes plausible replacement windows to the recorded session"
 }
 

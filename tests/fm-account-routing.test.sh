@@ -1785,6 +1785,8 @@ SH
   assert_not_grep '^account_profile=' "$meta" "provisional metadata invented a profile before Agent Fleet selection"
   assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
   assert_regex '^tmux_window_id=%77$' "$meta" "provisional metadata lost the stable replacement endpoint identity"
+  assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" \
+    "provisional metadata lost the scoped tmux session identity"
   touch "$gate"
   for _ in $(seq 1 100); do
     [ -f "$installed_marker" ] && break
@@ -1794,6 +1796,8 @@ SH
   [ -f "$installed_marker" ] || { touch "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never installed endpoint metadata"; }
   assert_grep 'account_rollback_cleanup=pending' "$meta" "endpoint metadata cleared rollback recovery before launch commit"
   assert_grep 'account_profile=claude-2' "$meta" "endpoint metadata lost the selected account profile"
+  assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" \
+    "endpoint metadata lost the scoped tmux session identity"
   touch "$installed_gate"
   status=0
   wait "$spawn_pid" || status=$?
@@ -2973,6 +2977,206 @@ test_continuation_accepts_stable_tracked_deletion() {
   pass "continuation identity represents stable tracked deletions explicitly"
 }
 
+test_continuation_revalidates_dirty_submodule_content() {
+  local id rec ready proceed output packet_pid status packet worktree subrepo
+  id=account-cont-submodule-z29a
+  rec=$(make_case continuation-submodule claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "submodule continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  subrepo="$CASE_DIR/submodule-source"
+  fm_git_init_commit "$subrepo"
+  git -C "$worktree" -c protocol.file.allow=always submodule add -q "$subrepo" nested-submodule
+  git -C "$worktree" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qam 'add submodule'
+  printf 'first dirty nested generation\n' > "$worktree/nested-submodule/README.md"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-submodule.ready"; proceed="$CASE_DIR/continuation-submodule.proceed"
+  output="$CASE_DIR/continuation-submodule.out"; packet="$HOME_DIR/data/$id/continuation-submodule.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_REPOSITORY_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" submodule > "$output" 2>&1 &
+  packet_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "submodule continuation gate did not open: $(cat "$output")"; }
+  printf 'second dirty nested generation\n' > "$worktree/nested-submodule/README.md"
+  touch "$proceed"
+  wait "$packet_pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation accepted changed bytes in an already-dirty submodule"
+  assert_contains "$(cat "$output")" "continuation repository snapshot changed" \
+    "dirty submodule replacement refusal was unclear"
+  assert_absent "$packet" "dirty submodule replacement installed a stale continuation packet"
+  pass "continuation identity includes nested bytes from dirty submodule worktrees"
+}
+
+test_continuation_repository_fingerprint_uses_pinned_root() {
+  local id rec packet worktree moved outside hook marker
+  id=account-cont-root-pin-z29b
+  rec=$(make_case continuation-root-pin claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "root-pin continuation precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  printf 'inside pinned repository\n' > "$worktree/README.md"
+  moved="$CASE_DIR/worktree-moved"; outside="$CASE_DIR/worktree-outside"; hook="$CASE_DIR/root-pin-hook"; marker="$CASE_DIR/root-pin.marker"
+  cp -R "$worktree" "$outside"
+  printf 'outside replacement repository\n' > "$outside/README.md"
+  mkdir -p "$hook"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == "README.md":
+        swapped = True
+        os.rename(os.environ["FM_PIN_ROOT"], os.environ["FM_PIN_MOVED"])
+        os.symlink(os.environ["FM_PIN_OUTSIDE"], os.environ["FM_PIN_ROOT"], target_is_directory=True)
+        try:
+            descriptor = original_open(file, flags, mode, dir_fd=dir_fd)
+        finally:
+            os.unlink(os.environ["FM_PIN_ROOT"])
+            os.rename(os.environ["FM_PIN_MOVED"], os.environ["FM_PIN_ROOT"])
+            with open(os.environ["FM_PIN_MARKER"], "w", encoding="utf-8") as output:
+                output.write("swapped\n")
+        return descriptor
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+os.open = guarded_open
+PY
+  rm -f "$CASE_DIR/endpoint-live"
+  packet=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_PIN_ROOT="$worktree" FM_PIN_MOVED="$moved" \
+    FM_PIN_OUTSIDE="$outside" FM_PIN_MARKER="$marker" PYTHONPATH="$hook" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" root-pin) \
+    || fail "continuation rejected descriptor-pinned repository traversal"
+  assert_present "$marker" "repository root ancestor-swap hook did not run"
+  assert_present "$packet" "descriptor-pinned continuation packet was not published"
+  assert_grep 'inside pinned repository' "$worktree/README.md" "repository root swap changed the original worktree"
+  assert_grep 'outside replacement repository' "$outside/README.md" "repository root traversal opened the replacement tree"
+  pass "continuation fingerprints repository descendants through one pinned root"
+}
+
+test_continuation_packet_publication_is_generation_owned() {
+  local id rec ready proceed first_out second_out first_pid status packet
+  id=account-cont-cas-z29c
+  rec=$(make_case continuation-cas claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "continuation CAS precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/continuation-cas.ready"; proceed="$CASE_DIR/continuation-cas.proceed"
+  first_out="$CASE_DIR/continuation-cas-first.out"; second_out="$CASE_DIR/continuation-cas-second.out"
+  packet="$HOME_DIR/data/$id/continuation-cas.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" cas > "$first_out" 2>&1 &
+  first_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$first_pid" 2>/dev/null || true; fail "continuation CAS gate did not open: $(cat "$first_out")"; }
+  if FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" cas > "$second_out" 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "a concurrent continuation overwrote the owned packet generation"
+  assert_contains "$(cat "$second_out")" "publication is already in progress" \
+    "concurrent continuation CAS refusal was unclear"
+  assert_present "$packet" "concurrent continuation removed the first owned packet generation"
+  touch "$proceed"
+  wait "$first_pid" || fail "owned continuation generation failed after its competitor was refused"
+  assert_present "$packet" "successful continuation CAS did not retain its canonical packet"
+  pass "continuation publication serializes generation ownership without overwrites"
+}
+
+test_continuation_rejects_root_swap_before_descriptor_open() {
+  local id rec ready proceed output pid status worktree moved outside
+  id=account-cont-root-preopen-z29d
+  rec=$(make_case continuation-root-preopen claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "root pre-open precondition failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  moved="$CASE_DIR/worktree-before-open"; outside="$CASE_DIR/outside-before-open"
+  cp -R "$worktree" "$outside"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/root-preopen.ready"; proceed="$CASE_DIR/root-preopen.proceed"; output="$CASE_DIR/root-preopen.out"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_ROOT_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_ROOT_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" root-preopen > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "root pre-open gate did not open"; }
+  mv "$worktree" "$moved"
+  ln -s "$outside" "$worktree"
+  touch "$proceed"
+  wait "$pid"; status=$?
+  rm "$worktree"; mv "$moved" "$worktree"
+  [ "$status" -ne 0 ] || fail "continuation pinned a replacement worktree generation"
+  assert_contains "$(cat "$output")" "changed before pinning" "pre-open root swap refusal was unclear"
+  pass "continuation proves cwd descriptor identity when the root swaps before open"
+}
+
+test_continuation_prepublish_cas_preserves_unowned_replacement() {
+  local id rec ready proceed output pid status packet replacement
+  id=account-cont-prepublish-z29e
+  rec=$(make_case continuation-prepublish claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "prepublish CAS precondition failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  packet="$HOME_DIR/data/$id/continuation-prepublish.md"; replacement="$CASE_DIR/unowned-replacement"
+  printf 'owned prior generation\n' > "$packet"
+  printf 'unowned concurrent generation\n' > "$replacement"
+  ready="$CASE_DIR/prepublish.ready"; proceed="$CASE_DIR/prepublish.proceed"; output="$CASE_DIR/prepublish.out"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_READY="$ready" \
+    FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" prepublish > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "prepublish CAS gate did not open: $(cat "$output")"; }
+  rm "$packet"; cp "$replacement" "$packet"
+  touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation overwrote an unowned prepublish generation"
+  cmp -s "$packet" "$replacement" || fail "continuation CAS deleted or changed an unowned replacement"
+  assert_contains "$(cat "$output")" "exchange generation changed before publication" \
+    "prepublish generation mismatch was not reported"
+  pass "continuation CAS preserves unowned replacements at the exchange boundary"
+}
+
+test_continuation_reclaims_only_positively_stale_publish_lock() {
+  local id rec packet lock
+  id=account-cont-stale-lock-z29f
+  rec=$(make_case continuation-stale-lock claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "stale publish-lock precondition failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  lock="$HOME_DIR/data/$id/.continuation-stale-lock.publish-lock"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-token\n' > "$lock"
+  packet=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" stale-lock) || fail "continuation did not reclaim a positively stale publish lock"
+  assert_present "$packet" "stale-lock recovery did not publish its packet"
+  assert_absent "$lock" "stale-lock recovery retained its owned publish lock"
+  pass "continuation publish locks reclaim only a positively stale owner"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -3944,6 +4148,17 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
   test_continuation_accepts_stable_tracked_deletion
   test_continuation_restores_prior_packet_after_failed_postcheck
   test_continuation_rollback_preserves_concurrent_packet_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_reserved_generation_is_durable_before_lease_mutation
+  test_continuation_revalidates_dirty_submodule_content
+  test_continuation_repository_fingerprint_uses_pinned_root
+  test_continuation_rejects_root_swap_before_descriptor_open
+  test_continuation_packet_publication_is_generation_owned
+  test_continuation_prepublish_cas_preserves_unowned_replacement
+  test_continuation_reclaims_only_positively_stale_publish_lock
   exit 0
 fi
 

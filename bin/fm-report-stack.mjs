@@ -407,9 +407,11 @@ ${gallery}
 </main></body></html>`;
 }
 
-function indexPage(rows) {
+function indexPage(rows, policy) {
   const data = JSON.stringify(rows).replaceAll("<", "\\u003c");
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firstmate report stack</title><style>${sharedCss()}</style></head><body><main>
+  const authority = JSON.stringify({ schemaVersion: 1, generation: policy.generation, cutoffMs: policy.cutoffMs });
+  return `<!-- firstmate-retention ${authority} -->
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firstmate report stack</title><style>${sharedCss()}</style></head><body><main>
 <header><p class="eyebrow">Firstmate completion ledger</p><h1>Report stack</h1><p>Durable, account-independent records of wrapped work.</p></header>
 <div class="toolbar"><input id="search" type="search" placeholder="Search tasks, summaries, projects…"><select id="kind"><option value="">All task types</option><option value="ship">Ship</option><option value="scout">Scout</option></select></div><div id="cards" class="cards"></div>
 <script>const reports=${data};const cards=document.querySelector('#cards');const search=document.querySelector('#search');const kind=document.querySelector('#kind');const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function draw(){const q=search.value.toLowerCase();const rows=reports.filter(r=>(!kind.value||r.kind===kind.value)&&(!q||[r.title,r.summary,r.taskId,r.project,r.harness,r.accountProfile].join(' ').toLowerCase().includes(q)));cards.innerHTML=rows.length?rows.map(r=>'<article class="card"><a href="entries/'+encodeURIComponent(r.reportId)+'/report.html"><p class="eyebrow">'+esc(r.kind)+' · '+esc(r.completedAt.slice(0,10))+'</p><h2>'+esc(r.title)+'</h2><p>'+esc(r.summary)+'</p><p class="meta">'+esc(r.project)+' · '+esc(r.harness)+(r.accountProfile?' · '+esc(r.accountProfile):'')+'</p></a></article>').join(''):'<div class="empty">No matching reports.</div>'}search.addEventListener('input',draw);kind.addEventListener('change',draw);draw();</script>
@@ -679,7 +681,7 @@ function snapshotStateArtifact(stateRoot, file, staged, destinationName, viewLim
   }
 }
 
-function readManifests() {
+function readManifests(policy = readRetentionPolicy()) {
   if (!fs.existsSync(entriesDir)) return [];
   return fs.readdirSync(entriesDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
@@ -693,10 +695,26 @@ function readManifests() {
       if (manifest.reportId !== entry.name) {
         throw new Error(`report manifest identity mismatch at ${file}`);
       }
+      const completedAt = Date.parse(manifest.completedAt);
+      if (Number.isFinite(policy.cutoffMs) && Number.isFinite(completedAt) && completedAt <= policy.cutoffMs) return undefined;
       return manifest;
     })
     .filter(Boolean)
     .sort((a, b) => b.completedAt.localeCompare(a.completedAt));
+}
+
+function readRetentionPolicy() {
+  const framed = runContainedHelper(["read-fd", "index.html", "4096", "head"], [stackRootDescriptor], 1024 * 1024);
+  const item = framedItems(framed).get("source");
+  if (!item || item.missing) return { schemaVersion: 1, generation: "", cutoffMs: Number.NEGATIVE_INFINITY };
+  const firstLine = item?.content.toString("utf8").split(/\r?\n/, 1)[0] || "";
+  const match = firstLine.match(/^<!-- firstmate-retention (\{.*\}) -->$/);
+  if (!match) throw new Error("invalid report retention authority in index.html");
+  const policy = JSON.parse(match[1]);
+  if (policy.schemaVersion !== 1 || typeof policy.generation !== "string" || !Number.isFinite(policy.cutoffMs)) {
+    throw new Error("invalid report retention authority in index.html");
+  }
+  return policy;
 }
 
 function reportTransactionPath(reportId) {
@@ -805,7 +823,20 @@ function pruneExpiredEntries() {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
   }
   const existingTombstones = retentionTombstones();
-  const cutoff = Date.now() - reportRetentionMs + reportRetentionGuardMs;
+  const currentPolicy = readRetentionPolicy();
+  const policy = {
+    schemaVersion: 1,
+    generation: crypto.randomUUID(),
+    cutoffMs: Math.max(currentPolicy.cutoffMs, Date.now() - reportRetentionMs + reportRetentionGuardMs),
+  };
+  const cutoff = policy.cutoffMs;
+  renderIndex(policy);
+  if (process.env.FM_REPORT_RETENTION_POLICY_TEST_READY && process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED) {
+    fs.writeFileSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_READY, "ready\n", { flag: "wx" });
+    while (!fs.existsSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED)) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
   const expired = [];
   for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
@@ -835,11 +866,11 @@ function pruneExpiredEntries() {
   return { pruned: cleanup.length, pending: tombstones.length > cleanup.length };
 }
 
-function renderIndex() {
+function renderIndex(policy = readRetentionPolicy()) {
   const tempName = `.index.html.${crypto.randomUUID()}.tmp`;
   const temp = path.join(entriesDir, tempName);
   try {
-    fs.writeFileSync(temp, indexPage(readManifests()), { flag: "wx", mode: 0o600 });
+    fs.writeFileSync(temp, indexPage(readManifests(policy), policy), { flag: "wx", mode: 0o600 });
     runContainedHelper(
       ["replace-file-fd", tempName, "index.html"],
       [entriesDescriptor, stackRootDescriptor],

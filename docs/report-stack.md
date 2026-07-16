@@ -5,6 +5,8 @@ The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation performs one bounded retention batch.
 Report retention is enforced by a per-user macOS LaunchAgent installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
+The installer publishes immutable self-contained generations and atomically advances the LaunchAgent plist only after the referenced generation is complete, so a crash or reboot never depends on a later Firstmate session to restore executable code.
+Each sweep atomically publishes an authoritative retention cutoff, regenerates the visible index from that cutoff, and only then begins bounded tombstoning and physical deletion, so cleanup may span later runs without restoring an expired report to readers.
 The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, retries failed runs, and records a successful-prune heartbeat that session bootstrap validates.
 Merging the code does not install or activate the owner.
 The stack begins pruning two owner intervals before a report reaches 30 days, so the bounded cadence cannot carry an entry beyond the ceiling.

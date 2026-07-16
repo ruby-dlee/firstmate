@@ -25,6 +25,8 @@ PACKET_TMP=
 PACKET_PRIOR_TMP=
 PACKET_PRIOR_ID=
 PUBLISHED_PACKET_ID=
+PACKET_LOCK=
+PACKET_LOCK_TOKEN=
 STATUS_SNAPSHOT_TMP=
 STATUS_IDENTITY_TMP=
 STATUS_REVALIDATION_TMP=
@@ -52,6 +54,60 @@ remove_owned_path() {
   rm -f -- "$path"
 }
 
+process_start_time() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+packet_lock_state() {
+  local pid started token extra current
+  [ -f "$PACKET_LOCK" ] && [ ! -L "$PACKET_LOCK" ] || { printf 'unknown'; return; }
+  pid=$(sed -n '1p' "$PACKET_LOCK"); started=$(sed -n '2p' "$PACKET_LOCK")
+  token=$(sed -n '3p' "$PACKET_LOCK"); extra=$(sed -n '4p' "$PACKET_LOCK")
+  case "$pid" in ''|*[!0-9]*) printf 'unknown'; return ;; esac
+  [ -n "$started" ] && [ -n "$token" ] && [ -z "$extra" ] || { printf 'unknown'; return; }
+  if ! kill -0 "$pid" 2>/dev/null; then printf 'stale'; return; fi
+  current=$(process_start_time "$pid") || { printf 'unknown'; return; }
+  if [ "$current" = "$started" ]; then printf 'live'; else printf 'stale'; fi
+}
+
+packet_lock_acquire() {
+  local candidate started state reclaim quarantine attempt
+  PACKET_LOCK="$TASK_DIR/.continuation-$ATTEMPT.publish-lock"
+  PACKET_LOCK_TOKEN="$$.$RANDOM.$(date +%s)"
+  started=$(process_start_time "$$") || return 1
+  candidate=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.lock.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n' "$$" "$started" "$PACKET_LOCK_TOKEN" > "$candidate" || return 1
+  reclaim="$PACKET_LOCK.reclaim"
+  for attempt in $(seq 1 100); do
+    if [ ! -e "$reclaim" ] && ln "$candidate" "$PACKET_LOCK" 2>/dev/null; then
+      rm -f "$candidate"
+      return 0
+    fi
+    state=$(packet_lock_state)
+    if [ "$state" = stale ] && mkdir "$reclaim" 2>/dev/null; then
+      state=$(packet_lock_state)
+      if [ "$state" = stale ]; then
+        quarantine="$PACKET_LOCK.stale.$PACKET_LOCK_TOKEN"
+        mv "$PACKET_LOCK" "$quarantine" 2>/dev/null || true
+        rm -f "$quarantine"
+      fi
+      rmdir "$reclaim" 2>/dev/null || true
+      [ "$state" != stale ] || continue
+    fi
+    sleep 0.01
+  done
+  rm -f "$candidate"
+  echo "error: continuation packet publication is already in progress for $ID" >&2
+  return 1
+}
+
+packet_lock_release() {
+  [ -n "$PACKET_LOCK" ] || return 0
+  [ -f "$PACKET_LOCK" ] && [ ! -L "$PACKET_LOCK" ] || return 0
+  [ "$(sed -n '3p' "$PACKET_LOCK")" = "$PACKET_LOCK_TOKEN" ] || return 0
+  rm -f "$PACKET_LOCK"
+}
+
 cleanup_packet_tmp() {
   [ -z "$PACKET_TMP" ] || rm -f "$PACKET_TMP"
   remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
@@ -64,6 +120,7 @@ cleanup_packet_tmp() {
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
   [ -z "$NO_MISTAKES_STATUS_TMP" ] || rm -f "$NO_MISTAKES_STATUS_TMP"
   [ -z "$TASK_SNAPSHOT_DIR" ] || rm -rf "$TASK_SNAPSHOT_DIR"
+  packet_lock_release
 }
 trap cleanup_packet_tmp EXIT
 # shellcheck source=bin/fm-account-routing-lib.sh
@@ -103,13 +160,15 @@ KIND=$(fm_meta_get "$META" kind)
 [ -n "$KIND" ] || KIND=ship
 BACKEND=$(fm_backend_of_meta "$META")
 TARGET=$(fm_backend_target_of_meta "$META")
+TMUX_SESSION_TARGET=$(fm_meta_get "$META" tmux_session_target)
+[ -n "$TMUX_SESSION_TARGET" ] || TMUX_SESSION_TARGET=$(fm_meta_get "$META" window)
 SECONDMATE_HOME=$(fm_meta_get "$META" home)
 [ -n "$SECONDMATE_HOME" ] || SECONDMATE_HOME=$(fm_meta_get "$META" worktree)
 PROBE_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$SECONDMATE_HOME")
 if [ "$PROBE_HOME" = "$FM_HOME" ]; then
-  ENDPOINT_STATE=$(fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
+  ENDPOINT_STATE=$(fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" "$TMUX_SESSION_TARGET" 2>/dev/null)
 else
-  ENDPOINT_STATE=$(unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" 2>/dev/null)
+  ENDPOINT_STATE=$(unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_target_state "$BACKEND" "$TARGET" "fm-$ID" "$TMUX_SESSION_TARGET" 2>/dev/null)
 fi
 case "$ENDPOINT_STATE" in
   absent) ;;
@@ -123,6 +182,19 @@ PROJECT=$(fm_meta_get "$META" project)
 WORKTREE_REAL=$(cd "$WORKTREE" && pwd -P)
 WORKTREE_ID=$(path_identity "$WORKTREE_REAL") \
   || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
+if [ -n "${FM_ACCOUNT_CONTINUATION_ROOT_TEST_READY:-}" ] \
+  && [ -n "${FM_ACCOUNT_CONTINUATION_ROOT_TEST_PROCEED:-}" ]; then
+  : > "$FM_ACCOUNT_CONTINUATION_ROOT_TEST_READY"
+  while [ ! -e "$FM_ACCOUNT_CONTINUATION_ROOT_TEST_PROCEED" ]; do sleep 0.01; done
+fi
+ORIGINAL_CWD=$PWD
+cd "$WORKTREE_REAL" \
+  || { echo "error: continuation worktree cannot be pinned for $ID" >&2; exit 1; }
+[ "$(path_identity . 2>/dev/null || true)" = "$WORKTREE_ID" ] \
+  || { echo "error: continuation worktree changed before pinning for $ID" >&2; exit 1; }
+exec 9< . \
+  || { echo "error: continuation worktree cannot be pinned for $ID" >&2; exit 1; }
+cd "$ORIGINAL_CWD" || exit 1
 TOP=$(git -C "$WORKTREE_REAL" rev-parse --show-toplevel 2>/dev/null) || { echo "error: continuation worktree is not inspectable for $ID" >&2; exit 1; }
 TOP_REAL=$(cd "$TOP" && pwd -P)
 [ "$TOP_REAL" = "$WORKTREE_REAL" ] || { echo "error: continuation path is not the recorded worktree root for $ID" >&2; exit 1; }
@@ -135,67 +207,7 @@ REPOSITORY_PATHS_TMP=$(mktemp "$STATE/.continuation-repository-paths-$ID.XXXXXX"
   || { echo "error: cannot stage continuation repository paths for $ID" >&2; exit 1; }
 
 append_repository_path_identities() {
-  node - "$WORKTREE_REAL" "$REPOSITORY_PATHS_TMP" <<'JS'
-const crypto = require("crypto");
-const fs = require("fs");
-
-const root = Buffer.from(`${fs.realpathSync.native(process.argv[2])}/`);
-const list = fs.readFileSync(process.argv[3]);
-const records = [];
-let start = 0;
-
-function fingerprint(stat) {
-  return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
-}
-
-function append(path, type, mode, hash) {
-  records.push(path, Buffer.from(`\0${type}:${mode.toString(8)}:${hash}\0`));
-}
-
-for (let end = 0; end <= list.length; end += 1) {
-  if (end !== list.length && list[end] !== 0) continue;
-  if (end === start) {
-    start = end + 1;
-    continue;
-  }
-  const relative = list.subarray(start, end);
-  const absolute = Buffer.concat([root, relative]);
-  let before;
-  try {
-    before = fs.lstatSync(absolute, { bigint: true });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    append(relative, "missing", 0n, "missing");
-    start = end + 1;
-    continue;
-  }
-  if (before.isSymbolicLink()) {
-    const target = fs.readlinkSync(absolute, { encoding: "buffer" });
-    const after = fs.lstatSync(absolute, { bigint: true });
-    if (fingerprint(before) !== fingerprint(after)) throw new Error("repository symlink changed during snapshot");
-    append(relative, "symlink", before.mode, crypto.createHash("sha256").update(target).digest("hex"));
-  } else if (before.isFile()) {
-    const fd = fs.openSync(absolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    try {
-      const opened = fs.fstatSync(fd, { bigint: true });
-      if (opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("repository file changed during open");
-      const hash = crypto.createHash("sha256");
-      const buffer = Buffer.allocUnsafe(65536);
-      let bytes;
-      while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) !== 0) hash.update(buffer.subarray(0, bytes));
-      const after = fs.fstatSync(fd, { bigint: true });
-      if (fingerprint(opened) !== fingerprint(after)) throw new Error("repository file changed during snapshot");
-      append(relative, "file", opened.mode, hash.digest("hex"));
-    } finally {
-      fs.closeSync(fd);
-    }
-  } else {
-    append(relative, "special", before.mode, fingerprint(before));
-  }
-  start = end + 1;
-}
-process.stdout.write(Buffer.concat(records));
-JS
+  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-paths-fd "$REPOSITORY_PATHS_TMP" 3<&9
 }
 
 capture_repository_identity() {
@@ -545,7 +557,10 @@ rollback_published_packet() {
     prior_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
     [ "$prior_id" = "$PACKET_PRIOR_ID" ] \
       || { echo "error: displaced continuation packet generation changed for $ID" >&2; return 1; }
-    mv -f -- "$PACKET_PRIOR_TMP" "$PACKET" || return 1
+    python3 "$SCRIPT_DIR/fm-contained-read.py" exchange-files-fd \
+      "${PACKET_PRIOR_TMP#./}" "${PACKET#./}" "$PACKET_PRIOR_ID" "$PUBLISHED_PACKET_ID" 3< . \
+      || return 1
+    remove_owned_path "$PACKET_PRIOR_TMP" "$PUBLISHED_PACKET_ID"
     PACKET_PRIOR_TMP=
     PACKET_PRIOR_ID=
   else
@@ -555,26 +570,36 @@ rollback_published_packet() {
 }
 
 publish_packet() {
-  local placeholder_id
+  local destination_id
+  packet_lock_acquire || return 1
   PUBLISHED_PACKET_ID=$(path_identity "$PACKET_TMP" 2>/dev/null || true)
   [ -n "$PUBLISHED_PACKET_ID" ] || return 1
   if [ -e "$PACKET" ]; then
-    PACKET_PRIOR_TMP=$(mktemp "$TASK_DIR/.continuation-prior-$ATTEMPT.XXXXXX") || return 1
-    placeholder_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
-    PACKET_PRIOR_ID=$placeholder_id
-    mv -f -- "$PACKET" "$PACKET_PRIOR_TMP" || return 1
-    PACKET_PRIOR_ID=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
-    [ -n "$PACKET_PRIOR_ID" ] || return 1
+    destination_id=$(path_identity "$PACKET" 2>/dev/null || true)
+    [ -n "$destination_id" ] || return 1
+    if [ -n "${FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_READY:-}" ] \
+      && [ -n "${FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_PROCEED:-}" ]; then
+      : > "$FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_READY"
+      while [ ! -e "$FM_ACCOUNT_CONTINUATION_PREPUBLISH_TEST_PROCEED" ]; do sleep 0.01; done
+    fi
+    python3 "$SCRIPT_DIR/fm-contained-read.py" exchange-files-fd \
+      "${PACKET_TMP#./}" "${PACKET#./}" "$PUBLISHED_PACKET_ID" "$destination_id" 3< . \
+      || return 1
+    PACKET_PRIOR_TMP=$PACKET_TMP
+    PACKET_PRIOR_ID=$destination_id
+    PACKET_TMP=
+    return 0
   fi
-  if ! mv -- "$PACKET_TMP" "$PACKET"; then
+  if ! ln -- "$PACKET_TMP" "$PACKET"; then
     if [ -n "$PACKET_PRIOR_TMP" ] && [ ! -e "$PACKET" ] \
       && [ "$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)" = "$PACKET_PRIOR_ID" ]; then
-      mv -- "$PACKET_PRIOR_TMP" "$PACKET" || true
+      ln -- "$PACKET_PRIOR_TMP" "$PACKET" 2>/dev/null || true
       PACKET_PRIOR_TMP=
       PACKET_PRIOR_ID=
     fi
     return 1
   fi
+  rm -f -- "$PACKET_TMP" || return 1
   PACKET_TMP=
   [ "$(path_identity "$PACKET" 2>/dev/null || true)" = "$PUBLISHED_PACKET_ID" ]
 }

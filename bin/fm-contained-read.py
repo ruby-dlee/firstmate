@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import errno
+import ctypes
+import hashlib
 import json
 import os
 import stat
@@ -42,7 +44,12 @@ def open_relative(root_descriptor, relative, flags):
         before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode):
             fail(f"source is a symlink: {relative}")
-        descriptor = os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=parent)
+        if flags & os.O_DIRECTORY:
+            if not stat.S_ISDIR(before.st_mode):
+                fail(f"source is not a real directory: {relative}")
+        elif not stat.S_ISREG(before.st_mode):
+            fail(f"source is not a real regular file: {relative}")
+        descriptor = os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         opened = os.fstat(descriptor)
         if opened.st_dev != before.st_dev or opened.st_ino != before.st_ino:
             os.close(descriptor)
@@ -60,6 +67,91 @@ def same_file(first, second):
         and first.st_mtime_ns == second.st_mtime_ns
         and first.st_ctime_ns == second.st_ctime_ns
     )
+
+
+def fingerprint_descriptor(descriptor, relative, records):
+    opened = os.fstat(descriptor)
+    if stat.S_ISREG(opened.st_mode):
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(descriptor, min(64 * 1024, opened.st_size - offset), offset)
+            if not chunk:
+                fail(f"repository file ended while fingerprinting: {relative}")
+            digest.update(chunk)
+            offset += len(chunk)
+        if not same_file(opened, os.fstat(descriptor)):
+            fail(f"repository file changed while fingerprinting: {relative}")
+        records.append((relative, "file", opened.st_mode, digest.hexdigest()))
+        return
+    if not stat.S_ISDIR(opened.st_mode):
+        records.append((relative, "special", opened.st_mode, "special"))
+        return
+    records.append((relative, "directory", opened.st_mode, "directory"))
+    for name in sorted(os.listdir(descriptor)):
+        child_relative = f"{relative}/{name}" if relative else name
+        before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+            target = os.readlink(name, dir_fd=descriptor).encode("utf-8", "surrogateescape")
+            after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if not same_file(before, after):
+                fail(f"repository symlink changed while fingerprinting: {child_relative}")
+            records.append((child_relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+            continue
+        flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
+        child = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        try:
+            actual = os.fstat(child)
+            if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
+                fail(f"repository path changed while fingerprinting: {child_relative}")
+            fingerprint_descriptor(child, child_relative, records)
+        finally:
+            os.close(child)
+
+
+def command_fingerprint_paths_fd(arguments):
+    if len(arguments) != 1:
+        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file>")
+    root = checked_root(3)
+    paths = open(arguments[0], "rb").read().split(b"\0")
+    records = []
+    for raw in paths:
+        if not raw:
+            continue
+        relative = raw.decode("utf-8", "surrogateescape")
+        try:
+            parts = components(relative)
+            parent = os.dup(root)
+            try:
+                for part in parts[:-1]:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    os.close(parent)
+                    parent = child
+                before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISLNK(before.st_mode):
+                    target = os.readlink(parts[-1], dir_fd=parent).encode("utf-8", "surrogateescape")
+                    after = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                    if not same_file(before, after):
+                        fail(f"repository symlink changed while fingerprinting: {relative}")
+                    records.append((relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+                else:
+                    flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
+                    item = os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    try:
+                        actual = os.fstat(item)
+                        if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
+                            fail(f"repository path changed while fingerprinting: {relative}")
+                        fingerprint_descriptor(item, relative, records)
+                    finally:
+                        os.close(item)
+            finally:
+                os.close(parent)
+        except FileNotFoundError:
+            records.append((relative, "missing", 0, "missing"))
+    output = sys.stdout.buffer
+    for relative, kind, mode, digest in records:
+        output.write(relative.encode("utf-8", "surrogateescape"))
+        output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
 
 
 def read_descriptor(descriptor, maximum, mode):
@@ -159,7 +251,7 @@ def copy_regular(source_parent, destination_parent, name, remaining):
     before = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode):
         return 0
-    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent)
+    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_parent)
     destination = None
     try:
         opened = os.fstat(source)
@@ -470,6 +562,47 @@ def command_remove_owned_directory_fd(arguments):
         os.close(directory)
 
 
+def exchange_names(root, first, second):
+    libc = ctypes.CDLL(None, use_errno=True)
+    first_raw = os.fsencode(first)
+    second_raw = os.fsencode(second)
+    if sys.platform == "darwin":
+        rename_exchange = libc.renameatx_np
+        rename_exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename_exchange.restype = ctypes.c_int
+        result = rename_exchange(root, first_raw, root, second_raw, 0x00000002)
+    else:
+        machine = os.uname().machine
+        syscall_number = 316 if machine in ("x86_64", "amd64") else 276
+        result = libc.syscall(syscall_number, root, first_raw, root, second_raw, 0x00000002)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def command_exchange_files_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py exchange-files-fd <source> <destination> <source-id> <destination-id>")
+    source_name, destination_name, source_id, destination_id = arguments
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("exchange names must be single safe components")
+    root = checked_root(3)
+    source = os.stat(source_name, dir_fd=root, follow_symlinks=False)
+    destination = os.stat(destination_name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISREG(source.st_mode) or not stat.S_ISREG(destination.st_mode):
+        fail("exchange operands must be real regular files")
+    if f"{source.st_dev}:{source.st_ino}" != source_id or f"{destination.st_dev}:{destination.st_ino}" != destination_id:
+        fail("exchange generation changed before publication")
+    exchange_names(root, source_name, destination_name)
+    moved_source = os.stat(destination_name, dir_fd=root, follow_symlinks=False)
+    moved_destination = os.stat(source_name, dir_fd=root, follow_symlinks=False)
+    if f"{moved_source.st_dev}:{moved_source.st_ino}" == source_id \
+            and f"{moved_destination.st_dev}:{moved_destination.st_ino}" == destination_id:
+        return
+    exchange_names(root, source_name, destination_name)
+    fail("exchange generation changed during publication")
+
+
 def main():
     if len(sys.argv) < 2:
         fail("contained read command is required")
@@ -485,6 +618,10 @@ def main():
         command_replace_file_fd(sys.argv[2:])
     elif sys.argv[1] == "remove-owned-directory-fd":
         command_remove_owned_directory_fd(sys.argv[2:])
+    elif sys.argv[1] == "fingerprint-paths-fd":
+        command_fingerprint_paths_fd(sys.argv[2:])
+    elif sys.argv[1] == "exchange-files-fd":
+        command_exchange_files_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

@@ -147,13 +147,13 @@ spawn_managed_endpoint_kill() {  # <backend> <target> <tab-id> <label> <kind> <s
   fi
 }
 
-spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmate-home>
-  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} endpoint_home
+spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} recorded_scoped_target=${6:-} endpoint_home
   endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
   if [ "$endpoint_home" != "$FM_HOME" ]; then
-    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_target_state "$backend" "$target" "$label" )
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_target_state "$backend" "$target" "$label" "$recorded_scoped_target" )
   else
-    fm_backend_target_state "$backend" "$target" "$label"
+    fm_backend_target_state "$backend" "$target" "$label" "$recorded_scoped_target"
   fi
 }
 
@@ -323,6 +323,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$rollback_kind" ] || rollback_kind=ship
     rollback_backend=$(fm_backend_of_meta "$RESUME_META")
     rollback_target=$(fm_backend_target_of_meta "$RESUME_META")
+    rollback_tmux_session_target=$(fm_account_meta_value "$RESUME_META" tmux_session_target)
+    [ -n "$rollback_tmux_session_target" ] || rollback_tmux_session_target=$(fm_account_meta_value "$RESUME_META" window)
     rollback_tab=$(fm_account_meta_value "$RESUME_META" zellij_tab_id)
     rollback_home=$(fm_account_meta_value "$RESUME_META" home)
     rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
@@ -336,7 +338,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if [ -n "$rollback_target" ]; then
       spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
     fi
-    rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null)
+    rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" "$rollback_tmux_session_target" 2>/dev/null)
     case "$rollback_endpoint_state" in
       absent) ;;
       present)
@@ -538,6 +540,7 @@ persist_failed_account_rollback() {
       [ -z "${ACCOUNT_PREDECESSOR_SESSION:-}" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
       [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${META_WINDOW:-${T:-}}" ] || echo "tmux_session_target=${META_WINDOW:-$T}"
       [ "${BACKEND:-tmux}" != herdr ] || {
         echo "herdr_session=${HERDR_SES:-}"
         echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
@@ -638,7 +641,7 @@ spawn_abort_cleanup() {
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
     spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" 2>/dev/null || true
-    endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" 2>/dev/null)
+    endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
     case "$endpoint_state" in
       absent) ;;
       present)
@@ -1125,7 +1128,7 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
   }
   existing_backend=$(fm_backend_of_meta "$STATE/$ID.meta")
   existing_target=$(fm_backend_target_of_meta "$STATE/$ID.meta")
-  existing_endpoint_state=$(fm_backend_target_state "$existing_backend" "$existing_target" "fm-$ID" 2>/dev/null)
+  existing_endpoint_state=$(fm_backend_target_state "$existing_backend" "$existing_target" "fm-$ID" "$(fm_meta_get "$STATE/$ID.meta" tmux_session_target)" 2>/dev/null)
   case "$existing_endpoint_state" in
     absent) ;;
     present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
@@ -1366,7 +1369,7 @@ fi
 
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
-  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" "$(fm_meta_get "$RESUME_META" tmux_session_target)" 2>/dev/null)
   case "$RECOVERY_ENDPOINT_STATE" in
     absent) ;;
     present)
@@ -1930,6 +1933,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = tmux ]; then
     echo "tmux_window_id=$WID"
+    echo "tmux_session_target=$META_WINDOW"
   fi
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
@@ -2061,7 +2065,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   ACCOUNT_NATIVE_LAUNCH_GO=
   ACCOUNT_NATIVE_LAUNCH_READY=
   ACCOUNT_NATIVE_LAUNCH_SCRIPT=
-  COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+  COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" "$META_WINDOW" 2>/dev/null)
   case "$COMMIT_ENDPOINT_STATE" in
     present) ;;
     absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;

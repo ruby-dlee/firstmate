@@ -1992,24 +1992,198 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
-  test_list_lazy_continuations_do_not_satisfy_required_sections
-  test_persistent_retention_owner_prunes_without_tasks_or_watcher
-  test_retention_activation_restores_previous_generation_on_failure
-  test_retention_error_publication_is_atomic_and_nonfollowing
-  exit 0
-fi
+test_lazy_list_blocks_retain_their_container_scope() {
+  local id=report-lazy-block-scope-b3p source entry manifest
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- list paragraph
+  ```text
+  ## Hidden heading
+  ```
+## Summary
+
+Visible summary.
+
+## What changed
+
+Changed.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+None.
+
+## Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null || fail "a lazy-list fence consumed headings after the list ended"
+  entry=$(run_stack path "$id") || fail "lazy-list fence report path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"summary": "Visible summary."' "$manifest" "lazy-list fence did not release its container scope"
+  pass "lazy-list fenced blocks retain and exit their actual container scope"
+}
+
+test_contained_reader_rejects_special_files_without_blocking() {
+  local root="$TMP_ROOT/contained-special" fifo output status pid
+  mkdir -p "$root"
+  fifo="$root/source"
+  mkfifo "$fifo"
+  output="$TMP_ROOT/contained-special.out"
+  (
+    cd "$root" || exit 1
+    python3 "$ROOT/bin/fm-contained-read.py" read-fd source 1024 strict 3< "$root"
+  ) > "$output" 2>&1 &
+  pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "contained reader blocked while opening a FIFO"
+  fi
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "contained reader accepted a FIFO"
+  assert_contains "$(cat "$output")" "not a real regular file" "contained reader special-file refusal was unclear"
+  pass "contained reads reject special files before nonblocking open"
+}
+
+test_repository_fingerprint_recurses_through_submodule_worktrees() {
+  local root="$TMP_ROOT/fingerprint-root" paths="$TMP_ROOT/fingerprint-paths" first second
+  mkdir -p "$root/submodule/nested"
+  printf 'first\n' > "$root/submodule/nested/file.txt"
+  printf 'submodule\0' > "$paths"
+  first=$(python3 "$ROOT/bin/fm-contained-read.py" fingerprint-paths-fd "$paths" 3< "$root") \
+    || fail "initial descriptor-relative repository fingerprint failed"
+  printf 'second\n' > "$root/submodule/nested/file.txt"
+  second=$(python3 "$ROOT/bin/fm-contained-read.py" fingerprint-paths-fd "$paths" 3< "$root") \
+    || fail "updated descriptor-relative repository fingerprint failed"
+  [ "$first" != "$second" ] || fail "nested dirty submodule content did not change repository identity"
+  assert_contains "$second" "submodule/nested/file.txt" "recursive repository identity omitted nested submodule content"
+  pass "repository identity traverses pinned roots and dirty submodule content"
+}
+
+test_retention_cutoff_is_authoritative_before_cleanup() {
+  local id=report-retention-cutoff-k2q entry manifest temp ready proceed output pid policy
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Cutoff-visible report."
+  run_stack publish "$id" >/dev/null || fail "cutoff precondition publication failed"
+  entry=$(run_stack path "$id") || fail "cutoff precondition path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  temp="$manifest.tmp"
+  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  ready="$TMP_ROOT/retention-policy.ready"; proceed="$TMP_ROOT/retention-policy.proceed"; output="$TMP_ROOT/retention-policy.out"
+  FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_PROCEED="$proceed" \
+    run_stack prune --status > "$output" 2>&1 &
+  pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -e "$ready" ] && break
+    sleep 0.05
+  done
+  [ -e "$ready" ] || { touch "$proceed"; wait "$pid" 2>/dev/null || true; fail "retention cutoff publication hook did not run"; }
+  assert_present "$(dirname "$entry")" "retention cleanup advanced before publishing its authoritative cutoff"
+  policy="$STACK/index.html"
+  assert_present "$policy" "retention did not atomically publish its cutoff generation and index"
+  assert_grep '<!-- firstmate-retention {"schemaVersion":1,"generation":"' "$policy" \
+    "retention index omitted its authoritative cutoff generation"
+  assert_no_grep "$id" "$policy" "atomic retention authority left an expired report visible in the index"
+  touch "$proceed"
+  wait "$pid" || fail "retention cutoff cleanup failed: $(cat "$output")"
+  assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
+  pass "retention publishes one authoritative cutoff before bounded cleanup"
+}
+
+test_retention_generations_survive_install_interruptions() {
+  local fakebin="$TMP_ROOT/retention-launchctl" install_root="$TMP_ROOT/retention-install"
+  local agents="$TMP_ROOT/LaunchAgents" plist old_program new_program saved status out
+  plist="$agents/com.firstmate.report-retention.plist"
+  old_program=$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s/.*<string>\([^<]*\)<\/string>.*/\1/p' "$plist" | sed -n '2p')
+  assert_present "$old_program" "retention precondition generation is missing"
+  saved="$TMP_ROOT/retention-old.plist"
+  cp "$plist" "$saved"
+  if out=$(FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT=generation-published \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 99 ] || fail "generation publication interrupt hook failed: $out"
+  cmp -s "$saved" "$plist" || fail "publishing an immutable generation changed the authoritative job early"
+  assert_present "$old_program" "generation publication moved the runnable prior owner"
+
+  if out=$(FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT=pointer-published \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 99 ] || fail "authoritative pointer interrupt hook failed: $out"
+  new_program=$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s/.*<string>\([^<]*\)<\/string>.*/\1/p' "$plist" | sed -n '2p')
+  [ "$new_program" != "$old_program" ] || fail "authoritative retention pointer did not advance generations"
+  assert_present "$new_program" "authoritative retention pointer references an incomplete generation"
+  assert_present "$old_program" "authoritative retention transition removed its prior runnable generation"
+  pass "retention installation atomically points at immutable reboot-safe generations"
+}
+
+test_retention_install_reclaims_positively_stale_lock() {
+  local fakebin="$TMP_ROOT/retention-launchctl" install_root="$TMP_ROOT/retention-install"
+  local agents="$TMP_ROOT/LaunchAgents" lock="$TMP_ROOT/retention-install/.install-lock"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-install-token\n' > "$lock"
+  FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure \
+    || fail "retention ensure did not reclaim a positively stale install lock"
+  assert_absent "$lock" "retention ensure retained its reclaimed install lock"
+  pass "retention installation reclaims only a positively stale owned lock"
+}
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_retention_batches_make_interruption_safe_progress
-  test_retention_install_recovers_interrupted_generation_transaction
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  test_retention_install_reclaims_positively_stale_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_lazy_list_blocks_retain_their_container_scope
+  test_contained_reader_rejects_special_files_without_blocking
+  test_repository_fingerprint_recurses_through_submodule_worktrees
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  test_retention_install_reclaims_positively_stale_lock
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
   test_list_lazy_continuations_do_not_satisfy_required_sections
   test_underindented_list_headings_exit_lazy_continuation
-  test_retention_install_and_recovery_share_owned_generation_lock
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_list_lazy_continuations_do_not_satisfy_required_sections
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  test_retention_error_publication_is_atomic_and_nonfollowing
   exit 0
 fi
 
@@ -2066,9 +2240,7 @@ test_retention_binds_manifests_to_entry_directories
 test_watcher_periodically_owns_idle_report_retention
 test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
-test_retention_activation_restores_previous_generation_on_failure
-test_retention_install_recovers_interrupted_generation_transaction
-test_retention_install_and_recovery_share_owned_generation_lock
+test_retention_generations_survive_install_interruptions
 test_retention_error_publication_is_atomic_and_nonfollowing
 test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation

@@ -717,8 +717,8 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # fm_backend_target_state: managed-lifecycle existence check. Prints exactly
 # present, absent, or unknown. Callers may release an external lease only on
 # absent; a control-plane or parse failure is always unknown.
-fm_backend_target_state() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
+fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
@@ -736,9 +736,15 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
           fi
           ;;
       esac
+      if [ -n "$recorded_scoped_target" ]; then
+        case "$recorded_scoped_target" in
+          *:*) session=${recorded_scoped_target%%:*} ;;
+          *) printf 'unknown'; return 0 ;;
+        esac
+      fi
       case "$target" in
-        *:*) session=${target%%:*} ;;
-        *) printf 'unknown'; return 0 ;;
+        *:*) [ -n "$session" ] || session=${target%%:*} ;;
+        *) [ -n "$session" ] || { printf 'unknown'; return 0; } ;;
       esac
       [ -n "$session" ] || { printf 'unknown'; return 0; }
       if windows=$(tmux list-windows -t "$session" -F '#{window_name}' 2>&1); then

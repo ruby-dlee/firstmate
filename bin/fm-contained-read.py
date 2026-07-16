@@ -147,15 +147,24 @@ def fingerprint_descriptor(descriptor, relative, records, budget):
 
 
 def command_fingerprint_paths_fd(arguments):
-    if len(arguments) not in (1, 3):
-        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file> [max-files max-bytes]")
+    if len(arguments) not in (1, 3, 4):
+        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file> [max-files max-bytes [max-seconds]]")
     root = checked_root(3)
     paths = open(arguments[0], "rb").read().split(b"\0")
-    maximum_files = int(arguments[1]) if len(arguments) == 3 else 100000
-    maximum_bytes = int(arguments[2]) if len(arguments) == 3 else 1073741824
-    if maximum_files <= 0 or maximum_bytes <= 0:
+    maximum_files = int(arguments[1]) if len(arguments) >= 3 else 100000
+    maximum_bytes = int(arguments[2]) if len(arguments) >= 3 else 1073741824
+    maximum_seconds = int(arguments[3]) if len(arguments) == 4 else None
+    if maximum_files <= 0 or maximum_bytes <= 0 or (maximum_seconds is not None and maximum_seconds <= 0):
         fail("repository fingerprint limits must be positive")
-    budget = FingerprintBudget(maximum_files, maximum_bytes)
+    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+    ready = os.environ.get("FM_FINGERPRINT_PATHS_TEST_READY")
+    proceed = os.environ.get("FM_FINGERPRINT_PATHS_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write("ready\n")
+        while not os.path.exists(proceed):
+            time.sleep(0.01)
+        budget.check_time()
     records = []
     for raw in paths:
         if not raw:
@@ -1155,6 +1164,74 @@ def command_copy_directory_fd(arguments):
         os.close(source)
 
 
+def command_rebase_legacy_report_links_fd(arguments):
+    if len(arguments) != 2:
+        fail("usage: fm-contained-read.py rebase-legacy-report-links-fd <cohort> <report>")
+    cohort_name, report_name = arguments
+    if len(components(cohort_name)) != 1 or len(components(report_name)) != 1:
+        fail("legacy report names must be single safe components")
+    root = checked_root(3)
+    cohort = open_relative(root, cohort_name, os.O_RDONLY | os.O_DIRECTORY)
+    report = open_relative(cohort, report_name, os.O_RDONLY | os.O_DIRECTORY)
+    source = None
+    staged_name = f".report.html.rebased.{secrets.token_hex(16)}"
+    try:
+        try:
+            source = open_relative(report, "report.html", os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        opened = os.fstat(source)
+        if opened.st_size > 32 * 1024 * 1024:
+            fail("legacy report page exceeds its migration limit")
+        content = bytearray()
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(source, min(1024 * 1024, opened.st_size - offset), offset)
+            if not chunk:
+                fail("legacy report page ended during migration")
+            content.extend(chunk)
+            offset += len(chunk)
+        if not same_file(opened, os.fstat(source)):
+            fail("legacy report page changed during migration")
+        rebased = bytes(content).replace(
+            b'src="../../.retention-policy.js"',
+            b'src="../../../.retention-policy.js"',
+        ).replace(
+            b'href="../../index.html"',
+            b'href="../../../index.html"',
+        )
+        if rebased == content:
+            return
+        staged = os.open(
+            staged_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=report,
+        )
+        try:
+            view = memoryview(rebased)
+            while view:
+                written = os.write(staged, view)
+                view = view[written:]
+            os.fsync(staged)
+        finally:
+            os.close(staged)
+        current = os.stat("report.html", dir_fd=report, follow_symlinks=False)
+        if not same_file(opened, current):
+            fail("legacy report page changed before migration install")
+        os.rename(staged_name, "report.html", src_dir_fd=report, dst_dir_fd=report)
+        os.fsync(report)
+    finally:
+        if source is not None:
+            os.close(source)
+        try:
+            os.unlink(staged_name, dir_fd=report)
+        except FileNotFoundError:
+            pass
+        os.close(report)
+        os.close(cohort)
+
+
 def command_exchange_directories_fd(arguments):
     if len(arguments) != 4:
         fail("usage: fm-contained-read.py exchange-directories-fd <first> <second> <first-id> <second-id>")
@@ -1487,14 +1564,15 @@ def command_remove_owned_tree_fd(arguments):
     observed = os.stat(name, dir_fd=root, follow_symlinks=False)
     if not stat.S_ISDIR(observed.st_mode) or f"{observed.st_dev}:{observed.st_ino}" != identity:
         fail("owned tree generation changed before removal")
+    tombstones = checked_root(4)
     descriptor = open_relative(root, name, os.O_RDONLY | os.O_DIRECTORY)
-    quarantine = f".{name}.removing.{os.getpid()}.{secrets.token_hex(16)}"
+    quarantine = f"tombstone-{secrets.token_hex(16)}"
     try:
-        rename_noreplace(root, root, name, quarantine)
-        quarantined = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        rename_noreplace(root, tombstones, name, quarantine)
+        quarantined = os.stat(quarantine, dir_fd=tombstones, follow_symlinks=False)
         if observed.st_dev != quarantined.st_dev or observed.st_ino != quarantined.st_ino:
             try:
-                rename_noreplace(root, root, quarantine, name)
+                rename_noreplace(tombstones, root, quarantine, name)
             except OSError:
                 pass
             fail("owned tree generation changed during quarantine")
@@ -1509,10 +1587,10 @@ def command_remove_owned_tree_fd(arguments):
                     fail("owned tree removal test gate timed out")
                 time.sleep(0.01)
         remove_directory_contents(descriptor)
-        current = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        current = os.stat(quarantine, dir_fd=tombstones, follow_symlinks=False)
         if observed.st_dev != current.st_dev or observed.st_ino != current.st_ino:
             fail("owned tree generation changed during removal")
-        os.rmdir(quarantine, dir_fd=root)
+        os.rmdir(quarantine, dir_fd=tombstones)
     finally:
         os.close(descriptor)
 
@@ -1556,6 +1634,8 @@ def main():
         command_prune_tombstones_fd(sys.argv[2:])
     elif sys.argv[1] == "copy-directory-fd":
         command_copy_directory_fd(sys.argv[2:])
+    elif sys.argv[1] == "rebase-legacy-report-links-fd":
+        command_rebase_legacy_report_links_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-directories-fd":
         command_exchange_directories_fd(sys.argv[2:])
     elif sys.argv[1] == "stage-retention-cohort-fd":

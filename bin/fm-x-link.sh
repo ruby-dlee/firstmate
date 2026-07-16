@@ -152,8 +152,8 @@ if [ -z "$CARRY_TS" ]; then
   REQ_REPLY_MAX=$REQ_EXPLICIT_MAX
 fi
 
-if [ -n "$CARRY_TS" ] && { [ -z "$REQ_PLATFORM" ] || [ -z "$REQ_REPLY_MAX" ]; }; then
-  echo "fm-x-link: relink requires carried reply context; pass --carry-platform and --carry-max from the prior task" >&2
+if [ -n "$CARRY_TS" ] && [ -z "$REQ_PLATFORM" ] && [ -z "$REQ_REPLY_MAX" ]; then
+  echo "fm-x-link: relink requires carried reply context; pass --carry-platform or --carry-max from the prior task" >&2
   exit 2
 fi
 

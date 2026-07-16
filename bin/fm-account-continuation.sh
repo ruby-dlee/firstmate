@@ -252,7 +252,8 @@ SUBMODULE_PATHS_TMP=$(mktemp "$STATE/.continuation-submodules-$ID.XXXXXX") \
 
 append_repository_path_identities() {
   python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-paths-fd "$REPOSITORY_PATHS_TMP" \
-    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" 3<&9
+    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
+    "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9
 }
 
 split_repository_index_paths() {
@@ -317,7 +318,7 @@ TASK_DIR=.
 TASK_SNAPSHOT_DIR=$(mktemp -d "$STATE/.continuation-task-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation task snapshot for $ID" >&2; exit 1; }
 TASK_SNAPSHOT_SOURCES=(
-  brief.md report.md completion.md decisions.md steering.md steering-pending.md
+  brief.md report.md completion.md decisions.md steering.md steering-pending.md steering-journal.md
   steering-unconfirmed.md side-effects.md do-not-rerun.md next-action.md checkpoint.md
   handoff.md recalled.md transcript-summary.md account-attempts.md
 )

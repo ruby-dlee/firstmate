@@ -21,11 +21,20 @@ test_prompt_transport_preserves_all_bytes() {
   prompt="$transport/prompt"
   printf 'prefix\0middle\377suffix\n\n' > "$prompt"
   cat > "$script" <<'PY'
-import sys
+import os, sys
+def read_exact(size):
+    chunks = []
+    while size:
+        chunk = os.read(0, size)
+        if not chunk:
+            raise RuntimeError("early EOF")
+        chunks.append(chunk)
+        size -= len(chunk)
+    return b"".join(chunks)
 with open(sys.argv[1], "wb") as output:
-    output.write(sys.stdin.buffer.read())
+    output.write(read_exact(int(sys.argv[2])))
 PY
-  command="exec python3 '$script' '$capture'"
+  command="exec python3 '$script' '$capture' 22"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
   python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
     || fail "continuation prompt transport rejected byte-verbatim stdin"
@@ -88,11 +97,20 @@ test_prompt_transport_consumes_verified_snapshot_after_mutation() {
   printf 'verified prefix\0verified suffix\377\n' > "$prompt"
   cp "$prompt" "$expected"
   cat > "$script" <<'PY'
-import sys
+import os, sys
+def read_exact(size):
+    chunks = []
+    while size:
+        chunk = os.read(0, size)
+        if not chunk:
+            raise RuntimeError("early EOF")
+        chunks.append(chunk)
+        size -= len(chunk)
+    return b"".join(chunks)
 with open(sys.argv[1], "wb") as output:
-    output.write(sys.stdin.buffer.read())
+    output.write(read_exact(int(sys.argv[2])))
 PY
-  command="exec python3 '$script' '$capture'"
+  command="exec python3 '$script' '$capture' 33"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
   FM_PROMPT_EXEC_TEST_READY="$ready" FM_PROMPT_EXEC_TEST_PROCEED="$proceed" \
     python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" &
@@ -107,8 +125,54 @@ PY
   pass "continuation prompt transport consumes its immutable verified snapshot"
 }
 
+test_prompt_transport_keeps_provider_stdin_interactive() {
+  local transport="$TMP_ROOT/interactive" prompt="$TMP_ROOT/interactive/prompt"
+  local capture="$TMP_ROOT/interactive.capture" script="$TMP_ROOT/interactive.py"
+  local command parent_id file_id content_id driver="$TMP_ROOT/interactive-driver.py"
+  mkdir "$transport"
+  printf 'initial packet' > "$prompt"
+  cat > "$script" <<'PY'
+import os, sys
+def read_exact(size):
+    chunks = []
+    while size:
+        chunk = os.read(0, size)
+        if not chunk:
+            raise RuntimeError("early EOF")
+        chunks.append(chunk)
+        size -= len(chunk)
+    return b"".join(chunks)
+initial = read_exact(14)
+separator = read_exact(1)
+followup = read_exact(16)
+with open(sys.argv[1], "wb") as output:
+    output.write(b"tty=" + str(os.isatty(0)).encode() + b"\n")
+    output.write(initial + b"\n" + separator + b"\n" + followup)
+PY
+  command="exec python3 '$script' '$capture'"
+  parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
+  cat > "$driver" <<'PY'
+import os, pty, subprocess, sys, time
+master, slave = pty.openpty()
+process = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+time.sleep(0.2)
+os.write(master, b"later steering.\r")
+status = process.wait(timeout=5)
+os.close(master)
+raise SystemExit(status)
+PY
+  python3 "$driver" python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
+    || fail "continuation prompt transport did not preserve interactive provider stdin"
+  assert_grep 'tty=True' "$capture" "continuation provider stdin was not a PTY"
+  assert_grep 'initial packet' "$capture" "continuation transport changed the initial packet"
+  assert_grep 'later steering.' "$capture" "continuation transport did not relay later steering"
+  pass "continuation prompt transport preserves interactive provider stdin after initial delivery"
+}
+
 test_prompt_transport_preserves_all_bytes
 test_prompt_transport_rejects_replaced_generation
 test_prompt_transport_rejects_replaced_parent
 test_prompt_transport_rejects_in_place_mutation
 test_prompt_transport_consumes_verified_snapshot_after_mutation
+test_prompt_transport_keeps_provider_stdin_interactive

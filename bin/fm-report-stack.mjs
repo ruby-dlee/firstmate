@@ -712,7 +712,7 @@ function snapshotStateArtifact(stateRoot, file, staged, destinationName, viewLim
 function retentionCohortFor(completedAt) {
   const timestamp = Date.parse(completedAt);
   if (!Number.isFinite(timestamp)) throw new Error(`invalid report completion time: ${completedAt}`);
-  const deadline = Math.floor((timestamp + reportRetentionMs) / reportRetentionCohortMs) * reportRetentionCohortMs;
+  const deadline = Math.ceil((timestamp + reportRetentionMs) / reportRetentionCohortMs) * reportRetentionCohortMs;
   return `cohort-${deadline}`;
 }
 
@@ -915,6 +915,11 @@ function recoverLegacyCutover() {
       runContainedHelper([
         "copy-directory-fd", entry.name, cohortName, entry.name,
       ], [entriesDescriptor, replacement.descriptor], 64 * 1024 * 1024);
+      runContainedHelper(
+        ["rebase-legacy-report-links-fd", cohortName, entry.name],
+        [replacement.descriptor],
+        1024 * 1024,
+      );
       copied += 1;
     }
     if (preparedStale) {
@@ -1421,7 +1426,7 @@ function publish(taskId, legacy) {
       if (hadPrevious) {
         runContainedHelper(
           ["remove-owned-tree-fd", path.basename(previous), previousIdentity],
-          [entriesDescriptor],
+          [entriesDescriptor, retentionTombstoneDescriptor],
           1024 * 1024,
         );
       }
@@ -1445,7 +1450,7 @@ function publish(taskId, legacy) {
         try {
           runContainedHelper(
             ["remove-owned-tree-fd", path.basename(staged), stagedIdentity],
-            [entriesDescriptor],
+            [entriesDescriptor, retentionTombstoneDescriptor],
             1024 * 1024,
           );
         } catch {}

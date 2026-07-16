@@ -2220,6 +2220,16 @@ test_link_carry_count_validation() {
   expect_code 2 "$rc" "link carry without reply context exit"
   assert_grep "relink requires carried reply context" "$err" "link must not silently drop reply context on relink"
   PATH="$BASE_PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-count 1 --carry-ts 1700000000 --carry-platform discord >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "link carry with platform-only context exit"
+  assert_grep "x_platform=discord" "$home/state/ok.meta" "platform-only relink did not preserve its authoritative context"
+  assert_no_grep "x_reply_max_chars=" "$home/state/ok.meta" "platform-only relink invented a reply budget"
+  PATH="$BASE_PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-count 1 --carry-ts 1700000000 --carry-max 280 >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "link carry with budget-only context exit"
+  assert_grep "x_reply_max_chars=280" "$home/state/ok.meta" "budget-only relink did not preserve its authoritative context"
+  assert_no_grep "x_platform=" "$home/state/ok.meta" "budget-only relink invented a platform"
+  PATH="$BASE_PATH" FM_HOME="$home" \
     "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-platform discord >/dev/null 2>"$err"; rc=$?
   expect_code 2 "$rc" "link --carry-platform without paired carry flags exit"
   assert_grep "--carry-platform and --carry-max require --carry-count and --carry-ts" "$err" \
@@ -2650,6 +2660,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_relay_context_response_is_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
+  test_link_carry_count_validation
   exit 0
 fi
 

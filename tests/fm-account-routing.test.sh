@@ -3462,6 +3462,34 @@ SH
   pass "submodule timeouts terminate and reap the command process group"
 }
 
+test_continuation_fingerprint_deadline_covers_ordinary_paths() {
+  local id rec ready proceed output pid status
+  id=account-cont-path-timeout-z36a
+  rec=$(make_case continuation-path-timeout claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "ordinary-path timeout precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/path-timeout.ready"; proceed="$CASE_DIR/path-timeout.proceed"
+  output="$CASE_DIR/path-timeout.out"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=1 \
+    FM_FINGERPRINT_PATHS_TEST_READY="$ready" FM_FINGERPRINT_PATHS_TEST_PROCEED="$proceed" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" path-timeout > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "ordinary-path fingerprint timeout gate did not open"; }
+  sleep 1.2
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "ordinary repository paths ignored the configured fingerprint deadline"
+  assert_contains "$(cat "$output")" "cannot verify continuation repository status" \
+    "ordinary repository path timeout did not fail at repository verification"
+  pass "continuation fingerprint deadline covers ordinary repository paths"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -4555,6 +4583,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
   test_continuation_rejects_symlinked_charter_ancestor
   test_continuation_rejects_present_empty_charter
+  test_continuation_fingerprint_deadline_covers_ordinary_paths
   exit 0
 fi
 
@@ -4644,6 +4673,7 @@ test_continuation_revalidates_exact_repository_status_before_install
 test_continuation_revalidates_dirty_tracked_content_before_install
 test_continuation_revalidates_dirty_untracked_content_before_install
 test_continuation_accepts_stable_tracked_deletion
+test_continuation_fingerprint_deadline_covers_ordinary_paths
 test_continuation_removes_packet_when_repository_changes_during_install
 test_continuation_restores_prior_packet_after_failed_postcheck
 test_continuation_rollback_preserves_concurrent_packet_replacement

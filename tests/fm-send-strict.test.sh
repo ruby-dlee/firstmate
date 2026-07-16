@@ -284,6 +284,36 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
   pass "fm-send strict: unknown managed delivery remains explicitly unconfirmed"
 }
 
+test_managed_steering_intent_precedes_external_submission() {
+  local dir fb home log journal ready proceed sender_pid sender_status intent
+  dir="$TMP_ROOT/managed-prejournal"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home managed-prejournal)
+  log="$dir/tmux.log"; journal="$home/data/managed-prejournal/steering-journal.md"
+  ready="$dir/after-submit.ready"; proceed="$dir/after-submit.proceed"
+  mkdir -p "$home/data/managed-prejournal"
+  : > "$log"
+  fm_write_meta "$home/state/managed-prejournal.meta" \
+    "window=sess:fm-managed-prejournal" "kind=ship" "harness=codex" \
+    "generation_id=account:managed-prejournal:attempt-1" "account_profile=codex-2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_SEND_TEST_AFTER_SUBMIT_READY="$ready" FM_SEND_TEST_AFTER_SUBMIT_PROCEED="$proceed" \
+    "$SEND" managed-prejournal "Journal this before external acceptance." >"$dir/send.out" 2>"$dir/send.err" &
+  sender_pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; /bin/sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$sender_pid" 2>/dev/null || true; fail "managed steering post-submit gate did not open"; }
+  assert_grep 'Journal this before external acceptance.' "$journal" \
+    "managed steering was externally accepted without a durable intent"
+  intent=$(sed -n 's/.*(intent \([0-9a-f]*\) pending).*/\1/p' "$journal")
+  [ -n "$intent" ] || fail "managed steering intent did not have a unique durable key"
+  kill -KILL "$sender_pid" 2>/dev/null || true
+  if wait "$sender_pid"; then sender_status=0; else sender_status=$?; fi
+  [ "$sender_status" -ne 0 ] || fail "managed steering interruption fixture exited successfully"
+  assert_grep "intent $intent pending" "$journal" \
+    "managed steering interruption lost its pending delivery identity"
+  pass "fm-send strict: managed steering is journaled before external submission"
+}
+
 test_concurrent_managed_steering_is_serialized_and_atomic() {
   local dir fb home log trail lock pid rc=0 i count
   local pids=()
@@ -529,6 +559,7 @@ test_healthy_fm_id_send_still_works() {
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_explicit_managed_target_records_steering
+  test_managed_steering_intent_precedes_external_submission
   test_concurrent_managed_steering_is_serialized_and_atomic
   test_managed_send_revalidates_after_respawn_wait
   test_managed_send_holds_lifecycle_through_audit
@@ -539,6 +570,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
   test_unknown_managed_delivery_is_recorded_unconfirmed
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
+  test_managed_steering_intent_precedes_external_submission
   exit 0
 fi
 
@@ -562,6 +598,7 @@ test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
 test_unknown_managed_delivery_is_recorded_unconfirmed
+test_managed_steering_intent_precedes_external_submission
 test_concurrent_managed_steering_is_serialized_and_atomic
 test_managed_send_revalidates_after_respawn_wait
 test_managed_send_holds_lifecycle_through_audit

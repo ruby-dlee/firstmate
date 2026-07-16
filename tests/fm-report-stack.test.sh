@@ -216,6 +216,8 @@ test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
   printf '{"schemaVersion":1,"reportId":"legacy-fresh","taskId":"legacy-fresh","title":"Fresh","summary":"Fresh","completedAt":"2026-07-15T00:00:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
     > "$stack/entries/legacy-fresh/manifest.json"
   printf 'fresh bytes\n' > "$stack/entries/legacy-fresh/report.md"
+  printf '<script src="../../.retention-policy.js"></script><a href="../../index.html">stack</a>\n' \
+    > "$stack/entries/legacy-fresh/report.html"
   printf '{"schemaVersion":1,"reportId":"legacy-fresh-two","taskId":"legacy-fresh-two","title":"Fresh two","summary":"Fresh two","completedAt":"2026-07-15T00:01:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
     > "$stack/entries/legacy-fresh-two/manifest.json"
   printf 'second fresh bytes\n' > "$stack/entries/legacy-fresh-two/report.md"
@@ -250,6 +252,12 @@ test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
     || fail "fresh legacy report was unavailable after atomic cutover"
   assert_grep 'fresh bytes' "$(dirname "$fresh_path")/report.md" \
     "cohort cutover changed fresh legacy artifact bytes"
+  assert_grep 'src="../../../.retention-policy.js"' "$fresh_path" \
+    "cohort cutover did not rebase the migrated retention-policy link"
+  assert_grep 'href="../../../index.html"' "$fresh_path" \
+    "cohort cutover did not rebase the migrated stack-navigation link"
+  assert_no_grep 'src="../../.retention-policy.js"' "$fresh_path" \
+    "cohort cutover retained the flat-entry retention-policy link"
   fresh_path=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path legacy-fresh-two) \
     || fail "second fresh legacy report was unavailable after atomic cutover"
   assert_grep 'second fresh bytes' "$(dirname "$fresh_path")/report.md" \
@@ -292,6 +300,22 @@ test_manifest_cohort_must_match_completion_time() {
   [ "$status" -ne 0 ] || fail "manifest cohort metadata was accepted despite a mismatched completion time"
   assert_contains "$out" "manifest identity mismatch" "manifest cohort-time mismatch failed unclearly"
   pass "report manifests bind cohort metadata to completion time"
+}
+
+test_retention_cohort_never_precedes_exact_expiry() {
+  local id=report-cohort-ceiling-z36a entry manifest completed cohort deadline expiry
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Cohort deadline alignment."
+  run_stack publish "$id" >/dev/null || fail "cohort ceiling publication failed"
+  entry=$(run_stack path "$id") || fail "cohort ceiling path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  completed=$(jq -r '.completedAt' "$manifest")
+  cohort=$(jq -r '.retentionCohort' "$manifest")
+  deadline=${cohort#cohort-}
+  expiry=$(node -e 'process.stdout.write(String(Date.parse(process.argv[1]) + 30 * 24 * 60 * 60 * 1000))' "$completed")
+  [ "$deadline" -ge "$expiry" ] || fail "retention cohort deadline preceded the exact 30-day expiry"
+  [ "$deadline" -lt $((expiry + 300000)) ] || fail "retention cohort ceiling exceeded one cohort"
+  pass "report retention cohorts never expire reports before the published cutoff"
 }
 
 test_republish_new_generation_refreshes_completion_time() {
@@ -2968,14 +2992,15 @@ test_report_publication_restores_swapped_staging_generation() {
 
 test_owned_tree_cleanup_quarantines_before_deletion() {
   local root="$TMP_ROOT/owned-tree-cleanup" owned="$TMP_ROOT/owned-tree-cleanup/owned"
+  local tombstones="$TMP_ROOT/owned-tree-cleanup-tombstones"
   local ready="$TMP_ROOT/owned-tree-cleanup.ready" proceed="$TMP_ROOT/owned-tree-cleanup.proceed"
   local output="$TMP_ROOT/owned-tree-cleanup.out" identity quarantine pid status
-  mkdir -p "$owned/nested"
+  mkdir -p "$owned/nested" "$tombstones"
   printf 'owned generation\n' > "$owned/nested/sentinel"
   identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$owned"; else stat -c '%d:%i' "$owned"; fi)
   FM_CONTAINED_REMOVE_TREE_TEST_READY="$ready" FM_CONTAINED_REMOVE_TREE_TEST_PROCEED="$proceed" \
     python3 "$ROOT/bin/fm-contained-read.py" remove-owned-tree-fd owned "$identity" \
-      3< "$root" > "$output" 2>&1 &
+      3< "$root" 4< "$tombstones" > "$output" 2>&1 &
   pid=$!
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "owned tree quarantine gate did not open"; }
@@ -2988,8 +3013,35 @@ test_owned_tree_cleanup_quarantines_before_deletion() {
   [ "$status" -eq 0 ] || fail "quarantined owned tree cleanup failed: $(cat "$output")"
   assert_grep 'concurrent replacement' "$owned/sentinel" \
     "owned tree cleanup removed a concurrent replacement generation"
-  assert_absent "$root/$quarantine" "owned tree cleanup retained its private quarantine"
+  assert_absent "$tombstones/$quarantine" "owned tree cleanup retained its private quarantine"
   pass "owned tree cleanup quarantines its generation before recursive deletion"
+}
+
+test_interrupted_owned_tree_cleanup_enters_retention_recovery() {
+  local root="$TMP_ROOT/owned-tree-interrupt" owned="$TMP_ROOT/owned-tree-interrupt/owned"
+  local tombstones="$TMP_ROOT/owned-tree-interrupt-tombstones"
+  local ready="$TMP_ROOT/owned-tree-interrupt.ready" proceed="$TMP_ROOT/owned-tree-interrupt.proceed"
+  local output="$TMP_ROOT/owned-tree-interrupt.out" identity quarantine pid status
+  mkdir -p "$owned/nested" "$tombstones"
+  printf 'recoverable generation\n' > "$owned/nested/sentinel"
+  identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$owned"; else stat -c '%d:%i' "$owned"; fi)
+  FM_CONTAINED_REMOVE_TREE_TEST_READY="$ready" FM_CONTAINED_REMOVE_TREE_TEST_PROCEED="$proceed" \
+    python3 "$ROOT/bin/fm-contained-read.py" remove-owned-tree-fd owned "$identity" \
+      3< "$root" 4< "$tombstones" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "interrupted owned tree quarantine gate did not open"; }
+  quarantine=$(cat "$ready")
+  kill -KILL "$pid" 2>/dev/null || true
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "owned tree interruption fixture exited successfully"
+  assert_absent "$owned" "interrupted cleanup restored an expired public generation"
+  assert_grep 'recoverable generation' "$tombstones/$quarantine/nested/sentinel" \
+    "interrupted cleanup did not leave its generation in retention recovery"
+  python3 "$ROOT/bin/fm-contained-read.py" prune-tombstones-fd 10 3< "$tombstones" >/dev/null \
+    || fail "retention recovery did not sweep an interrupted owned tree"
+  assert_absent "$tombstones/$quarantine" "retention recovery left the interrupted owned tree indefinitely"
+  pass "interrupted owned tree cleanup remains enrolled in retention recovery"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
@@ -3075,6 +3127,8 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
   test_retention_cutoff_is_authoritative_before_cleanup
   test_retention_fresh_handoff_is_cohort_bounded_and_continuous
   test_owned_tree_cleanup_quarantines_before_deletion
+  test_interrupted_owned_tree_cleanup_enters_retention_recovery
+  test_retention_cohort_never_precedes_exact_expiry
   exit 0
 fi
 
@@ -3168,6 +3222,7 @@ test_retention_error_publication_is_atomic_and_nonfollowing
 test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
 test_retention_owner_advances_pending_legacy_migration
 test_manifest_cohort_must_match_completion_time
+test_retention_cohort_never_precedes_exact_expiry
 test_retention_cutoff_is_authoritative_before_cleanup
 test_retention_cohort_tombstone_is_noreplace_owned
 test_retention_cohort_source_swap_restores_replacement
@@ -3179,6 +3234,7 @@ test_retention_fresh_handoff_is_cohort_bounded_and_continuous
 test_report_entry_manifest_reads_stay_on_pinned_generation
 test_report_publication_restores_swapped_staging_generation
 test_owned_tree_cleanup_quarantines_before_deletion
+test_interrupted_owned_tree_cleanup_enters_retention_recovery
 test_retention_activation_requires_launched_nonce_without_owner_gap
 test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline
 test_retention_pointer_failure_retires_only_candidate

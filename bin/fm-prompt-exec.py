@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import hashlib
+import errno
+import fcntl
 import os
+import selectors
+import signal
 import stat
 import sys
+import termios
 import time
+import tty
 
 
 def fail(message):
@@ -88,22 +94,110 @@ if cleanup_only:
 command = os.fsencode(sys.argv[5])
 if snapshot is None:
     fail("prompt snapshot is unavailable")
-read_descriptor, write_descriptor = os.pipe()
-writer = os.fork()
-if writer == 0:
-    os.close(read_descriptor)
+
+child, terminal = os.forkpty()
+if child == 0:
+    tty.setraw(0, termios.TCSANOW)
+    os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())
+
+
+def copy_window_size():
     try:
-        view = memoryview(snapshot)
-        while view:
-            written = os.write(write_descriptor, view)
-            view = view[written:]
-    except BrokenPipeError:
+        size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(terminal, termios.TIOCSWINSZ, size)
+    except OSError:
         pass
-    finally:
-        os.close(write_descriptor)
-    os._exit(0)
-os.close(write_descriptor)
-os.dup2(read_descriptor, 0)
-if read_descriptor != 0:
-    os.close(read_descriptor)
-os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())
+
+
+def forward_signal(signum, _frame):
+    try:
+        os.kill(child, signum)
+    except ProcessLookupError:
+        pass
+
+
+copy_window_size()
+signal.signal(signal.SIGWINCH, lambda signum, frame: copy_window_size())
+for forwarded in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
+    signal.signal(forwarded, forward_signal)
+
+os.set_blocking(terminal, False)
+selector = selectors.DefaultSelector()
+pending = memoryview(snapshot + b"\r")
+selector.register(terminal, selectors.EVENT_READ | selectors.EVENT_WRITE)
+stdin_registered = False
+child_status = None
+try:
+    while True:
+        if child_status is None:
+            waited, status = os.waitpid(child, os.WNOHANG)
+            if waited == child:
+                child_status = status
+        if child_status is not None and terminal not in selector.get_map():
+            break
+        for key, events in selector.select(timeout=0.1):
+            if key.fd == terminal:
+                if events & selectors.EVENT_WRITE and pending:
+                    try:
+                        written = os.write(terminal, pending)
+                        pending = pending[written:]
+                    except BlockingIOError:
+                        pass
+                    if not pending:
+                        selector.modify(terminal, selectors.EVENT_READ)
+                        try:
+                            os.set_blocking(0, False)
+                            selector.register(0, selectors.EVENT_READ)
+                            stdin_registered = True
+                        except OSError:
+                            pass
+                if events & selectors.EVENT_READ:
+                    try:
+                        output = os.read(terminal, 65536)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            output = b""
+                        else:
+                            raise
+                    if output:
+                        view = memoryview(output)
+                        while view:
+                            try:
+                                written = os.write(1, view)
+                                view = view[written:]
+                            except BlockingIOError:
+                                continue
+                    else:
+                        selector.unregister(terminal)
+            elif key.fd == 0:
+                try:
+                    incoming = os.read(0, 65536)
+                except BlockingIOError:
+                    continue
+                if incoming:
+                    view = memoryview(incoming)
+                    while view:
+                        try:
+                            written = os.write(terminal, view)
+                            view = view[written:]
+                        except BlockingIOError:
+                            continue
+                else:
+                    selector.unregister(0)
+                    stdin_registered = False
+finally:
+    if stdin_registered:
+        try:
+            selector.unregister(0)
+        except Exception:
+            pass
+    selector.close()
+    os.close(terminal)
+    if child_status is None:
+        _, child_status = os.waitpid(child, 0)
+
+if os.WIFEXITED(child_status):
+    raise SystemExit(os.WEXITSTATUS(child_status))
+if os.WIFSIGNALED(child_status):
+    raise SystemExit(128 + os.WTERMSIG(child_status))
+raise SystemExit(1)

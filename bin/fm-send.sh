@@ -261,6 +261,51 @@ else
   if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
   fi
+  persist_managed_steering() (  # <file-name> <header> <annotation> <message...>
+    local file_name=$1 header=$2 annotation=$3
+    shift 3
+    local steering_id steering_dir steering_file steering_lock
+    steering_id=$(fm_send_id_from_meta "$TARGET_META")
+    steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
+    trap 'fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true' EXIT
+    trap 'exit 1' HUP INT TERM
+    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
+    steering_file="$steering_dir/$file_name"
+    fm_account_safe_task_file "$steering_file" || return 1
+    {
+      printf -- '- %s%s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$annotation"
+      if [ "$#" -gt 0 ]; then
+        printf '%s\n' "$*" | sed 's/^/> /'
+        printf '\n'
+      fi
+    } | node "$SCRIPT_DIR/fm-task-file-append.mjs" "$DATA" "$steering_id" "$file_name" "$header"
+  )
+  record_managed_steering() {
+    persist_managed_steering steering.md '# Steering trail' '' "$@"
+  }
+  record_pending_managed_steering() {
+    persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
+  }
+  record_unconfirmed_managed_steering() {
+    persist_managed_steering steering-unconfirmed.md '# Unconfirmed steering' ' (delivery unconfirmed)' "$@"
+  }
+  record_managed_delivery_event() {
+    if [ "$#" -gt 1 ]; then
+      persist_managed_steering steering-journal.md '# Steering delivery journal' " (intent $STEERING_EVENT_ID $1)" "$2"
+    else
+      persist_managed_steering steering-journal.md '# Steering delivery journal' " (intent $STEERING_EVENT_ID $1)"
+    fi
+  }
+  if [ -n "$MANAGED_STEERING_ID" ]; then
+    STEERING_EVENT_ID=$(python3 -c 'import secrets; print(secrets.token_hex(16))') || {
+      echo "error: could not allocate a managed steering intent id" >&2
+      exit 1
+    }
+    if ! record_managed_delivery_event pending "$MESSAGE"; then
+      echo "error: managed steering intent could not be durably recorded before delivery" >&2
+      exit 1
+    fi
+  fi
   # Slash commands open a completion popup in some TUIs (verified on codex);
   # submitting too fast selects nothing, so give the popup time to settle before
   # the (retried) Enter. Codex opens the same kind of popup for a `$<skill>`
@@ -281,54 +326,39 @@ else
   # Type once, submit, verify. Lenient: only a positively-confirmed swallow
   # (text still in the composer) is an error; an unreadable pane is assumed sent.
   if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"); then
+    [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
     echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
   fi
+  if [ -n "${FM_SEND_TEST_AFTER_SUBMIT_READY:-}" ] && [ -n "${FM_SEND_TEST_AFTER_SUBMIT_PROCEED:-}" ]; then
+    : > "$FM_SEND_TEST_AFTER_SUBMIT_READY"
+    while [ ! -e "$FM_SEND_TEST_AFTER_SUBMIT_PROCEED" ]; do sleep 0.01; done
+  fi
   case "$verdict" in
     pending)
+      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event not-submitted >/dev/null 2>&1 || true
       echo "error: text not submitted to $T (Enter swallowed; text left in composer; tried $RESOLUTION_TRIED)" >&2
       exit 1
       ;;
     send-failed)
+      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
       echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
       exit 1
       ;;
   esac
-  persist_managed_steering() (  # <file-name> <header> <annotation> <message...>
-    local file_name=$1 header=$2 annotation=$3
-    shift 3
-    local steering_id steering_dir steering_file steering_lock
-    steering_id=$(fm_send_id_from_meta "$TARGET_META")
-    steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
-    trap 'fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true' EXIT
-    trap 'exit 1' HUP INT TERM
-    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
-    steering_file="$steering_dir/$file_name"
-    fm_account_safe_task_file "$steering_file" || return 1
-    {
-      printf -- '- %s%s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$annotation"
-      printf '%s\n' "$*" | sed 's/^/> /'
-      printf '\n'
-    } | node "$SCRIPT_DIR/fm-task-file-append.mjs" "$DATA" "$steering_id" "$file_name" "$header"
-  )
-  record_managed_steering() {
-    persist_managed_steering steering.md '# Steering trail' '' "$@"
-  }
-  record_pending_managed_steering() {
-    persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
-  }
-  record_unconfirmed_managed_steering() {
-    persist_managed_steering steering-unconfirmed.md '# Unconfirmed steering' ' (delivery unconfirmed)' "$@"
-  }
   if [ -n "$MANAGED_STEERING_ID" ]; then
     if [ "$verdict" = unknown ]; then
-      if record_unconfirmed_managed_steering "$@"; then
+      record_managed_delivery_event unconfirmed >/dev/null 2>&1 || true
+      if record_unconfirmed_managed_steering "$MESSAGE"; then
         echo "warning: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
       else
         echo "warning: text delivery to $T could not be confirmed or durably recorded" >&2
       fi
-    elif ! record_managed_steering "$@"; then
-      if record_pending_managed_steering "$@"; then
+    else
+      record_managed_delivery_event confirmed >/dev/null 2>&1 || true
+    fi
+    if [ "$verdict" != unknown ] && ! record_managed_steering "$MESSAGE"; then
+      if record_pending_managed_steering "$MESSAGE"; then
         echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
       else
         echo "warning: text was sent to $T but its managed steering delivery could not be durably recorded" >&2

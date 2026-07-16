@@ -2036,7 +2036,7 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_prompt_marker="\"$continuation_prompt_command\""
   case "$HARNESS" in
     claude) continuation_prompt_reference= ;;
-    codex) continuation_prompt_reference=- ;;
+    codex) continuation_prompt_reference= ;;
     *) echo "error: continuation prompt stdin transport supports only claude and codex" >&2; exit 1 ;;
   esac
   LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}

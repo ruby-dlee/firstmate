@@ -318,6 +318,23 @@ test_retention_cohort_never_precedes_exact_expiry() {
   pass "report retention cohorts never expire reports before the published cutoff"
 }
 
+test_retention_cohort_and_sweep_share_drift_budget() {
+  local stack="$TMP_ROOT/retention-drift-budget-stack" out status
+  mkdir -p "$stack/entries"
+  if out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_COHORT_MS=691200000 FM_REPORT_RETENTION_INTERVAL=691200 \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention accepted cohort and sweep drift beyond 15 days"
+  assert_contains "$out" "must not exceed 15 days" \
+    "retention joint drift rejection was not actionable"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_COHORT_MS=604800000 FM_REPORT_RETENTION_INTERVAL=691200 \
+    "$SCRIPT" prune --status >/dev/null \
+    || fail "retention rejected cohort and sweep drift at the 15-day boundary"
+  pass "retention jointly bounds cohort and sweep drift to 15 days"
+}
+
 test_retention_guard_cannot_advance_minimum_age() {
   local stack="$TMP_ROOT/retention-minimum-age-stack" before after completed deadline cohort cutoff
   local retention_ms=2592000000 id legacy_id
@@ -3197,6 +3214,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-38 ]; then
+  test_retention_cohort_and_sweep_share_drift_budget
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-parser ]; then
   test_nested_list_parent_scope_hides_required_headings
   test_blockquote_list_scope_requires_quote_markers
@@ -3288,6 +3310,7 @@ test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
 test_retention_owner_advances_pending_legacy_migration
 test_manifest_cohort_must_match_completion_time
 test_retention_cohort_never_precedes_exact_expiry
+test_retention_cohort_and_sweep_share_drift_budget
 test_retention_cutoff_is_authoritative_before_cleanup
 test_retention_cohort_tombstone_is_noreplace_owned
 test_retention_cohort_source_swap_restores_replacement

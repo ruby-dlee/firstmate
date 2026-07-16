@@ -3530,6 +3530,115 @@ test_continuation_fingerprint_deadline_covers_ordinary_paths() {
   pass "continuation fingerprint deadline covers ordinary repository paths"
 }
 
+test_continuation_deadline_starts_before_repository_enumeration() {
+  local id rec ready proceed output pid status real_git
+  id=account-cont-enumeration-timeout-z38a
+  rec=$(make_case continuation-enumeration-timeout claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "enumeration timeout precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/enumeration-timeout.ready"; proceed="$CASE_DIR/enumeration-timeout.proceed"
+  output="$CASE_DIR/enumeration-timeout.out"
+  real_git=$(command -v git)
+  cat > "$FAKEBIN_DIR/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_CONTINUATION_ENUMERATION_TEST:-}" = timeout ] \
+  && [ "$*" = "status --porcelain=v2 --branch -z" ]; then
+  : > "$FM_CONTINUATION_ENUMERATION_READY"
+  while [ ! -e "$FM_CONTINUATION_ENUMERATION_PROCEED" ]; do sleep 0.01; done
+fi
+exec "$FM_CONTINUATION_REAL_GIT" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/git"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=1 \
+    FM_CONTINUATION_ENUMERATION_TEST=timeout FM_CONTINUATION_ENUMERATION_READY="$ready" \
+    FM_CONTINUATION_ENUMERATION_PROCEED="$proceed" FM_CONTINUATION_REAL_GIT="$real_git" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" enumeration-timeout > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "repository enumeration timeout gate did not open"; }
+  sleep 1.2
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "repository enumeration ignored the continuation deadline"
+  assert_contains "$(cat "$output")" "repository fingerprint exceeds its time limit" \
+    "repository enumeration timeout did not preserve the monotonic deadline diagnostic"
+  assert_contains "$(cat "$output")" "FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS" \
+    "repository enumeration timeout did not provide actionable configuration guidance"
+  pass "continuation deadline starts before repository enumeration"
+}
+
+test_continuation_caps_repository_enumeration_output() {
+  local id rec output status real_git
+  id=account-cont-enumeration-limit-z38b
+  rec=$(make_case continuation-enumeration-limit claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "enumeration output precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  output="$CASE_DIR/enumeration-limit.out"
+  real_git=$(command -v git)
+  cat > "$FAKEBIN_DIR/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_CONTINUATION_ENUMERATION_TEST:-}" = oversized ] \
+  && [ "$*" = "status --porcelain=v2 --branch -z" ]; then
+  head -c 2048 /dev/zero | tr '\0' x
+  exit 0
+fi
+exec "$FM_CONTINUATION_REAL_GIT" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/git"
+  if FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=1024 \
+    FM_CONTINUATION_ENUMERATION_TEST=oversized FM_CONTINUATION_REAL_GIT="$real_git" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" enumeration-limit > "$output" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "continuation accepted oversized repository enumeration output"
+  assert_contains "$(cat "$output")" "repository enumeration or identity output exceeds its byte limit" \
+    "oversized repository enumeration did not report its bound"
+  assert_contains "$(cat "$output")" "FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES" \
+    "oversized repository enumeration did not provide actionable configuration guidance"
+  pass "continuation caps repository enumeration output"
+}
+
+test_continuation_deadline_covers_repository_parsing() {
+  local id rec ready proceed output pid status
+  id=account-cont-parse-timeout-z38c
+  rec=$(make_case continuation-parse-timeout claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "repository parsing timeout precondition spawn failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  ready="$CASE_DIR/parse-timeout.ready"; proceed="$CASE_DIR/parse-timeout.proceed"
+  output="$CASE_DIR/parse-timeout.out"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=1 \
+    FM_REPOSITORY_IDENTITY_PARSE_TEST_READY="$ready" \
+    FM_REPOSITORY_IDENTITY_PARSE_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" parse-timeout > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "repository parsing timeout gate did not open"; }
+  sleep 1.2
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "repository enumeration parsing ignored the continuation deadline"
+  assert_contains "$(cat "$output")" "repository fingerprint exceeds its time limit" \
+    "repository parsing timeout did not preserve the monotonic deadline diagnostic"
+  pass "continuation deadline covers repository enumeration parsing"
+}
+
 test_continuation_fingerprint_budget_spans_all_path_classes() {
   local root="$TMP_ROOT/shared-fingerprint-budget" tracked submodules untracked output status
   root="$root/root"
@@ -4728,6 +4837,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-38 ]; then
+  run_isolated_test test_continuation_deadline_starts_before_repository_enumeration
+  run_isolated_test test_continuation_caps_repository_enumeration_output
+  run_isolated_test test_continuation_deadline_covers_repository_parsing
+  run_isolated_test test_continuation_fingerprint_deadline_covers_ordinary_paths
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
@@ -4815,6 +4932,9 @@ run_isolated_test test_continuation_revalidates_dirty_tracked_content_before_ins
 run_isolated_test test_continuation_revalidates_dirty_untracked_content_before_install
 run_isolated_test test_continuation_accepts_stable_tracked_deletion
 run_isolated_test test_continuation_fingerprint_deadline_covers_ordinary_paths
+run_isolated_test test_continuation_deadline_starts_before_repository_enumeration
+run_isolated_test test_continuation_caps_repository_enumeration_output
+run_isolated_test test_continuation_deadline_covers_repository_parsing
 run_isolated_test test_continuation_removes_packet_when_repository_changes_during_install
 run_isolated_test test_continuation_restores_prior_packet_after_failed_postcheck
 run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replacement

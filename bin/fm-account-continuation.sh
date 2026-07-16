@@ -32,10 +32,6 @@ PACKET_LOCK_TOKEN=
 STATUS_SNAPSHOT_TMP=
 STATUS_IDENTITY_TMP=
 STATUS_REVALIDATION_TMP=
-REPOSITORY_PATHS_TMP=
-REPOSITORY_INDEX_TMP=
-SUBMODULE_PATHS_TMP=
-UNTRACKED_PATHS_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
@@ -45,6 +41,7 @@ MAX_PACKET_BYTES=65536
 MAX_SNAPSHOT_BYTES=8192
 MAX_REPOSITORY_FINGERPRINT_FILES=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES:-100000}
 MAX_REPOSITORY_FINGERPRINT_BYTES=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES:-268435456}
+MAX_REPOSITORY_ENUMERATION_BYTES=${FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES:-33554432}
 MAX_REPOSITORY_FINGERPRINT_SECONDS=${FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS:-30}
 NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
 path_identity() {
@@ -156,10 +153,6 @@ cleanup_packet_tmp() {
   [ -z "$STATUS_SNAPSHOT_TMP" ] || rm -f "$STATUS_SNAPSHOT_TMP"
   [ -z "$STATUS_IDENTITY_TMP" ] || rm -f "$STATUS_IDENTITY_TMP"
   [ -z "$STATUS_REVALIDATION_TMP" ] || rm -f "$STATUS_REVALIDATION_TMP"
-  [ -z "$REPOSITORY_PATHS_TMP" ] || rm -f "$REPOSITORY_PATHS_TMP"
-  [ -z "$REPOSITORY_INDEX_TMP" ] || rm -f "$REPOSITORY_INDEX_TMP"
-  [ -z "$SUBMODULE_PATHS_TMP" ] || rm -f "$SUBMODULE_PATHS_TMP"
-  [ -z "$UNTRACKED_PATHS_TMP" ] || rm -f "$UNTRACKED_PATHS_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
@@ -184,6 +177,9 @@ case "$MAX_REPOSITORY_FINGERPRINT_FILES" in
 esac
 case "$MAX_REPOSITORY_FINGERPRINT_BYTES" in
   ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES must be a positive integer" >&2; exit 2 ;;
+esac
+case "$MAX_REPOSITORY_ENUMERATION_BYTES" in
+  ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES must be a positive integer" >&2; exit 2 ;;
 esac
 case "$MAX_REPOSITORY_FINGERPRINT_SECONDS" in
   ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS must be a positive integer" >&2; exit 2 ;;
@@ -260,56 +256,20 @@ BRANCH=$(git_pinned branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 STATUS_IDENTITY_TMP=$(mktemp "$STATE/.continuation-status-identity-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation repository status identity for $ID" >&2; exit 1; }
-REPOSITORY_PATHS_TMP=$(mktemp "$STATE/.continuation-repository-paths-$ID.XXXXXX") \
-  || { echo "error: cannot stage continuation repository paths for $ID" >&2; exit 1; }
-REPOSITORY_INDEX_TMP=$(mktemp "$STATE/.continuation-repository-index-$ID.XXXXXX") \
-  || { echo "error: cannot stage continuation repository index for $ID" >&2; exit 1; }
-SUBMODULE_PATHS_TMP=$(mktemp "$STATE/.continuation-submodules-$ID.XXXXXX") \
-  || { echo "error: cannot stage continuation submodule paths for $ID" >&2; exit 1; }
-UNTRACKED_PATHS_TMP=$(mktemp "$STATE/.continuation-untracked-$ID.XXXXXX") \
-  || { echo "error: cannot stage continuation untracked paths for $ID" >&2; exit 1; }
-
-split_repository_index_paths() {
-  python3 - "$REPOSITORY_INDEX_TMP" "$REPOSITORY_PATHS_TMP" "$SUBMODULE_PATHS_TMP" <<'PY'
-import sys
-source, tracked, submodules = sys.argv[1:]
-tracked_output = open(tracked, "wb")
-submodule_output = open(submodules, "wb")
-try:
-    for record in open(source, "rb").read().split(b"\0"):
-        if not record:
-            continue
-        metadata, path = record.split(b"\t", 1)
-        mode = metadata.split(b" ", 1)[0]
-        destination = submodule_output if mode == b"160000" else tracked_output
-        destination.write(path + b"\0")
-finally:
-    tracked_output.close()
-    submodule_output.close()
-PY
-}
 
 capture_repository_identity() {
   local output=$1
-  {
-    printf 'status\0'
-    git_pinned status --porcelain=v2 --branch -z || return 1
-    printf '\0index\0'
-    git_pinned ls-files --stage -z > "$REPOSITORY_INDEX_TMP" || return 1
-    cat "$REPOSITORY_INDEX_TMP" || return 1
-    split_repository_index_paths || return 1
-    git_pinned ls-files --others --exclude-standard -z > "$UNTRACKED_PATHS_TMP" \
-      || return 1
-    printf '\0'
-    python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-repository-fd \
-      "$REPOSITORY_PATHS_TMP" "$SUBMODULE_PATHS_TMP" "$UNTRACKED_PATHS_TMP" \
-      "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
-      "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9 || return 1
-  } > "$output" 2>/dev/null
+  python3 "$SCRIPT_DIR/fm-contained-read.py" repository-identity-fd \
+    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
+    "$MAX_REPOSITORY_ENUMERATION_BYTES" "$MAX_REPOSITORY_FINGERPRINT_SECONDS" \
+    3<&9 > "$output"
 }
 
 capture_repository_identity "$STATUS_IDENTITY_TMP" \
-  || { echo "error: cannot verify continuation repository status for $ID" >&2; exit 1; }
+  || {
+    echo "error: cannot verify continuation repository status for $ID; reduce repository scope or adjust FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS, FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES, FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES, or FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES" >&2
+    exit 1
+  }
 
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }

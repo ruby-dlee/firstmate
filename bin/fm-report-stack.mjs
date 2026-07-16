@@ -51,8 +51,11 @@ const visualDepthLimit = 24;
 const visualBytesLimit = 20 * 1024 * 1024;
 const visualInventoryLimit = visualEntryLimit * visualDepthLimit * 255 * 6 + visualEntryLimit * 32 + 1024;
 const reportRetentionMs = 30 * 24 * 60 * 60 * 1000;
+const reportRetentionDriftMs = 15 * 24 * 60 * 60 * 1000;
 const reportRetentionBatch = Number.parseInt(process.env.FM_REPORT_RETENTION_BATCH || "4", 10);
-const reportRetentionCohortMs = Number.parseInt(process.env.FM_REPORT_RETENTION_COHORT_MS || String(5 * 60 * 1000), 10);
+const reportRetentionCohortMs = Number(process.env.FM_REPORT_RETENTION_COHORT_MS || String(5 * 60 * 1000));
+const reportRetentionSweepSeconds = Number(process.env.FM_REPORT_RETENTION_INTERVAL || "300");
+const reportRetentionSweepMs = reportRetentionSweepSeconds * 1000;
 const retentionPolicyName = ".retention-policy.js";
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
 const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
@@ -1115,9 +1118,15 @@ function nextRetentionPolicy() {
   if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
   }
-  if (!Number.isSafeInteger(reportRetentionCohortMs) || reportRetentionCohortMs <= 0
-    || reportRetentionCohortMs > reportRetentionMs) {
-    throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer no greater than 30 days");
+  if (!Number.isSafeInteger(reportRetentionCohortMs) || reportRetentionCohortMs <= 0) {
+    throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer");
+  }
+  if (!Number.isSafeInteger(reportRetentionSweepSeconds) || reportRetentionSweepSeconds <= 0
+    || !Number.isSafeInteger(reportRetentionSweepMs)) {
+    throw new Error("FM_REPORT_RETENTION_INTERVAL must be a positive integer number of seconds");
+  }
+  if (reportRetentionCohortMs + reportRetentionSweepMs > reportRetentionDriftMs) {
+    throw new Error("FM_REPORT_RETENTION_COHORT_MS plus FM_REPORT_RETENTION_INTERVAL must not exceed 15 days");
   }
   const previous = readRetentionPolicy();
   const policy = {

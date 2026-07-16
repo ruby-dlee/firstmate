@@ -76,12 +76,15 @@ def same_file(first, second):
 
 
 class FingerprintBudget:
-    def __init__(self, maximum_files, maximum_bytes, maximum_seconds=None):
+    def __init__(self, maximum_files, maximum_bytes, maximum_seconds=None, maximum_output_bytes=None):
         self.maximum_files = maximum_files
         self.maximum_bytes = maximum_bytes
+        self.maximum_output_bytes = maximum_output_bytes if maximum_output_bytes is not None else maximum_bytes
         self.deadline = time.monotonic() + maximum_seconds if maximum_seconds is not None else None
         self.files = 0
         self.bytes = 0
+        self.paths = 0
+        self.output_bytes = 0
 
     def check_time(self):
         if self.deadline is not None and time.monotonic() > self.deadline:
@@ -100,8 +103,30 @@ class FingerprintBudget:
         if self.bytes > self.maximum_bytes:
             fail("repository fingerprint exceeds its byte limit")
 
+    def consume_path(self):
+        self.check_time()
+        self.paths += 1
+        if self.paths > self.maximum_files:
+            fail("repository enumeration exceeds its path-count limit")
 
-def fingerprint_descriptor(descriptor, relative, records, budget):
+    def consume_output(self, size):
+        self.check_time()
+        self.output_bytes += size
+        if self.output_bytes > self.maximum_output_bytes:
+            fail("repository enumeration or identity output exceeds its byte limit")
+
+
+def write_identity(output, value, budget):
+    budget.consume_output(len(value))
+    output.write(value)
+
+
+def write_fingerprint(output, relative, kind, mode, digest, budget):
+    write_identity(output, relative.encode("utf-8", "surrogateescape"), budget)
+    write_identity(output, f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"), budget)
+
+
+def fingerprint_descriptor(descriptor, relative, output, budget):
     opened = os.fstat(descriptor)
     if stat.S_ISREG(opened.st_mode):
         budget.consume(opened.st_size)
@@ -116,14 +141,14 @@ def fingerprint_descriptor(descriptor, relative, records, budget):
             offset += len(chunk)
         if not same_file(opened, os.fstat(descriptor)):
             fail(f"repository file changed while fingerprinting: {relative}")
-        records.append((relative, "file", opened.st_mode, digest.hexdigest()))
+        write_fingerprint(output, relative, "file", opened.st_mode, digest.hexdigest(), budget)
         return
     if not stat.S_ISDIR(opened.st_mode):
         budget.consume(0)
-        records.append((relative, "special", opened.st_mode, "special"))
+        write_fingerprint(output, relative, "special", opened.st_mode, "special", budget)
         return
     budget.consume(0)
-    records.append((relative, "directory", opened.st_mode, "directory"))
+    write_fingerprint(output, relative, "directory", opened.st_mode, "directory", budget)
     for name in sorted(os.listdir(descriptor)):
         child_relative = f"{relative}/{name}" if relative else name
         before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
@@ -133,7 +158,14 @@ def fingerprint_descriptor(descriptor, relative, records, budget):
             if not same_file(before, after):
                 fail(f"repository symlink changed while fingerprinting: {child_relative}")
             budget.consume(len(target))
-            records.append((child_relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+            write_fingerprint(
+                output,
+                child_relative,
+                "symlink",
+                before.st_mode,
+                hashlib.sha256(target).hexdigest(),
+                budget,
+            )
             continue
         flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
         child = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
@@ -141,13 +173,40 @@ def fingerprint_descriptor(descriptor, relative, records, budget):
             actual = os.fstat(child)
             if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
                 fail(f"repository path changed while fingerprinting: {child_relative}")
-            fingerprint_descriptor(child, child_relative, records, budget)
+            fingerprint_descriptor(child, child_relative, output, budget)
         finally:
             os.close(child)
 
 
-def fingerprint_paths(root, paths_file, budget, output):
-    paths = open(paths_file, "rb").read().split(b"\0")
+def nul_records(value, budget):
+    start = 0
+    while start < len(value):
+        budget.check_time()
+        end = value.find(b"\0", start)
+        if end < 0:
+            fail("repository enumeration is not NUL terminated")
+        record = value[start:end]
+        start = end + 1
+        if record:
+            budget.consume_path()
+            yield record
+
+
+def bounded_path_file(path, budget):
+    opened = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(opened.st_mode):
+        fail("repository path inventory is not a regular file")
+    if opened.st_size > budget.maximum_output_bytes:
+        fail("repository path inventory exceeds its byte limit")
+    with open(path, "rb") as source:
+        value = source.read(budget.maximum_output_bytes + 1)
+    budget.check_time()
+    if len(value) > budget.maximum_output_bytes:
+        fail("repository path inventory exceeds its byte limit")
+    return value
+
+
+def fingerprint_paths_records(root, paths, budget, output):
     ready = os.environ.get("FM_FINGERPRINT_PATHS_TEST_READY")
     proceed = os.environ.get("FM_FINGERPRINT_PATHS_TEST_PROCEED")
     if ready and proceed:
@@ -156,7 +215,6 @@ def fingerprint_paths(root, paths_file, budget, output):
         while not os.path.exists(proceed):
             time.sleep(0.01)
         budget.check_time()
-    records = []
     for raw in paths:
         if not raw:
             continue
@@ -176,7 +234,14 @@ def fingerprint_paths(root, paths_file, budget, output):
                     if not same_file(before, after):
                         fail(f"repository symlink changed while fingerprinting: {relative}")
                     budget.consume(len(target))
-                    records.append((relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+                    write_fingerprint(
+                        output,
+                        relative,
+                        "symlink",
+                        before.st_mode,
+                        hashlib.sha256(target).hexdigest(),
+                        budget,
+                    )
                 else:
                     flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
                     item = os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
@@ -184,16 +249,18 @@ def fingerprint_paths(root, paths_file, budget, output):
                         actual = os.fstat(item)
                         if actual.st_dev != before.st_dev or actual.st_ino != before.st_ino:
                             fail(f"repository path changed while fingerprinting: {relative}")
-                        fingerprint_descriptor(item, relative, records, budget)
+                        fingerprint_descriptor(item, relative, output, budget)
                     finally:
                         os.close(item)
             finally:
                 os.close(parent)
         except FileNotFoundError:
-            records.append((relative, "missing", 0, "missing"))
-    for relative, kind, mode, digest in records:
-        output.write(relative.encode("utf-8", "surrogateescape"))
-        output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+            write_fingerprint(output, relative, "missing", 0, "missing", budget)
+
+
+def fingerprint_paths(root, paths_file, budget, output):
+    value = bounded_path_file(paths_file, budget)
+    fingerprint_paths_records(root, nul_records(value, budget), budget, output)
 
 
 def command_fingerprint_paths_fd(arguments):
@@ -226,7 +293,7 @@ def bounded_command_output(command, budget):
             for key, _ in selector.select(timeout=0.1):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if chunk:
-                    budget.consume_bytes(len(chunk))
+                    budget.consume_output(len(chunk))
                     output.append(chunk)
                 else:
                     selector.unregister(key.fileobj)
@@ -238,28 +305,43 @@ def bounded_command_output(command, budget):
     except BaseException:
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             try:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
                 break
+            except PermissionError:
+                if process.poll() is not None:
+                    break
             time.sleep(0.01)
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
         raise
     finally:
         selector.close()
         process.stdout.close()
 
 
-def fingerprint_submodules(root, paths_file, budget, output):
-    paths = [item for item in open(paths_file, "rb").read().split(b"\0") if item]
+def fingerprint_submodule_records(root, paths, budget, output):
     for raw in paths:
         relative = raw.decode("utf-8", "surrogateescape")
         descriptor = open_relative(root, relative, os.O_RDONLY | os.O_DIRECTORY)
@@ -280,12 +362,11 @@ def fingerprint_submodules(root, paths_file, budget, output):
                     budget,
                 ).split(b"\0")
             except subprocess.CalledProcessError:
-                output.write(b"submodule\0" + raw + b"\0unavailable\0")
+                write_identity(output, b"submodule\0" + raw + b"\0unavailable\0", budget)
                 continue
         finally:
             os.fchdir(root)
             os.close(descriptor)
-        records = []
         prefix = f"{relative}/"
         for item in untracked:
             if not item:
@@ -305,7 +386,14 @@ def fingerprint_submodules(root, paths_file, budget, output):
                     if not same_file(before, after):
                         fail(f"repository symlink changed while fingerprinting: {item_relative}")
                     budget.consume(len(target))
-                    records.append((item_relative, "symlink", before.st_mode, hashlib.sha256(target).hexdigest()))
+                    write_fingerprint(
+                        output,
+                        item_relative,
+                        "symlink",
+                        before.st_mode,
+                        hashlib.sha256(target).hexdigest(),
+                        budget,
+                    )
                 else:
                     flags = os.O_RDONLY | (os.O_DIRECTORY if stat.S_ISDIR(before.st_mode) else 0)
                     item_descriptor = os.open(
@@ -315,17 +403,19 @@ def fingerprint_submodules(root, paths_file, budget, output):
                         opened = os.fstat(item_descriptor)
                         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                             fail(f"repository path changed while fingerprinting: {item_relative}")
-                        fingerprint_descriptor(item_descriptor, item_relative, records, budget)
+                        fingerprint_descriptor(item_descriptor, item_relative, output, budget)
                     finally:
                         os.close(item_descriptor)
             finally:
                 os.close(parent)
-        output.write(b"submodule\0" + raw + b"\0")
+        write_identity(output, b"submodule\0" + raw + b"\0", budget)
         for value in command_output:
-            output.write(value + b"\0")
-        for item_relative, kind, mode, digest in records:
-            output.write(item_relative.encode("utf-8", "surrogateescape"))
-            output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+            write_identity(output, value + b"\0", budget)
+
+
+def fingerprint_submodules(root, paths_file, budget, output):
+    value = bounded_path_file(paths_file, budget)
+    fingerprint_submodule_records(root, nul_records(value, budget), budget, output)
 
 
 def command_fingerprint_submodules_fd(arguments):
@@ -355,12 +445,76 @@ def command_fingerprint_repository_fd(arguments):
         fail("repository fingerprint limits must be positive")
     budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
     output = sys.stdout.buffer
-    output.write(b"worktree-content\0")
+    write_identity(output, b"worktree-content\0", budget)
     fingerprint_paths(root, arguments[0], budget, output)
-    output.write(b"\0submodule-content\0")
+    write_identity(output, b"\0submodule-content\0", budget)
     fingerprint_submodules(root, arguments[1], budget, output)
-    output.write(b"\0untracked-content\0")
+    write_identity(output, b"\0untracked-content\0", budget)
     fingerprint_paths(root, arguments[2], budget, output)
+
+
+def command_repository_identity_fd(arguments):
+    if len(arguments) != 4:
+        fail(
+            "usage: fm-contained-read.py repository-identity-fd "
+            "<max-files> <max-content-bytes> <max-output-bytes> <max-seconds>"
+        )
+    maximum_files, maximum_bytes, maximum_output_bytes, maximum_seconds = map(int, arguments)
+    if min(maximum_files, maximum_bytes, maximum_output_bytes, maximum_seconds) <= 0:
+        fail("repository identity limits must be positive")
+    root = checked_root(3)
+    budget = FingerprintBudget(
+        maximum_files,
+        maximum_bytes,
+        maximum_seconds,
+        maximum_output_bytes,
+    )
+    os.fchdir(root)
+    try:
+        status_output = bounded_command_output(
+            ["git", "status", "--porcelain=v2", "--branch", "-z"],
+            budget,
+        )
+        index_output = bounded_command_output(["git", "ls-files", "--stage", "-z"], budget)
+        untracked_output = bounded_command_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            budget,
+        )
+    except subprocess.CalledProcessError as error:
+        fail(f"repository enumeration command failed with status {error.returncode}")
+
+    ready = os.environ.get("FM_REPOSITORY_IDENTITY_PARSE_TEST_READY")
+    proceed = os.environ.get("FM_REPOSITORY_IDENTITY_PARSE_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write("ready\n")
+        while not os.path.exists(proceed):
+            budget.check_time()
+            time.sleep(0.01)
+
+    tracked = []
+    submodules = []
+    for record in nul_records(index_output, budget):
+        if b"\t" not in record:
+            fail("repository index enumeration is malformed")
+        metadata, relative = record.split(b"\t", 1)
+        mode = metadata.split(b" ", 1)[0]
+        if not relative:
+            fail("repository index enumeration contains an empty path")
+        (submodules if mode == b"160000" else tracked).append(relative)
+    untracked = list(nul_records(untracked_output, budget))
+
+    output = sys.stdout.buffer
+    write_identity(output, b"status\0", budget)
+    write_identity(output, status_output, budget)
+    write_identity(output, b"\0index\0", budget)
+    write_identity(output, index_output, budget)
+    write_identity(output, b"\0worktree-content\0", budget)
+    fingerprint_paths_records(root, tracked, budget, output)
+    write_identity(output, b"\0submodule-content\0", budget)
+    fingerprint_submodule_records(root, submodules, budget, output)
+    write_identity(output, b"\0untracked-content\0", budget)
+    fingerprint_paths_records(root, untracked, budget, output)
 
 
 def command_git_fd(arguments):
@@ -1644,6 +1798,8 @@ def main():
         command_fingerprint_submodules_fd(sys.argv[2:])
     elif sys.argv[1] == "fingerprint-repository-fd":
         command_fingerprint_repository_fd(sys.argv[2:])
+    elif sys.argv[1] == "repository-identity-fd":
+        command_repository_identity_fd(sys.argv[2:])
     elif sys.argv[1] == "git-fd":
         command_git_fd(sys.argv[2:])
     elif sys.argv[1] == "cat-fd":

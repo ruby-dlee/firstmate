@@ -3,6 +3,7 @@
 Firstmate publishes one durable report for every task created after the report-stack cutover.
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
+Every locked report-stack operation prunes completed entries whose recorded completion time is at least 30 days old.
 
 ## Completion contract
 

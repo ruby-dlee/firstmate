@@ -942,6 +942,54 @@ test_aged_transactionless_staging_is_reclaimed() {
   pass "report recovery reclaims only aged transactionless staging while locked"
 }
 
+test_completed_reports_have_a_thirty_day_retention_ceiling() {
+  local old_id=report-retention-old-k2d fresh_id=report-retention-fresh-k2e old_entry fresh_entry manifest temp active
+  write_task "$old_id" ship
+  write_required_report "$HOME_DIR/data/$old_id/completion.md" "Expired report content."
+  run_stack publish "$old_id" >/dev/null || fail "expired retention precondition publication failed"
+  old_entry=$(run_stack path "$old_id") || fail "expired retention precondition path failed"
+  write_task "$fresh_id" ship
+  write_required_report "$HOME_DIR/data/$fresh_id/completion.md" "Fresh report content."
+  run_stack publish "$fresh_id" >/dev/null || fail "fresh retention precondition publication failed"
+  fresh_entry=$(run_stack path "$fresh_id") || fail "fresh retention precondition path failed"
+  manifest="$(dirname "$old_entry")/manifest.json"
+  temp="$manifest.tmp"
+  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  active="$STACK/entries/.active-retention.999.tmp"
+  mkdir -p "$active"
+  printf 'active staging bytes\n' > "$active/pending.txt"
+
+  run_stack render >/dev/null || fail "report retention sweep failed"
+  assert_absent "$(dirname "$old_entry")" "expired completed report entry was not pruned"
+  assert_present "$fresh_entry" "fresh completed report was pruned"
+  assert_present "$active/pending.txt" "fresh report staging was pruned as completed history"
+  assert_no_grep 'Expired report content' "$STACK/index.html" "report index retained an expired completed entry"
+  assert_grep 'Fresh report content' "$STACK/index.html" "report index lost the fresh completed entry"
+  pass "report stack prunes completed entries at the 30-day ceiling"
+}
+
+test_retention_restores_expired_entries_when_index_swap_fails() {
+  local id=report-retention-rollback-k2f entry manifest temp out status previous
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Retention rollback content."
+  run_stack publish "$id" >/dev/null || fail "retention rollback precondition publication failed"
+  entry=$(run_stack path "$id") || fail "retention rollback precondition path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  temp="$manifest.tmp"
+  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  rm -f "$STACK/index.html"
+  mkdir "$STACK/index.html"
+  if out=$(run_stack render 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention unexpectedly replaced an unsafe report index destination"
+  assert_present "$entry" "failed retention index swap did not restore the expired entry"
+  previous="$STACK/entries/.$(basename "$(dirname "$entry")").previous"
+  assert_absent "$previous" "failed retention index swap retained a rollback generation"
+  [ -n "$out" ] || true
+  pass "report retention rolls back entry pruning when index publication fails"
+}
+
 test_index_failure_restores_previous_generation() {
   local id=report-index-rollback-k3 entry out status
   write_task "$id" ship
@@ -1092,21 +1140,23 @@ test_visual_copy_is_descriptor_bounded() {
   assert_contains "$out" "visual evidence exceeds the 20 MiB report limit" \
     "oversized visual refusal omitted its byte limit"
   assert_no_grep 'copyFileSync' "$SCRIPT" "visual publication still reopens sources with copyFileSync"
-  assert_grep 'O_NOFOLLOW' "$SCRIPT" "visual publication does not open through a non-following descriptor"
-  assert_grep 'fs.readSync(inputDescriptor' "$SCRIPT" "visual publication does not copy through its verified descriptor"
+  assert_grep 'snapshot-task-fd' "$SCRIPT" "visual publication does not use the descriptor-relative snapshot helper"
+  assert_grep 'dir_fd=' "$ROOT/bin/fm-contained-read.py" "visual publication does not traverse through directory descriptors"
+  assert_grep 'os.O_NOFOLLOW' "$ROOT/bin/fm-contained-read.py" "visual publication does not use non-following descriptor opens"
   pass "report visual copies are descriptor-bound and byte-capped"
 }
 
 test_visual_containment_precedes_ancestor_swap() {
-  local id=report-visual-race-f7 out status parent moved outside source shim tmp_real
+  local id=report-visual-race-f7 out status parent moved outside source hook marker entry tmp_real
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Stable visual containment."
   parent="$HOME_DIR/data/$id/visuals/nested"
   moved="$TMP_ROOT/pinned-visual-parent"
   outside="$TMP_ROOT/outside-visual-parent"
   source="$parent/evidence.png"
-  shim="$TMP_ROOT/visual-swap-preload.cjs"
-  mkdir -p "$parent" "$outside"
+  hook="$TMP_ROOT/visual-swap-hook"
+  marker="$TMP_ROOT/visual-swap-marker"
+  mkdir -p "$parent" "$outside" "$hook"
   tmp_real=$(cd "$TMP_ROOT" && pwd -P)
   parent=$(cd "$parent" && pwd -P)
   outside=$(cd "$outside" && pwd -P)
@@ -1114,101 +1164,101 @@ test_visual_containment_precedes_ancestor_swap() {
   source="$parent/evidence.png"
   printf 'inside visual bytes\n' > "$source"
   printf 'outside private visual bytes\n' > "$outside/evidence.png"
-  cat > "$shim" <<'JS'
-const fs = require("fs");
-const path = require("path");
-const { syncBuiltinESMExports } = require("module");
-const originalLstatSync = fs.lstatSync.bind(fs);
-const originalRealpathSync = fs.realpathSync.bind(fs);
-const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
-const wanted = normalize(process.env.FM_REPORT_VISUAL_SWAP_FILE);
-let swapped = false;
-let lstatSeen = false;
-let realpathSeen = false;
-const swap = () => {
-  if (swapped) return;
-  swapped = true;
-  fs.renameSync(process.env.FM_REPORT_VISUAL_SWAP_PARENT, process.env.FM_REPORT_VISUAL_SWAP_MOVED);
-  fs.symlinkSync(process.env.FM_REPORT_VISUAL_SWAP_OUTSIDE, process.env.FM_REPORT_VISUAL_SWAP_PARENT, "dir");
-};
-fs.lstatSync = (target, ...args) => {
-  if (normalize(target) === wanted) {
-    if (realpathSeen) swap();
-    const result = originalLstatSync(target, ...args);
-    lstatSeen = true;
-    return result;
-  }
-  return originalLstatSync(target, ...args);
-};
-fs.realpathSync = (target, ...args) => {
-  if (normalize(target) === wanted) {
-    if (lstatSeen) swap();
-    realpathSeen = true;
-  }
-  return originalRealpathSync(target, ...args);
-};
-syncBuiltinESMExports();
-JS
-  if out=$(NODE_OPTIONS="--require=$shim" \
-    FM_REPORT_VISUAL_SWAP_FILE="$source" \
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == "evidence.png" and not flags & os.O_WRONLY:
+        swapped = True
+        os.rename(os.environ["FM_REPORT_VISUAL_SWAP_PARENT"], os.environ["FM_REPORT_VISUAL_SWAP_MOVED"])
+        os.rename(os.environ["FM_REPORT_VISUAL_SWAP_OUTSIDE"], os.environ["FM_REPORT_VISUAL_SWAP_PARENT"])
+        try:
+            descriptor = original_open(file, flags, mode, dir_fd=dir_fd)
+        finally:
+            os.rename(os.environ["FM_REPORT_VISUAL_SWAP_PARENT"], os.environ["FM_REPORT_VISUAL_SWAP_OUTSIDE"])
+            os.rename(os.environ["FM_REPORT_VISUAL_SWAP_MOVED"], os.environ["FM_REPORT_VISUAL_SWAP_PARENT"])
+            with open(os.environ["FM_REPORT_VISUAL_SWAP_MARKER"], "w", encoding="utf-8") as marker:
+                marker.write("swapped\n")
+        return descriptor
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
+  if out=$(PYTHONPATH="$hook" \
     FM_REPORT_VISUAL_SWAP_PARENT="$parent" \
     FM_REPORT_VISUAL_SWAP_MOVED="$moved" \
     FM_REPORT_VISUAL_SWAP_OUTSIDE="$outside" \
+    FM_REPORT_VISUAL_SWAP_MARKER="$marker" \
     run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
-  [ "$status" -ne 0 ] || fail "ancestor-swapped visual unexpectedly published: $out"
-  assert_contains "$out" "visual evidence escapes its task directory" \
-    "ancestor-swapped visual refusal omitted its containment failure"
+  [ "$status" -eq 0 ] || fail "descriptor-relative visual publication failed during a restored ancestor swap: $out"
+  assert_present "$marker" "visual ancestor-swap hook did not run"
+  entry=$(run_stack path "$id") || fail "descriptor-relative visual report could not be resolved"
+  assert_grep 'inside visual bytes' "$(dirname "$entry")/visuals/nested/evidence.png" \
+    "visual publication lost the file beneath its pinned directory"
   if grep -R -F 'outside private visual bytes' "$STACK" >/dev/null 2>&1; then
     fail "ancestor-swapped outside visual escaped into the report stack"
   fi
-  pass "report visual containment binds identity before ancestor resolution"
+  pass "report visual traversal remains anchored across ancestor swaps"
 }
 
 test_task_directory_identity_is_pinned_for_all_artifacts() {
-  local id=report-task-root-race-f8 out status parent moved outside source shim marker
+  local id=report-task-root-race-f8 out status parent moved outside hook marker entry
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Inside task report."
   parent=$(cd "$HOME_DIR/data/$id" && pwd -P)
   moved="$TMP_ROOT/pinned-task-root"
   outside="$TMP_ROOT/outside-task-root"
-  source="$parent/brief.md"
-  shim="$TMP_ROOT/task-root-swap-preload.cjs"
+  hook="$TMP_ROOT/task-root-swap-hook"
   marker="$TMP_ROOT/task-root-swapped"
-  mkdir -p "$outside/visuals"
-  ln "$source" "$outside/brief.md"
+  mkdir -p "$parent/visuals" "$outside/visuals" "$hook"
+  printf 'inside pinned visual bytes\n' > "$parent/visuals/evidence.png"
+  printf '# Task\n\nOutside private task\n' > "$outside/brief.md"
   write_required_report "$outside/completion.md" "Outside private report."
   printf 'outside private visual bytes\n' > "$outside/visuals/evidence.png"
-  cat > "$shim" <<'JS'
-const fs = require("fs");
-const path = require("path");
-const { syncBuiltinESMExports } = require("module");
-const originalOpenSync = fs.openSync.bind(fs);
-const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
-const target = normalize(process.env.FM_REPORT_TASK_SWAP_FILE);
-let swapped = false;
-fs.openSync = (file, ...args) => {
-  if (!swapped && normalize(file) === target) {
-    swapped = true;
-    fs.renameSync(process.env.FM_REPORT_TASK_SWAP_PARENT, process.env.FM_REPORT_TASK_SWAP_MOVED);
-    fs.renameSync(process.env.FM_REPORT_TASK_SWAP_OUTSIDE, process.env.FM_REPORT_TASK_SWAP_PARENT);
-    fs.writeFileSync(process.env.FM_REPORT_TASK_SWAP_MARKER, "swapped\n");
-  }
-  return originalOpenSync(file, ...args);
-};
-syncBuiltinESMExports();
-JS
-  if out=$(NODE_OPTIONS="--require=$shim" \
-    FM_REPORT_TASK_SWAP_FILE="$source" FM_REPORT_TASK_SWAP_PARENT="$parent" \
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == "brief.md":
+        swapped = True
+        os.rename(os.environ["FM_REPORT_TASK_SWAP_PARENT"], os.environ["FM_REPORT_TASK_SWAP_MOVED"])
+        os.rename(os.environ["FM_REPORT_TASK_SWAP_OUTSIDE"], os.environ["FM_REPORT_TASK_SWAP_PARENT"])
+        try:
+            descriptor = original_open(file, flags, mode, dir_fd=dir_fd)
+        finally:
+            os.rename(os.environ["FM_REPORT_TASK_SWAP_PARENT"], os.environ["FM_REPORT_TASK_SWAP_OUTSIDE"])
+            os.rename(os.environ["FM_REPORT_TASK_SWAP_MOVED"], os.environ["FM_REPORT_TASK_SWAP_PARENT"])
+            with open(os.environ["FM_REPORT_TASK_SWAP_MARKER"], "w", encoding="utf-8") as marker:
+                marker.write("swapped\n")
+        return descriptor
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
+  if out=$(PYTHONPATH="$hook" FM_REPORT_TASK_SWAP_PARENT="$parent" \
     FM_REPORT_TASK_SWAP_MOVED="$moved" FM_REPORT_TASK_SWAP_OUTSIDE="$outside" \
     FM_REPORT_TASK_SWAP_MARKER="$marker" run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
-  [ "$status" -ne 0 ] || fail "ancestor-swapped sibling task unexpectedly published: $out"
+  [ "$status" -eq 0 ] || fail "descriptor-relative task publication failed during a restored ancestor swap: $out"
   assert_present "$marker" "task-directory swap hook did not run: $out"
-  assert_contains "$out" "task data directory changed while reading" \
-    "task-directory swap did not fail against the pinned root"
+  entry=$(run_stack path "$id") || fail "descriptor-relative task report could not be resolved"
+  assert_grep 'Inside task report' "$(dirname "$entry")/report.md" "task report did not come from the pinned task directory"
+  assert_grep 'inside pinned visual bytes' "$(dirname "$entry")/visuals/evidence.png" "task visual did not come from the pinned task directory"
   if grep -R -E 'Outside private (task|report)|outside private visual bytes' "$STACK" >/dev/null 2>&1; then
     fail "sibling task artifacts escaped into the report stack"
   fi
-  pass "report publication pins one exact task directory for every artifact"
+  pass "report publication traverses every artifact through one pinned task directory"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
@@ -1255,6 +1305,13 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
   test_nested_html_containers_do_not_satisfy_required_sections
   test_task_directory_identity_is_pinned_for_all_artifacts
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
+  test_task_directory_identity_is_pinned_for_all_artifacts
+  test_completed_reports_have_a_thirty_day_retention_ceiling
+  test_retention_restores_expired_entries_when_index_swap_fails
   exit 0
 fi
 

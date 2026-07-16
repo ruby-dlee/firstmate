@@ -240,7 +240,7 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
 It installs automatically supported tools only after you say go; manual-only tools remain for you to install from the printed instructions.
 Required tools come in two parts: a universal toolchain every home needs regardless of backend, and a per-backend delta that follows the runtime backend actually resolved for this home.
-The universal toolchain is node, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi.
+The universal toolchain is node, python3, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
 In that list, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-balanced dispatch.
 The per-backend delta is required only for the backend resolved from `FM_BACKEND`, then `config/backend`, then runtime auto-detection, then default `tmux`, so a home is never told to install a tool an inactive backend or feature would need.
@@ -362,6 +362,7 @@ FM_ACCOUNT_SESSION_WAIT_SECONDS=10  # seconds a managed spawn waits for its requ
 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5  # seconds allowed per Agent Fleet session-status query
 FM_ACCOUNT_SESSION_SYNC_INTERVAL=60  # watcher cadence for reconciling missing managed provider-session mappings
 FM_ACCOUNT_SESSION_SYNC_TIMEOUT=5  # seconds allowed for each watcher reconciliation command
+FM_ACCOUNT_SESSION_MAX_PARALLEL=4  # maximum managed mappings attempted in one rotating watcher batch
 FM_ACCOUNT_NATIVE_READY_WAIT_SECONDS=5  # seconds sticky recovery waits for its native provider wrapper launch gate
 FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=5  # seconds allowed for the no-mistakes status snapshot in a provider-neutral continuation packet
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=5  # seconds quota-balanced dispatch waits for each Agent Fleet pool summary

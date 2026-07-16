@@ -26,25 +26,27 @@ assert_regex() {
 }
 
 write_continuation_ancestor_swap_hook() {
-  cat > "$1" <<'JS'
-const fs = require("fs");
-const path = require("path");
-const { syncBuiltinESMExports } = require("module");
-const originalOpenSync = fs.openSync.bind(fs);
-const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
-const target = normalize(process.env.FM_CONTINUATION_SWAP_TARGET);
-let swapped = false;
-fs.openSync = (file, ...args) => {
-  if (!swapped && normalize(file) === target) {
-    swapped = true;
-    fs.renameSync(process.env.FM_CONTINUATION_SWAP_PARENT, process.env.FM_CONTINUATION_SWAP_MOVED);
-    fs.symlinkSync(process.env.FM_CONTINUATION_SWAP_OUTSIDE, process.env.FM_CONTINUATION_SWAP_PARENT, "dir");
-    fs.writeFileSync(process.env.FM_CONTINUATION_SWAP_MARKER, "swapped\n");
-  }
-  return originalOpenSync(file, ...args);
-};
-syncBuiltinESMExports();
-JS
+  mkdir -p "$1"
+  cat > "$1/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == os.path.basename(os.environ["FM_CONTINUATION_SWAP_TARGET"]):
+        swapped = True
+        os.rename(os.environ["FM_CONTINUATION_SWAP_PARENT"], os.environ["FM_CONTINUATION_SWAP_MOVED"])
+        os.symlink(os.environ["FM_CONTINUATION_SWAP_OUTSIDE"], os.environ["FM_CONTINUATION_SWAP_PARENT"], target_is_directory=True)
+        with open(os.environ["FM_CONTINUATION_SWAP_MARKER"], "w", encoding="utf-8") as marker:
+            marker.write("swapped\n")
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
 }
 
 make_fakebin() {
@@ -1097,6 +1099,42 @@ test_session_sync_all_has_one_total_task_timeout_budget() {
   done
   [ -n "$out" ] || true
   pass "sync-all bounds the fair sweep to one task timeout window"
+}
+
+test_session_sync_all_rotates_a_bounded_parallel_batch() {
+  local rec id attempt count
+  rec=$(make_case sync-all-rotating claude account-sync-rotate-a1 account-sync-rotate-e5)
+  read_case "$rec"
+  for id in account-sync-rotate-a1 account-sync-rotate-b2 account-sync-rotate-c3 account-sync-rotate-d4 account-sync-rotate-e5; do
+    fm_write_meta "$HOME_DIR/state/$id.meta" \
+      "window=firstmate:fm-$id" \
+      "worktree=$WT_DIR" \
+      "project=$PROJ_DIR" \
+      "harness=claude" \
+      "kind=ship" \
+      "account_pool=claude-crew" \
+      "account_profile=claude-2" \
+      "account_task=$id" \
+      "account_attempt=attempt-$id"
+  done
+  for attempt in 1 2 3; do
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+      FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+      FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 \
+      FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=2 \
+      FM_ACCOUNT_SESSION_MAX_PARALLEL=2 PATH="$FAKEBIN_DIR:$PATH" \
+      "$SESSION_SYNC" --all >/dev/null 2>&1 || true
+    count=$(grep -c 'session status --task account-sync-rotate-' "$AF_LOG" || true)
+    case "$attempt" in
+      1) [ "$count" -eq 2 ] || fail "first sync batch launched $count mappings instead of two" ;;
+      2) [ "$count" -eq 4 ] || fail "second sync batch did not advance the rotating cursor (count=$count)" ;;
+      3) [ "$count" -eq 6 ] || fail "third sync batch did not preserve its bounded size (count=$count)" ;;
+    esac
+  done
+  for id in account-sync-rotate-a1 account-sync-rotate-b2 account-sync-rotate-c3 account-sync-rotate-d4 account-sync-rotate-e5; do
+    assert_grep "session status --task $id" "$AF_LOG" "rotating sync batches never reached $id"
+  done
+  pass "sync-all limits fanout and rotates fairly across managed tasks"
 }
 
 test_session_sync_releases_metadata_lock_during_provider_query() {
@@ -2607,33 +2645,36 @@ test_continuation_rejects_load_bearing_source_replacement_during_open() {
   rm -f "$CASE_DIR/endpoint-live"
   source="$(cd "$HOME_DIR/data/$id" && pwd -P)/checkpoint.md"
   printf 'load-bearing checkpoint\n' > "$source"
-  hook="$CASE_DIR/continuation-source-replacement.cjs"
-  cat > "$hook" <<'JS'
-const fs = require("fs");
-const path = require("path");
-const { syncBuiltinESMExports } = require("module");
-const originalOpenSync = fs.openSync.bind(fs);
-const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
-const target = normalize(process.env.FM_MUTATE_CONTINUATION_SOURCE);
-let replaced = false;
-fs.openSync = (file, ...args) => {
-  if (!replaced && normalize(file) === target) {
-    replaced = true;
-    fs.renameSync(file, `${file}.mutated`);
-    fs.writeFileSync(file, Buffer.alloc(fs.statSync(`${file}.mutated`).size, 122));
-  }
-  return originalOpenSync(file, ...args);
-};
-syncBuiltinESMExports();
-JS
-  export NODE_OPTIONS="--require=$hook" FM_MUTATE_CONTINUATION_SOURCE="$source"
+  hook="$CASE_DIR/continuation-source-replacement"
+  mkdir -p "$hook"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+replaced = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global replaced
+    target = os.environ["FM_MUTATE_CONTINUATION_SOURCE"]
+    if not replaced and dir_fd is not None and file == os.path.basename(target):
+        replaced = True
+        os.rename(target, f"{target}.mutated")
+        with open(target, "wb") as replacement:
+            replacement.write(b"z" * os.stat(f"{target}.mutated").st_size)
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
+  export PYTHONPATH="$hook" FM_MUTATE_CONTINUATION_SOURCE="$source"
   if out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3); then
     status=0
   else
     status=$?
   fi
-  unset NODE_OPTIONS FM_MUTATE_CONTINUATION_SOURCE
+  unset PYTHONPATH FM_MUTATE_CONTINUATION_SOURCE
   [ "$status" -ne 0 ] || fail "continuation accepted a replaced load-bearing source"
   assert_present "$source.mutated" "continuation identity-race hook did not run: $out"
   assert_contains "$out" 'contained read failed' \
@@ -2670,6 +2711,62 @@ SH
   pass "continuation appends the exact validated brief snapshot"
 }
 
+test_continuation_reads_descendants_through_the_pinned_root() {
+  local id rec task_dir moved outside source hook marker packet
+  id=account-continuation-openat-z28h
+  rec=$(make_case continuation-openat claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "descriptor-relative continuation precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
+  moved="$CASE_DIR/pinned-openat-task"
+  outside="$CASE_DIR/outside-openat-task"
+  source="$task_dir/decisions.md"
+  hook="$CASE_DIR/continuation-openat-hook"
+  marker="$CASE_DIR/continuation-openat-swapped"
+  mkdir -p "$outside" "$hook"
+  printf 'inside pinned decision\n' > "$source"
+  printf 'outside private decision\n' > "$outside/decisions.md"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == "decisions.md":
+        swapped = True
+        os.rename(os.environ["FM_CONTINUATION_SWAP_PARENT"], os.environ["FM_CONTINUATION_SWAP_MOVED"])
+        os.rename(os.environ["FM_CONTINUATION_SWAP_OUTSIDE"], os.environ["FM_CONTINUATION_SWAP_PARENT"])
+        try:
+            descriptor = original_open(file, flags, mode, dir_fd=dir_fd)
+        finally:
+            os.rename(os.environ["FM_CONTINUATION_SWAP_PARENT"], os.environ["FM_CONTINUATION_SWAP_OUTSIDE"])
+            os.rename(os.environ["FM_CONTINUATION_SWAP_MOVED"], os.environ["FM_CONTINUATION_SWAP_PARENT"])
+            with open(os.environ["FM_CONTINUATION_SWAP_MARKER"], "w", encoding="utf-8") as marker:
+                marker.write("swapped\n")
+        return descriptor
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
+  packet=$(PYTHONPATH="$hook" FM_CONTINUATION_SWAP_PARENT="$task_dir" \
+    FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
+    FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LOG="$TMUX_LOG" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" openat-swap) \
+    || fail "descriptor-relative continuation failed during a restored ancestor swap"
+  assert_present "$marker" "descriptor-relative continuation swap hook did not run"
+  assert_grep 'inside pinned decision' "$packet" "continuation lost the descendant from its pinned root"
+  assert_not_grep 'outside private decision' "$packet" "continuation read through the swapped pathname"
+  pass "continuation traverses descendants relative to its pinned root"
+}
+
 test_continuation_rejects_task_source_ancestor_swap() {
   local id rec task_dir moved outside source hook marker out status
   id=account-continuation-task-parent-z28e
@@ -2682,13 +2779,13 @@ test_continuation_rejects_task_source_ancestor_swap() {
   moved="$CASE_DIR/pinned-task-source"
   outside="$CASE_DIR/outside-task-source"
   source="$task_dir/decisions.md"
-  hook="$CASE_DIR/task-source-ancestor-swap.cjs"
+  hook="$CASE_DIR/task-source-ancestor-swap"
   marker="$CASE_DIR/task-source-swapped"
   mkdir "$outside"
   printf 'inside task decision\n' > "$source"
   printf 'outside private task decision\n' > "$outside/decisions.md"
   write_continuation_ancestor_swap_hook "$hook"
-  if out=$(NODE_OPTIONS="--require=$hook" \
+  if out=$(PYTHONPATH="$hook" \
     FM_CONTINUATION_SWAP_TARGET="$source" FM_CONTINUATION_SWAP_PARENT="$task_dir" \
     FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
     FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
@@ -2720,13 +2817,13 @@ test_continuation_rejects_metadata_ancestor_swap() {
   moved="$CASE_DIR/pinned-state-source"
   outside="$CASE_DIR/outside-state-source"
   source="$state_dir/$id.meta"
-  hook="$CASE_DIR/metadata-ancestor-swap.cjs"
+  hook="$CASE_DIR/metadata-ancestor-swap"
   marker="$CASE_DIR/metadata-source-swapped"
   mkdir "$outside"
   cp "$source" "$outside/$id.meta"
   printf 'outside_marker=private-metadata\n' >> "$outside/$id.meta"
   write_continuation_ancestor_swap_hook "$hook"
-  if out=$(NODE_OPTIONS="--require=$hook" \
+  if out=$(PYTHONPATH="$hook" \
     FM_CONTINUATION_SWAP_TARGET="$source" FM_CONTINUATION_SWAP_PARENT="$state_dir" \
     FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
     FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
@@ -3291,6 +3388,12 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
   test_continuation_appends_the_validated_brief_snapshot
   test_session_sync_all_has_one_total_task_timeout_budget
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
+  test_continuation_reads_descendants_through_the_pinned_root
+  test_session_sync_all_rotates_a_bounded_parallel_batch
   exit 0
 fi
 

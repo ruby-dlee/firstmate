@@ -10,7 +10,7 @@
 # An early SessionStart race is normal: without --require, no mapping returns
 # quietly non-zero so spawn or the watcher can retry later.
 # --require turns the missing mapping into a fail-closed recovery blocker.
-# --all scans only managed metas that still lack provider_session_id.
+# --all scans a rotating bounded batch of managed metas that still lack provider_session_id.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +29,7 @@ fm_refuse_if_gate_agent
 WAIT=0
 QUERY_TIMEOUT=${FM_ACCOUNT_SESSION_QUERY_TIMEOUT:-5}
 ALL_TASK_TIMEOUT=${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}
+ALL_MAX_PARALLEL=${FM_ACCOUNT_SESSION_MAX_PARALLEL:-4}
 REQUIRE=0
 ALL=0
 PRINT_UPDATED_AT=0
@@ -62,6 +63,7 @@ if [ -z "$ALL_TASK_TIMEOUT" ]; then
   ALL_TASK_TIMEOUT=$((QUERY_TIMEOUT + 2))
 fi
 case "$ALL_TASK_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_TASK_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
+case "$ALL_MAX_PARALLEL" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_MAX_PARALLEL must be a positive integer" >&2; exit 2 ;; esac
 session_timestamp_advances() {  # <candidate> <baseline>
   LC_ALL=C awk -v candidate="$1" -v baseline="$2" '
     function valid(value) {
@@ -92,18 +94,68 @@ session_timestamp_advances() {  # <candidate> <baseline>
 }
 if [ "$ALL" = 1 ]; then
   [ -z "$ID" ] || { echo "error: --all does not accept a task id" >&2; exit 2; }
-  rc=0 pids=
+  ALL_LOCK=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$STATE" session-sync-all 2>/dev/null) || exit 0
+  ALL_CURSOR="$STATE/.account-session-sync.cursor"
+  ALL_CURSOR_TMP=
+  ALL_PIDS=()
+  cleanup_all() {
+    local pid
+    for pid in "${ALL_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    done
+    [ -z "$ALL_CURSOR_TMP" ] || rm -f "$ALL_CURSOR_TMP"
+    fm_account_meta_lock_release "$ALL_LOCK" >/dev/null 2>&1 || true
+  }
+  trap cleanup_all EXIT INT TERM HUP
+  tasks=()
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     [ -n "$(fm_meta_get "$meta" account_profile)" ] || continue
     [ -z "$(fm_meta_get "$meta" provider_session_id)" ] || continue
     task=$(basename "$meta" .meta)
-    fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1 &
-    pids="$pids $!"
+    fm_account_valid_id "$task" || continue
+    tasks+=("$task")
   done
-  for pid in $pids; do
+  [ "${#tasks[@]}" -gt 0 ] || exit 0
+  cursor=
+  if fm_account_safe_file_destination "$ALL_CURSOR" && [ -f "$ALL_CURSOR" ]; then
+    cursor=$(sed -n '1p' "$ALL_CURSOR" 2>/dev/null || true)
+    fm_account_valid_id "$cursor" || cursor=
+  elif [ -e "$ALL_CURSOR" ] || [ -L "$ALL_CURSOR" ]; then
+    echo "error: unsafe account session synchronization cursor at $ALL_CURSOR" >&2
+    exit 1
+  fi
+  start=0
+  if [ -n "$cursor" ]; then
+    for index in "${!tasks[@]}"; do
+      if [[ "${tasks[$index]}" > "$cursor" ]]; then
+        start=$index
+        break
+      fi
+    done
+  fi
+  count=${#tasks[@]}
+  batch=$ALL_MAX_PARALLEL
+  [ "$batch" -le "$count" ] || batch=$count
+  launched=()
+  for ((offset = 0; offset < batch; offset += 1)); do
+    index=$(((start + offset) % count))
+    task=${tasks[$index]}
+    launched+=("$task")
+    (trap - EXIT INT TERM HUP; fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1) &
+    ALL_PIDS+=("$!")
+  done
+  ALL_CURSOR_TMP=$(mktemp "$STATE/.account-session-sync.cursor.XXXXXX") || exit 1
+  printf '%s\n' "${launched[$((batch - 1))]}" > "$ALL_CURSOR_TMP" || exit 1
+  fm_account_safe_file_destination "$ALL_CURSOR" || { echo "error: unsafe account session synchronization cursor at $ALL_CURSOR" >&2; exit 1; }
+  mv "$ALL_CURSOR_TMP" "$ALL_CURSOR" || exit 1
+  ALL_CURSOR_TMP=
+  rc=0
+  for pid in "${ALL_PIDS[@]}"; do
     wait "$pid" || rc=1
   done
+  ALL_PIDS=()
   exit "$rc"
 fi
 [ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]" >&2; exit 2; }

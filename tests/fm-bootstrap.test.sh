@@ -804,6 +804,33 @@ test_enforced_dispatch_validation_rejects_poolless_quota_rules() {
   pass "bootstrap rejects poolless quota balancing under enforcement"
 }
 
+test_python3_is_required_for_descriptor_relative_artifact_reads() {
+  local case_dir fakebin bash_env out
+  case_dir="$TMP_ROOT/python3-required"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  bash_env="$case_dir/no-python3.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = python3 ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: python3 (install: brew install python  # or the platform' \
+    "bootstrap did not report the descriptor-relative reader dependency"
+  pass "bootstrap requires Python 3 for contained artifact traversal"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
+  test_python3_is_required_for_descriptor_relative_artifact_reads
+  exit 0
+fi
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction

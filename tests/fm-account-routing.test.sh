@@ -713,7 +713,8 @@ test_enforce_failure_rolls_back_prepared_endpoint() {
   [ "$status" -ne 0 ] || fail "failed Agent Fleet selection should block spawn"
   assert_regex '^new-window ' "$TMUX_LOG" "selection did not happen after endpoint preparation"
   assert_regex '^kill-window ' "$TMUX_LOG" "selection failure did not remove its prepared endpoint"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" "selection failure did not return its prepared worktree"
+  assert_grep 'return --force' "$TREEHOUSE_LOG" \
+    "selection failure did not return its prepared worktree (spawn: $out; lifecycle: $(tr '\n' '|' < "$LIFECYCLE_LOG"))"
   assert_absent "$HOME_DIR/state/$id.meta" "selection failure wrote task meta"
   [ -n "$out" ] || true
   pass "enforce reserves immediately before binding and rolls back prepared runtime state"
@@ -4476,6 +4477,11 @@ test_teardown_stops_after_rollback_restores_predecessor() {
 if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
   test_secondmate_rollback_refuses_unsafe_tasktmp
   test_rollback_backup_rejects_symlink_and_rechecks_under_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = enforce-select-failure ]; then
+  test_enforce_failure_rolls_back_prepared_endpoint
   exit 0
 fi
 

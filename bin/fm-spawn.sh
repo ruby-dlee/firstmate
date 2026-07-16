@@ -619,6 +619,12 @@ cleanup_continuation_launch_transport() {
 spawn_abort_cleanup() {
   local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp
   trap - EXIT
+  # This is an EXIT trap whose job is to attempt every independent cleanup
+  # action and then return the original spawn status. The parent script runs
+  # with `set -e`; without disabling errexit here, a benign nonzero probe can
+  # stop the trap after endpoint removal but before lease/session/worktree
+  # rollback, leaking prepared resources.
+  set +e
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
   if [ -n "${META_WRITE_LOCK:-}" ]; then
     rollback_lock=$META_WRITE_LOCK

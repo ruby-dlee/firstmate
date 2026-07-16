@@ -723,6 +723,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
   local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
   local tmux_identity tmux_identity_session tmux_identity_label
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
+  session=
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then
     printf 'present'

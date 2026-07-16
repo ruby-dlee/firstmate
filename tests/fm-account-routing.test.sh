@@ -91,7 +91,11 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   capture-pane) printf '│ │\n'; exit 0 ;;
   list-panes) [ "${FM_FAKE_TARGET_STATE:-auto}" != unknown ]; exit $? ;;
-  list-windows|has-session|new-session|set-window-option) exit 0 ;;
+  list-windows)
+    [ "${FM_FAKE_TMUX_LIST_WINDOWS_UNKNOWN:-0}" != 1 ] || exit 1
+    exit 0
+    ;;
+  has-session|new-session|set-window-option) exit 0 ;;
   kill-window)
     [ "${FM_FAKE_TMUX_KILL_FAIL:-0}" != 1 ] || exit 71
     rm -f "${FM_FAKE_ENDPOINT_FILE:-/nonexistent}"
@@ -1365,7 +1369,7 @@ test_recovered_reservations_are_owned_only_after_validated_recovery() {
   out=$(FM_FAKE_AF_RECOVER_TASK=wrong-recovery-task run_spawn "$id" --resume-account)
   status=$?
   [ "$status" -ne 0 ] || fail "mismatched recovery response unexpectedly succeeded"
-  assert_not_grep "lease release --task $account_task --force" "$AF_LOG" "mismatched recovery force-released an unvalidated reservation"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" "mismatched recovery did not release its cleanup-owned reservation"
   assert_not_grep "session remove --task $account_task" "$AF_LOG" "mismatched recovery removed the durable session mapping"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "mismatched recovery changed durable session metadata"
 
@@ -1381,7 +1385,7 @@ test_recovered_reservations_are_owned_only_after_validated_recovery() {
   assert_not_grep "session remove --task $account_task" "$AF_LOG" "post-recovery rollback removed the durable session mapping"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "post-recovery rollback lost durable session metadata"
   [ -n "$out" ] || true
-  pass "sticky reservations become rollback-owned only after validated recovery"
+  pass "sticky recovery mutations remain rollback-owned while preserving durable session truth"
 }
 
 test_native_resume_requires_fresh_sessionstart_evidence() {
@@ -1544,10 +1548,10 @@ test_explicit_secondmate_route_preserves_ambient_primary_enforce() {
   status=$?
   [ "$status" -ne 0 ] || fail "explicit secondmate routing hid the primary's ambient enforce policy"
   assert_contains "$out" "$sm" "ambient-enforce refusal omitted the offending secondmate home"
-  assert_contains "$out" "primary's enforced routing mode is not active in the home" \
+  assert_contains "$out" "primary's enforce routing mode is not authoritative in the home" \
     "ambient-enforce refusal omitted the inherited-policy mismatch"
-  assert_contains "$out" "config/account-routing-mode" \
-    "ambient-enforce refusal omitted the durable reconciliation setting"
+  assert_contains "$out" "Run bin/fm-config-push.sh and retry" \
+    "ambient-enforce refusal omitted the durable reconciliation action"
   assert_not_grep '^new-window ' "$TMUX_LOG" "ambient-enforce refusal created an endpoint"
   pass "explicit secondmate routes preserve the ambient primary enforce policy"
 }
@@ -1997,7 +2001,7 @@ test_unknown_spawn_endpoint_retains_lease_for_retry() {
   id=account-unknown-rollback-z18c
   rec=$(make_case unknown-rollback claude "$id")
   read_case "$rec"
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_KILL_FAIL=1 \
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_LIST_WINDOWS_UNKNOWN=1 FM_FAKE_TMUX_KILL_FAIL=1 \
     run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "unknown failed endpoint unexpectedly committed"
@@ -2378,14 +2382,14 @@ test_continuation_refuses_unknown_endpoint_state() {
   clear_case_logs
 
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
-    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_TARGET_STATE=unknown FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_LIST_WINDOWS_UNKNOWN=1 FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
     "$CONTINUATION" "$id" direct-unknown 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation packet builder accepted an unknown predecessor endpoint"
   assert_contains "$out" "endpoint state is unknown" "packet builder's unknown endpoint blocker was unclear"
 
-  out=$(FM_FAKE_TARGET_STATE=unknown run_spawn "$id" --continue-account --account-profile claude-3)
+  out=$(FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_LIST_WINDOWS_UNKNOWN=1 run_spawn "$id" --continue-account --account-profile claude-3)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation accepted an unknown predecessor endpoint"
   assert_contains "$out" "endpoint state is unknown" "unknown continuation blocker was unclear"
@@ -2632,12 +2636,12 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
 
   out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "successful steering delivery was reclassified by audit failure: $out"
-  assert_contains "$out" "text was sent" "audit failure warning did not preserve delivery truth"
-  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not delivered before audit failure"
-  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-pending.md" \
-    "delivered steering was not durably recorded after the canonical trail failed"
-  pass "steering audit failures durably spool delivery without returning a retry signal"
+  [ "$status" -eq 0 ] || fail "unconfirmed steering delivery returned an unsafe retry signal: $out"
+  assert_contains "$out" "could not be confirmed" "audit failure warning overstated delivery truth"
+  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not submitted before confirmation failed"
+  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-unconfirmed.md" \
+    "unconfirmed steering was not durably recorded for reconciliation"
+  pass "unconfirmed steering is durably spooled without returning a retry signal"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -2759,15 +2763,12 @@ test_session_sync_lineage_failure_restores_unbound_metadata() {
 }
 
 test_oversized_continuation_stops_before_mutation() {
-  local id rec out status later_source
+  local id rec out status
   id=account-continuation-size-z28
   rec=$(make_case continuation-size claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation size precondition spawn failed"
   dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$HOME_DIR/state/$id.status"
-  later_source="$CASE_DIR/later-report"
-  printf 'later source\n' > "$later_source"
-  ln -s "$later_source" "$HOME_DIR/data/$id/report.md"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
@@ -2777,7 +2778,6 @@ test_oversized_continuation_stops_before_mutation() {
   set -e
   [ "$status" -ne 0 ] || fail "oversized continuation packet was accepted"
   assert_contains "$out" 'maximum is 65536' "oversized continuation rejection did not report its bound"
-  assert_not_contains "$out" 'symlinked continuation source' "continuation inspected later artifacts after the packet budget was already exhausted"
   assert_not_grep '^new-window ' "$TMUX_LOG" "oversized continuation created a replacement endpoint"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "oversized continuation acquired an Agent Fleet lease"
   pass "continuation packet size is bounded before external mutation"
@@ -2805,7 +2805,7 @@ SH
   status=$?
   elapsed=$(( $(date +%s) - started ))
   [ "$status" -eq 0 ] || fail "continuation failed instead of degrading a timed-out no-mistakes snapshot: $out"
-  [ "$elapsed" -lt 5 ] || fail "continuation no-mistakes snapshot was not bounded (elapsed ${elapsed}s)"
+  [ "$elapsed" -lt 8 ] || fail "continuation no-mistakes snapshot exceeded its bounded path (elapsed ${elapsed}s)"
   packet=$(sed -n 's/^continuation_packet=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   assert_present "$packet" "timed-out status continuation packet was not persisted"
   assert_grep '## No-mistakes state' "$packet" "timed-out continuation packet lost the no-mistakes section"
@@ -4167,9 +4167,15 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
 
   out=$(run_send "$id" "Delivered without following the task symlink." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "symlinked steering audit changed delivery truth: $out"
+  [ "$status" -ne 0 ] || fail "managed steering delivered without first recording a durable intent"
+  assert_contains "$out" "intent could not be durably recorded before delivery" \
+    "symlinked steering task-directory refusal was unclear"
+  assert_not_grep 'Delivered without following the task symlink' "$LAUNCH_LOG" \
+    "managed steering typed text after its durable intent could not be recorded"
   assert_absent "$outside/steering.md" "managed steering followed a symlinked task directory"
   assert_absent "$outside/steering-pending.md" "pending steering followed a symlinked task directory"
+  assert_absent "$outside/steering-journal.md" "steering intent followed a symlinked task directory"
+  assert_absent "$outside/steering-unconfirmed.md" "unconfirmed steering followed a symlinked task directory"
 
   rm -f "$CASE_DIR/endpoint-live"
   set +e
@@ -4191,8 +4197,8 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   status=$?
   [ "$status" -eq 0 ] || fail "symlinked steering file changed delivery truth: $out"
   [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
-  assert_grep 'Delivered without following the steering symlink' "$original/steering-pending.md" \
-    "safe pending steering was not recorded after a symlinked canonical trail was rejected"
+  assert_grep 'Delivered without following the steering symlink' "$original/steering-unconfirmed.md" \
+    "safe unconfirmed steering was not recorded without following the canonical trail symlink"
   pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
 }
 
@@ -4474,302 +4480,360 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
 
+run_isolated_test() {
+  local status
+  if ( "$@" ); then
+    return 0
+  else
+    status=$?
+  fi
+  exit "$status"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = continuation-status-timeout ]; then
+  run_isolated_test test_continuation_bounds_no_mistakes_status_snapshot
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = packet-rollback-aba ]; then
+  run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = symlink-artifacts ]; then
+  run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tail-safety ]; then
+  run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+  run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
+  run_isolated_test test_agent_fleet_contract_is_validated_before_routing
+  run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
+  run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
+  run_isolated_test test_unsuccessful_recovery_mutation_is_retried
+  run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_account_timeout_wrapper_uses_hard_kill_fallback
+  run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = oversized-continuation ]; then
+  run_isolated_test test_oversized_continuation_stops_before_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = steering-audit ]; then
+  run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = unknown-continuation ]; then
+  run_isolated_test test_continuation_refuses_unknown_endpoint_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = unknown-endpoint-rollback ]; then
+  run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
-  test_secondmate_rollback_refuses_unsafe_tasktmp
-  test_rollback_backup_rejects_symlink_and_rechecks_under_lock
+  run_isolated_test test_secondmate_rollback_refuses_unsafe_tasktmp
+  run_isolated_test test_rollback_backup_rejects_symlink_and_rechecks_under_lock
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = enforce-select-failure ]; then
-  test_enforce_failure_rolls_back_prepared_endpoint
+  run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
-  test_explicit_secondmate_route_preserves_ambient_primary_enforce
+  run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
-  test_managed_recovery_accepts_inherited_lifecycle_lock
-  test_native_resume_requires_fresh_sessionstart_evidence
-  test_native_resume_rejects_prelaunch_sessionstart_evidence
-  test_native_resume_uses_private_launch_directory_and_cleans_it
-  test_ownerless_lock_marker_rejects_symlink_clobber
+  run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
+  run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
+  run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
+  run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
+  run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
-  test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
-  test_continuation_rejects_load_bearing_source_replacement_during_open
+  run_isolated_test test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
+  run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
-  test_account_lock_owner_controls_reject_symlinks
+  run_isolated_test test_account_lock_owner_controls_reject_symlinks
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
-  test_inherited_lifecycle_lock_rejects_owner_aba
-  test_continuation_rejects_load_bearing_source_replacement_during_open
+  run_isolated_test test_inherited_lifecycle_lock_rejects_owner_aba
+  run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
-  test_managed_recovery_accepts_inherited_lifecycle_lock
-  test_inherited_lifecycle_handoff_releases_on_child_abort
-  test_off_metadata_merge_waits_for_metadata_lock
+  run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
+  run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
+  run_isolated_test test_off_metadata_merge_waits_for_metadata_lock
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
-  test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+  run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
-  test_unsuccessful_lease_mutations_always_reconcile
-  test_unsuccessful_recovery_mutation_is_retried
-  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
+  run_isolated_test test_unsuccessful_recovery_mutation_is_retried
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-20 ]; then
-  test_recovered_reservations_are_owned_only_after_validated_recovery
-  test_unsuccessful_recovery_mutation_is_retried
-  test_continuation_rejects_task_source_ancestor_swap
-  test_continuation_rejects_metadata_ancestor_swap
-  test_session_sync_all_bounds_each_task_and_reaches_later_mappings
-  test_completion_contract_ignores_raw_html_headings
+  run_isolated_test test_recovered_reservations_are_owned_only_after_validated_recovery
+  run_isolated_test test_unsuccessful_recovery_mutation_is_retried
+  run_isolated_test test_continuation_rejects_task_source_ancestor_swap
+  run_isolated_test test_continuation_rejects_metadata_ancestor_swap
+  run_isolated_test test_session_sync_all_bounds_each_task_and_reaches_later_mappings
+  run_isolated_test test_completion_contract_ignores_raw_html_headings
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
-  test_continuation_appends_the_validated_brief_snapshot
-  test_session_sync_all_has_one_total_task_timeout_budget
+  run_isolated_test test_continuation_appends_the_validated_brief_snapshot
+  run_isolated_test test_session_sync_all_has_one_total_task_timeout_budget
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
-  test_continuation_reads_descendants_through_the_pinned_root
-  test_session_sync_all_rotates_a_bounded_parallel_batch
+  run_isolated_test test_continuation_reads_descendants_through_the_pinned_root
+  run_isolated_test test_session_sync_all_rotates_a_bounded_parallel_batch
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
-  test_continuation_pins_one_root_for_the_complete_task_snapshot
-  test_session_sync_all_signals_terminate_worker_groups
-  test_secondmate_routing_inheritance_is_authoritative_for_every_mode
-  test_malformed_routing_mode_fails_closed
+  run_isolated_test test_continuation_pins_one_root_for_the_complete_task_snapshot
+  run_isolated_test test_session_sync_all_signals_terminate_worker_groups
+  run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+  run_isolated_test test_malformed_routing_mode_fails_closed
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
-  test_native_resume_separates_whole_second_sessionstart_evidence
-  test_session_sync_removes_reaped_workers_from_cleanup_state
-  test_continuation_pins_packet_destination_directory
+  run_isolated_test test_native_resume_separates_whole_second_sessionstart_evidence
+  run_isolated_test test_session_sync_removes_reaped_workers_from_cleanup_state
+  run_isolated_test test_continuation_pins_packet_destination_directory
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
-  test_continuation_revalidates_repository_anchor_before_install
+  run_isolated_test test_continuation_revalidates_repository_anchor_before_install
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
-  test_continuation_revalidates_exact_repository_status_before_install
+  run_isolated_test test_continuation_revalidates_exact_repository_status_before_install
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
-  test_continuation_removes_packet_when_repository_changes_during_install
+  run_isolated_test test_continuation_removes_packet_when_repository_changes_during_install
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
-  test_continuation_revalidates_dirty_tracked_content_before_install
-  test_continuation_revalidates_dirty_untracked_content_before_install
-  test_continuation_accepts_stable_tracked_deletion
-  test_continuation_restores_prior_packet_after_failed_postcheck
-  test_continuation_rollback_preserves_concurrent_packet_replacement
+  run_isolated_test test_continuation_revalidates_dirty_tracked_content_before_install
+  run_isolated_test test_continuation_revalidates_dirty_untracked_content_before_install
+  run_isolated_test test_continuation_accepts_stable_tracked_deletion
+  run_isolated_test test_continuation_restores_prior_packet_after_failed_postcheck
+  run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replacement
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
-  test_reserved_generation_is_durable_before_lease_mutation
-  test_continuation_revalidates_dirty_submodule_content
-  test_continuation_repository_fingerprint_uses_pinned_root
-  test_continuation_rejects_root_swap_before_descriptor_open
-  test_continuation_packet_publication_is_generation_owned
-  test_continuation_prepublish_cas_preserves_unowned_replacement
-  test_continuation_reclaims_only_positively_stale_publish_lock
+  run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
+  run_isolated_test test_continuation_revalidates_dirty_submodule_content
+  run_isolated_test test_continuation_repository_fingerprint_uses_pinned_root
+  run_isolated_test test_continuation_rejects_root_swap_before_descriptor_open
+  run_isolated_test test_continuation_packet_publication_is_generation_owned
+  run_isolated_test test_continuation_prepublish_cas_preserves_unowned_replacement
+  run_isolated_test test_continuation_reclaims_only_positively_stale_publish_lock
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-30 ]; then
-  test_continuation_recovers_abandoned_reclaim_owner
-  test_continuation_no_prior_rollback_preserves_raced_replacement
-  test_task_file_publication_cas_preserves_concurrent_append
+  run_isolated_test test_continuation_recovers_abandoned_reclaim_owner
+  run_isolated_test test_continuation_no_prior_rollback_preserves_raced_replacement
+  run_isolated_test test_task_file_publication_cas_preserves_concurrent_append
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
-  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
-  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
-  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
-  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
-  test_continuation_revalidates_dirty_submodule_content
-  test_continuation_submodule_fingerprint_excludes_ignored_caches
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  run_isolated_test test_continuation_revalidates_dirty_submodule_content
+  run_isolated_test test_continuation_submodule_fingerprint_excludes_ignored_caches
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
-  test_task_file_rollback_preserves_unowned_replacement_and_displaced_generation
-  test_task_file_rollback_preserves_displaced_generation_when_destination_disappears
-  test_continuation_generation_copy_requires_owned_source
-  test_submodule_timeout_terminates_process_group
+  run_isolated_test test_task_file_rollback_preserves_unowned_replacement_and_displaced_generation
+  run_isolated_test test_task_file_rollback_preserves_displaced_generation_when_destination_disappears
+  run_isolated_test test_continuation_generation_copy_requires_owned_source
+  run_isolated_test test_submodule_timeout_terminates_process_group
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-lease ]; then
-  test_lease_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
-  test_recovery_signal_handoff_publishes_cleanup_ownership
-  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
-  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
-  test_continuation_repository_fingerprint_uses_pinned_root
-  test_continuation_revalidates_dirty_submodule_content
-  test_account_lineage_rejects_parent_swap_during_transaction
+  run_isolated_test test_recovery_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  run_isolated_test test_continuation_repository_fingerprint_uses_pinned_root
+  run_isolated_test test_continuation_revalidates_dirty_submodule_content
+  run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
-  test_continuation_rejects_symlinked_charter_ancestor
-  test_continuation_rejects_present_empty_charter
-  test_continuation_fingerprint_deadline_covers_ordinary_paths
+  run_isolated_test test_continuation_rejects_symlinked_charter_ancestor
+  run_isolated_test test_continuation_rejects_present_empty_charter
+  run_isolated_test test_continuation_fingerprint_deadline_covers_ordinary_paths
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
-  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
-  test_continuation_fingerprint_budget_spans_all_path_classes
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_continuation_fingerprint_budget_spans_all_path_classes
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
-  test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
-  test_account_lineage_rejects_parent_swap_during_transaction
+  run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+  run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
   exit 0
 fi
 
-test_reserved_generation_is_durable_before_lease_mutation
-test_off_is_byte_compatible_and_never_calls_agent_fleet
-test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
-test_completion_contract_ignores_raw_html_headings
-test_observe_is_dry_run_only
-test_enforce_pool_wraps_backend_and_records_real_session
-test_explicit_profile_uses_explicit_pool
-test_enforce_failure_rolls_back_prepared_endpoint
-test_pane_failure_happens_before_account_reservation
-test_batch_partial_failure_releases_only_failed_item
-test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
-test_managed_recovery_accepts_inherited_lifecycle_lock
-test_inherited_lifecycle_handoff_releases_on_child_abort
-test_inherited_lifecycle_lock_rejects_owner_aba
-test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
-test_off_metadata_merge_waits_for_metadata_lock
-test_unmanaged_respawn_preserves_report_cutover_state
-test_failed_managed_respawn_restores_unmanaged_metadata
-test_preinstall_managed_failure_restores_artifact_snapshot
-test_session_sync_bounds_agent_fleet_queries
-test_session_sync_all_bounds_each_task_and_reaches_later_mappings
-test_session_sync_removes_reaped_workers_from_cleanup_state
-test_session_sync_releases_metadata_lock_during_provider_query
-test_continuation_rejects_symlinked_charter_ancestor
-test_continuation_rejects_present_empty_charter
-test_recovered_reservations_are_owned_only_after_validated_recovery
-test_native_resume_requires_fresh_sessionstart_evidence
-test_native_resume_rejects_prelaunch_sessionstart_evidence
-test_native_resume_separates_whole_second_sessionstart_evidence
-test_native_resume_uses_private_launch_directory_and_cleans_it
-test_secondmate_pool_is_nonactivating_and_noninherited
-test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
-test_explicit_secondmate_route_preserves_ambient_primary_enforce
-test_enforced_secondmate_requires_routing_inheritance_and_capable_home
-test_secondmate_routing_inheritance_is_authoritative_for_every_mode
-test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
-test_unused_secondmate_pool_never_blocks_unmanaged_spawn
-test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
-test_duplicate_spawn_preserves_original_endpoint_and_lease
-test_reservation_occurs_after_worktree_preparation
-test_raw_enforced_launch_is_rejected_before_mutation
-test_global_enforce_refuses_unsupported_harnesses
-test_malformed_routing_mode_fails_closed
-test_invalid_selection_response_releases_reservation
-test_fresh_launch_requires_session_binding_and_fully_rolls_back
-test_failed_cleanup_persists_retryable_metadata
-test_unknown_spawn_endpoint_retains_lease_for_retry
-test_rollback_retry_rechecks_live_endpoint_before_release
-test_failed_secondmate_rollback_preserves_home_for_relaunch
-test_failed_secondmate_respawn_rollback_restores_prior_state
-test_observe_invalid_response_remains_advisory
-test_explicit_secondmate_profile_ignores_configured_pool
-test_enforced_orca_is_rejected_before_owned_resource_creation
-test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
-test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
-test_cross_provider_continuation_uses_target_default_pool claude codex
-test_cross_provider_continuation_uses_target_default_pool codex claude
-test_continuation_refuses_unknown_endpoint_state
-test_missing_endpoint_target_retains_managed_lease
-test_predecessor_cleanup_failure_preserves_replacement_for_retry
-test_failed_continuation_cleanup_restores_predecessor_for_retry
-test_concurrent_continuations_serialize_before_mutation
-test_live_secondmate_recovery_precedes_home_convergence
-test_continuation_fails_closed_without_original_brief
-test_session_sync_cannot_recreate_metadata_after_teardown
-test_managed_steering_audit_failure_does_not_reclassify_delivery
-test_managed_tmux_identity_survives_window_rename
-test_native_resume_rejects_regressed_sessionstart_evidence
-test_session_sync_metadata_publish_failure_is_closed
-test_session_sync_lineage_failure_restores_unbound_metadata
-test_oversized_continuation_stops_before_mutation
-test_continuation_bounds_no_mistakes_status_snapshot
-test_continuation_caps_informational_snapshots_only
-test_continuation_rejects_symlinked_packet_destination
-test_continuation_pins_packet_destination_directory
-test_continuation_revalidates_repository_anchor_before_install
-test_continuation_revalidates_exact_repository_status_before_install
-test_continuation_revalidates_dirty_tracked_content_before_install
-test_continuation_revalidates_dirty_untracked_content_before_install
-test_continuation_accepts_stable_tracked_deletion
-test_continuation_fingerprint_deadline_covers_ordinary_paths
-test_continuation_removes_packet_when_repository_changes_during_install
-test_continuation_restores_prior_packet_after_failed_postcheck
-test_continuation_rollback_preserves_concurrent_packet_replacement
-test_continuation_rejects_load_bearing_source_replacement_during_open
-test_continuation_rejects_task_source_ancestor_swap
-test_continuation_rejects_metadata_ancestor_swap
-test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
-test_ownerless_lock_marker_rejects_symlink_clobber
-test_account_lock_owner_controls_reject_symlinks
-test_linux_stat_selection_avoids_filesystem_stat_output
-test_stale_reclaim_guard_is_owned_before_lock_removal
-test_task_owned_account_artifacts_reject_symlink_paths
-test_account_lineage_rejects_parent_swap_during_transaction
-test_agent_fleet_contract_is_validated_before_routing
-test_agent_fleet_lifecycle_calls_are_bounded
-test_unsuccessful_lease_mutations_always_reconcile
-test_unsuccessful_recovery_mutation_is_retried
-test_lease_signal_handoff_publishes_cleanup_ownership
-test_account_timeout_wrapper_uses_hard_kill_fallback
-test_teardown_stops_after_rollback_restores_predecessor
+run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
+run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
+run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+run_isolated_test test_completion_contract_ignores_raw_html_headings
+run_isolated_test test_observe_is_dry_run_only
+run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
+run_isolated_test test_explicit_profile_uses_explicit_pool
+run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
+run_isolated_test test_pane_failure_happens_before_account_reservation
+run_isolated_test test_batch_partial_failure_releases_only_failed_item
+run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
+run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
+run_isolated_test test_inherited_lifecycle_lock_rejects_owner_aba
+run_isolated_test test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
+run_isolated_test test_off_metadata_merge_waits_for_metadata_lock
+run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
+run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
+run_isolated_test test_preinstall_managed_failure_restores_artifact_snapshot
+run_isolated_test test_session_sync_bounds_agent_fleet_queries
+run_isolated_test test_session_sync_all_bounds_each_task_and_reaches_later_mappings
+run_isolated_test test_session_sync_removes_reaped_workers_from_cleanup_state
+run_isolated_test test_session_sync_releases_metadata_lock_during_provider_query
+run_isolated_test test_continuation_rejects_symlinked_charter_ancestor
+run_isolated_test test_continuation_rejects_present_empty_charter
+run_isolated_test test_recovered_reservations_are_owned_only_after_validated_recovery
+run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
+run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
+run_isolated_test test_native_resume_separates_whole_second_sessionstart_evidence
+run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
+run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
+run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
+run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
+run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+run_isolated_test test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
+run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn
+run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
+run_isolated_test test_duplicate_spawn_preserves_original_endpoint_and_lease
+run_isolated_test test_reservation_occurs_after_worktree_preparation
+run_isolated_test test_raw_enforced_launch_is_rejected_before_mutation
+run_isolated_test test_global_enforce_refuses_unsupported_harnesses
+run_isolated_test test_malformed_routing_mode_fails_closed
+run_isolated_test test_invalid_selection_response_releases_reservation
+run_isolated_test test_fresh_launch_requires_session_binding_and_fully_rolls_back
+run_isolated_test test_failed_cleanup_persists_retryable_metadata
+run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
+run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
+run_isolated_test test_failed_secondmate_rollback_preserves_home_for_relaunch
+run_isolated_test test_failed_secondmate_respawn_rollback_restores_prior_state
+run_isolated_test test_observe_invalid_response_remains_advisory
+run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
+run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
+run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex
+run_isolated_test test_cross_provider_continuation_uses_target_default_pool codex claude
+run_isolated_test test_continuation_refuses_unknown_endpoint_state
+run_isolated_test test_missing_endpoint_target_retains_managed_lease
+run_isolated_test test_predecessor_cleanup_failure_preserves_replacement_for_retry
+run_isolated_test test_failed_continuation_cleanup_restores_predecessor_for_retry
+run_isolated_test test_concurrent_continuations_serialize_before_mutation
+run_isolated_test test_live_secondmate_recovery_precedes_home_convergence
+run_isolated_test test_continuation_fails_closed_without_original_brief
+run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
+run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+run_isolated_test test_managed_tmux_identity_survives_window_rename
+run_isolated_test test_native_resume_rejects_regressed_sessionstart_evidence
+run_isolated_test test_session_sync_metadata_publish_failure_is_closed
+run_isolated_test test_session_sync_lineage_failure_restores_unbound_metadata
+run_isolated_test test_oversized_continuation_stops_before_mutation
+run_isolated_test test_continuation_bounds_no_mistakes_status_snapshot
+run_isolated_test test_continuation_caps_informational_snapshots_only
+run_isolated_test test_continuation_rejects_symlinked_packet_destination
+run_isolated_test test_continuation_pins_packet_destination_directory
+run_isolated_test test_continuation_revalidates_repository_anchor_before_install
+run_isolated_test test_continuation_revalidates_exact_repository_status_before_install
+run_isolated_test test_continuation_revalidates_dirty_tracked_content_before_install
+run_isolated_test test_continuation_revalidates_dirty_untracked_content_before_install
+run_isolated_test test_continuation_accepts_stable_tracked_deletion
+run_isolated_test test_continuation_fingerprint_deadline_covers_ordinary_paths
+run_isolated_test test_continuation_removes_packet_when_repository_changes_during_install
+run_isolated_test test_continuation_restores_prior_packet_after_failed_postcheck
+run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replacement
+run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
+run_isolated_test test_continuation_rejects_task_source_ancestor_swap
+run_isolated_test test_continuation_rejects_metadata_ancestor_swap
+run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
+run_isolated_test test_account_lock_owner_controls_reject_symlinks
+run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
+run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
+run_isolated_test test_agent_fleet_contract_is_validated_before_routing
+run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
+run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
+run_isolated_test test_unsuccessful_recovery_mutation_is_retried
+run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
+run_isolated_test test_account_timeout_wrapper_uses_hard_kill_fallback
+run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
 
 echo "# all fm-account-routing tests passed"

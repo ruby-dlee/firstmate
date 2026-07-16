@@ -24,7 +24,9 @@ fm_refuse_if_gate_agent
 PACKET_TMP=
 PACKET_PRIOR_TMP=
 PACKET_PRIOR_ID=
+PACKET_PRIOR_GENERATION=
 PUBLISHED_PACKET_ID=
+PUBLISHED_PACKET_GENERATION=
 PACKET_LOCK=
 PACKET_LOCK_TOKEN=
 STATUS_SNAPSHOT_TMP=
@@ -51,6 +53,19 @@ path_identity() {
   else
     stat -c '%d:%i' "$1" 2>/dev/null
   fi
+}
+
+file_generation_identity() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+value = os.stat(sys.argv[1], follow_symlinks=False)
+if not stat.S_ISREG(value.st_mode):
+    raise SystemExit(1)
+print(f"{value.st_dev}:{value.st_ino}:{value.st_size}:{value.st_mtime_ns}:{value.st_ctime_ns}")
+PY
 }
 
 remove_owned_path() {
@@ -607,13 +622,13 @@ if ! repository_snapshot_matches; then
 fi
 
 rollback_published_packet() {
-  local current_id prior_id preserved_id preserved_path quarantine
-  current_id=$(path_identity "$PACKET" 2>/dev/null || true)
-  if [ "$current_id" != "$PUBLISHED_PACKET_ID" ]; then
+  local current_generation prior_generation preserved_id preserved_path quarantine
+  current_generation=$(file_generation_identity "$PACKET" 2>/dev/null || true)
+  if [ "$current_generation" != "$PUBLISHED_PACKET_GENERATION" ]; then
     echo "error: continuation packet generation changed before rollback for $ID" >&2
     if [ -n "$PACKET_PRIOR_TMP" ]; then
-      prior_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
-      if [ "$prior_id" = "$PACKET_PRIOR_ID" ]; then
+      prior_generation=$(file_generation_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+      if [ "$prior_generation" = "$PACKET_PRIOR_GENERATION" ]; then
         preserved_id=${PACKET_PRIOR_ID//:/-}
         preserved_path="$TASK_DIR/continuation-$ATTEMPT.displaced-$preserved_id.md"
         if [ ! -e "$preserved_path" ] && ln -- "$PACKET_PRIOR_TMP" "$preserved_path" 2>/dev/null; then
@@ -625,12 +640,13 @@ rollback_published_packet() {
       fi
       PACKET_PRIOR_TMP=
       PACKET_PRIOR_ID=
+      PACKET_PRIOR_GENERATION=
     fi
     return 1
   fi
   if [ -n "$PACKET_PRIOR_TMP" ]; then
-    prior_id=$(path_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
-    [ "$prior_id" = "$PACKET_PRIOR_ID" ] \
+    prior_generation=$(file_generation_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+    [ "$prior_generation" = "$PACKET_PRIOR_GENERATION" ] \
       || { echo "error: displaced continuation packet generation changed for $ID" >&2; return 1; }
     python3 "$SCRIPT_DIR/fm-contained-read.py" exchange-files-fd \
       "${PACKET_PRIOR_TMP#./}" "${PACKET#./}" "$PACKET_PRIOR_ID" "$PUBLISHED_PACKET_ID" 3< . \
@@ -638,6 +654,7 @@ rollback_published_packet() {
     remove_owned_path "$PACKET_PRIOR_TMP" "$PUBLISHED_PACKET_ID"
     PACKET_PRIOR_TMP=
     PACKET_PRIOR_ID=
+    PACKET_PRIOR_GENERATION=
   else
     quarantine=".continuation-$ATTEMPT.rollback.$PACKET_LOCK_TOKEN"
     python3 "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
@@ -645,6 +662,7 @@ rollback_published_packet() {
       || return 1
   fi
   PUBLISHED_PACKET_ID=
+  PUBLISHED_PACKET_GENERATION=
 }
 
 publish_packet() {
@@ -665,6 +683,9 @@ publish_packet() {
       || return 1
     PACKET_PRIOR_TMP=$PACKET_TMP
     PACKET_PRIOR_ID=$destination_id
+    PACKET_PRIOR_GENERATION=$(file_generation_identity "$PACKET_PRIOR_TMP" 2>/dev/null || true)
+    PUBLISHED_PACKET_GENERATION=$(file_generation_identity "$PACKET" 2>/dev/null || true)
+    [ -n "$PACKET_PRIOR_GENERATION" ] && [ -n "$PUBLISHED_PACKET_GENERATION" ] || return 1
     PACKET_TMP=
     return 0
   fi
@@ -679,7 +700,9 @@ publish_packet() {
   fi
   rm -f -- "$PACKET_TMP" || return 1
   PACKET_TMP=
-  [ "$(path_identity "$PACKET" 2>/dev/null || true)" = "$PUBLISHED_PACKET_ID" ]
+  PUBLISHED_PACKET_GENERATION=$(file_generation_identity "$PACKET" 2>/dev/null || true)
+  [ "$(path_identity "$PACKET" 2>/dev/null || true)" = "$PUBLISHED_PACKET_ID" ] \
+    && [ -n "$PUBLISHED_PACKET_GENERATION" ]
 }
 
 fail_after_publish() {
@@ -719,9 +742,12 @@ fi
   && [ "$(path_identity "$TASK_DIR_PATH" 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
   && [ "$(path_identity . 2>/dev/null || true)" = "$TASK_DIR_ID" ] \
   || fail_after_publish "error: continuation task directory changed for $ID"
+[ "$(file_generation_identity "$PACKET" 2>/dev/null || true)" = "$PUBLISHED_PACKET_GENERATION" ] \
+  || fail_after_publish "error: continuation packet generation changed before finalization for $ID"
 remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
 PACKET_PRIOR_TMP=
 PACKET_PRIOR_ID=
+PACKET_PRIOR_GENERATION=
 PACKET_GENERATION="continuation-$ATTEMPT.generation-$PACKET_LOCK_TOKEN.md"
 if [ "${FM_ACCOUNT_CONTINUATION_EMIT_PROMPT_B64:-}" = 1 ]; then
   printf '%s\n' "$TASK_DIR_PATH/$PACKET_GENERATION"

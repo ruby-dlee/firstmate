@@ -1815,11 +1815,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS"; then
       ACCOUNT_LEASE_CREATED=1
     else
-      account_recover_status=$?
-      if [ "$account_recover_status" -eq 2 ]; then
-        ACCOUNT_LEASE_CREATED=1
-        persist_failed_account_rollback_short || true
-      fi
+      persist_failed_account_rollback_short || true
       exit 1
     fi
     persist_failed_account_rollback_short || exit 1

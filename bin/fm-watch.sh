@@ -476,7 +476,8 @@ sync_account_sessions_if_due() {
   local cadence="$STATE/.last-account-session-sync"
   marker_due "$cadence" "$ACCOUNT_SESSION_SYNC_INTERVAL" "watcher cadence" || return 0
   safe_touch_marker_or_log "$cadence" "watcher cadence" || true
-  run_bounded "$ACCOUNT_SESSION_SYNC_TIMEOUT" "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
+  FM_ACCOUNT_SESSION_TASK_TIMEOUT="$ACCOUNT_SESSION_SYNC_TIMEOUT" \
+    "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the

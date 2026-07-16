@@ -51,8 +51,17 @@ esac
 fm_account_valid_id "$ID" || { echo "error: invalid task id '$ID'" >&2; exit 1; }
 fm_account_valid_id "$ATTEMPT" || { echo "error: invalid account attempt '$ATTEMPT'" >&2; exit 1; }
 
-META="$STATE/$ID.meta"
-[ -f "$META" ] && [ ! -L "$META" ] || { echo "error: no safe managed metadata for continuation at $META" >&2; exit 1; }
+CONTAINED_READ="$SCRIPT_DIR/fm-contained-read.cjs"
+META_SOURCE="$STATE/$ID.meta"
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe continuation state directory at $STATE" >&2; exit 1; }
+[ -f "$META_SOURCE" ] && [ ! -L "$META_SOURCE" ] || { echo "error: no safe managed metadata for continuation at $META_SOURCE" >&2; exit 1; }
+META_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-meta-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation metadata for $ID" >&2; exit 1; }
+if ! node "$CONTAINED_READ" "$STATE" "$META_SOURCE" "$MAX_PACKET_BYTES" > "$META_SNAPSHOT_TMP"; then
+  echo "error: cannot safely snapshot continuation metadata for $ID" >&2
+  exit 1
+fi
+META="$META_SNAPSHOT_TMP"
 PROFILE=$(fm_meta_get "$META" account_profile)
 POOL=$(fm_meta_get "$META" account_pool)
 HARNESS=$(fm_meta_get "$META" harness)
@@ -90,24 +99,24 @@ HEAD=$(git -C "$WORKTREE_REAL" rev-parse HEAD 2>/dev/null) || { echo "error: can
 BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=detached
 
-continuation_safe_file() {
-  local file=$1 root=$2 parent root_real resolved
-  [ -s "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  parent=$(cd "$(dirname "$file")" && pwd -P) || return 1
-  root_real=$(cd "$root" && pwd -P) || return 1
-  resolved="$parent/$(basename "$file")"
-  case "$resolved" in "$root_real"/*) printf '%s\n' "$resolved" ;; *) return 1 ;; esac
+continuation_source_nonempty() {
+  local root=$1 file=$2
+  node "$CONTAINED_READ" "$root" "$file" "$MAX_PACKET_BYTES" >/dev/null 2>&1 \
+    && [ -s "$file" ]
 }
 
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 
 if [ "$KIND" = secondmate ] && [ -e "$WORKTREE_REAL/data/charter.md" ]; then
-  BRIEF=$(continuation_safe_file "$WORKTREE_REAL/data/charter.md" "$WORKTREE_REAL") || BRIEF=
+  BRIEF_ROOT="$WORKTREE_REAL/data"
+  BRIEF="$BRIEF_ROOT/charter.md"
 else
-  BRIEF=$(continuation_safe_file "$TASK_DIR/brief.md" "$TASK_DIR") || BRIEF=
+  BRIEF_ROOT=$TASK_DIR
+  BRIEF="$TASK_DIR/brief.md"
 fi
-[ -n "$BRIEF" ] || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+continuation_source_nonempty "$BRIEF_ROOT" "$BRIEF" \
+  || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
 
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
 PACKET_TMP=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.XXXXXX") \
@@ -197,89 +206,48 @@ append_snapshot_section() {
   packet_check_budget
 }
 
-continuation_path_identity_size() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f '%d:%i:%z' "$1" 2>/dev/null
-  else
-    stat -c '%d:%i:%s' "$1" 2>/dev/null
-  fi
-}
-
-continuation_fd_identity_size() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -Lf '%i:%z' "/dev/fd/$1" 2>/dev/null
-  else
-    stat -Lc '%d:%i:%s' "/dev/fd/$1" 2>/dev/null
-  fi
-}
-
-append_file_section() {  # <heading> <file>
-  local heading=$1 file=$2 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc
-  local fd_stat path_stat fd_identity path_identity
+append_file_section() {  # <heading> <root> <file>
+  local heading=$1 root=$2 file=$3 current file_bytes framing_bytes projected copy_start copy_end copied copy_rc source_tmp
   [ -f "$file" ] || return 0
   [ ! -L "$file" ] || { echo "error: refusing symlinked continuation source $file" >&2; return 1; }
-  if ! exec 9< "$file"; then
-    echo "error: cannot open continuation source $file" >&2
+  source_tmp=$(mktemp "$TASK_DIR/.continuation-source.XXXXXX") \
+    || { echo "error: cannot stage continuation source $file" >&2; return 1; }
+  if ! node "$CONTAINED_READ" "$root" "$file" 1048576 > "$source_tmp"; then
+    rm -f "$source_tmp"
+    echo "error: cannot safely read continuation source $file" >&2
     return 1
   fi
-  fd_stat=$(continuation_fd_identity_size 9) || {
-    exec 9<&-
-    echo "error: cannot inspect opened continuation source $file" >&2
-    return 1
-  }
-  [ ! -L "$file" ] || {
-    exec 9<&-
-    echo "error: refusing replaced continuation source $file" >&2
-    return 1
-  }
-  path_stat=$(continuation_path_identity_size "$file") || {
-    exec 9<&-
-    echo "error: cannot revalidate continuation source $file" >&2
-    return 1
-  }
-  path_identity=${path_stat%:*}
-  if [ "$(uname)" = Darwin ]; then
-    fd_identity=${fd_stat%:*}
-    path_identity=${path_identity#*:}
-  else
-    fd_identity=${fd_stat%:*}
-  fi
-  if [ "$fd_identity" != "$path_identity" ]; then
-    exec 9<&-
-    echo "error: continuation source changed while opening $file" >&2
-    return 1
-  fi
-  file_bytes=${fd_stat##*:}
+  file_bytes=$(snapshot_bytes "$source_tmp") || { rm -f "$source_tmp"; return 1; }
   current=$(packet_bytes) || {
-    exec 9<&-
+    rm -f "$source_tmp"
     echo "error: cannot measure continuation packet for $ID" >&2
     return 1
   }
   framing_bytes=$(printf '\n## %s\n\n\n' "$heading" | wc -c | tr -d '[:space:]')
   case "$file_bytes$framing_bytes" in
     *[!0-9]*)
-      exec 9<&-
+      rm -f "$source_tmp"
       echo "error: cannot measure continuation source $file" >&2
       return 1
       ;;
   esac
   projected=$((current + file_bytes + framing_bytes))
   if [ "$projected" -gt "$MAX_PACKET_BYTES" ]; then
-    exec 9<&-
+    rm -f "$source_tmp"
     packet_size_error "$projected"
     return 1
   fi
-  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || { exec 9<&-; return 1; }
+  printf '\n## %s\n\n' "$heading" >> "$PACKET_TMP" || { rm -f "$source_tmp"; return 1; }
   copy_start=$(packet_bytes) || {
-    exec 9<&-
+    rm -f "$source_tmp"
     echo "error: cannot measure continuation packet for $ID" >&2
     return 1
   }
   set +e
-  head -c "$((file_bytes + 1))" <&9 >> "$PACKET_TMP"
+  head -c "$file_bytes" "$source_tmp" >> "$PACKET_TMP"
   copy_rc=$?
   set -e
-  exec 9<&-
+  rm -f "$source_tmp"
   [ "$copy_rc" -eq 0 ] || { echo "error: cannot copy continuation source $file" >&2; return 1; }
   copy_end=$(packet_bytes) || { echo "error: cannot measure continuation packet for $ID" >&2; return 1; }
   copied=$((copy_end - copy_start))
@@ -309,10 +277,9 @@ packet_check_budget
 
 STATUS_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-status.XXXXXX") || STATUS_SNAPSHOT_TMP=
 LOG_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-log.XXXXXX") || LOG_SNAPSHOT_TMP=
-META_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-meta.XXXXXX") || META_SNAPSHOT_TMP=
 NO_MISTAKES_STATUS_TMP=$(mktemp "$TASK_DIR/.continuation-no-mistakes.XXXXXX") || NO_MISTAKES_STATUS_TMP=
 if [ -z "$STATUS_SNAPSHOT_TMP" ] || [ -z "$LOG_SNAPSHOT_TMP" ] \
-  || [ -z "$META_SNAPSHOT_TMP" ] || [ -z "$NO_MISTAKES_STATUS_TMP" ]; then
+  || [ -z "$NO_MISTAKES_STATUS_TMP" ]; then
   echo "error: cannot safely stage continuation snapshots for $ID" >&2
   exit 1
 fi
@@ -325,8 +292,6 @@ capture_command_snapshot "$LOG_SNAPSHOT_TMP" fatal git -C "$WORKTREE_REAL" log -
   || { echo "error: cannot snapshot continuation repository history for $ID" >&2; exit 1; }
 append_snapshot_section "Recent repository history" "$LOG_SNAPSHOT_TMP"
 
-capture_file_snapshot "$META_SNAPSHOT_TMP" "$META" \
-  || { echo "error: cannot snapshot continuation metadata for $ID" >&2; exit 1; }
 append_snapshot_section "Recorded task metadata" "$META_SNAPSHOT_TMP"
 
 if NO_MISTAKES_BIN=$(command -v no-mistakes 2>/dev/null); then
@@ -341,22 +306,22 @@ else
 fi
 append_snapshot_section "No-mistakes state" "$NO_MISTAKES_STATUS_TMP"
 
-append_file_section "Original brief or charter" "$BRIEF"
-append_file_section "Wake-event and progress status" "$STATE/$ID.status"
-append_file_section "Task report" "$TASK_DIR/report.md"
-append_file_section "Completion report" "$TASK_DIR/completion.md"
-append_file_section "Decisions" "$TASK_DIR/decisions.md"
-append_file_section "Steering trail" "$TASK_DIR/steering.md"
-append_file_section "Pending steering audit" "$TASK_DIR/steering-pending.md"
-append_file_section "Unconfirmed steering" "$TASK_DIR/steering-unconfirmed.md"
-append_file_section "Completed side effects" "$TASK_DIR/side-effects.md"
-append_file_section "Do not rerun" "$TASK_DIR/do-not-rerun.md"
-append_file_section "Next action" "$TASK_DIR/next-action.md"
-append_file_section "Checkpoint" "$TASK_DIR/checkpoint.md"
-append_file_section "Handoff" "$TASK_DIR/handoff.md"
-append_file_section "Recalled context" "$TASK_DIR/recalled.md"
-append_file_section "Provider transcript summary" "$TASK_DIR/transcript-summary.md"
-append_file_section "Account attempt lineage" "$TASK_DIR/account-attempts.md"
+append_file_section "Original brief or charter" "$BRIEF_ROOT" "$BRIEF"
+append_file_section "Wake-event and progress status" "$STATE" "$STATE/$ID.status"
+append_file_section "Task report" "$TASK_DIR" "$TASK_DIR/report.md"
+append_file_section "Completion report" "$TASK_DIR" "$TASK_DIR/completion.md"
+append_file_section "Decisions" "$TASK_DIR" "$TASK_DIR/decisions.md"
+append_file_section "Steering trail" "$TASK_DIR" "$TASK_DIR/steering.md"
+append_file_section "Pending steering audit" "$TASK_DIR" "$TASK_DIR/steering-pending.md"
+append_file_section "Unconfirmed steering" "$TASK_DIR" "$TASK_DIR/steering-unconfirmed.md"
+append_file_section "Completed side effects" "$TASK_DIR" "$TASK_DIR/side-effects.md"
+append_file_section "Do not rerun" "$TASK_DIR" "$TASK_DIR/do-not-rerun.md"
+append_file_section "Next action" "$TASK_DIR" "$TASK_DIR/next-action.md"
+append_file_section "Checkpoint" "$TASK_DIR" "$TASK_DIR/checkpoint.md"
+append_file_section "Handoff" "$TASK_DIR" "$TASK_DIR/handoff.md"
+append_file_section "Recalled context" "$TASK_DIR" "$TASK_DIR/recalled.md"
+append_file_section "Provider transcript summary" "$TASK_DIR" "$TASK_DIR/transcript-summary.md"
+append_file_section "Account attempt lineage" "$TASK_DIR" "$TASK_DIR/account-attempts.md"
 
 packet_check_budget
 if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then

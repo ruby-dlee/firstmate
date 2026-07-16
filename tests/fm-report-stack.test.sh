@@ -471,6 +471,49 @@ EOF
   pass "report section validation respects the opening Markdown fence length"
 }
 
+test_raw_html_does_not_satisfy_required_sections() {
+  local id=report-raw-html-b3k source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+Incomplete.
+
+<!--
+## What changed
+-->
+
+<div>
+## Verification
+
+Hidden.
+
+## Visual evidence
+
+Hidden.
+
+## Artifacts
+
+Hidden.
+
+## Follow-ups
+
+Hidden.
+</div>
+
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "headings inside raw HTML unexpectedly satisfied the report contract"
+  for heading in "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "raw HTML failure omitted missing heading $heading"
+  done
+  pass "report parsing excludes CommonMark raw HTML blocks and comments"
+}
+
 test_indented_pseudo_closers_do_not_end_fences() {
   local id source out status heading
 
@@ -479,7 +522,36 @@ test_indented_pseudo_closers_do_not_end_fences() {
     write_task "$id" ship
     source="$HOME_DIR/data/$id/completion.md"
     if [ "$marker" = backtick ]; then
-      printf '# Completion\n\n## Summary\n\nIncomplete.\n\n```markdown\n    ```\n## What changed\n\nHidden.\n\n## Verification\n\nHidden.\n\n## Visual evidence\n\nHidden.\n\n## Follow-ups\n\nHidden.\n```\n\n## Artifacts\n\nNone.\n' > "$source"
+      cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+Incomplete.
+
+```markdown
+    ```
+## What changed
+
+Hidden.
+
+## Verification
+
+Hidden.
+
+## Visual evidence
+
+Hidden.
+
+## Follow-ups
+
+Hidden.
+```
+
+## Artifacts
+
+None.
+EOF
     else
       printf '# Completion\n\n## Summary\n\nIncomplete.\n\n~~~markdown\n    ~~~\n## What changed\n\nHidden.\n\n## Verification\n\nHidden.\n\n## Visual evidence\n\nHidden.\n\n## Follow-ups\n\nHidden.\n~~~\n\n## Artifacts\n\nNone.\n' > "$source"
     fi
@@ -526,7 +598,35 @@ test_invalid_backtick_info_string_does_not_open_fence() {
   local id=report-invalid-backtick-info-b3h source
   write_task "$id" ship
   source="$HOME_DIR/data/$id/completion.md"
-  printf '# Completion\n\n```language`invalid\n\n## Summary\n\nComplete.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  cat > "$source" <<'EOF'
+# Completion
+
+```language`invalid
+
+## Summary
+
+Complete.
+
+## What changed
+
+Changed.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+EOF
   run_stack publish "$id" >/dev/null || fail "backtick-containing info string was treated as a valid fence opener"
   pass "invalid backtick fence info strings do not hide report headings"
 }
@@ -1075,6 +1175,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-20 ]; then
+  test_raw_html_does_not_satisfy_required_sections
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1099,6 +1204,7 @@ test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_nested_short_fences_do_not_satisfy_required_sections
+test_raw_html_does_not_satisfy_required_sections
 test_indented_pseudo_closers_do_not_end_fences
 test_required_headings_follow_commonmark_atx_rules
 test_invalid_backtick_info_string_does_not_open_fence

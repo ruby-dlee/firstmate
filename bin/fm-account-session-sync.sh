@@ -28,6 +28,7 @@ fm_refuse_if_gate_agent
 
 WAIT=0
 QUERY_TIMEOUT=${FM_ACCOUNT_SESSION_QUERY_TIMEOUT:-5}
+ALL_TASK_TIMEOUT=${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}
 REQUIRE=0
 ALL=0
 PRINT_UPDATED_AT=0
@@ -57,6 +58,10 @@ while [ "$#" -gt 0 ]; do
 done
 case "$WAIT" in ''|*[!0-9]*) echo "error: --wait must be a non-negative integer" >&2; exit 2 ;; esac
 case "$QUERY_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_QUERY_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
+if [ -z "$ALL_TASK_TIMEOUT" ]; then
+  ALL_TASK_TIMEOUT=$((QUERY_TIMEOUT + 2))
+fi
+case "$ALL_TASK_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_TASK_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
 session_timestamp_advances() {  # <candidate> <baseline>
   LC_ALL=C awk -v candidate="$1" -v baseline="$2" '
     function valid(value) {
@@ -93,7 +98,7 @@ if [ "$ALL" = 1 ]; then
     [ -n "$(fm_meta_get "$meta" account_profile)" ] || continue
     [ -z "$(fm_meta_get "$meta" provider_session_id)" ] || continue
     task=$(basename "$meta" .meta)
-    "$0" "$task" >/dev/null 2>&1 || rc=1
+    fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1 || rc=1
   done
   exit "$rc"
 fi

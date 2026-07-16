@@ -25,6 +25,28 @@ assert_regex() {
   grep -Eq "$pattern" "$file" 2>/dev/null || fail "$label"
 }
 
+write_continuation_ancestor_swap_hook() {
+  cat > "$1" <<'JS'
+const fs = require("fs");
+const path = require("path");
+const { syncBuiltinESMExports } = require("module");
+const originalOpenSync = fs.openSync.bind(fs);
+const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
+const target = normalize(process.env.FM_CONTINUATION_SWAP_TARGET);
+let swapped = false;
+fs.openSync = (file, ...args) => {
+  if (!swapped && normalize(file) === target) {
+    swapped = true;
+    fs.renameSync(process.env.FM_CONTINUATION_SWAP_PARENT, process.env.FM_CONTINUATION_SWAP_MOVED);
+    fs.symlinkSync(process.env.FM_CONTINUATION_SWAP_OUTSIDE, process.env.FM_CONTINUATION_SWAP_PARENT, "dir");
+    fs.writeFileSync(process.env.FM_CONTINUATION_SWAP_MARKER, "swapped\n");
+  }
+  return originalOpenSync(file, ...args);
+};
+syncBuiltinESMExports();
+JS
+}
+
 make_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -192,6 +214,7 @@ case "$*" in
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     case "$*" in
       *" lease recover "*)
+        [ "${FM_FAKE_AF_RECOVER_FAIL:-0}" != 1 ] || exit "${FM_FAKE_AF_RECOVER_FAIL_STATUS:-42}"
         if [ -n "${FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE:-}" ] && [ ! -e "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE" ]; then
           : > "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE"
           exit "${FM_FAKE_AF_RECOVER_FAIL_STATUS:-42}"
@@ -218,7 +241,10 @@ case "$*" in
       touch "$FM_FAKE_AF_SESSION_REFRESHED"
     fi
     [ -z "${FM_FAKE_AF_SESSION_MARKER:-}" ] || touch "$FM_FAKE_AF_SESSION_MARKER"
-    [ -z "${FM_FAKE_AF_SESSION_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SESSION_SLEEP"
+    if [ -n "${FM_FAKE_AF_SESSION_SLEEP:-}" ] \
+      && { [ -z "${FM_FAKE_AF_SESSION_SLEEP_TASK:-}" ] || [ "$task" = "$FM_FAKE_AF_SESSION_SLEEP_TASK" ]; }; then
+      sleep "$FM_FAKE_AF_SESSION_SLEEP"
+    fi
     if [ -n "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_FILE:-}" ]; then
       printf '%s\n%s\n' "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_PID:?}" \
         "${FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_START:?}" > "$FM_FAKE_AF_SESSION_REPLACE_LOCK_OWNER_FILE"
@@ -546,6 +572,42 @@ JS
   assert_grep '# Concurrent replacement' "$brief" "failed brief upgrade overwrote the concurrent edit"
   assert_no_grep '# Completion report' "$brief" "failed brief upgrade installed the contract over a concurrent edit"
   pass "completion-contract upgrades are contained, non-following, and atomic"
+}
+
+test_completion_contract_ignores_raw_html_headings() {
+  local id rec brief heading_count
+  id=contract-html-comment-example-z1bc
+  rec=$(make_case contract-html-comment-example claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  cat > "$brief" <<'EOF'
+# Task
+
+<!--
+# Completion report
+-->
+EOF
+  run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "commented completion-report example blocked contract injection"
+  heading_count=$(grep -c '^# Completion report$' "$brief")
+  [ "$heading_count" -eq 2 ] || fail "commented completion-report example suppressed the real contract"
+
+  id=contract-html-block-example-z1bd
+  rec=$(make_case contract-html-block-example claude "$id")
+  read_case "$rec"
+  brief="$HOME_DIR/data/$id/brief.md"
+  cat > "$brief" <<'EOF'
+# Task
+
+<div>
+# Completion report
+</div>
+
+Continue.
+EOF
+  run_spawn "$id" "$PROJ_DIR" >/dev/null || fail "raw HTML completion-report example blocked contract injection"
+  heading_count=$(grep -c '^# Completion report$' "$brief")
+  [ "$heading_count" -eq 2 ] || fail "raw HTML completion-report example suppressed the real contract"
+  pass "completion-contract injection ignores raw HTML headings"
 }
 
 test_observe_is_dry_run_only() {
@@ -969,6 +1031,42 @@ test_session_sync_bounds_agent_fleet_queries() {
   pass "session synchronization bounds every Agent Fleet query"
 }
 
+test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
+  local first later rec out status started elapsed
+  first=account-sync-all-a1
+  later=account-sync-all-z9
+  rec=$(make_case sync-all-fair claude "$first" "$later")
+  read_case "$rec"
+  for id in "$first" "$later"; do
+    fm_write_meta "$HOME_DIR/state/$id.meta" \
+      "window=firstmate:fm-$id" \
+      "worktree=$WT_DIR" \
+      "project=$PROJ_DIR" \
+      "harness=claude" \
+      "kind=ship" \
+      "account_pool=claude-crew" \
+      "account_profile=claude-2" \
+      "account_task=$id" \
+      "account_attempt=attempt-$id"
+  done
+  started=$(date +%s)
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 FM_FAKE_AF_SESSION_SLEEP_TASK="$first" \
+    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=2 \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all 2>&1)
+  status=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$status" -ne 0 ] || fail "sync-all hid the timed-out first mapping"
+  [ "$elapsed" -lt 5 ] || fail "sync-all did not bound the slow mapping (${elapsed}s)"
+  assert_grep "session status --task $first" "$AF_LOG" "sync-all never attempted the slow first mapping"
+  assert_grep "session status --task $later" "$AF_LOG" "sync-all starved the later mapping"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$later.meta" \
+    "sync-all did not publish the later mapping after the first timed out"
+  [ -n "$out" ] || true
+  pass "sync-all gives every task an independent bounded mapping attempt"
+}
+
 test_session_sync_releases_metadata_lock_during_provider_query() {
   local id rec meta_tmp marker sync_pid sync_rc
   id=account-sync-lock-z9e
@@ -1032,7 +1130,7 @@ test_continuation_rejects_symlinked_charter_ancestor() {
   pass "secondmate continuation requires a contained charter path"
 }
 
-test_recovered_reservations_are_owned_until_launch_commit() {
+test_recovered_reservations_are_owned_only_after_validated_recovery() {
   local id rec out status account_task session lineage
   id=account-recover-owned-z9b
   rec=$(make_case recover-owned claude "$id")
@@ -1046,7 +1144,7 @@ test_recovered_reservations_are_owned_until_launch_commit() {
   out=$(FM_FAKE_AF_RECOVER_TASK=wrong-recovery-task run_spawn "$id" --resume-account)
   status=$?
   [ "$status" -ne 0 ] || fail "mismatched recovery response unexpectedly succeeded"
-  assert_grep "lease release --task $account_task --force" "$AF_LOG" "mismatched recovery leaked its acquired reservation"
+  assert_not_grep "lease release --task $account_task --force" "$AF_LOG" "mismatched recovery force-released an unvalidated reservation"
   assert_not_grep "session remove --task $account_task" "$AF_LOG" "mismatched recovery removed the durable session mapping"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "mismatched recovery changed durable session metadata"
 
@@ -1062,7 +1160,7 @@ test_recovered_reservations_are_owned_until_launch_commit() {
   assert_not_grep "session remove --task $account_task" "$AF_LOG" "post-recovery rollback removed the durable session mapping"
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "post-recovery rollback lost durable session metadata"
   [ -n "$out" ] || true
-  pass "recovered reservations release on every validation and pre-bind failure"
+  pass "sticky reservations become rollback-owned only after validated recovery"
 }
 
 test_native_resume_requires_fresh_sessionstart_evidence() {
@@ -2468,7 +2566,7 @@ test_continuation_rejects_symlinked_packet_destination() {
 }
 
 test_continuation_rejects_load_bearing_source_replacement_during_open() {
-  local id rec source real_stat out status
+  local id rec source hook out status
   id=account-continuation-copy-race-z28d
   rec=$(make_case continuation-copy-race claude "$id")
   read_case "$rec"
@@ -2477,36 +2575,116 @@ test_continuation_rejects_load_bearing_source_replacement_during_open() {
   rm -f "$CASE_DIR/endpoint-live"
   source="$(cd "$HOME_DIR/data/$id" && pwd -P)/checkpoint.md"
   printf 'load-bearing checkpoint\n' > "$source"
-  real_stat=$(command -v stat)
-  cat > "$FAKEBIN_DIR/stat" <<'SH'
-#!/usr/bin/env bash
-last=
-for arg in "$@"; do last=$arg; done
-if [ -n "${FM_REPLACE_CONTINUATION_SOURCE:-}" ] && [ "$last" = "$FM_REPLACE_CONTINUATION_SOURCE" ] \
-  && [ ! -e "$FM_MUTATE_CONTINUATION_SOURCE.mutated" ]; then
-  size=$(wc -c < "$FM_MUTATE_CONTINUATION_SOURCE")
-  head -c "$size" /dev/zero | tr '\0' z > "$FM_MUTATE_CONTINUATION_SOURCE.replacement"
-  mv "$FM_MUTATE_CONTINUATION_SOURCE.replacement" "$FM_MUTATE_CONTINUATION_SOURCE"
-  : > "$FM_MUTATE_CONTINUATION_SOURCE.mutated"
-fi
-exec "$FM_REAL_STAT" "$@"
-SH
-  chmod +x "$FAKEBIN_DIR/stat"
-  export FM_REAL_STAT="$real_stat" FM_REPLACE_CONTINUATION_SOURCE="$source" FM_MUTATE_CONTINUATION_SOURCE="$source"
+  hook="$CASE_DIR/continuation-source-replacement.cjs"
+  cat > "$hook" <<'JS'
+const fs = require("fs");
+const path = require("path");
+const { syncBuiltinESMExports } = require("module");
+const originalOpenSync = fs.openSync.bind(fs);
+const normalize = (value) => path.resolve(value).replace(/^\/private(?=\/)/, "");
+const target = normalize(process.env.FM_MUTATE_CONTINUATION_SOURCE);
+let replaced = false;
+fs.openSync = (file, ...args) => {
+  if (!replaced && normalize(file) === target) {
+    replaced = true;
+    fs.renameSync(file, `${file}.mutated`);
+    fs.writeFileSync(file, Buffer.alloc(fs.statSync(`${file}.mutated`).size, 122));
+  }
+  return originalOpenSync(file, ...args);
+};
+syncBuiltinESMExports();
+JS
+  export NODE_OPTIONS="--require=$hook" FM_MUTATE_CONTINUATION_SOURCE="$source"
   if out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3); then
     status=0
   else
     status=$?
   fi
-  unset FM_REAL_STAT FM_REPLACE_CONTINUATION_SOURCE FM_MUTATE_CONTINUATION_SOURCE
+  unset NODE_OPTIONS FM_MUTATE_CONTINUATION_SOURCE
   [ "$status" -ne 0 ] || fail "continuation accepted a replaced load-bearing source"
   assert_present "$source.mutated" "continuation identity-race hook did not run: $out"
-  assert_contains "$out" 'continuation source changed while opening' \
+  assert_contains "$out" 'contained read failed' \
     "continuation replacement refusal did not report the identity change"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "continuation copy race acquired a replacement lease"
   assert_not_grep '^continuation_packet=' "$HOME_DIR/state/$id.meta" "continuation copy race installed a partial packet"
   pass "continuation load-bearing copies bind one validated source identity"
+}
+
+test_continuation_rejects_task_source_ancestor_swap() {
+  local id rec task_dir moved outside source hook marker out status
+  id=account-continuation-task-parent-z28e
+  rec=$(make_case continuation-task-parent claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "task-parent continuation precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
+  moved="$CASE_DIR/pinned-task-source"
+  outside="$CASE_DIR/outside-task-source"
+  source="$task_dir/decisions.md"
+  hook="$CASE_DIR/task-source-ancestor-swap.cjs"
+  marker="$CASE_DIR/task-source-swapped"
+  mkdir "$outside"
+  printf 'inside task decision\n' > "$source"
+  printf 'outside private task decision\n' > "$outside/decisions.md"
+  write_continuation_ancestor_swap_hook "$hook"
+  if out=$(NODE_OPTIONS="--require=$hook" \
+    FM_CONTINUATION_SWAP_TARGET="$source" FM_CONTINUATION_SWAP_PARENT="$task_dir" \
+    FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
+    FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LOG="$TMUX_LOG" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" task-parent-swap 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "continuation accepted a task-source ancestor swap"
+  assert_present "$marker" "task-source ancestor-swap hook did not run: $out"
+  assert_contains "$out" 'contained read failed' "task-source ancestor swap did not fail at the pinned read"
+  if find "$moved" "$outside" -type f -name 'continuation-task-parent-swap.md' -print -quit | grep -q .; then
+    fail "task-source ancestor swap installed a continuation packet"
+  fi
+  pass "continuation pins task-source ancestors through descriptor open"
+}
+
+test_continuation_rejects_metadata_ancestor_swap() {
+  local id rec state_dir moved outside source hook marker out status
+  id=account-continuation-meta-parent-z28f
+  rec=$(make_case continuation-meta-parent claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "metadata-parent continuation precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  state_dir=$(cd "$HOME_DIR/state" && pwd -P)
+  moved="$CASE_DIR/pinned-state-source"
+  outside="$CASE_DIR/outside-state-source"
+  source="$state_dir/$id.meta"
+  hook="$CASE_DIR/metadata-ancestor-swap.cjs"
+  marker="$CASE_DIR/metadata-source-swapped"
+  mkdir "$outside"
+  cp "$source" "$outside/$id.meta"
+  printf 'outside_marker=private-metadata\n' >> "$outside/$id.meta"
+  write_continuation_ancestor_swap_hook "$hook"
+  if out=$(NODE_OPTIONS="--require=$hook" \
+    FM_CONTINUATION_SWAP_TARGET="$source" FM_CONTINUATION_SWAP_PARENT="$state_dir" \
+    FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
+    FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LOG="$TMUX_LOG" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" metadata-parent-swap 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "continuation accepted a metadata ancestor swap"
+  assert_present "$marker" "metadata ancestor-swap hook did not run: $out"
+  assert_contains "$out" 'cannot safely snapshot continuation metadata' \
+    "metadata ancestor swap did not fail before parsing outside state"
+  assert_absent "$HOME_DIR/data/$id/continuation-metadata-parent-swap.md" \
+    "metadata ancestor swap installed a continuation packet"
+  pass "continuation pins metadata ancestors before parsing task identity"
 }
 
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
@@ -2771,7 +2949,7 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
 test_account_lineage_rejects_parent_swap_during_transaction() {
   local data id original moved outside ready proceed writer_pid writer_rc before
   data="$TMP_ROOT/lineage-parent-race/data"
-  id=lineage-parent-race
+  id='lineage-parent-race'
   original="$data/$id"
   moved="$TMP_ROOT/lineage-parent-race/pinned-task"
   outside="$TMP_ROOT/lineage-parent-race/outside-task"
@@ -2894,7 +3072,18 @@ test_unsuccessful_recovery_mutation_is_retried() {
   [ "$status" -eq 0 ] || fail "non-timeout recovery failure was not reconciled: $out"
   recover_count=$(grep -F -c "lease recover --task $account_task" "$AF_LOG")
   [ "$recover_count" -eq 2 ] || fail "recovery mutation was attempted $recover_count times instead of twice"
-  pass "unsuccessful sticky recovery mutations are reconciled before failure"
+
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  if out=$(FM_FAKE_AF_RECOVER_FAIL=1 run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "doubly failed sticky recovery unexpectedly succeeded"
+  recover_count=$(grep -F -c "lease recover --task $account_task" "$AF_LOG")
+  [ "$recover_count" -eq 2 ] || fail "doubly failed recovery was attempted $recover_count times instead of twice"
+  assert_not_grep "lease release --task $account_task --force" "$AF_LOG" \
+    "doubly failed recovery force-released a pre-existing reservation"
+  assert_grep "account_task=$account_task" "$HOME_DIR/state/$id.meta" \
+    "doubly failed recovery discarded sticky reservation identity"
+  pass "unsuccessful sticky recovery retries without claiming uncertain ownership"
 }
 
 test_account_timeout_wrapper_uses_hard_kill_fallback() {
@@ -3030,6 +3219,16 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-20 ]; then
+  test_recovered_reservations_are_owned_only_after_validated_recovery
+  test_unsuccessful_recovery_mutation_is_retried
+  test_continuation_rejects_task_source_ancestor_swap
+  test_continuation_rejects_metadata_ancestor_swap
+  test_session_sync_all_bounds_each_task_and_reaches_later_mappings
+  test_completion_contract_ignores_raw_html_headings
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3039,6 +3238,7 @@ fi
 test_reserved_generation_is_durable_before_lease_mutation
 test_off_is_byte_compatible_and_never_calls_agent_fleet
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+test_completion_contract_ignores_raw_html_headings
 test_observe_is_dry_run_only
 test_enforce_pool_wraps_backend_and_records_real_session
 test_explicit_profile_uses_explicit_pool
@@ -3055,9 +3255,10 @@ test_unmanaged_respawn_preserves_report_cutover_state
 test_failed_managed_respawn_restores_unmanaged_metadata
 test_preinstall_managed_failure_restores_artifact_snapshot
 test_session_sync_bounds_agent_fleet_queries
+test_session_sync_all_bounds_each_task_and_reaches_later_mappings
 test_session_sync_releases_metadata_lock_during_provider_query
 test_continuation_rejects_symlinked_charter_ancestor
-test_recovered_reservations_are_owned_until_launch_commit
+test_recovered_reservations_are_owned_only_after_validated_recovery
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence
 test_native_resume_uses_private_launch_directory_and_cleans_it
@@ -3106,6 +3307,8 @@ test_continuation_bounds_no_mistakes_status_snapshot
 test_continuation_caps_informational_snapshots_only
 test_continuation_rejects_symlinked_packet_destination
 test_continuation_rejects_load_bearing_source_replacement_during_open
+test_continuation_rejects_task_source_ancestor_swap
+test_continuation_rejects_metadata_ancestor_swap
 test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 test_ownerless_lock_marker_rejects_symlink_clobber
 test_account_lock_owner_controls_reject_symlinks

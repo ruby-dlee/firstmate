@@ -35,10 +35,38 @@ function heading(line) {
   };
 }
 
+const htmlBlockTags = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
+const htmlBlockTagPattern = new RegExp(`^ {0,3}</?(?:${htmlBlockTags})(?:[ \\t]+|/?>|$)`, "i");
+const completeOpenTagPattern = /^ {0,3}<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ "'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>(?:[ \t]*)$/;
+const completeClosingTagPattern = /^ {0,3}<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>(?:[ \t]*)$/;
+
+function htmlBlockStart(line, paragraphOpen) {
+  const script = line.match(/^ {0,3}<(script|pre|style|textarea)(?:[ \t]|>|$)/i);
+  if (script) return { end: new RegExp(`</${script[1]}[ \\t]*>`, "i") };
+  if (/^ {0,3}<!--/.test(line)) return { end: /-->/ };
+  if (/^ {0,3}<\?/.test(line)) return { end: /\?>/ };
+  if (/^ {0,3}<![A-Z]/.test(line)) return { end: />/ };
+  if (/^ {0,3}<!\[CDATA\[/.test(line)) return { end: /\]\]>/ };
+  if (htmlBlockTagPattern.test(line)) return { blank: true };
+  if (!paragraphOpen && (completeOpenTagPattern.test(line) || completeClosingTagPattern.test(line))) return { blank: true };
+  return undefined;
+}
+
 function markdownStructure(markdown) {
   const visible = [];
   let fence;
+  let htmlBlock;
+  let paragraphOpen = false;
   for (const line of String(markdown).split(/\r?\n/)) {
+    if (htmlBlock) {
+      if (htmlBlock.blank) {
+        if (/^[ \t]*$/.test(line)) htmlBlock = undefined;
+      } else if (htmlBlock.end.test(line)) {
+        htmlBlock = undefined;
+      }
+      paragraphOpen = false;
+      continue;
+    }
     const container = listContainerCandidate(line);
     const candidates = [{ text: line, indent: 0 }];
     if (container) candidates.push(container);
@@ -53,6 +81,7 @@ function markdownStructure(markdown) {
         && marker.length >= fence.length
         && marker.suffix.trim() === "");
       if (closing) fence = undefined;
+      paragraphOpen = false;
       continue;
     }
 
@@ -64,9 +93,22 @@ function markdownStructure(markdown) {
         length: opening.marker.length,
         indent: opening.indent,
       };
+      paragraphOpen = false;
       continue;
     }
-    visible.push({ line, heading: heading(line) });
+    const htmlStart = htmlBlockStart(line, paragraphOpen);
+    if (htmlStart) {
+      if (htmlStart.blank || !htmlStart.end.test(line.slice(line.indexOf("<") + 1))) htmlBlock = htmlStart;
+      paragraphOpen = false;
+      continue;
+    }
+    const parsedHeading = heading(line);
+    visible.push({ line, heading: parsedHeading });
+    if (/^[ \t]*$/.test(line) || parsedHeading) {
+      paragraphOpen = false;
+    } else {
+      paragraphOpen = true;
+    }
   }
   return visible;
 }

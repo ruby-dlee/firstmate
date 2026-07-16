@@ -1005,11 +1005,7 @@ fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-pr
     || [ "$pool" != "$expected_pool" ] \
     || [ "$provider" != "$expected_provider" ]; then
     echo "error: agent-fleet returned mismatched recovery state for $task" >&2
-    if ! fm_account_release "$task" --force; then
-      echo "error: failed to release invalid Agent Fleet recovery reservation for $task" >&2
-      return 2
-    fi
-    return 1
+    return 2
   fi
   FM_ACCOUNT_SELECTED_PROFILE=$profile
   FM_ACCOUNT_SELECTED_PROVIDER=$provider

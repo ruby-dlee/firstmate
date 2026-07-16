@@ -298,10 +298,7 @@ else
     local steering_id steering_dir steering_file steering_lock
     steering_id=$(fm_send_id_from_meta "$TARGET_META")
     steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
-    cleanup_managed_steering() {
-      fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true
-    }
-    trap cleanup_managed_steering EXIT
+    trap 'fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true' EXIT
     trap 'exit 1' HUP INT TERM
     steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
     steering_file="$steering_dir/$file_name"

@@ -68,6 +68,18 @@ function waitForPublicationTestGate() {
   }
 }
 
+function waitForPostPublicationTestGate() {
+  const ready = process.env.FM_FILE_TRANSACTION_POSTPUBLISH_TEST_READY;
+  const proceed = process.env.FM_FILE_TRANSACTION_POSTPUBLISH_TEST_PROCEED;
+  if (!ready || !proceed) return;
+  fs.writeFileSync(ready, "ready\n", { flag: "wx" });
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(proceed)) {
+    if (Date.now() >= deadline) throw new Error("file transaction post-publication test gate timed out");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+
 function pinnedTaskFileTransaction(dataDir, taskId, fileName, transform) {
   if (!/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(taskId)) throw new Error("invalid task id");
   if (path.basename(fileName) !== fileName || fileName === "." || fileName === "..") {
@@ -141,16 +153,28 @@ function pinnedTaskFileTransaction(dataDir, taskId, fileName, transform) {
       waitForPublicationTestGate();
       runContained(directory, "exchange-files-fd", staged, fileName,
         identity(replacementIdentity), identity(sourceIdentity));
-      const displaced = fs.lstatSync(staged, { bigint: true });
-      const installed = fs.lstatSync(fileName, { bigint: true });
+      let displaced;
+      let installed;
+      try {
+        waitForPostPublicationTestGate();
+        displaced = fs.lstatSync(staged, { bigint: true });
+        installed = fs.lstatSync(fileName, { bigint: true });
+      } catch {
+        staged = undefined;
+        throw new Error("task file changed during publication");
+      }
       const postExchangeSource = fs.fstatSync(source, { bigint: true });
       if (!sameIdentity(displaced, sourceIdentity) || !sameIdentity(installed, replacementIdentity)
         || !samePublishedSourceSnapshot(sourceIdentity, postExchangeSource)
         || !descriptorContentEquals(source, content)) {
-        try {
-          runContained(directory, "exchange-files-fd", staged, fileName,
-            identity(displaced), identity(installed));
-        } catch {
+        if (sameIdentity(displaced, sourceIdentity) && sameIdentity(installed, replacementIdentity)) {
+          try {
+            runContained(directory, "exchange-files-fd", staged, fileName,
+              identity(sourceIdentity), identity(replacementIdentity));
+          } catch {
+            staged = undefined;
+          }
+        } else {
           staged = undefined;
         }
         throw new Error("task file changed during publication");

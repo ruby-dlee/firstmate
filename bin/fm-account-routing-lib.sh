@@ -877,11 +877,33 @@ fm_account_reconcile_lease_mutation() {  # <binary> <task> <operation>
   return 2
 }
 
+fm_account_mutation_defer_signals() {
+  FM_ACCOUNT_MUTATION_PENDING_SIGNAL=
+  FM_ACCOUNT_MUTATION_SAVED_TRAPS=$(trap -p HUP INT TERM)
+  trap 'FM_ACCOUNT_MUTATION_PENDING_SIGNAL=HUP' HUP
+  trap 'FM_ACCOUNT_MUTATION_PENDING_SIGNAL=INT' INT
+  trap 'FM_ACCOUNT_MUTATION_PENDING_SIGNAL=TERM' TERM
+}
+
+fm_account_mutation_finish_handoff() {
+  local pending=${FM_ACCOUNT_MUTATION_PENDING_SIGNAL:-} saved=${FM_ACCOUNT_MUTATION_SAVED_TRAPS:-}
+  trap - HUP INT TERM
+  [ -z "$saved" ] || eval "$saved"
+  FM_ACCOUNT_MUTATION_PENDING_SIGNAL=
+  FM_ACCOUNT_MUTATION_SAVED_TRAPS=
+  [ -z "$pending" ] || kill -s "$pending" "$$"
+}
+
+fm_account_mutation_owned() {
+  [ "${FM_ACCOUNT_MUTATION_ACQUIRED:-0}" = 1 ]
+}
+
 # Sets FM_ACCOUNT_SELECTED_PROFILE and FM_ACCOUNT_SELECTED_PROVIDER.
 # In observe mode these are shadow values only and callers must not persist or
 # apply them.
 fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
   local mode=$1 harness=$2 pool=$3 requested_profile=$4 task=$5 binary json status acquired=0 selected_task selected_pool
+  FM_ACCOUNT_MUTATION_ACQUIRED=0
   FM_ACCOUNT_SELECTED_PROFILE=
   FM_ACCOUNT_SELECTED_PROVIDER=
   case "$harness" in
@@ -918,6 +940,7 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
       return 0
     fi
   else
+    fm_account_mutation_defer_signals
     if [ -n "$requested_profile" ] && [ "$pool" = explicit ]; then
       if json=$(fm_account_run_control "$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool"); then status=0; else status=$?; fi
     elif [ -n "$requested_profile" ]; then
@@ -926,12 +949,19 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
       if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness"); then status=0; else status=$?; fi
     fi
     if [ "$status" -ne 0 ]; then
-      fm_account_reconcile_lease_mutation "$binary" "$task" "lease mutation" || return $?
-      json=$FM_ACCOUNT_RECONCILED_JSON
-      status=0
+      if fm_account_reconcile_lease_mutation "$binary" "$task" "lease mutation"; then
+        json=$FM_ACCOUNT_RECONCILED_JSON
+        status=0
+      else
+        status=$?
+        fm_account_mutation_finish_handoff
+        return "$status"
+      fi
     fi
     [ "$status" -eq 0 ] || return "$status"
     acquired=1
+    FM_ACCOUNT_MUTATION_ACQUIRED=1
+    fm_account_mutation_finish_handoff
   fi
   if ! selected_task=$(fm_account_json_field "$json" '.task | select(type == "string" and length > 0)' selection) \
     || ! selected_pool=$(fm_account_json_field "$json" '.pool | select(type == "string" and length > 0)' selection) \
@@ -951,7 +981,7 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
     echo "error: agent-fleet returned a mismatched account selection" >&2
     if [ "$acquired" = 1 ]; then
       if fm_account_release "$task" --force; then
-        :
+        FM_ACCOUNT_MUTATION_ACQUIRED=0
       else
         echo "error: failed to release invalid Agent Fleet reservation for $task" >&2
         return 2

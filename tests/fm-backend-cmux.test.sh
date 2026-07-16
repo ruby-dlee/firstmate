@@ -629,6 +629,25 @@ test_target_ready_rejects_label_mismatch() {
   pass "fm_backend_cmux_target_ready: rejects a workspace id reused under a different title"
 }
 
+test_target_ready_refuses_ambiguous_surface_rebind() {
+  local dir fb status title
+  dir="$TMP_ROOT/ready-surface-ambiguous"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  printf '{"panes":[{"surface_ids":["cccccccc-2222-2222-2222-222222222222","dddddddd-3333-3333-3333-333333333333"]}]}' \
+    > "$dir/responses/3.out"
+  cp "$dir/responses/3.out" "$dir/responses/4.out"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" fm-label' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "target_ready rebound an absent recorded surface to an arbitrary replacement"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send' \
+    "ambiguous surface rebind attempted an active operation"
+  pass "fm_backend_cmux_target_ready: refuses ambiguous replacement surfaces"
+}
+
 test_capture_trims_locally() {
   local dir fb out
   dir="$TMP_ROOT/capture"; mkdir -p "$dir/responses"
@@ -1300,6 +1319,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
+  test_target_ready_refuses_ambiguous_surface_rebind
+  exit 0
+fi
+
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
 test_version_check_refuses_old_version
@@ -1334,6 +1358,7 @@ test_create_task_refuses_nonunique_post_create_title_without_adopting_foreign_wo
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
+test_target_ready_refuses_ambiguous_surface_rebind
 test_capture_trims_locally
 test_capture_fails_when_read_screen_fails_empty
 test_capture_fails_when_target_not_ready

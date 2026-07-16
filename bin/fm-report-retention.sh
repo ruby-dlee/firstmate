@@ -171,31 +171,43 @@ recover_candidate_fence() {
 }
 
 retain_owner_handoff_fence() {
-  local domain=$1 old_label=$2 old_generation=$3 new_label=$4 temp
+  local domain=$1 old_label=$2 old_generation=$3 new_label=$4 candidate_provenance=$5
+  local candidate_nonce=$6 heartbeat_backup=$7 heartbeat_had_previous=$8 temp
   temp=$(mktemp "$INSTALL_ROOT/.owner-handoff-fence.XXXXXX") || return 1
-  printf '%s\n%s\n%s\n%s\n' "$domain" "$old_label" "$old_generation" "$new_label" > "$temp" \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$domain" "$old_label" "$old_generation" "$new_label" \
+    "$candidate_provenance" "$candidate_nonce" "$heartbeat_backup" "$heartbeat_had_previous" > "$temp" \
     || { rm -f "$temp"; return 1; }
   chmod 600 "$temp" || { rm -f "$temp"; return 1; }
   mv -f "$temp" "$OWNER_HANDOFF_FENCE"
 }
 
 recover_owner_handoff_fence() {
-  local domain old_label old_generation new_label extra canonical_label current_program
+  local domain old_label old_generation new_label candidate_provenance candidate_nonce
+  local heartbeat_backup heartbeat_had_previous extra canonical_label current_program
   [ -e "$OWNER_HANDOFF_FENCE" ] || [ -L "$OWNER_HANDOFF_FENCE" ] || return 0
   [ -f "$OWNER_HANDOFF_FENCE" ] && [ ! -L "$OWNER_HANDOFF_FENCE" ] || return 1
   domain=$(sed -n '1p' "$OWNER_HANDOFF_FENCE")
   old_label=$(sed -n '2p' "$OWNER_HANDOFF_FENCE")
   old_generation=$(sed -n '3p' "$OWNER_HANDOFF_FENCE")
   new_label=$(sed -n '4p' "$OWNER_HANDOFF_FENCE")
-  extra=$(sed -n '5p' "$OWNER_HANDOFF_FENCE")
+  candidate_provenance=$(sed -n '5p' "$OWNER_HANDOFF_FENCE")
+  candidate_nonce=$(sed -n '6p' "$OWNER_HANDOFF_FENCE")
+  heartbeat_backup=$(sed -n '7p' "$OWNER_HANDOFF_FENCE")
+  heartbeat_had_previous=$(sed -n '8p' "$OWNER_HANDOFF_FENCE")
+  extra=$(sed -n '9p' "$OWNER_HANDOFF_FENCE")
   case "$domain" in gui/*) ;; *) return 1 ;; esac
   case "$old_label" in "$LABEL".*) ;; *) return 1 ;; esac
   case "$new_label" in "$LABEL".*) ;; *) return 1 ;; esac
   case "$old_generation" in -|"$GENERATIONS"/*) ;; *) return 1 ;; esac
-  [ -z "$extra" ] || return 1
+  case "$heartbeat_backup" in "$STACK_ROOT"/.retention-heartbeat.previous.*) ;; *) return 1 ;; esac
+  [ -n "$candidate_provenance" ] && [ -n "$candidate_nonce" ] && [ -z "$extra" ] \
+    && { [ "$heartbeat_had_previous" = 0 ] || [ "$heartbeat_had_previous" = 1 ]; } || return 1
   [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || return 1
   canonical_label=$(plist_label "$PLIST")
   if [ "$canonical_label" = "$old_label" ]; then
+    candidate_bootout_confirmed "$domain" "$new_label" || return 1
+    restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" \
+      "$candidate_provenance" "$candidate_nonce" || return 1
     rm -f "$OWNER_HANDOFF_FENCE"
     return 0
   fi
@@ -479,7 +491,9 @@ install_owner() {
   if [ "$activation_started" -eq 1 ] && heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline"; then
     if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
       retain_owner_handoff_fence "$domain" "$old_label" "${old_generation:--}" "$job_label" \
+        "$installed_provenance" "$activation_nonce" "$heartbeat_backup" "$heartbeat_had_previous" \
         || { rm -f "$plist_temp" "$previous_plist"; return 1; }
+      install_test_interrupt owner-handoff-prepointer || return $?
     fi
     if [ "${FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER:-}" = 1 ] || ! mv -f "$plist_temp" "$PLIST"; then
       rm -f "$OWNER_HANDOFF_FENCE"

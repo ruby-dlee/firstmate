@@ -172,6 +172,8 @@ RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
+CONTINUATION_PROMPT_DIR_ID=
+CONTINUATION_PROMPT_FILE_ID=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -435,6 +437,7 @@ ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
 ACCOUNT_LEASE_CREATED=0
+FM_ACCOUNT_MUTATION_ACQUIRED=0
 ACCOUNT_SPAWN_COMMITTED=0
 ACCOUNT_EFFECTIVE_MODE=off
 ACCOUNT_PRIMARY_MODE=off
@@ -598,6 +601,19 @@ persist_failed_account_rollback_short() {
   return "$status"
 }
 
+cleanup_continuation_launch_transport() {
+  [ -n "${CONTINUATION_LAUNCH_DIR:-}" ] || return 0
+  if [ -n "${CONTINUATION_PROMPT_FILE:-}" ] && [ -n "${CONTINUATION_PROMPT_DIR_ID:-}" ] \
+    && [ -n "${CONTINUATION_PROMPT_FILE_ID:-}" ]; then
+    python3 "$SCRIPT_DIR/fm-prompt-exec.py" --cleanup "$CONTINUATION_PROMPT_FILE" \
+      "$CONTINUATION_PROMPT_DIR_ID" "$CONTINUATION_PROMPT_FILE_ID" >/dev/null 2>&1 || true
+  fi
+  CONTINUATION_LAUNCH_DIR=
+  CONTINUATION_PROMPT_FILE=
+  CONTINUATION_PROMPT_DIR_ID=
+  CONTINUATION_PROMPT_FILE_ID=
+}
+
 spawn_abort_cleanup() {
   local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp
   trap - EXIT
@@ -657,10 +673,10 @@ spawn_abort_cleanup() {
     esac
   fi
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
-  [ -z "${CONTINUATION_LAUNCH_DIR:-}" ] || rm -rf "$CONTINUATION_LAUNCH_DIR"
+  cleanup_continuation_launch_transport
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
-    if [ "$ACCOUNT_LEASE_CREATED" = 1 ]; then
+    if [ "$ACCOUNT_LEASE_CREATED" = 1 ] || fm_account_mutation_owned; then
       if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
         account_clean=0
         echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown}" >&2
@@ -1519,23 +1535,33 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
     || { echo "error: cannot stage continuation prompt transport for $ID" >&2; exit 1; }
   chmod 700 "$CONTINUATION_LAUNCH_DIR" || exit 1
   CONTINUATION_PROMPT_FILE="$CONTINUATION_LAUNCH_DIR/prompt"
-  if ! printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
+  if ! CONTINUATION_PROMPT_IDENTITIES=$(printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
 import base64, os, sys
 data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
 if b"\0" in data:
     raise ValueError("prompt contains NUL")
-fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+parent_path, name = os.path.split(os.path.abspath(sys.argv[1]))
+parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
 try:
     written = 0
     while written < len(data):
         written += os.write(fd, data[written:])
     os.fsync(fd)
+    parent = os.fstat(parent_fd)
+    prompt = os.fstat(fd)
+    sys.stdout.write(f"{parent.st_dev}:{parent.st_ino}\n{prompt.st_dev}:{prompt.st_ino}\n")
 finally:
     os.close(fd)
-' "$CONTINUATION_PROMPT_FILE"; then
+    os.close(parent_fd)
+' "$CONTINUATION_PROMPT_FILE"); then
     echo "error: continuation prompt snapshot cannot be transported byte-verbatim for $ID" >&2
     exit 1
   fi
+  CONTINUATION_PROMPT_DIR_ID=${CONTINUATION_PROMPT_IDENTITIES%%$'\n'*}
+  CONTINUATION_PROMPT_FILE_ID=${CONTINUATION_PROMPT_IDENTITIES#*$'\n'}
+  [ -n "$CONTINUATION_PROMPT_DIR_ID" ] && [ -n "$CONTINUATION_PROMPT_FILE_ID" ] \
+    || { echo "error: continuation prompt transport identity is unavailable for $ID" >&2; exit 1; }
   BRIEF=$CONTINUATION_PACKET
 fi
 
@@ -1872,6 +1898,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     fi
     ACCOUNT_PROFILE=$FM_ACCOUNT_SELECTED_PROFILE
     ACCOUNT_LEASE_CREATED=1
+    FM_ACCOUNT_MUTATION_ACQUIRED=0
     persist_failed_account_rollback_short || exit 1
     fm_account_lineage_append "$DATA" "$ID" reserved "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" || exit 1
   fi
@@ -2004,7 +2031,7 @@ sq_brief=$(shell_quote "$BRIEF")
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_prompt_command="\$(cat __BRIEF__)"
   continuation_prompt_marker="\"$continuation_prompt_command\""
-  continuation_prompt_reference='"$1"'
+  continuation_prompt_reference="\"\$1\""
   LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
   case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac
 fi
@@ -2066,7 +2093,7 @@ if [ "$KIND" = secondmate ]; then
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_launch_command=$LAUNCH
-  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$continuation_launch_command")"
+  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$continuation_launch_command")"
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so

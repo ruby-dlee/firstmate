@@ -153,8 +153,15 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 REPORT_GATED=0
-if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ] && [ "$(fm_meta_get "$META" report_required)" = 1 ]; then
-  REPORT_GATED=1
+REPORT_REQUIRED_COUNT=$(grep -c '^report_required=' "$META" 2>/dev/null || true)
+if [ "$REPORT_REQUIRED_COUNT" -gt 0 ]; then
+  if [ "$REPORT_REQUIRED_COUNT" -ne 1 ] || [ "$(fm_meta_get "$META" report_required)" != 1 ]; then
+    echo "error: invalid report_required metadata for $ID; refusing teardown" >&2
+    exit 1
+  fi
+  if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+    REPORT_GATED=1
+  fi
 fi
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]

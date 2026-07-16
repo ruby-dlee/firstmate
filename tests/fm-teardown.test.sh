@@ -1959,8 +1959,39 @@ test_teardown_refuses_unsafe_tasktmp_metadata() {
   pass "teardown only removes its exact task temp root"
 }
 
+test_teardown_rejects_malformed_report_requirement() {
+  local case_dir rc
+  case_dir=$(make_case malformed-report-required)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=0\n' >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "malformed report_required teardown exit"
+  assert_present "$case_dir/state/task-x1.meta" "malformed report_required metadata was destructively bypassed"
+  assert_grep 'invalid report_required metadata' "$case_dir/stderr" \
+    "malformed report_required refusal was unclear"
+
+  case_dir=$(make_case duplicate-report-required)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=1\nreport_required=1\n' >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "duplicate report_required teardown exit"
+  assert_present "$case_dir/state/task-x1.meta" "duplicate report_required metadata was destructively bypassed"
+  pass "teardown treats only one exact report_required marker as valid"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   test_teardown_refuses_unsafe_tasktmp_metadata
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34-report-required ]; then
+  test_teardown_rejects_malformed_report_requirement
   exit 0
 fi
 
@@ -1984,6 +2015,7 @@ test_required_report_blocks_then_publishes_before_cleanup
 test_required_report_restores_rollback_generation_before_publish
 test_required_report_revalidates_after_quiescence
 test_teardown_refuses_unsafe_tasktmp_metadata
+test_teardown_rejects_malformed_report_requirement
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

@@ -370,6 +370,12 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
     | jq -r '.panes[0] // {} | .selected_surface_id // (.surface_ids[0] // empty)' 2>/dev/null
 }
 
+fm_backend_cmux_unique_surface_id_for_workspace() {  # <workspace_id>
+  local wsid=$1
+  fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null \
+    | jq -r '[.panes[]? | (.surface_ids // [])[]?] | unique | if length == 1 then .[0] else empty end' 2>/dev/null
+}
+
 # fm_backend_cmux_create_task: create the task's workspace (one surface),
 # refusing an existing live <label> (finding #6: cmux enforces no uniqueness
 # itself). Resolves the fresh workspace's default surface via one list-panes
@@ -502,7 +508,7 @@ fm_backend_cmux_target_ready() {  # <target> [expected-label]
       wsid=$(printf '%s' "$workspaces" | jq -r --arg want "$expected_title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null)
       [ -n "$wsid" ] || return 1
     fi
-    sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+    sfid=$(fm_backend_cmux_unique_surface_id_for_workspace "$wsid")
     [ -n "$sfid" ] || return 1
     FM_BACKEND_CMUX_WORKSPACE=$wsid
     FM_BACKEND_CMUX_SURFACE=$sfid

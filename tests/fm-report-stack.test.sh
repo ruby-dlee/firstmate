@@ -970,6 +970,66 @@ EOF
   pass "report parsing preserves parent list scope after nested lists"
 }
 
+test_blockquote_list_scope_requires_quote_markers() {
+  local id=report-quote-list-exit-b3p invalid=report-list-quote-nested-b3q source entry manifest out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+> - quoted list paragraph
+  ## Summary
+
+Visible summary after the quote.
+
+## What changed
+
+Changed.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+None.
+
+## Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null \
+    || fail "a heading outside a blockquote list stayed attached without an explicit quote marker"
+  entry=$(run_stack path "$id") || fail "blockquote-list report path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"summary": "Visible summary after the quote."' "$manifest" \
+    "blockquote-list ancestry hid the valid heading outside the quote"
+
+  write_task "$invalid" ship
+  source="$HOME_DIR/data/$invalid/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- > quoted list paragraph
+  > ## Summary
+  > ## What changed
+  > ## Verification
+  > ## Visual evidence
+  > ## Artifacts
+  > ## Follow-ups
+EOF
+  if out=$(run_stack publish "$invalid" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "headings inside a list-nested blockquote unexpectedly satisfied the report contract"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "list-nested blockquote failure omitted missing heading $heading"
+  done
+  pass "report parsing requires explicit blockquote markers for lazy list ancestry"
+}
+
 test_container_scopes_preserve_commonmark_blank_and_exit_rules() {
   local valid=report-container-exit-b3n invalid=report-list-blank-b3o source out status heading
   write_task "$valid" ship
@@ -2709,6 +2769,135 @@ test_retention_install_reclaims_positively_stale_lock() {
   pass "retention installation reclaims only a positively stale owned lock"
 }
 
+test_retention_prepointer_recovery_fences_candidate() {
+  local fakebin="$TMP_ROOT/retention-prepointer-launchctl" install_root="$TMP_ROOT/retention-prepointer-install"
+  local agents="$TMP_ROOT/retention-prepointer-agents" log="$TMP_ROOT/retention-prepointer.log"
+  local plist old_label candidate_label out status
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart|bootout) exit 0 ;; esac
+exit 0
+SH
+  chmod +x "$fakebin/launchctl"
+  plist="$agents/com.firstmate.report-retention.plist"
+  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention pre-pointer recovery precondition failed"
+  old_label=$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$plist")
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+    FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    FM_REPORT_RETENTION_INSTALL_TEST_INTERRUPT=owner-handoff-prepointer \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 99 ] || fail "retention pre-pointer interruption hook failed: $out"
+  [ "$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$plist")" = "$old_label" ] \
+    || fail "retention pre-pointer interruption advanced the authoritative plist"
+  candidate_label=$(sed -n '4p' "$install_root/.owner-handoff-fence")
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure >/dev/null \
+    || fail "retention ensure did not recover its pre-pointer handoff"
+  assert_grep "bootout gui/$(id -u)/$candidate_label" "$log" \
+    "pre-pointer recovery did not fence the running candidate"
+  assert_absent "$install_root/.owner-handoff-fence" "pre-pointer recovery retained its handoff fence"
+  pass "retention pre-pointer recovery fences the uncommitted candidate"
+}
+
+test_retention_cleanup_is_file_granular() {
+  local tombstones="$TMP_ROOT/file-granular-tombstones" tombstone="$TMP_ROOT/file-granular-tombstones/tombstone-test"
+  local before after output
+  mkdir -p "$tombstone/cohort/report/visuals"
+  printf 'one\n' > "$tombstone/cohort/report/report.md"
+  printf 'two\n' > "$tombstone/cohort/report/visuals/one.png"
+  printf 'three\n' > "$tombstone/cohort/report/visuals/two.png"
+  before=$(find "$tombstone" -mindepth 1 | wc -l | tr -d ' ')
+  output=$(python3 "$ROOT/bin/fm-contained-read.py" prune-tombstones-fd 1 3< "$tombstones") \
+    || fail "file-granular retention cleanup failed"
+  after=$(find "$tombstone" -mindepth 1 | wc -l | tr -d ' ')
+  [ "$after" -eq "$((before - 1))" ] || fail "one retention batch removed more than one filesystem item"
+  assert_contains "$output" '"pending":true' "file-granular retention cleanup did not persist remaining work"
+  pass "retention cleanup budgets progress at file granularity"
+}
+
+test_retention_fresh_handoff_is_cohort_bounded_and_continuous() {
+  local due="$STACK/entries/cohort-946684700000" ready="$TMP_ROOT/fresh-handoff.ready"
+  local proceed="$TMP_ROOT/fresh-handoff.proceed" output="$TMP_ROOT/fresh-handoff.out"
+  local base name probe probe_identity after_identity pid status count=64 i
+  mkdir "$due"
+  base=$(( $(date +%s) * 1000 + 86400000 ))
+  for i in $(seq 1 "$count"); do
+    name="cohort-$((base + i * 300000))"
+    mkdir "$STACK/entries/$name"
+    printf 'fresh-%s\n' "$i" > "$STACK/entries/$name/sentinel"
+  done
+  probe="$STACK/entries/cohort-$((base + 300000))"
+  probe_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$probe"; else stat -c '%d:%i' "$probe"; fi)
+  FM_REPORT_RETENTION_STAGE_TEST_READY="$ready" FM_REPORT_RETENTION_STAGE_TEST_PROCEED="$proceed" \
+    FM_REPORT_RETENTION_STAGE_TEST_ABORT=1 \
+    run_stack prune --status > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 200); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "fresh cohort handoff gate did not open"; }
+  for i in $(seq 1 "$count"); do
+    name="cohort-$((base + i * 300000))"
+    assert_grep "fresh-$i" "$STACK/entries/$name/sentinel" \
+      "fresh cohort $i became unavailable during bounded handoff"
+  done
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "interrupted fresh cohort handoff unexpectedly completed"
+  run_stack prune --status >/dev/null || fail "retention did not recover an interrupted fresh cohort handoff"
+  assert_absent "$due" "recovered retention handoff left its due cohort public"
+  for i in $(seq 1 "$count"); do
+    name="cohort-$((base + i * 300000))"
+    assert_grep "fresh-$i" "$STACK/entries/$name/sentinel" \
+      "recovered retention handoff lost fresh cohort $i"
+  done
+  after_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$probe"; else stat -c '%d:%i' "$probe"; fi)
+  [ "$after_identity" = "$probe_identity" ] || fail "fresh cohort handoff copied instead of moving its owned directory generation"
+  pass "retention hands off fresh cohorts by identity while their public paths stay live"
+}
+
+test_report_publication_restores_swapped_staging_generation() {
+  local id=report-publish-generation-race-k2t entry ready proceed output pid status staged saved
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Original published report."
+  run_stack publish "$id" >/dev/null || fail "report generation-race precondition failed"
+  entry=$(run_stack path "$id") || fail "report generation-race precondition path failed"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Replacement report attempt."
+  ready="$TMP_ROOT/report-publish-generation.ready"; proceed="$TMP_ROOT/report-publish-generation.proceed"
+  output="$TMP_ROOT/report-publish-generation.out"
+  FM_CONTAINED_REPORT_RENAME_TEST_READY="$ready" FM_CONTAINED_REPORT_RENAME_TEST_PROCEED="$proceed" \
+    run_stack publish "$id" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "report generation rename gate did not open"; }
+  staged="$STACK/entries/$(cat "$ready")"
+  saved="$staged.saved"
+  mv "$staged" "$saved"
+  mkdir "$staged"
+  printf 'unowned replacement\n' > "$staged/sentinel"
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "report publication accepted a swapped staging generation"
+  assert_grep 'Original published report' "$(dirname "$entry")/report.md" \
+    "failed report publication did not preserve the prior generation"
+  assert_absent "$(dirname "$entry")/sentinel" "unowned staging replacement was published"
+  assert_grep 'unowned replacement' "$staged/sentinel" \
+    "failed report publication did not restore the unowned staging replacement"
+  assert_present "$saved/manifest.json" "failed report publication lost its displaced owned staging generation"
+  rm -rf "$staged" "$saved"
+  pass "report publication restores a staging generation raced through rename"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_retention_batches_make_interruption_safe_progress
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
@@ -2765,6 +2954,21 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   test_retention_cutoff_is_authoritative_before_cleanup
   test_retention_cohort_source_swap_restores_replacement
   test_retention_handoff_persists_and_retries_old_owner_fencing
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34-retention ]; then
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_cleanup_is_file_granular
+  test_retention_fresh_handoff_is_cohort_bounded_and_continuous
+  test_retention_prepointer_recovery_fences_candidate
+  test_report_publication_restores_swapped_staging_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34-parser ]; then
+  test_nested_list_parent_scope_hides_required_headings
+  test_blockquote_list_scope_requires_quote_markers
   exit 0
 fi
 
@@ -2826,6 +3030,8 @@ test_summary_extraction_uses_validated_markdown_structure
 test_list_container_fences_hide_report_headings_and_summaries
 test_list_lazy_continuations_do_not_satisfy_required_sections
 test_underindented_list_headings_exit_lazy_continuation
+test_nested_list_parent_scope_hides_required_headings
+test_blockquote_list_scope_requires_quote_markers
 test_container_scopes_preserve_commonmark_blank_and_exit_rules
 test_large_non_utf8_text_artifacts_are_stored_verbatim
 test_large_visual_inventory_does_not_share_text_buffer_headroom
@@ -2847,6 +3053,21 @@ test_retention_batches_make_interruption_safe_progress
 test_persistent_retention_owner_prunes_without_tasks_or_watcher
 test_retention_generations_survive_install_interruptions
 test_retention_error_publication_is_atomic_and_nonfollowing
+test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
+test_manifest_cohort_must_match_completion_time
+test_retention_cutoff_is_authoritative_before_cleanup
+test_retention_cohort_tombstone_is_noreplace_owned
+test_retention_cohort_source_swap_restores_replacement
+test_retention_handoff_persists_and_retries_old_owner_fencing
+test_retention_prepointer_recovery_fences_candidate
+test_retention_cleanup_is_file_granular
+test_retention_fresh_handoff_is_cohort_bounded_and_continuous
+test_report_publication_restores_swapped_staging_generation
+test_retention_activation_requires_launched_nonce_without_owner_gap
+test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline
+test_retention_pointer_failure_retires_only_candidate
+test_retention_pointer_failure_retains_unfenced_candidate
+test_nested_list_parent_scope_hides_required_headings
 test_report_destination_roots_remain_pinned_during_ancestor_swap
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock

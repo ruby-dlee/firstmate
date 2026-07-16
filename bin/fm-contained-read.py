@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -196,7 +197,12 @@ def command_fingerprint_paths_fd(arguments):
 
 
 def bounded_command_output(command, budget):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     selector = selectors.DefaultSelector()
     output = []
     try:
@@ -217,8 +223,21 @@ def bounded_command_output(command, budget):
             raise subprocess.CalledProcessError(process.returncode, command)
         return b"".join(output)
     except BaseException:
-        if process.poll() is None:
-            process.kill()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait()
         raise
     finally:
@@ -691,6 +710,10 @@ def command_remove_owned_directory_fd(arguments):
 
 
 def exchange_names(root, first, second):
+    exchange_between(root, first, root, second)
+
+
+def exchange_between(first_root, first, second_root, second):
     libc = ctypes.CDLL(None, use_errno=True)
     first_raw = os.fsencode(first)
     second_raw = os.fsencode(second)
@@ -698,11 +721,11 @@ def exchange_names(root, first, second):
         rename_exchange = libc.renameatx_np
         rename_exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         rename_exchange.restype = ctypes.c_int
-        result = rename_exchange(root, first_raw, root, second_raw, 0x00000002)
+        result = rename_exchange(first_root, first_raw, second_root, second_raw, 0x00000002)
     else:
         machine = os.uname().machine
         syscall_number = 316 if machine in ("x86_64", "amd64") else 276
-        result = libc.syscall(syscall_number, root, first_raw, root, second_raw, 0x00000002)
+        result = libc.syscall(syscall_number, first_root, first_raw, second_root, second_raw, 0x00000002)
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
@@ -750,18 +773,30 @@ def command_exchange_files_fd(arguments):
 
 
 def command_copy_file_fd(arguments):
-    if len(arguments) not in (2, 3) or (len(arguments) == 3 and arguments[2] != "emit-base64"):
-        fail("usage: fm-contained-read.py copy-file-fd <source> <destination> [emit-base64]")
-    source_name, destination_name = arguments[:2]
-    emit_base64 = len(arguments) == 3
+    if len(arguments) not in (3, 4) or (len(arguments) == 4 and arguments[3] != "emit-base64"):
+        fail("usage: fm-contained-read.py copy-file-fd <source> <destination> <source-id> [emit-base64]")
+    source_name, destination_name, source_id = arguments[:3]
+    emit_base64 = len(arguments) == 4
     if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
         fail("copy names must be single safe components")
     root = checked_root(3)
+    ready = os.environ.get("FM_CONTAINED_COPY_TEST_READY")
+    proceed = os.environ.get("FM_CONTAINED_COPY_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write(f"{source_name}\n")
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("copy test gate timed out")
+            time.sleep(0.01)
     source = open_relative(root, source_name, os.O_RDONLY)
     destination = None
     copied = []
     try:
         before = os.fstat(source)
+        if not stat.S_ISREG(before.st_mode) or f"{before.st_dev}:{before.st_ino}" != source_id:
+            fail("copy source generation changed")
         destination = os.open(
             destination_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -781,7 +816,7 @@ def command_copy_file_fd(arguments):
             offset += len(chunk)
         os.fsync(destination)
         after = os.fstat(source)
-        if not same_file(before, after):
+        if not same_file(before, after) or f"{after.st_dev}:{after.st_ino}" != source_id:
             fail("source changed while copying")
         if emit_base64:
             sys.stdout.buffer.write(base64.b64encode(b"".join(copied)))
@@ -856,6 +891,30 @@ def command_rename_noreplace_owned_entry_fd(arguments):
         fail("owned entry generation changed during rename and the moved replacement was restored")
 
 
+def remove_one_tombstone_item(descriptor):
+    with os.scandir(descriptor) as entries:
+        entry = next(entries, None)
+    if entry is None:
+        return False
+    observed = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+    if stat.S_ISDIR(observed.st_mode):
+        child = open_relative(descriptor, entry.name, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            if remove_one_tombstone_item(child):
+                return True
+        finally:
+            os.close(child)
+        current = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+        if current.st_dev != observed.st_dev or current.st_ino != observed.st_ino:
+            fail(f"retention cleanup directory changed: {entry.name}")
+        os.rmdir(entry.name, dir_fd=descriptor)
+        return True
+    if not stat.S_ISREG(observed.st_mode):
+        fail(f"invalid retention cleanup entry: {entry.name}")
+    os.unlink(entry.name, dir_fd=descriptor)
+    return True
+
+
 def command_prune_tombstones_fd(arguments):
     if len(arguments) != 1:
         fail("usage: fm-contained-read.py prune-tombstones-fd <batch>")
@@ -864,37 +923,30 @@ def command_prune_tombstones_fd(arguments):
         fail("tombstone prune batch must be positive")
     root = checked_root(3)
     pruned = 0
-    pending = False
-    for tombstone_name in sorted(os.listdir(root)):
+    while pruned < batch:
+        with os.scandir(root) as tombstones:
+            tombstone_entry = next(tombstones, None)
+        if tombstone_entry is None:
+            break
+        tombstone_name = tombstone_entry.name
         if not tombstone_name.startswith("tombstone-"):
+            fail(f"invalid retention tombstone: {tombstone_name}")
+        observed = os.stat(tombstone_name, dir_fd=root, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode):
             fail(f"invalid retention tombstone: {tombstone_name}")
         tombstone = open_relative(root, tombstone_name, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            children = sorted(os.listdir(tombstone))
-            for child in children:
-                if pruned >= batch:
-                    pending = True
-                    break
-                child_stat = os.stat(child, dir_fd=tombstone, follow_symlinks=False)
-                legacy_expired = child.startswith(".") and child.endswith(".expired")
-                if not stat.S_ISDIR(child_stat.st_mode) or (child.startswith(".") and not legacy_expired):
-                    fail(f"invalid report entry in retention tombstone: {child}")
-                child_fd = open_relative(tombstone, child, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    remove_directory_contents(child_fd)
-                finally:
-                    os.close(child_fd)
-                os.rmdir(child, dir_fd=tombstone)
+            if remove_one_tombstone_item(tombstone):
                 pruned += 1
-            if not os.listdir(tombstone):
-                os.rmdir(tombstone_name, dir_fd=root)
-            else:
-                pending = True
+                continue
         finally:
             os.close(tombstone)
-        if pruned >= batch:
-            pending = pending or bool(os.listdir(root))
-            break
+        current = os.stat(tombstone_name, dir_fd=root, follow_symlinks=False)
+        if current.st_dev != observed.st_dev or current.st_ino != observed.st_ino:
+            fail(f"retention tombstone changed during cleanup: {tombstone_name}")
+        os.rmdir(tombstone_name, dir_fd=root)
+        pruned += 1
+    pending = bool(os.listdir(root))
     print(json.dumps({"pruned": pruned, "pending": pending}, separators=(",", ":")))
 
 
@@ -1023,6 +1075,84 @@ def command_exchange_directories_fd(arguments):
         fail("exchange directory generation changed during publication")
 
 
+def symlink_target(root, name):
+    observed = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISLNK(observed.st_mode):
+        fail(f"expected an owned symbolic link at {name}")
+    return os.readlink(name, dir_fd=root)
+
+
+def command_stage_retention_cohort_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py stage-retention-cohort-fd <cohort> <handoff> <identity> <target>")
+    cohort, handoff, identity, target = arguments
+    if len(components(cohort)) != 1 or len(components(handoff)) != 1 or not target:
+        fail("retention cohort handoff arguments are invalid")
+    active = checked_root(3)
+    replacement = checked_root(4)
+    source = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+    if stat.S_ISDIR(source.st_mode):
+        if f"{source.st_dev}:{source.st_ino}" != identity:
+            fail("fresh cohort generation changed before handoff")
+        try:
+            os.symlink(target, handoff, dir_fd=replacement)
+        except FileExistsError:
+            if symlink_target(replacement, handoff) != target:
+                fail("fresh cohort handoff link changed")
+        exchange_between(active, cohort, replacement, handoff)
+        moved_link = symlink_target(active, cohort)
+        moved_source = os.stat(handoff, dir_fd=replacement, follow_symlinks=False)
+        if moved_link != target or not stat.S_ISDIR(moved_source.st_mode) \
+                or f"{moved_source.st_dev}:{moved_source.st_ino}" != identity:
+            exchange_between(active, cohort, replacement, handoff)
+            fail("fresh cohort generation changed during handoff")
+    elif stat.S_ISLNK(source.st_mode):
+        if os.readlink(cohort, dir_fd=active) != target:
+            fail("fresh cohort public handoff link changed")
+        moved_source = os.stat(handoff, dir_fd=replacement, follow_symlinks=False)
+        if not stat.S_ISDIR(moved_source.st_mode) or f"{moved_source.st_dev}:{moved_source.st_ino}" != identity:
+            fail("fresh cohort handoff generation changed")
+    else:
+        fail("fresh cohort is not a directory or owned handoff link")
+    try:
+        os.symlink(handoff, cohort, dir_fd=replacement)
+    except FileExistsError:
+        if symlink_target(replacement, cohort) != handoff:
+            fail("fresh cohort replacement link changed")
+
+
+def command_finalize_retention_cohort_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py finalize-retention-cohort-fd <cohort> <handoff> <identity> <retired-target>")
+    cohort, handoff, identity, retired_target = arguments
+    if len(components(cohort)) != 1 or len(components(handoff)) != 1 or not retired_target:
+        fail("retention cohort finalization arguments are invalid")
+    active = checked_root(3)
+    retired = checked_root(4)
+    current = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+    if stat.S_ISLNK(current.st_mode):
+        if os.readlink(cohort, dir_fd=active) != handoff:
+            fail("fresh cohort activation link changed")
+        staged = os.stat(handoff, dir_fd=active, follow_symlinks=False)
+        if not stat.S_ISDIR(staged.st_mode) or f"{staged.st_dev}:{staged.st_ino}" != identity:
+            fail("fresh cohort activation generation changed")
+        exchange_between(active, cohort, active, handoff)
+        installed = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+        if not stat.S_ISDIR(installed.st_mode) or f"{installed.st_dev}:{installed.st_ino}" != identity \
+                or symlink_target(active, handoff) != handoff:
+            exchange_between(active, cohort, active, handoff)
+            fail("fresh cohort changed during activation")
+        os.unlink(handoff, dir_fd=active)
+    elif not stat.S_ISDIR(current.st_mode) or f"{current.st_dev}:{current.st_ino}" != identity:
+        fail("fresh cohort active generation changed")
+    try:
+        if symlink_target(retired, cohort) != retired_target:
+            fail("retired fresh cohort handoff link changed")
+        os.unlink(cohort, dir_fd=retired)
+    except FileNotFoundError:
+        pass
+
+
 def command_remove_owned_file_fd(arguments):
     if len(arguments) != 3:
         fail("usage: fm-contained-read.py remove-owned-file-fd <name> <identity> <quarantine>")
@@ -1066,6 +1196,160 @@ def command_remove_owned_file_fd(arguments):
     os.unlink(quarantine, dir_fd=root)
 
 
+def ensure_child_directory(root, name):
+    try:
+        os.mkdir(name, 0o700, dir_fd=root)
+    except FileExistsError:
+        pass
+    observed = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISDIR(observed.st_mode):
+        fail(f"report cohort is not a real directory: {name}")
+    descriptor = open_relative(root, name, os.O_RDONLY | os.O_DIRECTORY)
+    opened = os.fstat(descriptor)
+    if not same_file(observed, opened):
+        os.close(descriptor)
+        fail(f"report cohort changed while opening: {name}")
+    return descriptor
+
+
+def command_publish_report_fd(arguments):
+    if len(arguments) != 6:
+        fail("usage: fm-contained-read.py publish-report-fd <staged> <cohort> <report> <staged-id> <previous-cohort|-> <previous-id|->")
+    staged_name, cohort_name, report_name, staged_id, previous_cohort, previous_id = arguments
+    for name in (staged_name, cohort_name, report_name):
+        if len(components(name)) != 1:
+            fail("report publication names must be single safe components")
+    root = checked_root(3)
+    staged = os.stat(staged_name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISDIR(staged.st_mode) or f"{staged.st_dev}:{staged.st_ino}" != staged_id:
+        fail("staged report generation changed before publication")
+    ready = os.environ.get("FM_CONTAINED_REPORT_PUBLISH_TEST_READY")
+    proceed = os.environ.get("FM_CONTAINED_REPORT_PUBLISH_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write("ready\n")
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("report publication test gate timed out")
+            time.sleep(0.01)
+    destination = ensure_child_directory(root, cohort_name)
+    previous_name = f".{report_name}.previous"
+    previous_root = None
+    displaced = False
+    try:
+        if previous_cohort != "-":
+            if len(components(previous_cohort)) != 1 or not previous_id or previous_id == "-":
+                fail("previous report identity is invalid")
+            previous_root = ensure_child_directory(root, previous_cohort)
+            previous = os.stat(report_name, dir_fd=previous_root, follow_symlinks=False)
+            if not stat.S_ISDIR(previous.st_mode) or f"{previous.st_dev}:{previous.st_ino}" != previous_id:
+                fail("previous report generation changed before publication")
+            rename_noreplace(previous_root, root, report_name, previous_name)
+            moved_previous = os.stat(previous_name, dir_fd=root, follow_symlinks=False)
+            if f"{moved_previous.st_dev}:{moved_previous.st_ino}" != previous_id:
+                fail("previous report generation changed during publication")
+            displaced = True
+        rename_ready = os.environ.get("FM_CONTAINED_REPORT_RENAME_TEST_READY")
+        rename_proceed = os.environ.get("FM_CONTAINED_REPORT_RENAME_TEST_PROCEED")
+        if rename_ready and rename_proceed:
+            with open(rename_ready, "x", encoding="utf-8") as marker:
+                marker.write(f"{staged_name}\n")
+            deadline = time.monotonic() + 5
+            while not os.path.exists(rename_proceed):
+                if time.monotonic() >= deadline:
+                    fail("report rename test gate timed out")
+                time.sleep(0.01)
+        rename_noreplace(root, destination, staged_name, report_name)
+        installed = os.stat(report_name, dir_fd=destination, follow_symlinks=False)
+        if f"{installed.st_dev}:{installed.st_ino}" != staged_id:
+            try:
+                rename_noreplace(destination, root, report_name, staged_name)
+                restored = os.stat(staged_name, dir_fd=root, follow_symlinks=False)
+                if not same_file(installed, restored):
+                    fail("unowned staged report generation could not be restored")
+            except OSError as error:
+                fail(f"unowned staged report generation remains quarantined after rename: {error}")
+            fail("staged report generation changed during publication")
+    except Exception:
+        if displaced:
+            try:
+                rename_noreplace(root, previous_root, previous_name, report_name)
+            except OSError:
+                pass
+        raise
+    finally:
+        if previous_root is not None:
+            os.close(previous_root)
+        os.close(destination)
+
+
+def command_rollback_report_fd(arguments):
+    if len(arguments) != 6:
+        fail("usage: fm-contained-read.py rollback-report-fd <cohort> <report> <installed-id> <previous-cohort|-> <previous-id|-> <failed-name>")
+    cohort_name, report_name, installed_id, previous_cohort, previous_id, failed_name = arguments
+    for name in (cohort_name, report_name, failed_name):
+        if len(components(name)) != 1:
+            fail("report rollback names must be single safe components")
+    root = checked_root(3)
+    destination = ensure_child_directory(root, cohort_name)
+    installed = os.stat(report_name, dir_fd=destination, follow_symlinks=False)
+    if not stat.S_ISDIR(installed.st_mode) or f"{installed.st_dev}:{installed.st_ino}" != installed_id:
+        os.close(destination)
+        fail("installed report generation changed before rollback")
+    rename_noreplace(destination, root, report_name, failed_name)
+    failed = os.stat(failed_name, dir_fd=root, follow_symlinks=False)
+    if f"{failed.st_dev}:{failed.st_ino}" != installed_id:
+        os.close(destination)
+        fail("installed report generation changed during rollback")
+    previous_root = None
+    try:
+        if previous_cohort != "-":
+            previous_name = f".{report_name}.previous"
+            previous_root = ensure_child_directory(root, previous_cohort)
+            previous = os.stat(previous_name, dir_fd=root, follow_symlinks=False)
+            if not stat.S_ISDIR(previous.st_mode) or f"{previous.st_dev}:{previous.st_ino}" != previous_id:
+                fail("previous report generation changed before rollback")
+            rename_noreplace(root, previous_root, previous_name, report_name)
+        failed_root = open_relative(root, failed_name, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            remove_directory_contents(failed_root)
+        finally:
+            os.close(failed_root)
+        os.rmdir(failed_name, dir_fd=root)
+    except Exception:
+        try:
+            rename_noreplace(root, destination, failed_name, report_name)
+        except OSError:
+            pass
+        raise
+    finally:
+        if previous_root is not None:
+            os.close(previous_root)
+        os.close(destination)
+
+
+def command_remove_owned_tree_fd(arguments):
+    if len(arguments) != 2:
+        fail("usage: fm-contained-read.py remove-owned-tree-fd <name> <identity>")
+    name, identity = arguments
+    if len(components(name)) != 1:
+        fail("owned tree name must be one safe component")
+    root = checked_root(3)
+    observed = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISDIR(observed.st_mode) or f"{observed.st_dev}:{observed.st_ino}" != identity:
+        fail("owned tree generation changed before removal")
+    descriptor = open_relative(root, name, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        remove_directory_contents(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not same_file(observed, current):
+        fail("owned tree generation changed during removal")
+    os.rmdir(name, dir_fd=root)
+
+
 def main():
     if len(sys.argv) < 2:
         fail("contained read command is required")
@@ -1099,8 +1383,18 @@ def main():
         command_copy_directory_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-directories-fd":
         command_exchange_directories_fd(sys.argv[2:])
+    elif sys.argv[1] == "stage-retention-cohort-fd":
+        command_stage_retention_cohort_fd(sys.argv[2:])
+    elif sys.argv[1] == "finalize-retention-cohort-fd":
+        command_finalize_retention_cohort_fd(sys.argv[2:])
     elif sys.argv[1] == "remove-owned-file-fd":
         command_remove_owned_file_fd(sys.argv[2:])
+    elif sys.argv[1] == "publish-report-fd":
+        command_publish_report_fd(sys.argv[2:])
+    elif sys.argv[1] == "rollback-report-fd":
+        command_rollback_report_fd(sys.argv[2:])
+    elif sys.argv[1] == "remove-owned-tree-fd":
+        command_remove_owned_tree_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

@@ -176,7 +176,7 @@ function markdownStructure(markdown) {
       const parsedHeading = activeCandidate.containers.length === 0 ? heading(activeCandidate.text) : undefined;
       visible.push({ line, heading: lazyListContinuation ? undefined : parsedHeading });
       if (activeCandidate.containers.some(({ type }) => type === "list")) {
-        lazyList = activeCandidate.containers.filter(({ type }) => type === "list");
+        lazyList = activeCandidate.containers;
       } else if (!lazyListContinuation && !/^[ \t]*$/.test(line)) {
         lazyList = undefined;
       }

@@ -2244,7 +2244,7 @@ test_cross_profile_continuation_for_harness() {
   assert_contains "$launch" "$new_task" "$harness continuation did not use the new launch generation"
   assert_contains "$launch" "fm-prompt-exec.py" \
     "$harness continuation did not use the byte-preserving prompt transport"
-  assert_contains "$launch" '"$1"' \
+  assert_contains "$launch" "\"\$1\"" \
     "$harness continuation launch did not bind the prompt as a direct argv value"
   assert_not_contains "$launch" "__fm_continuation_prompt" \
     "$harness continuation still round-tripped prompt bytes through a shell variable"
@@ -3333,6 +3333,102 @@ JS
   pass "task-file publication is a generation-owned compare-and-swap"
 }
 
+test_task_file_rollback_preserves_unowned_replacement_and_displaced_generation() {
+  local data="$TMP_ROOT/task-file-rollback/data" task=task-file-rollback file ready proceed output pid status displaced
+  mkdir -p "$data/$task"
+  file="$data/$task/trail.md"; ready="$TMP_ROOT/task-file-rollback/ready"; proceed="$TMP_ROOT/task-file-rollback/proceed"
+  output="$TMP_ROOT/task-file-rollback/out"
+  printf 'original generation\n' > "$file"
+  FM_FILE_TRANSACTION_POSTPUBLISH_TEST_READY="$ready" FM_FILE_TRANSACTION_POSTPUBLISH_TEST_PROCEED="$proceed" \
+    node - "$ROOT/bin/fm-file-transaction.cjs" "$data" "$task" > "$output" 2>&1 <<'JS' &
+const { pinnedTaskFileTransaction } = require(process.argv[2]);
+pinnedTaskFileTransaction(process.argv[3], process.argv[4], 'trail.md', content => Buffer.concat([content, Buffer.from('transaction\n')]));
+JS
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "task-file rollback gate did not open"; }
+  mv "$file" "$data/$task/installed-owned"
+  printf 'concurrent replacement\n' > "$file"
+  touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "task-file rollback accepted an unowned replacement"
+  assert_contains "$(cat "$file")" "concurrent replacement" "task-file rollback clobbered the concurrent destination"
+  displaced=$(find "$data/$task" -maxdepth 1 -type f -name '.trail.md.*' -print -quit)
+  [ -n "$displaced" ] || fail "task-file rollback discarded the displaced prior generation"
+  assert_contains "$(cat "$displaced")" "original generation" "task-file rollback changed the displaced prior generation"
+  pass "task-file rollback preserves concurrent and displaced generations"
+}
+
+test_task_file_rollback_preserves_displaced_generation_when_destination_disappears() {
+  local data="$TMP_ROOT/task-file-rollback-missing/data" task=task-file-rollback-missing file ready proceed output pid status displaced
+  mkdir -p "$data/$task"
+  file="$data/$task/trail.md"; ready="$TMP_ROOT/task-file-rollback-missing/ready"; proceed="$TMP_ROOT/task-file-rollback-missing/proceed"
+  output="$TMP_ROOT/task-file-rollback-missing/out"
+  printf 'original missing generation\n' > "$file"
+  FM_FILE_TRANSACTION_POSTPUBLISH_TEST_READY="$ready" FM_FILE_TRANSACTION_POSTPUBLISH_TEST_PROCEED="$proceed" \
+    node - "$ROOT/bin/fm-file-transaction.cjs" "$data" "$task" > "$output" 2>&1 <<'JS' &
+const { pinnedTaskFileTransaction } = require(process.argv[2]);
+pinnedTaskFileTransaction(process.argv[3], process.argv[4], 'trail.md', content => Buffer.concat([content, Buffer.from('transaction\n')]));
+JS
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "task-file missing-destination gate did not open"; }
+  rm "$file"; touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "task-file rollback accepted a missing destination"
+  assert_absent "$file" "task-file rollback recreated an unowned missing destination"
+  displaced=$(find "$data/$task" -maxdepth 1 -type f -name '.trail.md.*' -print -quit)
+  [ -n "$displaced" ] || fail "task-file rollback discarded the displaced generation after destination removal"
+  assert_contains "$(cat "$displaced")" "original missing generation" "missing-destination rollback changed the displaced generation"
+  pass "task-file rollback preserves displaced state when the destination disappears"
+}
+
+test_continuation_generation_copy_requires_owned_source() {
+  local root="$TMP_ROOT/continuation-copy-owned" source destination prior ready proceed output pid status source_id
+  mkdir -p "$root"
+  source="$root/source"; destination="$root/destination"; prior="$root/prior"
+  ready="$TMP_ROOT/continuation-copy.ready"; proceed="$TMP_ROOT/continuation-copy.proceed"; output="$TMP_ROOT/continuation-copy.out"
+  printf 'verified packet\n' > "$source"
+  source_id=$(stat -f '%d:%i' "$source" 2>/dev/null || stat -c '%d:%i' "$source")
+  FM_CONTAINED_COPY_TEST_READY="$ready" FM_CONTAINED_COPY_TEST_PROCEED="$proceed" \
+    python3 "$ROOT/bin/fm-contained-read.py" copy-file-fd source destination "$source_id" \
+    3< "$root" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "owned continuation copy gate did not open"; }
+  mv "$source" "$prior"; printf 'unowned packet\n' > "$source"; touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "continuation generation copied an unowned canonical packet"
+  assert_absent "$destination" "failed continuation generation copy retained output"
+  assert_contains "$(cat "$source")" "unowned packet" "continuation generation copy changed the replacement source"
+  pass "continuation generation copy requires the published packet identity"
+}
+
+test_submodule_timeout_terminates_process_group() {
+  local root="$TMP_ROOT/submodule-process-group" fakebin paths output child_pid_file child_pid status child_state
+  mkdir -p "$root/submodule"; fakebin=$(fm_fakebin "$TMP_ROOT/submodule-process-group-bin")
+  paths="$TMP_ROOT/submodule-paths"; output="$TMP_ROOT/submodule-process.out"; child_pid_file="$TMP_ROOT/submodule-child.pid"
+  printf 'submodule\0' > "$paths"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+sleep 30 &
+child=$!
+printf '%s\n' "$child" > "$FM_SUBMODULE_CHILD_PID"
+trap 'wait "$child" 2>/dev/null; exit 143' TERM
+wait "$child"
+SH
+  chmod +x "$fakebin/git"
+  FM_SUBMODULE_CHILD_PID="$child_pid_file" PATH="$fakebin:$PATH" \
+    python3 "$ROOT/bin/fm-contained-read.py" fingerprint-submodules-fd "$paths" 10 1024 1 \
+    3< "$root" > "$output" 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "submodule fingerprint timeout unexpectedly succeeded"
+  [ -s "$child_pid_file" ] || fail "submodule timeout fixture did not start its descendant"
+  child_pid=$(cat "$child_pid_file")
+  child_state=$(ps -o stat= -p "$child_pid" 2>/dev/null || true)
+  [ -z "$child_state" ] || fail "submodule timeout left a descendant process alive ($child_state)"
+  pass "submodule timeouts terminate and reap the command process group"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -4113,6 +4209,31 @@ test_unsuccessful_recovery_mutation_is_retried() {
   pass "unsuccessful sticky recovery retries without claiming uncertain ownership"
 }
 
+test_lease_signal_handoff_publishes_cleanup_ownership() {
+  local observed="$TMP_ROOT/lease-signal-handoff" status
+  mkdir -p "${observed%/*}"
+  rm -f "$observed"
+  set +e
+  FM_TEST_LEASE_HANDOFF_OBSERVED="$observed" bash -c '
+    set -u
+    . "$1"
+    fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
+    fm_account_validate_contract() { return 0; }
+    fm_account_run_control() {
+      kill -TERM "$$"
+      printf "%s\n" "{\"task\":\"task-signal\",\"pool\":\"pool-signal\",\"profile\":\"profile-signal\",\"provider\":\"claude\"}"
+    }
+    trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
+    fm_account_select enforce claude pool-signal "" task-signal
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "lease handoff signal unexpectedly allowed selection to continue"
+  assert_regex '^1$' "$observed" \
+    "lease ownership was not cleanup-visible before the deferred signal was delivered"
+  pass "lease mutation defers signals until cleanup-visible ownership handoff"
+}
+
 test_account_timeout_wrapper_uses_hard_kill_fallback() {
   local fakebin log status perl_bin
   fakebin=$(fm_fakebin "$TMP_ROOT/hard-timeout")
@@ -4339,6 +4460,19 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
+  test_task_file_rollback_preserves_unowned_replacement_and_displaced_generation
+  test_task_file_rollback_preserves_displaced_generation_when_destination_disappears
+  test_continuation_generation_copy_requires_owned_source
+  test_submodule_timeout_terminates_process_group
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34-lease ]; then
+  test_lease_signal_handoff_publishes_cleanup_ownership
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -4441,6 +4575,7 @@ test_agent_fleet_contract_is_validated_before_routing
 test_agent_fleet_lifecycle_calls_are_bounded
 test_unsuccessful_lease_mutations_always_reconcile
 test_unsuccessful_recovery_mutation_is_retried
+test_lease_signal_handoff_publishes_cleanup_ownership
 test_account_timeout_wrapper_uses_hard_kill_fallback
 test_teardown_stops_after_rollback_restores_predecessor
 

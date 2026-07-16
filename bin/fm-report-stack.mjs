@@ -1143,7 +1143,10 @@ function recoverRetentionCutover() {
     || !/^tombstone-[0-9a-f-]+$/.test(record.tombstoneName)
     || !/^\d+:\d+$/.test(record.oldIdentity) || !/^\d+:\d+$/.test(record.replacementIdentity)
     || !Number.isFinite(record.dueBefore) || typeof record.policyGeneration !== "string"
-    || !Number.isFinite(record.cutoffMs)) {
+    || !Number.isFinite(record.cutoffMs) || !Array.isArray(record.freshCohorts)
+    || record.freshCohorts.some((item) => !item || !Number.isFinite(retentionCohortDeadline(item.name))
+      || !/^\.fresh\.[a-zA-Z0-9._-]+\.[0-9a-f-]+$/.test(item.handoff)
+      || !/^\d+:\d+$/.test(item.identity))) {
     throw new Error(`invalid report retention cutover marker at ${retentionCutoverName}`);
   }
   const retiredPath = path.join(configuredStackRoot, record.retiredName);
@@ -1167,6 +1170,27 @@ function recoverRetentionCutover() {
   let retiredIdentity = `${retiredStat.dev}:${retiredStat.ino}`;
   if (currentIdentity === record.oldIdentity && retiredIdentity === record.replacementIdentity) {
     const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
+    for (const item of record.freshCohorts) {
+      const target = path.join(retiredPath, item.handoff);
+      runContainedHelper(
+        ["stage-retention-cohort-fd", item.name, item.handoff, item.identity, target],
+        [entriesDescriptor, replacement.descriptor],
+        1024 * 1024,
+      );
+      if (process.env.FM_REPORT_RETENTION_STAGE_TEST_READY
+        && !fs.existsSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_READY)) {
+        fs.writeFileSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_READY, item.name, { flag: "wx" });
+        if (process.env.FM_REPORT_RETENTION_STAGE_TEST_PROCEED) {
+          while (!fs.existsSync(process.env.FM_REPORT_RETENTION_STAGE_TEST_PROCEED)) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        }
+        if (process.env.FM_REPORT_RETENTION_STAGE_TEST_ABORT === "1") {
+          fs.closeSync(replacement.descriptor);
+          throw new Error("report retention fresh handoff test interruption");
+        }
+      }
+    }
     const oldDescriptor = entriesDescriptor;
     runContainedHelper(
       ["exchange-directories-fd", "entries", record.retiredName, record.oldIdentity, record.replacementIdentity],
@@ -1187,16 +1211,11 @@ function recoverRetentionCutover() {
   }
   const retired = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "retired report namespace");
   try {
-    for (const entry of fs.readdirSync(retiredPath, { withFileTypes: true })) {
-      const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
-      if (Number.isFinite(deadline) && deadline <= record.dueBefore) continue;
-      const source = fs.lstatSync(path.join(retiredPath, entry.name));
-      if (source.isSymbolicLink() || (!source.isDirectory() && !source.isFile())) {
-        throw new Error(`invalid entry in retired report namespace: ${entry.name}`);
-      }
+    for (const item of record.freshCohorts) {
+      const target = path.join(retiredPath, item.handoff);
       runContainedHelper(
-        ["rename-noreplace-owned-entry-fd", entry.name, entry.name, `${source.dev}:${source.ino}`],
-        [retired.descriptor, entriesDescriptor],
+        ["finalize-retention-cohort-fd", item.name, item.handoff, item.identity, target],
+        [entriesDescriptor, retired.descriptor],
         1024 * 1024,
       );
     }
@@ -1222,10 +1241,10 @@ function recoverRetentionCutover() {
 function expireDueCohorts(policy) {
   recoverRetentionCutover();
   const dueBefore = Date.now() + reportRetentionGuardMs;
-  const hasDue = fs.readdirSync(entriesDir, { withFileTypes: true }).some((entry) => {
-    const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
-    return Number.isFinite(deadline) && deadline <= dueBefore;
-  });
+  const entries = fs.readdirSync(entriesDir, { withFileTypes: true });
+  const hasDue = entries.some((entry) => entry.isDirectory()
+    && Number.isFinite(retentionCohortDeadline(entry.name))
+    && retentionCohortDeadline(entry.name) <= dueBefore);
   if (!hasDue) {
     publishRetentionPolicy(policy);
     return;
@@ -1235,18 +1254,38 @@ function expireDueCohorts(policy) {
   const retiredPath = path.join(configuredStackRoot, retiredName);
   fs.mkdirSync(retiredPath, { mode: 0o700 });
   const replacement = pinnedDirectory(retiredPath, fs.realpathSync(configuredStackRoot), "report retention replacement namespace");
-  const old = fs.fstatSync(entriesDescriptor);
-  publishStackControl(retentionCutoverName, {
-    schemaVersion: 1,
-    retiredName,
-    tombstoneName,
-    oldIdentity: `${old.dev}:${old.ino}`,
-    replacementIdentity: `${replacement.dev}:${replacement.ino}`,
-    dueBefore,
-    policyGeneration: policy.generation,
-    cutoffMs: policy.cutoffMs,
-  });
-  fs.closeSync(replacement.descriptor);
+  try {
+    const freshCohorts = [];
+    for (const entry of entries) {
+      const deadline = entry.isDirectory() ? retentionCohortDeadline(entry.name) : Number.NaN;
+      if (Number.isFinite(deadline)) {
+        if (deadline <= dueBefore) continue;
+        const observed = fs.statSync(entry.name, { bigint: true });
+        freshCohorts.push({
+          name: entry.name,
+          handoff: `.fresh.${entry.name}.${crypto.randomUUID()}`,
+          identity: `${observed.dev}:${observed.ino}`,
+        });
+        continue;
+      }
+      if (entry.name.startsWith(".")) continue;
+      throw new Error(`invalid entry in report namespace during retention: ${entry.name}`);
+    }
+    const old = fs.fstatSync(entriesDescriptor);
+    publishStackControl(retentionCutoverName, {
+      schemaVersion: 1,
+      retiredName,
+      tombstoneName,
+      oldIdentity: `${old.dev}:${old.ino}`,
+      replacementIdentity: `${replacement.dev}:${replacement.ino}`,
+      dueBefore,
+      policyGeneration: policy.generation,
+      cutoffMs: policy.cutoffMs,
+      freshCohorts,
+    });
+  } finally {
+    fs.closeSync(replacement.descriptor);
+  }
   recoverRetentionCutover();
 }
 
@@ -1298,8 +1337,12 @@ function publish(taskId, legacy) {
       if (!previousManifest) throw new Error(`existing report entry is incomplete at ${existing.path}`);
     }
     const staged = path.join(entriesDir, `.${id}.${crypto.randomUUID()}.tmp`);
+    let stagedIdentity;
     let transaction;
+    let publicationInstalled = false;
     fs.mkdirSync(staged, { mode: 0o700 });
+    const stagedStat = fs.lstatSync(staged);
+    stagedIdentity = `${stagedStat.dev}:${stagedStat.ino}`;
     try {
       const statusArtifact = snapshotStateArtifact(
         stateRoot,
@@ -1364,45 +1407,65 @@ function publish(taskId, legacy) {
       if (!statusArtifact.present) fs.writeFileSync(path.join(staged, "status.log"), "Status trail unavailable.\n", { mode: 0o600 });
       fs.writeFileSync(path.join(staged, "report.html"), reportPage(manifest, markdown, visuals), { mode: 0o600 });
 
-      const cohortDirectory = path.join(entriesDir, manifest.retentionCohort);
-      try {
-        fs.mkdirSync(cohortDirectory, { mode: 0o700 });
-      } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-        realDirectory(cohortDirectory, fs.realpathSync(entriesDir), "report retention cohort");
-      }
-      const destination = path.join(cohortDirectory, id);
       const hadPrevious = Boolean(existing);
+      const previousStat = existing ? fs.lstatSync(existing.path) : undefined;
+      const previousIdentity = previousStat ? `${previousStat.dev}:${previousStat.ino}` : "-";
       transaction = writeReportTransaction(id, manifest.retentionCohort, existing?.cohort || null);
-      if (hadPrevious) fs.renameSync(existing.path, previous);
-      try {
-        fs.renameSync(staged, destination);
-      } catch (error) {
-        if (!fs.existsSync(destination) && fs.existsSync(previous)) fs.renameSync(previous, existing.path);
-        throw error;
-      }
+      runContainedHelper(
+        ["publish-report-fd", path.basename(staged), manifest.retentionCohort, id, stagedIdentity,
+          existing?.cohort || "-", previousIdentity],
+        [entriesDescriptor],
+        1024 * 1024,
+      );
+      publicationInstalled = true;
       try {
         renderIndex();
       } catch (error) {
-        fs.rmSync(destination, { recursive: true, force: true });
-        if (fs.existsSync(previous)) fs.renameSync(previous, existing.path);
+        runContainedHelper(
+          ["rollback-report-fd", manifest.retentionCohort, id, stagedIdentity,
+            existing?.cohort || "-", previousIdentity, `.${id}.failed.${crypto.randomUUID()}`],
+          [entriesDescriptor],
+          1024 * 1024,
+        );
+        fs.rmSync(transaction, { force: true });
+        transaction = undefined;
+        publicationInstalled = false;
         throw error;
       }
       fs.rmSync(transaction, { force: true });
       transaction = undefined;
-      fs.rmSync(previous, { recursive: true, force: true });
+      if (hadPrevious) {
+        runContainedHelper(
+          ["remove-owned-tree-fd", path.basename(previous), previousIdentity],
+          [entriesDescriptor],
+          1024 * 1024,
+        );
+      }
       console.log(`published ${taskId} ${path.join(configuredStackRoot, "entries", manifest.retentionCohort, id, "report.html")}`);
     } catch (error) {
       if (transaction && fs.existsSync(transaction)) {
-        try {
-          recoverPreviousEntries();
-        } catch (recoveryError) {
-          error.message = `${error.message}; report transaction recovery remains pending: ${recoveryError.message}`;
+        if (!publicationInstalled) {
+          fs.rmSync(transaction, { force: true });
+          transaction = undefined;
+        } else {
+          try {
+            recoverPreviousEntries();
+          } catch (recoveryError) {
+            error.message = `${error.message}; report transaction recovery remains pending: ${recoveryError.message}`;
+          }
         }
       }
       throw error;
     } finally {
-      fs.rmSync(staged, { recursive: true, force: true });
+      if (stagedIdentity && fs.existsSync(staged)) {
+        try {
+          runContainedHelper(
+            ["remove-owned-tree-fd", path.basename(staged), stagedIdentity],
+            [entriesDescriptor],
+            1024 * 1024,
+          );
+        } catch {}
+      }
     }
   } finally {
     fs.closeSync(stateRoot.descriptor);

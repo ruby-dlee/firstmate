@@ -705,8 +705,11 @@ test_enforce_failure_rolls_back_prepared_endpoint() {
   id=account-select-fail-z5
   rec=$(make_case select-fail claude "$id")
   read_case "$rec"
-  out=$(FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
+  if out=$(FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then
+    status=0
+  else
+    status=$?
+  fi
   [ "$status" -ne 0 ] || fail "failed Agent Fleet selection should block spawn"
   assert_regex '^new-window ' "$TMUX_LOG" "selection did not happen after endpoint preparation"
   assert_regex '^kill-window ' "$TMUX_LOG" "selection failure did not remove its prepared endpoint"

@@ -187,13 +187,18 @@ fm_afk_launch_lock_acquire() {
         rm -rf "$candidate"
         return 1
       fi
+      # Publish our in-process ownership token before the directory becomes
+      # visible. The lifecycle signal trap can then release the lock even if
+      # TERM lands immediately after the atomic rename.
+      FM_AFK_LAUNCH_LOCK_TOKEN=$token
       if [ ! -e "$FM_AFK_LAUNCH_LOCK" ] && fm_afk_launch_atomic_rename "$candidate" "$FM_AFK_LAUNCH_LOCK"; then
         if [ "$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)" = "$token" ]; then
-          FM_AFK_LAUNCH_LOCK_TOKEN=$token
           return 0
         fi
+        FM_AFK_LAUNCH_LOCK_TOKEN=
         return 1
       fi
+      FM_AFK_LAUNCH_LOCK_TOKEN=
       rm -rf "$candidate" 2>/dev/null || true
     fi
     stale_identity=$(fm_afk_launch_lock_identity) || {
@@ -971,10 +976,15 @@ fm_afk_launch_stop() {
 fm_afk_launch_main() {
   local result
   fm_refuse_if_gate_agent
-  fm_afk_launch_lock_acquire || return 1
   trap fm_afk_launch_lock_release EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  fm_afk_launch_lock_acquire
+  result=$?
+  if [ "$result" -ne 0 ]; then
+    trap - EXIT INT TERM
+    return "$result"
+  fi
   case "${1:-start}" in
     start) fm_afk_launch_start ;;
     start-native) fm_afk_launch_start_native ;;

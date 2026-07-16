@@ -527,26 +527,67 @@ SH
 }
 
 unit_signal_exits_with_lock_cleanup() {
-  local st marker child
+  local st ready resumed child
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-signal.XXXXXX")
-  marker="$st/resumed"
+  ready="$st/handler-ready"
+  resumed="$st/resumed"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
-    fm_afk_launch_start() { sleep 30; }
+    test_ready=$2
+    test_resumed=$3
+    fm_afk_launch_start() {
+      : > "$test_ready"
+      while :; do :; done
+    }
     fm_afk_launch_main start
-    : > "$2"
-  ' _ "$LAUNCH" "$marker" &
+    : > "$test_resumed"
+  ' _ "$LAUNCH" "$ready" "$resumed" &
   child=$!
   for _ in $(seq 1 40); do
-    [ -d "$st/state/.afk-launch.lock" ] && break
+    [ -e "$ready" ] && break
     sleep 0.05
   done
+  if [ ! -e "$ready" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    fail "launcher signal: cleanup handler did not become ready"
+    rm -rf "$st"
+    return
+  fi
   kill -TERM "$child" 2>/dev/null || true
   wait "$child" 2>/dev/null || true
-  if [ ! -e "$marker" ] && [ ! -e "$st/state/.afk-launch.lock" ]; then
+  if [ ! -e "$resumed" ] && [ ! -e "$st/state/.afk-launch.lock" ]; then
     pass "launcher signal: TERM exits and releases the lifecycle lock"
   else
     fail "launcher signal: interrupted lifecycle resumed or retained its lock"
+  fi
+  rm -rf "$st"
+}
+
+unit_signal_during_lock_publication_cleanup() {
+  local st entered resumed child
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-signal-publish.XXXXXX")
+  entered="$st/entered-lifecycle"
+  resumed="$st/resumed"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    test_entered=$2
+    fm_afk_launch_atomic_rename() {
+      command mv "$1" "$2" || return 1
+      kill -TERM "$$"
+      return 0
+    }
+    fm_afk_launch_start() { : > "$test_entered"; }
+    fm_afk_launch_main start
+    : > "$3"
+  ' _ "$LAUNCH" "$entered" "$resumed" &
+  child=$!
+  wait "$child" 2>/dev/null || true
+  if [ ! -e "$entered" ] && [ ! -e "$resumed" ] \
+    && [ ! -e "$st/state/.afk-launch.lock" ]; then
+    pass "launcher signal: TERM during atomic lock publication releases the lifecycle lock"
+  else
+    fail "launcher signal: lock publication resumed or retained its lock after TERM"
   fi
   rm -rf "$st"
 }
@@ -991,15 +1032,16 @@ unit_native_handoff_lock_wait_is_bounded() {
   local st out status
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-handoff-bounded.XXXXXX")
   mkdir -p "$st/state"
-  set +e
-  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_NATIVE_HANDOFF_LOCK_WAIT_SECONDS=0 \
+  if out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_NATIVE_HANDOFF_LOCK_WAIT_SECONDS=0 \
     bash -c '
       . "$1"
       fm_lock_try_acquire() { return 1; }
       fm_afk_launch_start_native
-    ' _ "$LAUNCH" 2>&1)
-  status=$?
-  set -e
+    ' _ "$LAUNCH" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
   if [ "$status" -ne 0 ] \
     && [[ "$out" == *"native handoff lock remained busy"* ]] \
     && [[ "$out" == *"retry after the active handoff finishes"* ]]; then
@@ -1763,6 +1805,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = signal-lock-cleanup ]; then
+  unit_signal_exits_with_lock_cleanup
+  unit_signal_during_lock_publication_cleanup
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1782,6 +1831,7 @@ unit_terminal_record_symlink_is_malformed
 unit_tmux_record_is_home_scoped_and_exact
 unit_linux_stat_selection_avoids_filesystem_stat_output
 unit_signal_exits_with_lock_cleanup
+unit_signal_during_lock_publication_cleanup
 unit_herdr_partial_create_recovery
 unit_herdr_creation_intent_reconciles
 unit_expired_herdr_creation_intent_clears

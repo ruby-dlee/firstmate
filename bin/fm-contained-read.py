@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import errno
+import base64
 import ctypes
 import hashlib
 import json
@@ -581,6 +582,24 @@ def exchange_names(root, first, second):
         raise OSError(error, os.strerror(error))
 
 
+def rename_noreplace(source_root, destination_root, source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    destination_raw = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename_exclusive = libc.renameatx_np
+        rename_exclusive.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename_exclusive.restype = ctypes.c_int
+        result = rename_exclusive(source_root, source_raw, destination_root, destination_raw, 0x00000004)
+    else:
+        machine = os.uname().machine
+        syscall_number = 316 if machine in ("x86_64", "amd64") else 276
+        result = libc.syscall(syscall_number, source_root, source_raw, destination_root, destination_raw, 0x00000001)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def command_exchange_files_fd(arguments):
     if len(arguments) != 4:
         fail("usage: fm-contained-read.py exchange-files-fd <source> <destination> <source-id> <destination-id>")
@@ -602,6 +621,251 @@ def command_exchange_files_fd(arguments):
         return
     exchange_names(root, source_name, destination_name)
     fail("exchange generation changed during publication")
+
+
+def command_copy_file_fd(arguments):
+    if len(arguments) not in (2, 3) or (len(arguments) == 3 and arguments[2] != "emit-base64"):
+        fail("usage: fm-contained-read.py copy-file-fd <source> <destination> [emit-base64]")
+    source_name, destination_name = arguments[:2]
+    emit_base64 = len(arguments) == 3
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("copy names must be single safe components")
+    root = checked_root(3)
+    source = open_relative(root, source_name, os.O_RDONLY)
+    destination = None
+    copied = []
+    try:
+        before = os.fstat(source)
+        destination = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root,
+        )
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(source, min(1024 * 1024, before.st_size - offset), offset)
+            if not chunk:
+                fail("source ended before its recorded size")
+            written = 0
+            while written < len(chunk):
+                written += os.write(destination, chunk[written:])
+            if emit_base64:
+                copied.append(chunk)
+            offset += len(chunk)
+        os.fsync(destination)
+        after = os.fstat(source)
+        if not same_file(before, after):
+            fail("source changed while copying")
+        if emit_base64:
+            sys.stdout.buffer.write(base64.b64encode(b"".join(copied)))
+    except Exception:
+        if destination is not None:
+            os.close(destination)
+            destination = None
+        try:
+            os.unlink(destination_name, dir_fd=root)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if destination is not None:
+            os.close(destination)
+        os.close(source)
+
+
+def command_rename_noreplace_owned_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py rename-noreplace-owned-fd <source> <destination> <source-id>")
+    source_name, destination_name, source_id = arguments
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("rename names must be single safe components")
+    source_root = checked_root(3)
+    destination_root = checked_root(4)
+    source = os.stat(source_name, dir_fd=source_root, follow_symlinks=False)
+    if not stat.S_ISDIR(source.st_mode) or f"{source.st_dev}:{source.st_ino}" != source_id:
+        fail("owned directory generation changed before rename")
+    ready = os.environ.get("FM_CONTAINED_RENAME_TEST_READY")
+    proceed = os.environ.get("FM_CONTAINED_RENAME_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write(f"{destination_name}\n")
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("owned rename test gate timed out")
+            time.sleep(0.01)
+    rename_noreplace(source_root, destination_root, source_name, destination_name)
+    moved = os.stat(destination_name, dir_fd=destination_root, follow_symlinks=False)
+    if moved.st_dev != source.st_dev or moved.st_ino != source.st_ino:
+        fail("owned directory generation changed during rename")
+
+
+def command_prune_tombstones_fd(arguments):
+    if len(arguments) != 1:
+        fail("usage: fm-contained-read.py prune-tombstones-fd <batch>")
+    batch = int(arguments[0])
+    if batch <= 0:
+        fail("tombstone prune batch must be positive")
+    root = checked_root(3)
+    pruned = 0
+    pending = False
+    for tombstone_name in sorted(os.listdir(root)):
+        if not tombstone_name.startswith("tombstone-"):
+            fail(f"invalid retention tombstone: {tombstone_name}")
+        tombstone = open_relative(root, tombstone_name, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            children = sorted(os.listdir(tombstone))
+            for child in children:
+                if pruned >= batch:
+                    pending = True
+                    break
+                child_stat = os.stat(child, dir_fd=tombstone, follow_symlinks=False)
+                legacy_expired = child.startswith(".") and child.endswith(".expired")
+                if not stat.S_ISDIR(child_stat.st_mode) or (child.startswith(".") and not legacy_expired):
+                    fail(f"invalid report entry in retention tombstone: {child}")
+                child_fd = open_relative(tombstone, child, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    remove_directory_contents(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(child, dir_fd=tombstone)
+                pruned += 1
+            if not os.listdir(tombstone):
+                os.rmdir(tombstone_name, dir_fd=root)
+            else:
+                pending = True
+        finally:
+            os.close(tombstone)
+        if pruned >= batch:
+            pending = pending or bool(os.listdir(root))
+            break
+    print(json.dumps({"pruned": pruned, "pending": pending}, separators=(",", ":")))
+
+
+def copy_directory_contents(source, destination):
+    before = os.fstat(source)
+    names = sorted(os.listdir(source))
+    for name in names:
+        observed = os.stat(name, dir_fd=source, follow_symlinks=False)
+        if stat.S_ISDIR(observed.st_mode):
+            child_source = open_relative(source, name, os.O_RDONLY | os.O_DIRECTORY)
+            os.mkdir(name, 0o700, dir_fd=destination)
+            child_destination = open_relative(destination, name, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                copy_directory_contents(child_source, child_destination)
+            finally:
+                os.close(child_destination)
+                os.close(child_source)
+        elif stat.S_ISREG(observed.st_mode):
+            child_source = open_relative(source, name, os.O_RDONLY)
+            child_destination = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=destination,
+            )
+            try:
+                opened = os.fstat(child_source)
+                offset = 0
+                while offset < opened.st_size:
+                    chunk = os.pread(child_source, min(1024 * 1024, opened.st_size - offset), offset)
+                    if not chunk:
+                        fail(f"source ended while copying {name}")
+                    written = 0
+                    while written < len(chunk):
+                        written += os.write(child_destination, chunk[written:])
+                    offset += len(chunk)
+                os.fsync(child_destination)
+                if not same_file(opened, os.fstat(child_source)):
+                    fail(f"source changed while copying {name}")
+            finally:
+                os.close(child_destination)
+                os.close(child_source)
+        else:
+            fail(f"source is not a real file or directory: {name}")
+    after = os.fstat(source)
+    if before.st_dev != after.st_dev or before.st_ino != after.st_ino or names != sorted(os.listdir(source)):
+        fail("source directory changed while copying")
+
+
+def command_copy_directory_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py copy-directory-fd <source> <destination-parent|-> <destination>")
+    source_name, parent_name, destination_name = arguments
+    if len(components(source_name)) != 1 or len(components(destination_name)) != 1:
+        fail("copy directory names must be single safe components")
+    if parent_name != "-" and len(components(parent_name)) != 1:
+        fail("copy directory parent must be one safe component")
+    source_root = checked_root(3)
+    destination_root = checked_root(4)
+    source = open_relative(source_root, source_name, os.O_RDONLY | os.O_DIRECTORY)
+    parent = os.dup(destination_root)
+    staged_name = f".{destination_name}.legacy-restore"
+    try:
+        if parent_name != "-":
+            try:
+                os.mkdir(parent_name, 0o700, dir_fd=destination_root)
+            except FileExistsError:
+                pass
+            os.close(parent)
+            parent = open_relative(destination_root, parent_name, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            staged = open_relative(parent, staged_name, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            staged = None
+        if staged is not None:
+            try:
+                remove_directory_contents(staged)
+            finally:
+                os.close(staged)
+            os.rmdir(staged_name, dir_fd=parent)
+        os.mkdir(staged_name, 0o700, dir_fd=parent)
+        destination = open_relative(parent, staged_name, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            copy_directory_contents(source, destination)
+            os.fsync(destination)
+        finally:
+            os.close(destination)
+        rename_noreplace(parent, parent, staged_name, destination_name)
+        os.fsync(parent)
+    except Exception:
+        try:
+            staged = open_relative(parent, staged_name, os.O_RDONLY | os.O_DIRECTORY)
+        except (FileNotFoundError, NotADirectoryError):
+            staged = None
+        if staged is not None:
+            try:
+                remove_directory_contents(staged)
+            finally:
+                os.close(staged)
+            os.rmdir(staged_name, dir_fd=parent)
+        raise
+    finally:
+        os.close(parent)
+        os.close(source)
+
+
+def command_exchange_directories_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py exchange-directories-fd <first> <second> <first-id> <second-id>")
+    first_name, second_name, first_id, second_id = arguments
+    if len(components(first_name)) != 1 or len(components(second_name)) != 1:
+        fail("exchange directory names must be single safe components")
+    root = checked_root(3)
+    first = os.stat(first_name, dir_fd=root, follow_symlinks=False)
+    second = os.stat(second_name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISDIR(first.st_mode) or not stat.S_ISDIR(second.st_mode):
+        fail("exchange operands must be real directories")
+    if f"{first.st_dev}:{first.st_ino}" != first_id or f"{second.st_dev}:{second.st_ino}" != second_id:
+        fail("exchange directory generation changed before publication")
+    exchange_names(root, first_name, second_name)
+    moved_first = os.stat(second_name, dir_fd=root, follow_symlinks=False)
+    moved_second = os.stat(first_name, dir_fd=root, follow_symlinks=False)
+    if f"{moved_first.st_dev}:{moved_first.st_ino}" != first_id \
+            or f"{moved_second.st_dev}:{moved_second.st_ino}" != second_id:
+        exchange_names(root, first_name, second_name)
+        fail("exchange directory generation changed during publication")
 
 
 def command_remove_owned_file_fd(arguments):
@@ -666,6 +930,16 @@ def main():
         command_fingerprint_paths_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-files-fd":
         command_exchange_files_fd(sys.argv[2:])
+    elif sys.argv[1] == "copy-file-fd":
+        command_copy_file_fd(sys.argv[2:])
+    elif sys.argv[1] == "rename-noreplace-owned-fd":
+        command_rename_noreplace_owned_fd(sys.argv[2:])
+    elif sys.argv[1] == "prune-tombstones-fd":
+        command_prune_tombstones_fd(sys.argv[2:])
+    elif sys.argv[1] == "copy-directory-fd":
+        command_copy_directory_fd(sys.argv[2:])
+    elif sys.argv[1] == "exchange-directories-fd":
+        command_exchange_directories_fd(sys.argv[2:])
     elif sys.argv[1] == "remove-owned-file-fd":
         command_remove_owned_file_fd(sys.argv[2:])
     else:

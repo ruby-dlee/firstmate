@@ -305,7 +305,7 @@ secondmate_liveness_sweep() {
     backend=$(fm_backend_of_meta "$meta")
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
-    verdict=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" 2>/dev/null) || verdict="unknown"
+    verdict=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null) || verdict="unknown"
     case "$harness" in
       claude|codex|opencode|pi|grok) ;;
       *) [ "$verdict" = dead ] && verdict=unknown ;;
@@ -334,7 +334,7 @@ secondmate_liveness_sweep() {
         backend=$(fm_backend_of_meta "$meta")
         target=$(fm_backend_target_of_meta "$meta")
         [ -n "$target" ] || target="$window"
-        recheck=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" 2>/dev/null) || recheck=unknown
+        recheck=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null) || recheck=unknown
         case "$harness" in
           claude|codex|opencode|pi|grok) ;;
           *) [ "$recheck" = dead ] && recheck=unknown ;;

@@ -58,6 +58,15 @@ function scopedLine(line, containers) {
   return { text: line.slice(offset) };
 }
 
+function activeListScope(line, containers) {
+  for (let length = containers.length; length > 0; length -= 1) {
+    const active = containers.slice(0, length);
+    const scoped = scopedLine(line, active);
+    if (scoped) return { containers: active, text: scoped.text };
+  }
+  return undefined;
+}
+
 function fenceMarker(line) {
   const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
   if (!match || (match[1][0] === "`" && match[2].includes("`"))) return undefined;
@@ -131,11 +140,18 @@ function markdownStructure(markdown) {
       }
 
       const candidate = containerCandidate(line);
-      const lazyListContinuation = candidate.containers.length === 0 && lazyList
-        && scopedLine(line, lazyList) !== undefined && !/^[ \t]*$/.test(line);
-      const activeCandidate = lazyListContinuation
-        ? { text: scopedLine(line, lazyList).text, containers: lazyList }
+      const activeList = lazyList && !/^[ \t]*$/.test(line) ? activeListScope(line, lazyList) : undefined;
+      const nestedCandidate = activeList ? containerCandidate(activeList.text) : undefined;
+      const lazyListContinuation = Boolean(activeList);
+      const activeCandidate = activeList
+        ? { text: nestedCandidate.text, containers: [...activeList.containers, ...nestedCandidate.containers] }
         : candidate;
+      if (!activeList && candidate.containers.length === 0 && /^(?: {4}|\t)/.test(line)) {
+        visible.push({ line, heading: undefined });
+        paragraphOpen = false;
+        consumed = true;
+        continue;
+      }
       const marker = fenceMarker(activeCandidate.text);
       if (marker) {
         fence = {
@@ -157,10 +173,10 @@ function markdownStructure(markdown) {
         consumed = true;
         continue;
       }
-      const parsedHeading = candidate.containers.length === 0 ? heading(line) : undefined;
+      const parsedHeading = activeCandidate.containers.length === 0 ? heading(activeCandidate.text) : undefined;
       visible.push({ line, heading: lazyListContinuation ? undefined : parsedHeading });
-      if (candidate.containers.some(({ type }) => type === "list")) {
-        lazyList = candidate.containers.filter(({ type }) => type === "list");
+      if (activeCandidate.containers.some(({ type }) => type === "list")) {
+        lazyList = activeCandidate.containers.filter(({ type }) => type === "list");
       } else if (!lazyListContinuation && !/^[ \t]*$/.test(line)) {
         lazyList = undefined;
       }

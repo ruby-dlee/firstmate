@@ -30,6 +30,7 @@ HEARTBEAT="$STACK_ROOT/.retention-heartbeat"
 ERROR_FILE="$STACK_ROOT/.retention-error"
 INSTALL_LOCK="$INSTALL_ROOT/.install-lock"
 INSTALL_RECLAIM="$INSTALL_ROOT/.install-lock-reclaim"
+CANDIDATE_FENCE="$INSTALL_ROOT/.candidate-fence"
 INSTALL_LOCK_TOKEN=
 SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.cjs fm-contained-read.py fm-gate-refuse-lib.sh)
 
@@ -97,6 +98,75 @@ heartbeat_matches() {
   [ -n "$run_identity" ] && { [ -z "$previous_run" ] || [ "$run_identity" != "$previous_run" ]; } || return 1
   now=$(date +%s)
   [ "$((now - epoch))" -le "$((INTERVAL * 2 + 60))" ]
+}
+
+restore_prior_heartbeat() {
+  local backup=$1 had_previous=$2 candidate_provenance=$3 candidate_nonce=$4
+  local current_id backup_id python_runtime quarantine
+  [ -e "$backup" ] || [ "$had_previous" = 0 ] || return 1
+  if [ ! -f "$HEARTBEAT" ] || [ -L "$HEARTBEAT" ] \
+    || [ "$(sed -n '2p' "$HEARTBEAT")" != "$candidate_provenance" ] \
+    || { [ "$(sed -n '3p' "$HEARTBEAT")" != "$candidate_nonce" ] && [ -n "$(sed -n '3p' "$HEARTBEAT")" ]; }; then
+    rm -f "$backup"
+    return 0
+  fi
+  current_id=$(file_identity "$HEARTBEAT") || return 1
+  python_runtime=$(resolve_runtime "${FM_REPORT_PYTHON:-}" python3) || return 1
+  if [ "$had_previous" = 1 ]; then
+    backup_id=$(file_identity "$backup") || return 1
+    "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" exchange-files-fd \
+      "$(basename "$backup")" "$(basename "$HEARTBEAT")" "$backup_id" "$current_id" 3< "$STACK_ROOT" \
+      || return 1
+    quarantine=".$(basename "$backup").discarded.$INSTALL_LOCK_TOKEN"
+    "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+      "$(basename "$backup")" "$current_id" "$quarantine" 3< "$STACK_ROOT"
+  else
+    quarantine=".$(basename "$HEARTBEAT").discarded.$INSTALL_LOCK_TOKEN"
+    "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+      "$(basename "$HEARTBEAT")" "$current_id" "$quarantine" 3< "$STACK_ROOT"
+  fi
+}
+
+candidate_bootout_confirmed() {
+  local domain=$1 job_label=$2
+  "$LAUNCHCTL" bootout "$domain/$job_label" >/dev/null 2>&1 && return 0
+  ! "$LAUNCHCTL" print "$domain/$job_label" >/dev/null 2>&1
+}
+
+retain_candidate_fence() {
+  local domain=$1 job_label=$2 generation=$3 candidate_provenance=$4 candidate_nonce=$5
+  local heartbeat_backup=$6 heartbeat_had_previous=$7 temp
+  temp=$(mktemp "$INSTALL_ROOT/.candidate-fence.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$domain" "$job_label" "$generation" \
+    "$candidate_provenance" "$candidate_nonce" "$heartbeat_backup" "$heartbeat_had_previous" > "$temp" \
+    || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+  mv -f "$temp" "$CANDIDATE_FENCE"
+}
+
+recover_candidate_fence() {
+  local domain job_label generation candidate_provenance candidate_nonce heartbeat_backup heartbeat_had_previous extra
+  [ -e "$CANDIDATE_FENCE" ] || [ -L "$CANDIDATE_FENCE" ] || return 0
+  [ -f "$CANDIDATE_FENCE" ] && [ ! -L "$CANDIDATE_FENCE" ] || return 1
+  domain=$(sed -n '1p' "$CANDIDATE_FENCE")
+  job_label=$(sed -n '2p' "$CANDIDATE_FENCE")
+  generation=$(sed -n '3p' "$CANDIDATE_FENCE")
+  candidate_provenance=$(sed -n '4p' "$CANDIDATE_FENCE")
+  candidate_nonce=$(sed -n '5p' "$CANDIDATE_FENCE")
+  heartbeat_backup=$(sed -n '6p' "$CANDIDATE_FENCE")
+  heartbeat_had_previous=$(sed -n '7p' "$CANDIDATE_FENCE")
+  extra=$(sed -n '8p' "$CANDIDATE_FENCE")
+  case "$domain" in gui/*) ;; *) return 1 ;; esac
+  case "$job_label" in "$LABEL".*) ;; *) return 1 ;; esac
+  case "$generation" in "$GENERATIONS"/*) ;; *) return 1 ;; esac
+  case "$heartbeat_backup" in "$STACK_ROOT"/.retention-heartbeat.previous.*) ;; *) return 1 ;; esac
+  [ -d "$generation" ] && [ ! -L "$generation" ] && [ -n "$candidate_provenance" ] \
+    && [ -n "$candidate_nonce" ] && [ -z "$extra" ] \
+    && { [ "$heartbeat_had_previous" = 0 ] || [ "$heartbeat_had_previous" = 1 ]; } || return 1
+  candidate_bootout_confirmed "$domain" "$job_label" || return 1
+  restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$candidate_provenance" "$candidate_nonce" || return 1
+  rm -rf "$generation"
+  rm -f "$CANDIDATE_FENCE"
 }
 
 control_state() {
@@ -283,9 +353,9 @@ install_test_interrupt() {
 }
 
 install_owner() {
-  local token staging generation generation_plist plist_temp previous_plist domain file
+  local token staging generation generation_plist plist_temp previous_plist domain file heartbeat_backup
   local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program='' old_label=''
-  local job_label activation_nonce activation_started=0 activation_baseline='' installed_plist_identity='' activation_attempts
+  local job_label activation_nonce activation_started=0 activation_baseline='' activation_attempts heartbeat_had_previous=0
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent installation requires macOS" >&2; return 1; }
   command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
   mkdir -p "$GENERATIONS" "$LAUNCH_AGENTS_DIR" || return 1
@@ -314,26 +384,40 @@ install_owner() {
   cp "$generation_plist" "$plist_temp" || return 1
   chmod 600 "$plist_temp" || return 1
   mv "$staging" "$generation" || return 1
+  generation_plist="$generation/$LABEL.plist"
   install_test_interrupt generation-published || return $?
+  if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then
+    [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || { rm -f "$plist_temp" "$previous_plist"; rm -rf "$generation"; echo "error: unsafe installed report-retention plist" >&2; return 1; }
+    cp -p "$PLIST" "$previous_plist" || { rm -f "$plist_temp" "$previous_plist"; rm -rf "$generation"; return 1; }
+    old_program=$(plist_program "$previous_plist")
+    old_label=$(plist_label "$previous_plist")
+  fi
+  mkdir -p "$STACK_ROOT" || return 1
+  heartbeat_backup=$(mktemp "$STACK_ROOT/.retention-heartbeat.previous.XXXXXX") || return 1
+  rm -f "$heartbeat_backup"
+  if [ -e "$HEARTBEAT" ] || [ -L "$HEARTBEAT" ]; then
+    [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ] || return 1
+    cp -p "$HEARTBEAT" "$heartbeat_backup" || return 1
+    heartbeat_had_previous=1
+  fi
   if ! FM_REPORT_RETENTION_NODE="$node_runtime" FM_REPORT_PYTHON="$python_runtime" \
     FM_REPORT_RETENTION_ACTIVATION_NONCE='' \
     "$bash_runtime" "$generation/bin/fm-report-retention.sh" run-once \
     || ! heartbeat_matches "$installed_provenance" ""; then
+    restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
+    rm -f "$plist_temp" "$previous_plist" "$heartbeat_backup"
+    rm -rf "$generation"
     echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
     return 1
   fi
-  if [ -e "$PLIST" ] || [ -L "$PLIST" ]; then
-    [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || { echo "error: unsafe installed report-retention plist" >&2; return 1; }
-    cp -p "$PLIST" "$previous_plist" || return 1
-    old_program=$(plist_program "$previous_plist")
-    old_label=$(plist_label "$previous_plist")
-  fi
-  mv -f "$plist_temp" "$PLIST" || return 1
-  installed_plist_identity=$(file_identity "$PLIST") || return 1
-  install_test_interrupt pointer-published || return $?
   domain="gui/$(id -u)"
-  if "$LAUNCHCTL" bootstrap "$domain" "$PLIST"; then
-    if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then activation_baseline=$(sed -n '4p' "$HEARTBEAT"); fi
+  if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then activation_baseline=$(sed -n '4p' "$HEARTBEAT"); fi
+  if "$LAUNCHCTL" bootstrap "$domain" "$generation_plist"; then
+    if [ "${FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_BOOTSTRAP:-}" = 1 ]; then
+      FM_REPORT_RETENTION_NODE="$node_runtime" FM_REPORT_PYTHON="$python_runtime" \
+        FM_REPORT_RETENTION_ACTIVATION_NONCE="$activation_nonce" \
+        "$bash_runtime" "$generation/bin/fm-report-retention.sh" run-once || true
+    fi
     if FM_REPORT_RETENTION_EXPECTED_NONCE="$activation_nonce" \
       FM_REPORT_RETENTION_EXPECTED_PROVENANCE="$installed_provenance" \
       "$LAUNCHCTL" kickstart "$domain/$job_label"; then
@@ -353,6 +437,22 @@ install_owner() {
     done
   fi
   if [ "$activation_started" -eq 1 ] && heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline"; then
+    if [ "${FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER:-}" = 1 ] || ! mv -f "$plist_temp" "$PLIST"; then
+      if candidate_bootout_confirmed "$domain" "$job_label"; then
+        restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
+        rm -f "$heartbeat_backup"
+        rm -rf "$generation"
+        echo "error: report-retention LaunchAgent pointer publication failed; previous generation preserved" >&2
+      else
+        retain_candidate_fence "$domain" "$job_label" "$generation" "$installed_provenance" \
+          "$activation_nonce" "$heartbeat_backup" "$heartbeat_had_previous" || true
+        echo "error: report-retention LaunchAgent pointer publication failed and candidate fencing is pending" >&2
+      fi
+      rm -f "$plist_temp" "$previous_plist"
+      return 1
+    fi
+    rm -f "$heartbeat_backup"
+    install_test_interrupt pointer-published || return $?
     if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
       "$LAUNCHCTL" bootout "$domain/$old_label" >/dev/null 2>&1 || true
     fi
@@ -363,13 +463,15 @@ install_owner() {
     done
     return 0
   fi
-  "$LAUNCHCTL" bootout "$domain/$job_label" >/dev/null 2>&1 || true
-  if [ -f "$previous_plist" ]; then
-    mv -f "$previous_plist" "$PLIST"
-  elif [ -n "$installed_plist_identity" ]; then
-    remove_owned_launch_file "$PLIST" "$installed_plist_identity" ".$LABEL.failed.$token" \
-      || { echo "error: failed retention plist ownership changed during rollback" >&2; return 1; }
+  if candidate_bootout_confirmed "$domain" "$job_label"; then
+    restore_prior_heartbeat "$heartbeat_backup" "$heartbeat_had_previous" "$installed_provenance" "$activation_nonce" || true
+    rm -f "$heartbeat_backup"
+    rm -rf "$generation"
+  else
+    retain_candidate_fence "$domain" "$job_label" "$generation" "$installed_provenance" \
+      "$activation_nonce" "$heartbeat_backup" "$heartbeat_had_previous" || true
   fi
+  rm -f "$plist_temp" "$previous_plist"
   echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
   return 1
 }
@@ -398,6 +500,7 @@ run_with_install_lock() {
   local operation=$1 status
   install_lock_acquire || return 1
   trap 'install_lock_release >/dev/null 2>&1 || true' EXIT
+  recover_candidate_fence || { echo "error: report-retention candidate fencing is still pending" >&2; install_lock_release; trap - EXIT; return 1; }
   "$operation"; status=$?
   install_lock_release
   trap - EXIT

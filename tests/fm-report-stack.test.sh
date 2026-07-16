@@ -208,6 +208,53 @@ test_revision_fields_distinguish_pr_head_from_worktree_head() {
   pass "report manifests distinguish PR head from worktree HEAD compatibly"
 }
 
+test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
+  local stack="$TMP_ROOT/legacy-cutover-stack" ready="$TMP_ROOT/legacy-cutover.ready"
+  local proceed="$TMP_ROOT/legacy-cutover.proceed" output="$TMP_ROOT/legacy-cutover.out" pid status fresh_path
+  mkdir -p "$stack/entries/legacy-fresh" "$stack/entries/legacy-expired" "$stack/entries/.legacy-old.expired"
+  printf '{"schemaVersion":1,"reportId":"legacy-fresh","taskId":"legacy-fresh","title":"Fresh","summary":"Fresh","completedAt":"2026-07-15T00:00:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
+    > "$stack/entries/legacy-fresh/manifest.json"
+  printf 'fresh bytes\n' > "$stack/entries/legacy-fresh/report.md"
+  printf '{"schemaVersion":1,"reportId":"legacy-expired","taskId":"legacy-expired","title":"Expired","summary":"Expired","completedAt":"2000-01-01T00:00:00.000Z","kind":"ship","project":"example","harness":"codex"}\n' \
+    > "$stack/entries/legacy-expired/manifest.json"
+  printf 'expired bytes\n' > "$stack/entries/legacy-expired/report.md"
+  printf 'old tombstone bytes\n' > "$stack/entries/.legacy-old.expired/report.md"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_BATCH=1 \
+    FM_REPORT_LEGACY_CUTOVER_TEST_READY="$ready" FM_REPORT_LEGACY_CUTOVER_TEST_PROCEED="$proceed" \
+    "$SCRIPT" render > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "legacy cutover preparation gate did not open"; }
+  assert_absent "$stack/entries/legacy-fresh" \
+    "legacy cutover restored fresh bytes before the retirement boundary"
+  assert_absent "$stack/entries/legacy-expired" \
+    "legacy cutover left expired raw bytes visible during fresh restoration"
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "legacy report cutover failed: $(cat "$output")"
+  assert_absent "$stack/entries/legacy-fresh" "legacy flat fresh path survived cohort cutover"
+  assert_absent "$stack/entries/legacy-expired" "expired legacy raw path survived cohort cutover"
+  fresh_path=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path legacy-fresh) \
+    || fail "fresh legacy report was unavailable after atomic cutover"
+  assert_grep 'fresh bytes' "$(dirname "$fresh_path")/report.md" \
+    "cohort cutover changed fresh legacy artifact bytes"
+  [ -z "$(find "$stack/.retention-tombstones" -name '.legacy-old.expired' -print -quit)" ] \
+    || fail "legacy expired tombstone did not enter bounded private cleanup"
+  assert_absent "$stack/.legacy-cutover.json" "completed legacy cutover retained its transaction marker"
+  pass "legacy cutover atomically cohortizes fresh reports and retires expired raw paths"
+}
+
+test_manifest_cohort_must_match_completion_time() {
+  local stack="$TMP_ROOT/manifest-cohort-stack" cohort=cohort-4102444800000 out status
+  mkdir -p "$stack/entries/$cohort/cohort-mismatch"
+  printf '{"schemaVersion":1,"reportId":"cohort-mismatch","taskId":"cohort-mismatch","title":"Mismatch","summary":"Mismatch","completedAt":"2000-01-01T00:00:00.000Z","retentionCohort":"%s","kind":"ship","project":"example","harness":"codex"}\n' "$cohort" \
+    > "$stack/entries/$cohort/cohort-mismatch/manifest.json"
+  if out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" render 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "manifest cohort metadata was accepted despite a mismatched completion time"
+  assert_contains "$out" "manifest identity mismatch" "manifest cohort-time mismatch failed unclearly"
+  pass "report manifests bind cohort metadata to completion time"
+}
+
 test_republish_new_generation_refreshes_completion_time() {
   local id=report-generation-a4 repo meta entry manifest staged
   repo="$TMP_ROOT/generation-worktree"
@@ -226,7 +273,13 @@ test_republish_new_generation_refreshes_completion_time() {
   run_stack publish "$id" >/dev/null || fail "first generation report publication failed"
   entry=$(run_stack path "$id")
   manifest="$(dirname "$entry")/manifest.json"
-  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$manifest.tmp"
+  node - "$manifest" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const value = JSON.parse(fs.readFileSync(file));
+value.completedAt = new Date(Date.parse(value.completedAt) - 1000).toISOString();
+fs.writeFileSync(`${file}.tmp`, `${JSON.stringify(value, null, 2)}\n`);
+NODE
   mv "$manifest.tmp" "$manifest"
 
   git -C "$repo" commit -q --allow-empty -m second
@@ -893,6 +946,30 @@ EOF
   pass "report parsing exits lazy list continuation below the actual required content indent"
 }
 
+test_nested_list_parent_scope_hides_required_headings() {
+  local id=report-list-parent-b3m source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+- outer paragraph
+  - inner paragraph
+  ## Summary
+  ## What changed
+  ## Verification
+  ## Visual evidence
+  ## Artifacts
+  ## Follow-ups
+EOF
+  if out=$(run_stack publish "$id" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "headings inside a nested list's parent scope unexpectedly satisfied the report contract"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "nested parent-list failure omitted missing heading $heading"
+  done
+  pass "report parsing preserves parent list scope after nested lists"
+}
+
 test_container_scopes_preserve_commonmark_blank_and_exit_rules() {
   local valid=report-container-exit-b3n invalid=report-list-blank-b3o source out status heading
   write_task "$valid" ship
@@ -1103,19 +1180,20 @@ test_lock_control_files_are_bounded_and_nonfollowing() {
 }
 
 test_previous_generation_is_recovered_for_readers() {
-  local id=report-crash-recovery-k2 entry report_id previous json
+  local id=report-crash-recovery-k2 entry destination report_id previous json
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Crash-safe report."
   run_stack publish "$id" >/dev/null || fail "crash-recovery report failed to publish"
   entry=$(run_stack path "$id")
-  report_id=$(basename "$(dirname "$entry")")
-  previous="$STACK/entries/.$report_id.previous"
-  mv "$STACK/entries/$report_id" "$previous"
+  destination=$(dirname "$entry")
+  report_id=$(basename "$destination")
+  previous="$(dirname "$destination")/.$report_id.previous"
+  mv "$destination" "$previous"
 
   json=$(run_stack list --json) || fail "report list did not recover the previous generation"
   printf '%s\n' "$json" | grep -F '"taskId": "report-crash-recovery-k2"' >/dev/null \
     || fail "recovered previous generation was absent from report inventory"
-  assert_present "$STACK/entries/$report_id/report.html" "reader recovery did not restore the durable report entry"
+  assert_present "$destination/report.html" "reader recovery did not restore the durable report entry"
   assert_absent "$previous" "reader recovery retained the hidden previous generation"
   entry=$(run_stack path "$id") || fail "report path did not resolve after generation recovery"
   assert_present "$entry" "recovered report path is missing"
@@ -1348,6 +1426,12 @@ test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
     fs.writeFileSync(process.argv[2], `${JSON.stringify(value, null, 2)}\n`);
   ' "$manifest" "$temp"
   mv "$temp" "$manifest"
+  temp="$TMP_ROOT/retention-owner-manifest.tmp"
+  sed 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684800000"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  mkdir "$STACK/entries/cohort-946684800000"
+  mv "$(dirname "$entry")" "$STACK/entries/cohort-946684800000/"
+  entry="$STACK/entries/cohort-946684800000/$(basename "$(dirname "$entry")")/report.html"
   fakebin="$TMP_ROOT/retention-launchctl"; install_root="$TMP_ROOT/retention-install"; agents="$TMP_ROOT/LaunchAgents"
   mkdir -p "$fakebin" "$agents"
   cat > "$fakebin/launchctl" <<'SH'
@@ -2125,26 +2209,32 @@ test_repository_fingerprint_recurses_through_submodule_worktrees() {
 }
 
 test_retention_cutoff_is_authoritative_before_cleanup() {
-  local id=report-retention-cutoff-k2q entry manifest temp ready proceed output pid policy cutoff
+  local id=report-retention-cutoff-k2q fresh=report-retention-fresh-k2q entry fresh_entry manifest temp ready output policy cutoff
+  local expired_cohort="$STACK/entries/cohort-946684800000"
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cutoff-visible report."
   run_stack publish "$id" >/dev/null || fail "cutoff precondition publication failed"
   entry=$(run_stack path "$id") || fail "cutoff precondition path failed"
+  write_task "$fresh" ship
+  write_required_report "$HOME_DIR/data/$fresh/completion.md" "Fresh report."
+  run_stack publish "$fresh" >/dev/null || fail "fresh cutoff precondition publication failed"
+  fresh_entry=$(run_stack path "$fresh") || fail "fresh cutoff precondition path failed"
   manifest="$(dirname "$entry")/manifest.json"
   temp="$manifest.tmp"
-  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
+    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684800000"/' "$manifest" > "$temp"
   mv "$temp" "$manifest"
-  ready="$TMP_ROOT/retention-policy.ready"; proceed="$TMP_ROOT/retention-policy.proceed"; output="$TMP_ROOT/retention-policy.out"
-  trap 'touch "$proceed" 2>/dev/null || true' RETURN
-  FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_PROCEED="$proceed" \
-    run_stack prune --status > "$output" 2>&1 &
-  pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [ -e "$ready" ] && break
-    sleep 0.05
-  done
-  [ -e "$ready" ] || { touch "$proceed"; wait "$pid" 2>/dev/null || true; fail "retention cutoff publication hook did not run"; }
-  assert_present "$(dirname "$entry")" "retention cleanup advanced before publishing its authoritative cutoff"
+  mkdir "$expired_cohort"
+  mv "$(dirname "$entry")" "$expired_cohort/"
+  entry="$expired_cohort/$(basename "$(dirname "$entry")")/report.html"
+  ready="$TMP_ROOT/retention-policy.ready"; output="$TMP_ROOT/retention-policy.out"
+  if FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_ABORT=1 \
+    run_stack prune --status > "$output" 2>&1; then
+    fail "retention namespace interruption hook unexpectedly completed"
+  fi
+  assert_present "$ready" "retention cutoff publication hook did not run"
+  assert_absent "$(dirname "$entry")" "expired raw artifacts remained in the public namespace after the cutoff milestone"
+  assert_present "$(dirname "$fresh_entry")" "fresh report became unavailable while an expired cohort was retired"
   policy="$STACK/.retention-policy.js"
   assert_present "$policy" "retention did not atomically publish its cutoff generation and index"
   assert_grep 'window.firstmateRetentionPolicy={"schemaVersion":1,"generation":"' "$policy" \
@@ -2152,22 +2242,43 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   cutoff=$(sed -n 's/.*"cutoffMs":\([0-9]*\).*/\1/p' "$policy")
   [ -n "$cutoff" ] && [ "$cutoff" -gt 946684800000 ] \
     || fail "retention authority did not hide the expired report before scanning manifests"
-  assert_grep '<script src=".retention-policy.js"></script>' "$STACK/index.html" \
-    "report index does not honor the independently published cutoff authority"
-  assert_grep '<html lang="en" style="visibility:hidden">' "$entry" \
-    "direct report page exposes content before evaluating retention authority"
-  assert_grep '<script src="../../.retention-policy.js"></script>' "$entry" \
-    "direct report page does not load the current retention authority"
-  assert_grep 'completedAt<=cutoff' "$entry" \
-    "direct report page does not apply the cutoff to its completion timestamp"
-  assert_grep 'This report has expired.' "$entry" \
-    "direct report page has no expired-report browser state"
-  touch "$proceed"
-  wait "$pid" || fail "retention cutoff cleanup failed: $(cat "$output")"
-  trap - RETURN
+  assert_absent "$(dirname "$entry")" "interrupted retention restored expired raw artifacts"
+  run_stack prune --status >/dev/null || fail "retention did not recover its interrupted namespace generation"
   assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
+  assert_present "$(dirname "$fresh_entry")" "retention cleanup removed an unrelated fresh cohort"
   assert_no_grep "$id" "$STACK/index.html" "completed retention rendering left an expired report visible"
-  pass "retention publishes one authoritative cutoff before bounded cleanup"
+  pass "retention atomically retires due cohorts without interrupting fresh reports"
+}
+
+test_retention_cohort_tombstone_is_noreplace_owned() {
+  local id=report-retention-cohort-race-k2s entry manifest temp source tombstone ready proceed output pid status
+  id=report-retention-cohort-race-k2s
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Cohort rename race."
+  run_stack publish "$id" >/dev/null || fail "cohort rename race precondition publication failed"
+  entry=$(run_stack path "$id") || fail "cohort rename race path failed"
+  manifest="$(dirname "$entry")/manifest.json"; temp="$manifest.tmp"
+  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
+    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684500000"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  source="$STACK/entries/cohort-946684500000"
+  mkdir "$source"
+  mv "$(dirname "$entry")" "$source/"
+  ready="$TMP_ROOT/cohort-rename.ready"; proceed="$TMP_ROOT/cohort-rename.proceed"; output="$TMP_ROOT/cohort-rename.out"
+  FM_CONTAINED_RENAME_TEST_READY="$ready" FM_CONTAINED_RENAME_TEST_PROCEED="$proceed" \
+    run_stack prune --status > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "cohort no-replace gate did not open"; }
+  tombstone="$STACK/.retention-tombstones/$(cat "$ready")"
+  mkdir "$tombstone"; printf 'replacement\n' > "$tombstone/sentinel"
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "cohort retirement replaced a concurrently created tombstone"
+  assert_present "$source" "failed cohort retirement moved its uncommitted source"
+  assert_grep replacement "$tombstone/sentinel" "cohort retirement mutated a replacement tombstone"
+  rm -rf "$source" "$tombstone"
+  pass "retention cohort retirement is no-replace and generation-owned"
 }
 
 test_failed_initial_retention_activation_disarms_plist() {
@@ -2300,6 +2411,124 @@ SH
   pass "retention activation overlaps owners and requires a launched-job nonce"
 }
 
+test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline() {
+  local fakebin="$TMP_ROOT/retention-bootstrap-heartbeat-launchctl"
+  local install_root="$TMP_ROOT/retention-bootstrap-heartbeat-install"
+  local agents="$TMP_ROOT/retention-bootstrap-heartbeat-agents"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH='' \
+    FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_BOOTSTRAP=1 \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention rejected a RunAtLoad heartbeat produced after bootstrap"
+  assert_present "$agents/com.firstmate.report-retention.plist" \
+    "retention did not publish the owner proven healthy during bootstrap"
+  pass "retention activation baselines health before bootstrap RunAtLoad"
+}
+
+test_retention_pointer_failure_retires_only_candidate() {
+  local fakebin="$TMP_ROOT/retention-pointer-failure-launchctl"
+  local install_root="$TMP_ROOT/retention-pointer-failure-install"
+  local agents="$TMP_ROOT/retention-pointer-failure-agents" log="$TMP_ROOT/retention-pointer-failure.log"
+  local plist saved_plist saved_heartbeat old_label out status generations
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart|bootout) exit 0 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  plist="$agents/com.firstmate.report-retention.plist"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention pointer-failure precondition installation failed"
+  saved_plist="$TMP_ROOT/retention-pointer-failure.saved.plist"
+  saved_heartbeat="$TMP_ROOT/retention-pointer-failure.saved.heartbeat"
+  cp "$plist" "$saved_plist"; cp "$STACK/.retention-heartbeat" "$saved_heartbeat"
+  old_label=$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$plist")
+  : > "$log"
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER=1 \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention pointer publication failure unexpectedly succeeded"
+  assert_contains "$out" "pointer publication failed" "retention pointer failure diagnostic was unclear"
+  cmp -s "$saved_plist" "$plist" || fail "pointer failure changed the authoritative prior plist"
+  cmp -s "$saved_heartbeat" "$STACK/.retention-heartbeat" || fail "pointer failure changed the authoritative prior heartbeat"
+  if grep -F "bootout gui/$(id -u)/$old_label" "$log" >/dev/null 2>&1; then
+    fail "pointer failure booted out the authoritative prior owner"
+  fi
+  assert_grep 'bootout ' "$log" "pointer failure did not retire its candidate owner"
+  generations=$(find "$install_root/generations" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  [ "$generations" -eq 1 ] || fail "pointer failure retained candidate staging or generation state"
+  pass "retention pointer failure preserves the authoritative owner and heartbeat"
+}
+
+test_retention_pointer_failure_retains_unfenced_candidate() {
+  local fakebin="$TMP_ROOT/retention-unfenced-launchctl" install_root="$TMP_ROOT/retention-unfenced-install"
+  local agents="$TMP_ROOT/retention-unfenced-agents" log="$TMP_ROOT/retention-unfenced.log"
+  local plist saved_plist saved_heartbeat out status generations
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in
+  print|bootstrap|kickstart) exit 0 ;;
+  bootout) [ "${FM_FAKE_BOOTOUT_FAIL:-}" != 1 ] ;;
+esac
+SH
+  chmod +x "$fakebin/launchctl"
+  plist="$agents/com.firstmate.report-retention.plist"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "unfenced-candidate precondition installation failed"
+  saved_plist="$TMP_ROOT/retention-unfenced.saved.plist"
+  saved_heartbeat="$TMP_ROOT/retention-unfenced.saved.heartbeat"
+  cp "$plist" "$saved_plist"; cp "$STACK/.retention-heartbeat" "$saved_heartbeat"
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER=1 FM_FAKE_BOOTOUT_FAIL=1 \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "unfenced candidate pointer failure unexpectedly succeeded"
+  assert_contains "$out" "candidate fencing is pending" "unfenced candidate failure was unclear"
+  cmp -s "$saved_plist" "$plist" || fail "unfenced candidate replaced the authoritative plist"
+  cmp -s "$saved_heartbeat" "$STACK/.retention-heartbeat" \
+    && fail "unfenced candidate restored the prior heartbeat before bootout"
+  assert_present "$install_root/.candidate-fence" "unfenced candidate lost its durable recovery record"
+  generations=$(find "$install_root/generations" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  [ "$generations" -eq 2 ] || fail "unfenced candidate executable generation was removed"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" ensure >/dev/null \
+    || fail "later ensure could not finish candidate fencing"
+  cmp -s "$saved_heartbeat" "$STACK/.retention-heartbeat" \
+    || fail "successful later fencing did not restore the prior heartbeat"
+  assert_absent "$install_root/.candidate-fence" "successful later fencing retained its recovery record"
+  generations=$(find "$install_root/generations" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  [ "$generations" -eq 1 ] || fail "successful later fencing retained the candidate generation"
+  pass "pointer failure retains candidates until bootout is positively confirmed"
+}
+
 test_retention_install_recovers_owned_stale_reclaim_marker() {
   local fakebin="$TMP_ROOT/retention-reclaim-launchctl" install_root="$TMP_ROOT/retention-reclaim-install"
   local agents="$TMP_ROOT/retention-reclaim-agents" reclaim="$TMP_ROOT/retention-reclaim-install/.install-lock-reclaim"
@@ -2428,6 +2657,22 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
   test_failed_initial_retention_activation_disarms_plist
   test_retention_activation_wait_budget_accepts_delayed_health
   test_bounded_report_reads_reject_fifo_swaps_without_blocking
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
+  test_revision_fields_distinguish_pr_head_from_worktree_head
+  test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
+  test_manifest_cohort_must_match_completion_time
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_cohort_tombstone_is_noreplace_owned
+  test_retention_activation_requires_launched_nonce_without_owner_gap
+  test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline
+  test_retention_pointer_failure_retires_only_candidate
+  test_retention_pointer_failure_retains_unfenced_candidate
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  test_nested_list_parent_scope_hides_required_headings
   exit 0
 fi
 

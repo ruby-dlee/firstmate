@@ -22,6 +22,7 @@ make_stubs() {  # <dir> -> echoes fakebin dir
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+all=$*
 case "${1:-}" in
   send-keys)
     shift
@@ -47,7 +48,10 @@ case "${1:-}" in
     if [ -n "${FM_FAKE_TMUX_DEAD_TARGET:-}" ] && [ "$target" = "$FM_FAKE_TMUX_DEAD_TARGET" ]; then
       exit 1
     fi
-    printf '%%1\n'
+    case "$all" in
+      *'#{session_name}'*) printf '%s\t%s\n' "${FM_FAKE_TMUX_SESSION:-sess}" "${FM_FAKE_TMUX_LABEL:-fm-lost}" ;;
+      *) printf '%%1\n' ;;
+    esac
     exit 0 ;;
   capture-pane)
     [ "${FM_FAKE_TMUX_CAPTURE_FAIL:-0}" != 1 ] || exit 1
@@ -66,6 +70,24 @@ exit 0
 SH
   chmod +x "$fb/sleep"
   printf '%s\n' "$fb"
+}
+
+test_managed_tmux_send_rejects_reused_id_in_other_session() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/tmux-session-bound"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home tmux-session-bound); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/tmux-session-bound.meta" \
+    "window=recorded:fm-tmux-session-bound" "tmux_window_id=@77" \
+    "tmux_session_target=recorded:fm-tmux-session-bound" "kind=ship" "harness=codex"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_SESSION=other FM_FAKE_TMUX_LABEL=fm-tmux-session-bound FM_SEND_SETTLE=0 \
+    "$SEND" tmux-session-bound "wrong-session steer" >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -eq 0 ] || fail "fm-send did not use the recorded session when a stable id was reused"
+  assert_grep 'target=recorded:fm-tmux-session-bound ' "$log" \
+    "fm-send did not bind every steering operation to the recorded session"
+  ! grep -q 'target=@77 ' "$log" || fail "fm-send steered through a reusable stable tmux id"
+  pass "fm-send performs managed tmux steering through the recorded session target"
 }
 
 setup_home() {  # <name> -> echoes home dir
@@ -504,6 +526,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
+  test_managed_tmux_send_rejects_reused_id_in_other_session
+  exit 0
+fi
+
 test_exact_lane_id_send_still_works
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
@@ -519,3 +546,4 @@ test_managed_send_holds_lifecycle_through_audit
 test_managed_key_revalidates_after_respawn_wait
 test_managed_steering_rejects_parent_swap_during_persistence
 test_healthy_fm_id_send_still_works
+test_managed_tmux_send_rejects_reused_id_in_other_session

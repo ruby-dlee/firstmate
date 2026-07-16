@@ -526,7 +526,7 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # changing call sites.
 
 # fm_backend_capture: bounded plain-text session capture.
-fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
+fm_backend_capture() {  # <backend> <target> <lines> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -541,7 +541,7 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
 }
 
 # fm_backend_send_key: one backend-supported named special key.
-fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
+fm_backend_send_key() {  # <backend> <target> <key> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -558,7 +558,7 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
 # fm_backend_send_text_submit: type text once, then submit and verify,
 # retrying only the submission (never retyping). Echoes the verdict
 # (empty|pending|unknown|send-failed for submit-verifying adapters).
-fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -730,14 +730,6 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
   fm_backend_source "$backend" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
   case "$backend" in
     tmux)
-      case "$target" in
-        @*)
-          if tmux display-message -p -t "$target" '#{window_name}' >/dev/null 2>&1; then
-            printf 'unknown'
-            return 0
-          fi
-          ;;
-      esac
       if [ -n "$recorded_scoped_target" ]; then
         case "$recorded_scoped_target" in
           *:*) session=${recorded_scoped_target%%:*} ;;
@@ -982,11 +974,11 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
 # an action from it alone - the secondmate-liveness sweep gates a respawn on
 # `dead` only, precisely so a momentary read glitch can never duplicate a
 # live supervisor.
-fm_backend_agent_alive() {  # <backend> <target> [expected-label]
+fm_backend_agent_alive() {  # <backend> <target> [expected-label] [recorded-scoped-target]
   local backend=$1 target=$2 expected_label=${3:-}
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
-    tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" ;;
+    tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" "${4:-}" ;;
     herdr) fm_backend_herdr_agent_alive "$target" "$expected_label" ;;
     *) printf 'unknown' ;;
   esac

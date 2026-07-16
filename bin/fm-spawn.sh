@@ -1507,7 +1507,14 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
-  CONTINUATION_PACKET=$("$SCRIPT_DIR/fm-account-continuation.sh" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
+  CONTINUATION_RESULT=$(FM_ACCOUNT_CONTINUATION_EMIT_PROMPT_B64=1 \
+    "$SCRIPT_DIR/fm-account-continuation.sh" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
+  case "$CONTINUATION_RESULT" in *$'\n'*) ;; *) echo "error: continuation prompt snapshot is incomplete for $ID" >&2; exit 1 ;; esac
+  CONTINUATION_PACKET=${CONTINUATION_RESULT%%$'\n'*}
+  CONTINUATION_PROMPT_B64=${CONTINUATION_RESULT#*$'\n'}
+  printf '%s' "$CONTINUATION_PROMPT_B64" \
+    | python3 -c 'import base64,sys; base64.b64decode(sys.stdin.buffer.read(), validate=True)' \
+    || { echo "error: continuation prompt snapshot is invalid for $ID" >&2; exit 1; }
   BRIEF=$CONTINUATION_PACKET
 fi
 
@@ -1973,6 +1980,18 @@ META_WRITE_LOCK=
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
+if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+  continuation_prompt_command="\$(cat __BRIEF__)"
+  continuation_prompt_marker="\"$continuation_prompt_command\""
+  continuation_prompt_dollar='$'
+  continuation_prompt_reference="\"${continuation_prompt_dollar}__fm_continuation_prompt\""
+  sq_continuation_b64=$(shell_quote "$CONTINUATION_PROMPT_B64")
+  sq_continuation_decoder=$(shell_quote 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read(), validate=True)+b"x")')
+  continuation_prompt_setup="__fm_continuation_prompt=\$(printf '%s' $sq_continuation_b64 | python3 -c $sq_continuation_decoder); __fm_continuation_prompt=\${__fm_continuation_prompt%x}; "
+  LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
+  case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac
+  LAUNCH="$continuation_prompt_setup$LAUNCH"
+fi
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")

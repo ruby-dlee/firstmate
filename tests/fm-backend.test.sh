@@ -649,10 +649,24 @@ test_managed_tmux_target_identity_checks_recorded_session() {
 
   ! fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
     || fail "a reused tmux window id in another session passed existence validation"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
+    || fail "a reused stable id blocked confident absence after the recorded-session scan"
+  ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-other-task \
+    || fail "managed tmux capture accepted a scoped target with the wrong task label"
+  fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session capture was blocked by an unrelated reused stable id"
+  fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
+    || fail "recorded-session key send was blocked by an unrelated reused stable id"
+  fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session text send was blocked by an unrelated reused stable id"
+  [ "$(fm_backend_agent_alive tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "session-mismatched tmux identity passed agent-liveness validation"
   ! fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
     || fail "a reused tmux window id in another session passed kill validation"
-  ! grep -q '^kill-window ' "$log" \
-    || fail "session-mismatched tmux identity reached kill-window"
+  ! grep -Eq '^(capture-pane|send-keys) .* -t @77( |$)' "$log" \
+    || fail "managed tmux activity used a reusable stable id after session binding"
+  grep -Eq '^(capture-pane|send-keys) .* -t recorded-session:fm-intended-task( |$)' "$log" \
+    || fail "managed tmux activity did not use the recorded scoped target"
 
   fake_session=recorded-session
   fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
@@ -663,7 +677,7 @@ test_managed_tmux_target_identity_checks_recorded_session() {
     || fail "the session-matched tmux identity did not retain its verified stable target"
   ! grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
     || fail "tmux kill discarded its stable identity for a name-based target"
-  pass "managed tmux kill retains its stable id after recorded-session validation"
+  pass "managed tmux activity is scoped while lifecycle kill retains verified identity"
 }
 
 test_managed_tmux_target_state_finds_replacement_window() {
@@ -1181,6 +1195,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   exit 0
 fi

@@ -2197,7 +2197,8 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 }
 
 test_cross_profile_continuation_for_harness() {
-  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task packet out status launch source_model
+  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
+  local packet_b64 prompt_setup prompt_setup_end decoded_prompt verified_packet dollar
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
@@ -2222,9 +2223,16 @@ test_cross_profile_continuation_for_harness() {
   status=$?
   [ "$status" -eq 0 ] || fail "$harness cross-profile continuation failed: $out"
   new_task=$(meta_account_task "$id")
+  new_attempt=$(sed -n 's/^account_attempt=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   [ "$new_task" != "$old_task" ] || fail "$harness continuation reused a stale launch generation"
   packet=$(sed -n 's/^continuation_packet=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   assert_present "$packet" "$harness continuation packet was not persisted"
+  canonical="$HOME_DIR/data/$id/continuation-$new_attempt.md"
+  [ "$packet" != "$canonical" ] || fail "$harness continuation launch retained the replaceable canonical packet path"
+  case "${packet##*/}" in
+    "continuation-$new_attempt.generation-"*.md) ;;
+    *) fail "$harness continuation did not pin an immutable launch generation" ;;
+  esac
   assert_grep 'done: external side effect alpha; do not rerun' "$packet" "$harness continuation packet lost completed side-effect state"
   assert_grep "Ship completion evidence for $harness." "$packet" "$harness continuation packet lost ship completion evidence"
   assert_grep 'Keep the existing branch' "$packet" "$harness continuation packet lost decisions"
@@ -2232,9 +2240,31 @@ test_cross_profile_continuation_for_harness() {
   assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"
   assert_regex '^## Unconfirmed steering$' "$packet" "$harness continuation did not separate unconfirmed steering"
   assert_grep "Preserve unconfirmed delivery for $harness." "$packet" "$harness continuation lost unconfirmed steering"
+  packet_b64=$(python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1], "rb").read()).decode())' "$packet")
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "--profile '$new_profile' --task '$new_task'" "$harness continuation did not use the new profile/generation"
-  assert_contains "$launch" "cat '$packet'" "$harness continuation did not seed the fresh provider from task-owned state"
+  assert_contains "$launch" "$packet_b64" \
+    "$harness continuation did not bind the verified prompt snapshot into its launch"
+  assert_not_contains "$launch" "cat '$packet'" \
+    "$harness continuation launch still rereads its generation by pathname"
+  dollar='$'
+  prompt_setup_end="__fm_continuation_prompt=${dollar}{__fm_continuation_prompt%x};"
+  prompt_setup=${launch%%"$prompt_setup_end"*}$prompt_setup_end
+  decoded_prompt="$CASE_DIR/decoded-continuation-prompt"
+  verified_packet="$CASE_DIR/verified-continuation-prompt"
+  cp "$packet" "$verified_packet"
+  printf 'replacement generation\n' > "$canonical.replacement"
+  mv "$canonical.replacement" "$canonical"
+  assert_grep 'done: external side effect alpha; do not rerun' "$packet" \
+    "$harness continuation launch snapshot changed with its canonical audit path"
+  printf 'replacement launch generation\n' > "$packet.replacement"
+  mv "$packet.replacement" "$packet"
+  assert_not_contains "$launch" 'replacement launch generation' \
+    "$harness launch consumed replacement bytes from its generation pathname"
+  bash -c "${prompt_setup}printf '%s' \"\$__fm_continuation_prompt\"" > "$decoded_prompt" \
+    || fail "$harness launch-time continuation decoding failed"
+  cmp -s "$verified_packet" "$decoded_prompt" \
+    || fail "$harness launch-time prompt lost bytes or trailing newlines after pathname replacement"
   assert_contains "$launch" "--model '$source_model'" "$harness same-provider continuation lost its inherited model"
   assert_regex '^effort=high$' "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "$harness continuation did not release its predecessor after binding"
@@ -4253,6 +4283,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-30 ]; then
   test_continuation_recovers_abandoned_reclaim_owner
   test_continuation_no_prior_rollback_preserves_raced_replacement
   test_task_file_publication_cas_preserves_concurrent_append
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
+  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
   exit 0
 fi
 

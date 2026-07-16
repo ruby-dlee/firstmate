@@ -668,4 +668,16 @@ fi
 remove_owned_path "$PACKET_PRIOR_TMP" "$PACKET_PRIOR_ID"
 PACKET_PRIOR_TMP=
 PACKET_PRIOR_ID=
-printf '%s\n' "$TASK_DIR_PATH/continuation-$ATTEMPT.md"
+PACKET_GENERATION="continuation-$ATTEMPT.generation-$PACKET_LOCK_TOKEN.md"
+if [ "${FM_ACCOUNT_CONTINUATION_EMIT_PROMPT_B64:-}" = 1 ]; then
+  printf '%s\n' "$TASK_DIR_PATH/$PACKET_GENERATION"
+  python3 "$SCRIPT_DIR/fm-contained-read.py" copy-file-fd \
+    "${PACKET#./}" "$PACKET_GENERATION" emit-base64 3< . \
+    || { echo "error: cannot pin continuation packet generation for $ID" >&2; exit 1; }
+  printf '\n'
+else
+  python3 "$SCRIPT_DIR/fm-contained-read.py" copy-file-fd \
+    "${PACKET#./}" "$PACKET_GENERATION" 3< . \
+    || { echo "error: cannot pin continuation packet generation for $ID" >&2; exit 1; }
+  printf '%s\n' "$TASK_DIR_PATH/$PACKET_GENERATION"
+fi

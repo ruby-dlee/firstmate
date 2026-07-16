@@ -170,9 +170,75 @@ PY
   pass "continuation prompt transport preserves interactive provider stdin after initial delivery"
 }
 
+test_prompt_transport_waits_for_raw_mode() {
+  local transport="$TMP_ROOT/raw-ready" prompt="$TMP_ROOT/raw-ready/prompt"
+  local capture="$TMP_ROOT/raw-ready.capture" script="$TMP_ROOT/raw-ready.py"
+  local ready="$TMP_ROOT/raw-ready.ready" proceed="$TMP_ROOT/raw-ready.proceed"
+  local command parent_id file_id content_id pid
+  mkdir "$transport"
+  printf 'before\003middle\004after\377' > "$prompt"
+  cat > "$script" <<'PY'
+import os, sys
+size = int(sys.argv[2])
+content = bytearray()
+while len(content) < size:
+    chunk = os.read(0, size - len(content))
+    if not chunk:
+        raise RuntimeError("early EOF")
+    content.extend(chunk)
+with open(sys.argv[1], "wb") as output:
+    output.write(content)
+PY
+  command="exec python3 '$script' '$capture' 20"
+  parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
+  FM_PROMPT_EXEC_TEST_BEFORE_RAW_READY="$ready" FM_PROMPT_EXEC_TEST_BEFORE_RAW_PROCEED="$proceed" \
+    python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "raw-mode readiness gate did not open"; }
+  assert_absent "$capture" "prompt bytes reached the provider before raw mode was active"
+  touch "$proceed"
+  wait "$pid" || fail "prompt transport failed after raw-mode readiness"
+  cmp -s "$capture" <(printf 'before\003middle\004after\377') \
+    || fail "prompt transport applied canonical-mode processing before raw readiness"
+  pass "continuation prompt transport waits for raw mode before writing bytes"
+}
+
+test_prompt_transport_restores_inherited_terminal_state() {
+  local transport="$TMP_ROOT/terminal-state" prompt="$TMP_ROOT/terminal-state/prompt"
+  local driver="$TMP_ROOT/terminal-state-driver.py" command parent_id file_id content_id
+  mkdir "$transport"
+  printf 'packet' > "$prompt"
+  cat > "$driver" <<'PY'
+import fcntl, os, pty, subprocess, sys, termios
+master, slave = pty.openpty()
+before_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
+before_termios = termios.tcgetattr(slave)
+process = subprocess.run(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True, timeout=5)
+after_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
+after_termios = termios.tcgetattr(slave)
+os.close(slave)
+os.close(master)
+if process.returncode != 0:
+    raise SystemExit(process.returncode)
+if after_flags != before_flags:
+    raise RuntimeError("inherited stdin flags changed")
+if after_termios != before_termios:
+    raise RuntimeError("inherited stdin termios changed")
+PY
+  command="exec python3 -c 'import os; os.read(0, 6)'"
+  parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
+  python3 "$driver" python3 "$ROOT/bin/fm-prompt-exec.py" \
+    "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
+    || fail "prompt transport did not restore inherited terminal state"
+  pass "continuation prompt transport restores inherited stdin flags and termios"
+}
+
 test_prompt_transport_preserves_all_bytes
 test_prompt_transport_rejects_replaced_generation
 test_prompt_transport_rejects_replaced_parent
 test_prompt_transport_rejects_in_place_mutation
 test_prompt_transport_consumes_verified_snapshot_after_mutation
 test_prompt_transport_keeps_provider_stdin_interactive
+test_prompt_transport_waits_for_raw_mode
+test_prompt_transport_restores_inherited_terminal_state

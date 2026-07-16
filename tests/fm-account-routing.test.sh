@@ -2244,8 +2244,17 @@ test_cross_profile_continuation_for_harness() {
     "$harness" > "$HOME_DIR/data/$id/steering.md"
   assert_grep "Preserve the verified next action for $harness." "$HOME_DIR/data/$id/steering.md" "$harness managed steering was not recorded"
   printf '# Pending steering audit\n\n- Preserve pending delivery for %s.\n' "$harness" > "$HOME_DIR/data/$id/steering-pending.md"
+  printf '# Steering journal\n\n- Preserve journal delivery for %s.\n' "$harness" > "$HOME_DIR/data/$id/steering-journal.md"
   printf '# Unconfirmed steering\n\n- 2026-07-15T00:00:00Z (delivery unconfirmed)\n\n> Preserve unconfirmed delivery for %s.\n' \
     "$harness" > "$HOME_DIR/data/$id/steering-unconfirmed.md"
+  printf '# Completed side effects\n\n- Preserve completed side effects for %s.\n' "$harness" > "$HOME_DIR/data/$id/side-effects.md"
+  printf '# Do not rerun\n\n- Preserve do-not-rerun state for %s.\n' "$harness" > "$HOME_DIR/data/$id/do-not-rerun.md"
+  printf '# Next action\n\n- Preserve next action for %s.\n' "$harness" > "$HOME_DIR/data/$id/next-action.md"
+  printf '# Checkpoint\n\n- Preserve checkpoint for %s.\n' "$harness" > "$HOME_DIR/data/$id/checkpoint.md"
+  printf '# Handoff\n\n- Preserve handoff for %s.\n' "$harness" > "$HOME_DIR/data/$id/handoff.md"
+  printf '# Recalled context\n\n- Preserve recalled context for %s.\n' "$harness" > "$HOME_DIR/data/$id/recalled.md"
+  printf '# Provider transcript summary\n\n- Preserve transcript summary for %s.\n' "$harness" > "$HOME_DIR/data/$id/transcript-summary.md"
+  printf '\n- Preserve account lineage for %s.\n' "$harness" >> "$HOME_DIR/data/$id/account-attempts.md"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$new_profile" FM_FAKE_AF_POOL=explicit run_spawn "$id" --continue-account --account-profile "$new_profile")
@@ -2269,6 +2278,33 @@ test_cross_profile_continuation_for_harness() {
   assert_grep "Preserve pending delivery for $harness." "$packet" "$harness continuation packet lost pending steering audit"
   assert_regex '^## Unconfirmed steering$' "$packet" "$harness continuation did not separate unconfirmed steering"
   assert_grep "Preserve unconfirmed delivery for $harness." "$packet" "$harness continuation lost unconfirmed steering"
+  python3 - "$packet" "$harness" <<'PY' \
+    || fail "$harness continuation snapshot sections no longer match their source artifacts"
+import re
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read()
+harness = sys.argv[2]
+sections = {
+    match.group(1): match.group(2)
+    for match in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", source, re.MULTILINE | re.DOTALL)
+}
+expected = {
+    "Steering journal": f"Preserve journal delivery for {harness}.",
+    "Unconfirmed steering": f"Preserve unconfirmed delivery for {harness}.",
+    "Completed side effects": f"Preserve completed side effects for {harness}.",
+    "Do not rerun": f"Preserve do-not-rerun state for {harness}.",
+    "Next action": f"Preserve next action for {harness}.",
+    "Checkpoint": f"Preserve checkpoint for {harness}.",
+    "Handoff": f"Preserve handoff for {harness}.",
+    "Recalled context": f"Preserve recalled context for {harness}.",
+    "Provider transcript summary": f"Preserve transcript summary for {harness}.",
+    "Account attempt lineage": f"Preserve account lineage for {harness}.",
+}
+for heading, marker in expected.items():
+    if marker not in sections.get(heading, ""):
+        raise SystemExit(f"{heading} omitted or contains the wrong source")
+PY
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "$new_profile" "$harness continuation did not use the new profile"
   assert_contains "$launch" "$new_task" "$harness continuation did not use the new launch generation"
@@ -3490,6 +3526,32 @@ test_continuation_fingerprint_deadline_covers_ordinary_paths() {
   pass "continuation fingerprint deadline covers ordinary repository paths"
 }
 
+test_continuation_fingerprint_budget_spans_all_path_classes() {
+  local root="$TMP_ROOT/shared-fingerprint-budget" tracked submodules untracked output status
+  root="$root/root"
+  tracked="$TMP_ROOT/shared-fingerprint-tracked"
+  submodules="$TMP_ROOT/shared-fingerprint-submodules"
+  untracked="$TMP_ROOT/shared-fingerprint-untracked"
+  output="$TMP_ROOT/shared-fingerprint.out"
+  mkdir -p "$root/submodule"
+  printf 'tracked\n' > "$root/tracked"
+  printf 'untracked\n' > "$root/untracked"
+  git -C "$root/submodule" init -q
+  git -C "$root/submodule" config user.name fmtest
+  git -C "$root/submodule" config user.email fmtest@example.invalid
+  git -C "$root/submodule" commit -q --allow-empty -m initial
+  printf 'tracked\0' > "$tracked"
+  printf 'submodule\0' > "$submodules"
+  printf 'untracked\0' > "$untracked"
+  python3 "$ROOT/bin/fm-contained-read.py" fingerprint-repository-fd \
+    "$tracked" "$submodules" "$untracked" 5 1048576 10 3< "$root" > "$output" 2>&1
+  status=$?
+  [ "$status" -ne 0 ] || fail "repository path classes each received a fresh fingerprint budget"
+  assert_contains "$(cat "$output")" "repository fingerprint exceeds its file-count limit" \
+    "shared fingerprint budget failure was unclear"
+  pass "continuation shares one fingerprint budget across every repository path class"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -4584,6 +4646,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
   test_continuation_rejects_symlinked_charter_ancestor
   test_continuation_rejects_present_empty_charter
   test_continuation_fingerprint_deadline_covers_ordinary_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
+  test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  test_continuation_fingerprint_budget_spans_all_path_classes
   exit 0
 fi
 

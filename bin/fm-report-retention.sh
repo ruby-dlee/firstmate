@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep the machine-global completion report stack below its 30-day ceiling.
+# Keep machine-global completion reports visible and undeleted for at least 30 days.
 # Usage: fm-report-retention.sh ensure
 #        fm-report-retention.sh install
 #        fm-report-retention.sh run-once

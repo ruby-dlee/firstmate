@@ -33,6 +33,7 @@ STATUS_REVALIDATION_TMP=
 REPOSITORY_PATHS_TMP=
 REPOSITORY_INDEX_TMP=
 SUBMODULE_PATHS_TMP=
+UNTRACKED_PATHS_TMP=
 LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
@@ -143,6 +144,7 @@ cleanup_packet_tmp() {
   [ -z "$REPOSITORY_PATHS_TMP" ] || rm -f "$REPOSITORY_PATHS_TMP"
   [ -z "$REPOSITORY_INDEX_TMP" ] || rm -f "$REPOSITORY_INDEX_TMP"
   [ -z "$SUBMODULE_PATHS_TMP" ] || rm -f "$SUBMODULE_PATHS_TMP"
+  [ -z "$UNTRACKED_PATHS_TMP" ] || rm -f "$UNTRACKED_PATHS_TMP"
   [ -z "$LOG_SNAPSHOT_TMP" ] || rm -f "$LOG_SNAPSHOT_TMP"
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
@@ -249,12 +251,8 @@ REPOSITORY_INDEX_TMP=$(mktemp "$STATE/.continuation-repository-index-$ID.XXXXXX"
   || { echo "error: cannot stage continuation repository index for $ID" >&2; exit 1; }
 SUBMODULE_PATHS_TMP=$(mktemp "$STATE/.continuation-submodules-$ID.XXXXXX") \
   || { echo "error: cannot stage continuation submodule paths for $ID" >&2; exit 1; }
-
-append_repository_path_identities() {
-  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-paths-fd "$REPOSITORY_PATHS_TMP" \
-    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
-    "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9
-}
+UNTRACKED_PATHS_TMP=$(mktemp "$STATE/.continuation-untracked-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation untracked paths for $ID" >&2; exit 1; }
 
 split_repository_index_paths() {
   python3 - "$REPOSITORY_INDEX_TMP" "$REPOSITORY_PATHS_TMP" "$SUBMODULE_PATHS_TMP" <<'PY'
@@ -276,12 +274,6 @@ finally:
 PY
 }
 
-append_submodule_identities() {
-  python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-submodules-fd "$SUBMODULE_PATHS_TMP" \
-    "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
-    "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9
-}
-
 capture_repository_identity() {
   local output=$1
   {
@@ -290,15 +282,14 @@ capture_repository_identity() {
     printf '\0index\0'
     git_pinned ls-files --stage -z > "$REPOSITORY_INDEX_TMP" || return 1
     cat "$REPOSITORY_INDEX_TMP" || return 1
-    printf '\0worktree-content\0'
     split_repository_index_paths || return 1
-    append_repository_path_identities || return 1
-    printf '\0submodule-content\0'
-    append_submodule_identities || return 1
-    printf '\0untracked-content\0'
-    git_pinned ls-files --others --exclude-standard -z > "$REPOSITORY_PATHS_TMP" \
+    git_pinned ls-files --others --exclude-standard -z > "$UNTRACKED_PATHS_TMP" \
       || return 1
-    append_repository_path_identities || return 1
+    printf '\0'
+    python3 "$SCRIPT_DIR/fm-contained-read.py" fingerprint-repository-fd \
+      "$REPOSITORY_PATHS_TMP" "$SUBMODULE_PATHS_TMP" "$UNTRACKED_PATHS_TMP" \
+      "$MAX_REPOSITORY_FINGERPRINT_FILES" "$MAX_REPOSITORY_FINGERPRINT_BYTES" \
+      "$MAX_REPOSITORY_FINGERPRINT_SECONDS" 3<&9 || return 1
   } > "$output" 2>/dev/null
 }
 
@@ -591,15 +582,16 @@ append_task_snapshot "Completion report" 2
 append_task_snapshot "Decisions" 3
 append_task_snapshot "Steering trail" 4
 append_task_snapshot "Pending steering audit" 5
-append_task_snapshot "Unconfirmed steering" 6
-append_task_snapshot "Completed side effects" 7
-append_task_snapshot "Do not rerun" 8
-append_task_snapshot "Next action" 9
-append_task_snapshot "Checkpoint" 10
-append_task_snapshot "Handoff" 11
-append_task_snapshot "Recalled context" 12
-append_task_snapshot "Provider transcript summary" 13
-append_task_snapshot "Account attempt lineage" 14
+append_task_snapshot "Steering journal" 6
+append_task_snapshot "Unconfirmed steering" 7
+append_task_snapshot "Completed side effects" 8
+append_task_snapshot "Do not rerun" 9
+append_task_snapshot "Next action" 10
+append_task_snapshot "Checkpoint" 11
+append_task_snapshot "Handoff" 12
+append_task_snapshot "Recalled context" 13
+append_task_snapshot "Provider transcript summary" 14
+append_task_snapshot "Account attempt lineage" 15
 
 packet_check_budget
 STATUS_REVALIDATION_TMP=$(mktemp "$STATE/.continuation-status-revalidation-$ID.XXXXXX") \

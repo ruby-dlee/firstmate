@@ -9,7 +9,8 @@ The installer publishes immutable self-contained generations and atomically adva
 Each sweep atomically publishes an authoritative retention cutoff, regenerates the visible index from that cutoff, and only then begins bounded tombstoning and physical deletion, so cleanup may span later runs without restoring an expired report to readers.
 The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, retries failed runs, and records a successful-prune heartbeat that session bootstrap validates.
 Merging the code does not install or activate the owner.
-The stack begins pruning two owner intervals before a report reaches 30 days, so the bounded cadence cannot carry an entry beyond the ceiling.
+The authoritative visibility cutoff advances monotonically to the exact `now - 30 days` boundary and never advances past it.
+Physical cleanup waits for the report's five-minute cohort deadline and a later owner sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its 30-day minimum age.
 Expired entries are renamed to deletion tombstones before the index changes, and interrupted recursive deletion resumes from those tombstones without restoring partial entries.
 
 ## Completion contract

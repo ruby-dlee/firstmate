@@ -146,17 +146,8 @@ def fingerprint_descriptor(descriptor, relative, records, budget):
             os.close(child)
 
 
-def command_fingerprint_paths_fd(arguments):
-    if len(arguments) not in (1, 3, 4):
-        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file> [max-files max-bytes [max-seconds]]")
-    root = checked_root(3)
-    paths = open(arguments[0], "rb").read().split(b"\0")
-    maximum_files = int(arguments[1]) if len(arguments) >= 3 else 100000
-    maximum_bytes = int(arguments[2]) if len(arguments) >= 3 else 1073741824
-    maximum_seconds = int(arguments[3]) if len(arguments) == 4 else None
-    if maximum_files <= 0 or maximum_bytes <= 0 or (maximum_seconds is not None and maximum_seconds <= 0):
-        fail("repository fingerprint limits must be positive")
-    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+def fingerprint_paths(root, paths_file, budget, output):
+    paths = open(paths_file, "rb").read().split(b"\0")
     ready = os.environ.get("FM_FINGERPRINT_PATHS_TEST_READY")
     proceed = os.environ.get("FM_FINGERPRINT_PATHS_TEST_PROCEED")
     if ready and proceed:
@@ -200,10 +191,22 @@ def command_fingerprint_paths_fd(arguments):
                 os.close(parent)
         except FileNotFoundError:
             records.append((relative, "missing", 0, "missing"))
-    output = sys.stdout.buffer
     for relative, kind, mode, digest in records:
         output.write(relative.encode("utf-8", "surrogateescape"))
         output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+
+
+def command_fingerprint_paths_fd(arguments):
+    if len(arguments) not in (1, 3, 4):
+        fail("usage: fm-contained-read.py fingerprint-paths-fd <paths-file> [max-files max-bytes [max-seconds]]")
+    root = checked_root(3)
+    maximum_files = int(arguments[1]) if len(arguments) >= 3 else 100000
+    maximum_bytes = int(arguments[2]) if len(arguments) >= 3 else 1073741824
+    maximum_seconds = int(arguments[3]) if len(arguments) == 4 else None
+    if maximum_files <= 0 or maximum_bytes <= 0 or (maximum_seconds is not None and maximum_seconds <= 0):
+        fail("repository fingerprint limits must be positive")
+    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+    fingerprint_paths(root, arguments[0], budget, sys.stdout.buffer)
 
 
 def bounded_command_output(command, budget):
@@ -255,18 +258,8 @@ def bounded_command_output(command, budget):
         process.stdout.close()
 
 
-def command_fingerprint_submodules_fd(arguments):
-    if len(arguments) != 4:
-        fail("usage: fm-contained-read.py fingerprint-submodules-fd <paths-file> <max-files> <max-bytes> <max-seconds>")
-    root = checked_root(3)
-    maximum_files = int(arguments[1])
-    maximum_bytes = int(arguments[2])
-    maximum_seconds = int(arguments[3])
-    if maximum_files <= 0 or maximum_bytes <= 0 or maximum_seconds <= 0:
-        fail("repository fingerprint limits must be positive")
-    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
-    paths = [item for item in open(arguments[0], "rb").read().split(b"\0") if item]
-    output = sys.stdout.buffer
+def fingerprint_submodules(root, paths_file, budget, output):
+    paths = [item for item in open(paths_file, "rb").read().split(b"\0") if item]
     for raw in paths:
         relative = raw.decode("utf-8", "surrogateescape")
         descriptor = open_relative(root, relative, os.O_RDONLY | os.O_DIRECTORY)
@@ -333,6 +326,41 @@ def command_fingerprint_submodules_fd(arguments):
         for item_relative, kind, mode, digest in records:
             output.write(item_relative.encode("utf-8", "surrogateescape"))
             output.write(f"\0{kind}:{mode:o}:{digest}\0".encode("ascii"))
+
+
+def command_fingerprint_submodules_fd(arguments):
+    if len(arguments) != 4:
+        fail("usage: fm-contained-read.py fingerprint-submodules-fd <paths-file> <max-files> <max-bytes> <max-seconds>")
+    root = checked_root(3)
+    maximum_files = int(arguments[1])
+    maximum_bytes = int(arguments[2])
+    maximum_seconds = int(arguments[3])
+    if maximum_files <= 0 or maximum_bytes <= 0 or maximum_seconds <= 0:
+        fail("repository fingerprint limits must be positive")
+    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+    fingerprint_submodules(root, arguments[0], budget, sys.stdout.buffer)
+
+
+def command_fingerprint_repository_fd(arguments):
+    if len(arguments) != 6:
+        fail(
+            "usage: fm-contained-read.py fingerprint-repository-fd "
+            "<tracked-paths> <submodule-paths> <untracked-paths> <max-files> <max-bytes> <max-seconds>"
+        )
+    root = checked_root(3)
+    maximum_files = int(arguments[3])
+    maximum_bytes = int(arguments[4])
+    maximum_seconds = int(arguments[5])
+    if maximum_files <= 0 or maximum_bytes <= 0 or maximum_seconds <= 0:
+        fail("repository fingerprint limits must be positive")
+    budget = FingerprintBudget(maximum_files, maximum_bytes, maximum_seconds)
+    output = sys.stdout.buffer
+    output.write(b"worktree-content\0")
+    fingerprint_paths(root, arguments[0], budget, output)
+    output.write(b"\0submodule-content\0")
+    fingerprint_submodules(root, arguments[1], budget, output)
+    output.write(b"\0untracked-content\0")
+    fingerprint_paths(root, arguments[2], budget, output)
 
 
 def command_git_fd(arguments):
@@ -1614,6 +1642,8 @@ def main():
         command_fingerprint_paths_fd(sys.argv[2:])
     elif sys.argv[1] == "fingerprint-submodules-fd":
         command_fingerprint_submodules_fd(sys.argv[2:])
+    elif sys.argv[1] == "fingerprint-repository-fd":
+        command_fingerprint_repository_fd(sys.argv[2:])
     elif sys.argv[1] == "git-fd":
         command_git_fd(sys.argv[2:])
     elif sys.argv[1] == "cat-fd":

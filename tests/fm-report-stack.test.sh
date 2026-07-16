@@ -355,6 +355,23 @@ process.stdout.write(String(JSON.parse(source.match(/=(\{.*\});/)[1]).cutoffMs))
   pass "retention guard cannot advance visibility or cleanup before 30 days"
 }
 
+test_retention_cutoff_never_regresses_with_wall_time() {
+  local stack="$TMP_ROOT/retention-monotonic-stack" prior actual now retention_ms=2592000000
+  mkdir -p "$stack/entries"
+  now=$(node -e 'process.stdout.write(String(Date.now()))')
+  prior=$((now - retention_ms + 600000))
+  printf 'window.firstmateRetentionPolicy={"schemaVersion":1,"generation":"prior-clock","cutoffMs":%s};\n' \
+    "$prior" > "$stack/.retention-policy.js"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" prune >/dev/null \
+    || fail "retention rejected an existing cutoff from a later wall-clock reading"
+  actual=$(node -e '
+const source = require("fs").readFileSync(process.argv[1], "utf8");
+process.stdout.write(String(JSON.parse(source.match(/=(\{.*\});/)[1]).cutoffMs));
+' "$stack/.retention-policy.js")
+  [ "$actual" -ge "$prior" ] || fail "retention visibility cutoff moved backward with wall time"
+  pass "report retention cutoff remains monotonic across wall-clock regressions"
+}
+
 test_republish_new_generation_refreshes_completion_time() {
   local id=report-generation-a4 repo meta entry manifest staged
   repo="$TMP_ROOT/generation-worktree"
@@ -1429,7 +1446,7 @@ test_aged_transactionless_staging_is_reclaimed() {
   pass "report recovery reclaims only aged transactionless staging while locked"
 }
 
-test_completed_reports_have_a_thirty_day_retention_ceiling() {
+test_completed_reports_prune_after_minimum_age() {
   local old_id=report-retention-old-k2d fresh_id=report-retention-fresh-k2e old_entry fresh_entry manifest temp active
   write_task "$old_id" ship
   write_required_report "$HOME_DIR/data/$old_id/completion.md" "Expired report content."
@@ -1453,7 +1470,7 @@ test_completed_reports_have_a_thirty_day_retention_ceiling() {
   assert_present "$active/pending.txt" "fresh report staging was pruned as completed history"
   assert_no_grep 'Expired report content' "$STACK/index.html" "report index retained an expired completed entry"
   assert_grep 'Fresh report content' "$STACK/index.html" "report index lost the fresh completed entry"
-  pass "report stack prunes completed entries at the 30-day ceiling"
+  pass "report stack prunes completed entries after their minimum age"
 }
 
 test_retention_binds_manifests_to_entry_directories() {
@@ -2209,7 +2226,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
   test_task_directory_identity_is_pinned_for_all_artifacts
-  test_completed_reports_have_a_thirty_day_retention_ceiling
+  test_completed_reports_prune_after_minimum_age
   test_retention_restores_expired_entries_when_index_swap_fails
   exit 0
 fi
@@ -3174,6 +3191,12 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-minimum-age ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
+  test_retention_guard_cannot_advance_minimum_age
+  test_retention_cutoff_never_regresses_with_wall_time
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-parser ]; then
   test_nested_list_parent_scope_hides_required_headings
   test_blockquote_list_scope_requires_quote_markers
@@ -3254,7 +3277,7 @@ test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry
 test_aged_transactionless_staging_is_reclaimed
-test_completed_reports_have_a_thirty_day_retention_ceiling
+test_completed_reports_prune_after_minimum_age
 test_retention_binds_manifests_to_entry_directories
 test_watcher_periodically_owns_idle_report_retention
 test_retention_batches_make_interruption_safe_progress

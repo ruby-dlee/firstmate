@@ -612,8 +612,8 @@ let lastPruneStatus = { pruned: 0, pending: false };
 function withLock(callback) {
   const release = acquireLock();
   try {
-    const retentionPolicy = nextRetentionPolicy();
     recoverRetentionCutover();
+    const retentionPolicy = nextRetentionPolicy();
     recoverPreviousEntries();
     cutoverLegacyEntries();
     if (readStackControl(legacyCutoverName) !== undefined) {
@@ -1119,10 +1119,11 @@ function nextRetentionPolicy() {
     || reportRetentionCohortMs > reportRetentionMs) {
     throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer no greater than 30 days");
   }
+  const previous = readRetentionPolicy();
   const policy = {
     schemaVersion: 1,
     generation: crypto.randomUUID(),
-    cutoffMs: Date.now() - reportRetentionMs,
+    cutoffMs: Math.max(previous.cutoffMs, Date.now() - reportRetentionMs),
   };
   return policy;
 }

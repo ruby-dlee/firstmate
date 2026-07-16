@@ -95,10 +95,36 @@ command = os.fsencode(sys.argv[5])
 if snapshot is None:
     fail("prompt snapshot is unavailable")
 
+try:
+    original_stdin_flags = fcntl.fcntl(0, fcntl.F_GETFL)
+except OSError:
+    original_stdin_flags = None
+try:
+    original_stdin_termios = termios.tcgetattr(0)
+except termios.error:
+    original_stdin_termios = None
+
+ready_reader, ready_writer = os.pipe()
 child, terminal = os.forkpty()
 if child == 0:
+    os.close(ready_reader)
+    test_ready = os.environ.get("FM_PROMPT_EXEC_TEST_BEFORE_RAW_READY")
+    test_proceed = os.environ.get("FM_PROMPT_EXEC_TEST_BEFORE_RAW_PROCEED")
+    if test_ready and test_proceed:
+        marker = os.open(test_ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(marker)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(test_proceed):
+            if time.monotonic() >= deadline:
+                fail("raw-mode test gate timed out")
+            time.sleep(0.01)
     tty.setraw(0, termios.TCSANOW)
+    os.write(ready_writer, b"1")
+    os.close(ready_writer)
     os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())
+
+os.close(ready_writer)
+ready_writer = None
 
 
 def copy_window_size():
@@ -124,10 +150,14 @@ for forwarded in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
 os.set_blocking(terminal, False)
 selector = selectors.DefaultSelector()
 pending = memoryview(snapshot + b"\r")
-selector.register(terminal, selectors.EVENT_READ | selectors.EVENT_WRITE)
 stdin_registered = False
 child_status = None
 try:
+    if os.read(ready_reader, 1) != b"1":
+        fail("provider terminal did not enter raw mode")
+    os.close(ready_reader)
+    ready_reader = None
+    selector.register(terminal, selectors.EVENT_READ | selectors.EVENT_WRITE)
     while True:
         if child_status is None:
             waited, status = os.waitpid(child, os.WNOHANG)
@@ -186,6 +216,8 @@ try:
                     selector.unregister(0)
                     stdin_registered = False
 finally:
+    if ready_reader is not None:
+        os.close(ready_reader)
     if stdin_registered:
         try:
             selector.unregister(0)
@@ -193,6 +225,16 @@ finally:
             pass
     selector.close()
     os.close(terminal)
+    if original_stdin_flags is not None:
+        try:
+            fcntl.fcntl(0, fcntl.F_SETFL, original_stdin_flags)
+        except OSError:
+            pass
+    if original_stdin_termios is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSANOW, original_stdin_termios)
+        except termios.error:
+            pass
     if child_status is None:
         _, child_status = os.waitpid(child, 0)
 

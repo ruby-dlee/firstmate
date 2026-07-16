@@ -485,7 +485,7 @@ fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>
 # header for the fresh-surface pitfall this avoids). When the caller knows
 # the owning firstmate task label, refresh stale workspace/surface ids by label.
 fm_backend_cmux_target_ready() {  # <target> [expected-label]
-  local expected_label=${2:-} expected_title title wsid sfid workspaces
+  local expected_label=${2:-} expected_title title wsid sfid workspaces title_count
   fm_backend_cmux_parse_target "$1" || return 1
   if [ -n "$expected_label" ]; then
     expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
@@ -497,7 +497,9 @@ fm_backend_cmux_target_ready() {  # <target> [expected-label]
     elif [ -n "$title" ]; then
       return 1
     else
-      wsid=$(printf '%s' "$workspaces" | jq -r --arg want "$expected_title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1)
+      title_count=$(printf '%s' "$workspaces" | jq -r --arg want "$expected_title" '[.workspaces[]? | select(.title == $want)] | length' 2>/dev/null) || return 1
+      [ "$title_count" = 1 ] || return 1
+      wsid=$(printf '%s' "$workspaces" | jq -r --arg want "$expected_title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null)
       [ -n "$wsid" ] || return 1
     fi
     sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")

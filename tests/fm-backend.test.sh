@@ -634,6 +634,36 @@ test_managed_tmux_target_identity() {
   pass "managed tmux operations reject reused window ids with another task label"
 }
 
+test_managed_tmux_target_identity_checks_recorded_session() {
+  local log fake_session fake_label
+  log="$TMP_ROOT/managed-tmux-session-identity.log"
+  : > "$log"
+  fake_session=other-session
+  fake_label=fm-intended-task
+  tmux() {
+    printf '%s\n' "$*" >> "$log"
+    case "$*" in
+      *'#{session_name}'*) printf '%s\t%s\n' "$fake_session" "$fake_label" ;;
+    esac
+  }
+
+  ! fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
+    || fail "a reused tmux window id in another session passed existence validation"
+  ! fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
+    || fail "a reused tmux window id in another session passed kill validation"
+  ! grep -q '^kill-window ' "$log" \
+    || fail "session-mismatched tmux identity reached kill-window"
+
+  fake_session=recorded-session
+  fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
+    || fail "the recorded tmux session identity did not pass existence validation"
+  fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
+    || fail "the recorded tmux session identity did not pass kill validation"
+  grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
+    || fail "the session-matched tmux identity did not kill through its recorded scoped target"
+  pass "managed tmux existence and kill validate stable ids against the recorded session"
+}
+
 test_managed_tmux_target_state_finds_replacement_window() {
   local log window_names
   log="$TMP_ROOT/managed-tmux-replacement.log"
@@ -1143,6 +1173,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
@@ -1161,6 +1196,7 @@ test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_managed_tmux_target_identity
+test_managed_tmux_target_identity_checks_recorded_session
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

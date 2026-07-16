@@ -137,13 +137,13 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
 
-spawn_managed_endpoint_kill() {  # <backend> <target> <tab-id> <label> <kind> <secondmate-home>
-  local backend=$1 target=$2 tab_id=$3 label=$4 kind=$5 secondmate_home=${6:-} endpoint_home
+spawn_managed_endpoint_kill() {  # <backend> <target> <tab-id> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 tab_id=$3 label=$4 kind=$5 secondmate_home=${6:-} recorded_scoped_target=${7:-} endpoint_home
   endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
   if [ "$endpoint_home" != "$FM_HOME" ]; then
-    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_kill "$backend" "$target" "$tab_id" "$label" )
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_kill "$backend" "$target" "$tab_id" "$label" "$recorded_scoped_target" )
   else
-    fm_backend_kill "$backend" "$target" "$tab_id" "$label"
+    fm_backend_kill "$backend" "$target" "$tab_id" "$label" "$recorded_scoped_target"
   fi
 }
 
@@ -336,7 +336,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       exit 1
     fi
     if [ -n "$rollback_target" ]; then
-      spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" 2>/dev/null || true
+      spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" "$rollback_tmux_session_target" 2>/dev/null || true
     fi
     rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" "$rollback_tmux_session_target" 2>/dev/null)
     case "$rollback_endpoint_state" in
@@ -640,7 +640,7 @@ spawn_abort_cleanup() {
     fi
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
-    spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" 2>/dev/null || true
+    spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
     endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
     case "$endpoint_state" in
       absent) ;;

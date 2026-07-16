@@ -59,6 +59,15 @@ set -u
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'tmux %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  display-message*"#{session_name}"*"#{window_name}"*)
+    printf '%s\t' "${FM_FAKE_TMUX_SESSION:-firstmate}"
+    if [ "${FM_FAKE_TMUX_RENAMED:-0}" = 1 ]; then
+      printf 'fm-renamed-task\n'
+    else
+      cat "${FM_FAKE_TMUX_LABEL_FILE:-/nonexistent}"
+    fi
+    exit $?
+    ;;
   display-message*"#{window_name}"*)
     if [ "${FM_FAKE_TMUX_RENAMED:-0}" = 1 ]; then
       printf 'fm-renamed-task\n'
@@ -3177,6 +3186,84 @@ test_continuation_reclaims_only_positively_stale_publish_lock() {
   pass "continuation publish locks reclaim only a positively stale owner"
 }
 
+test_continuation_recovers_abandoned_reclaim_owner() {
+  local id rec packet lock reclaim
+  id=account-cont-reclaim-z30a
+  rec=$(make_case continuation-reclaim claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "reclaim precondition failed"
+  use_named_fake_tmux_target "$id"
+  rm -f "$CASE_DIR/endpoint-live"
+  lock="$HOME_DIR/data/$id/.continuation-reclaim.publish-lock"
+  reclaim="$lock.reclaim"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-lock\n' > "$lock"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-reclaim\n' > "$reclaim"
+  packet=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" reclaim) || fail "continuation did not recover an abandoned reclaim owner"
+  assert_present "$packet" "abandoned reclaim recovery did not publish"
+  assert_absent "$lock" "abandoned reclaim recovery retained the lock"
+  assert_absent "$reclaim" "abandoned reclaim recovery retained the reclaim owner"
+  pass "continuation reclaim ownership is atomically published and stale-recoverable"
+}
+
+test_continuation_no_prior_rollback_preserves_raced_replacement() {
+  local id rec install_ready install_proceed remove_ready remove_proceed output pid status packet replacement worktree
+  id=account-cont-remove-z30b
+  rec=$(make_case continuation-remove claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "rollback race precondition failed"
+  use_named_fake_tmux_target "$id"
+  worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
+  rm -f "$CASE_DIR/endpoint-live"
+  install_ready="$CASE_DIR/install.ready"; install_proceed="$CASE_DIR/install.proceed"
+  remove_ready="$CASE_DIR/remove.ready"; remove_proceed="$CASE_DIR/remove.proceed"
+  output="$CASE_DIR/remove.out"; packet="$HOME_DIR/data/$id/continuation-remove.md"
+  replacement="$CASE_DIR/unowned.bytes"
+  printf 'unowned replacement\000must survive' > "$replacement"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_INSTALL_TEST_READY="$install_ready" \
+    FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED="$install_proceed" \
+    FM_CONTAINED_REMOVE_TEST_READY="$remove_ready" FM_CONTAINED_REMOVE_TEST_PROCEED="$remove_proceed" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" remove > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$install_ready" ] && break; sleep 0.05; done
+  [ -e "$install_ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "rollback install gate did not open"; }
+  printf 'changed\n' > "$worktree/rollback-race.txt"
+  touch "$install_proceed"
+  for _ in $(seq 1 100); do [ -e "$remove_ready" ] && break; sleep 0.05; done
+  [ -e "$remove_ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "conditional removal gate did not open: $(cat "$output")"; }
+  rm -f "$packet"; cp "$replacement" "$packet"; touch "$remove_proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "rollback race unexpectedly succeeded"
+  cmp -s "$packet" "$replacement" || fail "conditional rollback deleted an unowned packet"
+  pass "continuation rollback conditionally removes only its owned packet inode"
+}
+
+test_task_file_publication_cas_preserves_concurrent_append() {
+  local data="$TMP_ROOT/task-file-cas/data" task=task-file-cas file ready proceed output pid status before
+  mkdir -p "$data/$task"
+  file="$data/$task/trail.md"; ready="$TMP_ROOT/task-file-cas/ready"; proceed="$TMP_ROOT/task-file-cas/proceed"
+  output="$TMP_ROOT/task-file-cas/out"
+  printf 'original\n' > "$file"
+  FM_FILE_TRANSACTION_PUBLISH_TEST_READY="$ready" FM_FILE_TRANSACTION_PUBLISH_TEST_PROCEED="$proceed" \
+    node - "$ROOT/bin/fm-file-transaction.cjs" "$data" "$task" > "$output" 2>&1 <<'JS' &
+const { pinnedTaskFileTransaction } = require(process.argv[2]);
+pinnedTaskFileTransaction(process.argv[3], process.argv[4], 'trail.md', content => Buffer.concat([content, Buffer.from('transaction\n')]));
+JS
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "task-file CAS gate did not open"; }
+  printf 'concurrent\n' >> "$file"; before=$(cat "$file"); touch "$proceed"
+  wait "$pid"; status=$?
+  [ "$status" -ne 0 ] || fail "task-file CAS overwrote a concurrent append"
+  [ "$(cat "$file")" = "$before" ] || fail "task-file CAS failed to restore concurrent content"
+  assert_no_grep 'transaction' "$file" "failed task-file CAS published stale output"
+  pass "task-file publication is a generation-owned compare-and-swap"
+}
+
 test_continuation_removes_packet_when_repository_changes_during_install() {
   local id rec ready proceed output packet_pid status packet worktree
   id=account-continuation-install-race-z28j
@@ -4159,6 +4246,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
   test_continuation_packet_publication_is_generation_owned
   test_continuation_prepublish_cas_preserves_unowned_replacement
   test_continuation_reclaims_only_positively_stale_publish_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-30 ]; then
+  test_continuation_recovers_abandoned_reclaim_owner
+  test_continuation_no_prior_rollback_preserves_raced_replacement
+  test_task_file_publication_cas_preserves_concurrent_append
   exit 0
 fi
 

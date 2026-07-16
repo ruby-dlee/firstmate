@@ -72,23 +72,55 @@ publish_error() {
 }
 
 write_heartbeat() {
-  local provenance_value=$1 temp
+  local provenance_value=$1 activation_nonce=${FM_REPORT_RETENTION_ACTIVATION_NONCE:-} run_identity temp
   mkdir -p "$STACK_ROOT" || return 1
   temp=$(mktemp "$STACK_ROOT/.retention-heartbeat.XXXXXX") || return 1
-  printf '%s\n%s\n' "$(date +%s)" "$provenance_value" > "$temp" || { rm -f "$temp"; return 1; }
+  run_identity="$$.$RANDOM.$(date +%s)"
+  printf '%s\n%s\n%s\n%s\n' "$(date +%s)" "$provenance_value" "$activation_nonce" "$run_identity" > "$temp" || { rm -f "$temp"; return 1; }
   chmod 600 "$temp" || { rm -f "$temp"; return 1; }
   mv -f "$temp" "$HEARTBEAT"
 }
 
 heartbeat_matches() {
-  local expected=$1 epoch recorded now
+  local expected=$1 expected_nonce=${2:-} previous_run=${3:-} epoch recorded nonce run_identity now
   [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ] || return 1
   epoch=$(sed -n '1p' "$HEARTBEAT")
   recorded=$(sed -n '2p' "$HEARTBEAT")
+  nonce=$(sed -n '3p' "$HEARTBEAT")
+  run_identity=$(sed -n '4p' "$HEARTBEAT")
   case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
   [ "$recorded" = "$expected" ] || return 1
+  [ "$nonce" = "$expected_nonce" ] || return 1
+  [ -n "$run_identity" ] && { [ -z "$previous_run" ] || [ "$run_identity" != "$previous_run" ]; } || return 1
   now=$(date +%s)
   [ "$((now - epoch))" -le "$((INTERVAL * 2 + 60))" ]
+}
+
+control_state() {
+  local control=$1 pid started token extra current
+  [ -f "$control" ] && [ ! -L "$control" ] || { printf 'unknown'; return; }
+  pid=$(sed -n '1p' "$control"); started=$(sed -n '2p' "$control")
+  token=$(sed -n '3p' "$control"); extra=$(sed -n '4p' "$control")
+  case "$pid" in ''|*[!0-9]*) printf 'unknown'; return ;; esac
+  [ -n "$started" ] && [ -n "$token" ] && [ -z "$extra" ] || { printf 'unknown'; return; }
+  if ! kill -0 "$pid" 2>/dev/null; then printf 'stale'; return; fi
+  current=$(process_start_time "$pid") || { printf 'unknown'; return; }
+  if [ "$current" = "$started" ]; then printf 'live'; else printf 'stale'; fi
+}
+
+file_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
+remove_owned_install_file() {
+  local file=$1 identity=$2 quarantine=$3 python_runtime
+  python_runtime=$(resolve_runtime "${FM_REPORT_PYTHON:-}" python3) || return 1
+  "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+    "$(basename "$file")" "$identity" "$quarantine" 3< "$INSTALL_ROOT"
 }
 
 process_start_time() {
@@ -96,15 +128,46 @@ process_start_time() {
 }
 
 install_lock_state() {
-  local pid started token extra current
-  [ -f "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ] || { printf 'unknown'; return; }
-  pid=$(sed -n '1p' "$INSTALL_LOCK"); started=$(sed -n '2p' "$INSTALL_LOCK")
-  token=$(sed -n '3p' "$INSTALL_LOCK"); extra=$(sed -n '4p' "$INSTALL_LOCK")
-  case "$pid" in ''|*[!0-9]*) printf 'unknown'; return ;; esac
-  [ -n "$started" ] && [ -n "$token" ] && [ -z "$extra" ] || { printf 'unknown'; return; }
-  if ! kill -0 "$pid" 2>/dev/null; then printf 'stale'; return; fi
-  current=$(process_start_time "$pid") || { printf 'unknown'; return; }
-  if [ "$current" = "$started" ]; then printf 'live'; else printf 'stale'; fi
+  control_state "$INSTALL_LOCK"
+}
+
+install_reclaim_acquire() {
+  local candidate started state quarantine expected observed
+  started=$(process_start_time "$$") || return 1
+  candidate=$(mktemp "$INSTALL_ROOT/.install-lock-reclaim.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n' "$$" "$started" "$INSTALL_LOCK_TOKEN" > "$candidate" || { rm -f "$candidate"; return 1; }
+  while :; do
+    if ln "$candidate" "$INSTALL_RECLAIM" 2>/dev/null; then
+      rm -f "$candidate"
+      return 0
+    fi
+    observed=$(file_identity "$INSTALL_RECLAIM") || { rm -f "$candidate"; return 1; }
+    state=$(control_state "$INSTALL_RECLAIM")
+    [ "$state" = stale ] || { rm -f "$candidate"; return 1; }
+    expected=$(sed -n '3p' "$INSTALL_RECLAIM")
+    [ -n "$expected" ] && [ "$(file_identity "$INSTALL_RECLAIM")" = "$observed" ] \
+      || { rm -f "$candidate"; return 1; }
+    quarantine=".install-lock-reclaim.stale.$INSTALL_LOCK_TOKEN"
+    remove_owned_install_file "$INSTALL_RECLAIM" "$observed" "$quarantine" || continue
+  done
+}
+
+install_reclaim_recover() {
+  local state quarantine expected observed
+  [ -e "$INSTALL_RECLAIM" ] || [ -L "$INSTALL_RECLAIM" ] || return 0
+  observed=$(file_identity "$INSTALL_RECLAIM") || return 1
+  state=$(control_state "$INSTALL_RECLAIM")
+  [ "$state" = stale ] || return 1
+  expected=$(sed -n '3p' "$INSTALL_RECLAIM")
+  [ -n "$expected" ] && [ "$(file_identity "$INSTALL_RECLAIM")" = "$observed" ] || return 1
+  quarantine=".install-lock-reclaim.stale.$INSTALL_LOCK_TOKEN"
+  remove_owned_install_file "$INSTALL_RECLAIM" "$observed" "$quarantine"
+}
+
+install_reclaim_release() {
+  [ -f "$INSTALL_RECLAIM" ] && [ ! -L "$INSTALL_RECLAIM" ] || return 0
+  [ "$(sed -n '3p' "$INSTALL_RECLAIM")" = "$INSTALL_LOCK_TOKEN" ] || return 0
+  rm -f "$INSTALL_RECLAIM"
 }
 
 install_lock_acquire() {
@@ -115,19 +178,20 @@ install_lock_acquire() {
   candidate=$(mktemp "$INSTALL_ROOT/.install-lock.XXXXXX") || return 1
   printf '%s\n%s\n%s\n' "$$" "$started" "$INSTALL_LOCK_TOKEN" > "$candidate" || return 1
   for _attempt in $(seq 1 100); do
+    install_reclaim_recover >/dev/null 2>&1 || true
     if [ ! -e "$INSTALL_RECLAIM" ] && ln "$candidate" "$INSTALL_LOCK" 2>/dev/null; then
       rm -f "$candidate"
       return 0
     fi
     state=$(install_lock_state)
-    if [ "$state" = stale ] && mkdir "$INSTALL_RECLAIM" 2>/dev/null; then
+    if [ "$state" = stale ] && install_reclaim_acquire; then
       state=$(install_lock_state)
       if [ "$state" = stale ]; then
         quarantine="$INSTALL_LOCK.stale.$INSTALL_LOCK_TOKEN"
         mv "$INSTALL_LOCK" "$quarantine" 2>/dev/null || true
         rm -f "$quarantine"
       fi
-      rmdir "$INSTALL_RECLAIM" 2>/dev/null || true
+      install_reclaim_release
       [ "$state" != stale ] || continue
     fi
     sleep 0.05
@@ -167,14 +231,23 @@ plist_program() {
   sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s/.*<string>\([^<]*\)<\/string>.*/\1/p' "$1" | sed -n '2p'
 }
 
+plist_label() {
+  sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$1" | sed -n '1p'
+}
+
+plist_environment_value() {
+  local file=$1 key=$2
+  sed -n "s#.*<key>$key</key><string>\\([^<]*\\)</string>.*#\\1#p" "$file" | sed -n '1p'
+}
+
 write_generation_plist() {
-  local destination=$1 bash_runtime=$2 node_runtime=$3 python_runtime=$4 generation=$5 runtime_path
+  local destination=$1 bash_runtime=$2 node_runtime=$3 python_runtime=$4 generation=$5 job_label=$6 activation_nonce=$7 runtime_path
   runtime_path="$(dirname "$node_runtime"):$(dirname "$python_runtime"):/usr/bin:/bin:/usr/sbin:/sbin"
   cat > "$destination" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>$(xml_escape "$LABEL")</string>
+<key>Label</key><string>$(xml_escape "$job_label")</string>
 <key>ProgramArguments</key><array>
 <string>$(xml_escape "$bash_runtime")</string>
 <string>$(xml_escape "$generation/bin/fm-report-retention.sh")</string>
@@ -187,6 +260,7 @@ write_generation_plist() {
 <key>FM_REPORT_STACK_ROOT</key><string>$(xml_escape "$STACK_ROOT")</string>
 <key>FM_REPORT_RETENTION_INTERVAL</key><string>$(xml_escape "$INTERVAL")</string>
 <key>FM_REPORT_RETENTION_PROGRESS_INTERVAL</key><string>$(xml_escape "$PROGRESS_INTERVAL")</string>
+<key>FM_REPORT_RETENTION_ACTIVATION_NONCE</key><string>$(xml_escape "$activation_nonce")</string>
 </dict>
 <key>RunAtLoad</key><true/><key>StartInterval</key><integer>$INTERVAL</integer>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -200,7 +274,8 @@ install_test_interrupt() {
 
 install_owner() {
   local token staging generation generation_plist plist_temp previous_plist domain file
-  local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program=
+  local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program='' old_label=''
+  local job_label activation_nonce activation_started=0 activation_baseline=
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent installation requires macOS" >&2; return 1; }
   command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
   mkdir -p "$GENERATIONS" "$LAUNCH_AGENTS_DIR" || return 1
@@ -210,6 +285,8 @@ install_owner() {
   node_runtime=$(resolve_runtime "${FM_REPORT_RETENTION_NODE:-}" node) || return 1
   python_runtime=$(resolve_runtime "${FM_REPORT_PYTHON:-}" python3) || return 1
   token="$(date +%s).$$.$RANDOM"
+  job_label="$LABEL.$token"
+  activation_nonce="$token.$RANDOM"
   staging=$(mktemp -d "$GENERATIONS/.staging.$token.XXXXXX") || return 1
   generation="$GENERATIONS/$token"
   generation_plist="$staging/$LABEL.plist"
@@ -222,15 +299,16 @@ install_owner() {
   source_provenance=$(provenance "$SCRIPT_DIR") || return 1
   installed_provenance=$(provenance "$staging/bin") || return 1
   [ "$source_provenance" = "$installed_provenance" ] || return 1
-  write_generation_plist "$generation_plist" "$bash_runtime" "$node_runtime" "$python_runtime" "$generation" || return 1
+  write_generation_plist "$generation_plist" "$bash_runtime" "$node_runtime" "$python_runtime" "$generation" "$job_label" "$activation_nonce" || return 1
   chmod 600 "$generation_plist" || return 1
   cp "$generation_plist" "$plist_temp" || return 1
   chmod 600 "$plist_temp" || return 1
   mv "$staging" "$generation" || return 1
   install_test_interrupt generation-published || return $?
   if ! FM_REPORT_RETENTION_NODE="$node_runtime" FM_REPORT_PYTHON="$python_runtime" \
+    FM_REPORT_RETENTION_ACTIVATION_NONCE='' \
     "$bash_runtime" "$generation/bin/fm-report-retention.sh" run-once \
-    || ! heartbeat_matches "$installed_provenance"; then
+    || ! heartbeat_matches "$installed_provenance" ""; then
     echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
     return 1
   fi
@@ -238,14 +316,34 @@ install_owner() {
     [ -f "$PLIST" ] && [ ! -L "$PLIST" ] || { echo "error: unsafe installed report-retention plist" >&2; return 1; }
     cp -p "$PLIST" "$previous_plist" || return 1
     old_program=$(plist_program "$previous_plist")
+    old_label=$(plist_label "$previous_plist")
   fi
   mv -f "$plist_temp" "$PLIST" || return 1
   install_test_interrupt pointer-published || return $?
   domain="gui/$(id -u)"
-  "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
-  if "$LAUNCHCTL" bootstrap "$domain" "$PLIST" \
-    && "$LAUNCHCTL" kickstart "$domain/$LABEL" \
-    && heartbeat_matches "$installed_provenance"; then
+  if "$LAUNCHCTL" bootstrap "$domain" "$PLIST"; then
+    if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then activation_baseline=$(sed -n '4p' "$HEARTBEAT"); fi
+    if FM_REPORT_RETENTION_EXPECTED_NONCE="$activation_nonce" \
+      FM_REPORT_RETENTION_EXPECTED_PROVENANCE="$installed_provenance" \
+      "$LAUNCHCTL" kickstart "$domain/$job_label"; then
+      activation_started=1
+      if [ "${FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH:-}" = 1 ]; then
+        FM_REPORT_RETENTION_NODE="$node_runtime" FM_REPORT_PYTHON="$python_runtime" \
+          FM_REPORT_RETENTION_ACTIVATION_NONCE="$activation_nonce" \
+          "$bash_runtime" "$generation/bin/fm-report-retention.sh" run-once || true
+      fi
+    fi
+  fi
+  if [ "$activation_started" -eq 1 ]; then
+    for _attempt in $(seq 1 100); do
+      heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline" && break
+      sleep 0.05
+    done
+  fi
+  if [ "$activation_started" -eq 1 ] && heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline"; then
+    if [ -n "$old_label" ] && [ "$old_label" != "$job_label" ]; then
+      "$LAUNCHCTL" bootout "$domain/$old_label" >/dev/null 2>&1 || true
+    fi
     rm -f "$previous_plist"
     for file in "$GENERATIONS"/*; do
       [ -d "$file" ] || continue
@@ -253,18 +351,16 @@ install_owner() {
     done
     return 0
   fi
+  "$LAUNCHCTL" bootout "$domain/$job_label" >/dev/null 2>&1 || true
   if [ -f "$previous_plist" ]; then
     mv -f "$previous_plist" "$PLIST"
-    "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
-    "$LAUNCHCTL" bootstrap "$domain" "$PLIST" >/dev/null 2>&1 || true
-    "$LAUNCHCTL" kickstart "$domain/$LABEL" >/dev/null 2>&1 || true
   fi
   echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
   return 1
 }
 
 ensure_owner() {
-  local program installed_provenance source_provenance domain
+  local program installed_provenance source_provenance domain job_label activation_nonce
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent requires macOS" >&2; return 1; }
   [ -f "$PLIST" ] && [ ! -L "$PLIST" ] \
     || { echo "error: report-retention LaunchAgent is not installed; run bin/fm-bootstrap.sh install report-retention after captain approval" >&2; return 1; }
@@ -276,8 +372,11 @@ ensure_owner() {
   [ "$installed_provenance" = "$source_provenance" ] \
     || { echo "error: installed report-retention owner is stale; rerun bin/fm-bootstrap.sh install report-retention after captain approval" >&2; return 1; }
   domain="gui/$(id -u)"
-  "$LAUNCHCTL" print "$domain/$LABEL" >/dev/null 2>&1 || { echo "error: report-retention LaunchAgent is not loaded" >&2; return 1; }
-  heartbeat_matches "$installed_provenance" || { echo "error: report-retention successful-prune heartbeat is stale" >&2; return 1; }
+  job_label=$(plist_label "$PLIST")
+  activation_nonce=$(plist_environment_value "$PLIST" FM_REPORT_RETENTION_ACTIVATION_NONCE)
+  [ -n "$job_label" ] && [ -n "$activation_nonce" ] || { echo "error: report-retention LaunchAgent activation identity is invalid" >&2; return 1; }
+  "$LAUNCHCTL" print "$domain/$job_label" >/dev/null 2>&1 || { echo "error: report-retention LaunchAgent is not loaded" >&2; return 1; }
+  heartbeat_matches "$installed_provenance" "$activation_nonce" || { echo "error: report-retention successful-prune heartbeat is stale" >&2; return 1; }
 }
 
 run_with_install_lock() {

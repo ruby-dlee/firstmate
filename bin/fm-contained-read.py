@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import time
 
 
 def fail(message):
@@ -603,6 +604,49 @@ def command_exchange_files_fd(arguments):
     fail("exchange generation changed during publication")
 
 
+def command_remove_owned_file_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py remove-owned-file-fd <name> <identity> <quarantine>")
+    name, identity, quarantine = arguments
+    if len(components(name)) != 1 or len(components(quarantine)) != 1:
+        fail("owned file names must be single safe components")
+    root = checked_root(3)
+    before = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or f"{before.st_dev}:{before.st_ino}" != identity:
+        fail("owned file generation changed before removal")
+    try:
+        os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        fail("owned file quarantine already exists")
+    except FileNotFoundError:
+        pass
+    ready = os.environ.get("FM_CONTAINED_REMOVE_TEST_READY")
+    proceed = os.environ.get("FM_CONTAINED_REMOVE_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write("ready\n")
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("owned file removal test gate timed out")
+            time.sleep(0.01)
+    os.rename(name, quarantine, src_dir_fd=root, dst_dir_fd=root)
+    moved = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+    if f"{moved.st_dev}:{moved.st_ino}" != identity:
+        try:
+            os.link(
+                quarantine,
+                name,
+                src_dir_fd=root,
+                dst_dir_fd=root,
+                follow_symlinks=False,
+            )
+            os.unlink(quarantine, dir_fd=root)
+        except OSError:
+            pass
+        fail("owned file generation changed during removal")
+    os.unlink(quarantine, dir_fd=root)
+
+
 def main():
     if len(sys.argv) < 2:
         fail("contained read command is required")
@@ -622,6 +666,8 @@ def main():
         command_fingerprint_paths_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-files-fd":
         command_exchange_files_fd(sys.argv[2:])
+    elif sys.argv[1] == "remove-owned-file-fd":
+        command_remove_owned_file_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

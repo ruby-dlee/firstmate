@@ -52,6 +52,7 @@ const visualInventoryLimit = visualEntryLimit * visualDepthLimit * 255 * 6 + vis
 const reportRetentionMs = 30 * 24 * 60 * 60 * 1000;
 const reportRetentionGuardMs = Number.parseInt(process.env.FM_REPORT_RETENTION_GUARD_MS || String(5 * 60 * 1000), 10);
 const reportRetentionBatch = Number.parseInt(process.env.FM_REPORT_RETENTION_BATCH || "4", 10);
+const retentionPolicyName = ".retention-policy.js";
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
 const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
 
@@ -414,7 +415,7 @@ function indexPage(rows, policy) {
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firstmate report stack</title><style>${sharedCss()}</style></head><body><main>
 <header><p class="eyebrow">Firstmate completion ledger</p><h1>Report stack</h1><p>Durable, account-independent records of wrapped work.</p></header>
 <div class="toolbar"><input id="search" type="search" placeholder="Search tasks, summaries, projects…"><select id="kind"><option value="">All task types</option><option value="ship">Ship</option><option value="scout">Scout</option></select></div><div id="cards" class="cards"></div>
-<script>const reports=${data};const cards=document.querySelector('#cards');const search=document.querySelector('#search');const kind=document.querySelector('#kind');const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function draw(){const q=search.value.toLowerCase();const rows=reports.filter(r=>(!kind.value||r.kind===kind.value)&&(!q||[r.title,r.summary,r.taskId,r.project,r.harness,r.accountProfile].join(' ').toLowerCase().includes(q)));cards.innerHTML=rows.length?rows.map(r=>'<article class="card"><a href="entries/'+encodeURIComponent(r.reportId)+'/report.html"><p class="eyebrow">'+esc(r.kind)+' · '+esc(r.completedAt.slice(0,10))+'</p><h2>'+esc(r.title)+'</h2><p>'+esc(r.summary)+'</p><p class="meta">'+esc(r.project)+' · '+esc(r.harness)+(r.accountProfile?' · '+esc(r.accountProfile):'')+'</p></a></article>').join(''):'<div class="empty">No matching reports.</div>'}search.addEventListener('input',draw);kind.addEventListener('change',draw);draw();</script>
+<script src="${retentionPolicyName}"></script><script>const cutoff=Number(window.firstmateRetentionPolicy?.cutoffMs);const reports=${data}.filter(r=>!Number.isFinite(cutoff)||Date.parse(r.completedAt)>cutoff);const cards=document.querySelector('#cards');const search=document.querySelector('#search');const kind=document.querySelector('#kind');const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function draw(){const q=search.value.toLowerCase();const rows=reports.filter(r=>(!kind.value||r.kind===kind.value)&&(!q||[r.title,r.summary,r.taskId,r.project,r.harness,r.accountProfile].join(' ').toLowerCase().includes(q)));cards.innerHTML=rows.length?rows.map(r=>'<article class="card"><a href="entries/'+encodeURIComponent(r.reportId)+'/report.html"><p class="eyebrow">'+esc(r.kind)+' · '+esc(r.completedAt.slice(0,10))+'</p><h2>'+esc(r.title)+'</h2><p>'+esc(r.summary)+'</p><p class="meta">'+esc(r.project)+' · '+esc(r.harness)+(r.accountProfile?' · '+esc(r.accountProfile):'')+'</p></a></article>').join(''):'<div class="empty">No matching reports.</div>'}search.addEventListener('input',draw);kind.addEventListener('change',draw);draw();</script>
 </main></body></html>`;
 }
 
@@ -595,8 +596,9 @@ let lastPruneStatus = { pruned: 0, pending: false };
 function withLock(callback) {
   const release = acquireLock();
   try {
+    const retentionPolicy = advanceRetentionPolicy();
     recoverPreviousEntries();
-    lastPruneStatus = pruneExpiredEntries();
+    lastPruneStatus = pruneExpiredEntries(retentionPolicy);
     return callback();
   } finally {
     release();
@@ -681,6 +683,32 @@ function snapshotStateArtifact(stateRoot, file, staged, destinationName, viewLim
   }
 }
 
+function readEntryManifest(entryName, label = "report manifest") {
+  const entry = pinnedDirectory(entryName, fs.realpathSync(entriesDir), "report entry directory");
+  try {
+    if (label === "report manifest"
+      && process.env.FM_REPORT_ENTRY_TEST_READY && process.env.FM_REPORT_ENTRY_TEST_PROCEED) {
+      fs.writeFileSync(process.env.FM_REPORT_ENTRY_TEST_READY, "ready\n", { flag: "wx" });
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(process.env.FM_REPORT_ENTRY_TEST_PROCEED)) {
+        if (Date.now() >= deadline) throw new Error("report entry test gate timed out");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
+    const framed = runContainedHelper(
+      ["read-fd", "manifest.json", String(manifestLimit), "strict"],
+      [entry.descriptor],
+      manifestLimit + 1024 * 1024,
+    );
+    const item = framedItems(framed).get("source");
+    if (!item || item.missing) return undefined;
+    if (item.oversized) throw new Error(`${label} exceeds its ${manifestLimit}-byte limit`);
+    return JSON.parse(item.content.toString("utf8"));
+  } finally {
+    fs.closeSync(entry.descriptor);
+  }
+}
+
 function readManifests(policy = readRetentionPolicy()) {
   if (!fs.existsSync(entriesDir)) return [];
   return fs.readdirSync(entriesDir, { withFileTypes: true })
@@ -690,8 +718,8 @@ function readManifests(policy = readRetentionPolicy()) {
         throw new Error(`invalid report entry id at ${path.join(entriesDir, entry.name)}`);
       }
       const file = path.join(entriesDir, entry.name, "manifest.json");
-      if (!fs.existsSync(file)) return undefined;
-      const manifest = JSON.parse(readBoundedRegularFile(file, manifestLimit, "report manifest"));
+      const manifest = readEntryManifest(entry.name);
+      if (!manifest) return undefined;
       if (manifest.reportId !== entry.name) {
         throw new Error(`report manifest identity mismatch at ${file}`);
       }
@@ -704,17 +732,33 @@ function readManifests(policy = readRetentionPolicy()) {
 }
 
 function readRetentionPolicy() {
-  const framed = runContainedHelper(["read-fd", "index.html", "4096", "head"], [stackRootDescriptor], 1024 * 1024);
+  const framed = runContainedHelper(["read-fd", retentionPolicyName, "4096", "strict"], [stackRootDescriptor], 1024 * 1024);
   const item = framedItems(framed).get("source");
   if (!item || item.missing) return { schemaVersion: 1, generation: "", cutoffMs: Number.NEGATIVE_INFINITY };
-  const firstLine = item?.content.toString("utf8").split(/\r?\n/, 1)[0] || "";
-  const match = firstLine.match(/^<!-- firstmate-retention (\{.*\}) -->$/);
-  if (!match) throw new Error("invalid report retention authority in index.html");
+  const source = item.content.toString("utf8").trim();
+  const match = source.match(/^window\.firstmateRetentionPolicy=(\{.*\});$/);
+  if (!match) throw new Error(`invalid report retention authority in ${retentionPolicyName}`);
   const policy = JSON.parse(match[1]);
   if (policy.schemaVersion !== 1 || typeof policy.generation !== "string" || !Number.isFinite(policy.cutoffMs)) {
-    throw new Error("invalid report retention authority in index.html");
+    throw new Error(`invalid report retention authority in ${retentionPolicyName}`);
   }
   return policy;
+}
+
+function publishRetentionPolicy(policy) {
+  const tempName = `.${retentionPolicyName}.${crypto.randomUUID()}.tmp`;
+  const temp = path.join(entriesDir, tempName);
+  const authority = JSON.stringify({ schemaVersion: 1, generation: policy.generation, cutoffMs: policy.cutoffMs });
+  try {
+    fs.writeFileSync(temp, `window.firstmateRetentionPolicy=${authority};\n`, { flag: "wx", mode: 0o600 });
+    runContainedHelper(
+      ["replace-file-fd", tempName, retentionPolicyName],
+      [entriesDescriptor, stackRootDescriptor],
+      1024 * 1024,
+    );
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
 }
 
 function reportTransactionPath(reportId) {
@@ -815,28 +859,32 @@ function retentionTombstones() {
     .map((entry) => path.join(entriesDir, entry.name));
 }
 
-function pruneExpiredEntries() {
+function advanceRetentionPolicy() {
   if (!Number.isSafeInteger(reportRetentionGuardMs) || reportRetentionGuardMs < 0 || reportRetentionGuardMs >= reportRetentionMs) {
     throw new Error("FM_REPORT_RETENTION_GUARD_MS must be a non-negative integer below 30 days");
   }
   if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
   }
-  const existingTombstones = retentionTombstones();
   const currentPolicy = readRetentionPolicy();
   const policy = {
     schemaVersion: 1,
     generation: crypto.randomUUID(),
     cutoffMs: Math.max(currentPolicy.cutoffMs, Date.now() - reportRetentionMs + reportRetentionGuardMs),
   };
-  const cutoff = policy.cutoffMs;
-  renderIndex(policy);
+  publishRetentionPolicy(policy);
   if (process.env.FM_REPORT_RETENTION_POLICY_TEST_READY && process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED) {
     fs.writeFileSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_READY, "ready\n", { flag: "wx" });
     while (!fs.existsSync(process.env.FM_REPORT_RETENTION_POLICY_TEST_PROCEED)) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   }
+  return policy;
+}
+
+function pruneExpiredEntries(policy) {
+  const existingTombstones = retentionTombstones();
+  const cutoff = policy.cutoffMs;
   const expired = [];
   for (const entry of fs.readdirSync(entriesDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
@@ -845,8 +893,8 @@ function pruneExpiredEntries() {
     }
     const destination = path.join(entriesDir, entry.name);
     const manifestFile = path.join(destination, "manifest.json");
-    if (!fs.existsSync(manifestFile)) continue;
-    const manifest = JSON.parse(readBoundedRegularFile(manifestFile, manifestLimit, "report manifest"));
+    const manifest = readEntryManifest(entry.name, "retention report manifest");
+    if (!manifest) continue;
     if (manifest.reportId !== entry.name) throw new Error(`report manifest identity mismatch at ${manifestFile}`);
     const completedAt = Date.parse(manifest.completedAt);
     if (!Number.isFinite(completedAt) || completedAt > cutoff) continue;
@@ -858,7 +906,7 @@ function pruneExpiredEntries() {
   for (const { destination, tombstone } of expired) {
     fs.renameSync(destination, tombstone);
   }
-  if (existingTombstones.length > 0 || expired.length > 0) renderIndex();
+  if (existingTombstones.length > 0 || expired.length > 0) renderIndex(policy);
 
   const tombstones = retentionTombstones();
   const cleanup = tombstones.slice(0, reportRetentionBatch);
@@ -901,8 +949,8 @@ function publish(taskId, legacy) {
     let previousManifest;
     if (fs.existsSync(destination)) {
       realDirectory(destination, fs.realpathSync(entriesDir), "existing report entry");
-      if (!fs.existsSync(path.join(destination, "manifest.json"))) throw new Error(`existing report entry is incomplete at ${destination}`);
-      previousManifest = JSON.parse(readBoundedRegularFile(path.join(destination, "manifest.json"), manifestLimit, "existing report manifest"));
+      previousManifest = readEntryManifest(id, "existing report manifest");
+      if (!previousManifest) throw new Error(`existing report entry is incomplete at ${destination}`);
     }
     const staged = path.join(entriesDir, `.${id}.${crypto.randomUUID()}.tmp`);
     let transaction;

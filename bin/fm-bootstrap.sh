@@ -360,7 +360,7 @@ secondmate_liveness_sweep() {
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
           continue
         fi
-        fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" 2>/dev/null || true
+        fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null || true
         resume_args=()
         if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)

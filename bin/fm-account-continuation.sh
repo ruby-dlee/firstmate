@@ -70,33 +70,54 @@ packet_lock_state() {
   if [ "$current" = "$started" ]; then printf 'live'; else printf 'stale'; fi
 }
 
+packet_reclaim_state() {
+  local reclaim=$1 pid started token extra current
+  [ -f "$reclaim" ] && [ ! -L "$reclaim" ] || { printf 'unknown'; return; }
+  pid=$(sed -n '1p' "$reclaim"); started=$(sed -n '2p' "$reclaim")
+  token=$(sed -n '3p' "$reclaim"); extra=$(sed -n '4p' "$reclaim")
+  case "$pid" in ''|*[!0-9]*) printf 'unknown'; return ;; esac
+  [ -n "$started" ] && [ -n "$token" ] && [ -z "$extra" ] || { printf 'unknown'; return; }
+  if ! kill -0 "$pid" 2>/dev/null; then printf 'stale'; return; fi
+  current=$(process_start_time "$pid") || { printf 'unknown'; return; }
+  if [ "$current" = "$started" ]; then printf 'live'; else printf 'stale'; fi
+}
+
 packet_lock_acquire() {
-  local candidate started state reclaim quarantine attempt
+  local candidate reclaim_candidate started state reclaim reclaim_state reclaim_id quarantine attempt
   PACKET_LOCK="$TASK_DIR/.continuation-$ATTEMPT.publish-lock"
   PACKET_LOCK_TOKEN="$$.$RANDOM.$(date +%s)"
   started=$(process_start_time "$$") || return 1
   candidate=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.lock.XXXXXX") || return 1
   printf '%s\n%s\n%s\n' "$$" "$started" "$PACKET_LOCK_TOKEN" > "$candidate" || return 1
   reclaim="$PACKET_LOCK.reclaim"
+  reclaim_candidate=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.reclaim.XXXXXX") || return 1
+  printf '%s\n%s\n%s\n' "$$" "$started" "$PACKET_LOCK_TOKEN" > "$reclaim_candidate" || return 1
   for attempt in $(seq 1 100); do
     if [ ! -e "$reclaim" ] && ln "$candidate" "$PACKET_LOCK" 2>/dev/null; then
-      rm -f "$candidate"
+      rm -f "$candidate" "$reclaim_candidate"
       return 0
     fi
     state=$(packet_lock_state)
-    if [ "$state" = stale ] && mkdir "$reclaim" 2>/dev/null; then
+    if [ "$state" = stale ] && ln "$reclaim_candidate" "$reclaim" 2>/dev/null; then
       state=$(packet_lock_state)
       if [ "$state" = stale ]; then
         quarantine="$PACKET_LOCK.stale.$PACKET_LOCK_TOKEN"
         mv "$PACKET_LOCK" "$quarantine" 2>/dev/null || true
         rm -f "$quarantine"
       fi
-      rmdir "$reclaim" 2>/dev/null || true
+      [ "$(sed -n '3p' "$reclaim" 2>/dev/null || true)" != "$PACKET_LOCK_TOKEN" ] || rm -f "$reclaim"
       [ "$state" != stale ] || continue
+    fi
+    reclaim_state=$(packet_reclaim_state "$reclaim")
+    if [ "$reclaim_state" = stale ]; then
+      reclaim_id=$(path_identity "$reclaim" 2>/dev/null || true)
+      [ -z "$reclaim_id" ] || python3 "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+        "${reclaim#./}" "$reclaim_id" ".continuation-$ATTEMPT.reclaim-retired.$PACKET_LOCK_TOKEN" 3< . \
+        >/dev/null 2>&1 || true
     fi
     sleep 0.01
   done
-  rm -f "$candidate"
+  rm -f "$candidate" "$reclaim_candidate"
   echo "error: continuation packet publication is already in progress for $ID" >&2
   return 1
 }
@@ -532,7 +553,7 @@ if ! repository_snapshot_matches; then
 fi
 
 rollback_published_packet() {
-  local current_id prior_id preserved_id preserved_path
+  local current_id prior_id preserved_id preserved_path quarantine
   current_id=$(path_identity "$PACKET" 2>/dev/null || true)
   if [ "$current_id" != "$PUBLISHED_PACKET_ID" ]; then
     echo "error: continuation packet generation changed before rollback for $ID" >&2
@@ -564,7 +585,10 @@ rollback_published_packet() {
     PACKET_PRIOR_TMP=
     PACKET_PRIOR_ID=
   else
-    rm -f -- "$PACKET" || return 1
+    quarantine=".continuation-$ATTEMPT.rollback.$PACKET_LOCK_TOKEN"
+    python3 "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+      "${PACKET#./}" "$PUBLISHED_PACKET_ID" "$quarantine" 3< . \
+      || return 1
   fi
   PUBLISHED_PACKET_ID=
 }

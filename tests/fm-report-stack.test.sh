@@ -10,6 +10,7 @@ HOME_DIR="$TMP_ROOT/home"
 STACK="$TMP_ROOT/stack"
 SCRIPT="$ROOT/bin/fm-report-stack.mjs"
 mkdir -p "$HOME_DIR/state" "$HOME_DIR/data"
+export FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1
 
 write_task() {
   local id=$1 kind=${2:-ship} task_dir="$HOME_DIR/data/$1"
@@ -2060,6 +2061,53 @@ test_contained_reader_rejects_special_files_without_blocking() {
   pass "contained reads reject special files before nonblocking open"
 }
 
+test_report_contract_and_task_transaction_reject_fifos_without_blocking() {
+  local root="$TMP_ROOT/task-special" fifo output pid status
+  mkdir -p "$root/data/task"
+  fifo="$root/data/task/brief.md"; mkfifo "$fifo"; output="$root/out"
+  FM_GATE_REFUSE_BYPASS=1 bash -c '. "$1/bin/fm-report-contract-lib.sh"; fm_completion_report_contract_present "$2"' \
+    _ "$ROOT" "$fifo" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.02; done
+  if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "report contract blocked on FIFO"; fi
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "report contract accepted FIFO"
+  node - "$ROOT/bin/fm-file-transaction.cjs" "$root/data" > "$output" 2>&1 <<'JS' &
+const { pinnedTaskFileTransaction } = require(process.argv[2]);
+pinnedTaskFileTransaction(process.argv[3], 'task', 'brief.md', content => content);
+JS
+  pid=$!
+  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.02; done
+  if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "task transaction blocked on FIFO"; fi
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "task transaction accepted FIFO"
+  pass "task-file readers reject special files before nonblocking open"
+}
+
+test_report_entry_manifest_reads_stay_on_pinned_generation() {
+  local id=report-entry-pin-z30c entry moved outside ready proceed output pid status
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Pinned manifest content."
+  run_stack publish "$id" >/dev/null || fail "entry-pin publication failed"
+  entry=$(dirname "$(run_stack path "$id")") || fail "entry-pin path failed"
+  moved="$TMP_ROOT/pinned-entry"; outside="$TMP_ROOT/outside-entry"; mkdir -p "$outside"
+  cp "$entry/manifest.json" "$outside/manifest.json"
+  sed 's/Finish the report stack/OUTSIDE MANIFEST/' "$outside/manifest.json" > "$outside/manifest.tmp"
+  mv "$outside/manifest.tmp" "$outside/manifest.json"
+  ready="$TMP_ROOT/entry-pin.ready"; proceed="$TMP_ROOT/entry-pin.proceed"; output="$TMP_ROOT/entry-pin.out"
+  FM_REPORT_ENTRY_TEST_READY="$ready" FM_REPORT_ENTRY_TEST_PROCEED="$proceed" run_stack list --json > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "entry manifest pin gate did not open"; }
+  mv "$entry" "$moved"; ln -s "$outside" "$entry"; touch "$proceed"
+  wait "$pid"; status=$?
+  rm "$entry"; mv "$moved" "$entry"
+  [ "$status" -eq 0 ] || fail "pinned manifest read failed: $(cat "$output")"
+  assert_grep 'Finish the report stack' "$output" "pinned manifest generation was not read"
+  assert_no_grep 'OUTSIDE MANIFEST' "$output" "manifest read followed a swapped entry ancestor"
+  pass "report manifests are read relative to pinned entry descriptors"
+}
+
 test_repository_fingerprint_recurses_through_submodule_worktrees() {
   local root="$TMP_ROOT/fingerprint-root" paths="$TMP_ROOT/fingerprint-paths" first second
   mkdir -p "$root/submodule/nested"
@@ -2076,7 +2124,7 @@ test_repository_fingerprint_recurses_through_submodule_worktrees() {
 }
 
 test_retention_cutoff_is_authoritative_before_cleanup() {
-  local id=report-retention-cutoff-k2q entry manifest temp ready proceed output pid policy
+  local id=report-retention-cutoff-k2q entry manifest temp ready proceed output pid policy cutoff
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cutoff-visible report."
   run_stack publish "$id" >/dev/null || fail "cutoff precondition publication failed"
@@ -2086,6 +2134,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
   mv "$temp" "$manifest"
   ready="$TMP_ROOT/retention-policy.ready"; proceed="$TMP_ROOT/retention-policy.proceed"; output="$TMP_ROOT/retention-policy.out"
+  trap 'touch "$proceed" 2>/dev/null || true' RETURN
   FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_PROCEED="$proceed" \
     run_stack prune --status > "$output" 2>&1 &
   pid=$!
@@ -2095,15 +2144,108 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   done
   [ -e "$ready" ] || { touch "$proceed"; wait "$pid" 2>/dev/null || true; fail "retention cutoff publication hook did not run"; }
   assert_present "$(dirname "$entry")" "retention cleanup advanced before publishing its authoritative cutoff"
-  policy="$STACK/index.html"
+  policy="$STACK/.retention-policy.js"
   assert_present "$policy" "retention did not atomically publish its cutoff generation and index"
-  assert_grep '<!-- firstmate-retention {"schemaVersion":1,"generation":"' "$policy" \
-    "retention index omitted its authoritative cutoff generation"
-  assert_no_grep "$id" "$policy" "atomic retention authority left an expired report visible in the index"
+  assert_grep 'window.firstmateRetentionPolicy={"schemaVersion":1,"generation":"' "$policy" \
+    "retention authority omitted its cutoff generation"
+  cutoff=$(sed -n 's/.*"cutoffMs":\([0-9]*\).*/\1/p' "$policy")
+  [ -n "$cutoff" ] && [ "$cutoff" -gt 946684800000 ] \
+    || fail "retention authority did not hide the expired report before scanning manifests"
+  assert_grep '<script src=".retention-policy.js"></script>' "$STACK/index.html" \
+    "report index does not honor the independently published cutoff authority"
   touch "$proceed"
   wait "$pid" || fail "retention cutoff cleanup failed: $(cat "$output")"
+  trap - RETURN
   assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
+  assert_no_grep "$id" "$STACK/index.html" "completed retention rendering left an expired report visible"
   pass "retention publishes one authoritative cutoff before bounded cleanup"
+}
+
+test_retention_activation_requires_launched_nonce_without_owner_gap() {
+  local fakebin="$TMP_ROOT/retention-nonce-launchctl" install_root="$TMP_ROOT/retention-nonce-install"
+  local agents="$TMP_ROOT/retention-nonce-agents" log="$TMP_ROOT/retention-nonce.log"
+  local plist saved old_label out status
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  plist="$agents/com.firstmate.report-retention.plist"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention activation-nonce precondition installation failed"
+  old_label=$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$plist")
+  saved="$TMP_ROOT/retention-nonce-prior.plist"
+  cp "$plist" "$saved"
+  : > "$log"
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH='' \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention activation reused its preflight heartbeat"
+  assert_contains "$out" "activation failed" "missing launched heartbeat refusal was unclear"
+  if grep -F "bootout gui/$(id -u)/$old_label" "$log" >/dev/null 2>&1; then
+    fail "retention activation unloaded the working owner before replacement health"
+  fi
+  cmp -s "$saved" "$plist" \
+    || fail "failed retention activation did not preserve its authoritative prior plist"
+  pass "retention activation overlaps owners and requires a launched-job nonce"
+}
+
+test_retention_install_recovers_owned_stale_reclaim_marker() {
+  local fakebin="$TMP_ROOT/retention-reclaim-launchctl" install_root="$TMP_ROOT/retention-reclaim-install"
+  local agents="$TMP_ROOT/retention-reclaim-agents" reclaim="$TMP_ROOT/retention-reclaim-install/.install-lock-reclaim"
+  mkdir -p "$fakebin" "$agents" "$install_root"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-reclaim-generation\n' > "$reclaim"
+  FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention install did not recover a positively stale reclaim owner"
+  assert_absent "$reclaim" "retention install retained an abandoned owned reclaim marker"
+  pass "retention install reclaim markers are owned and stale-recoverable"
+}
+
+test_retention_reclaim_never_removes_replacement_generation() {
+  local fakebin="$TMP_ROOT/retention-reclaim-race-launchctl" install_root="$TMP_ROOT/retention-reclaim-race-install"
+  local agents="$TMP_ROOT/retention-reclaim-race-agents" reclaim="$install_root/.install-lock-reclaim"
+  local ready="$TMP_ROOT/retention-reclaim-race.ready" proceed="$TMP_ROOT/retention-reclaim-race.proceed"
+  local replacement="$TMP_ROOT/retention-reclaim-race.replacement" output="$TMP_ROOT/retention-reclaim-race.out"
+  local started installer status
+  mkdir -p "$fakebin" "$agents" "$install_root"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/launchctl"; chmod +x "$fakebin/launchctl"
+  printf '999999\nMon Jan  1 00:00:00 2001\nstale-reclaim-generation\n' > "$reclaim"
+  started=$(LC_ALL=C ps -o lstart= -p "$$" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  printf '%s\n%s\n%s\n' "$$" "$started" live-reclaim-generation > "$replacement"
+  FM_CONTAINED_REMOVE_TEST_READY="$ready" FM_CONTAINED_REMOVE_TEST_PROCEED="$proceed" \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" \
+    "$ROOT/bin/fm-report-retention.sh" install > "$output" 2>&1 &
+  installer=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$installer" 2>/dev/null || true; fail "retention reclaim removal gate did not open"; }
+  mv -f "$replacement" "$reclaim"
+  touch "$proceed"
+  if wait "$installer"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention install bypassed a live replacement reclaim owner"
+  [ "$(sed -n '3p' "$reclaim")" = live-reclaim-generation ] \
+    || fail "retention stale reclaim deleted or overwrote a replacement generation"
+  pass "retention reclaim removes only the observed stale inode"
 }
 
 test_retention_generations_survive_install_interruptions() {
@@ -2168,6 +2310,23 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
   test_retention_generations_survive_install_interruptions
   test_retention_install_reclaims_positively_stale_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-30 ]; then
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_activation_requires_launched_nonce_without_owner_gap
+  test_retention_install_recovers_owned_stale_reclaim_marker
+  test_report_contract_and_task_transaction_reject_fifos_without_blocking
+  test_report_entry_manifest_reads_stay_on_pinned_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-round-30 ]; then
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_activation_requires_launched_nonce_without_owner_gap
+  test_retention_install_recovers_owned_stale_reclaim_marker
+  test_retention_reclaim_never_removes_replacement_generation
   exit 0
 fi
 

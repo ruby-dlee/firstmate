@@ -711,6 +711,27 @@ test_send_key_recovers_stale_target_by_label() {
   pass "fm_backend_cmux_send_key: recovers stale workspace/surface ids by expected label"
 }
 
+test_send_key_refuses_duplicate_rebind_titles() {
+  local dir fb title status
+  dir="$TMP_ROOT/sendkey-duplicate-rebind"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "c1111111-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_send_key "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" Enter fm-label' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "send_key rebound an absent cmux workspace to an ambiguous duplicate title"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] \
+    || fail "duplicate cmux rebind inspected or steered an arbitrary matching workspace"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send-key' \
+    "duplicate cmux rebind reached a mutation command"
+  pass "fm_backend_cmux_send_key refuses ambiguous same-title workspace rebinds"
+}
+
 test_send_literal_uses_separator_for_option_shaped_text() {
   local dir fb
   dir="$TMP_ROOT/sendliteral"; mkdir -p "$dir/responses"
@@ -1274,6 +1295,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_send_key_refuses_duplicate_rebind_titles
+  exit 0
+fi
+
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
 test_version_check_refuses_old_version
@@ -1313,6 +1339,7 @@ test_capture_fails_when_read_screen_fails_empty
 test_capture_fails_when_target_not_ready
 test_send_key_normalizes_and_targets
 test_send_key_recovers_stale_target_by_label
+test_send_key_refuses_duplicate_rebind_titles
 test_send_literal_uses_separator_for_option_shaped_text
 test_current_path_probes_with_marker
 test_composer_state_bare_prompt_is_empty

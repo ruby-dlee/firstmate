@@ -34,12 +34,22 @@ fm_backend_tmux_resolve_bare_selector() {  # <name>
 
 # fm_backend_tmux_capture: bounded plain-text pane capture. Mirrors
 # fm-peek.sh's and fm-watch.sh's `tmux capture-pane -p -t "$T" -S -"$N"`.
-fm_backend_tmux_expected_label_matches() {  # <target> [expected-label]
-  local target=$1 expected_label=${2:-} actual_label
-  [ -n "$expected_label" ] || return 0
+fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorded-scoped-target]
+  local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} expected_session actual_identity actual_session actual_label
+  [ -n "$expected_label" ] || [ -n "$recorded_scoped_target" ] || return 0
   case "$target" in @*) ;; *) return 0 ;; esac
-  actual_label=$(tmux display-message -p -t "$target" '#{window_name}' 2>/dev/null) || return 1
-  [ "$actual_label" = "$expected_label" ]
+  if [ -n "$recorded_scoped_target" ]; then
+    case "$recorded_scoped_target" in
+      *:*) expected_session=${recorded_scoped_target%%:*} ;;
+      *) return 1 ;;
+    esac
+  fi
+  actual_identity=$(tmux display-message -p -t "$target" '#{session_name}	#{window_name}' 2>/dev/null) || return 1
+  actual_session=${actual_identity%%$'\t'*}
+  actual_label=${actual_identity#*$'\t'}
+  [ "$actual_identity" != "$actual_session" ] || return 1
+  [ -z "$expected_label" ] || [ "$actual_label" = "$expected_label" ] || return 1
+  [ -z "$expected_session" ] || [ "$actual_session" = "$expected_session" ]
 }
 
 fm_backend_tmux_capture() {  # <target> <lines> [expected-label]
@@ -130,9 +140,11 @@ fm_backend_tmux_send_literal() {  # <target> <text>
 
 # fm_backend_tmux_kill: remove the task's window, best-effort. Mirrors
 # fm-teardown.sh's `tmux kill-window -t "$T" 2>/dev/null || true`.
-fm_backend_tmux_kill() {  # <target> [backend-id] [expected-label]
-  fm_backend_tmux_expected_label_matches "$1" "${3:-}" || return 1
-  tmux kill-window -t "$1" 2>/dev/null || true
+fm_backend_tmux_kill() {  # <target> [backend-id] [expected-label] [recorded-scoped-target]
+  local kill_target=$1
+  fm_backend_tmux_expected_label_matches "$1" "${3:-}" "${4:-}" || return 1
+  case "$1" in @*) [ -z "${4:-}" ] || kill_target=$4 ;; esac
+  tmux kill-window -t "$kill_target" 2>/dev/null || true
 }
 
 # fm_backend_tmux_current_command: <target>'s live foreground process name -

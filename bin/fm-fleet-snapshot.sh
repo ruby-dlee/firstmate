@@ -342,7 +342,7 @@ task_json_lines() {
 
     endpoint_exists=null
     if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
+      if fm_backend_target_exists "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" >/dev/null 2>&1; then
         endpoint_exists=true
       else
         endpoint_exists=false

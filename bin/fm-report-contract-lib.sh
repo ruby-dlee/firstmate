@@ -69,10 +69,15 @@ function contractPresent(markdown) {
 
 try {
   if (action === 'present') {
-    const source = fs.openSync(brief, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const entry = fs.lstatSync(brief, { bigint: true });
+    if (entry.isSymbolicLink() || !entry.isFile()) throw new Error('source is not a regular file');
+    const source = fs.openSync(brief,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
       const stat = fs.fstatSync(source, { bigint: true });
-      if (!stat.isFile()) throw new Error('source is not a regular file');
+      if (!stat.isFile() || stat.dev !== entry.dev || stat.ino !== entry.ino) {
+        throw new Error('source changed while opening');
+      }
       process.exitCode = contractPresent(fs.readFileSync(source).toString('utf8')) ? 0 : 1;
     } finally {
       fs.closeSync(source);

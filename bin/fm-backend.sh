@@ -663,13 +663,15 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
 # primitive so callers that only need a fast alive/dead read (recovery
 # digests, the session-start fleet digest) do not re-derive it inline.
-fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane
+fm_backend_target_exists() {  # <backend> <target> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} probe_target session pane
   case "$backend" in
     tmux)
       fm_backend_source tmux || return 1
-      fm_backend_tmux_expected_label_matches "$target" "$expected_label" || return 1
-      tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
+      fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target" || return 1
+      probe_target=$target
+      case "$target" in @*) [ -z "$recorded_scoped_target" ] || probe_target=$recorded_scoped_target ;; esac
+      tmux display-message -p -t "$probe_target" '#{pane_id}' >/dev/null 2>&1
       ;;
     herdr)
       fm_backend_source herdr || return 1
@@ -721,7 +723,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
   local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
-  if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
+  if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then
     printf 'present'
     return 0
   fi

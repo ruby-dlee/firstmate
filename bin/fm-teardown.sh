@@ -193,9 +193,9 @@ quiesce_secondmate_endpoint() {
   [ "$endpoint_home" = "$FM_HOME" ] || probe_home=$endpoint_home
   if [ -n "$T" ]; then
     if [ -n "$probe_home" ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" ) 2>/dev/null || true
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" ) 2>/dev/null || true
     else
-      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
     fi
   fi
   if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$probe_home" "$(meta_value "$META" tmux_session_target)"; then
@@ -234,9 +234,9 @@ quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
   fm_account_meta_lock_release "$lock" || return 1
   if [ -n "$target" ]; then
     if [ -n "$probe_home" ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" ) 2>/dev/null || true
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$tmux_session_target" ) 2>/dev/null || true
     else
-      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" 2>/dev/null || true
+      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$tmux_session_target" 2>/dev/null || true
     fi
   fi
   if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home" "$tmux_session_target"; then
@@ -1098,7 +1098,7 @@ cleanup_firstmate_home_children() {
       child_account_lock=$MANAGED_ACCOUNT_LOCK
     else
       if [ -n "$child_t" ]; then
-        ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
+        ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" "$(meta_value "$child_meta" tmux_session_target)" ) 2>/dev/null || true
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
@@ -1188,9 +1188,9 @@ quiesce_completion_report_endpoint() {
   zellij_tab=$(meta_value "$META" zellij_tab_id)
   if [ -n "$T" ]; then
     if [ -n "$PROBE_HOME" ]; then
-      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" ) 2>/dev/null || true
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" ) 2>/dev/null || true
     else
-      fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" 2>/dev/null || true
+      fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
     fi
   fi
   if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME" "$(meta_value "$META" tmux_session_target)"; then
@@ -1278,7 +1278,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
   if [ "$MANAGED_ACCOUNT" = 0 ]; then
-    [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+    [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
   fi
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
@@ -1305,7 +1305,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
 fi
 
 if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ] && [ "$SECONDMATE_ENDPOINT_QUIESCED" = 0 ]; then
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT

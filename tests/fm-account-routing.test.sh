@@ -3502,6 +3502,76 @@ SH
   pass "submodule timeouts terminate and reap the command process group"
 }
 
+test_bounded_command_reap_never_waits_unbounded() {
+  local output="$TMP_ROOT/bounded-reap.out" status
+  if python3 - "$ROOT/bin/fm-contained-read.py" > "$output" 2>&1 <<'PY'
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_contained_read", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+read_fd, write_fd = os.pipe()
+
+
+class Process:
+    def __init__(self):
+        self.pid = 12345
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.waits = []
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        return None
+
+    def kill(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if timeout is None:
+            raise AssertionError("unbounded wait attempted")
+        raise subprocess.TimeoutExpired("git", timeout)
+
+
+class Budget:
+    def check_time(self):
+        raise RuntimeError("repository fingerprint exceeds its time limit")
+
+
+process = Process()
+module.subprocess.Popen = lambda *args, **kwargs: process
+module.os.killpg = lambda *args, **kwargs: None
+started = time.monotonic()
+try:
+    module.bounded_command_output(["git", "status"], Budget())
+except RuntimeError as error:
+    if "cleanup timed out before the child could be reaped" not in str(error):
+        raise
+else:
+    raise AssertionError("bounded command unexpectedly succeeded")
+finally:
+    os.close(write_fd)
+elapsed = time.monotonic() - started
+if elapsed >= 2:
+    raise AssertionError(f"bounded reap took {elapsed:.3f} seconds")
+if process.waits != [0.5, 0.1]:
+    raise AssertionError(f"unexpected reap attempts: {process.waits}")
+PY
+  then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ] || fail "bounded command reap regression failed: $(cat "$output")"
+  pass "bounded command cleanup never waits indefinitely to reap"
+}
+
 test_continuation_fingerprint_deadline_covers_ordinary_paths() {
   local id rec ready proceed output pid status
   id=account-cont-path-timeout-z36a
@@ -4845,6 +4915,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-38 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-39 ]; then
+  run_isolated_test test_submodule_timeout_terminates_process_group
+  run_isolated_test test_bounded_command_reap_never_waits_unbounded
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
@@ -4932,6 +5008,7 @@ run_isolated_test test_continuation_revalidates_dirty_tracked_content_before_ins
 run_isolated_test test_continuation_revalidates_dirty_untracked_content_before_install
 run_isolated_test test_continuation_accepts_stable_tracked_deletion
 run_isolated_test test_continuation_fingerprint_deadline_covers_ordinary_paths
+run_isolated_test test_bounded_command_reap_never_waits_unbounded
 run_isolated_test test_continuation_deadline_starts_before_repository_enumeration
 run_isolated_test test_continuation_caps_repository_enumeration_output
 run_isolated_test test_continuation_deadline_covers_repository_parsing

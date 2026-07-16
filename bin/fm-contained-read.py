@@ -302,7 +302,7 @@ def bounded_command_output(command, budget):
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, command)
         return b"".join(output)
-    except BaseException:
+    except BaseException as error:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except OSError:
@@ -327,18 +327,27 @@ def bounded_command_output(command, budget):
                 process.kill()
             except OSError:
                 pass
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
+        if not bounded_process_wait(process, 0.5):
             try:
                 process.kill()
             except OSError:
                 pass
-            process.wait()
+            if not bounded_process_wait(process, 0.1):
+                raise RuntimeError(
+                    "repository command cleanup timed out before the child could be reaped"
+                ) from error
         raise
     finally:
         selector.close()
         process.stdout.close()
+
+
+def bounded_process_wait(process, timeout):
+    try:
+        process.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def fingerprint_submodule_records(root, paths, budget, output):
@@ -1844,12 +1853,17 @@ def main():
         fail(f"unknown contained read command: {sys.argv[1]}")
 
 
-try:
-    main()
-except (OSError, RuntimeError, ValueError) as error:
-    if isinstance(error, OSError) and error.errno == errno.ELOOP:
-        message = "source traversal encountered a symlink"
-    else:
-        message = str(error)
-    print(f"error: contained read failed: {message}", file=sys.stderr)
-    sys.exit(1)
+def run():
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError) as error:
+        if isinstance(error, OSError) and error.errno == errno.ELOOP:
+            message = "source traversal encountered a symlink"
+        else:
+            message = str(error)
+        print(f"error: contained read failed: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

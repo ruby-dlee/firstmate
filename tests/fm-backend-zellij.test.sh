@@ -248,6 +248,47 @@ test_target_state_distinguishes_absent_from_malformed_panes() {
   pass "Zellij target state distinguishes missing panes from malformed records"
 }
 
+test_target_state_follows_replacement_pane_in_expected_tab() {
+  local dir fb out scoped
+  dir="$TMP_ROOT/target-state-replacement"; mkdir -p "$dir/responses"
+  scoped=$(zellij_expected_scoped_title fm-replacement)
+  zellij_pane_response "$dir" 1 9 3
+  zellij_tab_response "$dir" 2 3 "$scoped"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "replacement Zellij pane probe failed"
+  [ "$out" = present ] || fail "matching replacement pane was classified $out instead of present"
+
+  dir="$TMP_ROOT/target-state-replacement-mismatch"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 9 4
+  zellij_tab_response "$dir" 2 4 fm-another-task
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "mismatched replacement Zellij pane probe failed"
+  [ "$out" = absent ] || fail "foreign replacement pane was classified $out instead of absent"
+
+  dir="$TMP_ROOT/target-state-replacement-malformed"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 9 3
+  printf '{bad\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "malformed replacement Zellij pane probe failed"
+  [ "$out" = unknown ] || fail "malformed replacement tab state was classified $out instead of unknown"
+  pass "Zellij target state follows replacement panes by task tab identity"
+}
+
 test_normalize_key() {
   ( . "$ROOT/bin/backends/zellij.sh"
     [ "$(fm_backend_zellij_normalize_key Enter)" = Enter ] || { echo "Enter failed" >&2; exit 1; }
@@ -1103,6 +1144,11 @@ test_scripts_reject_fm_target_label_mismatch() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_target_state_follows_replacement_pane_in_expected_tab
+  exit 0
+fi
+
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
 test_version_check_refuses_old_version
@@ -1111,6 +1157,7 @@ test_session_defaults_to_firstmate
 test_session_honors_override
 test_parse_target
 test_target_state_distinguishes_absent_from_malformed_panes
+test_target_state_follows_replacement_pane_in_expected_tab
 test_normalize_key
 test_scoped_title_uses_primary_home_label
 test_scoped_title_uses_secondmate_home_label

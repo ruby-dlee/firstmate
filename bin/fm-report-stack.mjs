@@ -12,6 +12,7 @@
 //        fm-report-stack.mjs list [--json]
 //        fm-report-stack.mjs path [<task-id>]
 //        fm-report-stack.mjs open [<task-id>]
+//        fm-report-stack.mjs prune
 //
 // FM_REPORT_STACK_ROOT overrides the default. When XDG_DATA_HOME is set, the
 // default is $XDG_DATA_HOME/firstmate/report-stack; otherwise it is
@@ -347,15 +348,6 @@ function escapeHtml(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
 
-function redactSensitive(value) {
-  return String(value)
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b/g, "[REDACTED TOKEN]")
-    .replace(/\b(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
-    .replace(/((["'])(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|passwd|secret|authorization|cookie)\2\s*:\s*)(["'])(?:\\.|(?!\3).)*\3/gi, "$1$3[REDACTED]$3")
-    .replace(/^(\s*(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|passwd|secret|authorization|cookie)\s*[:=]\s*).+$/gim, "$1[REDACTED]");
-}
-
 function safeHttpUrl(value) {
   if (!value) return "";
   try {
@@ -621,9 +613,19 @@ function readManifests() {
   if (!fs.existsSync(entriesDir)) return [];
   return fs.readdirSync(entriesDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => path.join(entriesDir, entry.name, "manifest.json"))
-    .filter((file) => fs.existsSync(file))
-    .map((file) => JSON.parse(readBoundedRegularFile(file, manifestLimit, "report manifest")))
+    .map((entry) => {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.name)) {
+        throw new Error(`invalid report entry id at ${path.join(entriesDir, entry.name)}`);
+      }
+      const file = path.join(entriesDir, entry.name, "manifest.json");
+      if (!fs.existsSync(file)) return undefined;
+      const manifest = JSON.parse(readBoundedRegularFile(file, manifestLimit, "report manifest"));
+      if (manifest.reportId !== entry.name) {
+        throw new Error(`report manifest identity mismatch at ${file}`);
+      }
+      return manifest;
+    })
+    .filter(Boolean)
     .sort((a, b) => b.completedAt.localeCompare(a.completedAt));
 }
 
@@ -772,10 +774,10 @@ function publish(taskId, legacy) {
     const sourceName = meta.kind === "scout" ? "report.md" : "completion.md";
     const sourceFile = path.join(taskData, sourceName);
     const statusFile = path.join(stateDir, `${taskId}.status`);
-    const status = redactSensitive(readArtifact(statusFile, stateRoot, "status trail", {
+    const status = readArtifact(statusFile, stateRoot, "status trail", {
       maxBytes: informationalTrailLimit,
       truncate: "tail",
-    }) || "");
+    }) || "";
     const id = stableReportId(taskId);
     const destination = path.join(entriesDir, id);
     const previous = path.join(entriesDir, `.${id}.previous`);
@@ -790,13 +792,13 @@ function publish(taskId, legacy) {
     fs.mkdirSync(staged, { mode: 0o700 });
     try {
       const taskArtifacts = snapshotTaskArtifacts(dataRoot, taskId, sourceName, staged, sourceFile);
-      const brief = redactSensitive(taskArtifacts.brief);
+      const brief = taskArtifacts.brief;
       const source = taskArtifacts.source;
       const visuals = taskArtifacts.visuals;
       let markdown;
       if (source !== undefined) {
         if (meta.report_required === "1") requireCompletionSections(source, sourceFile, taskId);
-        markdown = redactSensitive(source);
+        markdown = source;
       } else if (legacy && meta.report_required !== "1") markdown = `# ${titleFromBrief(taskId, brief)}\n\n## Summary\n\n${lastStatus(status)}\n\n## Preserved trail\n\nThis compatibility report was synthesized for a task created before completion reports were required.\nSee the attached task brief and status trail for details.\n`;
       else throw new Error(`required completion report is missing at ${sourceFile}`);
       if (!markdown.trim()) throw new Error(`completion report is empty at ${sourceFile}`);
@@ -913,6 +915,8 @@ try {
     });
     execFileSync(process.platform === "darwin" ? "open" : "xdg-open", [target], { stdio: "ignore" });
     console.log(target);
+  } else if (command === "prune") {
+    withLock(() => {});
   } else {
     fail(`unknown command: ${command}`);
   }

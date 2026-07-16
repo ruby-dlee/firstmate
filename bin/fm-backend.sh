@@ -718,7 +718,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # present, absent, or unknown. Callers may release an external lease only on
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes pane_record tabs tab_id scoped count
+  local backend=$1 target=$2 expected_label=${3:-} out identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id
   local workspace surface workspaces workspace_record title_record title expected_title resolved_workspace
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" 2>/dev/null; then
@@ -804,14 +804,8 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
       pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$pane" \
         '[.[] | select((.id | tostring) == $pane and .is_plugin == false)] | first // null' 2>/dev/null) \
         || { printf 'unknown'; return 0; }
-      if [ "$pane_record" = null ]; then
-        printf 'absent'
-        return 0
-      fi
-      tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id | tostring' 2>/dev/null) \
-        || { printf 'unknown'; return 0; }
       if [ -z "$expected_label" ]; then
-        printf 'present'
+        if [ "$pane_record" = null ]; then printf 'absent'; else printf 'present'; fi
         return 0
       fi
       if ! tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
@@ -827,15 +821,41 @@ fm_backend_target_state() {  # <backend> <target> [expected-label]
         return 0
       fi
       scoped=$(fm_backend_zellij_scoped_title "$expected_label")
-      if printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" --arg want "$scoped" \
-        'any(.[]?; (.tab_id | tostring) == $tab and .name == $want)' >/dev/null 2>&1; then
-        printf 'present'
+      scoped_count=$(printf '%s\n' "$tabs" | jq -r --arg want "$scoped" \
+        '[.[]? | select(.name == $want)] | length' 2>/dev/null) || { printf 'unknown'; return 0; }
+      case "$scoped_count" in
+        1)
+          expected_tab_id=$(printf '%s\n' "$tabs" | jq -r --arg want "$scoped" \
+            '[.[]? | select(.name == $want)] | first | .tab_id | tostring' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
+          ;;
+        0)
+          count=$(printf '%s\n' "$tabs" | jq -r --arg want "$expected_label" \
+            '[.[]? | select(.name == $want)] | length' 2>/dev/null) || { printf 'unknown'; return 0; }
+          case "$count" in
+            1)
+              expected_tab_id=$(printf '%s\n' "$tabs" | jq -r --arg want "$expected_label" \
+                '[.[]? | select(.name == $want)] | first | .tab_id | tostring' 2>/dev/null) \
+                || { printf 'unknown'; return 0; }
+              ;;
+            0) expected_tab_id= ;;
+            *) printf 'unknown'; return 0 ;;
+          esac
+          ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      if [ "$pane_record" = null ]; then
+        if [ -n "$expected_tab_id" ] && printf '%s\n' "$panes" | jq -e --arg tab "$expected_tab_id" \
+          'any(.[]?; .is_plugin == false and (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
+          printf 'present'
+        else
+          printf 'absent'
+        fi
         return 0
       fi
-      count=$(printf '%s\n' "$tabs" | jq -r --arg want "$expected_label" \
-        '[.[]? | select(.name == $want)] | length' 2>/dev/null) || { printf 'unknown'; return 0; }
-      if [ "$count" = 1 ] && printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" --arg want "$expected_label" \
-        'any(.[]?; (.tab_id | tostring) == $tab and .name == $want)' >/dev/null 2>&1; then
+      tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id | tostring' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if [ -n "$expected_tab_id" ] && [ "$tab_id" = "$expected_tab_id" ]; then
         printf 'present'
       else
         printf 'unknown'

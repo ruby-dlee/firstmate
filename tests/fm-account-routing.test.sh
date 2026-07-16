@@ -243,6 +243,14 @@ case "$*" in
       touch "$FM_FAKE_AF_SESSION_REFRESHED"
     fi
     [ -z "${FM_FAKE_AF_SESSION_MARKER:-}" ] || touch "$FM_FAKE_AF_SESSION_MARKER"
+    if [ -n "${FM_FAKE_AF_SESSION_CHILD_PID_FILE:-}" ]; then
+      (
+        trap '' HUP INT TERM
+        while :; do sleep 1; done
+      ) &
+      printf '%s\n' "$!" > "$FM_FAKE_AF_SESSION_CHILD_PID_FILE"
+      wait "$!"
+    fi
     if [ -n "${FM_FAKE_AF_SESSION_SLEEP:-}" ] \
       && { [ -z "${FM_FAKE_AF_SESSION_SLEEP_TASK:-}" ] || [ "$task" = "$FM_FAKE_AF_SESSION_SLEEP_TASK" ]; }; then
       sleep "$FM_FAKE_AF_SESSION_SLEEP"
@@ -1137,6 +1145,48 @@ test_session_sync_all_rotates_a_bounded_parallel_batch() {
   pass "sync-all limits fanout and rotates fairly across managed tasks"
 }
 
+test_session_sync_all_signals_terminate_worker_groups() {
+  local rec id sync_pid child_pid status marker child_state
+  id=account-sync-signal-a1
+  rec=$(make_case sync-all-signal claude "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "account_pool=claude-crew" \
+    "account_profile=claude-2" \
+    "account_task=$id" \
+    "account_attempt=attempt-$id"
+  marker="$CASE_DIR/session-child.pid"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_SESSION_CHILD_PID_FILE="$marker" FM_ACCOUNT_SESSION_TASK_TIMEOUT=30 \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all >/dev/null 2>&1 &
+  sync_pid=$!
+  for _ in $(seq 1 100); do
+    [ -s "$marker" ] && break
+    sleep 0.05
+  done
+  [ -s "$marker" ] || { kill "$sync_pid" 2>/dev/null || true; fail "sync worker descendant never started"; }
+  child_pid=$(cat "$marker")
+  kill -TERM "$sync_pid"
+  wait "$sync_pid"
+  status=$?
+  [ "$status" -eq 143 ] || fail "TERM did not stop the sync sweep with signal status (exit $status)"
+  for _ in $(seq 1 40); do
+    child_state=$(ps -p "$child_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
+    case "$child_state" in ''|Z*) break ;; esac
+    sleep 0.05
+  done
+  child_state=$(ps -p "$child_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
+  case "$child_state" in ''|Z*) ;; *) fail "sync sweep left its Agent Fleet descendant running (state $child_state)" ;; esac
+  assert_absent "$HOME_DIR/state/.account-meta-session-sync-all.lock" "signaled sync sweep retained its sweep lock"
+  pass "sync-all signals terminate and reap complete worker groups"
+}
+
 test_session_sync_releases_metadata_lock_during_provider_query() {
   local id rec meta_tmp marker sync_pid sync_rc
   id=account-sync-lock-z9e
@@ -1419,7 +1469,7 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }
 
-test_unenforced_secondmate_convergence_failures_warn_and_launch() {
+test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   local id rec sm out status
   id=account-secondmate-observe-inherit-z11f
   rec=$(make_case secondmate-observe-inherit claude)
@@ -1431,9 +1481,23 @@ test_unenforced_secondmate_convergence_failures_warn_and_launch() {
   mkdir "$sm/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -eq 0 ] || fail "observe secondmate did not preserve warn-and-launch behavior: $out"
+  [ "$status" -ne 0 ] || fail "observe secondmate launched without authoritative routing inheritance"
   assert_contains "$out" "config inheritance failed" "observe convergence failure was not warned"
-  assert_regex '^new-window ' "$TMUX_LOG" "observe convergence warning blocked launch"
+  assert_contains "$out" "account-routing-mode inheritance did not succeed" "observe convergence failure did not block on policy authority"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "observe convergence failure created an endpoint"
+
+  id=account-secondmate-off-stale-z11h
+  rec=$(make_case secondmate-off-stale claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+  mkdir "$sm/config/account-routing-mode"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "off downgrade launched while stale child routing policy could not be removed"
+  assert_contains "$out" "account-routing-mode inheritance did not succeed" "off downgrade did not block on policy authority"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "off downgrade convergence failure created an endpoint"
 
   id=account-secondmate-off-incapable-z11g
   rec=$(make_case secondmate-off-incapable claude)
@@ -1447,7 +1511,7 @@ test_unenforced_secondmate_convergence_failures_warn_and_launch() {
   [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"
   assert_contains "$out" "lacks Agent Fleet routing support" "off capability gap was not warned"
   assert_regex '^new-window ' "$TMUX_LOG" "off capability warning blocked launch"
-  pass "off and observe secondmates warn but launch through convergence gaps"
+  pass "secondmate launches require authoritative routing policy in every mode"
 }
 
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
@@ -1714,6 +1778,13 @@ test_malformed_routing_mode_fails_closed() {
   [ "$status" -ne 0 ] || fail "multi-value routing mode silently fell back to off"
   assert_not_grep '^new-window ' "$TMUX_LOG" "invalid routing mode created an endpoint"
   assert_contains "$out" "must contain exactly one value" "invalid routing mode error was suppressed"
+  printf 'en force\n' > "$HOME_DIR/config/account-routing-mode"
+  clear_case_logs
+  out=$(run_spawn "$id" "$PROJ_DIR")
+  status=$?
+  [ "$status" -ne 0 ] || fail "internally spaced routing mode silently activated enforce"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "internally spaced routing mode created an endpoint"
+  assert_contains "$out" "invalid account routing mode 'en force'" "internal policy whitespace was not preserved for validation"
   rm -f "$HOME_DIR/config/account-routing-mode"
   mkdir "$HOME_DIR/config/account-routing-mode"
   clear_case_logs
@@ -2767,6 +2838,67 @@ PY
   pass "continuation traverses descendants relative to its pinned root"
 }
 
+test_continuation_pins_one_root_for_the_complete_task_snapshot() {
+  local id rec task_dir moved outside hook marker packet
+  id=account-continuation-one-root-z28i
+  rec=$(make_case continuation-one-root claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "single-root continuation precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
+  moved="$CASE_DIR/pinned-one-root-task"
+  outside="$CASE_DIR/outside-one-root-task"
+  hook="$CASE_DIR/continuation-one-root-hook"
+  marker="$CASE_DIR/continuation-one-root-swapped"
+  mkdir -p "$outside" "$hook"
+  printf 'inside pinned decision\n' > "$task_dir/decisions.md"
+  printf 'inside pinned steering\n' > "$task_dir/steering.md"
+  printf 'outside decision\n' > "$outside/decisions.md"
+  printf 'outside steering\n' > "$outside/steering.md"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+original_open = os.open
+swapped = False
+
+
+def guarded_open(file, flags, mode=0o777, *, dir_fd=None):
+    global swapped
+    if not swapped and dir_fd is not None and file == "decisions.md":
+        swapped = True
+        descriptor = original_open(file, flags, mode, dir_fd=dir_fd)
+        os.rename(os.environ["FM_CONTINUATION_SWAP_PARENT"], os.environ["FM_CONTINUATION_SWAP_MOVED"])
+        os.rename(os.environ["FM_CONTINUATION_SWAP_OUTSIDE"], os.environ["FM_CONTINUATION_SWAP_PARENT"])
+        with open(os.environ["FM_CONTINUATION_SWAP_MARKER"], "w", encoding="utf-8") as marker:
+            marker.write("swapped\n")
+        return descriptor
+    if swapped and dir_fd is not None and file == "steering.md":
+        try:
+            return original_open(file, flags, mode, dir_fd=dir_fd)
+        finally:
+            os.rename(os.environ["FM_CONTINUATION_SWAP_PARENT"], os.environ["FM_CONTINUATION_SWAP_OUTSIDE"])
+            os.rename(os.environ["FM_CONTINUATION_SWAP_MOVED"], os.environ["FM_CONTINUATION_SWAP_PARENT"])
+    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+
+os.open = guarded_open
+PY
+  packet=$(PYTHONPATH="$hook" FM_CONTINUATION_SWAP_PARENT="$task_dir" \
+    FM_CONTINUATION_SWAP_MOVED="$moved" FM_CONTINUATION_SWAP_OUTSIDE="$outside" \
+    FM_CONTINUATION_SWAP_MARKER="$marker" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LOG="$TMUX_LOG" \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" one-root-swap) \
+    || fail "continuation did not hold one task root across its complete snapshot"
+  assert_present "$marker" "single-root continuation swap hook did not run"
+  assert_grep 'inside pinned decision' "$packet" "single-root snapshot lost the original decision"
+  assert_grep 'inside pinned steering' "$packet" "single-root snapshot mixed in replacement steering"
+  assert_not_grep 'outside decision' "$packet" "single-root snapshot read a replacement decision"
+  assert_not_grep 'outside steering' "$packet" "single-root snapshot read replacement steering"
+  pass "continuation pins one task root for its complete artifact snapshot"
+}
+
 test_continuation_rejects_task_source_ancestor_swap() {
   local id rec task_dir moved outside source hook marker out status
   id=account-continuation-task-parent-z28e
@@ -3397,6 +3529,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_continuation_pins_one_root_for_the_complete_task_snapshot
+  test_session_sync_all_signals_terminate_worker_groups
+  test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+  test_malformed_routing_mode_fails_closed
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -3434,7 +3574,7 @@ test_secondmate_pool_is_nonactivating_and_noninherited
 test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
 test_explicit_secondmate_route_preserves_ambient_primary_enforce
 test_enforced_secondmate_requires_routing_inheritance_and_capable_home
-test_unenforced_secondmate_convergence_failures_warn_and_launch
+test_secondmate_routing_inheritance_is_authoritative_for_every_mode
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt

@@ -1023,7 +1023,7 @@ if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
 if [ "$KIND" = secondmate ]; then
-  ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 "$NO_ACCOUNT_ROUTING") || exit 1
+  ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 1
 fi
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
@@ -1413,18 +1413,25 @@ if [ "$KIND" = secondmate ]; then
     propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config"; then
     echo "warning: secondmate $ID config inheritance failed for $PROJ_ABS/config" >&2
   fi
-  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-    if ! secondmate_routing_config_inherited "$CONFIG_INHERIT_REPORT_TMP"; then
-      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: account-routing-mode inheritance did not succeed. Reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+  if ! secondmate_routing_config_inherited "$CONFIG_INHERIT_REPORT_TMP"; then
+    echo "error: refusing secondmate launch for $PROJ_ABS: account-routing-mode inheritance did not succeed. Reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+    exit 1
+  fi
+  if sm_inherited_routing_mode=$(fm_account_read_single_value "$PROJ_ABS/config/account-routing-mode" 2>/dev/null); then
+    :
+  else
+    sm_routing_status=$?
+    [ "$sm_routing_status" -eq 1 ] || {
+      echo "error: refusing secondmate launch for $PROJ_ABS: the inherited account-routing-mode is unreadable. Run bin/fm-config-push.sh and retry." >&2
       exit 1
-    fi
-    if [ "$ACCOUNT_PRIMARY_MODE" = enforce ]; then
-      sm_inherited_routing_mode=$(fm_account_read_single_value "$PROJ_ABS/config/account-routing-mode" 2>/dev/null || true)
-      if [ "$sm_inherited_routing_mode" != enforce ]; then
-        echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the primary's enforced routing mode is not active in the home. Set config/account-routing-mode to enforce in the primary, run bin/fm-config-push.sh, and retry." >&2
-        exit 1
-      fi
-    fi
+    }
+    sm_inherited_routing_mode=off
+  fi
+  if [ "$sm_inherited_routing_mode" != "$ACCOUNT_PRIMARY_MODE" ]; then
+    echo "error: refusing secondmate launch for $PROJ_ABS: the primary's $ACCOUNT_PRIMARY_MODE routing mode is not authoritative in the home. Run bin/fm-config-push.sh and retry." >&2
+    exit 1
+  fi
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
       echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
       exit 1

@@ -27,6 +27,7 @@ LOG_SNAPSHOT_TMP=
 META_SNAPSHOT_TMP=
 BRIEF_SNAPSHOT_TMP=
 NO_MISTAKES_STATUS_TMP=
+TASK_SNAPSHOT_DIR=
 MAX_PACKET_BYTES=65536
 MAX_SNAPSHOT_BYTES=8192
 NO_MISTAKES_STATUS_TIMEOUT=${FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT:-5}
@@ -37,6 +38,7 @@ cleanup_packet_tmp() {
   [ -z "$META_SNAPSHOT_TMP" ] || rm -f "$META_SNAPSHOT_TMP"
   [ -z "$BRIEF_SNAPSHOT_TMP" ] || rm -f "$BRIEF_SNAPSHOT_TMP"
   [ -z "$NO_MISTAKES_STATUS_TMP" ] || rm -f "$NO_MISTAKES_STATUS_TMP"
+  [ -z "$TASK_SNAPSHOT_DIR" ] || rm -rf "$TASK_SNAPSHOT_DIR"
 }
 trap cleanup_packet_tmp EXIT
 # shellcheck source=bin/fm-account-routing-lib.sh
@@ -104,18 +106,36 @@ BRANCH=$(git -C "$WORKTREE_REAL" branch --show-current 2>/dev/null)
 TASK_DIR=$(fm_account_task_dir "$DATA" "$ID" create) \
   || { echo "error: continuation task directory is unsafe for $ID" >&2; exit 1; }
 
+TASK_SNAPSHOT_DIR=$(mktemp -d "$STATE/.continuation-task-$ID.XXXXXX") \
+  || { echo "error: cannot stage continuation task snapshot for $ID" >&2; exit 1; }
+TASK_SNAPSHOT_SOURCES=(
+  brief.md report.md completion.md decisions.md steering.md steering-pending.md
+  steering-unconfirmed.md side-effects.md do-not-rerun.md next-action.md checkpoint.md
+  handoff.md recalled.md transcript-summary.md account-attempts.md
+)
+if ! node "$CONTAINED_READ" snapshot "$TASK_DIR" "$TASK_SNAPSHOT_DIR" 1048576 "${TASK_SNAPSHOT_SOURCES[@]}"; then
+  echo "error: cannot safely snapshot continuation task artifacts for $ID" >&2
+  exit 1
+fi
+
 if [ "$KIND" = secondmate ] && [ -e "$WORKTREE_REAL/data/charter.md" ]; then
   BRIEF_ROOT="$WORKTREE_REAL/data"
   BRIEF="$BRIEF_ROOT/charter.md"
 else
-  BRIEF_ROOT=$TASK_DIR
-  BRIEF="$TASK_DIR/brief.md"
+  BRIEF_ROOT=
+  BRIEF=
 fi
-BRIEF_SNAPSHOT_TMP=$(mktemp "$TASK_DIR/.continuation-brief.XXXXXX") \
-  || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
-node "$CONTAINED_READ" "$BRIEF_ROOT" "$BRIEF" "$MAX_PACKET_BYTES" > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null \
-  && [ -s "$BRIEF_SNAPSHOT_TMP" ] \
-  || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+if [ -n "$BRIEF" ]; then
+  BRIEF_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-brief-$ID.XXXXXX") \
+    || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
+  node "$CONTAINED_READ" "$BRIEF_ROOT" "$BRIEF" "$MAX_PACKET_BYTES" > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null \
+    && [ -s "$BRIEF_SNAPSHOT_TMP" ] \
+    || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+else
+  BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
+  [ -s "$BRIEF_SNAPSHOT_TMP" ] \
+    || { echo "error: no safe non-empty original brief or charter for continuation of $ID" >&2; exit 1; }
+fi
 
 PACKET="$TASK_DIR/continuation-$ATTEMPT.md"
 PACKET_TMP=$(mktemp "$TASK_DIR/.continuation-$ATTEMPT.XXXXXX") \
@@ -258,6 +278,12 @@ append_file_section() {  # <heading> <root> <file>
   return "$rc"
 }
 
+append_task_snapshot() {  # <heading> <snapshot-index>
+  local heading=$1 source_tmp="$TASK_SNAPSHOT_DIR/$2.snapshot"
+  [ -f "$source_tmp" ] || return 0
+  append_staged_file_section "$heading" "$source_tmp"
+}
+
 {
   printf '# Provider-neutral continuation for %s\n\n' "$ID"
   printf 'This is a fresh provider session for the same Firstmate task, not a replay from the beginning.\n'
@@ -310,20 +336,20 @@ append_snapshot_section "No-mistakes state" "$NO_MISTAKES_STATUS_TMP"
 
 append_staged_file_section "Original brief or charter" "$BRIEF_SNAPSHOT_TMP"
 append_file_section "Wake-event and progress status" "$STATE" "$STATE/$ID.status"
-append_file_section "Task report" "$TASK_DIR" "$TASK_DIR/report.md"
-append_file_section "Completion report" "$TASK_DIR" "$TASK_DIR/completion.md"
-append_file_section "Decisions" "$TASK_DIR" "$TASK_DIR/decisions.md"
-append_file_section "Steering trail" "$TASK_DIR" "$TASK_DIR/steering.md"
-append_file_section "Pending steering audit" "$TASK_DIR" "$TASK_DIR/steering-pending.md"
-append_file_section "Unconfirmed steering" "$TASK_DIR" "$TASK_DIR/steering-unconfirmed.md"
-append_file_section "Completed side effects" "$TASK_DIR" "$TASK_DIR/side-effects.md"
-append_file_section "Do not rerun" "$TASK_DIR" "$TASK_DIR/do-not-rerun.md"
-append_file_section "Next action" "$TASK_DIR" "$TASK_DIR/next-action.md"
-append_file_section "Checkpoint" "$TASK_DIR" "$TASK_DIR/checkpoint.md"
-append_file_section "Handoff" "$TASK_DIR" "$TASK_DIR/handoff.md"
-append_file_section "Recalled context" "$TASK_DIR" "$TASK_DIR/recalled.md"
-append_file_section "Provider transcript summary" "$TASK_DIR" "$TASK_DIR/transcript-summary.md"
-append_file_section "Account attempt lineage" "$TASK_DIR" "$TASK_DIR/account-attempts.md"
+append_task_snapshot "Task report" 1
+append_task_snapshot "Completion report" 2
+append_task_snapshot "Decisions" 3
+append_task_snapshot "Steering trail" 4
+append_task_snapshot "Pending steering audit" 5
+append_task_snapshot "Unconfirmed steering" 6
+append_task_snapshot "Completed side effects" 7
+append_task_snapshot "Do not rerun" 8
+append_task_snapshot "Next action" 9
+append_task_snapshot "Checkpoint" 10
+append_task_snapshot "Handoff" 11
+append_task_snapshot "Recalled context" 12
+append_task_snapshot "Provider transcript summary" 13
+append_task_snapshot "Account attempt lineage" 14
 
 packet_check_budget
 if [ -L "$PACKET" ] || { [ -e "$PACKET" ] && [ ! -f "$PACKET" ]; }; then

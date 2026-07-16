@@ -270,6 +270,38 @@ def command_snapshot_task_fd(arguments):
         os.close(task)
 
 
+def command_snapshot_files_fd(arguments):
+    if len(arguments) < 2:
+        fail("usage: fm-contained-read.py snapshot-files-fd <maximum-bytes> <source>...")
+    maximum = int(arguments[0])
+    if maximum < 0:
+        fail("invalid contained snapshot limit")
+    root = checked_root(3)
+    destination = checked_root(4)
+    for index, relative in enumerate(arguments[1:]):
+        if len(components(relative)) != 1:
+            fail("snapshot sources must be single safe components")
+        item = read_relative(root, relative, maximum, "strict", optional=True)
+        if item is None:
+            continue
+        if item["oversized"]:
+            fail(f"source exceeds {maximum} bytes: {relative}")
+        name = f"{index}.snapshot"
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=destination,
+        )
+        try:
+            content = item["content"]
+            written = 0
+            while written < len(content):
+                written += os.write(descriptor, content[written:])
+        finally:
+            os.close(descriptor)
+
+
 def main():
     if len(sys.argv) < 2:
         fail("contained read command is required")
@@ -277,6 +309,8 @@ def main():
         command_read_fd(sys.argv[2:])
     elif sys.argv[1] == "snapshot-task-fd":
         command_snapshot_task_fd(sys.argv[2:])
+    elif sys.argv[1] == "snapshot-files-fd":
+        command_snapshot_files_fd(sys.argv[2:])
     else:
         fail(f"unknown contained read command: {sys.argv[1]}")
 

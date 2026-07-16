@@ -105,6 +105,9 @@ CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 ACCOUNT_SESSION_SYNC_INTERVAL=${FM_ACCOUNT_SESSION_SYNC_INTERVAL:-60}
 ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
+ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT:-$((ACCOUNT_SESSION_SYNC_TIMEOUT + 3))}
+REPORT_RETENTION_INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-86400}
+REPORT_RETENTION_TIMEOUT=${FM_REPORT_RETENTION_TIMEOUT:-30}
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -476,8 +479,17 @@ sync_account_sessions_if_due() {
   local cadence="$STATE/.last-account-session-sync"
   marker_due "$cadence" "$ACCOUNT_SESSION_SYNC_INTERVAL" "watcher cadence" || return 0
   safe_touch_marker_or_log "$cadence" "watcher cadence" || true
-  FM_ACCOUNT_SESSION_TASK_TIMEOUT="$ACCOUNT_SESSION_SYNC_TIMEOUT" \
+  FM_ACCOUNT_SESSION_QUERY_TIMEOUT="$ACCOUNT_SESSION_SYNC_TIMEOUT" \
+    FM_ACCOUNT_SESSION_TASK_TIMEOUT="$ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT" \
     "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
+}
+
+prune_reports_if_due() {
+  local cadence="$STATE/.last-report-retention"
+  marker_due "$cadence" "$REPORT_RETENTION_INTERVAL" "report retention cadence" || return 0
+  if run_bounded "$REPORT_RETENTION_TIMEOUT" "$FM_ROOT/bin/fm-report-stack.mjs" prune >/dev/null 2>&1; then
+    safe_touch_marker_or_log "$cadence" "report retention cadence" || true
+  fi
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the
@@ -689,6 +701,8 @@ while :; do
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
+
+  prune_reports_if_due
 
   # A managed provider's SessionStart hook may race the initial spawn return.
   # Reconcile only metas still missing provider_session_id; failures stay

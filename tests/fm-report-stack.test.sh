@@ -63,16 +63,12 @@ test_publish_ship_with_visual() {
   if grep -R -F 'must-not-leak' "$STACK" >/dev/null 2>&1; then
     fail "provider session id leaked into the report stack"
   fi
-  if grep -R -F 'must-also-not-leak' "$STACK" >/dev/null 2>&1; then
-    fail "credential-like report text was not redacted"
-  fi
-  assert_grep 'password=[REDACTED]' "$(dirname "$entry")/report.md" "report redaction left no visible marker"
-  if grep -E 'aws-secret-value|db-secret-value|slack-secret-value|url-secret|json-password-secret|json-access-secret' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
-    fail "prefixed or URL credentials survived report redaction"
-  fi
-  assert_grep 'AWS_SECRET_ACCESS_KEY=[REDACTED]' "$(dirname "$entry")/report.md" "prefixed access-key redaction left no marker"
-  assert_grep 'https://[REDACTED]@example.invalid/path' "$(dirname "$entry")/report.md" "credential URL redaction left no marker"
-  assert_grep '"password":"[REDACTED]","access_token":"[REDACTED]","safe":"visible"' "$(dirname "$entry")/report.md" "inline JSON credential redaction damaged safe fields"
+  cmp -s "$HOME_DIR/data/$id/completion.md" "$(dirname "$entry")/report.md" \
+    || fail "published report markdown did not preserve its source bytes"
+  cmp -s "$HOME_DIR/data/$id/brief.md" "$(dirname "$entry")/brief.md" \
+    || fail "published task brief did not preserve its source bytes"
+  cmp -s "$HOME_DIR/state/$id.status" "$(dirname "$entry")/status.log" \
+    || fail "published status trail did not preserve its source bytes"
 
   manifest="$(dirname "$entry")/manifest.json"
   report_id=$(sed -n 's/.*"reportId": "\([^"]*\)".*/\1/p' "$manifest")
@@ -91,6 +87,46 @@ test_publish_ship_with_visual() {
   count=$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l | tr -d ' ')
   [ "$count" = 1 ] || fail "report retry created duplicate entries (count=$count)"
   pass "report stack replaces corrected ship reports without changing stable identity"
+}
+
+test_report_artifacts_remain_verbatim_across_key_shaped_content() {
+  local id=report-verbatim-key-a1b source entry
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+-----BEGIN PRIVATE KEY-----
+Preserve this trusted internal artifact exactly.
+
+## What changed
+
+Recorded work.
+
+## Verification
+
+Evidence checked.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+-----END PRIVATE KEY-----
+EOF
+  run_stack publish "$id" >/dev/null || fail "key-shaped report artifact failed publication"
+  entry=$(run_stack path "$id") || fail "key-shaped report artifact path failed"
+  cmp -s "$source" "$(dirname "$entry")/report.md" \
+    || fail "key-shaped report artifact was inspected or transformed"
+  pass "report stack preserves trusted internal artifact bytes verbatim"
 }
 
 test_report_links_reject_credentials_and_encode_visual_paths() {
@@ -539,6 +575,53 @@ EOF
   pass "report parsing excludes raw HTML nested in Markdown containers"
 }
 
+test_container_scoped_fences_do_not_close_from_top_level() {
+  local container id source out status heading
+  for container in quote list; do
+    id="report-container-scope-$container-b3m"
+    write_task "$id" ship
+    source="$HOME_DIR/data/$id/completion.md"
+    if [ "$container" = quote ]; then
+      cat > "$source" <<'EOF'
+# Completion
+
+> ```text
+> Nested example.
+```text
+## Summary
+## What changed
+## Verification
+## Visual evidence
+## Artifacts
+## Follow-ups
+```
+EOF
+    else
+      cat > "$source" <<'EOF'
+# Completion
+
+- ```text
+  Nested example.
+```text
+## Summary
+## What changed
+## Verification
+## Visual evidence
+## Artifacts
+## Follow-ups
+```
+EOF
+    fi
+    out=$(run_stack publish "$id" 2>&1)
+    status=$?
+    [ "$status" -ne 0 ] || fail "$container-scoped fence was closed by a top-level fence"
+    for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+      assert_contains "$out" "$heading" "$container fence-scope failure omitted missing heading $heading"
+    done
+  done
+  pass "report parsing keeps fenced blocks scoped to their Markdown containers"
+}
+
 test_indented_pseudo_closers_do_not_end_fences() {
   local id source out status heading
 
@@ -969,6 +1052,61 @@ test_completed_reports_have_a_thirty_day_retention_ceiling() {
   pass "report stack prunes completed entries at the 30-day ceiling"
 }
 
+test_retention_binds_manifests_to_entry_directories() {
+  local old_id=report-retention-mismatch-old-k2g fresh_id=report-retention-mismatch-fresh-k2h old_entry fresh_entry manifest temp out status fresh_report_id
+  write_task "$old_id" ship
+  write_required_report "$HOME_DIR/data/$old_id/completion.md" "Expired mismatched report."
+  run_stack publish "$old_id" >/dev/null || fail "mismatched retention old publication failed"
+  old_entry=$(run_stack path "$old_id") || fail "mismatched retention old path failed"
+  write_task "$fresh_id" ship
+  write_required_report "$HOME_DIR/data/$fresh_id/completion.md" "Fresh protected report."
+  run_stack publish "$fresh_id" >/dev/null || fail "mismatched retention fresh publication failed"
+  fresh_entry=$(run_stack path "$fresh_id") || fail "mismatched retention fresh path failed"
+  manifest="$(dirname "$old_entry")/manifest.json"
+  fresh_report_id=$(basename "$(dirname "$fresh_entry")")
+  temp="$manifest.tmp"
+  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
+    -e "s/\"reportId\": \"[^\"]*\"/\"reportId\": \"$fresh_report_id\"/" "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  if out=$(run_stack prune 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention accepted a manifest bound to another entry"
+  assert_contains "$out" "report manifest identity mismatch" "retention mismatch refusal was unclear"
+  assert_present "$old_entry" "retention mismatch deleted the enclosing expired entry"
+  assert_present "$fresh_entry" "retention mismatch deleted the fresh entry named by the manifest"
+  rm -rf "$(dirname "$old_entry")"
+  pass "report retention binds every manifest to its enclosing entry"
+}
+
+test_watcher_periodically_owns_idle_report_retention() {
+  local old_id=report-retention-watch-old-k2i fresh_id=report-retention-watch-fresh-k2j old_entry fresh_entry manifest temp active
+  write_task "$old_id" ship
+  write_required_report "$HOME_DIR/data/$old_id/completion.md" "Watcher-expired report."
+  run_stack publish "$old_id" >/dev/null || fail "watch retention old publication failed"
+  old_entry=$(run_stack path "$old_id") || fail "watch retention old path failed"
+  write_task "$fresh_id" ship
+  write_required_report "$HOME_DIR/data/$fresh_id/completion.md" "Watcher-fresh report."
+  run_stack publish "$fresh_id" >/dev/null || fail "watch retention fresh publication failed"
+  fresh_entry=$(run_stack path "$fresh_id") || fail "watch retention fresh path failed"
+  manifest="$(dirname "$old_entry")/manifest.json"
+  temp="$manifest.tmp"
+  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
+  mv "$temp" "$manifest"
+  active="$STACK/entries/.watch-retention.999.tmp"
+  mkdir -p "$active"
+  printf 'active staging bytes\n' > "$active/pending.txt"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$HOME_DIR/state" FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=86400 FM_REPORT_RETENTION_TIMEOUT=5 bash -c '
+      . "$1/bin/fm-watch.sh"
+      prune_reports_if_due
+      prune_reports_if_due
+    ' _ "$ROOT" || fail "watcher-owned report retention failed"
+  assert_absent "$(dirname "$old_entry")" "watcher-owned retention kept an expired report"
+  assert_present "$fresh_entry" "watcher-owned retention removed a fresh report"
+  assert_present "$active/pending.txt" "watcher-owned retention touched active staging"
+  assert_present "$HOME_DIR/state/.last-report-retention" "watcher-owned retention did not persist its cadence"
+  pass "watcher supervision periodically owns idle report retention"
+}
+
 test_retention_restores_expired_entries_when_index_swap_fails() {
   local id=report-retention-rollback-k2f entry manifest temp out status previous
   write_task "$id" ship
@@ -1315,6 +1453,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_report_artifacts_remain_verbatim_across_key_shaped_content
+  test_container_scoped_fences_do_not_close_from_top_level
+  test_retention_binds_manifests_to_entry_directories
+  test_watcher_periodically_owns_idle_report_retention
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_required_sections_fail_actionably
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -1327,6 +1473,7 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
 fi
 
 test_publish_ship_with_visual
+test_report_artifacts_remain_verbatim_across_key_shaped_content
 test_report_links_reject_credentials_and_encode_visual_paths
 test_pr_url_strips_query_and_fragment
 test_revision_fields_distinguish_pr_head_from_worktree_head
@@ -1340,6 +1487,7 @@ test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_nested_short_fences_do_not_satisfy_required_sections
 test_raw_html_does_not_satisfy_required_sections
+test_container_scoped_fences_do_not_close_from_top_level
 test_indented_pseudo_closers_do_not_end_fences
 test_required_headings_follow_commonmark_atx_rules
 test_invalid_backtick_info_string_does_not_open_fence
@@ -1356,6 +1504,9 @@ test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry
 test_aged_transactionless_staging_is_reclaimed
+test_completed_reports_have_a_thirty_day_retention_ceiling
+test_retention_binds_manifests_to_entry_directories
+test_watcher_periodically_owns_idle_report_retention
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

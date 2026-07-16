@@ -1097,19 +1097,21 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
 }
 
 test_account_session_sync_is_bounded_and_cadenced() {
-  local dir state fake_root sync_bin calls timeout_file elapsed_file sync_cadence_file elapsed count
+  local dir state fake_root sync_bin calls query_timeout_file task_timeout_file elapsed_file sync_cadence_file elapsed count
   dir=$(make_case account-session-sync); state="$dir/state"
   fake_root="$dir/root"
   sync_bin="$fake_root/bin/fm-account-session-sync.sh"
   calls="$dir/account-session-sync.calls"
-  timeout_file="$dir/account-session-sync.timeout"
+  query_timeout_file="$dir/account-session-sync-query.timeout"
+  task_timeout_file="$dir/account-session-sync-task.timeout"
   elapsed_file="$dir/account-session-sync.elapsed"
   sync_cadence_file="$state/.last-account-session-sync"
   mkdir -p "$fake_root/bin"
 cat > "$sync_bin" <<'SH'
 #!/usr/bin/env bash
 printf 'call\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
-printf '%s\n' "${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}" > "$FM_FAKE_ACCOUNT_SYNC_TIMEOUT"
+printf '%s\n' "${FM_ACCOUNT_SESSION_QUERY_TIMEOUT:-}" > "$FM_FAKE_ACCOUNT_SYNC_QUERY_TIMEOUT"
+printf '%s\n' "${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}" > "$FM_FAKE_ACCOUNT_SYNC_TASK_TIMEOUT"
 SH
   chmod +x "$sync_bin"
   # shellcheck disable=SC2030,SC2031
@@ -1119,7 +1121,8 @@ SH
     export FM_ACCOUNT_SESSION_SYNC_INTERVAL=60
     export FM_ACCOUNT_SESSION_SYNC_TIMEOUT=1
     export FM_FAKE_ACCOUNT_SYNC_CALLS="$calls"
-    export FM_FAKE_ACCOUNT_SYNC_TIMEOUT="$timeout_file"
+    export FM_FAKE_ACCOUNT_SYNC_QUERY_TIMEOUT="$query_timeout_file"
+    export FM_FAKE_ACCOUNT_SYNC_TASK_TIMEOUT="$task_timeout_file"
     # shellcheck source=bin/fm-watch.sh
     . "$WATCH"
     start=$(date +%s)
@@ -1131,7 +1134,8 @@ SH
   count=$(wc -l < "$calls" | tr -d '[:space:]')
   [ "$elapsed" -lt 5 ] || fail "account session synchronization stalled watcher progress for ${elapsed}s"
   [ "$count" -eq 1 ] || fail "account session synchronization ignored its persistent cadence (calls=$count)"
-  [ "$(cat "$timeout_file")" = 1 ] || fail "watcher did not pass its budget as a per-task sync timeout"
+  [ "$(cat "$query_timeout_file")" = 1 ] || fail "watcher did not pass the inner query timeout explicitly"
+  [ "$(cat "$task_timeout_file")" = 4 ] || fail "watcher did not give the full reconciliation explicit headroom"
   assert_present "$sync_cadence_file" "account session synchronization did not persist its cadence"
   pass "watcher delegates per-task sync budgets and separately cadences the sweep"
 }
@@ -1206,6 +1210,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   test_watcher_markers_refuse_symlinks
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_account_session_sync_is_bounded_and_cadenced
   exit 0
 fi
 

@@ -4,6 +4,7 @@ Firstmate publishes one durable report for every task created after the report-s
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation prunes completed entries whose recorded completion time is at least 30 days old.
+The normal supervision watcher also runs a bounded daily `prune` operation, so idle report stacks retain the same ceiling without requiring report access.
 
 ## Completion contract
 
@@ -26,12 +27,11 @@ Each entry contains a manifest, the completion report, the original task brief, 
 The entry id is deterministic from the canonical Firstmate home path plus task id, so publication retries replace the same entry instead of duplicating it.
 The manifest's task generation identity distinguishes a same-generation retry from a replacement generation, preserving prior completion provenance only when it still belongs to the current work.
 The manifest records routing labels useful for review but never stores provider session ids, auth material, environment values, or account-home contents.
-Text artifacts receive defense-in-depth redaction for common credential assignments, private keys, and token formats before storage.
-Task briefs and completion reports must still avoid secrets because no heuristic redactor can recognize every credential shape.
+Task briefs, status trails, completion reports, and attachments are trusted internal artifacts preserved verbatim without content inspection or heuristic transformation.
 Publication reads only real files and directories contained beneath the configured task roots, refusing symlinks and path escapes.
 It limits a completion report to 16 MiB and visual evidence to 20 MiB total, 512 entries, and 24 nested directory levels; oversized or unsafe input leaves the previous durable entry unchanged for repair and retry.
 
 The generated `index.html` is an offline searchable card stack with task-type filtering and links to each report page.
 Run `bin/fm-report-stack.mjs open` or use `/reports` to regenerate and open it.
-Use `list`, `path`, and `render` for terminal or automation access.
+Use `list`, `path`, `render`, and `prune` for terminal or automation access.
 Use `publish <id> --legacy` only when intentionally archiving a pre-cutover task; it synthesizes a compatibility report if no normal report source exists.

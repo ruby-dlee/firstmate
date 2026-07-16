@@ -20,9 +20,12 @@ function inspectRoot(root, expectedIdentity, expectedReal) {
 }
 
 function main() {
-  const root = path.resolve(process.argv[2] || "");
-  const file = path.resolve(process.argv[3] || "");
-  const maximum = Number(process.argv[4]);
+  const snapshotMode = process.argv[2] === "snapshot";
+  const offset = snapshotMode ? 1 : 0;
+  const root = path.resolve(process.argv[2 + offset] || "");
+  const file = path.resolve(process.argv[3 + offset] || "");
+  const maximum = Number(process.argv[4 + offset]);
+  const sources = process.argv.slice(5 + offset);
   if (!root || !file || !Number.isSafeInteger(maximum) || maximum < 0) fail("usage: fm-contained-read.cjs <root> <file> <maximum-bytes>");
 
   const rootStat = fs.lstatSync(root, { bigint: true });
@@ -34,6 +37,27 @@ function main() {
     const openedRoot = fs.fstatSync(rootFd, { bigint: true });
     if (!openedRoot.isDirectory() || identity(openedRoot) !== rootIdentity) fail("opened root identity differs");
     inspectRoot(root, rootIdentity, rootReal);
+    if (snapshotMode) {
+      if (sources.length === 0) fail("snapshot requires at least one source");
+      const destinationStat = fs.lstatSync(file, { bigint: true });
+      if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) fail("snapshot destination is not a real directory");
+      const destinationReal = fs.realpathSync(file);
+      const destinationIdentity = identity(destinationStat);
+      const destinationFd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      try {
+        const openedDestination = fs.fstatSync(destinationFd, { bigint: true });
+        if (!openedDestination.isDirectory() || identity(openedDestination) !== destinationIdentity) fail("opened snapshot destination identity differs");
+        const helper = path.join(__dirname, "fm-contained-read.py");
+        execFileSync("python3", [helper, "snapshot-files-fd", String(maximum), ...sources], {
+          stdio: ["ignore", "ignore", "pipe", rootFd, destinationFd],
+        });
+        inspectRoot(file, destinationIdentity, destinationReal);
+      } finally {
+        fs.closeSync(destinationFd);
+      }
+      inspectRoot(root, rootIdentity, rootReal);
+      return;
+    }
     const relative = path.relative(root, file);
     if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail("source escapes its root");
     const helper = path.join(__dirname, "fm-contained-read.py");

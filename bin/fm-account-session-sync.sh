@@ -101,13 +101,53 @@ if [ "$ALL" = 1 ]; then
   cleanup_all() {
     local pid
     for pid in "${ALL_PIDS[@]}"; do
-      kill "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${ALL_PIDS[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
     [ -z "$ALL_CURSOR_TMP" ] || rm -f "$ALL_CURSOR_TMP"
     fm_account_meta_lock_release "$ALL_LOCK" >/dev/null 2>&1 || true
   }
-  trap cleanup_all EXIT INT TERM HUP
+  trap cleanup_all EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  launch_group_bounded() {
+    perl -e '
+      use strict;
+      use warnings;
+      my $seconds = shift @ARGV;
+      my $pid = fork();
+      die "fork failed" unless defined $pid;
+      if (!$pid) {
+        setpgrp(0, 0);
+        exec @ARGV;
+        exit 127;
+      }
+      my $finish = sub {
+        my ($signal, $status) = @_;
+        kill $signal, -$pid;
+        select undef, undef, undef, 0.2;
+        kill "KILL", -$pid;
+        waitpid($pid, 0);
+        exit $status;
+      };
+      local $SIG{HUP} = sub { $finish->("HUP", 129) };
+      local $SIG{INT} = sub { $finish->("INT", 130) };
+      local $SIG{TERM} = sub { $finish->("TERM", 143) };
+      local $SIG{ALRM} = sub { $finish->("TERM", 124) };
+      alarm $seconds;
+      waitpid($pid, 0);
+      my $status = $?;
+      alarm 0;
+      kill "TERM", -$pid;
+      select undef, undef, undef, 0.2;
+      kill "KILL", -$pid;
+      exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+    ' "$@" </dev/null >/dev/null 2>&1 &
+    ALL_PIDS+=("$!")
+  }
   tasks=()
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
@@ -143,8 +183,7 @@ if [ "$ALL" = 1 ]; then
     index=$(((start + offset) % count))
     task=${tasks[$index]}
     launched+=("$task")
-    (trap - EXIT INT TERM HUP; fm_account_run_bounded "$ALL_TASK_TIMEOUT" "$0" "$task" >/dev/null 2>&1) &
-    ALL_PIDS+=("$!")
+    launch_group_bounded "$ALL_TASK_TIMEOUT" env FM_ACCOUNT_BOUND_INHERIT_GROUP=1 "$0" "$task"
   done
   ALL_CURSOR_TMP=$(mktemp "$STATE/.account-session-sync.cursor.XXXXXX") || exit 1
   printf '%s\n' "${launched[$((batch - 1))]}" > "$ALL_CURSOR_TMP" || exit 1

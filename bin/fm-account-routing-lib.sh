@@ -31,23 +31,24 @@ fm_account_shell_quote() {
 }
 
 fm_account_run_bounded() {
-  local seconds=$1 status
+  local seconds=$1 status foreground_flag=()
   shift
   case "$seconds" in ''|*[!0-9]*|0) return 2 ;; esac
+  [ "${FM_ACCOUNT_BOUND_INHERIT_GROUP:-0}" != 1 ] || foreground_flag=(--foreground)
   if command -v timeout >/dev/null 2>&1; then
-    timeout --kill-after=1 "$seconds" "$@" || {
+    timeout "${foreground_flag[@]}" --kill-after=1 "$seconds" "$@" || {
       status=$?
       [ "$status" -ne 137 ] || status=124
       return "$status"
     }
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout --kill-after=1 "$seconds" "$@" || {
+    gtimeout "${foreground_flag[@]}" --kill-after=1 "$seconds" "$@" || {
       status=$?
       [ "$status" -ne 137 ] || status=124
       return "$status"
     }
   elif command -v perl >/dev/null 2>&1; then
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$seconds" "$@"
+    perl -e 'my $t = shift; my $inherit = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0) unless $inherit; exec @ARGV } my $target = $inherit ? $pid : -$pid; local $SIG{ALRM} = sub { kill "TERM", $target; select undef, undef, undef, 0.2; kill "KILL", $target; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$seconds" "${FM_ACCOUNT_BOUND_INHERIT_GROUP:-0}" "$@"
   else
     return 127
   fi
@@ -133,7 +134,8 @@ fm_account_read_single_value() {  # <file>
   values=$(awk '
     {
       sub(/[[:space:]]*#.*/, "")
-      gsub(/[[:space:]]/, "")
+      sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+$/, "")
       if (length($0) > 0) print
     }
   ' "$file") || {

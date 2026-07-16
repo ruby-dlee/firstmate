@@ -18,6 +18,7 @@ fm_refuse_if_gate_agent
 STACK_ROOT="${FM_REPORT_STACK_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/firstmate/report-stack}"
 INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-300}
 PROGRESS_INTERVAL=${FM_REPORT_RETENTION_PROGRESS_INTERVAL:-1}
+ACTIVATION_WAIT_MS=${FM_REPORT_RETENTION_ACTIVATION_WAIT_MS:-}
 LABEL=${FM_REPORT_RETENTION_LABEL:-com.firstmate.report-retention}
 PLATFORM=${FM_REPORT_RETENTION_PLATFORM:-$(uname)}
 INSTALL_ROOT=${FM_REPORT_RETENTION_INSTALL_ROOT:-$HOME/Library/Application Support/Firstmate/report-retention}
@@ -34,6 +35,8 @@ SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.c
 
 case "$INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
 case "$PROGRESS_INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_PROGRESS_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
+[ -n "$ACTIVATION_WAIT_MS" ] || ACTIVATION_WAIT_MS=$((INTERVAL * 2000 + 60000))
+case "$ACTIVATION_WAIT_MS" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_ACTIVATION_WAIT_MS must be a positive integer" >&2; exit 2 ;; esac
 [ "$INTERVAL" -lt 1296000 ] || { echo "error: FM_REPORT_RETENTION_INTERVAL must be below 15 days" >&2; exit 2; }
 [ "$PROGRESS_INTERVAL" -le "$INTERVAL" ] || { echo "error: FM_REPORT_RETENTION_PROGRESS_INTERVAL must not exceed the owner interval" >&2; exit 2; }
 
@@ -121,6 +124,13 @@ remove_owned_install_file() {
   python_runtime=$(resolve_runtime "${FM_REPORT_PYTHON:-}" python3) || return 1
   "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
     "$(basename "$file")" "$identity" "$quarantine" 3< "$INSTALL_ROOT"
+}
+
+remove_owned_launch_file() {
+  local file=$1 identity=$2 quarantine=$3 python_runtime
+  python_runtime=$(resolve_runtime "${FM_REPORT_PYTHON:-}" python3) || return 1
+  "$python_runtime" "$SCRIPT_DIR/fm-contained-read.py" remove-owned-file-fd \
+    "$(basename "$file")" "$identity" "$quarantine" 3< "$LAUNCH_AGENTS_DIR"
 }
 
 process_start_time() {
@@ -275,7 +285,7 @@ install_test_interrupt() {
 install_owner() {
   local token staging generation generation_plist plist_temp previous_plist domain file
   local bash_runtime node_runtime python_runtime source_provenance installed_provenance old_program='' old_label=''
-  local job_label activation_nonce activation_started=0 activation_baseline=
+  local job_label activation_nonce activation_started=0 activation_baseline='' installed_plist_identity='' activation_attempts
   [ "$PLATFORM" = Darwin ] || { echo "error: report-retention LaunchAgent installation requires macOS" >&2; return 1; }
   command -v "$LAUNCHCTL" >/dev/null 2>&1 || { echo "error: launchctl is unavailable" >&2; return 1; }
   mkdir -p "$GENERATIONS" "$LAUNCH_AGENTS_DIR" || return 1
@@ -319,6 +329,7 @@ install_owner() {
     old_label=$(plist_label "$previous_plist")
   fi
   mv -f "$plist_temp" "$PLIST" || return 1
+  installed_plist_identity=$(file_identity "$PLIST") || return 1
   install_test_interrupt pointer-published || return $?
   domain="gui/$(id -u)"
   if "$LAUNCHCTL" bootstrap "$domain" "$PLIST"; then
@@ -335,7 +346,8 @@ install_owner() {
     fi
   fi
   if [ "$activation_started" -eq 1 ]; then
-    for _attempt in $(seq 1 100); do
+    activation_attempts=$(((ACTIVATION_WAIT_MS + 49) / 50))
+    for _attempt in $(seq 1 "$activation_attempts"); do
       heartbeat_matches "$installed_provenance" "$activation_nonce" "$activation_baseline" && break
       sleep 0.05
     done
@@ -354,6 +366,9 @@ install_owner() {
   "$LAUNCHCTL" bootout "$domain/$job_label" >/dev/null 2>&1 || true
   if [ -f "$previous_plist" ]; then
     mv -f "$previous_plist" "$PLIST"
+  elif [ -n "$installed_plist_identity" ]; then
+    remove_owned_launch_file "$PLIST" "$installed_plist_identity" ".$LABEL.failed.$token" \
+      || { echo "error: failed retention plist ownership changed during rollback" >&2; return 1; }
   fi
   echo "error: report-retention LaunchAgent activation failed; previous generation restored" >&2
   return 1

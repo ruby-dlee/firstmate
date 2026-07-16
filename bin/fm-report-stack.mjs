@@ -328,7 +328,15 @@ function readDescriptorAtMost(descriptor, maxBytes, overflowMessage) {
 function readBoundedRegularFile(file, maxBytes, label) {
   const initial = fs.lstatSync(file);
   if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  if (process.env.FM_REPORT_BOUNDED_READ_TEST_READY && process.env.FM_REPORT_BOUNDED_READ_TEST_PROCEED) {
+    fs.writeFileSync(process.env.FM_REPORT_BOUNDED_READ_TEST_READY, "ready\n", { flag: "wx" });
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(process.env.FM_REPORT_BOUNDED_READ_TEST_PROCEED)) {
+      if (Date.now() >= deadline) throw new Error("bounded report read test gate timed out");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   const descriptor = fs.openSync(file, flags);
   try {
     const stat = fs.fstatSync(descriptor);
@@ -397,15 +405,15 @@ function reportPage(manifest, markdown, visuals) {
     }).join("")}</div></section>`
     : `<section><h2>Visual evidence</h2><p class="muted">No image artifacts were attached.</p></section>`;
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(manifest.title)} · Firstmate report</title><style>${sharedCss()}</style></head><body><main>
+<html lang="en" style="visibility:hidden"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(manifest.title)} · Firstmate report</title><style>${sharedCss()}</style><script src="../../${retentionPolicyName}"></script></head><body><main>
 <nav><a href="../../index.html">← Report stack</a></nav>
 <header><p class="eyebrow">${escapeHtml(manifest.kind)} · ${escapeHtml(manifest.mode)}</p><h1>${escapeHtml(manifest.title)}</h1><p>${escapeHtml(manifest.summary)}</p></header>
 <dl><div><dt>Task</dt><dd>${escapeHtml(manifest.taskId)}</dd></div><div><dt>Completed</dt><dd>${escapeHtml(manifest.completedAt)}</dd></div><div><dt>Project</dt><dd>${escapeHtml(manifest.project)}</dd></div><div><dt>Harness</dt><dd>${escapeHtml(manifest.harness)}</dd></div><div><dt>Account profile</dt><dd>${escapeHtml(manifest.accountProfile || "unmanaged")}</dd></div>${revisionDetails}</dl>
 ${gallery}
 <section><h2>Completion report</h2><pre class="report">${escapeHtml(markdown)}</pre></section>
 <section><h2>Trail</h2><p><a href="report.md">Report source</a> · <a href="brief.md">Task brief</a> · <a href="status.log">Status trail</a>${manifest.prUrl ? ` · <a href="${escapeHtml(manifest.prUrl)}">Pull request</a>` : ""}</p></section>
-</main></body></html>`;
+</main><script>(()=>{const cutoff=Number(window.firstmateRetentionPolicy?.cutoffMs);const completedAt=Date.parse(${JSON.stringify(manifest.completedAt)});if(Number.isFinite(cutoff)&&Number.isFinite(completedAt)&&completedAt<=cutoff){document.body.replaceChildren(Object.assign(document.createElement('main'),{textContent:'This report has expired.'}));}document.documentElement.style.visibility='visible';})();</script></body></html>`;
 }
 
 function indexPage(rows, policy) {

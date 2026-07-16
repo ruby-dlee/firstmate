@@ -659,9 +659,11 @@ test_managed_tmux_target_identity_checks_recorded_session() {
     || fail "the recorded tmux session identity did not pass existence validation"
   fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
     || fail "the recorded tmux session identity did not pass kill validation"
-  grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
-    || fail "the session-matched tmux identity did not kill through its recorded scoped target"
-  pass "managed tmux existence and kill validate stable ids against the recorded session"
+  grep -q '^kill-window -t @77$' "$log" \
+    || fail "the session-matched tmux identity did not retain its verified stable target"
+  ! grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
+    || fail "tmux kill discarded its stable identity for a name-based target"
+  pass "managed tmux kill retains its stable id after recorded-session validation"
 }
 
 test_managed_tmux_target_state_finds_replacement_window() {
@@ -1174,6 +1176,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   exit 0
 fi

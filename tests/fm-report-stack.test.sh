@@ -11,6 +11,7 @@ STACK="$TMP_ROOT/stack"
 SCRIPT="$ROOT/bin/fm-report-stack.mjs"
 mkdir -p "$HOME_DIR/state" "$HOME_DIR/data"
 export FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1
+export FM_REPORT_RETENTION_ACTIVATION_WAIT_MS=250
 
 write_task() {
   local id=$1 kind=${2:-ship} task_dir="$HOME_DIR/data/$1"
@@ -2153,12 +2154,112 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
     || fail "retention authority did not hide the expired report before scanning manifests"
   assert_grep '<script src=".retention-policy.js"></script>' "$STACK/index.html" \
     "report index does not honor the independently published cutoff authority"
+  assert_grep '<html lang="en" style="visibility:hidden">' "$entry" \
+    "direct report page exposes content before evaluating retention authority"
+  assert_grep '<script src="../../.retention-policy.js"></script>' "$entry" \
+    "direct report page does not load the current retention authority"
+  assert_grep 'completedAt<=cutoff' "$entry" \
+    "direct report page does not apply the cutoff to its completion timestamp"
+  assert_grep 'This report has expired.' "$entry" \
+    "direct report page has no expired-report browser state"
   touch "$proceed"
   wait "$pid" || fail "retention cutoff cleanup failed: $(cat "$output")"
   trap - RETURN
   assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
   assert_no_grep "$id" "$STACK/index.html" "completed retention rendering left an expired report visible"
   pass "retention publishes one authoritative cutoff before bounded cleanup"
+}
+
+test_failed_initial_retention_activation_disarms_plist() {
+  local fakebin="$TMP_ROOT/retention-initial-failure-launchctl" install_root="$TMP_ROOT/retention-initial-failure-install"
+  local agents="$TMP_ROOT/retention-initial-failure-agents" log="$TMP_ROOT/retention-initial-failure.log"
+  local plist out status
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in print|bootstrap|kickstart) exit 0 ;; bootout) exit 1 ;; esac
+SH
+  chmod +x "$fakebin/launchctl"
+  plist="$agents/com.firstmate.report-retention.plist"
+  if out=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH='' \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_ACTIVATION_WAIT_MS=100 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "first retention installation unexpectedly accepted missing launched health"
+  assert_contains "$out" "activation failed" "first-install activation failure was not reported"
+  assert_absent "$plist" "failed first retention installation left an unproven reboot-armed plist"
+  assert_grep 'bootout' "$log" "failed first retention installation did not unload its replacement job"
+  pass "failed first retention installation removes its owned canonical plist"
+}
+
+test_retention_activation_wait_budget_accepts_delayed_health() {
+  local fakebin="$TMP_ROOT/retention-delayed-launchctl" install_root="$TMP_ROOT/retention-delayed-install"
+  local agents="$TMP_ROOT/retention-delayed-agents" log="$TMP_ROOT/retention-delayed.log"
+  mkdir -p "$fakebin" "$agents"
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in
+  print|bootstrap) exit 0 ;;
+  kickstart)
+    (
+      sleep 5.5
+      temp="$FM_REPORT_STACK_ROOT/.retention-heartbeat.delayed.$$"
+      printf '%s\n%s\n%s\n%s\n' "$(date +%s)" "$FM_REPORT_RETENTION_EXPECTED_PROVENANCE" \
+        "$FM_REPORT_RETENTION_EXPECTED_NONCE" "delayed-$$" > "$temp"
+      mv -f "$temp" "$FM_REPORT_STACK_ROOT/.retention-heartbeat"
+    ) &
+    exit 0
+    ;;
+  bootout) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/launchctl"
+  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH='' \
+    FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_ACTIVATION_WAIT_MS=7000 \
+    FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-report-retention.sh" install >/dev/null \
+    || fail "retention activation rejected health inside its configured wait budget"
+  assert_present "$agents/com.firstmate.report-retention.plist" \
+    "successful delayed retention activation removed its canonical plist"
+  pass "retention activation honors its explicit launched-health wait budget"
+}
+
+test_bounded_report_reads_reject_fifo_swaps_without_blocking() {
+  local id=bounded-read-race-z31 transaction saved ready proceed output pid status
+  transaction="$STACK/entries/.$id.transaction"
+  saved="$TMP_ROOT/bounded-read-race.transaction"
+  ready="$TMP_ROOT/bounded-read-race.ready"
+  proceed="$TMP_ROOT/bounded-read-race.proceed"
+  output="$TMP_ROOT/bounded-read-race.out"
+  printf '{"schemaVersion":1,"reportId":"%s","hadPrevious":false}\n' "$id" > "$transaction"
+  FM_REPORT_BOUNDED_READ_TEST_READY="$ready" FM_REPORT_BOUNDED_READ_TEST_PROCEED="$proceed" \
+    run_stack render > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "bounded report read race gate did not open"; }
+  mv "$transaction" "$saved"
+  mkfifo "$transaction"
+  touch "$proceed"
+  for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.02; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "bounded report read blocked after a regular file became a FIFO"
+  fi
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "bounded report read accepted a FIFO replacement"
+  assert_contains "$(cat "$output")" "stable real regular file" \
+    "bounded report read FIFO refusal was unclear"
+  rm -f "$transaction"
+  pass "bounded report reads open nonblocking and reject FIFO swaps"
 }
 
 test_retention_activation_requires_launched_nonce_without_owner_gap() {
@@ -2319,6 +2420,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-30 ]; then
   test_retention_install_recovers_owned_stale_reclaim_marker
   test_report_contract_and_task_transaction_reject_fifos_without_blocking
   test_report_entry_manifest_reads_stay_on_pinned_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_failed_initial_retention_activation_disarms_plist
+  test_retention_activation_wait_budget_accepts_delayed_health
+  test_bounded_report_reads_reject_fifo_swaps_without_blocking
   exit 0
 fi
 

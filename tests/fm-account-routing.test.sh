@@ -1312,9 +1312,39 @@ test_continuation_rejects_symlinked_charter_ancestor() {
     "$CONTINUATION" "$id" safe-attempt 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation accepted a charter through a symlinked ancestor"
-  assert_contains "$out" "no safe non-empty original brief or charter" "unsafe charter rejection was unclear"
+  assert_contains "$out" "charter is present but unsafe" "unsafe charter rejection was unclear"
   assert_absent "$HOME_DIR/data/$id/continuation-safe-attempt.md" "unsafe charter was copied into a continuation packet"
   pass "secondmate continuation requires a contained charter path"
+}
+
+test_continuation_rejects_present_empty_charter() {
+  local id rec out status
+  id=account-empty-charter-z9f
+  rec=$(make_case empty-charter claude "$id")
+  read_case "$rec"
+  mkdir -p "$WT_DIR/data"
+  : > "$WT_DIR/data/charter.md"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=secondmate" \
+    "home=$WT_DIR" \
+    "account_pool=claude-crew" \
+    "account_profile=claude-2" \
+    "account_task=$id" \
+    "account_attempt=legacy"
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" empty-charter-attempt 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "continuation silently replaced an empty present charter with the task brief"
+  assert_contains "$out" "secondmate charter is empty" "empty charter rejection was unclear"
+  assert_absent "$HOME_DIR/data/$id/continuation-empty-charter-attempt.md" \
+    "empty charter fallback published a continuation packet"
+  pass "secondmate continuation falls back only when the charter is absent"
 }
 
 test_recovered_reservations_are_owned_only_after_validated_recovery() {
@@ -4522,6 +4552,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
+  test_continuation_rejects_symlinked_charter_ancestor
+  test_continuation_rejects_present_empty_charter
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   test_account_lineage_rejects_parent_swap_during_transaction
@@ -4552,6 +4588,7 @@ test_session_sync_all_bounds_each_task_and_reaches_later_mappings
 test_session_sync_removes_reaped_workers_from_cleanup_state
 test_session_sync_releases_metadata_lock_during_provider_query
 test_continuation_rejects_symlinked_charter_ancestor
+test_continuation_rejects_present_empty_charter
 test_recovered_reservations_are_owned_only_after_validated_recovery
 test_native_resume_requires_fresh_sessionstart_evidence
 test_native_resume_rejects_prelaunch_sessionstart_evidence

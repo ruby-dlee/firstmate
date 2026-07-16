@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import selectors
+import secrets
 import signal
 import stat
 import subprocess
@@ -507,6 +508,31 @@ def copy_regular(source_parent, destination_parent, name, remaining):
         if destination is not None:
             os.close(destination)
         os.close(source)
+
+
+def command_cat_optional_fd(arguments):
+    if len(arguments) != 2:
+        fail("usage: fm-contained-read.py cat-optional-fd <relative> <maximum-bytes>")
+    relative, maximum_raw = arguments
+    maximum = int(maximum_raw)
+    if maximum < 0:
+        fail("invalid contained read limit")
+    parts = components(relative)
+    parent = os.dup(checked_root(3))
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        try:
+            item = read_relative(parent, parts[-1], maximum, "strict")
+        except FileNotFoundError:
+            raise SystemExit(3)
+        if item["oversized"]:
+            fail(f"source exceeds {maximum} bytes: {relative}")
+        sys.stdout.buffer.write(item["content"])
+    finally:
+        os.close(parent)
 
 
 def snapshot_artifact(source_parent, destination_parent, source_name, destination_name, view_limit, mode, copy_limit=None, optional=False):
@@ -1229,6 +1255,52 @@ def command_finalize_retention_cohort_fd(arguments):
         pass
 
 
+def command_prepare_retention_link_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py prepare-retention-link-fd <cohort> <identity> <target>")
+    cohort, identity, target = arguments
+    if len(components(cohort)) != 1 or os.path.isabs(target) or "\0" in target:
+        fail("retention link arguments are invalid")
+    active = checked_root(3)
+    replacement = checked_root(4)
+    source = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+    if not stat.S_ISDIR(source.st_mode) or f"{source.st_dev}:{source.st_ino}" != identity:
+        fail("fresh cohort generation changed before cutover")
+    try:
+        os.symlink(target, cohort, dir_fd=replacement)
+    except FileExistsError:
+        if symlink_target(replacement, cohort) != target:
+            fail("fresh cohort cutover link changed")
+
+
+def command_finalize_retention_link_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py finalize-retention-link-fd <cohort> <identity> <target>")
+    cohort, identity, target = arguments
+    if len(components(cohort)) != 1 or os.path.isabs(target) or "\0" in target:
+        fail("retention link arguments are invalid")
+    active = checked_root(3)
+    retired = checked_root(4)
+    current = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+    if stat.S_ISDIR(current.st_mode):
+        if f"{current.st_dev}:{current.st_ino}" != identity:
+            fail("fresh cohort active generation changed")
+        return
+    if not stat.S_ISLNK(current.st_mode) or os.readlink(cohort, dir_fd=active) != target:
+        fail("fresh cohort public link changed")
+    source = os.stat(cohort, dir_fd=retired, follow_symlinks=False)
+    if not stat.S_ISDIR(source.st_mode) or f"{source.st_dev}:{source.st_ino}" != identity:
+        fail("fresh cohort retired generation changed")
+    exchange_between(active, cohort, retired, cohort)
+    installed = os.stat(cohort, dir_fd=active, follow_symlinks=False)
+    displaced_target = symlink_target(retired, cohort)
+    if not stat.S_ISDIR(installed.st_mode) or f"{installed.st_dev}:{installed.st_ino}" != identity \
+            or displaced_target != target:
+        exchange_between(active, cohort, retired, cohort)
+        fail("fresh cohort changed during activation")
+    os.unlink(cohort, dir_fd=retired)
+
+
 def command_remove_owned_file_fd(arguments):
     if len(arguments) != 3:
         fail("usage: fm-contained-read.py remove-owned-file-fd <name> <identity> <quarantine>")
@@ -1416,14 +1488,33 @@ def command_remove_owned_tree_fd(arguments):
     if not stat.S_ISDIR(observed.st_mode) or f"{observed.st_dev}:{observed.st_ino}" != identity:
         fail("owned tree generation changed before removal")
     descriptor = open_relative(root, name, os.O_RDONLY | os.O_DIRECTORY)
+    quarantine = f".{name}.removing.{os.getpid()}.{secrets.token_hex(16)}"
     try:
+        rename_noreplace(root, root, name, quarantine)
+        quarantined = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        if observed.st_dev != quarantined.st_dev or observed.st_ino != quarantined.st_ino:
+            try:
+                rename_noreplace(root, root, quarantine, name)
+            except OSError:
+                pass
+            fail("owned tree generation changed during quarantine")
+        ready = os.environ.get("FM_CONTAINED_REMOVE_TREE_TEST_READY")
+        proceed = os.environ.get("FM_CONTAINED_REMOVE_TREE_TEST_PROCEED")
+        if ready and proceed:
+            with open(ready, "x", encoding="utf-8") as marker:
+                marker.write(f"{quarantine}\n")
+            deadline = time.monotonic() + 5
+            while not os.path.exists(proceed):
+                if time.monotonic() >= deadline:
+                    fail("owned tree removal test gate timed out")
+                time.sleep(0.01)
         remove_directory_contents(descriptor)
+        current = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        if observed.st_dev != current.st_dev or observed.st_ino != current.st_ino:
+            fail("owned tree generation changed during removal")
+        os.rmdir(quarantine, dir_fd=root)
     finally:
         os.close(descriptor)
-    current = os.stat(name, dir_fd=root, follow_symlinks=False)
-    if not same_file(observed, current):
-        fail("owned tree generation changed during removal")
-    os.rmdir(name, dir_fd=root)
 
 
 def main():
@@ -1449,6 +1540,8 @@ def main():
         command_git_fd(sys.argv[2:])
     elif sys.argv[1] == "cat-fd":
         command_cat_fd(sys.argv[2:])
+    elif sys.argv[1] == "cat-optional-fd":
+        command_cat_optional_fd(sys.argv[2:])
     elif sys.argv[1] == "cat-child-fd":
         command_cat_child_fd(sys.argv[2:])
     elif sys.argv[1] == "exchange-files-fd":
@@ -1469,6 +1562,10 @@ def main():
         command_stage_retention_cohort_fd(sys.argv[2:])
     elif sys.argv[1] == "finalize-retention-cohort-fd":
         command_finalize_retention_cohort_fd(sys.argv[2:])
+    elif sys.argv[1] == "prepare-retention-link-fd":
+        command_prepare_retention_link_fd(sys.argv[2:])
+    elif sys.argv[1] == "finalize-retention-link-fd":
+        command_finalize_retention_link_fd(sys.argv[2:])
     elif sys.argv[1] == "remove-owned-file-fd":
         command_remove_owned_file_fd(sys.argv[2:])
     elif sys.argv[1] == "publish-report-fd":

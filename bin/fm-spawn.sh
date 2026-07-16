@@ -174,6 +174,7 @@ CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 CONTINUATION_PROMPT_DIR_ID=
 CONTINUATION_PROMPT_FILE_ID=
+CONTINUATION_PROMPT_CONTENT_ID=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -612,6 +613,7 @@ cleanup_continuation_launch_transport() {
   CONTINUATION_PROMPT_FILE=
   CONTINUATION_PROMPT_DIR_ID=
   CONTINUATION_PROMPT_FILE_ID=
+  CONTINUATION_PROMPT_CONTENT_ID=
 }
 
 spawn_abort_cleanup() {
@@ -1536,7 +1538,7 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   chmod 700 "$CONTINUATION_LAUNCH_DIR" || exit 1
   CONTINUATION_PROMPT_FILE="$CONTINUATION_LAUNCH_DIR/prompt"
   if ! CONTINUATION_PROMPT_IDENTITIES=$(printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
-import base64, os, sys
+import base64, hashlib, os, sys
 data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
 parent_path, name = os.path.split(os.path.abspath(sys.argv[1]))
 parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1548,7 +1550,7 @@ try:
     os.fsync(fd)
     parent = os.fstat(parent_fd)
     prompt = os.fstat(fd)
-    sys.stdout.write(f"{parent.st_dev}:{parent.st_ino}\n{prompt.st_dev}:{prompt.st_ino}\n")
+    sys.stdout.write(f"{parent.st_dev}:{parent.st_ino}\n{prompt.st_dev}:{prompt.st_ino}\n{hashlib.sha256(data).hexdigest()}\n")
 finally:
     os.close(fd)
     os.close(parent_fd)
@@ -1557,8 +1559,11 @@ finally:
     exit 1
   fi
   CONTINUATION_PROMPT_DIR_ID=${CONTINUATION_PROMPT_IDENTITIES%%$'\n'*}
-  CONTINUATION_PROMPT_FILE_ID=${CONTINUATION_PROMPT_IDENTITIES#*$'\n'}
+  CONTINUATION_PROMPT_REMAINDER=${CONTINUATION_PROMPT_IDENTITIES#*$'\n'}
+  CONTINUATION_PROMPT_FILE_ID=${CONTINUATION_PROMPT_REMAINDER%%$'\n'*}
+  CONTINUATION_PROMPT_CONTENT_ID=${CONTINUATION_PROMPT_REMAINDER#*$'\n'}
   [ -n "$CONTINUATION_PROMPT_DIR_ID" ] && [ -n "$CONTINUATION_PROMPT_FILE_ID" ] \
+    && [ -n "$CONTINUATION_PROMPT_CONTENT_ID" ] \
     || { echo "error: continuation prompt transport identity is unavailable for $ID" >&2; exit 1; }
   BRIEF=$CONTINUATION_PACKET
 fi
@@ -2095,7 +2100,7 @@ if [ "$KIND" = secondmate ]; then
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_launch_command=$LAUNCH
-  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$continuation_launch_command")"
+  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so

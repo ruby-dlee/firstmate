@@ -329,10 +329,19 @@ fi
 if [ "$KIND" = secondmate ]; then
   BRIEF_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-brief-$ID.XXXXXX") \
     || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
-  if ! python3 "$SCRIPT_DIR/fm-contained-read.py" cat-fd data/charter.md "$MAX_PACKET_BYTES" 3<&9 \
-    > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null || [ ! -s "$BRIEF_SNAPSHOT_TMP" ]; then
-    rm -f "$BRIEF_SNAPSHOT_TMP"
-    BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
+  if python3 "$SCRIPT_DIR/fm-contained-read.py" cat-optional-fd data/charter.md "$MAX_PACKET_BYTES" 3<&9 \
+    > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null; then
+    [ -s "$BRIEF_SNAPSHOT_TMP" ] \
+      || { echo "error: secondmate charter is empty for continuation of $ID" >&2; exit 1; }
+  else
+    charter_status=$?
+    if [ "$charter_status" -eq 3 ]; then
+      rm -f "$BRIEF_SNAPSHOT_TMP"
+      BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
+    else
+      echo "error: secondmate charter is present but unsafe for continuation of $ID" >&2
+      exit 1
+    fi
   fi
 else
   BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"

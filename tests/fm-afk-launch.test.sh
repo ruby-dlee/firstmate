@@ -1454,6 +1454,35 @@ unit_afk_bounded_copy_preserves_mtime() {
   rm -rf "$st"
 }
 
+unit_afk_bounded_copy_rejects_source_generation_swap() {
+  local st source moved destination ready proceed output pid status
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-copy-generation.XXXXXX")
+  mkdir -p "$st/state" "$st/backup"
+  source="$st/state/source"; moved="$st/state/source-owned"; destination="$st/backup/destination"
+  ready="$st/ready"; proceed="$st/proceed"; output="$st/output"
+  printf 'owned\n' > "$source"; printf 'destination\n' > "$destination"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_COPY_TEST_READY="$ready" \
+    FM_AFK_COPY_TEST_PROCEED="$proceed" bash -c \
+    '. "$1"; fm_afk_safe_control_copy "$2" "$3" 4096' _ "$START" "$source" "$destination" \
+    > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.01; done
+  if [ ! -e "$ready" ]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "AFK copy: source-generation gate did not open"
+    rm -rf "$st"
+    return
+  fi
+  mv "$source" "$moved"; printf 'raced\n' > "$source"; touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  if [ "$status" -ne 0 ] && grep -F destination "$destination" >/dev/null 2>&1; then
+    pass "AFK copy: source generation is pinned through open"
+  else
+    fail "AFK copy: accepted a source generation swapped between stat and open"
+  fi
+  rm -rf "$st"
+}
+
 unit_afk_control_reads_are_nonblocking_and_generation_pinned() {
   local st control ready proceed output pid rc
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-control-read.XXXXXX")
@@ -1728,6 +1757,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
+  unit_afk_bounded_copy_rejects_source_generation_swap
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1782,6 +1817,7 @@ unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_afk_backups_reject_unsafe_or_oversized_sources
 unit_afk_bounded_copy_preserves_mtime
+unit_afk_bounded_copy_rejects_source_generation_swap
 unit_afk_control_reads_are_nonblocking_and_generation_pinned
 unit_flag_write_failure_aborts
 unit_flag_staging_does_not_follow_predictable_symlink

@@ -260,6 +260,29 @@ test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths() {
   pass "legacy cutover keeps pending fresh reports visible and retires expired raw paths"
 }
 
+test_retention_owner_advances_pending_legacy_migration() {
+  local stack="$TMP_ROOT/legacy-owner-stack" id completed
+  mkdir -p "$stack/entries"
+  completed=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  for id in legacy-owner-one legacy-owner-two legacy-owner-three; do
+    mkdir "$stack/entries/$id"
+    printf '{"schemaVersion":1,"reportId":"%s","taskId":"%s","title":"Fresh","summary":"Fresh","completedAt":"%s","kind":"ship","project":"example","harness":"codex"}\n' \
+      "$id" "$id" "$completed" > "$stack/entries/$id/manifest.json"
+    printf '%s bytes\n' "$id" > "$stack/entries/$id/report.md"
+  done
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_BATCH=1 \
+    FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
+    FM_REPORT_RETENTION_NODE="$(command -v node)" \
+    "$ROOT/bin/fm-report-retention.sh" run-once >/dev/null \
+    || fail "retention owner did not continue bounded legacy migration"
+  assert_absent "$stack/.legacy-cutover.json" "retention owner left bounded legacy migration pending"
+  for id in legacy-owner-one legacy-owner-two legacy-owner-three; do
+    FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path "$id" >/dev/null \
+      || fail "retention owner lost $id while advancing legacy migration"
+  done
+  pass "retention owner automatically advances bounded legacy migration"
+}
+
 test_manifest_cohort_must_match_completion_time() {
   local stack="$TMP_ROOT/manifest-cohort-stack" cohort=cohort-4102444800000 out status
   mkdir -p "$stack/entries/$cohort/cohort-mismatch"
@@ -2943,6 +2966,32 @@ test_report_publication_restores_swapped_staging_generation() {
   pass "report publication restores a staging generation raced through rename"
 }
 
+test_owned_tree_cleanup_quarantines_before_deletion() {
+  local root="$TMP_ROOT/owned-tree-cleanup" owned="$TMP_ROOT/owned-tree-cleanup/owned"
+  local ready="$TMP_ROOT/owned-tree-cleanup.ready" proceed="$TMP_ROOT/owned-tree-cleanup.proceed"
+  local output="$TMP_ROOT/owned-tree-cleanup.out" identity quarantine pid status
+  mkdir -p "$owned/nested"
+  printf 'owned generation\n' > "$owned/nested/sentinel"
+  identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$owned"; else stat -c '%d:%i' "$owned"; fi)
+  FM_CONTAINED_REMOVE_TREE_TEST_READY="$ready" FM_CONTAINED_REMOVE_TREE_TEST_PROCEED="$proceed" \
+    python3 "$ROOT/bin/fm-contained-read.py" remove-owned-tree-fd owned "$identity" \
+      3< "$root" > "$output" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "owned tree quarantine gate did not open"; }
+  quarantine=$(cat "$ready")
+  assert_absent "$owned" "owned tree remained at its public name during recursive deletion"
+  mkdir "$owned"
+  printf 'concurrent replacement\n' > "$owned/sentinel"
+  touch "$proceed"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "quarantined owned tree cleanup failed: $(cat "$output")"
+  assert_grep 'concurrent replacement' "$owned/sentinel" \
+    "owned tree cleanup removed a concurrent replacement generation"
+  assert_absent "$root/$quarantine" "owned tree cleanup retained its private quarantine"
+  pass "owned tree cleanup quarantines its generation before recursive deletion"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_retention_batches_make_interruption_safe_progress
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
@@ -3016,6 +3065,16 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
   test_report_entry_manifest_reads_stay_on_pinned_generation
   test_retention_fresh_handoff_is_cohort_bounded_and_continuous
   test_retention_candidate_is_fenced_before_bootstrap
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-36 ]; then
+  test_publish_ship_with_visual
+  test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
+  test_retention_owner_advances_pending_legacy_migration
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_fresh_handoff_is_cohort_bounded_and_continuous
+  test_owned_tree_cleanup_quarantines_before_deletion
   exit 0
 fi
 
@@ -3107,6 +3166,7 @@ test_persistent_retention_owner_prunes_without_tasks_or_watcher
 test_retention_generations_survive_install_interruptions
 test_retention_error_publication_is_atomic_and_nonfollowing
 test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
+test_retention_owner_advances_pending_legacy_migration
 test_manifest_cohort_must_match_completion_time
 test_retention_cutoff_is_authoritative_before_cleanup
 test_retention_cohort_tombstone_is_noreplace_owned
@@ -3118,6 +3178,7 @@ test_retention_cleanup_is_file_granular
 test_retention_fresh_handoff_is_cohort_bounded_and_continuous
 test_report_entry_manifest_reads_stay_on_pinned_generation
 test_report_publication_restores_swapped_staging_generation
+test_owned_tree_cleanup_quarantines_before_deletion
 test_retention_activation_requires_launched_nonce_without_owner_gap
 test_retention_accepts_runatload_heartbeat_after_prebootstrap_baseline
 test_retention_pointer_failure_retires_only_candidate

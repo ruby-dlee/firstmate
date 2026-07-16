@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import hashlib
 import os
 import stat
 import sys
+import time
 
 
 def fail(message):
@@ -10,8 +12,8 @@ def fail(message):
 
 
 cleanup_only = len(sys.argv) == 5 and sys.argv[1] == "--cleanup"
-if len(sys.argv) != 5:
-    fail("expected a prompt file, parent identity, file identity, and launch command")
+if (cleanup_only and len(sys.argv) != 5) or (not cleanup_only and len(sys.argv) != 6):
+    fail("expected a prompt file, parent identity, file identity, content identity, and launch command")
 
 prompt_path = os.path.abspath(sys.argv[2] if cleanup_only else sys.argv[1])
 parent_path, name = os.path.split(prompt_path)
@@ -20,9 +22,10 @@ if not name or name in (".", ".."):
 
 expected_parent = sys.argv[3] if cleanup_only else sys.argv[2]
 expected_file = sys.argv[4] if cleanup_only else sys.argv[3]
+expected_content = None if cleanup_only else sys.argv[4]
 parent = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 descriptor = None
-stdin_descriptor = None
+snapshot = None
 try:
     parent_stat = os.fstat(parent)
     if f"{parent_stat.st_dev}:{parent_stat.st_ino}" != expected_parent:
@@ -34,8 +37,34 @@ try:
     opened = os.fstat(descriptor)
     if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
         fail("prompt source changed while opening")
+    if not cleanup_only:
+        digest = hashlib.sha256()
+        chunks = []
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(descriptor, min(65536, opened.st_size - offset), offset)
+            if not chunk:
+                fail("prompt source ended while verifying content")
+            digest.update(chunk)
+            chunks.append(chunk)
+            offset += len(chunk)
+        snapshot = b"".join(chunks)
+    finished = os.fstat(descriptor)
+    if (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns) != (
+        opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
+    ) or (not cleanup_only and digest.hexdigest() != expected_content):
+        fail("prompt source content changed")
+    ready = os.environ.get("FM_PROMPT_EXEC_TEST_READY")
+    proceed = os.environ.get("FM_PROMPT_EXEC_TEST_PROCEED")
+    if not cleanup_only and ready and proceed:
+        marker = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(marker)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("prompt launch test gate timed out")
+            time.sleep(0.01)
     os.unlink(name, dir_fd=parent)
-    stdin_descriptor = os.dup(descriptor)
 finally:
     if descriptor is not None:
         os.close(descriptor)
@@ -54,15 +83,27 @@ finally:
     os.close(grandparent)
 
 if cleanup_only:
-    if stdin_descriptor is not None:
-        os.close(stdin_descriptor)
     raise SystemExit(0)
 
-command = os.fsencode(sys.argv[4])
-if stdin_descriptor is None:
-    fail("prompt descriptor is unavailable")
-os.lseek(stdin_descriptor, 0, os.SEEK_SET)
-os.dup2(stdin_descriptor, 0)
-if stdin_descriptor != 0:
-    os.close(stdin_descriptor)
+command = os.fsencode(sys.argv[5])
+if snapshot is None:
+    fail("prompt snapshot is unavailable")
+read_descriptor, write_descriptor = os.pipe()
+writer = os.fork()
+if writer == 0:
+    os.close(read_descriptor)
+    try:
+        view = memoryview(snapshot)
+        while view:
+            written = os.write(write_descriptor, view)
+            view = view[written:]
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(write_descriptor)
+    os._exit(0)
+os.close(write_descriptor)
+os.dup2(read_descriptor, 0)
+if read_descriptor != 0:
+    os.close(read_descriptor)
 os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())

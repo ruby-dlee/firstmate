@@ -100,6 +100,7 @@ fm_afk_safe_control_copy() {  # <source> <destination> <maximum-bytes>
 import os
 import stat
 import sys
+import time
 
 source = os.path.abspath(sys.argv[1])
 destination = os.path.abspath(sys.argv[2])
@@ -113,8 +114,17 @@ try:
     before = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
         raise OSError("unsafe source control file")
+    ready = os.environ.get("FM_AFK_COPY_TEST_READY")
+    proceed = os.environ.get("FM_AFK_COPY_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write("ready\n")
+        while not os.path.exists(proceed):
+            time.sleep(0.01)
     source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_parent)
     opened = os.fstat(source_fd)
+    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        raise OSError("source control file changed while opening")
     destination_before = os.stat(destination_name, dir_fd=destination_parent, follow_symlinks=False)
     if not stat.S_ISREG(destination_before.st_mode):
         raise OSError("unsafe destination control file")

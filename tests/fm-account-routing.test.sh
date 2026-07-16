@@ -2784,7 +2784,7 @@ test_oversized_continuation_stops_before_mutation() {
 }
 
 test_continuation_bounds_no_mistakes_status_snapshot() {
-  local id rec out status started elapsed packet
+  local id rec out status started finished elapsed_ms packet
   id=account-continuation-status-timeout-z28a
   rec=$(make_case continuation-status-timeout claude "$id")
   read_case "$rec"
@@ -2799,14 +2799,18 @@ SH
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
-  started=$(date +%s)
-  out=$(FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=1 FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
-    run_spawn "$id" --continue-account --account-profile claude-3)
+  started=$(python3 -c 'import time; print(time.monotonic_ns())')
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=1 \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" status-timeout 2>&1)
   status=$?
-  elapsed=$(( $(date +%s) - started ))
+  finished=$(python3 -c 'import time; print(time.monotonic_ns())')
+  elapsed_ms=$(( (finished - started) / 1000000 ))
   [ "$status" -eq 0 ] || fail "continuation failed instead of degrading a timed-out no-mistakes snapshot: $out"
-  [ "$elapsed" -lt 8 ] || fail "continuation no-mistakes snapshot exceeded its bounded path (elapsed ${elapsed}s)"
-  packet=$(sed -n 's/^continuation_packet=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  [ "$elapsed_ms" -lt 6000 ] \
+    || fail "continuation no-mistakes snapshot exceeded its bounded path (elapsed ${elapsed_ms}ms)"
+  packet=$(printf '%s\n' "$out" | tail -1)
   assert_present "$packet" "timed-out status continuation packet was not persisted"
   assert_grep '## No-mistakes state' "$packet" "timed-out continuation packet lost the no-mistakes section"
   if ! grep -qxF unavailable "$packet"; then
@@ -3540,8 +3544,14 @@ class Process:
 
 
 class Budget:
-    def check_time(self):
+    def __init__(self):
+        self.deadline = time.monotonic() + 0.25
+
+    def check_time(self, reserve_seconds=0):
         raise RuntimeError("repository fingerprint exceeds its time limit")
+
+    def bounded_deadline(self, maximum_seconds):
+        return min(self.deadline, time.monotonic() + maximum_seconds)
 
 
 process = Process()
@@ -3558,10 +3568,12 @@ else:
 finally:
     os.close(write_fd)
 elapsed = time.monotonic() - started
-if elapsed >= 2:
+if elapsed >= 0.5:
     raise AssertionError(f"bounded reap took {elapsed:.3f} seconds")
-if process.waits != [0.5, 0.1]:
-    raise AssertionError(f"unexpected reap attempts: {process.waits}")
+if not process.waits or any(timeout is None or timeout < 0 for timeout in process.waits):
+    raise AssertionError(f"unbounded reap attempts: {process.waits}")
+if max(process.waits) > 0.25:
+    raise AssertionError(f"reap waits exceeded the shared deadline: {process.waits}")
 PY
   then
     status=0

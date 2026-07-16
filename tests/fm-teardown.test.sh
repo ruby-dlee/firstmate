@@ -180,6 +180,7 @@ write_meta() {
   local case_dir=$1 mode=$2 kind=$3
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=fm-task-x1" \
+    "tmux_session_target=firstmate:fm-task-x1" \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
@@ -1489,7 +1490,7 @@ test_managed_force_teardown_releases_lease_and_session() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "managed-force-release: teardown should succeed"
+  expect_code 0 "$rc" "managed-force-release: teardown should succeed: $(cat "$case_dir/stderr")"
   assert_grep 'lease release --task fm-home-task-x1-attempt-a1 --force' "$af_log" "managed teardown did not release the lease"
   assert_grep 'session remove --task fm-home-task-x1-attempt-a1' "$af_log" "managed teardown did not remove the session mapping"
   assert_absent "$case_dir/state/task-x1.meta" "managed teardown left task metadata"
@@ -2111,6 +2112,11 @@ test_teardown_rejects_malformed_report_requirement() {
 
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   test_teardown_refuses_unsafe_tasktmp_metadata
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-force-release ]; then
+  test_managed_force_teardown_releases_lease_and_session
   exit 0
 fi
 

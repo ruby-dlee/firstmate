@@ -15,6 +15,10 @@ import sys
 import time
 
 
+COMMAND_CLEANUP_RESERVE_SECONDS = 0.5
+COMMAND_TERM_GRACE_SECONDS = 0.1
+
+
 def fail(message):
     raise RuntimeError(message)
 
@@ -86,9 +90,15 @@ class FingerprintBudget:
         self.paths = 0
         self.output_bytes = 0
 
-    def check_time(self):
-        if self.deadline is not None and time.monotonic() > self.deadline:
+    def check_time(self, reserve_seconds=0):
+        if self.deadline is not None and time.monotonic() + reserve_seconds > self.deadline:
             fail("repository fingerprint exceeds its time limit")
+
+    def bounded_deadline(self, maximum_seconds):
+        deadline = time.monotonic() + maximum_seconds
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        return deadline
 
     def consume(self, size=0):
         self.check_time()
@@ -289,7 +299,7 @@ def bounded_command_output(command, budget):
         os.set_blocking(process.stdout.fileno(), False)
         selector.register(process.stdout, selectors.EVENT_READ)
         while True:
-            budget.check_time()
+            budget.check_time(COMMAND_CLEANUP_RESERVE_SECONDS)
             for key, _ in selector.select(timeout=0.1):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if chunk:
@@ -303,6 +313,7 @@ def bounded_command_output(command, budget):
             raise subprocess.CalledProcessError(process.returncode, command)
         return b"".join(output)
     except BaseException as error:
+        cleanup_deadline = budget.bounded_deadline(COMMAND_CLEANUP_RESERVE_SECONDS)
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except OSError:
@@ -310,8 +321,11 @@ def bounded_command_output(command, budget):
                 process.terminate()
             except OSError:
                 pass
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
+        term_deadline = min(
+            cleanup_deadline,
+            time.monotonic() + COMMAND_TERM_GRACE_SECONDS,
+        )
+        while time.monotonic() < term_deadline:
             try:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
@@ -319,7 +333,7 @@ def bounded_command_output(command, budget):
             except PermissionError:
                 if process.poll() is not None:
                     break
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0, term_deadline - time.monotonic())))
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except OSError:
@@ -327,12 +341,12 @@ def bounded_command_output(command, budget):
                 process.kill()
             except OSError:
                 pass
-        if not bounded_process_wait(process, 0.5):
+        if not bounded_process_wait(process, max(0, cleanup_deadline - time.monotonic())):
             try:
                 process.kill()
             except OSError:
                 pass
-            if not bounded_process_wait(process, 0.1):
+            if not bounded_process_wait(process, max(0, cleanup_deadline - time.monotonic())):
                 raise RuntimeError(
                     "repository command cleanup timed out before the child could be reaped"
                 ) from error

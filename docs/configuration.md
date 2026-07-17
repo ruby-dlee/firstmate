@@ -23,17 +23,18 @@ The file format is unchanged in both modes; tasks-axi and manual edits produce t
 
 ## Runtime backend (config/backend / FM_BACKEND)
 
-For spawn-capable adapters, the runtime session-provider backend controls where task windows/endpoints are created, captured, sent to, watched, and killed.
-`tmux` is the verified reference backend (see [`docs/tmux-backend.md`](tmux-backend.md)); `herdr`, `zellij`, `orca`, and `cmux` are experimental spawn backends (see [`docs/herdr-backend.md`](herdr-backend.md), [`docs/zellij-backend.md`](zellij-backend.md), [`docs/orca-backend.md`](orca-backend.md), and [`docs/cmux-backend.md`](cmux-backend.md)).
-Treehouse remains the worktree provider for tmux, herdr, zellij, and cmux, since herdr, zellij, and cmux are session providers only; Orca provides both the task worktree and terminal endpoint.
+The runtime session-provider backend controls where task windows/endpoints are created, captured, sent to, watched, and killed.
+`tmux` is the verified reference backend (see [`docs/tmux-backend.md`](tmux-backend.md)); `herdr`, `zellij`, and `cmux` are experimental new-task spawn backends, while `orca` is retained only for eligible pre-cutover task recovery (see [`docs/herdr-backend.md`](herdr-backend.md), [`docs/zellij-backend.md`](zellij-backend.md), [`docs/orca-backend.md`](orca-backend.md), and [`docs/cmux-backend.md`](cmux-backend.md)).
+Treehouse remains the worktree provider for tmux, herdr, zellij, and cmux, since herdr, zellij, and cmux are session providers only; eligible legacy Orca recoveries use Orca for both the task worktree and terminal endpoint.
 New spawns choose the backend in this order: an explicit `--backend` flag firstmate passes when it spawns a task, then `FM_BACKEND`, then the first non-empty line of local gitignored `config/backend`, then runtime auto-detection from `$TMUX`, `HERDR_ENV=1`, or cmux runtime signals, then default `tmux`.
 If more than one runtime marker is present, detection resolves innermost-first: `$TMUX` is checked before `HERDR_ENV=1`, which is checked before cmux's primary `CMUX_WORKSPACE_ID` marker and its documented fallback signals - tmux or herdr started from inside a cmux terminal is the innermost, currently-executing layer, while cmux itself (a terminal application, not a nestable multiplexer) is always checked last.
 See [`docs/cmux-backend.md`](cmux-backend.md#runtime-auto-detection) for why cmux can be selected when `CMUX_WORKSPACE_ID` is absent.
 Auto-detected herdr or cmux prints a stderr notice naming `config/backend` and `--backend tmux` as opt-outs; auto-detected tmux stays silent to preserve existing default behavior.
-Zellij and Orca are never auto-detected; select them by putting the name in a local `config/backend` file, by exporting `FM_BACKEND=<name>`, or by telling the first mate in chat.
+Zellij is never auto-detected; select it through local `config/backend`, `FM_BACKEND=zellij`, or an explicit request.
+Orca is also never auto-detected and may be selected only under the [`docs/orca-backend.md`](orca-backend.md#eligibility) eligibility contract.
 Any value other than `tmux`, `herdr`, `zellij`, `orca`, or `cmux` is rejected until another adapter is implemented and verified.
-`fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, `orca`, and `cmux` for ship and scout tasks; `backend=orca` and `backend=cmux` both still refuse `--secondmate` until secondmate launch semantics are designed for each.
-New task spawns additionally refuse `backend=orca` before any owned mutation: every new task is report-required and Orca has no reliable endpoint-absence proof for report-gated teardown, so only pre-existing tasks without a `report_required` marker (legacy teardown contract) may still respawn onto it.
+`fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, and `cmux` for new ship and scout tasks; `backend=cmux` still refuses `--secondmate` until its secondmate launch semantics are designed.
+Every new task refuses `backend=orca` before any owned mutation, and Orca also refuses `--secondmate`; the Orca guide owns the rationale and exact legacy eligibility rule.
 `codex-app` is not an accepted runtime backend yet; [`docs/codex-app-backend.md`](codex-app-backend.md) owns the Codex App boundary.
 The session-start secondmate liveness sweep uses a deeper `fm_backend_agent_alive` probe where verified.
 Today that probe can classify tmux and herdr secondmate endpoints as `alive`, `dead`, or `unknown`; zellij, Orca, and cmux report `unknown` until their own agent-process classifiers are verified.
@@ -44,7 +45,7 @@ A backend spawn refusal from a missing dependency, version gate, or unauthentica
 Task meta records `backend=` only for a non-default backend; an absent `backend=` means `tmux`, preserving existing default-path meta files.
 A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
 A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
-An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
+An eligible legacy Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
 A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
 Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.
 A selector containing `:` is passed through as an explicit backend endpoint escape hatch.
@@ -166,19 +167,21 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
 Agent Fleet is a private CLI with no Firstmate-managed installer; obtain an approved release bundle from the maintainer, follow that bundle's installation instructions, and ensure `agent-fleet` is on `PATH` before enabling routing.
-Account routing is default-off, so an unchanged installation makes no Agent Fleet calls and preserves the legacy provider launch and task metadata.
+Account routing is default-off, so an unchanged installation makes no Agent Fleet calls, does not wrap the provider launch, and adds no managed account-routing fields to task metadata.
 Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
 The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.
 The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
-`observe` asks Agent Fleet for a non-leasing dry-run decision, reports the non-secret pool/provider/profile choice, and leaves launch and metadata unchanged even when Agent Fleet is unavailable.
+`observe` asks Agent Fleet for a non-leasing dry-run decision, reports the non-secret pool/provider/profile choice, does not wrap the provider launch, and writes no managed account-routing fields even when Agent Fleet is unavailable.
 `enforce` prepares the isolated runtime endpoint and worktree first, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
 Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
 `--account-profile <profile>` pins one dynamic profile, using the supplied `--account-pool` when present and the reserved `explicit` pool otherwise.
-Pool and profile identifiers are non-secret aliases made only of letters, digits, dot, underscore, and dash, starting with a letter or digit; account email addresses and filesystem paths are invalid.
+Firstmate's direct spawn flags and `config/secondmate-account-pool` accept non-secret pool and profile aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
+Account email addresses and filesystem paths are invalid in every input surface.
 Managed task metadata records `account_pool=`, `account_profile=`, a home-namespaced and generation-unique `account_task=`, `account_attempt=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
 Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
 Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a newer SessionStart update after its local launch gate before committing the recovered lease.
+The per-task lifecycle lock serializes concurrent managed recovery attempts, and a waiter re-reads the committed metadata generation after acquiring ownership before it acts.
 When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
 Continuation verifies a bounded repository identity before replacement and fails closed when the file, byte, enumeration, or time limit cannot cover the repository; the environment-variable table below owns those tuning defaults.
 Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
@@ -250,7 +253,7 @@ The per-backend delta is required only for the backend resolved from `FM_BACKEND
 That delta is owned in code by `fm_backend_required_tools` in `bin/fm-backend.sh`: the resolved backend's own session-provider CLI (`tmux`, `herdr`, `zellij`, `orca`, or `cmux`), `jq` for the JSON-emitting experimental adapters (`herdr`, `zellij`, `cmux`) whose spawn and liveness paths parse the backend's JSON output, and the `treehouse` worktree provider for every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`).
 Backend tool availability uses the adapter's own executable resolver, so bootstrap and spawn agree on supported non-`PATH` locations such as cmux's bundled CLI.
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
-Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
+For an eligible pre-cutover task, Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
 Bootstrap reports missing Agent Fleet and `jq` whenever local routing mode or dispatch configuration can enforce routing; observe mode degrades to the legacy launch when either is unavailable, and off mode never invokes them.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
@@ -359,7 +362,7 @@ FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
-FM_BACKEND=             # optional runtime backend override for new spawns; tmux/herdr/zellij/orca/cmux support ship/scout spawns, codex-app is not accepted
+FM_BACKEND=             # optional runtime backend override; tmux/herdr/zellij/cmux support new ship/scout spawns, Orca is legacy-recovery-only, and codex-app is not accepted
 FM_ACCOUNT_ROUTING=off  # optional Agent Fleet mode override: off, observe, or enforce; explicit per-spawn account flags still take precedence
 FM_AGENT_FLEET_BIN=agent-fleet  # test/lab override for the Agent Fleet executable; normal operation resolves agent-fleet from PATH
 FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per Agent Fleet control-plane command
@@ -378,6 +381,7 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the 
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=5  # seconds quota-balanced dispatch waits for each Agent Fleet pool summary
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
 FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
+FM_REPORT_RETENTION_COHORT_MS=300000  # retention cohort width; this plus the owner interval may not exceed 15 days
 HERDR_SESSION=default  # herdr-only: named session for normal backend ops; not enough for destructive cleanup (docs/herdr-backend.md)
 FM_BACKEND_HERDR_COMPOSER_LINES=20  # herdr-only: tail lines scanned by composer-state guard/fallback paths; idle-baseline submit confirmation uses agent-state
 FM_BACKEND_HERDR_IDLE_RE='^Type a message\.\.\.$'  # herdr-only: empty-composer placeholder regex after shared ghost extraction plus border and prompt stripping

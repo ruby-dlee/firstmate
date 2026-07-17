@@ -15,8 +15,8 @@
 #   4. off.
 # Valid modes are off, observe, and enforce.
 # Off does not invoke Agent Fleet.
-# Observe performs only `choose --dry-run`, never creates a lease, and never
-# changes the provider launch or task metadata.
+# Observe performs only `choose --dry-run`, never creates a lease, never wraps
+# the provider launch, and never writes managed account metadata.
 # Enforce atomically reserves one profile after endpoint and worktree setup,
 # immediately before provider launch, and fails closed on every Agent Fleet or
 # validation error.

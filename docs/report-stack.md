@@ -4,13 +4,13 @@ Firstmate publishes one durable report for every task created after the report-s
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation performs one bounded retention batch.
-Report retention is enforced by a per-user macOS LaunchAgent installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
+Scheduled retention is owned by a per-user macOS LaunchAgent only when it is installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
 The installer publishes immutable self-contained generations and atomically advances the LaunchAgent plist only after the referenced generation is complete, so a crash or reboot never depends on a later Firstmate session to restore executable code.
-Each sweep atomically publishes an authoritative retention cutoff, regenerates the visible index from that cutoff, and only then begins bounded tombstoning and physical deletion, so cleanup may span later runs without restoring an expired report to readers.
+Each sweep uses a crash-recoverable namespace cutover to isolate expired cohorts, publishes the authoritative retention cutoff, regenerates the visible index, and then makes bounded physical-deletion progress, so cleanup may span later runs without restoring an expired report to readers.
 The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, retries failed runs, and records a successful-prune heartbeat that session bootstrap validates.
 Merging the code does not install or activate the owner.
-The authoritative visibility cutoff advances monotonically to the exact `now - 30 days` boundary and never advances past it.
-Physical cleanup waits for the report's five-minute cohort deadline and a later owner sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its 30-day minimum age.
+The authoritative visibility cutoff is the later of its prior value and the current `now - 30 days` boundary, so ordinary forward wall time tracks that boundary exactly while a backward clock adjustment never re-exposes expired reports.
+Physical cleanup still waits for each report's 30-day minimum age, its five-minute cohort deadline, and a later retention sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its minimum age.
 The cohort width plus owner sweep interval may total at most 15 days, bounding scheduled visibility removal and tombstoning to 45 days after completion while physical tombstone deletion remains best-effort and bounded per sweep.
 Expired entries are renamed to deletion tombstones before the index changes, and interrupted recursive deletion resumes from those tombstones without restoring partial entries.
 

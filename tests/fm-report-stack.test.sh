@@ -754,6 +754,21 @@ EOF
   pass "report stack requires substantive content in every completion section"
 }
 
+test_required_sections_reject_container_only_markers() {
+  local id=report-container-only-sections-b3r source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Completion\n\n## Summary\n\n> \n\n## What changed\n\n+ \n\n## Verification\n\n1. \n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "container-only section markers unexpectedly satisfied required sections"
+  for heading in "## Summary" "## What changed" "## Verification"; do
+    assert_contains "$out" "$heading" "container-only failure omitted $heading"
+  done
+  assert_present "$HOME_DIR/state/$id.meta" "container-only validation removed task state"
+  pass "report stack rejects bare container markers as section content"
+}
+
 test_fenced_required_section_bodies_use_scoped_content() {
   local id source out status
 
@@ -4006,6 +4021,11 @@ if [ "${FM_TEST_FOCUSED:-}" = fenced-report-body-final ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = report-container-markers ]; then
+  test_required_sections_reject_container_only_markers
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   test_required_sections_fail_actionably
   test_required_sections_reject_empty_bodies
@@ -4075,6 +4095,7 @@ test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_required_sections_reject_empty_bodies
+test_required_sections_reject_container_only_markers
 test_fenced_required_section_bodies_use_scoped_content
 test_nested_short_fences_do_not_satisfy_required_sections
 test_raw_html_does_not_satisfy_required_sections

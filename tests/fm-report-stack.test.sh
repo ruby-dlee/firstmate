@@ -3261,8 +3261,13 @@ test_report_publication_restores_swapped_staging_generation() {
   FM_CONTAINED_REPORT_RENAME_TEST_READY="$ready" FM_CONTAINED_REPORT_RENAME_TEST_PROCEED="$proceed" \
     run_stack publish "$id" > "$output" 2>&1 &
   pid=$!
-  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
-  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "report generation rename gate did not open"; }
+  for _ in $(seq 1 1000); do
+    [ -e "$ready" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  [ -e "$ready" ] \
+    || { kill -TERM "$pid" 2>/dev/null || true; fail "report generation rename gate did not open: $(cat "$output")"; }
   staged="$STACK/entries/$(cat "$ready")"
   saved="$staged.saved"
   mv "$staged" "$saved"

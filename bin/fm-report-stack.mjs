@@ -456,7 +456,7 @@ function acquireLock() {
   const pinnedTombstones = pinnedDirectory(".retention-tombstones", pinnedStackRoot.real, "report retention tombstone directory");
   retentionTombstoneDescriptor = pinnedTombstones.descriptor;
   const lock = path.join(stackRoot, ".publish.lock");
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     const token = crypto.randomUUID();
     const candidate = path.join(stackRoot, `.publish.lock.candidate.${process.pid}.${token}`);
     try {
@@ -1081,7 +1081,12 @@ function recoverPreviousEntries() {
       if (fs.existsSync(previous)) {
         fs.rmSync(destination, { recursive: true, force: true });
         const restoredCohort = path.join(entriesDir, record.previousCohort);
-        fs.mkdirSync(restoredCohort, { mode: 0o700 });
+        try {
+          fs.mkdirSync(restoredCohort, { mode: 0o700 });
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+        }
+        realDirectory(restoredCohort, fs.realpathSync(entriesDir), "restored report retention cohort");
         fs.renameSync(previous, path.join(restoredCohort, reportId));
       } else if (!fs.existsSync(destination)) {
         throw new Error(`report transaction lost both generations for ${reportId}`);

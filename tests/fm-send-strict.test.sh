@@ -49,6 +49,7 @@ case "${1:-}" in
       exit 1
     fi
     case "$all" in
+      *'#{cursor_y}'*) printf '0\n' ;;
       *'#{session_name}'*) printf '%s\t%s\n' "${FM_FAKE_TMUX_SESSION:-sess}" "${FM_FAKE_TMUX_LABEL:-fm-lost}" ;;
       *) printf '%%1\n' ;;
     esac
@@ -252,7 +253,7 @@ test_explicit_managed_target_records_steering() {
     "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
   expect_code 0 "$rc" "explicit managed target send"
   assert_grep "Preserve this explicit managed steer" "$trail" \
-    "explicit managed target delivery was absent from the provider-neutral steering trail"
+    "explicit managed target delivery was absent from the provider-neutral steering trail: $(cat "$err")"
   pass "fm-send strict: explicit targets resolved to managed metadata are audited"
 }
 
@@ -329,13 +330,19 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
 
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=30 \
       "$SEND" managed-concurrent "Concurrent managed steer $i." >"$dir/send-$i.out" 2>"$dir/send-$i.err" &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do
     wait "$pid" || rc=1
   done
-  [ "$rc" -eq 0 ] || fail "a concurrent managed steer failed"
+  if [ "$rc" -ne 0 ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      [ ! -s "$dir/send-$i.err" ] || printf 'send-%s: %s\n' "$i" "$(cat "$dir/send-$i.err")" >&2
+    done
+    fail "a concurrent managed steer failed"
+  fi
   count=$(grep -c '^# Steering trail$' "$trail")
   [ "$count" -eq 1 ] || fail "concurrent steering wrote $count trail headers"
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -381,10 +388,7 @@ test_managed_send_revalidates_after_respawn_wait() {
     "generation_id=account:managed-race:attempt-2" "account_profile=codex-3"
   mv "$staged" "$home/state/managed-race.meta"
   fm_account_lifecycle_lock_release "$lock" || fail "could not release the respawn race lifecycle lock"
-  set +e
-  wait "$sender_pid"
-  sender_rc=$?
-  set -e
+  if wait "$sender_pid"; then sender_rc=0; else sender_rc=$?; fi
 
   [ "$sender_rc" -ne 0 ] || fail "managed sender accepted replaced metadata after waiting"
   assert_contains "$(cat "$err")" "generation or endpoint changed" \
@@ -427,10 +431,7 @@ test_managed_key_revalidates_after_respawn_wait() {
     "generation_id=account:managed-key-race:attempt-2" "account_profile=codex-3"
   mv "$staged" "$home/state/managed-key-race.meta"
   fm_account_lifecycle_lock_release "$lock" || fail "could not release the key respawn race lifecycle lock"
-  set +e
-  wait "$sender_pid"
-  sender_rc=$?
-  set -e
+  if wait "$sender_pid"; then sender_rc=0; else sender_rc=$?; fi
 
   [ "$sender_rc" -ne 0 ] || fail "managed key sender accepted replaced metadata after waiting"
   assert_contains "$(cat "$err")" "generation or endpoint changed" \
@@ -440,28 +441,27 @@ test_managed_key_revalidates_after_respawn_wait() {
 }
 
 test_managed_send_holds_lifecycle_through_audit() {
-  local dir fb home log trail steering_lock sender_pid sender_rc teardown_pid teardown_rc delivered
+  local dir fb home log trail ready proceed sender_pid sender_rc teardown_pid teardown_rc delivered
   dir="$TMP_ROOT/managed-teardown-race"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-teardown-race)
   log="$dir/tmux.log"; trail="$home/data/managed-audit-race/steering.md"
+  ready="$dir/after-submit.ready"; proceed="$dir/after-submit.proceed"
   mkdir -p "$home/data/managed-audit-race"
   : > "$log"
   fm_write_meta "$home/state/managed-audit-race.meta" \
     "window=sess:fm-managed-audit-race" "kind=ship" "harness=codex" \
     "generation_id=account:managed-audit-race:attempt-1" "account_profile=codex-2"
 
-  steering_lock=$(fm_account_lock_acquire "$home/state" managed-audit-race account-steering \
-    "managed steering" 10) || fail "could not hold the steering lock for the teardown race"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_SEND_TEST_AFTER_SUBMIT_READY="$ready" FM_SEND_TEST_AFTER_SUBMIT_PROCEED="$proceed" \
     "$SEND" managed-audit-race "Audit before teardown." >"$dir/send.out" 2>"$dir/send.err" &
   sender_pid=$!
   delivered=
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    grep -Fq 'arg=Audit before teardown.' "$log" && { delivered=1; break; }
+    [ -e "$ready" ] && { delivered=1; break; }
     /bin/sleep 0.05
   done
   if [ -z "$delivered" ]; then
-    fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true
     kill "$sender_pid" 2>/dev/null || true
     wait "$sender_pid" 2>/dev/null || true
     fail "managed sender never delivered before the audit gate"
@@ -478,13 +478,9 @@ test_managed_send_holds_lifecycle_through_audit() {
   [ ! -e "$dir/teardown-acquired" ] \
     || fail "teardown acquired the lifecycle lock before managed audit persistence"
 
-  fm_account_meta_lock_release "$steering_lock" || fail "could not release the steering audit gate"
-  set +e
-  wait "$sender_pid"
-  sender_rc=$?
-  wait "$teardown_pid"
-  teardown_rc=$?
-  set -e
+  : > "$proceed"
+  if wait "$sender_pid"; then sender_rc=0; else sender_rc=$?; fi
+  if wait "$teardown_pid"; then teardown_rc=0; else teardown_rc=$?; fi
   expect_code 0 "$sender_rc" "managed send should finish after canonical audit persistence"
   expect_code 0 "$teardown_rc" "teardown waiter should observe the canonical audit before proceeding"
   assert_present "$dir/teardown-acquired" "teardown waiter never acquired lifecycle ownership"
@@ -512,7 +508,7 @@ test_managed_steering_rejects_parent_swap_during_persistence() {
     "generation_id=account:managed-steering-parent-race:attempt-1" "account_profile=codex-2"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    FM_FILE_TRANSACTION_TEST_READY="$ready" FM_FILE_TRANSACTION_TEST_PROCEED="$proceed" \
+    FM_SEND_TEST_AFTER_SUBMIT_READY="$ready" FM_SEND_TEST_AFTER_SUBMIT_PROCEED="$proceed" \
     "$SEND" managed-steering-parent-race "Do not persist through a replaced parent." >"$dir/send.out" 2>"$dir/send.err" &
   sender_pid=$!
   for _ in $(seq 1 100); do
@@ -527,11 +523,9 @@ test_managed_steering_rejects_parent_swap_during_persistence() {
   mv "$task_dir" "$moved"
   ln -s "$outside" "$task_dir"
   : > "$proceed"
-  set +e
-  wait "$sender_pid"
-  sender_rc=$?
-  set -e
-  expect_code 0 "$sender_rc" "delivered managed steering should retain delivery truth after audit refusal"
+  if wait "$sender_pid"; then sender_rc=0; else sender_rc=$?; fi
+  expect_code 0 "$sender_rc" \
+    "delivered managed steering should retain delivery truth after audit refusal: $(cat "$dir/send.err")"
   [ "$(cat "$outside/steering.md")" = 'outside steering sentinel' ] \
     || fail "managed steering transaction wrote through a raced task parent"
   [ "$(cat "$moved/steering.md")" = "$before" ] \

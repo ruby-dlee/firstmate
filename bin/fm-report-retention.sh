@@ -506,6 +506,7 @@ install_owner() {
       retain_owner_handoff_fence "$domain" "$old_label" "${old_generation:--}" "$job_label" \
         "$installed_provenance" "$activation_nonce" "$heartbeat_backup" "$heartbeat_had_previous" \
         || { rm -f "$plist_temp" "$previous_plist"; return 1; }
+      rm -f "$CANDIDATE_FENCE" || { rm -f "$plist_temp" "$previous_plist"; return 1; }
       install_test_interrupt owner-handoff-prepointer || return $?
     fi
     if [ "${FM_REPORT_RETENTION_INSTALL_TEST_FAIL_POINTER:-}" = 1 ] || ! mv -f "$plist_temp" "$PLIST"; then

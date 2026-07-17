@@ -858,6 +858,13 @@ SH
     ' "$ROOT" "$identity" 2>&1) || fail "malformed Herdr pane record was not fail-closed: $out"
   done
   out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "a removed final Herdr pane and workspace were not classified as absent: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
     FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}' \
     FM_HERDR_TABS='{"result":{"tabs":[]}}' bash -c '
     . "$0/bin/fm-backend.sh"

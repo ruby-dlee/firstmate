@@ -695,7 +695,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
     --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
     'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace and .label == $want_label)' >/dev/null 2>&1; then
-    printf 'mismatch'
+    if [ "$pane_record" = null ]; then printf 'absent'; else printf 'mismatch'; fi
     return 0
   fi
   tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \

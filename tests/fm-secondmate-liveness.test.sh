@@ -401,10 +401,12 @@ test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
   local w fb tmuxfb log out
   w=$(new_world sweep-unmanaged-routing)
   add_sm_home "$w" sm1 firstmate:fm-sm1
+  mkdir -p "$w/home/config"
+  printf 'enforce\n' > "$w/home/config/account-routing-mode"
   fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
   log="$w/calls.log"; : > "$log"
 
-  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" FM_ACCOUNT_ROUTING=enforce)
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
 
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "an unmanaged secondmate should retain legacy recovery after routing is enabled"

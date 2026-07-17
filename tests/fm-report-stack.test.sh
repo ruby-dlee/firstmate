@@ -41,6 +41,35 @@ run_stack_home() {
   FM_HOME="$home" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" "$@"
 }
 
+expire_report_entry() {  # <report.html> [completed-at] -> updated report.html
+  local entry=$1 completed_at=${2:-2000-01-01T00:00:00.000Z}
+  local report_dir report_id cohort manifest destination
+  report_dir=$(dirname "$entry")
+  report_id=$(basename "$report_dir")
+  cohort=$(node -e '
+    const timestamp = Date.parse(process.argv[1]);
+    const retention = 30 * 24 * 60 * 60 * 1000;
+    const width = Number(process.argv[2]);
+    process.stdout.write(`cohort-${Math.ceil((timestamp + retention) / width) * width}`);
+  ' "$completed_at" "${FM_REPORT_RETENTION_COHORT_MS:-300000}") || return 1
+  manifest="$report_dir/manifest.json"
+  node - "$manifest" "$completed_at" "$cohort" <<'NODE'
+const fs = require("fs");
+const [file, completedAt, retentionCohort] = process.argv.slice(2);
+const value = JSON.parse(fs.readFileSync(file, "utf8"));
+value.completedAt = completedAt;
+value.retentionCohort = retentionCohort;
+fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+NODE
+  destination="$STACK/entries/$cohort/$report_id"
+  mkdir -p "$STACK/entries/$cohort"
+  if [ "$report_dir" != "$destination" ]; then
+    [ ! -e "$destination" ] || fail "expired report destination already exists: $destination"
+    mv "$report_dir" "$destination"
+  fi
+  printf '%s/report.html\n' "$destination"
+}
+
 write_required_report() {
   local file=$1 summary=$2
   printf '# Completion\n\n## Summary\n\n%s\n\n## What changed\n\nRecorded work.\n\n## Verification\n\nEvidence checked.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' "$summary" > "$file"
@@ -390,7 +419,7 @@ process.stdout.write(String(JSON.parse(source.match(/=(\{.*\});/)[1]).cutoffMs))
 }
 
 test_republish_new_generation_refreshes_completion_time() {
-  local id=report-generation-a4 repo meta entry manifest staged
+  local id=report-generation-a4 repo meta entry manifest staged previous_completed completed
   repo="$TMP_ROOT/generation-worktree"
   mkdir -p "$repo"
   git -C "$repo" init -q
@@ -407,23 +436,19 @@ test_republish_new_generation_refreshes_completion_time() {
   run_stack publish "$id" >/dev/null || fail "first generation report publication failed"
   entry=$(run_stack path "$id")
   manifest="$(dirname "$entry")/manifest.json"
-  node - "$manifest" <<'NODE'
-const fs = require("fs");
-const file = process.argv[2];
-const value = JSON.parse(fs.readFileSync(file));
-value.completedAt = new Date(Date.parse(value.completedAt) - 1000).toISOString();
-fs.writeFileSync(`${file}.tmp`, `${JSON.stringify(value, null, 2)}\n`);
-NODE
-  mv "$manifest.tmp" "$manifest"
+  previous_completed=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  /bin/sleep 0.02
 
   git -C "$repo" commit -q --allow-empty -m second
   sed 's/^harness=.*/harness=claude/; s/^account_profile=.*/account_profile=claude-3/; s/^generation_id=.*/generation_id=generation-restored/' "$meta" > "$staged"
   mv "$staged" "$meta"
   write_required_report "$HOME_DIR/data/$id/completion.md" "Restored generation."
   run_stack publish "$id" >/dev/null || fail "restored generation report publication failed"
-  if grep -q '"completedAt": "2000-01-01T00:00:00.000Z"' "$manifest"; then
-    fail "new generation retained the superseded completion timestamp"
-  fi
+  entry=$(run_stack path "$id") || fail "restored generation report path failed"
+  manifest="$(dirname "$entry")/manifest.json"
+  completed=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  [ -n "$completed" ] && [ "$completed" != "$previous_completed" ] \
+    || fail "new generation retained the superseded completion timestamp"
   assert_grep '"harness": "claude"' "$manifest" "new generation report retained the superseded harness"
   assert_grep '"accountProfile": "claude-3"' "$manifest" "new generation report retained the superseded profile"
   pass "report republish refreshes completion time for a new task generation"
@@ -517,25 +542,29 @@ test_metadata_is_bounded_before_reading() {
 }
 
 test_report_temps_are_exclusive_and_randomized() {
-  local id=report-temp-safety-a8 outside entry report_id
+  local id=report-temp-safety-a8 outside entry report_id index_plant transaction_plant
   id=report-temp-safety-a8
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Exclusive report staging."
   outside="$TMP_ROOT/report-temp-sentinel"
   printf 'sentinel\n' > "$outside"
   mkdir -p "$STACK"
+  index_plant="$STACK/.index.html.${BASHPID:-$$}.tmp"
   (
-    ln -s "$outside" "$STACK/.index.html.${BASHPID:-$$}.tmp"
+    ln -s "$outside" "$index_plant"
     exec env FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" publish "$id"
   ) >/dev/null || fail "legacy predictable index temp fixture blocked randomized publication"
   assert_grep 'sentinel' "$outside" "report index staging followed a planted temp symlink"
+  rm -f "$index_plant"
   entry=$(run_stack path "$id")
   report_id=$(basename "$(dirname "$entry")")
+  transaction_plant="$STACK/entries/.$report_id.transaction.${BASHPID:-$$}.tmp"
   (
-    ln -s "$outside" "$STACK/entries/.$report_id.transaction.${BASHPID:-$$}.tmp"
+    ln -s "$outside" "$transaction_plant"
     exec env FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" "$SCRIPT" publish "$id"
   ) >/dev/null || fail "legacy predictable transaction temp fixture blocked randomized publication"
   assert_grep 'sentinel' "$outside" "report transaction staging followed a planted temp symlink"
+  rm -f "$transaction_plant"
   pass "report transactions and indexes use exclusive randomized staging"
 }
 
@@ -1292,7 +1321,7 @@ test_stale_lock_rejects_reused_pid() {
 }
 
 test_stale_lock_reclaim_is_serialized() {
-  local pids="" pid failures=0
+  local pids="" pid failures=0 i
   mkdir -p "$STACK/.publish.lock"
   printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$STACK/.publish.lock/owner"
   touch -t 200001010000 "$STACK/.publish.lock"
@@ -1303,7 +1332,12 @@ test_stale_lock_reclaim_is_serialized() {
   for pid in $pids; do
     wait "$pid" || failures=$((failures + 1))
   done
-  [ "$failures" -eq 0 ] || fail "concurrent stale-lock reclaim lost $failures publisher(s)"
+  if [ "$failures" -ne 0 ]; then
+    for i in 1 2 3 4 5 6 7 8; do
+      [ ! -s "$TMP_ROOT/render-$i.out" ] || printf 'render-%s: %s\n' "$i" "$(cat "$TMP_ROOT/render-$i.out")" >&2
+    done
+    fail "concurrent stale-lock reclaim lost $failures publisher(s)"
+  fi
   assert_absent "$STACK/.publish.lock" "concurrent render retained the publication lock"
   if find "$STACK" -maxdepth 1 -name '.publish.lock.stale.*' | grep . >/dev/null 2>&1; then
     fail "concurrent stale-lock reclaim leaked quarantine state"
@@ -1374,34 +1408,40 @@ test_lock_control_files_are_bounded_and_nonfollowing() {
 }
 
 test_previous_generation_is_recovered_for_readers() {
-  local id=report-crash-recovery-k2 entry destination report_id previous json
+  local id=report-crash-recovery-k2 entry destination report_id cohort previous transaction json
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Crash-safe report."
   run_stack publish "$id" >/dev/null || fail "crash-recovery report failed to publish"
   entry=$(run_stack path "$id")
   destination=$(dirname "$entry")
   report_id=$(basename "$destination")
-  previous="$(dirname "$destination")/.$report_id.previous"
+  cohort=$(basename "$(dirname "$destination")")
+  previous="$STACK/entries/.$report_id.previous"
+  transaction="$STACK/entries/.$report_id.transaction"
   mv "$destination" "$previous"
+  printf '{"schemaVersion":2,"reportId":"%s","destinationCohort":"%s","previousCohort":"%s"}\n' \
+    "$report_id" "$cohort" "$cohort" > "$transaction"
 
   json=$(run_stack list --json) || fail "report list did not recover the previous generation"
   printf '%s\n' "$json" | grep -F '"taskId": "report-crash-recovery-k2"' >/dev/null \
     || fail "recovered previous generation was absent from report inventory"
   assert_present "$destination/report.html" "reader recovery did not restore the durable report entry"
   assert_absent "$previous" "reader recovery retained the hidden previous generation"
+  assert_absent "$transaction" "reader recovery retained the completed report transaction"
   entry=$(run_stack path "$id") || fail "report path did not resolve after generation recovery"
   assert_present "$entry" "recovered report path is missing"
   pass "report readers recover crash-interrupted generation swaps"
 }
 
 test_replacement_transaction_recovery_restores_entry_and_index() {
-  local id=report-replacement-transaction-k2b entry destination report_id previous transaction staged json
+  local id=report-replacement-transaction-k2b entry destination report_id cohort previous transaction staged json
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Original transaction generation."
   run_stack publish "$id" >/dev/null || fail "replacement transaction precondition failed"
   entry=$(run_stack path "$id")
   destination=$(dirname "$entry")
   report_id=$(basename "$destination")
+  cohort=$(basename "$(dirname "$destination")")
   previous="$STACK/entries/.$report_id.previous"
   transaction="$STACK/entries/.$report_id.transaction"
   staged="$STACK/entries/.$report_id.999.tmp"
@@ -1411,7 +1451,8 @@ test_replacement_transaction_recovery_restores_entry_and_index() {
   rm -f "$destination/report.md.bak"
   mkdir -p "$staged"
   printf 'stale index\n' > "$STACK/index.html"
-  printf '{"schemaVersion":1,"reportId":"%s","hadPrevious":true}\n' "$report_id" > "$transaction"
+  printf '{"schemaVersion":2,"reportId":"%s","destinationCohort":"%s","previousCohort":"%s"}\n' \
+    "$report_id" "$cohort" "$cohort" > "$transaction"
 
   json=$(run_stack list --json) || fail "report list did not recover an interrupted replacement transaction"
   printf '%s\n' "$json" | grep -F '"taskId": "report-replacement-transaction-k2b"' >/dev/null \
@@ -1426,16 +1467,18 @@ test_replacement_transaction_recovery_restores_entry_and_index() {
 }
 
 test_first_publication_transaction_recovery_removes_unindexed_entry() {
-  local id=report-first-transaction-k2c entry destination report_id transaction json
+  local id=report-first-transaction-k2c entry destination report_id cohort transaction json
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Uncommitted first publication."
   run_stack publish "$id" >/dev/null || fail "first-publication transaction precondition failed"
   entry=$(run_stack path "$id")
   destination=$(dirname "$entry")
   report_id=$(basename "$destination")
+  cohort=$(basename "$(dirname "$destination")")
   transaction="$STACK/entries/.$report_id.transaction"
   printf 'stale index\n' > "$STACK/index.html"
-  printf '{"schemaVersion":1,"reportId":"%s","hadPrevious":false}\n' "$report_id" > "$transaction"
+  printf '{"schemaVersion":2,"reportId":"%s","destinationCohort":"%s","previousCohort":null}\n' \
+    "$report_id" "$cohort" > "$transaction"
 
   json=$(run_stack list --json) || fail "report list did not recover an interrupted first publication"
   if printf '%s\n' "$json" | grep -F '"taskId": "report-first-transaction-k2c"' >/dev/null; then
@@ -1464,7 +1507,7 @@ test_aged_transactionless_staging_is_reclaimed() {
 }
 
 test_completed_reports_prune_after_minimum_age() {
-  local old_id=report-retention-old-k2d fresh_id=report-retention-fresh-k2e old_entry fresh_entry manifest temp active
+  local old_id=report-retention-old-k2d fresh_id=report-retention-fresh-k2e old_entry fresh_entry
   write_task "$old_id" ship
   write_required_report "$HOME_DIR/data/$old_id/completion.md" "Expired report content."
   run_stack publish "$old_id" >/dev/null || fail "expired retention precondition publication failed"
@@ -1473,18 +1516,10 @@ test_completed_reports_prune_after_minimum_age() {
   write_required_report "$HOME_DIR/data/$fresh_id/completion.md" "Fresh report content."
   run_stack publish "$fresh_id" >/dev/null || fail "fresh retention precondition publication failed"
   fresh_entry=$(run_stack path "$fresh_id") || fail "fresh retention precondition path failed"
-  manifest="$(dirname "$old_entry")/manifest.json"
-  temp="$manifest.tmp"
-  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
-  active="$STACK/entries/.active-retention.999.tmp"
-  mkdir -p "$active"
-  printf 'active staging bytes\n' > "$active/pending.txt"
-
+  old_entry=$(expire_report_entry "$old_entry") || fail "expired retention fixture could not be aged"
   run_stack render >/dev/null || fail "report retention sweep failed"
   assert_absent "$(dirname "$old_entry")" "expired completed report entry was not pruned"
   assert_present "$fresh_entry" "fresh completed report was pruned"
-  assert_present "$active/pending.txt" "fresh report staging was pruned as completed history"
   assert_no_grep 'Expired report content' "$STACK/index.html" "report index retained an expired completed entry"
   assert_grep 'Fresh report content' "$STACK/index.html" "report index lost the fresh completed entry"
   pass "report stack prunes completed entries after their minimum age"
@@ -1503,8 +1538,7 @@ test_retention_binds_manifests_to_entry_directories() {
   manifest="$(dirname "$old_entry")/manifest.json"
   fresh_report_id=$(basename "$(dirname "$fresh_entry")")
   temp="$manifest.tmp"
-  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
-    -e "s/\"reportId\": \"[^\"]*\"/\"reportId\": \"$fresh_report_id\"/" "$manifest" > "$temp"
+  sed -e "s/\"reportId\": \"[^\"]*\"/\"reportId\": \"$fresh_report_id\"/" "$manifest" > "$temp"
   mv "$temp" "$manifest"
   if out=$(run_stack prune 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "retention accepted a manifest bound to another entry"
@@ -1516,7 +1550,7 @@ test_retention_binds_manifests_to_entry_directories() {
 }
 
 test_watcher_periodically_owns_idle_report_retention() {
-  local old_id=report-retention-watch-old-k2i fresh_id=report-retention-watch-fresh-k2j old_entry fresh_entry manifest temp active
+  local old_id=report-retention-watch-old-k2i fresh_id=report-retention-watch-fresh-k2j old_entry fresh_entry
   write_task "$old_id" ship
   write_required_report "$HOME_DIR/data/$old_id/completion.md" "Watcher-expired report."
   run_stack publish "$old_id" >/dev/null || fail "watch retention old publication failed"
@@ -1525,13 +1559,7 @@ test_watcher_periodically_owns_idle_report_retention() {
   write_required_report "$HOME_DIR/data/$fresh_id/completion.md" "Watcher-fresh report."
   run_stack publish "$fresh_id" >/dev/null || fail "watch retention fresh publication failed"
   fresh_entry=$(run_stack path "$fresh_id") || fail "watch retention fresh path failed"
-  manifest="$(dirname "$old_entry")/manifest.json"
-  temp="$manifest.tmp"
-  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
-  active="$STACK/entries/.watch-retention.999.tmp"
-  mkdir -p "$active"
-  printf 'active staging bytes\n' > "$active/pending.txt"
+  old_entry=$(expire_report_entry "$old_entry") || fail "watcher retention fixture could not be aged"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$HOME_DIR/state" FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_RETENTION_INTERVAL=86400 FM_REPORT_RETENTION_TIMEOUT=5 bash -c '
       . "$1/bin/fm-watch.sh"
@@ -1540,93 +1568,77 @@ test_watcher_periodically_owns_idle_report_retention() {
     ' _ "$ROOT" || fail "watcher-owned report retention failed"
   assert_absent "$(dirname "$old_entry")" "watcher-owned retention kept an expired report"
   assert_present "$fresh_entry" "watcher-owned retention removed a fresh report"
-  assert_present "$active/pending.txt" "watcher-owned retention touched active staging"
   assert_present "$HOME_DIR/state/.last-report-retention" "watcher-owned retention did not persist its cadence"
   pass "watcher supervision periodically owns idle report retention"
 }
 
 test_retention_restores_expired_entries_when_index_swap_fails() {
-  local id=report-retention-rollback-k2f entry manifest temp out status tombstone
+  local id=report-retention-rollback-k2f entry out status tombstone index
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Retention rollback content."
   run_stack publish "$id" >/dev/null || fail "retention rollback precondition publication failed"
   entry=$(run_stack path "$id") || fail "retention rollback precondition path failed"
-  manifest="$(dirname "$entry")/manifest.json"
-  temp="$manifest.tmp"
-  sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
+  entry=$(expire_report_entry "$entry") || fail "retention rollback fixture could not be aged"
   rm -f "$STACK/index.html"
   mkdir "$STACK/index.html"
   if out=$(run_stack render 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "retention unexpectedly replaced an unsafe report index destination"
   assert_absent "$(dirname "$entry")" "failed retention index swap restored an expired entry"
-  tombstone="$STACK/entries/.$(basename "$(dirname "$entry")").expired"
+  tombstone=$(find "$STACK/.retention-tombstones" -mindepth 1 -maxdepth 1 -type d -name 'tombstone-*' -print -quit)
+  [ -n "$tombstone" ] || fail "failed retention index swap lost its durable deletion tombstone"
   assert_present "$tombstone" "failed retention index swap lost its durable deletion tombstone"
   rmdir "$STACK/index.html"
-  run_stack prune >/dev/null || fail "retention could not resume a deletion tombstone"
+  for index in $(seq 1 100); do
+    run_stack prune >/dev/null || fail "retention could not resume a deletion tombstone"
+    [ ! -e "$tombstone" ] && break
+  done
   assert_absent "$tombstone" "resumed retention kept a completed deletion tombstone"
   [ -n "$out" ] || true
   pass "report retention preserves deletion tombstones across index failures"
 }
 
 test_retention_batches_make_interruption_safe_progress() {
-  local id entry manifest temp output index
-  local -a manifests
+  local id entry output index tombstone
+  local -a entries
   for index in 1 2 3; do
     id="report-retention-batch-$index-k2l"
     write_task "$id" ship
     write_required_report "$HOME_DIR/data/$id/completion.md" "Expired batch $index."
     run_stack publish "$id" >/dev/null || fail "retention batch precondition $index failed"
     entry=$(run_stack path "$id") || fail "retention batch path $index failed"
-    manifests[index]="$(dirname "$entry")/manifest.json"
+    entries[index]="$entry"
   done
   for index in 1 2 3; do
-    manifest=${manifests[index]}
-    temp="$manifest.tmp"
-    sed 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' "$manifest" > "$temp"
-    mv "$temp" "$manifest"
+    entries[index]=$(expire_report_entry "${entries[index]}") \
+      || fail "retention batch fixture $index could not be aged"
   done
   output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "first bounded retention batch failed"
   assert_contains "$output" '"pending":true' "bounded retention did not advertise remaining work"
-  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*.expired' | wc -l | tr -d ' ')" -eq 2 ] \
-    || fail "bounded retention did not tombstone every due report before physical cleanup"
-  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -name '*report-retention-batch-*' | wc -l | tr -d ' ')" -eq 0 ] \
-    || fail "bounded retention left due reports live after its first visibility transaction"
+  tombstone=$(find "$STACK/.retention-tombstones" -mindepth 1 -maxdepth 1 -type d -name 'tombstone-*' -print -quit)
+  [ -n "$tombstone" ] || fail "bounded retention did not retain its pending tombstone"
+  for index in 1 2 3; do
+    assert_absent "$(dirname "${entries[index]}")" \
+      "bounded retention left due report $index live after its visibility transaction"
+  done
   assert_no_grep 'report-retention-batch-' "$STACK/index.html" \
     "bounded retention left a due report in the current index"
-  for index in 1 2 3 4 5 6 7 8; do
+  for index in $(seq 1 100); do
     output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "retention progress batch $index failed"
     case "$output" in *'"pending":false'*) break ;; esac
   done
-  [ "$(find "$STACK/entries" -mindepth 1 -maxdepth 1 -type d -name '*report-retention-batch-*' | wc -l | tr -d ' ')" -eq 0 ] \
-    || fail "bounded retention did not finish all expired entries and tombstones"
+  assert_absent "$tombstone" "bounded retention did not finish its expired cohort tombstone"
   pass "report retention removes every due report before bounded tombstone cleanup"
 }
 
 test_persistent_retention_owner_prunes_without_tasks_or_watcher() {
-  local id=report-retention-owner-k2m entry manifest temp fakebin install_root agents heartbeat out status bash_runtime node_runtime python_runtime plist
+  local id=report-retention-owner-k2m entry fakebin install_root agents heartbeat out status bash_runtime node_runtime python_runtime plist log
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Persistent-owner expiry."
   run_stack publish "$id" >/dev/null || fail "persistent retention owner precondition failed"
   entry=$(run_stack path "$id") || fail "persistent retention owner path failed"
-  manifest="$(dirname "$entry")/manifest.json"
-  temp="$manifest.tmp"
-  # shellcheck disable=SC2016
-  node -e '
-    const fs = require("fs");
-    const file = process.argv[1];
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
-    value.completedAt = new Date(Date.now() - 30 * 86400000 + 500).toISOString();
-    fs.writeFileSync(process.argv[2], `${JSON.stringify(value, null, 2)}\n`);
-  ' "$manifest" "$temp"
-  mv "$temp" "$manifest"
-  temp="$TMP_ROOT/retention-owner-manifest.tmp"
-  sed 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684800000"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
-  mkdir "$STACK/entries/cohort-946684800000"
-  mv "$(dirname "$entry")" "$STACK/entries/cohort-946684800000/"
-  entry="$STACK/entries/cohort-946684800000/$(basename "$(dirname "$entry")")/report.html"
+  entry=$(expire_report_entry "$entry") || fail "persistent retention fixture could not be aged"
   fakebin="$TMP_ROOT/retention-launchctl"; install_root="$TMP_ROOT/retention-install"; agents="$TMP_ROOT/LaunchAgents"
+  log="$TMP_ROOT/launchctl.log"
   mkdir -p "$fakebin" "$agents"
   : > "$log"
   cat > "$fakebin/launchctl" <<'SH'
@@ -1638,7 +1650,7 @@ SH
   FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
     FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
-    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
     "$ROOT/bin/fm-bootstrap.sh" install report-retention >/dev/null \
     || fail "retention LaunchAgent installation through bootstrap failed"
   node_runtime=$(command -v node)
@@ -1657,7 +1669,7 @@ SH
   FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
     FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
-    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
     "$ROOT/bin/fm-report-retention.sh" ensure || fail "healthy installed retention owner was rejected"
   temp="$heartbeat.tmp"
   { printf '1\n'; sed -n '2p' "$heartbeat"; } > "$temp"
@@ -1665,12 +1677,12 @@ SH
   if out=$(FM_GATE_REFUSE_BYPASS=1 FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
     FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
-    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log" \
+    FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
     "$ROOT/bin/fm-report-retention.sh" ensure 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "stale successful-prune heartbeat was accepted"
   assert_contains "$out" "heartbeat is stale" "stale retention heartbeat refusal was unclear"
-  assert_grep 'bootstrap' "$TMP_ROOT/launchctl.log" "retention install did not bootstrap its LaunchAgent"
-  assert_grep 'kickstart' "$TMP_ROOT/launchctl.log" "retention install did not start its LaunchAgent"
+  assert_grep 'bootstrap' "$log" "retention install did not bootstrap its LaunchAgent"
+  assert_grep 'kickstart' "$log" "retention install did not start its LaunchAgent"
   pass "restart-capable retention installation is stable, task-independent, and health-checked"
 }
 
@@ -1898,7 +1910,7 @@ SH
 }
 
 test_report_destination_roots_remain_pinned_during_ancestor_swap() {
-  local id=report-destination-race-k2n ready proceed output moved outside pid status
+  local id=report-destination-race-k2n ready proceed output moved outside pid status published_manifest
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Pinned destination roots."
   ready="$TMP_ROOT/report-destination.ready"; proceed="$TMP_ROOT/report-destination.proceed"
@@ -1915,7 +1927,9 @@ test_report_destination_roots_remain_pinned_during_ancestor_swap() {
   touch "$proceed"
   wait "$pid"; status=$?
   [ "$status" -eq 0 ] || fail "pinned report publication failed after ancestor swap: $(cat "$output")"
-  assert_grep 'Pinned destination roots.' "$(find "$moved/entries" -name report.md -print -quit)" \
+  published_manifest=$(grep -R -l -F "\"taskId\": \"$id\"" "$moved/entries")
+  [ -n "$published_manifest" ] || fail "pinned report publication did not retain its task manifest"
+  assert_grep 'Pinned destination roots.' "$(dirname "$published_manifest")/report.md" \
     "report publication left the originally pinned destination"
   [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "report publication was redirected through the swapped stack path"
   rm "$STACK"
@@ -1924,13 +1938,14 @@ test_report_destination_roots_remain_pinned_during_ancestor_swap() {
 }
 
 test_index_failure_restores_previous_generation() {
-  local id=report-index-rollback-k3 entry out status
+  local id=report-index-rollback-k3 entry invalid out status
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Original generation."
   run_stack publish "$id" >/dev/null || fail "index rollback precondition failed"
   entry=$(run_stack path "$id")
-  mkdir -p "$STACK/entries/invalid-manifest"
-  printf '{invalid\n' > "$STACK/entries/invalid-manifest/manifest.json"
+  invalid="$(dirname "$(dirname "$entry")")/invalid-manifest"
+  mkdir -p "$invalid"
+  printf '{invalid\n' > "$invalid/manifest.json"
   write_required_report "$HOME_DIR/data/$id/completion.md" "Replacement generation."
 
   out=$(run_stack publish "$id" 2>&1)
@@ -1940,7 +1955,7 @@ test_index_failure_restores_previous_generation() {
   if grep -F 'Replacement generation' "$(dirname "$entry")/report.md" >/dev/null 2>&1; then
     fail "failed index rendering retained the unindexed replacement generation"
   fi
-  rm -rf "$STACK/entries/invalid-manifest"
+  rm -rf "$invalid"
   [ -n "$out" ] || true
   pass "report publication restores the previous generation when index rendering fails"
 }
@@ -1955,7 +1970,7 @@ test_readers_wait_for_publication_lock() {
   sleep 0.2
   kill -0 "$reader" 2>/dev/null || fail "report reader bypassed the publication lock"
   rm -rf "$STACK/.publish.lock"
-  wait "$reader" || fail "report reader failed after the publication lock was released"
+  wait "$reader" || fail "report reader failed after the publication lock was released: $(cat "$TMP_ROOT/locked-reader.err")"
   pass "report readers hold the publication lock while resolving entries"
 }
 
@@ -2365,22 +2380,25 @@ JS
 }
 
 test_report_entry_manifest_reads_stay_on_pinned_generation() {
-  local id=report-entry-pin-z30c entry moved outside ready proceed output pid status
+  local id=report-entry-pin-z30c stack entry moved outside ready proceed output pid status
+  stack="$TMP_ROOT/entry-pin-stack"
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Pinned manifest content."
-  run_stack publish "$id" >/dev/null || fail "entry-pin publication failed"
-  entry=$(dirname "$(run_stack path "$id")") || fail "entry-pin path failed"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" publish "$id" >/dev/null \
+    || fail "entry-pin publication failed"
+  entry=$(dirname "$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path "$id")") \
+    || fail "entry-pin path failed"
   moved="$TMP_ROOT/pinned-entry"; outside="$TMP_ROOT/outside-entry"; mkdir -p "$outside"
   printf '{"outside":true}\n' > "$outside/manifest.json"
   ready="$TMP_ROOT/entry-pin.ready"; proceed="$TMP_ROOT/entry-pin.proceed"; output="$TMP_ROOT/entry-pin.out"
-  FM_REPORT_ENTRY_TEST_READY="$ready" FM_REPORT_ENTRY_TEST_PROCEED="$proceed" run_stack list --json > "$output" 2>&1 &
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_ENTRY_TEST_READY="$ready" FM_REPORT_ENTRY_TEST_PROCEED="$proceed" \
+    "$SCRIPT" list --json > "$output" 2>&1 &
   pid=$!
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "entry manifest pin gate did not open"; }
   mv "$entry" "$moved"; ln -s "$outside" "$entry"; touch "$proceed"
-  set +e
-  wait "$pid"; status=$?
-  set -e
+  if wait "$pid"; then status=0; else status=$?; fi
   rm "$entry"; mv "$moved" "$entry"
   [ "$status" -eq 0 ] || fail "pinned manifest read failed: $(cat "$output")"
   assert_no_grep '"outside": true' "$output" "manifest read followed a swapped entry ancestor"
@@ -2404,9 +2422,7 @@ test_repository_fingerprint_recurses_through_submodule_worktrees() {
 
 test_retention_cutoff_is_authoritative_before_cleanup() {
   local id=report-retention-cutoff-k2q second=report-retention-cutoff-k2r fresh=report-retention-fresh-k2q
-  local entry second_entry fresh_entry manifest second_manifest temp ready output policy cutoff
-  local expired_cohort="$STACK/entries/cohort-946684800000"
-  local second_expired_cohort="$STACK/entries/cohort-946598400000"
+  local entry second_entry fresh_entry ready output policy cutoff
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cutoff-visible report."
   run_stack publish "$id" >/dev/null || fail "cutoff precondition publication failed"
@@ -2415,26 +2431,13 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
   write_required_report "$HOME_DIR/data/$fresh/completion.md" "Fresh report."
   run_stack publish "$fresh" >/dev/null || fail "fresh cutoff precondition publication failed"
   fresh_entry=$(run_stack path "$fresh") || fail "fresh cutoff precondition path failed"
-  manifest="$(dirname "$entry")/manifest.json"
-  temp="$manifest.tmp"
-  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
-    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684800000"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
-  mkdir "$expired_cohort"
-  mv "$(dirname "$entry")" "$expired_cohort/"
-  entry="$expired_cohort/$(basename "$(dirname "$entry")")/report.html"
+  entry=$(expire_report_entry "$entry") || fail "retention cutoff fixture could not be aged"
   write_task "$second" ship
   write_required_report "$HOME_DIR/data/$second/completion.md" "Second cutoff-visible report."
   run_stack publish "$second" >/dev/null || fail "second cutoff precondition publication failed"
   second_entry=$(run_stack path "$second") || fail "second cutoff precondition path failed"
-  second_manifest="$(dirname "$second_entry")/manifest.json"
-  temp="$second_manifest.tmp"
-  sed -e 's/"completedAt": "[^"]*"/"completedAt": "1999-12-31T00:00:00.000Z"/' \
-    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946598400000"/' "$second_manifest" > "$temp"
-  mv "$temp" "$second_manifest"
-  mkdir "$second_expired_cohort"
-  mv "$(dirname "$second_entry")" "$second_expired_cohort/"
-  second_entry="$second_expired_cohort/$(basename "$(dirname "$second_entry")")/report.html"
+  second_entry=$(expire_report_entry "$second_entry" '1999-12-31T00:00:00.000Z') \
+    || fail "second retention cutoff fixture could not be aged"
   ready="$TMP_ROOT/retention-policy.ready"; output="$TMP_ROOT/retention-policy.out"
   if FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_ABORT=1 \
     run_stack prune --status > "$output" 2>&1; then
@@ -2461,19 +2464,14 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
 }
 
 test_retention_cohort_tombstone_is_noreplace_owned() {
-  local id=report-retention-cohort-race-k2s entry manifest temp source retired retired_name tombstone ready proceed output pid status
+  local id=report-retention-cohort-race-k2s entry source retired retired_name tombstone ready proceed output pid status
   id=report-retention-cohort-race-k2s
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Cohort rename race."
   run_stack publish "$id" >/dev/null || fail "cohort rename race precondition publication failed"
   entry=$(run_stack path "$id") || fail "cohort rename race path failed"
-  manifest="$(dirname "$entry")/manifest.json"; temp="$manifest.tmp"
-  sed -e 's/"completedAt": "[^"]*"/"completedAt": "2000-01-01T00:00:00.000Z"/' \
-    -e 's/"retentionCohort": "[^"]*"/"retentionCohort": "cohort-946684500000"/' "$manifest" > "$temp"
-  mv "$temp" "$manifest"
-  source="$STACK/entries/cohort-946684500000"
-  mkdir "$source"
-  mv "$(dirname "$entry")" "$source/"
+  entry=$(expire_report_entry "$entry") || fail "cohort rename fixture could not be aged"
+  source=$(dirname "$(dirname "$entry")")
   ready="$TMP_ROOT/cohort-rename.ready"; proceed="$TMP_ROOT/cohort-rename.proceed"; output="$TMP_ROOT/cohort-rename.out"
   FM_CONTAINED_RENAME_TEST_READY="$ready" FM_CONTAINED_RENAME_TEST_PROCEED="$proceed" \
     run_stack prune --status > "$output" 2>&1 &
@@ -2491,6 +2489,7 @@ test_retention_cohort_tombstone_is_noreplace_owned() {
   assert_present "$retired" "failed cohort retirement lost its uncommitted retired namespace"
   assert_grep replacement "$tombstone/sentinel" "cohort retirement mutated a replacement tombstone"
   rm -rf "$retired" "$tombstone" "$source"
+  rm -f "$STACK/.retention-cutover.json"
   pass "retention cohort retirement is no-replace and generation-owned"
 }
 
@@ -2534,12 +2533,13 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/launchctl"
-  FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
+  if ! output=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
     FM_REPORT_STACK_ROOT="$STACK" FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
     FM_REPORT_RETENTION_INSTALL_ROOT="$install_root" FM_REPORT_RETENTION_LAUNCH_AGENTS_DIR="$agents" \
     FM_REPORT_RETENTION_LAUNCHCTL="$fakebin/launchctl" FM_FAKE_LAUNCHCTL_LOG="$log" \
-    "$ROOT/bin/fm-report-retention.sh" install \
-    || fail "retention handoff precondition installation failed"
+    "$ROOT/bin/fm-report-retention.sh" install 2>&1); then
+    fail "retention handoff precondition installation failed: $output; retention error: $(cat "$STACK/.retention-error" 2>/dev/null)"
+  fi
   old_label=$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' \
     "$agents/com.firstmate.report-retention.plist")
   if output=$(FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1 FM_REPORT_RETENTION_PLATFORM=Darwin \
@@ -2932,6 +2932,8 @@ SH
   [ "$status" -eq 99 ] || fail "retention pre-pointer interruption hook failed: $out"
   [ "$(sed -n 's/.*<key>Label<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$plist")" = "$old_label" ] \
     || fail "retention pre-pointer interruption advanced the authoritative plist"
+  assert_absent "$install_root/.candidate-fence" \
+    "retention pre-pointer handoff retained duplicate candidate ownership"
   candidate_label=$(sed -n '4p' "$install_root/.owner-handoff-fence")
   FM_REPORT_RETENTION_PLATFORM=Darwin FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_RETENTION_INTERVAL=1 FM_REPORT_RETENTION_PROGRESS_INTERVAL=1 \
@@ -3257,6 +3259,41 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   test_invalid_backtick_info_string_does_not_open_fence
   test_summary_extraction_uses_validated_markdown_structure
   test_list_container_fences_hide_report_headings_and_summaries
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = report-generation-recovery ]; then
+  test_previous_generation_is_recovered_for_readers
+  test_replacement_transaction_recovery_restores_entry_and_index
+  test_first_publication_transaction_recovery_removes_unindexed_entry
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-fixtures ]; then
+  test_completed_reports_prune_after_minimum_age
+  test_retention_binds_manifests_to_entry_directories
+  test_watcher_periodically_owns_idle_report_retention
+  test_retention_restores_expired_entries_when_index_swap_fails
+  test_retention_batches_make_interruption_safe_progress
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_cohort_tombstone_is_noreplace_owned
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = report-retention-state-leak ]; then
+  test_report_temps_are_exclusive_and_randomized
+  test_completed_reports_prune_after_minimum_age
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-handoff-state-leak ]; then
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
+  test_retention_generations_survive_install_interruptions
+  test_retention_cutoff_is_authoritative_before_cleanup
+  test_retention_cohort_tombstone_is_noreplace_owned
+  test_retention_cohort_source_swap_restores_replacement
+  test_retention_handoff_persists_and_retries_old_owner_fencing
   exit 0
 fi
 

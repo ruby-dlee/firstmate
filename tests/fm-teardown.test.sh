@@ -180,7 +180,6 @@ write_meta() {
   local case_dir=$1 mode=$2 kind=$3
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=fm-task-x1" \
-    "tmux_session_target=firstmate:fm-task-x1" \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
@@ -1477,6 +1476,7 @@ test_managed_force_teardown_releases_lease_and_session() {
   : > "$af_log"
   write_meta "$case_dir" local-only ship
   printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     'account_pool=claude-crew' \
     'account_profile=claude-2' \
     'account_task=fm-home-task-x1-attempt-a1' \
@@ -1543,6 +1543,7 @@ test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
   : > "$order_log"
   write_meta "$case_dir" local-only ship
   printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     'account_pool=codex-crew' \
     'account_profile=codex-2' \
     'account_task=fm-home-task-x1-attempt-b2' \
@@ -1585,6 +1586,7 @@ test_managed_teardown_locks_generation_before_endpoint_cleanup() {
   : > "$af_log"
   write_meta "$case_dir" local-only ship
   printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     'account_pool=claude-crew' \
     'account_profile=claude-2' \
     'account_task=fm-home-task-x1-old-attempt' \
@@ -1659,6 +1661,7 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
   printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     'kind=secondmate' \
@@ -1667,6 +1670,7 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
   fm_git_worktree "$child_project" "$child_worktree" child-branch
   fm_write_meta "$case_dir/wt/state/$child_id.meta" \
     "window=fm-$child_id" \
+    "tmux_session_target=firstmate:fm-$child_id" \
     "worktree=$child_worktree" \
     "project=$child_project" \
     'harness=claude' \
@@ -1764,6 +1768,7 @@ test_forced_secondmate_child_uses_child_home_for_endpoint_verification() {
   printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     'kind=secondmate' \
@@ -1834,6 +1839,7 @@ test_forced_secondmate_quiesces_parent_before_child_cleanup() {
   printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     'kind=secondmate' \
@@ -1904,7 +1910,9 @@ test_required_report_blocks_then_publishes_before_cleanup() {
   live="$case_dir/report-endpoint-live"
   quiesced="$case_dir/report-endpoint-quiesced"
   write_meta "$case_dir" no-mistakes ship
-  printf '%s\n' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
   mkdir -p "$data/task-x1"
   printf '# Task\n\nPublish before cleanup\n' > "$data/task-x1/brief.md"
   printf 'done: implementation landed\n' > "$case_dir/state/task-x1.status"
@@ -1967,10 +1975,14 @@ test_required_report_restores_rollback_generation_before_publish() {
   : > "$af_log"
   mkdir -p "$data/task-x1"
   write_meta "$case_dir" no-mistakes ship
-  printf '%s\n' 'harness=codex' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'harness=codex' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
   cp "$case_dir/state/task-x1.meta" "$backup"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     'harness=claude' \
@@ -2028,7 +2040,9 @@ test_required_report_revalidates_after_quiescence() {
   data="$case_dir/data"
   live="$case_dir/report-endpoint-live"
   write_meta "$case_dir" no-mistakes ship
-  printf '%s\n' 'report_required=1' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
   mkdir -p "$data/task-x1"
   printf '# Task\n\nQuiesce before validation\n' > "$data/task-x1/brief.md"
   printf '# Completion\n\n## Summary\n\nReady.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
@@ -2117,6 +2131,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-force-release ]; then
   test_managed_force_teardown_releases_lease_and_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-endpoint-identity ]; then
+  test_managed_force_teardown_releases_lease_and_session
+  test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
   exit 0
 fi
 

@@ -20,6 +20,7 @@ New task metadata carries `report_required=1`.
 A ship task writes `data/<id>/completion.md`, while a scout keeps using `data/<id>/report.md`.
 Both may attach screenshots, diagrams, or other review artifacts under `data/<id>/visuals/`.
 Every post-cutover ship and scout report must use the level-two sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
+Every required section must contain substantive body content, with an explicit `None.` accepted when the section has nothing to report.
 
 For `report_required` tasks, `fm-teardown.sh` first quiesces the endpoint and confirms it gone while failing closed on an alive or unknown state, then runs non-destructive safety validation including the Orca path match and worktree checks, reconciles rollback state, and publishes before releasing an account lease or removing a worktree.
 A safety refusal after quiescence preserves all work and metadata but leaves the crewmate endpoint stopped.

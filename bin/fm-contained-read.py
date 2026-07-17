@@ -1699,16 +1699,12 @@ def command_publish_report_fd(arguments):
     staged = os.stat(staged_name, dir_fd=root, follow_symlinks=False)
     if not stat.S_ISDIR(staged.st_mode) or f"{staged.st_dev}:{staged.st_ino}" != staged_id:
         fail("staged report generation changed before publication")
-    ready = os.environ.get("FM_CONTAINED_REPORT_PUBLISH_TEST_READY")
-    proceed = os.environ.get("FM_CONTAINED_REPORT_PUBLISH_TEST_PROCEED")
-    if ready and proceed:
-        with open(ready, "x", encoding="utf-8") as marker:
-            marker.write("ready\n")
-        deadline = time.monotonic() + 5
-        while not os.path.exists(proceed):
-            if time.monotonic() >= deadline:
-                fail("report publication test gate timed out")
-            time.sleep(0.01)
+    test_fifo_handshake(
+        "FM_CONTAINED_REPORT_PUBLISH_TEST_READY",
+        "FM_CONTAINED_REPORT_PUBLISH_TEST_PROCEED",
+        f"{staged_name}\n",
+        "report publication test gate",
+    )
     destination = ensure_child_directory(root, cohort_name)
     previous_name = f".{report_name}.previous"
     previous_root = None

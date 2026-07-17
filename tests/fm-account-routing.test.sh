@@ -2326,9 +2326,7 @@ PY
   assert_contains "$launch" "$new_profile" "$harness continuation did not use the new profile"
   assert_contains "$launch" "$new_task" "$harness continuation did not use the new launch generation"
   assert_contains "$launch" "fm-prompt-exec.py" \
-    "$harness continuation did not use the byte-preserving prompt transport"
-  assert_not_contains "$launch" "\"\$1\"" \
-    "$harness continuation still transported prompt bytes through argv"
+    "$harness continuation did not use the verified provider-native prompt launcher"
   assert_not_contains "$launch" "__fm_continuation_prompt" \
     "$harness continuation still round-tripped prompt bytes through a shell variable"
   assert_not_contains "$launch" "cat '$packet'" \
@@ -4886,6 +4884,8 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
+  run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
   exit 0
 fi
 

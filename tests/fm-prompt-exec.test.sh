@@ -15,34 +15,46 @@ content_identity() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-test_prompt_transport_preserves_all_bytes() {
+test_prompt_transport_uses_one_native_multiline_argument() {
   local transport="$TMP_ROOT/transport" prompt capture="$TMP_ROOT/capture" script="$TMP_ROOT/capture.py" command parent_id file_id content_id
   mkdir "$transport"
-  prompt="$transport/prompt"
-  printf 'prefix\0middle\377suffix\n\n' > "$prompt"
+  prompt="$transport/prompt"; capture="$TMP_ROOT/capture"
+  printf 'prefix\nmiddle\nsuffix\n\n' > "$prompt"
   cat > "$script" <<'PY'
-import os, sys
-def read_exact(size):
-    chunks = []
-    while size:
-        chunk = os.read(0, size)
-        if not chunk:
-            raise RuntimeError("early EOF")
-        chunks.append(chunk)
-        size -= len(chunk)
-    return b"".join(chunks)
+import os
+import sys
+if len(sys.argv) != 3:
+    raise RuntimeError(f"expected one prompt argument, received {len(sys.argv) - 2}")
 with open(sys.argv[1], "wb") as output:
-    output.write(read_exact(int(sys.argv[2])))
+    output.write(os.fsencode(sys.argv[2]))
 PY
-  command="exec python3 '$script' '$capture' 22"
+  command="exec python3 '$script' '$capture'"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
   python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
-    || fail "continuation prompt transport rejected byte-verbatim stdin"
-  cmp -s "$capture" <(printf 'prefix\0middle\377suffix\n\n') \
-    || fail "continuation prompt transport changed NUL, invalid UTF-8, or trailing newlines"
+    || fail "continuation prompt transport rejected a native multiline argument"
+  cmp -s "$capture" <(printf 'prefix\nmiddle\nsuffix\n\n') \
+    || fail "continuation prompt transport split or changed the native multiline argument"
   assert_absent "$prompt" "continuation prompt transport retained its consumed generation"
   assert_absent "$transport" "continuation prompt transport retained its private launch directory"
-  pass "continuation prompt transport preserves every byte through stdin"
+  pass "continuation prompt transport uses one provider-native multiline argument"
+}
+
+test_prompt_transport_rejects_non_argument_bytes() {
+  local kind transport prompt marker output status parent_id file_id content_id
+  for kind in nul invalid-utf8; do
+    transport="$TMP_ROOT/$kind"; prompt="$transport/prompt"; marker="$TMP_ROOT/$kind-launched"; output="$TMP_ROOT/$kind.out"
+    mkdir "$transport"
+    if [ "$kind" = nul ]; then printf 'prefix\0suffix\n' > "$prompt"; else printf 'prefix\377suffix\n' > "$prompt"; fi
+    parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
+    if python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" \
+      "printf launched > '$marker'" > "$output" 2>&1; then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "prompt transport accepted $kind bytes in a provider-native argument"
+    assert_absent "$marker" "prompt transport launched after rejecting $kind bytes"
+    assert_present "$prompt" "prompt transport consumed the rejected $kind source"
+  done
+  assert_contains "$(cat "$TMP_ROOT/nul.out")" "cannot contain NUL bytes" "NUL rejection was not actionable"
+  assert_contains "$(cat "$TMP_ROOT/invalid-utf8.out")" "must be valid UTF-8" "invalid UTF-8 rejection was not actionable"
+  pass "continuation prompt transport rejects bytes native arguments cannot preserve"
 }
 
 test_prompt_transport_rejects_replaced_generation() {
@@ -94,23 +106,15 @@ test_prompt_transport_consumes_verified_snapshot_after_mutation() {
   local ready="$TMP_ROOT/post-hash.ready" proceed="$TMP_ROOT/post-hash.proceed"
   local command parent_id file_id content_id pid
   mkdir "$transport"
-  printf 'verified prefix\0verified suffix\377\n' > "$prompt"
+  printf 'verified prefix\nverified suffix\n' > "$prompt"
   cp "$prompt" "$expected"
   cat > "$script" <<'PY'
-import os, sys
-def read_exact(size):
-    chunks = []
-    while size:
-        chunk = os.read(0, size)
-        if not chunk:
-            raise RuntimeError("early EOF")
-        chunks.append(chunk)
-        size -= len(chunk)
-    return b"".join(chunks)
+import os
+import sys
 with open(sys.argv[1], "wb") as output:
-    output.write(read_exact(int(sys.argv[2])))
+    output.write(os.fsencode(sys.argv[2]))
 PY
-  command="exec python3 '$script' '$capture' 33"
+  command="exec python3 '$script' '$capture'"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
   FM_PROMPT_EXEC_TEST_READY="$ready" FM_PROMPT_EXEC_TEST_PROCEED="$proceed" \
     python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" &
@@ -130,7 +134,7 @@ test_prompt_transport_keeps_provider_stdin_interactive() {
   local capture="$TMP_ROOT/interactive.capture" script="$TMP_ROOT/interactive.py"
   local command parent_id file_id content_id driver="$TMP_ROOT/interactive-driver.py"
   mkdir "$transport"
-  printf 'initial packet' > "$prompt"
+  printf 'initial\npacket' > "$prompt"
   cat > "$script" <<'PY'
 import os, sys
 def read_exact(size):
@@ -142,12 +146,11 @@ def read_exact(size):
         chunks.append(chunk)
         size -= len(chunk)
     return b"".join(chunks)
-initial = read_exact(14)
-separator = read_exact(1)
 followup = read_exact(16)
 with open(sys.argv[1], "wb") as output:
     output.write(b"tty=" + str(os.isatty(0)).encode() + b"\n")
-    output.write(initial + b"\n" + separator + b"\n" + followup)
+    output.write(b"prompt=" + os.fsencode(sys.argv[2]) + b"\n")
+    output.write(b"stdin=" + followup)
 PY
   command="exec python3 '$script' '$capture'"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
@@ -164,44 +167,9 @@ raise SystemExit(status)
 PY
   python3 "$driver" python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
     || fail "continuation prompt transport did not preserve interactive provider stdin"
-  assert_grep 'tty=True' "$capture" "continuation provider stdin was not a PTY"
-  assert_grep 'initial packet' "$capture" "continuation transport changed the initial packet"
-  assert_grep 'later steering.' "$capture" "continuation transport did not relay later steering"
-  pass "continuation prompt transport preserves interactive provider stdin after initial delivery"
-}
-
-test_prompt_transport_waits_for_raw_mode() {
-  local transport="$TMP_ROOT/raw-ready" prompt="$TMP_ROOT/raw-ready/prompt"
-  local capture="$TMP_ROOT/raw-ready.capture" script="$TMP_ROOT/raw-ready.py"
-  local ready="$TMP_ROOT/raw-ready.ready" proceed="$TMP_ROOT/raw-ready.proceed"
-  local command parent_id file_id content_id pid
-  mkdir "$transport"
-  printf 'before\003middle\004after\377' > "$prompt"
-  cat > "$script" <<'PY'
-import os, sys
-size = int(sys.argv[2])
-content = bytearray()
-while len(content) < size:
-    chunk = os.read(0, size - len(content))
-    if not chunk:
-        raise RuntimeError("early EOF")
-    content.extend(chunk)
-with open(sys.argv[1], "wb") as output:
-    output.write(content)
-PY
-  command="exec python3 '$script' '$capture' 20"
-  parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
-  FM_PROMPT_EXEC_TEST_BEFORE_RAW_READY="$ready" FM_PROMPT_EXEC_TEST_BEFORE_RAW_PROCEED="$proceed" \
-    python3 "$ROOT/bin/fm-prompt-exec.py" "$prompt" "$parent_id" "$file_id" "$content_id" "$command" &
-  pid=$!
-  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
-  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "raw-mode readiness gate did not open"; }
-  assert_absent "$capture" "prompt bytes reached the provider before raw mode was active"
-  touch "$proceed"
-  wait "$pid" || fail "prompt transport failed after raw-mode readiness"
-  cmp -s "$capture" <(printf 'before\003middle\004after\377') \
-    || fail "prompt transport applied canonical-mode processing before raw readiness"
-  pass "continuation prompt transport waits for raw mode before writing bytes"
+  cmp -s "$capture" <(printf 'tty=True\nprompt=initial\npacket\nstdin=later steering.\n') \
+    || fail "continuation transport did not isolate its multiline prompt argument from interactive stdin"
+  pass "continuation prompt transport leaves provider stdin interactive and unprimed"
 }
 
 test_prompt_transport_restores_inherited_terminal_state() {
@@ -226,7 +194,7 @@ if after_flags != before_flags:
 if after_termios != before_termios:
     raise RuntimeError("inherited stdin termios changed")
 PY
-  command="exec python3 -c 'import os; os.read(0, 6)'"
+  command="exec python3 -c 'pass'"
   parent_id=$(path_identity "$transport"); file_id=$(path_identity "$prompt"); content_id=$(content_identity "$prompt")
   python3 "$driver" python3 "$ROOT/bin/fm-prompt-exec.py" \
     "$prompt" "$parent_id" "$file_id" "$content_id" "$command" \
@@ -234,11 +202,11 @@ PY
   pass "continuation prompt transport restores inherited stdin flags and termios"
 }
 
-test_prompt_transport_preserves_all_bytes
+test_prompt_transport_uses_one_native_multiline_argument
+test_prompt_transport_rejects_non_argument_bytes
 test_prompt_transport_rejects_replaced_generation
 test_prompt_transport_rejects_replaced_parent
 test_prompt_transport_rejects_in_place_mutation
 test_prompt_transport_consumes_verified_snapshot_after_mutation
 test_prompt_transport_keeps_provider_stdin_interactive
-test_prompt_transport_waits_for_raw_mode
 test_prompt_transport_restores_inherited_terminal_state

@@ -1649,7 +1649,7 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   CONTINUATION_PACKET=${CONTINUATION_RESULT%%$'\n'*}
   CONTINUATION_PROMPT_B64=${CONTINUATION_RESULT#*$'\n'}
   CONTINUATION_LAUNCH_DIR=$(mktemp -d "$STATE/.$ID.continuation-launch.XXXXXX") \
-    || { echo "error: cannot stage continuation prompt transport for $ID" >&2; exit 1; }
+    || { echo "error: cannot stage continuation native prompt for $ID" >&2; exit 1; }
   chmod 700 "$CONTINUATION_LAUNCH_DIR" || exit 1
   CONTINUATION_PROMPT_FILE="$CONTINUATION_LAUNCH_DIR/prompt"
   if ! CONTINUATION_PROMPT_IDENTITIES=$(printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
@@ -1679,7 +1679,7 @@ finally:
   CONTINUATION_PROMPT_CONTENT_ID=${CONTINUATION_PROMPT_REMAINDER#*$'\n'}
   [ -n "$CONTINUATION_PROMPT_DIR_ID" ] && [ -n "$CONTINUATION_PROMPT_FILE_ID" ] \
     && [ -n "$CONTINUATION_PROMPT_CONTENT_ID" ] \
-    || { echo "error: continuation prompt transport identity is unavailable for $ID" >&2; exit 1; }
+    || { echo "error: continuation native prompt identity is unavailable for $ID" >&2; exit 1; }
   BRIEF=$CONTINUATION_PACKET
 fi
 
@@ -2155,7 +2155,7 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   case "$HARNESS" in
     claude) continuation_prompt_reference= ;;
     codex) continuation_prompt_reference= ;;
-    *) echo "error: continuation prompt stdin transport supports only claude and codex" >&2; exit 1 ;;
+    *) echo "error: continuation native prompt launch supports only claude and codex" >&2; exit 1 ;;
   esac
   LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
   case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac

@@ -1227,6 +1227,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
+  test_meta_get_and_backend_of_meta
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   exit 0

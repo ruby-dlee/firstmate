@@ -143,23 +143,41 @@ function firstSummary(markdown, fallback) {
   return (text || fallback).slice(0, 320);
 }
 
-function levelTwoHeadings(markdown) {
-  const headings = new Set();
-  for (const { heading } of markdownStructure(markdown)) {
-    if (heading?.level === 2) headings.add(heading.content.toLowerCase());
-  }
-  return headings;
-}
-
 function requireCompletionSections(markdown, sourceFile, taskId) {
-  const headings = levelTwoHeadings(markdown);
-  const missing = requiredSections.filter((section) => !headings.has(section.toLowerCase()));
-  if (missing.length === 0) return;
+  const sections = new Map(requiredSections.map((section) => [section.toLowerCase(), { present: false, body: [] }]));
+  let currentSection;
+  for (const entry of markdownStructure(markdown)) {
+    if (entry.heading?.level === 2) {
+      currentSection = sections.get(entry.heading.content.toLowerCase());
+      if (currentSection) currentSection.present = true;
+    } else if (currentSection) {
+      currentSection.body.push(entry);
+    }
+  }
+  const substantive = ({ line, heading }) => {
+    if (heading) return false;
+    const text = line
+      .replace(/!\[([^\]]*)\]\(([^)]*)\)/g, "$1 $2")
+      .replace(/\[([^\]]*)\]\(([^)]*)\)/g, "$1 $2")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/[`*_~#|]/g, " ");
+    return /[\p{L}\p{N}\p{S}]/u.test(text);
+  };
+  const missing = requiredSections.filter((section) => !sections.get(section.toLowerCase()).present);
+  const empty = requiredSections.filter((section) => {
+    const state = sections.get(section.toLowerCase());
+    return state.present && !state.body.some(substantive);
+  });
+  if (missing.length === 0 && empty.length === 0) return;
   const required = requiredSections.map((section) => `## ${section}`).join(", ");
   const absent = missing.map((section) => `## ${section}`).join(", ");
+  const blank = empty.map((section) => `## ${section}`).join(", ");
+  const problems = [];
+  if (missing.length > 0) problems.push(`missing required section headings: ${absent}`);
+  if (empty.length > 0) problems.push(`required sections have no substantive content: ${blank}`);
   throw new Error(
-    `completion report at ${sourceFile} is missing required section headings: ${absent}. `
-    + `Update ${sourceFile} to include these level-two headings: ${required}. `
+    `completion report at ${sourceFile} ${problems.join("; ")}. `
+    + `Update ${sourceFile} to include these level-two headings with substantive content: ${required}. `
     + `Then rerun ${fmRoot}/bin/fm-report-stack.mjs publish ${taskId} or ${fmRoot}/bin/fm-teardown.sh ${taskId}. `
     + "This attempt did not replace the durable report, and teardown remains stopped before destructive cleanup.",
   );
@@ -768,16 +786,12 @@ function acquireLock() {
           "lock-acquired\n",
           "report lock acquired test gate",
         );
-        if (process.env.FM_REPORT_LOCK_TEST_READY) {
-          fs.writeFileSync(process.env.FM_REPORT_LOCK_TEST_READY, "ready\n", { flag: "wx" });
-          if (process.env.FM_REPORT_LOCK_TEST_PROCEED) {
-            const deadline = Date.now() + 5000;
-            while (!fs.existsSync(process.env.FM_REPORT_LOCK_TEST_PROCEED)) {
-              if (Date.now() >= deadline) throw new Error("report lock test gate timed out");
-              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-            }
-          }
-        }
+        runTestFifoHandshake(
+          "FM_REPORT_LOCK_TEST_READY",
+          "FM_REPORT_LOCK_TEST_PROCEED",
+          "lock-acquired\n",
+          "report lock test gate",
+        );
         if (process.env.FM_REPORT_LOCK_TEST_SETUP_FAILURE === "1") {
           throw new Error("synthetic report publication lock setup failure");
         }
@@ -801,14 +815,12 @@ function acquireLock() {
         entriesDir = ".";
         entriesDescriptor = pinnedEntries.descriptor;
         retentionTombstoneDescriptor = pinnedTombstones.descriptor;
-        if (process.env.FM_REPORT_STACK_DESTINATION_TEST_READY && process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED) {
-          fs.writeFileSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_READY, "ready\n", { flag: "wx" });
-          const deadline = Date.now() + 5000;
-          while (!fs.existsSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED)) {
-            if (Date.now() >= deadline) throw new Error("report destination test gate timed out");
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-          }
-        }
+        runTestFifoHandshake(
+          "FM_REPORT_STACK_DESTINATION_TEST_READY",
+          "FM_REPORT_STACK_DESTINATION_TEST_PROCEED",
+          "destination-pinned\n",
+          "report destination test gate",
+        );
         return release;
       } catch (setupError) {
         try { fs.closeSync(pinnedEntries?.descriptor); } catch {}
@@ -826,9 +838,12 @@ function acquireLock() {
       }
     } catch (error) {
       if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
-      if (process.env.FM_REPORT_LOCK_WAITER_TEST_READY && !fs.existsSync(process.env.FM_REPORT_LOCK_WAITER_TEST_READY)) {
-        fs.writeFileSync(process.env.FM_REPORT_LOCK_WAITER_TEST_READY, "ready\n", { flag: "wx" });
-      }
+      runTestFifoHandshake(
+        "FM_REPORT_LOCK_WAITER_TEST_READY",
+        "FM_REPORT_LOCK_WAITER_TEST_PROCEED",
+        "lock-observed\n",
+        "report lock waiter test gate",
+      );
       try {
         const lockStat = fs.lstatSync(lock);
         if (lockStat.isSymbolicLink() || !lockStat.isDirectory()) {

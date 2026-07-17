@@ -723,6 +723,37 @@ test_required_sections_fail_actionably() {
   pass "report stack rejects incomplete reports with a retry-safe actionable correction"
 }
 
+test_required_sections_reject_empty_bodies() {
+  local id=report-empty-sections-b3a source out status heading
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+## What changed
+
+## Verification
+
+## Visual evidence
+
+## Artifacts
+
+## Follow-ups
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "report with empty required sections unexpectedly published"
+  assert_contains "$out" "required sections have no substantive content" \
+    "empty-section failure did not identify the content requirement"
+  for heading in "## Summary" "## What changed" "## Verification" "## Visual evidence" "## Artifacts" "## Follow-ups"; do
+    assert_contains "$out" "$heading" "empty-section failure omitted $heading"
+  done
+  assert_present "$HOME_DIR/state/$id.meta" "empty-section validation removed task state"
+  pass "report stack requires substantive content in every completion section"
+}
+
 test_nested_short_fences_do_not_satisfy_required_sections() {
   local id source out status heading
 
@@ -1760,8 +1791,8 @@ test_lock_control_files_are_bounded_and_nonfollowing() {
 }
 
 test_namespace_cutover_waiter_pins_entries_after_lock_acquisition() {
-  local id=report-cutover-waiter-k2b stack entry owner_ready owner_proceed waiter_ready owner_out waiter_out
-  local owner_pid waiter_pid owner_status waiter_status
+  local id=report-cutover-waiter-k2b stack entry owner_ready owner_proceed waiter_ready waiter_proceed owner_out waiter_out
+  local owner_pid waiter_pid owner_status waiter_status state
   stack="$STACK"
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Namespace cutover waiter."
@@ -1773,30 +1804,42 @@ test_namespace_cutover_waiter_pins_entries_after_lock_acquisition() {
   owner_ready="$TMP_ROOT/cutover-owner.ready"
   owner_proceed="$TMP_ROOT/cutover-owner.proceed"
   waiter_ready="$TMP_ROOT/cutover-waiter.ready"
+  waiter_proceed="$TMP_ROOT/cutover-waiter.proceed"
   owner_out="$TMP_ROOT/cutover-owner.out"
   waiter_out="$TMP_ROOT/cutover-waiter.out"
+  mkfifo "$owner_ready" "$owner_proceed" "$waiter_ready" "$waiter_proceed"
+  exec 7<>"$owner_ready"
+  exec 8<>"$owner_proceed"
+  exec 9<>"$waiter_ready"
+  exec 10<>"$waiter_proceed"
 
   FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_LOCK_TEST_READY="$owner_ready" FM_REPORT_LOCK_TEST_PROCEED="$owner_proceed" \
     "$SCRIPT" prune --status > "$owner_out" 2>&1 &
   owner_pid=$!
-  for _ in $(seq 1 100); do [ -e "$owner_ready" ] && break; sleep 0.02; done
-  [ -e "$owner_ready" ] || { kill -TERM "$owner_pid" 2>/dev/null || true; fail "namespace-cutover owner did not acquire its publication lock"; }
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$owner_pid" 2>/dev/null || true
+    fail "namespace-cutover owner did not acquire its publication lock: $(cat "$owner_out")"
+  fi
+  [ "$state" = "lock-acquired" ] || fail "namespace-cutover owner emitted an unexpected lock state: $state"
 
-  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_LOCK_WAITER_TEST_READY="$waiter_ready" \
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_WAITER_TEST_READY="$waiter_ready" FM_REPORT_LOCK_WAITER_TEST_PROCEED="$waiter_proceed" \
     "$SCRIPT" render > "$waiter_out" 2>&1 &
   waiter_pid=$!
-  for _ in $(seq 1 100); do [ -e "$waiter_ready" ] && break; sleep 0.02; done
-  [ -e "$waiter_ready" ] || {
+  if ! IFS= read -r -t 10 state <&9; then
     kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
-    fail "namespace-cutover waiter did not observe the held publication lock"
-  }
-  touch "$owner_proceed"
+    fail "namespace-cutover waiter did not observe the held publication lock: $(cat "$waiter_out")"
+  fi
+  [ "$state" = "lock-observed" ] || fail "namespace-cutover waiter emitted an unexpected lock state: $state"
+  printf 'continue\n' >&10
+  printf 'continue\n' >&8
   if wait "$owner_pid"; then owner_status=0; else owner_status=$?; fi
   if wait "$waiter_pid"; then waiter_status=0; else waiter_status=$?; fi
   [ "$owner_status" -eq 0 ] || fail "namespace-cutover owner failed: $(cat "$owner_out")"
   [ "$waiter_status" -eq 0 ] || fail "namespace-cutover waiter failed after lock acquisition: $(cat "$waiter_out")"
   assert_absent "$stack/.publish.lock" "namespace-cutover waiter retained its publication lock"
+  exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-
   pass "publication waiters pin mutable namespaces only after acquiring the lock"
 }
 
@@ -2393,21 +2436,27 @@ SH
 }
 
 test_report_destination_roots_remain_pinned_during_ancestor_swap() {
-  local id=report-destination-race-k2n ready proceed output moved outside pid status published_manifest
+  local id=report-destination-race-k2n ready proceed output moved outside pid status published_manifest state
   write_task "$id" ship
   write_required_report "$HOME_DIR/data/$id/completion.md" "Pinned destination roots."
   ready="$TMP_ROOT/report-destination.ready"; proceed="$TMP_ROOT/report-destination.proceed"
   output="$TMP_ROOT/report-destination.out"; moved="$TMP_ROOT/stack-original"; outside="$TMP_ROOT/stack-outside"
   mkdir -p "$STACK" "$outside"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
   FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
     FM_REPORT_STACK_DESTINATION_TEST_READY="$ready" FM_REPORT_STACK_DESTINATION_TEST_PROCEED="$proceed" \
     "$SCRIPT" publish "$id" > "$output" 2>&1 &
   pid=$!
-  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
-  [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "report destination race gate did not open"; }
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "report destination race gate did not open: $(cat "$output")"
+  fi
+  [ "$state" = "destination-pinned" ] || fail "report destination gate emitted an unexpected state: $state"
   mv "$STACK" "$moved"
   ln -s "$outside" "$STACK"
-  touch "$proceed"
+  printf 'continue\n' >&8
   wait "$pid"; status=$?
   [ "$status" -eq 0 ] || fail "pinned report publication failed after ancestor swap: $(cat "$output")"
   published_manifest=$(grep -R -l -F "\"taskId\": \"$id\"" "$moved/entries")
@@ -2417,7 +2466,35 @@ test_report_destination_roots_remain_pinned_during_ancestor_swap() {
   [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "report publication was redirected through the swapped stack path"
   rm "$STACK"
   mv "$moved" "$STACK"
+  exec 7>&-; exec 8>&-
   pass "report stack serializes and publishes through pinned destination roots"
+}
+
+test_report_publication_gate_uses_framed_fifo() {
+  local id=report-publish-fifo-k2na ready proceed output pid status staged entry
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Framed report publication."
+  ready="$TMP_ROOT/report-publish-fifo.ready"; proceed="$TMP_ROOT/report-publish-fifo.proceed"
+  output="$TMP_ROOT/report-publish-fifo.out"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_CONTAINED_REPORT_PUBLISH_TEST_READY="$ready" FM_CONTAINED_REPORT_PUBLISH_TEST_PROCEED="$proceed" \
+    run_stack publish "$id" > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 staged <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "report publication FIFO did not emit its staged generation: $(cat "$output")"
+  fi
+  case "$staged" in ".$id-"*.tmp) ;; *) fail "report publication FIFO emitted an unexpected frame: $staged" ;; esac
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "framed report publication failed: $(cat "$output")"
+  entry=$(run_stack path "$id") || fail "framed report publication did not install a report"
+  assert_grep 'Framed report publication.' "$(dirname "$entry")/report.md" \
+    "framed report publication installed the wrong generation"
+  exec 7>&-; exec 8>&-
+  pass "report publication synchronization uses a framed one-shot FIFO"
 }
 
 test_index_failure_restores_previous_generation() {
@@ -3761,6 +3838,15 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
+  test_required_sections_fail_actionably
+  test_required_sections_reject_empty_bodies
+  test_namespace_cutover_waiter_pins_entries_after_lock_acquisition
+  test_report_destination_roots_remain_pinned_during_ancestor_swap
+  test_report_publication_gate_uses_framed_fifo
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = report-generation-recovery ]; then
   test_previous_generation_is_recovered_for_readers
   test_replacement_transaction_recovery_restores_entry_and_index
@@ -3820,6 +3906,7 @@ test_report_temps_are_exclusive_and_randomized
 test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
+test_required_sections_reject_empty_bodies
 test_nested_short_fences_do_not_satisfy_required_sections
 test_raw_html_does_not_satisfy_required_sections
 test_container_scoped_fences_do_not_close_from_top_level
@@ -3887,6 +3974,7 @@ test_retention_pointer_failure_retires_only_candidate
 test_retention_pointer_failure_retains_unfenced_candidate
 test_nested_list_parent_scope_hides_required_headings
 test_report_destination_roots_remain_pinned_during_ancestor_swap
+test_report_publication_gate_uses_framed_fifo
 test_index_failure_restores_previous_generation
 test_readers_wait_for_publication_lock
 test_visual_symlink_fails_closed_and_cleans_staging

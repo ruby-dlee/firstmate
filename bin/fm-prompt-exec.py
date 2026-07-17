@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 import hashlib
-import errno
-import fcntl
 import os
-import selectors
-import signal
 import stat
 import sys
-import termios
 import time
-import tty
 
 
 def fail(message):
@@ -60,6 +54,13 @@ try:
         opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
     ) or (not cleanup_only and digest.hexdigest() != expected_content):
         fail("prompt source content changed")
+    if not cleanup_only:
+        if b"\0" in snapshot:
+            fail("provider-native initial prompt cannot contain NUL bytes")
+        try:
+            snapshot.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("provider-native initial prompt must be valid UTF-8")
     ready = os.environ.get("FM_PROMPT_EXEC_TEST_READY")
     proceed = os.environ.get("FM_PROMPT_EXEC_TEST_PROCEED")
     if not cleanup_only and ready and proceed:
@@ -95,151 +96,8 @@ command = os.fsencode(sys.argv[5])
 if snapshot is None:
     fail("prompt snapshot is unavailable")
 
-try:
-    original_stdin_flags = fcntl.fcntl(0, fcntl.F_GETFL)
-except OSError:
-    original_stdin_flags = None
-try:
-    original_stdin_termios = termios.tcgetattr(0)
-except termios.error:
-    original_stdin_termios = None
-
-ready_reader, ready_writer = os.pipe()
-child, terminal = os.forkpty()
-if child == 0:
-    os.close(ready_reader)
-    test_ready = os.environ.get("FM_PROMPT_EXEC_TEST_BEFORE_RAW_READY")
-    test_proceed = os.environ.get("FM_PROMPT_EXEC_TEST_BEFORE_RAW_PROCEED")
-    if test_ready and test_proceed:
-        marker = os.open(test_ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        os.close(marker)
-        deadline = time.monotonic() + 5
-        while not os.path.exists(test_proceed):
-            if time.monotonic() >= deadline:
-                fail("raw-mode test gate timed out")
-            time.sleep(0.01)
-    tty.setraw(0, termios.TCSANOW)
-    os.write(ready_writer, b"1")
-    os.close(ready_writer)
-    os.execve(b"/bin/bash", [b"bash", b"-c", command, b"fm-continuation"], os.environb.copy())
-
-os.close(ready_writer)
-ready_writer = None
-
-
-def copy_window_size():
-    try:
-        size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
-        fcntl.ioctl(terminal, termios.TIOCSWINSZ, size)
-    except OSError:
-        pass
-
-
-def forward_signal(signum, _frame):
-    try:
-        os.kill(child, signum)
-    except ProcessLookupError:
-        pass
-
-
-copy_window_size()
-signal.signal(signal.SIGWINCH, lambda signum, frame: copy_window_size())
-for forwarded in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
-    signal.signal(forwarded, forward_signal)
-
-os.set_blocking(terminal, False)
-selector = selectors.DefaultSelector()
-pending = memoryview(snapshot + b"\r")
-stdin_registered = False
-child_status = None
-try:
-    if os.read(ready_reader, 1) != b"1":
-        fail("provider terminal did not enter raw mode")
-    os.close(ready_reader)
-    ready_reader = None
-    selector.register(terminal, selectors.EVENT_READ | selectors.EVENT_WRITE)
-    while True:
-        if child_status is None:
-            waited, status = os.waitpid(child, os.WNOHANG)
-            if waited == child:
-                child_status = status
-        if child_status is not None and terminal not in selector.get_map():
-            break
-        for key, events in selector.select(timeout=0.1):
-            if key.fd == terminal:
-                if events & selectors.EVENT_WRITE and pending:
-                    try:
-                        written = os.write(terminal, pending)
-                        pending = pending[written:]
-                    except BlockingIOError:
-                        pass
-                    if not pending:
-                        selector.modify(terminal, selectors.EVENT_READ)
-                        try:
-                            os.set_blocking(0, False)
-                            selector.register(0, selectors.EVENT_READ)
-                            stdin_registered = True
-                        except OSError:
-                            pass
-                if events & selectors.EVENT_READ:
-                    try:
-                        output = os.read(terminal, 65536)
-                    except OSError as error:
-                        if error.errno == errno.EIO:
-                            output = b""
-                        else:
-                            raise
-                    if output:
-                        view = memoryview(output)
-                        while view:
-                            try:
-                                written = os.write(1, view)
-                                view = view[written:]
-                            except BlockingIOError:
-                                continue
-                    else:
-                        selector.unregister(terminal)
-            elif key.fd == 0:
-                try:
-                    incoming = os.read(0, 65536)
-                except BlockingIOError:
-                    continue
-                if incoming:
-                    view = memoryview(incoming)
-                    while view:
-                        try:
-                            written = os.write(terminal, view)
-                            view = view[written:]
-                        except BlockingIOError:
-                            continue
-                else:
-                    selector.unregister(0)
-                    stdin_registered = False
-finally:
-    if ready_reader is not None:
-        os.close(ready_reader)
-    if stdin_registered:
-        try:
-            selector.unregister(0)
-        except Exception:
-            pass
-    selector.close()
-    os.close(terminal)
-    if original_stdin_flags is not None:
-        try:
-            fcntl.fcntl(0, fcntl.F_SETFL, original_stdin_flags)
-        except OSError:
-            pass
-    if original_stdin_termios is not None:
-        try:
-            termios.tcsetattr(0, termios.TCSANOW, original_stdin_termios)
-        except termios.error:
-            pass
-    if child_status is None:
-        _, child_status = os.waitpid(child, 0)
-
-if os.WIFEXITED(child_status):
-    raise SystemExit(os.WEXITSTATUS(child_status))
-if os.WIFSIGNALED(child_status):
-    raise SystemExit(128 + os.WTERMSIG(child_status))
-raise SystemExit(1)
+os.execve(
+    b"/bin/bash",
+    [b"bash", b"-c", command + b' "$1"', b"fm-continuation", snapshot],
+    os.environb.copy(),
+)

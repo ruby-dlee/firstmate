@@ -450,6 +450,42 @@ test_herdr_install_requires_manual_action() {
   pass "bootstrap: Herdr manual-install guidance is never executed as a shell command"
 }
 
+test_herdr_detach_dependencies_have_manual_guidance() {
+  local tool case_dir fakebin bash_env out install_out status instructions
+  instructions="https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#herdr-detached-launcher-prerequisites"
+  for tool in nohup perl; do
+    case_dir="$TMP_ROOT/herdr-missing-$tool"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    printf '%s\n' herdr > "$case_dir/home/config/backend"
+    fakebin=$(make_fake_toolchain_no_tmux "$case_dir" herdr nohup perl)
+    rm -f "$fakebin/$tool"
+    bash_env="$case_dir/no-$tool.bash"
+    cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = "${FM_FAKE_MISSING_TOOL:-}" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+    out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_FAKE_MISSING_TOOL="$tool" \
+      FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+    assert_contains "$out" "MISSING_MANUAL: $tool (instructions: $instructions)" \
+      "backend=herdr should give manual guidance for missing $tool"
+    assert_not_contains "$out" "MISSING: $tool (install: )" \
+      "backend=herdr should not emit empty install guidance for $tool"
+
+    install_out=$("$ROOT/bin/fm-bootstrap.sh" install "$tool" 2>&1)
+    status=$?
+    [ "$status" -ne 0 ] || fail "install $tool should require manual action"
+    [ "$install_out" = "error: $tool requires manual installation (instructions: $instructions)" ] \
+      || fail "install $tool should return actionable manual guidance, got: $install_out"
+  done
+  pass "bootstrap: Herdr detach dependencies have actionable manual guidance"
+}
+
 test_cmux_bundled_cli_satisfies_dependency() {
   local case_dir fakebin bundle out
   case_dir="$TMP_ROOT/cmux-bundled-cli"
@@ -831,6 +867,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  test_herdr_detach_dependencies_have_manual_guidance
+  exit 0
+fi
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -838,6 +879,7 @@ test_orca_backend_gates_orca_tool_only_when_selected
 test_session_provider_backends_do_not_require_tmux
 test_session_provider_backends_gate_own_cli_not_tmux
 test_herdr_install_requires_manual_action
+test_herdr_detach_dependencies_have_manual_guidance
 test_cmux_bundled_cli_satisfies_dependency
 test_unknown_backend_reports_invalid_configuration
 test_json_backends_require_jq_not_tmux

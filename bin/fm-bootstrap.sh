@@ -435,6 +435,7 @@ install_cmd() {
 manual_install_url() {
   case "$1" in
     herdr) echo "https://herdr.dev" ;;
+    nohup|perl) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#herdr-detached-launcher-prerequisites" ;;
     agent-fleet) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing" ;;
     *) return 1 ;;
   esac

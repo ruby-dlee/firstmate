@@ -20,14 +20,15 @@ Prerequisites:
 
 - `herdr` itself, protocol 14 or newer (0.7.1 and 0.7.3 verified) - see [herdr.dev](https://herdr.dev) for install instructions.
 - `jq`, required to parse herdr's JSON output: `brew install jq` (or your platform's package manager).
+- `nohup` and `perl`, required by the detached server launcher; [`docs/configuration.md`](configuration.md#herdr-detached-launcher-prerequisites) owns the platform-specific recovery guidance.
 - The universal firstmate prerequisites - a verified crew harness plus the required toolchain, owned by [`docs/configuration.md`](configuration.md) ("Harness support", "Toolchain"); treehouse still provides the worktree, herdr only provides the session.
 
 Select herdr by putting `herdr` in a local `config/backend` file - the durable way to pick it - or by exporting `FM_BACKEND=herdr` when you launch your harness for a one-off session; telling the first mate in chat to use herdr also works.
 It can also be auto-detected: when firstmate itself is running natively inside herdr (`HERDR_ENV=1`) and no explicit backend is set, firstmate auto-selects herdr and prints a one-time opt-out notice; running inside tmux nested in herdr always resolves to tmux instead.
-A herdr spawn refuses loudly before creating a session container or acquiring a ship/scout worktree if `herdr` or `jq` is missing or the installed herdr's protocol is older than verified.
+A herdr spawn refuses loudly before creating a session container or acquiring a ship/scout worktree if any backend-specific prerequisite above is missing or the installed herdr's protocol is older than verified.
 For `--secondmate` launches, secondmate home sync and inherited-config propagation happen before this spawn-time backend gate.
 
-No first-run provisioning is needed beyond having `herdr` and `jq` on `PATH`; firstmate creates the workspace and tab it needs on first spawn.
+No first-run provisioning is needed after the prerequisites above are satisfied; firstmate creates the workspace and tab it needs on first spawn.
 
 Watching and attaching: each firstmate home gets its own herdr workspace (the primary uses `firstmate`; each secondmate uses `2ndmate-<secondmate-id>`), with one tab per task inside it, named `fm-<id>`.
 Attach to the selected `HERDR_SESSION` and switch to the workspace for the home you want to watch to see every one of that home's tasks as tabs in one tab bar.
@@ -50,7 +51,7 @@ An auto-detected herdr spawn prints one loud stderr notice (set `config/backend`
 Auto-detecting tmux stays silent, since that reproduces today's unconfigured default byte-for-byte.
 Only when none of that resolves anything does firstmate fall back to the hard default, tmux.
 Absent `backend=` in a task's meta always means `tmux`; a herdr task carries an explicit `backend=herdr` line, while other experimental adapters carry their own backend values.
-A herdr spawn refuses loudly if `herdr` or `jq` is missing, or if the installed herdr's protocol is older than the verified minimum (`fm_backend_herdr_version_check`).
+A herdr spawn applies the prerequisite and protocol gates described in "Setup" and refuses loudly when either gate fails.
 
 ## Worktree provider stays treehouse
 
@@ -178,7 +179,7 @@ Herdr tasks additionally record:
 | Operation | Verified herdr call | What was verified |
 |---|---|---|
 | Version/protocol gate | `herdr status --json` -> `.client.protocol` | Session-independent; `.server.*` fields ARE session-dependent. |
-| Headless server start | `HERDR_SESSION=<name> herdr server --session <name>` (backgrounded) | A bare socket call does NOT auto-start the server; the adapter always starts-then-polls before any workspace/tab/pane call. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
+| Headless server start | `fm_backend_herdr_server_launch_detached <name>` | A bare socket call does NOT auto-start the server, so the adapter starts through a `nohup` + Perl double-fork/`setsid` launcher and then polls before any workspace/tab/pane call. The launcher execs `herdr server --session <name>` with `HERDR_SESSION=<name>`, stdin redirected from `/dev/null`, and discarded output. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
 | Duplicate task check | `herdr tab list --workspace <id>`, match by `.label` | Herdr does NOT enforce tab-label uniqueness itself; two tabs can share a label. The adapter's own duplicate check is required. |
 | Send literal (unsubmitted) | `herdr pane send-text <pane> <text>` | Does NOT auto-submit, contrary to the original design addendum's guess. Verified directly: a unique marker sent this way sits unexecuted in the composer until a separate Enter. Behaves exactly like tmux's `send-keys -l`. |
 | Send + submit atomically | `herdr pane run <pane> <command>` | Runs and submits a command in one call; used for the two fixed spawn-time commands (`treehouse get`, the `GOTMPDIR` export) exactly where tmux used one `send-keys ... Enter` call. |
@@ -192,6 +193,20 @@ Herdr tasks additionally record:
 | Recovery / list-live | `herdr tab list --workspace <id>`, filter labels starting with `fm-` | Label-based, never trusts a stored id blindly - see "ID stability" below. `<id>` is always THIS home's own workspace (`fm_backend_herdr_workspace_find`), so recovery never sees a sibling home's tabs. |
 | Workspace create / tab create (focus) | `herdr workspace create --no-focus`, `herdr tab create --no-focus` | Verified: neither focuses by default once a workspace already exists in the session, matching pre-P3 (flagless) behavior; `--no-focus` is passed anyway for defense in depth, since the very first workspace ever created in a brand-new session focuses regardless of the flag. `--focus` was separately verified to reliably focus, confirming the flag has real effect. |
 | Session targeting for DESTRUCTIVE calls | `herdr session stop <name> --session <name> --json`, then `herdr session delete <name> --session <name> --json`; never `herdr server stop` | Owned by `bin/fm-herdr-lab.sh` (which `tests/herdr-test-safety.sh` sources), re-querying `herdr session list --json` before every destructive call. See "Session targeting" below - `HERDR_SESSION` alone is not reliably honored once another herdr server is already running on the machine. |
+
+## Detached server lifecycle verification (2026-07-17)
+
+Herdr 0.7.3 with protocol 16 reports `detached_server_daemon: false`, so the adapter must establish the detached lifecycle before it returns readiness.
+The pre-fix production path was invoked from a Bash driver in a throwaway tmux window with isolated session `fm-lab-bridge-survival-78142-16255`.
+Before destroying the parent window, the lab server PID 78507 and dummy agent PID 78625 shared session id 0 with the driver and the server retained process group 78149 from the driver.
+After `tmux kill-window -t firstmate:bridge-herdr-parent-16255` and 30 seconds, the server and dummy agent were dead and the scoped CLI returned `server.running=false` and connection refused.
+The fixed path uses `nohup` around a portable Perl double-fork: the first child calls `POSIX::setsid()`, forks once more, and execs only `herdr server --session <name>` with stdin redirected from `/dev/null` and output discarded.
+The adapter remains the single Herdr lifecycle owner, and captain launchers do not start or stop Herdr.
+The same lab shape was rerun from the fixed branch with isolated session `fm-lab-bridge-fix-91917` and throwaway window `firstmate:bridge-herdr-fix-91917`.
+Before the kill, driver PID 16023 was in process group 16023 while server PID 16206 was already reparented to PID 1 in process group 16205.
+After the parent window was absent for 84 seconds, server PID 16206 and dummy agent PID 16413 remained alive, `status --json` reported the scoped server running and compatible, and `pane get` plus `agent get` returned pane `w1:p2` with `agent_status=working`.
+Guarded teardown removed only `fm-lab-bridge-fix-91917`, and the default Herdr server remained running.
+`tests/fm-backend-herdr.test.sh` also launches a fake server through the detached helper and asserts survival after caller exit, reparenting, a distinct process group, closed terminal stdin, and the exact scoped server arguments.
 
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker
 

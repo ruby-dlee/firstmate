@@ -80,20 +80,33 @@ SH
 }
 
 # The commit this branch started from - the P1 "current main" baseline.
-resolve_base_ref() {
-  local ref base
-  for ref in main refs/heads/main origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD; do
-    if git -C "$ROOT" rev-parse --verify -q "$ref^{commit}" >/dev/null; then
-      base=$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null) || continue
+#
+# A push workflow for an integrated commit can have main/origin-main at HEAD.
+# In that shape, its first parent is the pre-feature main baseline.
+resolve_base_ref() {  # [repo-root]
+  local root=${1:-$ROOT} ref ref_commit base head main_at_head
+  head=$(git -C "$root" rev-parse HEAD) || return 1
+  main_at_head=0
+  for ref in origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD main refs/heads/main; do
+    if ref_commit=$(git -C "$root" rev-parse --verify -q "$ref^{commit}"); then
+      base=$(git -C "$root" merge-base "$head" "$ref_commit" 2>/dev/null) || continue
       [ -n "$base" ] || continue
+      if [ "$base" = "$head" ]; then
+        [ "$ref_commit" = "$head" ] && main_at_head=1
+        continue
+      fi
       printf '%s\n' "$base"
       return 0
     fi
   done
+  if [ "$main_at_head" -eq 1 ] && git -C "$root" rev-parse --verify -q "$head^1" >/dev/null; then
+    git -C "$root" rev-parse "$head^1"
+    return 0
+  fi
   return 1
 }
 BASE_REF=$(resolve_base_ref) \
-  || fail "fm-backend baseline requires local main or origin/main; fetch the default branch before running this test"
+  || fail "fm-backend baseline requires a distinct main merge-base or verified main-at-HEAD first parent"
 
 # --- shared: a pre-refactor bin/ shim --------------------------------------
 #
@@ -110,7 +123,7 @@ BASE_REF=$(resolve_base_ref) \
 # tmux-only conformance run the tmux adapter's behavior is what is under test,
 # and that is unchanged by any later (e.g. non-tmux backend) addition to
 # fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-transition-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-account-routing-lib.sh fm-report-contract-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
@@ -130,6 +143,58 @@ build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry p
 }
 
 # --- fm-backend.sh unit tests ------------------------------------------------
+
+test_resolve_base_ref_uses_single_parent_when_main_is_head() {
+  local repo expected actual
+  repo="$TMP_ROOT/base-single-parent"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" symbolic-ref HEAD refs/heads/main
+  printf 'first\n' > "$repo/fixture"
+  git -C "$repo" add fixture
+  git -C "$repo" commit -qm first
+  printf 'second\n' >> "$repo/fixture"
+  git -C "$repo" commit -qam second
+  expected=$(git -C "$repo" rev-parse HEAD^1)
+  actual=$(resolve_base_ref "$repo")
+  [ "$actual" = "$expected" ] \
+    || fail "resolve_base_ref should use HEAD^1 when verified main is a single-parent HEAD"
+  pass "resolve_base_ref: verified main-at-HEAD single-parent commits use their first parent"
+}
+
+test_resolve_base_ref_refuses_unverified_merge_parent() {
+  local repo actual
+  repo="$TMP_ROOT/base-unverified-merge"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" symbolic-ref HEAD refs/heads/topic
+  printf 'root\n' > "$repo/fixture"
+  git -C "$repo" add fixture
+  git -C "$repo" commit -qm root
+  git -C "$repo" branch side
+  printf 'topic\n' >> "$repo/fixture"
+  git -C "$repo" commit -qam topic
+  git -C "$repo" checkout -q side
+  printf 'side\n' > "$repo/side"
+  git -C "$repo" add side
+  git -C "$repo" commit -qm side
+  git -C "$repo" checkout -q topic
+  git -C "$repo" merge -q --no-edit side
+  if actual=$(resolve_base_ref "$repo"); then
+    fail "resolve_base_ref should refuse an unverified topic merge parent, got $actual"
+  fi
+  pass "resolve_base_ref: unverified topic merges do not supply a baseline"
+}
+
+test_herdr_required_tools_include_detached_launcher_dependencies() {
+  local required tool
+  required=$(fm_backend_required_tools herdr) || fail "Herdr should have a required-tool registry entry"
+  for tool in herdr jq nohup perl treehouse; do
+    fm_backend_list_contains "$required" "$tool" \
+      || fail "Herdr required tools should include $tool"
+  done
+  pass "fm_backend_required_tools: Herdr includes detached launcher dependencies"
+}
 
 test_backend_name_precedence() {
   local dir cfg
@@ -1252,6 +1317,18 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
+  test_resolve_base_ref_uses_single_parent_when_main_is_head
+  test_herdr_required_tools_include_detached_launcher_dependencies
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  test_resolve_base_ref_uses_single_parent_when_main_is_head
+  test_resolve_base_ref_refuses_unverified_merge_parent
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
@@ -1259,6 +1336,9 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   exit 0
 fi
 
+test_resolve_base_ref_uses_single_parent_when_main_is_head
+test_resolve_base_ref_refuses_unverified_merge_parent
+test_herdr_required_tools_include_detached_launcher_dependencies
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id

@@ -282,6 +282,60 @@ test_cli_helper_sets_env_and_appends_trailing_session_flag() {
   pass "fm_backend_herdr_cli: sets HERDR_SESSION AND appends a trailing --session flag on every call"
 }
 
+test_server_launch_detaches_from_callers_session() {
+  local dir fb marker result parent child parent_pid parent_pgid child_pid child_ppid child_pgid child_tty child_args
+  dir="$TMP_ROOT/server-detach"; fb="$dir/fakebin"; marker="$dir/detached.tsv"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+tty_state=no
+[ -t 0 ] && tty_state=yes
+printf 'child\t%s\t%s\t%s\t%s\t%s\n' \
+  "$$" \
+  "$PPID" \
+  "$(ps -o pgid= -p $$ | tr -d ' ')" \
+  "$tty_state" \
+  "$*" > "${FM_HERDR_DETACH_MARKER:?}"
+exec sleep 20
+SH
+  chmod +x "$fb/herdr"
+
+  result=$( PATH="$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$marker" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    printf "parent\t%s\t%s\n" \
+      "$$" \
+      "$(ps -o pgid= -p $$ | tr -d " ")"
+    fm_backend_herdr_server_launch_detached fmtest || exit 1
+    for _attempt in $(seq 1 40); do
+      [ -s "$FM_HERDR_DETACH_MARKER" ] && break
+      sleep 0.05
+    done
+    [ -s "$FM_HERDR_DETACH_MARKER" ] || exit 1
+    cat "$FM_HERDR_DETACH_MARKER"
+  ' "$ROOT" )
+  expect_code 0 $? "the detached launcher should start the fake Herdr server"
+
+  parent=$(printf '%s\n' "$result" | sed -n '1p')
+  child=$(printf '%s\n' "$result" | sed -n '2p')
+  IFS=$'\t' read -r _parent parent_pid parent_pgid <<< "$parent"
+  IFS=$'\t' read -r _child child_pid child_ppid child_pgid child_tty child_args <<< "$child"
+
+  if [ -z "$child_pid" ] || ! kill -0 "$child_pid" 2>/dev/null; then
+    fail "the detached fake server did not survive its launching shell"
+  fi
+  [ "$child_pgid" != "$parent_pgid" ] \
+    || fail "the detached fake server remained in the caller process group $parent_pgid"
+  [ "$child_ppid" != "$parent_pid" ] \
+    || fail "the detached fake server remained a direct child of its launching shell $parent_pid"
+  [ "$child_tty" = no ] \
+    || fail "the detached fake server retained a terminal on stdin"
+  [ "$child_args" = "server --session fmtest" ] \
+    || fail "the detached launcher changed the scoped server command: $child_args"
+  kill "$child_pid" 2>/dev/null || true
+  pass "fm_backend_herdr_server_launch_detached: server survives caller exit reparented in a distinct process group with closed stdin"
+}
+
 # --- container_ensure / create_task ------------------------------------------
 
 test_container_ensure_starts_server_and_workspace() {
@@ -2231,6 +2285,7 @@ test_workspace_label_secondmate_marker_trims_whitespace
 test_workspace_label_empty_marker_falls_back_to_primary
 test_workspace_label_different_secondmates_get_different_labels
 test_cli_helper_sets_env_and_appends_trailing_session_flag
+test_server_launch_detaches_from_callers_session
 test_container_ensure_starts_server_and_workspace
 test_container_ensure_reuses_existing_workspace
 test_container_ensure_creates_with_no_focus_flag

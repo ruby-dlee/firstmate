@@ -34,9 +34,10 @@
 # verification doc) uses LABEL matching (fm-<id> tab labels), never trusts a
 # stored pane id blindly: fm_backend_herdr_list_live.
 #
-# Requires: herdr (CLI + socket), jq (JSON parsing). Bootstrap detects these
-# through fm_backend_required_tools only when herdr is the resolved backend;
-# this adapter also gates them again before spawning.
+# Requires: herdr (CLI + socket), jq (JSON parsing), nohup, and perl (portable
+# detached setsid server launcher). Bootstrap detects these through
+# fm_backend_required_tools only when herdr is the resolved backend; this
+# adapter also gates them again before spawning.
 
 # FM_HOME fallback: every real caller (fm-spawn.sh, fm-peek.sh, fm-send.sh,
 # fm-teardown.sh, fm-watch.sh, fm-crew-state.sh) already sets FM_HOME as a
@@ -134,10 +135,13 @@ fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
   HERDR_SESSION="$session" herdr "$@" --session "$session"
 }
 
-# fm_backend_herdr_tool_check: refuse loudly if herdr or jq is missing.
+# fm_backend_herdr_tool_check: refuse loudly if herdr, jq, or the portable
+# setsid launcher prerequisites are missing.
 fm_backend_herdr_tool_check() {
   command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (dual-licensed AGPL-3.0-or-later/commercial)" >&2; return 1; }
   command -v jq >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'jq' is not installed (required to parse herdr's JSON output)" >&2; return 1; }
+  command -v nohup >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'nohup' is not installed (required to detach the Herdr server from the launching terminal)" >&2; return 1; }
+  command -v perl >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'perl' is not installed (required for the portable setsid Herdr server launcher)" >&2; return 1; }
   return 0
 }
 
@@ -173,16 +177,47 @@ fm_backend_herdr_session() {
   printf '%s' "${HERDR_SESSION:-default}"
 }
 
+# fm_backend_herdr_server_launch_detached: start exactly one headless Herdr
+# server outside the caller's process group, session, controlling terminal,
+# and stdio lifetime. A portable Perl double-fork performs setsid even on
+# macOS, where the util-linux `setsid` executable is absent. The adapter stays
+# the single lifecycle owner; captain launchers never start or stop Herdr.
+fm_backend_herdr_server_launch_detached() {  # <session>
+  local session=$1 herdr_bin perl_bin
+  herdr_bin=$(command -v herdr) || return 1
+  perl_bin=$(command -v perl) || return 1
+  command -v nohup >/dev/null 2>&1 || return 1
+  (
+    # Dollar expressions in the single-quoted program below belong to Perl.
+    # shellcheck disable=SC2016
+    HERDR_SESSION="$session" nohup "$perl_bin" -MPOSIX -e '
+      my $pid = fork();
+      defined $pid or die "first fork: $!";
+      exit 0 if $pid;
+      POSIX::setsid() >= 0 or die "setsid: $!";
+      $pid = fork();
+      defined $pid or die "second fork: $!";
+      exit 0 if $pid;
+      exec { $ARGV[0] } @ARGV;
+      die "exec $ARGV[0]: $!";
+    ' -- "$herdr_bin" server --session "$session" </dev/null >/dev/null 2>&1 &
+  ) || return 1
+}
+
 # fm_backend_herdr_server_ensure: start the herdr server for <session>
 # headless (no TUI client) if not already running, mirroring tmux's `tmux
 # has-session || tmux new-session -d`. Verified: a bare socket CLI call does
 # NOT auto-start the server, so this must run before any workspace/tab/pane
-# call. Bounded poll for the server to report running.
+# call. The detached launcher must survive the captain pane that initiated the
+# first spawn. Bounded poll for the server to report running.
 fm_backend_herdr_server_ensure() {  # <session>
-  local session=$1 running out i
+  local session=$1 running i
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
   [ "$running" = "true" ] && return 0
-  ( fm_backend_herdr_cli "$session" server >/dev/null 2>&1 & ) || return 1
+  fm_backend_herdr_server_launch_detached "$session" || return 1
+  # Give the double-forked grandchild one scheduling turn to exec before the
+  # first status poll. The bounded loop below remains the readiness authority.
+  sleep "${FM_BACKEND_HERDR_LAUNCH_SETTLE:-0.1}"
   for i in $(seq 1 20); do
     running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
     [ "$running" = "true" ] && return 0

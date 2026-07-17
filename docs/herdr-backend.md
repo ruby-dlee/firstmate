@@ -178,7 +178,7 @@ Herdr tasks additionally record:
 | Operation | Verified herdr call | What was verified |
 |---|---|---|
 | Version/protocol gate | `herdr status --json` -> `.client.protocol` | Session-independent; `.server.*` fields ARE session-dependent. |
-| Headless server start | `HERDR_SESSION=<name> herdr server --session <name>` (backgrounded) | A bare socket call does NOT auto-start the server; the adapter always starts-then-polls before any workspace/tab/pane call. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
+| Headless server start | `fm_backend_herdr_server_launch_detached <name>` | A bare socket call does NOT auto-start the server, so the adapter starts through a `nohup` + Perl double-fork/`setsid` launcher and then polls before any workspace/tab/pane call. The launcher execs `herdr server --session <name>` with `HERDR_SESSION=<name>`, closed stdin, and discarded output. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
 | Duplicate task check | `herdr tab list --workspace <id>`, match by `.label` | Herdr does NOT enforce tab-label uniqueness itself; two tabs can share a label. The adapter's own duplicate check is required. |
 | Send literal (unsubmitted) | `herdr pane send-text <pane> <text>` | Does NOT auto-submit, contrary to the original design addendum's guess. Verified directly: a unique marker sent this way sits unexecuted in the composer until a separate Enter. Behaves exactly like tmux's `send-keys -l`. |
 | Send + submit atomically | `herdr pane run <pane> <command>` | Runs and submits a command in one call; used for the two fixed spawn-time commands (`treehouse get`, the `GOTMPDIR` export) exactly where tmux used one `send-keys ... Enter` call. |
@@ -192,6 +192,20 @@ Herdr tasks additionally record:
 | Recovery / list-live | `herdr tab list --workspace <id>`, filter labels starting with `fm-` | Label-based, never trusts a stored id blindly - see "ID stability" below. `<id>` is always THIS home's own workspace (`fm_backend_herdr_workspace_find`), so recovery never sees a sibling home's tabs. |
 | Workspace create / tab create (focus) | `herdr workspace create --no-focus`, `herdr tab create --no-focus` | Verified: neither focuses by default once a workspace already exists in the session, matching pre-P3 (flagless) behavior; `--no-focus` is passed anyway for defense in depth, since the very first workspace ever created in a brand-new session focuses regardless of the flag. `--focus` was separately verified to reliably focus, confirming the flag has real effect. |
 | Session targeting for DESTRUCTIVE calls | `herdr session stop <name> --session <name> --json`, then `herdr session delete <name> --session <name> --json`; never `herdr server stop` | Owned by `bin/fm-herdr-lab.sh` (which `tests/herdr-test-safety.sh` sources), re-querying `herdr session list --json` before every destructive call. See "Session targeting" below - `HERDR_SESSION` alone is not reliably honored once another herdr server is already running on the machine. |
+
+## Detached server lifecycle verification (2026-07-17)
+
+Herdr 0.7.3 with protocol 16 reports `detached_server_daemon: false`, so the adapter must establish the detached lifecycle before it returns readiness.
+The pre-fix production path was invoked from a Bash driver in a throwaway tmux window with isolated session `fm-lab-bridge-survival-78142-16255`.
+Before destroying the parent window, the lab server PID 78507 and dummy agent PID 78625 shared session id 0 with the driver and the server retained process group 78149 from the driver.
+After `tmux kill-window -t firstmate:bridge-herdr-parent-16255` and 30 seconds, the server and dummy agent were dead and the scoped CLI returned `server.running=false` and connection refused.
+The fixed path uses `nohup` around a portable Perl double-fork that calls `POSIX::setsid()`, double-forks again, closes stdin, discards output, and execs only `herdr server --session <name>`.
+The adapter remains the single Herdr lifecycle owner, and captain launchers do not start or stop Herdr.
+The same lab shape was rerun from the fixed branch with isolated session `fm-lab-bridge-fix-91917` and throwaway window `firstmate:bridge-herdr-fix-91917`.
+Before the kill, driver PID 16023 was in process group 16023 while server PID 16206 was already reparented to PID 1 in process group 16205.
+After the parent window was absent for 84 seconds, server PID 16206 and dummy agent PID 16413 remained alive, `status --json` reported the scoped server running and compatible, and `pane get` plus `agent get` returned pane `w1:p2` with `agent_status=working`.
+Guarded teardown removed only `fm-lab-bridge-fix-91917`, and the default Herdr server remained running.
+`tests/fm-backend-herdr.test.sh` also launches a fake server through the detached helper and asserts survival after caller exit, reparenting, a distinct process group, closed terminal stdin, and the exact scoped server arguments.
 
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker
 

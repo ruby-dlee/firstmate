@@ -80,20 +80,29 @@ SH
 }
 
 # The commit this branch started from - the P1 "current main" baseline.
+#
+# A push workflow for the merge commit itself has main/origin-main at HEAD.
+# In that shape, the merge's first parent is the pre-feature main baseline.
 resolve_base_ref() {
-  local ref base
-  for ref in main refs/heads/main origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD; do
+  local ref base parent_count
+  for ref in origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD main refs/heads/main; do
     if git -C "$ROOT" rev-parse --verify -q "$ref^{commit}" >/dev/null; then
       base=$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null) || continue
       [ -n "$base" ] || continue
+      [ "$base" = "$(git -C "$ROOT" rev-parse HEAD)" ] && continue
       printf '%s\n' "$base"
       return 0
     fi
   done
+  parent_count=$(git -C "$ROOT" rev-list --parents -n 1 HEAD | awk '{ print NF - 1 }')
+  if [ "$parent_count" -ge 2 ]; then
+    git -C "$ROOT" rev-parse HEAD^1
+    return 0
+  fi
   return 1
 }
 BASE_REF=$(resolve_base_ref) \
-  || fail "fm-backend baseline requires local main or origin/main; fetch the default branch before running this test"
+  || fail "fm-backend baseline requires a distinct main merge-base or a merge commit first parent"
 
 # --- shared: a pre-refactor bin/ shim --------------------------------------
 #

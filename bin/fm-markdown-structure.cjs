@@ -99,6 +99,9 @@ function htmlBlockStart(line, paragraphOpen) {
   return undefined;
 }
 
+// Fenced blocks stay structurally invisible by default.
+// The opt-in exposes scoped body lines tagged as fenced while keeping delimiters
+// and heading syntax inside the fence non-structural.
 function markdownStructure(markdown, { includeFenceContent = false } = {}) {
   const visible = [];
   let fence;

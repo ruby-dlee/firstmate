@@ -187,8 +187,9 @@ status_open_decisions() {  # <status-file>
   printf '%s' "$open"
 }
 
-# task id from a recorded window target, falling back to the tmux-shaped
-# "<session>:fm-<id>" form when no metadata state is available.
+# Resolve a task id from each metadata file's last window=, terminal=, or managed
+# tmux_window_id= target, falling back to the legacy tmux-shaped
+# "<session>:fm-<id>" form when no metadata match is available.
 window_to_task() {
   local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta mw mt mi t
   if [ -n "$state" ]; then

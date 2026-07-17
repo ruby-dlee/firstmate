@@ -21,6 +21,8 @@ A ship task writes `data/<id>/completion.md`, while a scout keeps using `data/<i
 Both may attach screenshots, diagrams, or other review artifacts under `data/<id>/visuals/`.
 Every post-cutover ship and scout report must use the level-two sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
 Every required section must contain substantive body content, with an explicit `None.` accepted when the section has nothing to report.
+Within a real required section, meaningful fenced transcript or literal-code lines count as body content, but an empty fence body, whitespace, a bare Markdown blockquote or list marker, or Unicode control and format characters alone do not.
+Fence delimiters never count as body content, and heading-like lines inside a fence never satisfy a required section heading.
 
 For `report_required` tasks, `fm-teardown.sh` first quiesces the endpoint and confirms it gone while failing closed on an alive or unknown state, then runs non-destructive safety validation including the Orca path match and worktree checks, reconciles rollback state, and publishes before releasing an account lease or removing a worktree.
 A safety refusal after quiescence preserves all work and metadata but leaves the crewmate endpoint stopped.
@@ -36,7 +38,7 @@ Each entry contains a manifest, the completion report, the original task brief, 
 The entry id is deterministic from the canonical Firstmate home path plus task id, so publication retries replace the same entry instead of duplicating it.
 The manifest's task generation identity distinguishes a same-generation retry from a replacement generation, preserving prior completion provenance only when it still belongs to the current work.
 The manifest records routing labels useful for review but never stores provider session ids, auth material, environment values, or account-home contents.
-Task briefs, status trails, completion reports, and attachments are trusted internal artifacts preserved verbatim without content inspection or heuristic transformation.
+Task briefs, status trails, completion reports, and attachments are trusted internal artifacts preserved verbatim without heuristic redaction or transformation.
 Bounded decoded views are used only for validation and HTML metadata; the stored source files retain their original bytes.
 Publication reads only real files and directories contained beneath the configured task roots, refusing symlinks and path escapes.
 It limits a completion report to 16 MiB and visual evidence to 20 MiB total, 512 entries, and 24 nested directory levels; oversized or unsafe input leaves the previous durable entry unchanged for repair and retry.

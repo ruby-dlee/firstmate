@@ -1432,6 +1432,74 @@ test_stale_lock_reclaim_is_serialized() {
   pass "report stack serializes concurrent stale-lock reclamation"
 }
 
+test_reclaim_guard_fences_the_stale_generation_gap() {
+  local stack="$TMP_ROOT/reclaim-fence-stack" reclaimer_ready reclaimer_proceed waiter_seen waiter_acquired
+  local reclaimer_out waiter_out reclaimer_pid waiter_pid reclaimer_status waiter_status
+  mkdir -p "$stack/.publish.lock"
+  printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$stack/.publish.lock/owner"
+  touch -t 200001010000 "$stack/.publish.lock"
+  reclaimer_ready="$TMP_ROOT/reclaim-fence.ready"
+  reclaimer_proceed="$TMP_ROOT/reclaim-fence.proceed"
+  waiter_seen="$TMP_ROOT/reclaim-waiter-seen.ready"
+  waiter_acquired="$TMP_ROOT/reclaim-waiter-acquired.ready"
+  reclaimer_out="$TMP_ROOT/reclaim-fence.out"
+  waiter_out="$TMP_ROOT/reclaim-waiter.out"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RECLAIM_TEST_READY="$reclaimer_ready" FM_REPORT_RECLAIM_TEST_PROCEED="$reclaimer_proceed" \
+    "$SCRIPT" render > "$reclaimer_out" 2>&1 &
+  reclaimer_pid=$!
+  for _ in $(seq 1 1000); do
+    [ -e "$reclaimer_ready" ] && break
+    kill -0 "$reclaimer_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  [ -e "$reclaimer_ready" ] || {
+    kill -TERM "$reclaimer_pid" 2>/dev/null || true
+    fail "report reclaimer did not enter its fenced generation gap: $(cat "$reclaimer_out")"
+  }
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RECLAIM_WAITER_TEST_READY="$waiter_seen" FM_REPORT_LOCK_TEST_READY="$waiter_acquired" \
+    "$SCRIPT" render > "$waiter_out" 2>&1 &
+  waiter_pid=$!
+  for _ in $(seq 1 1000); do
+    [ -e "$waiter_seen" ] && break
+    kill -0 "$waiter_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  [ -e "$waiter_seen" ] || {
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report waiter did not observe the active reclaim guard: $(cat "$waiter_out")"
+  }
+  [ ! -e "$waiter_acquired" ] || {
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report waiter acquired a replacement lock before stale reclamation released its guard"
+  }
+
+  touch "$reclaimer_proceed"
+  if wait "$reclaimer_pid"; then reclaimer_status=0; else reclaimer_status=$?; fi
+  if wait "$waiter_pid"; then waiter_status=0; else waiter_status=$?; fi
+  [ "$reclaimer_status" -eq 0 ] || fail "fenced report reclaimer failed: $(cat "$reclaimer_out")"
+  [ "$waiter_status" -eq 0 ] || fail "fenced report waiter failed: $(cat "$waiter_out")"
+  assert_absent "$stack/.publish.lock" "fenced stale-lock test retained the publication lock"
+  assert_absent "$stack/.publish.lock.reclaim" "fenced stale-lock test retained the reclaim guard"
+  pass "report reclaim guard fences the absent-lock generation gap"
+}
+
+test_abandoned_reclaim_guard_is_recovered() {
+  local stack="$TMP_ROOT/abandoned-reclaim-guard-stack"
+  mkdir -p "$stack"
+  printf '{"pid":%s,"startedAt":"different-process-start","token":"abandoned-guard"}\n' "$$" \
+    > "$stack/.publish.lock.reclaim"
+  touch -t 200001010000 "$stack/.publish.lock.reclaim"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" render >/dev/null \
+    || fail "abandoned report-lock reclaim guard was not recovered"
+  assert_absent "$stack/.publish.lock" "abandoned reclaim-guard recovery retained the publication lock"
+  assert_absent "$stack/.publish.lock.reclaim" "abandoned reclaim-guard recovery retained the reclaim guard"
+  pass "report stack recovers an abandoned outer reclaim guard"
+}
+
 test_abandoned_reclaim_marker_is_recovered() {
   mkdir -p "$STACK/.publish.lock"
   printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$STACK/.publish.lock/owner"
@@ -3562,6 +3630,8 @@ test_large_visual_inventory_does_not_share_text_buffer_headroom
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
+test_reclaim_guard_fences_the_stale_generation_gap
+test_abandoned_reclaim_guard_is_recovered
 test_abandoned_reclaim_marker_is_recovered
 test_abandoned_reclaim_directory_is_recovered
 test_publish_lock_directory_symlink_fails_closed

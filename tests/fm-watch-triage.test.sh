@@ -145,6 +145,28 @@ test_classifier_primitives() {
   pass "classifier primitives: last line, captain-relevance, window->task, FM_CAPTAIN_RE override"
 }
 
+test_managed_tmux_window_id_reverse_mapping() {
+  local dir state
+  dir=$(make_case managed-tmux-reverse-map); state="$dir/state"
+  fm_write_meta "$state/managed-tmux-task.meta" \
+    "window=firstmate:fm-managed-tmux-task" \
+    "tmux_window_id=@stale" \
+    "tmux_window_id=@7"
+  fm_write_meta "$state/zz-duplicate.meta" \
+    "window=firstmate:fm-zz-duplicate" \
+    "tmux_window_id=@7"
+
+  [ "$(window_to_task '@7' "$state")" = "managed-tmux-task" ] \
+    || fail "managed tmux @id did not reverse-map to the first matching task"
+  [ "$(window_to_task '@stale' "$state")" = "@stale" ] \
+    || fail "window_to_task did not use the last tmux_window_id metadata value"
+  printf 'done: managed tmux task complete\n' > "$state/managed-tmux-task.status"
+  stale_is_terminal '@7' "$state" \
+    || fail "watcher stale classification did not consume the managed tmux @id mapping"
+
+  pass "managed tmux @id reverse-maps through last-value metadata and watcher classification"
+}
+
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
 # benign (absorb) ONLY when fm-crew-state.sh reports the crew as working from an
 # actively-running pipeline step (source run-step) or a busy pane (source pane);
@@ -1096,10 +1118,138 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+test_account_session_sync_is_bounded_and_cadenced() {
+  local dir state fake_root sync_bin calls query_timeout_file task_timeout_file elapsed_file sync_cadence_file elapsed count
+  dir=$(make_case account-session-sync); state="$dir/state"
+  fake_root="$dir/root"
+  sync_bin="$fake_root/bin/fm-account-session-sync.sh"
+  calls="$dir/account-session-sync.calls"
+  query_timeout_file="$dir/account-session-sync-query.timeout"
+  task_timeout_file="$dir/account-session-sync-task.timeout"
+  elapsed_file="$dir/account-session-sync.elapsed"
+  sync_cadence_file="$state/.last-account-session-sync"
+  mkdir -p "$fake_root/bin"
+cat > "$sync_bin" <<'SH'
+#!/usr/bin/env bash
+printf 'call\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
+printf '%s\n' "${FM_ACCOUNT_SESSION_QUERY_TIMEOUT:-}" > "$FM_FAKE_ACCOUNT_SYNC_QUERY_TIMEOUT"
+printf '%s\n' "${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}" > "$FM_FAKE_ACCOUNT_SYNC_TASK_TIMEOUT"
+SH
+  chmod +x "$sync_bin"
+  # shellcheck disable=SC2030,SC2031
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_ROOT_OVERRIDE="$fake_root"
+    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=60
+    export FM_ACCOUNT_SESSION_SYNC_TIMEOUT=1
+    export FM_FAKE_ACCOUNT_SYNC_CALLS="$calls"
+    export FM_FAKE_ACCOUNT_SYNC_QUERY_TIMEOUT="$query_timeout_file"
+    export FM_FAKE_ACCOUNT_SYNC_TASK_TIMEOUT="$task_timeout_file"
+    # shellcheck source=bin/fm-watch.sh
+    . "$WATCH"
+    start=$(date +%s)
+    sync_account_sessions_if_due
+    sync_account_sessions_if_due
+    echo $(( $(date +%s) - start )) > "$elapsed_file"
+  ) || fail "bounded account session synchronization failed"
+  elapsed=$(cat "$elapsed_file")
+  count=$(wc -l < "$calls" | tr -d '[:space:]')
+  [ "$elapsed" -lt 5 ] || fail "account session synchronization stalled watcher progress for ${elapsed}s"
+  [ "$count" -eq 1 ] || fail "account session synchronization ignored its persistent cadence (calls=$count)"
+  [ "$(cat "$query_timeout_file")" = 1 ] || fail "watcher did not pass the inner query timeout explicitly"
+  [ "$(cat "$task_timeout_file")" = 4 ] || fail "watcher did not give the full reconciliation explicit headroom"
+  assert_present "$sync_cadence_file" "account session synchronization did not persist its cadence"
+  pass "watcher delegates per-task sync budgets and separately cadences the sweep"
+}
+
+test_watcher_markers_refuse_symlinks() {
+  local dir state fake_root sync_bin outside before after
+  dir=$(make_case watcher-marker-symlink); state="$dir/state"
+  fake_root="$dir/root"
+  sync_bin="$fake_root/bin/fm-account-session-sync.sh"
+  outside="$dir/outside-marker"
+  mkdir -p "$fake_root/bin"
+  printf 'sentinel\n' > "$outside"
+  touch "$outside"
+  before=$(file_mtime "$outside")
+  rm -f "$state/.last-account-session-sync" "$state/.last-check" \
+    "$state/.last-heartbeat" "$state/.last-watcher-beat"
+  ln -s "$outside" "$state/.last-account-session-sync"
+  for marker in .last-check .last-heartbeat .last-watcher-beat; do
+    ln -s "$outside" "$state/$marker"
+  done
+  cat > "$sync_bin" <<'SH'
+#!/usr/bin/env bash
+printf 'called\n' >> "$FM_FAKE_ACCOUNT_SYNC_CALLS"
+SH
+  chmod +x "$sync_bin"
+  # shellcheck disable=SC1090,SC2030,SC2031
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_ROOT_OVERRIDE="$fake_root"
+    export FM_ACCOUNT_SESSION_SYNC_INTERVAL=999999
+    export FM_FAKE_ACCOUNT_SYNC_CALLS="$dir/sync.calls"
+    . "$WATCH"
+    sync_account_sessions_if_due
+    marker_due "$state/.last-check" 999999 "watcher check" || fail "unsafe check marker was not treated as due"
+    marker_due "$state/.last-heartbeat" 999999 "watcher heartbeat" || fail "unsafe heartbeat marker was not treated as due"
+    safe_touch_marker_or_log "$state/.last-check" "watcher check" || true
+    safe_touch_marker_or_log "$state/.last-heartbeat" "watcher heartbeat" || true
+    safe_touch_marker_or_log "$state/.last-watcher-beat" "watcher beacon" || true
+  )
+  after=$(file_mtime "$outside")
+  [ "$after" = "$before" ] || fail "watcher marker validation touched a symlink target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher marker validation changed outside content"
+  assert_present "$dir/sync.calls" "unsafe account cadence marker was not treated as due"
+  [ "$(grep -c 'unsafe .* marker' "$state/.watch-triage.log" 2>/dev/null || true)" -eq 4 ] \
+    || fail "unsafe watcher markers were not each logged exactly once"
+  pass "watcher markers validate before age checks and refuse symlinks"
+}
+
+test_watcher_timeout_wrapper_uses_hard_kill_fallback() {
+  local dir state fakebin log
+  dir=$(make_case watcher-hard-timeout); state="$dir/state"
+  fakebin=$(fm_fakebin "$dir/hard-timeout")
+  log="$dir/hard-timeout.args"
+  cat > "$fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$FM_FAKE_TIMEOUT_LOG"
+SH
+  chmod +x "$fakebin/timeout"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_FAKE_TIMEOUT_LOG="$log" bash -c '
+    . "$1"
+    run_bounded 4 true
+  ' _ "$WATCH" || fail "watcher timeout wrapper invocation failed"
+  grep -F -- '--kill-after=1 4 true' "$log" >/dev/null \
+    || fail "watcher timeout wrapper omitted the hard KILL fallback"
+  pass "watcher timeouts force-kill TERM-resistant subprocesses"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_watcher_markers_refuse_symlinks
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  test_watcher_markers_refuse_symlinks
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_account_session_sync_is_bounded_and_cadenced
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-tmux-reverse-map ]; then
+  test_managed_tmux_window_id_reverse_mapping
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
+test_managed_tmux_window_id_reverse_mapping
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
@@ -1129,3 +1279,6 @@ test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
+test_account_session_sync_is_bounded_and_cadenced
+test_watcher_markers_refuse_symlinks
+test_watcher_timeout_wrapper_uses_hard_kill_fallback

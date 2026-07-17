@@ -386,6 +386,15 @@ case "\$cmd \$sub" in
       exit 0
     fi
     ;;
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"${stale#*:}","tab_id":"tab-stale"},{"pane_id":"${fresh#*:}","tab_id":"tab-fresh"}]}}\n'
+    ;;
+  "workspace list")
+    printf '{"result":{"workspaces":[{"workspace_id":"ws-home","label":"2ndmate-sm-instr"}]}}\n'
+    ;;
+  "tab list")
+    printf '{"result":{"tabs":[{"tab_id":"tab-stale","workspace_id":"ws-home","label":"fm-sm-instr"},{"tab_id":"tab-fresh","workspace_id":"ws-home","label":"fm-sm-instr"}]}}\n'
+    ;;
   "agent get")
     if [ "\$arg" = "${stale#*:}" ]; then
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
@@ -424,6 +433,8 @@ test_nudge_selector_stable_after_herdr_respawn() {
     printf 'kind=secondmate\n'
     printf 'harness=claude\n'
     printf 'home=%s/sm-instr\n' "$w"
+    printf 'herdr_workspace_id=ws-home\n'
+    printf 'herdr_tab_id=tab-stale\n'
   } > "$meta"
 
   spawn_stub="$w/spawn-stub.sh"

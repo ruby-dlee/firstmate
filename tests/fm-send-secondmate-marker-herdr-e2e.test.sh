@@ -21,6 +21,8 @@ set -u
 . "$ROOT/bin/fm-marker-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
+# shellcheck source=tests/herdr-test-safety.sh
+. "$ROOT/tests/herdr-test-safety.sh"
 
 if [ "${FM_SEND_MARKER_HERDR_E2E:-0}" != 1 ]; then
   echo "skip: set FM_SEND_MARKER_HERDR_E2E=1 to run the real Pi/Herdr secondmate-marker regression"
@@ -33,6 +35,7 @@ done
 
 LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
 SESSION=$("$LAB_HELPER" name fm-send-secondmate-marker-v7)
+herdr_test_lab_available "$SESSION" || exit 0
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-send-marker-herdr-e2e.XXXXXX")
 SENDER_HOME="$TMP_ROOT/sender-home"
 SECOND_HOME="$TMP_ROOT/secondmate-home"

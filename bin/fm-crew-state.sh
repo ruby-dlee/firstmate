@@ -135,11 +135,9 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
+RECORDED_SCOPED_TARGET=$(fm_meta_get "$META" tmux_session_target)
 pane_readable() {  # <target>
-  case "$TASK_BACKEND" in
-    tmux) tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1 ;;
-    *) fm_backend_capture "$TASK_BACKEND" "$1" 1 "$EXPECTED_LABEL" >/dev/null 2>&1 ;;
-  esac
+  fm_backend_capture "$TASK_BACKEND" "$1" 1 "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET" >/dev/null 2>&1
 }
 # crew_pane_is_busy: the busy-signature fallback, backend-aware the same way -
 # fm_backend_busy_state's native semantic state (herdr's agent.get) when
@@ -166,19 +164,14 @@ pane_readable() {  # <target>
 # dialog, not mid-tool-call) does not render the busy banner, so this
 # corroboration does not mask that case: it stays correctly not-busy.
 crew_pane_is_busy() {  # <target>
-  case "$TASK_BACKEND" in
-    tmux) fm_pane_is_busy "$1" ;;
+  local bs tail40
+  bs=$(fm_backend_busy_state "$TASK_BACKEND" "$1" "$EXPECTED_LABEL" 2>/dev/null)
+  case "$bs" in
+    busy) return 0 ;;
     *)
-      local bs tail40
-      bs=$(fm_backend_busy_state "$TASK_BACKEND" "$1" 2>/dev/null)
-      case "$bs" in
-        busy) return 0 ;;
-        *)
-          tail40=$(fm_backend_capture "$TASK_BACKEND" "$1" 40 "$EXPECTED_LABEL" 2>/dev/null) || return 1
-          printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
-            | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
-          ;;
-      esac
+      tail40=$(fm_backend_capture "$TASK_BACKEND" "$1" 40 "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET" 2>/dev/null) || return 1
+      printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
+        | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
       ;;
   esac
 }

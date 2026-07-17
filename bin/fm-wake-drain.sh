@@ -3,6 +3,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
@@ -43,15 +46,22 @@ trap 'exit 143' TERM
 fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=true
 
+if ! fm_wake_safe_file_destination "$FM_WAKE_QUEUE"; then
+  echo "error: unsafe wake queue destination: $FM_WAKE_QUEUE" >&2
+  exit 1
+fi
+
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
   : > "$FM_WAKE_QUEUE"
   assert_watcher_liveness
   exit 0
 fi
 
-DRAIN_TMP="$STATE/.wake-queue.drain.$(fm_current_pid)"
-rm -f "$DRAIN_TMP"
+DRAIN_TMP=$(mktemp "$STATE/.wake-queue.drain.XXXXXX") || exit 1
 mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
+if ! fm_wake_safe_file_destination "$FM_WAKE_QUEUE"; then
+  exit 1
+fi
 : > "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"

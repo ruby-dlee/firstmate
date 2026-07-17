@@ -573,6 +573,7 @@ test_backend_of_selector_matches_explicit_target_meta() {
   fm_write_meta "$state/tmux-task.meta" "window=firstmate:fm-tmux-task"
   fm_write_meta "$state/custom-window-task.meta" "window=custom-window"
   fm_write_meta "$state/orca-task.meta" "window=fm-orca-task" "terminal=term-orca-task" "backend=orca"
+  fm_write_meta "$state/managed-tmux-task.meta" "window=firstmate:fm-managed-tmux-task" "tmux_window_id=@7"
 
   [ "$(fm_backend_of_selector 'dotfiles-d6' 'default:wA:p2' "$state")" = herdr ] \
     || fail "bare non-fm task id selector should use its recorded backend"
@@ -588,6 +589,8 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "raw window selector matching metadata should not require tmux fallback"
   [ "$(fm_backend_of_selector 'term-orca-task' 'term-orca-task' "$state")" = orca ] \
     || fail "matching an explicit Orca terminal handle should inherit metadata backend"
+  [ "$(fm_backend_meta_for_window '@7' "$state")" = "$state/managed-tmux-task.meta" ] \
+    || fail "managed tmux window ids should reverse-resolve to their task metadata"
   [ "$(fm_backend_of_selector 'default:w1:p2' 'default:w1:p2' "$state")" = herdr ] \
     || fail "explicit backend target matching metadata should use that task's backend"
   [ "$(fm_backend_of_selector 'firstmate:fm-tmux-task' 'firstmate:fm-tmux-task' "$state")" = tmux ] \
@@ -596,6 +599,163 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "explicit target with no matching metadata should keep the tmux compatibility default"
 
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
+}
+
+test_managed_tmux_target_identity() {
+  local log out
+  log="$TMP_ROOT/managed-tmux-target.log"
+  : > "$log"
+  tmux() {
+    printf '%s\n' "$*" >> "$log"
+    case "$*" in
+      *'#{window_name}'*) printf 'fm-other-task\n'; return 0 ;;
+      list-panes*) return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux '' fm-intended-task)" = unknown ] \
+    || fail "an empty managed endpoint target should be unknown"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+    || fail "a live tmux window id with another label should have unknown managed state"
+  out=$(fm_backend_agent_alive tmux @77 fm-intended-task)
+  [ "$out" = unknown ] || fail "a reused tmux window id should have unknown agent liveness"
+  ! fm_backend_capture tmux @77 10 fm-intended-task \
+    || fail "capture accepted a reused tmux window id"
+  ! fm_backend_send_key tmux @77 Enter fm-intended-task \
+    || fail "send-key accepted a reused tmux window id"
+  ! fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task \
+    || fail "send-text accepted a reused tmux window id"
+  ! fm_backend_kill tmux @77 '' fm-intended-task \
+    || fail "kill accepted a reused tmux window id"
+  if grep -Eq 'capture-pane|send-keys|kill-window' "$log"; then
+    fail "a reused tmux window id reached a read or mutation command"
+  fi
+  pass "managed tmux operations reject reused window ids with another task label"
+}
+
+test_managed_tmux_target_identity_checks_recorded_session() {
+  local log fake_session fake_label
+  log="$TMP_ROOT/managed-tmux-session-identity.log"
+  : > "$log"
+  fake_session=other-session
+  fake_label=fm-intended-task
+  tmux() {
+    printf '%s\n' "$*" >> "$log"
+    case "$*" in
+      *'#{session_name}'*) printf '%s\t%s\n' "$fake_session" "$fake_label" ;;
+    esac
+  }
+
+  ! fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
+    || fail "a reused tmux window id in another session passed existence validation"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a live stable id moved intact to another session was classified absent"
+  fake_label=fm-other-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a moved and renamed live stable id was classified absent"
+  fake_label=fm-intended-task
+  ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-other-task \
+    || fail "managed tmux capture accepted a scoped target with the wrong task label"
+  ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session capture accepted an unrelated reused stable id"
+  ! fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
+    || fail "recorded-session key send accepted an unrelated reused stable id"
+  ! fm_backend_send_text_submit tmux @77 message 1 0 0 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "recorded-session text send accepted an unrelated reused stable id"
+  [ "$(fm_backend_agent_alive tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "session-mismatched tmux identity passed agent-liveness validation"
+  ! fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
+    || fail "a reused tmux window id in another session passed kill validation"
+  ! grep -Eq '^(capture-pane|send-keys) ' "$log" \
+    || fail "session-mismatched managed tmux activity reached the reused or name-based target"
+
+  fake_session=recorded-session
+  fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
+    || fail "the recorded tmux session identity did not pass existence validation"
+  fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
+    || fail "session-matched capture rejected the stable tmux identity"
+  fm_backend_send_key tmux @77 Enter fm-intended-task recorded-session:fm-intended-task \
+    || fail "session-matched key send rejected the stable tmux identity"
+  grep -Eq '^(capture-pane|send-keys) .* -t @77( |$)' "$log" \
+    || fail "managed tmux activity discarded the verified stable identity"
+  ! grep -Eq '^(capture-pane|send-keys) .* -t recorded-session:fm-intended-task( |$)' "$log" \
+    || fail "managed tmux activity retargeted through the mutable recorded name"
+  fm_backend_kill tmux @77 '' fm-intended-task recorded-session:fm-intended-task \
+    || fail "the recorded tmux session identity did not pass kill validation"
+  grep -q '^kill-window -t @77$' "$log" \
+    || fail "the session-matched tmux identity did not retain its verified stable target"
+  ! grep -q '^kill-window -t recorded-session:fm-intended-task$' "$log" \
+    || fail "tmux kill discarded its stable identity for a name-based target"
+
+  fake_label=fm-renamed-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a renamed live stable id in the recorded session was classified absent"
+  pass "managed tmux activity is scoped while lifecycle kill retains verified identity"
+}
+
+test_managed_tmux_target_state_finds_replacement_window() {
+  local log window_names
+  log="$TMP_ROOT/managed-tmux-replacement.log"
+  : > "$log"
+  window_names=fm-intended-task
+  tmux() {
+    printf '%s\n' "$*" >> "$log"
+    case "${1:-}" in
+      display-message) return 1 ;;
+      list-windows)
+        [ "${2:-}" = -t ] && [ "${3:-}" = recorded-session ] || return 1
+        printf '%s\n' "$window_names"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = present ] \
+    || fail "a uniquely labeled replacement tmux window was classified as absent"
+  window_names=$'fm-intended-task\nfm-intended-task'
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = unknown ] \
+    || fail "duplicate plausible tmux replacements were not fail-closed"
+  window_names=fm-other-task
+  [ "$(fm_backend_target_state tmux recorded-session:fm-intended-task fm-intended-task)" = absent ] \
+    || fail "tmux target state did not retain confident absence without a replacement label"
+  grep -q '^list-windows -t recorded-session ' "$log" \
+    || fail "tmux replacement discovery did not scan the recorded session"
+  ! grep -q '^list-windows -a ' "$log" \
+    || fail "tmux replacement discovery crossed session boundaries"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task)" = unknown ] \
+    || fail "a missing stable tmux id without a recoverable session was not fail-closed"
+  window_names=fm-other-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
+    || fail "stable tmux metadata could not establish absence through its recorded session identity"
+  window_names=fm-intended-task
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = present ] \
+    || fail "stable tmux metadata did not find a replacement in its recorded session"
+  pass "managed tmux target state scopes plausible replacement windows to the recorded session"
+}
+
+test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears() {
+  local resolved=1
+  tmux() {
+    case "${1:-}" in
+      list-windows)
+        printf "can't find session: recorded-session\n" >&2
+        return 1
+        ;;
+      display-message)
+        [ "$resolved" = 1 ] || return 1
+        printf 'other-session\tfm-renamed-task\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a live stable id moved out of a destroyed recorded session was classified absent"
+  resolved=0
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
+    || fail "a truly unresolvable stable id did not establish absence after its recorded session disappeared"
+  pass "managed tmux target state resolves stable ids after recorded-session loss"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------
@@ -1062,6 +1222,43 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
+  test_managed_tmux_target_state_finds_replacement_window
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
+  test_meta_get_and_backend_of_meta
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-31 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-32 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  test_managed_tmux_target_state_finds_replacement_window
+  test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
+  exit 0
+fi
+
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
@@ -1079,6 +1276,10 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_managed_tmux_target_identity
+test_managed_tmux_target_identity_checks_recorded_session
+test_managed_tmux_target_state_finds_replacement_window
+test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

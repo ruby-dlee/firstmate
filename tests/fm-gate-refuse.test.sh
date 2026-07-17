@@ -34,6 +34,37 @@ GATE_LIB="$ROOT/bin/fm-gate-refuse-lib.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
+MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
+PROMOTE="$ROOT/bin/fm-promote.sh"
+SESSION_START="$ROOT/bin/fm-session-start.sh"
+HOME_SEED="$ROOT/bin/fm-home-seed.sh"
+BACKLOG_HANDOFF="$ROOT/bin/fm-backlog-handoff.sh"
+PR_CHECK="$ROOT/bin/fm-pr-check.sh"
+AFK_LAUNCH="$ROOT/bin/fm-afk-launch.sh"
+AFK_START="$ROOT/bin/fm-afk-start.sh"
+BOOTSTRAP="$ROOT/bin/fm-bootstrap.sh"
+UPDATE="$ROOT/bin/fm-update.sh"
+CONFIG_PUSH="$ROOT/bin/fm-config-push.sh"
+ACCOUNT_SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
+ACCOUNT_CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
+FLEET_SYNC="$ROOT/bin/fm-fleet-sync.sh"
+X_REPLY="$ROOT/bin/fm-x-reply.sh"
+X_DISMISS="$ROOT/bin/fm-x-dismiss.sh"
+X_FOLLOWUP="$ROOT/bin/fm-x-followup.sh"
+X_LINK="$ROOT/bin/fm-x-link.sh"
+X_POLL="$ROOT/bin/fm-x-poll.sh"
+WATCH="$ROOT/bin/fm-watch.sh"
+WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
+WATCH_CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
+WAKE_DRAIN="$ROOT/bin/fm-wake-drain.sh"
+REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
+TASK_FILE_APPEND="$ROOT/bin/fm-task-file-append.mjs"
+BRIEF="$ROOT/bin/fm-brief.sh"
+ENSURE_AGENTS="$ROOT/bin/fm-ensure-agents-md.sh"
+LOCK="$ROOT/bin/fm-lock.sh"
+REVIEW_DIFF="$ROOT/bin/fm-review-diff.sh"
+SUPERVISE_DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -74,6 +105,19 @@ make_normal_repo() {
 
 GATE_WT=$(make_gate_worktree "$TMP/gate")
 NORMAL_CWD=$(make_normal_repo "$TMP/normal-cwd")
+mkdir -p "$GATE_WT/bin" "$NORMAL_CWD/bin"
+cp -R "$ROOT/bin/." "$GATE_WT/bin/"
+cp -R "$ROOT/bin/." "$NORMAL_CWD/bin/"
+GATE_LIB="$GATE_WT/bin/fm-gate-refuse-lib.sh"
+NORMAL_LIB="$NORMAL_CWD/bin/fm-gate-refuse-lib.sh"
+
+guarded_script() {
+  local cwd=$1 script=$2
+  case "$cwd" in
+    "$GATE_WT") printf '%s/bin/%s\n' "$GATE_WT" "$(basename "$script")" ;;
+    *) printf '%s/bin/%s\n' "$NORMAL_CWD" "$(basename "$script")" ;;
+  esac
+}
 
 # --- the shared helper, tested directly -------------------------------------
 
@@ -82,7 +126,7 @@ NORMAL_CWD=$(make_normal_repo "$TMP/normal-cwd")
 # a literal "set" second argument re-exports it, so callers pick the signal under
 # test. Echoes combined output; the guard's exit is the caller's $?.
 run_guard_lib() {
-  local cwd=$1 marker=${2:-unset}
+  local cwd=$1 marker=${2:-unset} library=${3:-$NORMAL_LIB}
   (
     cd "$cwd" || exit 111
     unset NO_MISTAKES_GATE FM_GATE_REFUSE_BYPASS
@@ -92,7 +136,7 @@ run_guard_lib() {
     esac
     set -eu
     # shellcheck source=bin/fm-gate-refuse-lib.sh
-    . "$GATE_LIB"
+    . "$library"
     fm_refuse_if_gate_agent
   ) 2>&1
 }
@@ -115,12 +159,20 @@ test_helper_empty_env_marker_refuses() {
 
 test_helper_path_backstop_refuses() {
   local out rc
-  # Marker UNSET: only the git-common-dir backstop can fire here.
-  out=$(run_guard_lib "$GATE_WT"); rc=$?
+  out=$(run_guard_lib "$NORMAL_CWD" unset "$GATE_LIB"); rc=$?
   expect_code 3 "$rc" "helper: gate worktree must exit 3 even with the marker unset"
   assert_contains "$out" "$PATH_MSG" "helper: path-backstop refusal message"
   assert_not_contains "$out" "$ENV_MSG" "helper: backstop must not be attributed to the env marker"
   pass "fm-gate-refuse-lib: refuses from a gate worktree via git-common-dir (marker unset)"
+}
+
+test_helper_caller_path_backstop_refuses() {
+  local out rc
+  out=$(run_guard_lib "$GATE_WT" unset "$NORMAL_LIB"); rc=$?
+  expect_code 3 "$rc" "helper: gate caller checkout must exit 3 when using a normal checkout's script"
+  assert_contains "$out" "$PATH_MSG" "helper: caller-path backstop refusal message"
+  assert_not_contains "$out" "$ENV_MSG" "helper: caller-path refusal must not be attributed to the env marker"
+  pass "fm-gate-refuse-lib: inspects the caller checkout as well as the script checkout"
 }
 
 test_helper_normal_is_noop() {
@@ -167,7 +219,7 @@ run_spawn() {
       "FM_PROJECTS_OVERRIDE=$home/projects" "FM_CONFIG_OVERRIDE=$home/config" \
       "FM_SPAWN_NO_GUARD=1" "FM_FAKE_PANE_PATH=$pane" "TMUX=fake,1,0" \
       "PATH=$fakebin:$PATH" "$@" \
-      "$SPAWN" "$id" "$proj" codex ) 2>&1
+      "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex ) 2>&1
 }
 
 test_spawn_refuses_and_admits() {
@@ -240,7 +292,7 @@ run_send() {
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "PATH=$fakebin:$PATH" "FM_HOME=$home" "FM_ROOT_OVERRIDE=$home" \
       "FM_TMUX_LOG=$log" "FM_SEND_SETTLE=0" "$@" \
-      "$SEND" "$target" "$text" ) 2>&1
+      "$(guarded_script "$cwd" "$SEND")" "$target" "$text" ) 2>&1
 }
 
 test_send_refuses_and_admits() {
@@ -326,9 +378,9 @@ SH
 run_teardown() {
   local cwd=$1 case_dir=$2; shift 2
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
-      "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" \
+      "FM_ROOT_OVERRIDE=$cwd" "FM_STATE_OVERRIDE=$case_dir/state" \
       "FM_CONFIG_OVERRIDE=$case_dir/config" "PATH=$case_dir/fakebin:$PATH" "$@" \
-      "$TEARDOWN" task-x1 ) 2>&1
+      "$(guarded_script "$cwd" "$TEARDOWN")" task-x1 ) 2>&1
 }
 
 test_teardown_refuses_and_admits() {
@@ -356,6 +408,327 @@ test_teardown_refuses_and_admits() {
   assert_not_contains "$out" "$PATH_MSG" "teardown: normal teardown must not print the backstop refusal"
   assert_not_contains "$out" "REFUSED" "teardown: normal teardown of landed work must not refuse"
   pass "fm-teardown: refuses on marker and gate-worktree backstop; a normal teardown is unaffected"
+}
+
+# --- merge entrypoints ------------------------------------------------------
+
+run_pr_merge_guarded() {
+  local cwd=$1 home=$2 fakebin=$3 log=$4
+  shift 4
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
+      "FM_TEST_GH_AXI_LOG=$log" "PATH=$fakebin:$PATH" "$@" \
+      "$(guarded_script "$cwd" "$PR_MERGE")" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+}
+
+make_local_merge_case() {
+  local name=$1 case_dir project before
+  case_dir="$TMP/$name"
+  project="$case_dir/project"
+  mkdir -p "$case_dir/state"
+  git init -q -b main "$project"
+  git -C "$project" commit -q --allow-empty -m baseline
+  before=$(git -C "$project" rev-parse HEAD)
+  git -C "$project" branch fm/task-x1
+  git -C "$project" switch -q fm/task-x1
+  printf 'land me\n' > "$project/change.txt"
+  git -C "$project" add change.txt
+  git -C "$project" commit -q -m change
+  git -C "$project" switch -q main
+  fm_write_meta "$case_dir/state/task-x1.meta" "project=$project" "mode=local-only"
+  printf '%s|%s\n' "$case_dir" "$before"
+}
+
+run_local_merge_guarded() {
+  local cwd=$1 case_dir=$2
+  shift 2
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" "$@" \
+      "$(guarded_script "$cwd" "$MERGE_LOCAL")" task-x1 ) 2>&1
+}
+
+test_merge_entrypoints_refuse_gate_contexts() {
+  local home fakebin log before_meta out rc local_case case_dir before after
+  home="$TMP/merge-guard-home"
+  fakebin=$(fm_fakebin "$TMP/merge-guard-fake")
+  log="$TMP/merge-guard-gh.log"
+  mkdir -p "$home/state"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship" "mode=no-mistakes"
+  before_meta=$(cat "$home/state/task-x1.meta")
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+SH
+  chmod +x "$fakebin/gh-axi"
+
+  out=$(run_pr_merge_guarded "$NORMAL_CWD" "$home" "$fakebin" "$log" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "pr merge: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "pr merge: env-marker refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before_meta" ] || fail "refused PR merge mutated task metadata"
+  [ ! -s "$log" ] || fail "refused PR merge invoked gh-axi"
+
+  out=$(run_pr_merge_guarded "$GATE_WT" "$home" "$fakebin" "$log"); rc=$?
+  expect_code 3 "$rc" "pr merge: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "pr merge: path-backstop refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before_meta" ] || fail "path-refused PR merge mutated task metadata"
+  [ ! -s "$log" ] || fail "path-refused PR merge invoked gh-axi"
+
+  local_case=$(make_local_merge_case merge-local-envmark)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$NORMAL_CWD" "$case_dir" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "local merge: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "local merge: env-marker refusal message"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" = "$before" ] || fail "refused local merge advanced main"
+
+  local_case=$(make_local_merge_case merge-local-backstop)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$GATE_WT" "$case_dir"); rc=$?
+  expect_code 3 "$rc" "local merge: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "local merge: path-backstop refusal message"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" = "$before" ] || fail "path-refused local merge advanced main"
+
+  local_case=$(make_local_merge_case merge-local-ok)
+  IFS='|' read -r case_dir before <<EOF
+$local_case
+EOF
+  out=$(run_local_merge_guarded "$NORMAL_CWD" "$case_dir"); rc=$?
+  expect_code 0 "$rc" "local merge: normal session should still merge"
+  after=$(git -C "$case_dir/project" rev-parse main)
+  [ "$after" != "$before" ] || fail "normal local merge did not advance main"
+  pass "merge entrypoints refuse both gate signals before metadata or Git mutation"
+}
+
+run_promote_guarded() {
+  local cwd=$1 home=$2
+  shift 2
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
+      "FM_DATA_OVERRIDE=$home/data" "$@" "$(guarded_script "$cwd" "$PROMOTE")" task-x1 ) 2>&1
+}
+
+test_promote_refuses_gate_contexts() {
+  local home before out rc
+  home="$TMP/promote-guard-home"
+  mkdir -p "$home/state" "$home/data/task-x1"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=scout"
+  before=$(cat "$home/state/task-x1.meta")
+
+  out=$(run_promote_guarded "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "promote: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "promote: env-marker refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before" ] || fail "refused promotion mutated task metadata"
+
+  out=$(run_promote_guarded "$GATE_WT" "$home"); rc=$?
+  expect_code 3 "$rc" "promote: gate-worktree cwd must refuse"
+  assert_contains "$out" "$PATH_MSG" "promote: path-backstop refusal message"
+  [ "$(cat "$home/state/task-x1.meta")" = "$before" ] || fail "path-refused promotion mutated task metadata"
+  pass "fm-promote refuses both gate signals before task mutation"
+}
+
+run_primary_mutator_guarded() {
+  local name=$1 cwd=$2 home=$3
+  shift 3
+  case "$name" in
+    session-start)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$SESSION_START")" ) 2>&1
+      ;;
+    home-seed)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$HOME_SEED")" secondmate-x "$home/secondmate" --no-projects ) 2>&1
+      ;;
+    backlog-handoff)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$BACKLOG_HANDOFF")" secondmate-x queued-x ) 2>&1
+      ;;
+    pr-check)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$PR_CHECK")" task-x1 https://github.com/example/repo/pull/9 ) 2>&1
+      ;;
+    afk-launch)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$AFK_LAUNCH")" start-native ) 2>&1
+      ;;
+    afk-start)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "FM_STATE_OVERRIDE=$home/state" \
+          "FM_AFK_STATE_PREPARED=1" "$@" "$(guarded_script "$cwd" "$AFK_START")" ) 2>&1
+      ;;
+    bootstrap)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$BOOTSTRAP")" ) 2>&1
+      ;;
+    update)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$UPDATE")" ) 2>&1
+      ;;
+    config-push)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$CONFIG_PUSH")" ) 2>&1
+      ;;
+    account-session-sync)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$ACCOUNT_SESSION_SYNC")" task-x1 ) 2>&1
+      ;;
+    account-continuation)
+      ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+          "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" "$@" "$(guarded_script "$cwd" "$ACCOUNT_CONTINUATION")" task-x1 attempt-x2 ) 2>&1
+      ;;
+  esac
+}
+
+test_primary_mutators_refuse_gate_contexts() {
+  local home name out rc
+  home="$TMP/primary-mutators"
+  mkdir -p "$home/data" "$home/state"
+  printf '# Backlog\n\n## In flight\n## Queued\n- [ ] queued-x - queued\n## Done\n' > "$home/data/backlog.md"
+  fm_write_meta "$home/state/task-x1.meta" "window=fm-task-x1" "kind=ship"
+
+  for name in session-start home-seed backlog-handoff pr-check afk-launch afk-start bootstrap update config-push account-session-sync account-continuation; do
+    out=$(run_primary_mutator_guarded "$name" "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
+    expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"
+
+    out=$(run_primary_mutator_guarded "$name" "$GATE_WT" "$home"); rc=$?
+    expect_code 3 "$rc" "$name: gate-worktree cwd must refuse"
+    assert_contains "$out" "$PATH_MSG" "$name: path-backstop refusal message"
+  done
+
+  assert_absent "$home/state/.lock" "refused session start acquired the fleet lock"
+  assert_absent "$home/state/.afk-launch.lock" "refused AFK launch acquired the lifecycle lock"
+  assert_absent "$home/state/.afk" "refused AFK launch entered away mode"
+  assert_absent "$home/state/.account-meta-task-x1.lock" "refused session sync acquired the metadata lock"
+  assert_absent "$home/data/secondmates.md" "refused home seed changed the secondmate registry"
+  assert_absent "$home/state/task-x1.check.sh" "refused PR check armed a merge poll"
+  if grep -q '^pr=' "$home/state/task-x1.meta"; then
+    fail "refused PR check changed task metadata"
+  fi
+  assert_grep 'queued-x' "$home/data/backlog.md" "refused backlog handoff moved the queued item"
+  pass "primary fleet mutators refuse both gate signals before state changes"
+}
+
+test_extended_mutating_entrypoints_refuse_gate_context() {
+  local home stack script name out rc
+  home="$TMP/extended-mutators"
+  stack="$TMP/extended-report-stack"
+  mkdir -p "$home/state" "$home/data" "$home/projects"
+
+  for name in fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
+    case "$name" in
+      fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
+      x-reply) script=$(guarded_script "$NORMAL_CWD" "$X_REPLY"); set -- request-x "reply" ;;
+      x-dismiss) script=$(guarded_script "$NORMAL_CWD" "$X_DISMISS"); set -- request-x ;;
+      x-followup) script=$(guarded_script "$NORMAL_CWD" "$X_FOLLOWUP"); set -- --check task-x ;;
+      x-link) script=$(guarded_script "$NORMAL_CWD" "$X_LINK"); set -- task-x request-x ;;
+      x-poll) script=$(guarded_script "$NORMAL_CWD" "$X_POLL"); set -- ;;
+      watch) script=$(guarded_script "$NORMAL_CWD" "$WATCH"); set -- ;;
+      watch-arm) script=$(guarded_script "$NORMAL_CWD" "$WATCH_ARM"); set -- ;;
+      watch-checkpoint) script=$(guarded_script "$NORMAL_CWD" "$WATCH_CHECKPOINT"); set -- ;;
+      wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;
+      brief) script=$(guarded_script "$NORMAL_CWD" "$BRIEF"); set -- task-x ship project-x objective ;;
+      ensure-agents) script=$(guarded_script "$NORMAL_CWD" "$ENSURE_AGENTS"); set -- "$home" ;;
+      lock) script=$(guarded_script "$NORMAL_CWD" "$LOCK"); set -- ;;
+      review-diff) script=$(guarded_script "$NORMAL_CWD" "$REVIEW_DIFF"); set -- task-x ;;
+      supervise-daemon) script=$(guarded_script "$NORMAL_CWD" "$SUPERVISE_DAEMON"); set -- ;;
+    esac
+    out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
+      FM_HOME="$home" FM_ROOT_OVERRIDE="$NORMAL_CWD" FM_STATE_OVERRIDE="$home/state" \
+      "$script" "$@" 2>&1)
+    rc=$?
+    expect_code 3 "$rc" "$name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "$name: env-marker refusal message"
+  done
+
+  for name in publish render list path open; do
+    script=$(guarded_script "$NORMAL_CWD" "$REPORT_STACK")
+    case "$name" in
+      publish) set -- publish task-x ;;
+      render) set -- render ;;
+      list) set -- list --json ;;
+      path) set -- path task-x ;;
+      open) set -- open task-x ;;
+    esac
+    out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
+      FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" "$@" 2>&1)
+    rc=$?
+    expect_code 3 "$rc" "report $name: NO_MISTAKES_GATE must refuse"
+    assert_contains "$out" "$ENV_MSG" "report $name: env-marker refusal message"
+  done
+
+  script=$(guarded_script "$GATE_WT" "$REPORT_STACK")
+  out=$(cd "$NORMAL_CWD" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+    FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" list --json 2>&1)
+  rc=$?
+  expect_code 3 "$rc" "report list: gate script checkout must refuse with marker unset"
+  assert_contains "$out" "$PATH_MSG" "report list: script-checkout backstop refusal message"
+
+  script=$(guarded_script "$NORMAL_CWD" "$REPORT_STACK")
+  out=$(cd "$GATE_WT" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+    FM_HOME="$home" FM_REPORT_STACK_ROOT="$stack" "$script" path task-x 2>&1)
+  rc=$?
+  expect_code 3 "$rc" "report path: gate caller checkout must refuse with marker unset"
+  assert_contains "$out" "$PATH_MSG" "report path: caller-checkout backstop refusal message"
+
+  assert_absent "$stack" "refused report commands created or recovered report-stack state"
+  assert_absent "$home/state/.watch.lock" "refused watcher created its singleton lock"
+  pass "every directly invocable control-plane mutator and report command refuses gate contexts"
+}
+
+# --- fm-task-file-append ----------------------------------------------------
+
+# run_task_append <cwd> <script-cwd> <home> <task> [ASSIGN...] -> combined output.
+# One line is piped on stdin and the script is run via node, the way the
+# fm-send/account-routing callers invoke it; a refused run must exit 3 before
+# reading stdin or touching data/<task>.
+run_task_append() {
+  local cwd=$1 script_cwd=$2 home=$3 task=$4; shift 4
+  ( cd "$cwd" && printf 'appended line\n' \
+      | env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS "$@" \
+        node "$(guarded_script "$script_cwd" "$TASK_FILE_APPEND")" \
+        "$home/data" "$task" trail.md '# Trail' ) 2>&1
+}
+
+test_task_file_append_refuses_and_admits() {
+  local home out rc
+  home="$TMP/task-append-home"
+  # Every task dir pre-exists, so a refused run is blocked ONLY by the gate
+  # refusal - without the guard these appends would succeed and exit 0.
+  mkdir -p "$home/data/append-envmark" "$home/data/append-script" \
+    "$home/data/append-caller" "$home/data/append-ok"
+
+  # env-marker refuse: neutral cwd, marker set; the trail must not be written.
+  out=$(run_task_append "$NORMAL_CWD" "$NORMAL_CWD" "$home" append-envmark NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "task append: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "task append: env-marker refusal message"
+  assert_absent "$home/data/append-envmark/trail.md" "task append: refused env-marker append must not write the trail"
+
+  # path-backstop refuse via the script checkout (marker UNSET).
+  out=$(run_task_append "$NORMAL_CWD" "$GATE_WT" "$home" append-script); rc=$?
+  expect_code 3 "$rc" "task append: gate script checkout must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "task append: script-checkout backstop refusal message"
+  assert_absent "$home/data/append-script/trail.md" "task append: script-backstop refused append must not write the trail"
+
+  # path-backstop refuse via the caller checkout (marker UNSET).
+  out=$(run_task_append "$GATE_WT" "$NORMAL_CWD" "$home" append-caller); rc=$?
+  expect_code 3 "$rc" "task append: gate caller checkout must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "task append: caller-checkout backstop refusal message"
+  assert_absent "$home/data/append-caller/trail.md" "task append: caller-backstop refused append must not write the trail"
+
+  # no-regression: a normal session still appends, with the first-write header.
+  out=$(run_task_append "$NORMAL_CWD" "$NORMAL_CWD" "$home" append-ok); rc=$?
+  expect_code 0 "$rc" "task append: a normal session must still append"
+  assert_not_contains "$out" "$ENV_MSG" "task append: normal append must not print the gate refusal"
+  assert_not_contains "$out" "$PATH_MSG" "task append: normal append must not print the backstop refusal"
+  assert_present "$home/data/append-ok/trail.md" "task append: normal append should create the trail file"
+  assert_grep '# Trail' "$home/data/append-ok/trail.md" "task append: normal append should write the first-write header"
+  assert_grep 'appended line' "$home/data/append-ok/trail.md" "task append: normal append should write the piped addition"
+  pass "fm-task-file-append: refuses on marker and gate-worktree backstop; a normal trail append is unaffected"
 }
 
 # --- tracked .no-mistakes.yaml ----------------------------------------------
@@ -391,8 +764,14 @@ test_no_mistakes_yaml_disables_project_settings() {
 test_helper_env_marker_refuses
 test_helper_empty_env_marker_refuses
 test_helper_path_backstop_refuses
+test_helper_caller_path_backstop_refuses
 test_helper_normal_is_noop
 test_spawn_refuses_and_admits
 test_send_refuses_and_admits
 test_teardown_refuses_and_admits
+test_merge_entrypoints_refuse_gate_contexts
+test_promote_refuses_gate_contexts
+test_primary_mutators_refuse_gate_contexts
+test_extended_mutating_entrypoints_refuse_gate_context
+test_task_file_append_refuses_and_admits
 test_no_mistakes_yaml_disables_project_settings

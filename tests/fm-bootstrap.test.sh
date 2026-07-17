@@ -37,7 +37,7 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
-  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi agent-fleet
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
@@ -691,9 +691,145 @@ empty array use is flagged^{"rules":[{"when":"big feature","use":[]}]}^exact^CRE
 array profile without harness is flagged^{"rules":[{"when":"big feature","use":[{"model":"gpt-5.5"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each use profile needs harness
 unknown select is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"mystery"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown select: mystery
 array profile unsupported effort is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","effort":"max"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
+quota-balanced account pools are accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+direct pinned account is accepted^{"rules":[{"when":"delicate task","use":{"harness":"codex","account_pool":"codex-crew","account_profile":"codex-2"}}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+email-like account pool is flagged^{"rules":[{"when":"anything","use":{"harness":"claude","account_pool":"me@example.com"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_pool
+non-string account profile is flagged^{"rules":[{"when":"anything","use":{"harness":"codex","account_profile":2}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_profile
+account pool on unsupported harness is flagged^{"rules":[{"when":"news","use":{"harness":"grok","account_pool":"grok-crew"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - account_pool requires claude or codex harness
+account profile on unsupported harness is flagged^{"rules":[{"when":"news","use":{"harness":"grok","account_profile":"grok-1"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - account_profile requires claude or codex harness
+mixed quota-balanced pool candidates are flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex"}],"select":"quota-balanced"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - quota-balanced account_pool candidates must all carry account_pool
+pinned quota-balanced candidate is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew","account_profile":"claude-2"},{"harness":"codex","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - quota-balanced candidates cannot carry account_profile
+profile-only quota-balanced candidate is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_profile":"claude-2"},{"harness":"codex"}],"select":"quota-balanced"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - quota-balanced candidates cannot carry account_profile
+invalid default account pool is flagged^{"default":{"harness":"claude","account_pool":"-claude"}}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid default account_pool
 ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
+
+test_account_routing_dependency_preflight() {
+  local case_dir fakebin out bash_env
+  case_dir="$TMP_ROOT/account-routing-enforce"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' enforce > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "enforce mode did not report manual Agent Fleet installation"
+  assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
+
+  case_dir="$TMP_ROOT/account-routing-dispatch"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' '{"rules":[{"when":"account-routed work","use":{"harness":"claude","account_pool":"claude-crew"}}]}' > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "account-routed dispatch profile did not report manual Agent Fleet installation"
+  assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
+
+  case_dir="$TMP_ROOT/account-routing-observe"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' observe > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
+  assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
+  pass "bootstrap reports dependencies only when configuration can enforce routing"
+}
+
+test_agent_fleet_install_requires_manual_release() {
+  local out rc
+  out=$("$ROOT/bin/fm-bootstrap.sh" install agent-fleet 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "bootstrap tried to auto-install private Agent Fleet"
+  assert_contains "$out" 'agent-fleet requires manual installation' "manual Agent Fleet install refusal was not actionable"
+  assert_contains "$out" 'docs/configuration.md#agent-fleet-account-routing' "manual Agent Fleet install refusal omitted its instructions"
+  pass "bootstrap keeps private Agent Fleet installation manual"
+}
+
+test_invalid_account_routing_policy_is_reported() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/account-routing-invalid"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf 'enforce\noff\n' > "$case_dir/home/config/account-routing-mode"
+  fakebin=$(make_fake_toolchain "$case_dir")
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'ACCOUNT_ROUTING: invalid routing policy - ' "multi-value routing policy was silent"
+  assert_contains "$out" 'must contain exactly one value' "multi-value routing diagnostic lost its cause"
+
+  rm -f "$case_dir/home/config/account-routing-mode"
+  mkdir "$case_dir/home/config/account-routing-mode"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'ACCOUNT_ROUTING: invalid routing policy - ' "unreadable routing policy was silent"
+  assert_contains "$out" 'cannot read' "unreadable routing diagnostic lost its cause"
+  pass "bootstrap surfaces invalid account-routing policy"
+}
+
+test_enforced_dispatch_validation_rejects_poolless_quota_rules() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/account-routing-enforced-dispatch"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' enforce > "$case_dir/home/config/account-routing-mode"
+  printf '%s\n' '{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"quota-balanced"}]}' \
+    > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'CREW_DISPATCH: invalid config/crew-dispatch.json - enforced quota-balanced candidates must all carry account_pool' \
+    "enforced poolless quota rule was accepted"
+  pass "bootstrap rejects poolless quota balancing under enforcement"
+}
+
+test_python3_is_required_for_descriptor_relative_artifact_reads() {
+  local case_dir fakebin bash_env out
+  case_dir="$TMP_ROOT/python3-required"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  bash_env="$case_dir/no-python3.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = python3 ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: python3 (install: brew install python  # or the platform' \
+    "bootstrap did not report the descriptor-relative reader dependency"
+  pass "bootstrap requires Python 3 for contained artifact traversal"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
+  test_python3_is_required_for_descriptor_relative_artifact_reads
+  exit 0
+fi
 
 test_bootstrap_reporting
 test_no_mistakes_min_version
@@ -713,3 +849,7 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
+test_account_routing_dependency_preflight
+test_agent_fleet_install_requires_manual_release
+test_invalid_account_routing_policy_is_reported
+test_enforced_dispatch_validation_rejects_poolless_quota_rules

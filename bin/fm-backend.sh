@@ -17,8 +17,10 @@
 # auto-detection (report.md's Open Question #2: start with a dedicated
 # background session for predictability, unlike tmux's/herdr's ambient-session
 # reuse); see report.md's "Zellij Backend" section and docs/zellij-backend.md
-# for its empirical basis. P4 makes Orca spawn-capable: Orca owns both the
-# task worktree and the terminal endpoint. P5 adds bin/backends/cmux.sh, also
+# for its empirical basis. P4 added Orca lifecycle support with Orca owning
+# both the task worktree and terminal endpoint; new report-required tasks now
+# refuse Orca, while eligible pre-cutover tasks may still respawn there.
+# P5 adds bin/backends/cmux.sh, also
 # EXPERIMENTAL and spawn-capable, behind `--backend cmux`/`FM_BACKEND=cmux`/
 # `config/backend`, and behind runtime auto-detection when firstmate itself is
 # running inside a cmux-spawned terminal (primary CMUX_WORKSPACE_ID marker, or
@@ -33,8 +35,9 @@
 # treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
 # `backend=tmux` for a default-backend task, so existing and newly spawned
 # default-path metas stay byte-identical. Only a task spawned on a non-tmux
-# spawn-capable backend, currently experimental herdr, zellij, orca, or cmux,
-# carries an explicit `backend=` line.
+# spawn-capable backend, currently experimental herdr, zellij, or cmux,
+# carries an explicit `backend=` line; an eligible legacy Orca respawn also
+# carries `backend=orca`.
 #
 # Event-source framing (herdr-addendum "Events as the core abstraction"): a
 # backend's supervision surface is conceptually an EVENT SOURCE - it produces
@@ -62,7 +65,8 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # but newer than tmux's long-proven default path. zellij is EXPERIMENTAL (P3;
 # data/fm-backend-design-d7/report.md "Zellij Backend") - verified against the
 # real 0.44.0 binary (docs/zellij-backend.md). orca is EXPERIMENTAL and
-# spawn-capable; unlike tmux/herdr/zellij it is also the worktree provider.
+# supports eligible pre-cutover respawns only; unlike tmux/herdr/zellij it is
+# also the worktree provider.
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
 # codex-app remains deliberately absent; see docs/codex-app-backend.md.
@@ -350,23 +354,31 @@ fm_backend_of_meta() {  # <meta-file>
 }
 
 fm_backend_target_of_meta() {  # <meta-file>
-  local meta=$1 backend terminal window
+  local meta=$1 backend terminal window tmux_window_id
   backend=$(fm_backend_of_meta "$meta")
   if [ "$backend" = orca ]; then
     terminal=$(fm_meta_get "$meta" terminal)
     [ -n "$terminal" ] && { printf '%s' "$terminal"; return 0; }
+  elif [ "$backend" = tmux ]; then
+    tmux_window_id=$(fm_meta_get "$meta" tmux_window_id)
+    [ -n "$tmux_window_id" ] && { printf '%s' "$tmux_window_id"; return 0; }
   fi
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] && printf '%s' "$window"
+  return 0
 }
 
 fm_backend_meta_for_window() {  # <target> <state-dir>
-  local target=$1 state=$2 meta window terminal
+  local target=$1 state=$2 meta window terminal tmux_window_id
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     window=$(fm_meta_get "$meta" window)
     terminal=$(fm_meta_get "$meta" terminal)
-    { [ -n "$window" ] && [ "$window" = "$target" ]; } || { [ -n "$terminal" ] && [ "$terminal" = "$target" ]; } || continue
+    tmux_window_id=$(fm_meta_get "$meta" tmux_window_id)
+    { [ -n "$window" ] && [ "$window" = "$target" ]; } \
+      || { [ -n "$terminal" ] && [ "$terminal" = "$target" ]; } \
+      || { [ -n "$tmux_window_id" ] && [ "$tmux_window_id" = "$target" ]; } \
+      || continue
     printf '%s' "$meta"
     return 0
   done
@@ -518,7 +530,7 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # changing call sites.
 
 # fm_backend_capture: bounded plain-text session capture.
-fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
+fm_backend_capture() {  # <backend> <target> <lines> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -533,7 +545,7 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
 }
 
 # fm_backend_send_key: one backend-supported named special key.
-fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
+fm_backend_send_key() {  # <backend> <target> <key> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -550,7 +562,7 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
 # fm_backend_send_text_submit: type text once, then submit and verify,
 # retrying only the submission (never retyping). Echoes the verdict
 # (empty|pending|unknown|send-failed for submit-verifying adapters).
-fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
@@ -608,7 +620,7 @@ fm_backend_worktree_path() {  # <backend> <worktree-id>
 # uses unknown as the cue for its pane-hash + FM_BUSY_REGEX detection, while
 # fm-crew-state.sh also corroborates native idle verdicts before treating a
 # no-run crew as not busy.
-fm_backend_busy_state() {  # <backend> <target>
+fm_backend_busy_state() {  # <backend> <target> [expected-label]
   local backend=$1
   shift
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
@@ -655,17 +667,22 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
 # primitive so callers that only need a fast alive/dead read (recovery
 # digests, the session-start fleet digest) do not re-derive it inline.
-fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane
+fm_backend_target_exists() {  # <backend> <target> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} probe_target session pane
   case "$backend" in
     tmux)
-      tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
+      fm_backend_source tmux || return 1
+      fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target" || return 1
+      probe_target=$target
+      case "$target" in @*) [ -z "$recorded_scoped_target" ] || probe_target=$recorded_scoped_target ;; esac
+      tmux display-message -p -t "$probe_target" '#{pane_id}' >/dev/null 2>&1
       ;;
     herdr)
       fm_backend_source herdr || return 1
       session=${target%%:*}
       pane=${target#*:}
       [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
+      fm_backend_herdr_expected_label_matches "$target" "$expected_label" || return 1
       # fm_backend_herdr_cli (not a raw HERDR_SESSION-only call): verified
       # empirically (docs/herdr-backend.md "Session targeting") that the bare
       # env var alone is NOT reliably honored once another herdr server is
@@ -694,6 +711,274 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
   esac
 }
 
+fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
+  local backend=$1 kind=$2 owner_home=$3 secondmate_home=${4:-}
+  if [ "$backend" = herdr ] && [ "$kind" = secondmate ] && [ -n "$secondmate_home" ]; then
+    printf '%s' "$secondmate_home"
+  else
+    printf '%s' "$owner_home"
+  fi
+}
+
+# fm_backend_target_state: managed-lifecycle existence check. Prints exactly
+# present, absent, or unknown. Callers may release an external lease only on
+# absent; a control-plane or parse failure is always unknown.
+fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
+  local tmux_identity
+  local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
+  session=
+  [ -n "$target" ] || { printf 'unknown'; return 0; }
+  if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then
+    printf 'present'
+    return 0
+  fi
+  fm_backend_source "$backend" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  case "$backend" in
+    tmux)
+      if [ -n "$recorded_scoped_target" ]; then
+        case "$recorded_scoped_target" in
+          *:*) session=${recorded_scoped_target%%:*} ;;
+          *) printf 'unknown'; return 0 ;;
+        esac
+      fi
+      case "$target" in
+        *:*) [ -n "$session" ] || session=${target%%:*} ;;
+        *) [ -n "$session" ] || { printf 'unknown'; return 0; } ;;
+      esac
+      [ -n "$session" ] || { printf 'unknown'; return 0; }
+      if windows=$(tmux list-windows -t "$session" -F '#{window_name}' 2>&1); then
+        if [ -n "$expected_label" ]; then
+          count=$(printf '%s\n' "$windows" | awk -v want="$expected_label" '$0 == want { count += 1 } END { print count + 0 }')
+          case "$count" in
+            0)
+              tmux_identity=
+              case "$target" in
+                @*) tmux_identity=$(tmux display-message -p -t "$target" $'#{session_name}\t#{window_name}' 2>/dev/null || true) ;;
+              esac
+              if [ -n "$tmux_identity" ]; then
+                printf 'unknown'
+              else
+                printf 'absent'
+              fi
+              ;;
+            1) printf 'present' ;;
+            *) printf 'unknown' ;;
+          esac
+        else
+          printf 'absent'
+        fi
+      else
+        case "$windows" in
+          *'no server running on '*|*'failed to connect to server: No such file or directory'*|*'can'\''t find session:'*)
+            tmux_identity=
+            case "$target" in
+              @*) tmux_identity=$(tmux display-message -p -t "$target" $'#{session_name}\t#{window_name}' 2>/dev/null || true) ;;
+            esac
+            if [ -n "$tmux_identity" ]; then
+              printf 'unknown'
+            else
+              printf 'absent'
+            fi
+            ;;
+          *) printf 'unknown' ;;
+        esac
+      fi
+      ;;
+    herdr)
+      session=${target%%:*}
+      pane=${target#*:}
+      if [ -z "$session" ] || [ -z "$pane" ] || [ "$pane" = "$target" ]; then
+        printf 'unknown'
+        return 0
+      fi
+      if ! sessions=$(herdr session list --json 2>/dev/null) \
+        || ! printf '%s\n' "$sessions" | jq -e '
+          (.sessions | type) == "array"
+          and all(.sessions[];
+            type == "object"
+            and (.name | type) == "string"
+            and (.name | length) > 0
+            and (.running | type) == "boolean")
+        ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      if ! printf '%s\n' "$sessions" | jq -e --arg session "$session" \
+        'any(.sessions[]?; .name == $session and .running == true)' >/dev/null 2>&1; then
+        printf 'absent'
+        return 0
+      fi
+      identity=$(fm_backend_herdr_identity_state "$target" "$expected_label")
+      case "$identity" in
+        match) printf 'present' ;;
+        absent) printf 'absent' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+    zellij)
+      fm_backend_zellij_parse_target "$target" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      session=$FM_BACKEND_ZELLIJ_SESSION
+      pane=$FM_BACKEND_ZELLIJ_PANE
+      if ! sessions=$(zellij list-sessions --short --no-formatting 2>/dev/null); then
+        printf 'unknown'
+        return 0
+      fi
+      if ! printf '%s\n' "$sessions" | grep -qxF "$session"; then
+        printf 'absent'
+        return 0
+      fi
+      if ! panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) \
+        || ! printf '%s\n' "$panes" | jq -e '
+          type == "array"
+          and all(.[];
+            type == "object"
+            and has("id")
+            and .id != null
+            and (.is_plugin | type) == "boolean"
+            and (.is_plugin or (has("tab_id") and .tab_id != null)))
+        ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$pane" \
+        '[.[] | select((.id | tostring) == $pane and .is_plugin == false)] | first // null' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if [ -z "$expected_label" ]; then
+        if [ "$pane_record" = null ]; then printf 'absent'; else printf 'present'; fi
+        return 0
+      fi
+      if ! tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
+        || ! printf '%s\n' "$tabs" | jq -e '
+          type == "array"
+          and all(.[];
+            type == "object"
+            and has("tab_id")
+            and .tab_id != null
+            and (.name | type) == "string")
+        ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      scoped=$(fm_backend_zellij_scoped_title "$expected_label")
+      scoped_count=$(printf '%s\n' "$tabs" | jq -r --arg want "$scoped" \
+        '[.[]? | select(.name == $want)] | length' 2>/dev/null) || { printf 'unknown'; return 0; }
+      case "$scoped_count" in
+        1)
+          expected_tab_id=$(printf '%s\n' "$tabs" | jq -r --arg want "$scoped" \
+            '[.[]? | select(.name == $want)] | first | .tab_id | tostring' 2>/dev/null) \
+            || { printf 'unknown'; return 0; }
+          ;;
+        0)
+          count=$(printf '%s\n' "$tabs" | jq -r --arg want "$expected_label" \
+            '[.[]? | select(.name == $want)] | length' 2>/dev/null) || { printf 'unknown'; return 0; }
+          case "$count" in
+            1)
+              expected_tab_id=$(printf '%s\n' "$tabs" | jq -r --arg want "$expected_label" \
+                '[.[]? | select(.name == $want)] | first | .tab_id | tostring' 2>/dev/null) \
+                || { printf 'unknown'; return 0; }
+              ;;
+            0) expected_tab_id= ;;
+            *) printf 'unknown'; return 0 ;;
+          esac
+          ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      if [ "$pane_record" = null ]; then
+        if [ -n "$expected_tab_id" ] && printf '%s\n' "$panes" | jq -e --arg tab "$expected_tab_id" \
+          'any(.[]?; .is_plugin == false and (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
+          printf 'present'
+        else
+          printf 'absent'
+        fi
+        return 0
+      fi
+      tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id | tostring' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if [ -n "$expected_tab_id" ] && [ "$tab_id" = "$expected_tab_id" ]; then
+        printf 'present'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    cmux)
+      fm_backend_cmux_parse_target "$target" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      workspace=$FM_BACKEND_CMUX_WORKSPACE
+      surface=$FM_BACKEND_CMUX_SURFACE
+      if ! workspaces=$(fm_backend_cmux_all_workspaces 2>/dev/null) \
+        || ! printf '%s\n' "$workspaces" | jq -e '
+          (.workspaces | type) == "array"
+          and all(.workspaces[];
+            type == "object"
+            and (.id | type) == "string"
+            and (.id | length) > 0
+            and (.title | type) == "string")
+        ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      resolved_workspace=$workspace
+      workspace_record=$(printf '%s\n' "$workspaces" | jq -cr --arg id "$workspace" \
+        '[.workspaces[] | select(.id == $id)] | first // null' 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if [ -n "$expected_label" ]; then
+        expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
+        title_count=$(printf '%s\n' "$workspaces" | jq -r --arg want "$expected_title" \
+          '[.workspaces[] | select(.title == $want)] | length' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+        case "$title_count" in
+          0)
+            if [ "$workspace_record" = null ]; then printf 'absent'; else printf 'unknown'; fi
+            return 0
+            ;;
+          1) ;;
+          *) printf 'unknown'; return 0 ;;
+        esac
+        title_record=$(printf '%s\n' "$workspaces" | jq -cr --arg want "$expected_title" \
+          '[.workspaces[] | select(.title == $want)] | first' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+        resolved_workspace=$(printf '%s\n' "$title_record" | jq -r '.id' 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+        if [ "$workspace_record" != null ] && [ "$resolved_workspace" != "$workspace" ]; then
+          printf 'unknown'
+          return 0
+        fi
+      elif [ "$workspace_record" = null ]; then
+        printf 'absent'
+        return 0
+      fi
+      if ! panes=$(fm_backend_cmux_cli list-panes --workspace "$resolved_workspace" --json --id-format uuids 2>/dev/null) \
+        || ! printf '%s\n' "$panes" | jq -e '
+          (.panes | type) == "array"
+          and all(.panes[];
+            type == "object"
+            and (.surface_ids | type) == "array"
+            and all(.surface_ids[]; type == "string" and length > 0))
+        ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      if [ "$resolved_workspace" != "$workspace" ]; then
+        if printf '%s\n' "$panes" | jq -e 'any(.panes[]; (.surface_ids | length) > 0)' >/dev/null 2>&1; then
+          printf 'present'
+        else
+          printf 'absent'
+        fi
+      elif printf '%s\n' "$panes" | jq -e --arg surface "$surface" \
+        'any(.panes[]; .surface_ids | index($surface))' >/dev/null 2>&1; then
+        printf 'present'
+      elif printf '%s\n' "$panes" | jq -e 'any(.panes[]; (.surface_ids | length) > 0)' >/dev/null 2>&1; then
+        printf 'present'
+      else
+        printf 'absent'
+      fi
+      ;;
+    *)
+      printf 'unknown'
+      ;;
+  esac
+}
+
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS
 # under <target>, distinct from fm_backend_target_exists's pane-PRESENCE-only
 # check above. A secondmate agent that has exited leaves its backend endpoint
@@ -715,12 +1000,12 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # an action from it alone - the secondmate-liveness sweep gates a respawn on
 # `dead` only, precisely so a momentary read glitch can never duplicate a
 # live supervisor.
-fm_backend_agent_alive() {  # <backend> <target>
-  local backend=$1 target=$2
+fm_backend_agent_alive() {  # <backend> <target> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=$2 expected_label=${3:-}
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
-    tmux) fm_backend_tmux_agent_alive "$target" ;;
-    herdr) fm_backend_herdr_agent_alive "$target" ;;
+    tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" "${4:-}" ;;
+    herdr) fm_backend_herdr_agent_alive "$target" "$expected_label" ;;
     *) printf 'unknown' ;;
   esac
 }

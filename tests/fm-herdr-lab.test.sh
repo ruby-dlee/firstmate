@@ -28,18 +28,21 @@ done
 [ "${previous:-}" = --session ] || { echo "fake herdr: missing trailing --session" >&2; exit 90; }
 session=$last
 default_socket=$(cat "$state/default-socket")
+default_running=${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}
 lab_state=absent
 [ ! -f "$state/$session" ] || lab_state=$(cat "$state/$session")
 
 case "$1 ${2:-}" in
   "session list")
     if [ "$lab_state" = absent ] || [ "$lab_state" = deleted ]; then
-      jq -nc --arg socket "$default_socket" '{sessions:[{default:true,name:"default",running:true,socket_path:$socket}]}'
+      jq -nc --arg socket "$default_socket" --argjson default_running "$default_running" \
+        '{sessions:[{default:true,name:"default",running:$default_running,socket_path:$socket}]}'
     else
       running=false
       [ "$lab_state" = running ] && running=true
       jq -nc --arg socket "$default_socket" --arg name "$session" --argjson running "$running" \
-        '{sessions:[{default:true,name:"default",running:true,socket_path:$socket},{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]}'
+        --argjson default_running "$default_running" \
+        '{sessions:[{default:true,name:"default",running:$default_running,socket_path:$socket},{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]}'
     fi
     ;;
   "server --session")
@@ -82,6 +85,7 @@ run_with_fake() {
     FM_FAKE_HERDR_SERVER_DELAY="${FM_FAKE_HERDR_SERVER_DELAY:-0}" \
     FM_FAKE_HERDR_FAST_POLL="${FM_FAKE_HERDR_FAST_POLL:-}" \
     FM_FAKE_HERDR_DELETE_FAIL="${FM_FAKE_HERDR_DELETE_FAIL:-}" \
+    FM_FAKE_HERDR_DEFAULT_RUNNING="${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}" \
     FM_HERDR_LAB_STATE_DIR="$TRIPWIRES" \
     "$@"
 }
@@ -178,6 +182,53 @@ test_changed_default_trips_after_teardown() {
   pass "fm-herdr-lab: changed default fleet state is a hard failure"
 }
 
+test_stopped_default_refuses_provision() {
+  local name="fm-lab-stopped-default-$$" status=0
+  : > "$FAKE_LOG"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a stopped default session must refuse provisioning"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "refused provisioning still recorded a fleet-state tripwire"
+  assert_absent "$FAKE_STATE/$name" "refused provisioning still launched the lab session"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "provision with a running default session failed"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown after the running-default provision failed"
+  pass "fm-herdr-lab: provisioning requires a proven-running default session"
+}
+
+test_malformed_default_running_refuses_provision() {
+  local name="fm-lab-malformed-default-$$" status=0
+  : > "$FAKE_LOG"
+  FM_FAKE_HERDR_DEFAULT_RUNNING='"true"' run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a string-valued default running state must refuse provisioning"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "malformed running state still recorded a fleet-state tripwire"
+  assert_absent "$FAKE_STATE/$name" "malformed running state still launched the lab session"
+  if grep -F "server --session" "$FAKE_LOG" >/dev/null; then
+    fail "malformed running state reached the lab server launch"
+  fi
+  pass "fm-herdr-lab: default running proof requires the JSON Boolean true"
+}
+
+test_stopped_default_blocks_destructive_boundaries() {
+  local name="fm-lab-default-stops-$$" status=0
+  : > "$FAKE_LOG"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "running-default fixture provision failed"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_cli "$name" workspace close main >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a mutating run command with a stopped default session must refuse"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_cli "$name" workspace list >/dev/null \
+    || fail "a read-only run command was blocked by the stopped default session"
+  status=0
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_stop "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "guarded stop with a stopped default session must refuse"
+  [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "refused stop still reached the lab session"
+  status=0
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "teardown with a stopped default session must refuse"
+  [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "refused teardown still reached the lab session"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "refused teardown removed the ownership tripwire"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown after the default session resumed failed"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "teardown after resume left its tripwire behind"
+  pass "fm-herdr-lab: destructive lab boundaries re-prove the running default session"
+}
+
 test_stopped_owned_lab_can_reprovision() {
   local name="fm-lab-reprovision-$$"
   : > "$FAKE_LOG"
@@ -235,6 +286,9 @@ test_refuses_unsafe_names
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown
+test_stopped_default_refuses_provision
+test_malformed_default_running_refuses_provision
+test_stopped_default_blocks_destructive_boundaries
 test_stopped_owned_lab_can_reprovision
 test_failed_delete_retains_tripwire
 test_timed_out_provision_cancels_late_launch

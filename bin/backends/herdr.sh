@@ -97,8 +97,8 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # that home. fm-spawn.sh briefly shadows FM_HOME to a secondmate's own home
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
-fm_backend_herdr_workspace_label() {
-  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
+fm_backend_herdr_workspace_label_for_home() {  # <home>
+  local marker="$1/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
   if [ -f "$marker" ]; then
     id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
@@ -107,6 +107,10 @@ fm_backend_herdr_workspace_label() {
     fi
   fi
   printf 'firstmate'
+}
+
+fm_backend_herdr_workspace_label() {
+  fm_backend_herdr_workspace_label_for_home "$FM_HOME"
 }
 
 # fm_backend_herdr_cli: run `herdr <args...>` scoped to <session>, setting
@@ -440,9 +444,17 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # maps to `alive`; `unknown` stays `unknown` - fail-safe toward refusal,
 # exactly like the husk check itself. Callers must never treat `unknown` as a
 # confirmed-dead signal.
-fm_backend_herdr_agent_alive() {  # <target>
-  local target=$1
+fm_backend_herdr_agent_alive() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-} identity_state
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  if [ -n "$expected_label" ]; then
+    identity_state=$(fm_backend_herdr_identity_state "$target" "$expected_label")
+    case "$identity_state" in
+      absent) printf 'dead'; return 0 ;;
+      match) ;;
+      *) printf 'unknown'; return 0 ;;
+    esac
+  fi
   case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
     dead|no-agent) printf 'dead' ;;
     live) printf 'alive' ;;
@@ -533,17 +545,24 @@ $dup_tab_ids
 EOF
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
       echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     }
     if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     fi
     remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
-      '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null)
+      '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null) || {
+      echo "error: could not parse herdr husk-removal verification listing for tab '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
+      return 1
+    }
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     fi
   fi
@@ -560,9 +579,229 @@ fm_backend_herdr_parse_target() {  # <target>
   [ -n "$FM_BACKEND_HERDR_SESSION" ] && [ -n "$FM_BACKEND_HERDR_PANE" ] && [ "$FM_BACKEND_HERDR_PANE" != "$target" ]
 }
 
-fm_backend_herdr_target_ready() {  # <target>
+fm_backend_herdr_identity_pack() {  # <label> <workspace-id> <workspace-label> [tab-id]
+  local label=$1 workspace=$2 workspace_label=$3 tab=${4:-}
+  case "$label$workspace$workspace_label$tab" in *'|'*|*$'\t'*|*$'\n'*) return 1 ;; esac
+  [ -n "$label" ] && [ -n "$workspace" ] && [ -n "$workspace_label" ] || return 1
+  printf '%s|%s|%s|%s' "$label" "$workspace" "$workspace_label" "$tab"
+}
+
+fm_backend_herdr_identity_parse() {  # <packed-identity>
+  local packed=$1 rest
+  case "$packed" in *'|'*'|'*'|'*) ;; *) return 1 ;; esac
+  FM_BACKEND_HERDR_EXPECTED_LABEL=${packed%%|*}
+  rest=${packed#*|}
+  FM_BACKEND_HERDR_EXPECTED_WORKSPACE=${rest%%|*}
+  rest=${rest#*|}
+  FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL=${rest%%|*}
+  FM_BACKEND_HERDR_EXPECTED_TAB=${rest#*|}
+  case "$FM_BACKEND_HERDR_EXPECTED_TAB" in *'|'*) return 1 ;; esac
+  [ -n "$FM_BACKEND_HERDR_EXPECTED_LABEL" ] \
+    && [ -n "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" ] \
+    && [ -n "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" ]
+}
+
+fm_backend_herdr_identity_from_meta() {  # <target> <expected-label>
+  local target=$1 expected_label=$2 state meta id target_of_meta workspace tab kind endpoint_home workspace_label marker_id
+  command -v fm_meta_get >/dev/null 2>&1 || return 1
+  command -v fm_backend_of_meta >/dev/null 2>&1 || return 1
+  command -v fm_backend_target_of_meta >/dev/null 2>&1 || return 1
+  state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+  for meta in "$state"/*.meta; do
+    [ -f "$meta" ] || continue
+    [ "$(fm_backend_of_meta "$meta")" = herdr ] || continue
+    target_of_meta=$(fm_backend_target_of_meta "$meta")
+    [ "$target_of_meta" = "$target" ] || continue
+    id=${meta##*/}
+    id=${id%.meta}
+    [ "$expected_label" = "fm-$id" ] || continue
+    workspace=$(fm_meta_get "$meta" herdr_workspace_id)
+    tab=$(fm_meta_get "$meta" herdr_tab_id)
+    [ -n "$workspace" ] || return 1
+    kind=$(fm_meta_get "$meta" kind)
+    endpoint_home=$FM_HOME
+    if [ "$kind" = secondmate ]; then
+      endpoint_home=$(fm_meta_get "$meta" home)
+      [ -n "$endpoint_home" ] || return 1
+      marker_id=$(tr -d '[:space:]' < "$endpoint_home/$FM_BACKEND_HERDR_SECONDMATE_MARKER" 2>/dev/null) || return 1
+      [ "$marker_id" = "$id" ] || return 1
+    fi
+    workspace_label=$(fm_backend_herdr_workspace_label_for_home "$endpoint_home")
+    fm_backend_herdr_identity_pack "$expected_label" "$workspace" "$workspace_label" "$tab"
+    return
+  done
+  return 1
+}
+
+fm_backend_herdr_expected_identity() {  # <target> <expected-label-or-identity>
+  local target=$1 expected=${2:-} workspace workspace_label
+  [ -n "$expected" ] || return 1
+  if fm_backend_herdr_identity_parse "$expected"; then
+    printf '%s' "$expected"
+    return 0
+  fi
+  if fm_backend_herdr_identity_from_meta "$target" "$expected"; then
+    return 0
+  fi
+  workspace=$(fm_backend_herdr_workspace_find "$FM_BACKEND_HERDR_SESSION") || return 1
+  [ -n "$workspace" ] || return 1
+  workspace_label=$(fm_backend_herdr_workspace_label)
+  fm_backend_herdr_identity_pack "$expected" "$workspace" "$workspace_label"
+}
+
+fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
+  local target=$1 expected=${2:-} identity panes pane_record tabs tab_id workspaces labeled_workspaces labeled_workspace
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  if [ -n "$expected" ]; then
+    identity=$(fm_backend_herdr_expected_identity "$target" "$expected") \
+      || { printf 'unknown'; return 0; }
+    fm_backend_herdr_identity_parse "$identity" || { printf 'unknown'; return 0; }
+  fi
+  panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$panes" | jq -e '
+    (.result.panes | type) == "array"
+    and all(.result.panes[];
+      type == "object"
+      and (.pane_id | type) == "string"
+      and (.pane_id | length) > 0
+      and (.tab_id | type) == "string"
+      and (.tab_id | length) > 0)
+  ' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$FM_BACKEND_HERDR_PANE" \
+    '[.result.panes[] | select(.pane_id == $pane)] | first // null' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if [ -z "$expected" ]; then
+    if [ "$pane_record" = null ]; then printf 'absent'; else printf 'match'; fi
+    return 0
+  fi
+  workspaces=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" workspace list 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$workspaces" | jq -e '
+    (.result.workspaces | type) == "array"
+    and all(.result.workspaces[];
+      type == "object"
+      and (.workspace_id | type) == "string"
+      and (.workspace_id | length) > 0
+      and (.label | type) == "string")
+  ' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if ! printf '%s\n' "$workspaces" | jq -e \
+    --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+    --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
+    'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace and .label == $want_label)' >/dev/null 2>&1; then
+    # The recorded workspace-id+label pair is gone (killing a workspace's last
+    # tab auto-deletes the workspace, so this IS the normal shape of a
+    # torn-down task). Absence still needs three independent proofs: the
+    # recorded pane is gone, the recorded workspace id no longer exists under
+    # ANY label (a recycled or relabeled id is a collision, not absence), and
+    # no workspace still carrying the expected home label holds the expected
+    # fm-<task> tab (a replacement generation). Anything short of all three -
+    # including any CLI or parse failure below - stays mismatch/unknown so
+    # callers fail closed instead of releasing a live target's lease.
+    if [ "$pane_record" != null ]; then printf 'mismatch'; return 0; fi
+    if printf '%s\n' "$workspaces" | jq -e \
+      --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+      'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace)' >/dev/null 2>&1; then
+      printf 'mismatch'
+      return 0
+    fi
+    labeled_workspaces=$(printf '%s\n' "$workspaces" | jq -r \
+      --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
+      '.result.workspaces[]? | select(.label == $want_label) | .workspace_id' 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    while IFS= read -r labeled_workspace; do
+      [ -n "$labeled_workspace" ] || continue
+      tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$labeled_workspace" 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if ! printf '%s\n' "$tabs" | jq -e '
+        (.result.tabs | type) == "array"
+        and all(.result.tabs[];
+          type == "object"
+          and (.tab_id | type) == "string"
+          and (.tab_id | length) > 0
+          and (.workspace_id | type) == "string"
+          and (.workspace_id | length) > 0
+          and (.label | type) == "string")
+      ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      if printf '%s\n' "$tabs" | jq -e \
+        --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+        'any(.result.tabs[]?; .label == $want_label)' >/dev/null 2>&1; then
+        printf 'mismatch'
+        return 0
+      fi
+    done <<EOF
+$labeled_workspaces
+EOF
+    printf 'absent'
+    return 0
+  fi
+  tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if ! printf '%s\n' "$tabs" | jq -e '
+    (.result.tabs | type) == "array"
+    and all(.result.tabs[];
+      type == "object"
+      and (.tab_id | type) == "string"
+      and (.tab_id | length) > 0
+      and (.workspace_id | type) == "string"
+      and (.workspace_id | length) > 0
+      and (.label | type) == "string")
+  ' >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if [ "$pane_record" = null ]; then
+    if printf '%s\n' "$tabs" | jq -e \
+      --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+      --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+      'any(.result.tabs[]?;
+        (.workspace_id | tostring) == $workspace
+        and .label == $want_label)' >/dev/null 2>&1; then
+      printf 'unknown'
+    else
+      printf 'absent'
+    fi
+    return 0
+  fi
+  tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if printf '%s\n' "$tabs" | jq -e \
+    --arg tab "$tab_id" \
+    --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \
+    --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+    --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+    'any(.result.tabs[]?;
+      (.tab_id | tostring) == $tab
+      and ($recorded_tab == "" or (.tab_id | tostring) == $recorded_tab)
+      and (.workspace_id | tostring) == $workspace
+      and .label == $want_label)' >/dev/null 2>&1; then
+    printf 'match'
+  elif printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" \
+    'any(.result.tabs[]?; (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
+    printf 'mismatch'
+  else
+    printf 'unknown'
+  fi
+}
+
+fm_backend_herdr_expected_label_matches() {  # <target> [expected-label]
+  [ -n "${2:-}" ] || return 0
+  [ "$(fm_backend_herdr_identity_state "$1" "${2:-}")" = match ]
+}
+
+fm_backend_herdr_target_ready() {  # <target> [expected-label]
   fm_backend_herdr_parse_target "$1" || return 1
   fm_backend_herdr_server_ensure "$FM_BACKEND_HERDR_SESSION" || return 1
+  fm_backend_herdr_expected_label_matches "$1" "${2:-}" || return 1
 }
 
 # fm_backend_herdr_current_path: the live FOREGROUND process's cwd, or empty on
@@ -596,8 +835,8 @@ fm_backend_herdr_send_text_line() {  # <target> <text>
 # caller sends Enter separately. Mirrors tmux's `send-keys -t T -l text`.
 # Verified: `pane send-text` does NOT auto-submit (contrary to the addendum's
 # original guess); it behaves exactly like tmux's `-l` literal send.
-fm_backend_herdr_send_literal() {  # <target> <text>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_send_literal() {  # <target> <text> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
@@ -617,8 +856,8 @@ fm_backend_herdr_normalize_key() {  # <key>
 
 # fm_backend_herdr_send_key: one named special key. Mirrors fm-send.sh's --key
 # path (tmux's `send-keys -t T key`).
-fm_backend_herdr_send_key() {  # <target> <key>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_send_key() {  # <target> <key> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   local key
   key=$(fm_backend_herdr_normalize_key "$2")
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-keys "$FM_BACKEND_HERDR_PANE" "$key" >/dev/null 2>&1
@@ -637,8 +876,8 @@ fm_backend_herdr_send_key() {  # <target> <key>
 # the composer-state guard/fallback reads around submit and injection). Workaround:
 # always request a generous fetch far above any realistic viewport height, then
 # trim to the caller's requested bound ourselves with `tail`.
-fm_backend_herdr_capture() {  # <target> <lines>
-  fm_backend_herdr_target_ready "$1" || return 1
+fm_backend_herdr_capture() {  # <target> <lines> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
   local lines=${2:-200} fetch out
   case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
   fetch=$lines
@@ -848,16 +1087,17 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 # already branches on for tmux ("empty" means "confirmed submitted" for every
 # backend; how each backend confirms it is an internal decision - herdr's is
 # no longer literally "the composer read empty").
-fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
+fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} i=0 verdict baseline confirm_sleep
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
-  fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
+  fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'send-failed'; return 0; }
+  fm_backend_herdr_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
   sleep "$settle"
   baseline=$(fm_backend_herdr_classify_submit_agent_status \
     "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   while :; do
-    fm_backend_herdr_send_key "$target" Enter || true
+    fm_backend_herdr_send_key "$target" Enter "$expected_label" || true
     if [ "$baseline" = idle ]; then
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
@@ -878,8 +1118,11 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors
 # tmux-kill-window's `|| true` contract). Verified: closing a tab's only pane
 # closes the tab too, so a separate tab close is unnecessary.
-fm_backend_herdr_kill() {  # <target>
-  fm_backend_herdr_target_ready "$1" || return 0
+fm_backend_herdr_kill() {  # <target> [backend-id] [expected-label]
+  if ! fm_backend_herdr_target_ready "$1" "${3:-}"; then
+    [ -z "${3:-}" ] && return 0
+    return 1
+  fi
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
 }
 
@@ -927,8 +1170,8 @@ fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
 # gets real semantics" per the design report. See
 # fm_backend_herdr_classify_agent_status for the status->busy/idle/unknown
 # mapping.
-fm_backend_herdr_busy_state() {  # <target>
-  fm_backend_herdr_target_ready "$1" || { printf 'unknown'; return 0; }
+fm_backend_herdr_busy_state() {  # <target> [expected-label]
+  fm_backend_herdr_target_ready "$1" "${2:-}" || { printf 'unknown'; return 0; }
   fm_backend_herdr_classify_agent_status \
     "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")"
 }

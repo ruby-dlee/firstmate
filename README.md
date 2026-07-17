@@ -42,11 +42,13 @@ Launching a supported harness inside it instantiates your first mate - and makes
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
-- **A visible crew** - every crewmate works in its own tmux window, experimental herdr/zellij tab, cmux workspace, or Orca terminal you can watch or type into; the first mate reconciles.
-- **Disposable worktrees** - each task runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, or an Orca-managed worktree when `backend=orca`, so parallel work on one repo never collides.
+- **A visible crew** - every new crewmate works in its own tmux window, experimental herdr/zellij tab, or cmux workspace you can watch or type into; the first mate reconciles.
+- **Disposable worktrees** - each new ship or scout task runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, so parallel work on one repo never collides.
 - **Two task shapes** - ship tasks deliver a change; scout tasks investigate, plan, reproduce, or audit and leave a report.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
 - **Optional secondmates** - opt in to persistent domain supervisors that run from isolated firstmate homes with their own `FM_HOME`, state, projects, and session lock, supervising project clones or a project-less firstmate-repo domain, kept on the primary firstmate version by guarded local fast-forwards and checked for live agent processes at session start.
+- **Optional multi-account routing** - route Claude and Codex crews through explicit or pooled Agent Fleet profiles while preserving sticky recovery and provider-neutral continuation.
+- **Durable completion reports** - every new ship and scout task publishes a detailed, visual, searchable report to one machine-global stack through fail-closed teardown.
 - **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; verified primary harnesses also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post up to three public-safe completion follow-ups within seven days for genuine milestones and the final outcome without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
 - **Guarded by construction** - the first mate is read-only over your projects outside guarded clone refreshes, safe branch pruning, and approved `local-only` fast-forward merges; crewmates make every project change behind your merge approval.
@@ -59,10 +61,11 @@ Full detail on every feature lives in [docs/architecture.md](docs/architecture.m
 ### Requirements
 
 - A verified agent harness: Claude Code, Grok, Pi, Codex, or OpenCode.
+- Node.js and Python 3.
 - Git and the GitHub CLI, authenticated through `gh auth login`.
 - tmux, for the reference session backend.
 
-The first mate detects and offers to install everything else.
+The first mate detects missing dependencies, offers supported installs after consent, and prints instructions for manual-only tools.
 
 ### Recommended harnesses
 
@@ -122,7 +125,7 @@ For Pi, approve the project trust prompt once per clone on first launch so both 
 
 ### More backends
 
-Setup guides for tmux (the default) and every other supported backend (herdr, zellij, Orca, cmux) are linked in [Documentation](#documentation) below.
+Setup guides for tmux (the default) and the new-task-capable herdr, zellij, and cmux backends are linked below; the Orca guide documents its legacy recovery-only path.
 
 ## How It Works
 
@@ -138,23 +141,26 @@ Setup guides for tmux (the default) and every other supported backend (herdr, ze
     │ backend sends / status files │
     ▼              ▼               ▼
  ┌────────┐   ┌────────┐      ┌────────┐
- │fm-task1│   │fm-task2│  ... │fm-taskN│   tmux windows, herdr/zellij tabs, cmux workspaces, or Orca terminals
+ │fm-task1│   │fm-task2│  ... │fm-taskN│   tmux windows, herdr/zellij tabs, or cmux workspaces
  │crewmate│   │crewmate│      │crewmate│   one autonomous agent each
  └───┬────┘   └───┬────┘      └───┬────┘
      ▼            ▼               ▼
-  treehouse worktree, Orca worktree, or isolated secondmate home
+  treehouse worktree or isolated secondmate home
      │
-     ├─ ship: project mode ► PR/local merge ► teardown
+     ├─ ship: completion.md + project mode ► PR/local merge ► teardown
      │
-     └─ scout: report at data/<id>/report.md ► relay findings ► teardown
+     └─ scout: report.md ► relay findings ► teardown
+
+        teardown publishes both task shapes to the machine-global report stack
 ```
 
 You chat with the first mate.
 It routes each request to a crewmate in its own session endpoint and git worktree, supervises the fleet with a zero-token event-driven watcher, and brings you finished PRs, approved local merges, or investigation reports.
 Optional secondmates extend this to persistent domain supervisors, dispatch profiles let you steer which harness handles which task, and an opt-in X mode lets the same fleet answer public mentions.
+Optional Agent Fleet routing distributes Claude and Codex work across account profiles, while the completion report stack keeps the result independent of any account or Firstmate home.
 `codex-app` is not a runtime backend yet; [docs/codex-app-backend.md](docs/codex-app-backend.md) owns the Codex App boundary.
 
-Full architecture - the supervision engine, worktree isolation, secondmates, dispatch profiles, project modes, optional X mode, fleet sync, and self-update - is in [docs/architecture.md](docs/architecture.md).
+Full architecture - the supervision engine, worktree isolation, secondmates, dispatch and account routing, completion reports, project modes, optional X mode, fleet sync, and self-update - is in [docs/architecture.md](docs/architecture.md).
 
 ## Built-in skills
 
@@ -165,6 +171,7 @@ Claude and grok use the slash form shown here; codex uses the same names with `$
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/afk`             | Enter away-mode supervision: the sub-supervisor self-handles routine wakes in bash, escalates captain-relevant events and bounded declared-external-wait rechecks as batched digests, and actively alerts if delivery wedges while you step away |
 | `/bearings`        | Generate a "pick up where I left off" status report from the read-only fleet snapshot - backlog, per-task crew state, open PRs, scout reports, pending decisions, and date-gated queued work - written to a dated file in `data/` and surfaced concisely in chat; read-mostly, mutates no task state |
+| `/reports`         | Browse, search, open, or summarize the machine-global completion report stack, including visual evidence and follow-ups                        |
 | `/updatefirstmate` | Self-update the running firstmate and its secondmates to the latest from origin with fast-forward-only pulls, then re-read instructions and nudge secondmates |
 | `/stow`            | Sweep the session for uncaptured durable knowledge, route each finding to its disk home per AGENTS.md, file undone next steps to the backlog, and report what is now safe to reset |
 
@@ -182,16 +189,17 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
-- [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
+- [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, account routing, completion reports, and project modes work.
+- [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend and Agent Fleet account routing, optional X mode, the files you set, and harness support.
 - [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for a wedged away-mode escalation delivery.
 - [docs/tmux-backend.md](docs/tmux-backend.md) - setup guide for the tmux reference backend: prerequisites, attaching, and watching crew windows.
 - [docs/herdr-backend.md](docs/herdr-backend.md) - setup guide for the experimental herdr backend, plus its verification notes and known gaps.
 - [docs/zellij-backend.md](docs/zellij-backend.md) - setup guide for the experimental zellij backend, plus its verification notes and known gaps.
-- [docs/orca-backend.md](docs/orca-backend.md) - setup guide for the experimental Orca backend, plus its lifecycle notes and known gaps.
+- [docs/orca-backend.md](docs/orca-backend.md) - legacy Orca task recovery, lifecycle notes, and known gaps; new task spawns are refused.
 - [docs/cmux-backend.md](docs/cmux-backend.md) - setup guide for the experimental cmux backend, plus its verification notes and known gaps.
 - [docs/codex-app-backend.md](docs/codex-app-backend.md) - Codex App backend boundary, evidence, and rollout contract.
 - [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: verified per-harness hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
+- [docs/report-stack.md](docs/report-stack.md) - completion-report requirements, publication safety, stored artifacts, and browsing commands.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi, Grok, and unknown harness fallback.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
 - [`AGENTS.md`](AGENTS.md) - the distro's core instruction file and the first mate's full operating manual.

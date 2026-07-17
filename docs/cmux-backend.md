@@ -299,8 +299,8 @@ The helper and both branches are pinned in `tests/fm-backend-cmux.test.sh` by `t
 The live `window_of_workspace` window/count detection is pinned in `tests/fm-backend-cmux-smoke.test.sh`.
 The last-in-window path is not driven end to end in the automated smoke suite because closing the last workspace inherently leaves a window cmux cannot close over the socket, so a live end-to-end run cannot self-clean; the manual run recorded above is its empirical proof instead.
 
-Related current-window scoping, observed during this work and left out of scope for this fix: `workspace list --json` WITHOUT `--window` is scoped to the CURRENT window only (verified live).
-`fm_backend_cmux_window_of_workspace` passes `--window` per window and is unaffected, but `fm_backend_cmux_workspace_id_for_label` and `fm_backend_cmux_list_live` see only the current window's workspaces, and `fm_backend_cmux_target_ready`'s label recovery inherits that scope.
+Related current-window scoping, observed during this work: `workspace list --json` WITHOUT `--window` is scoped to the CURRENT window only (verified live).
+`fm_backend_cmux_all_workspaces`, `fm_backend_cmux_list_live`, and the lifecycle classifier walk `list-windows --json` and pass `--window` for every window; `fm_backend_cmux_workspace_id_for_label` and `fm_backend_cmux_target_ready`'s label recovery remain scoped to the current window.
 That is correct for the selected-workspace teardown case (a selected workspace is in the current window) but is a known limitation for a task workspace parked in a non-current window.
 
 ## Workspace ids do not survive a relaunch (verified from source, not a live restart)

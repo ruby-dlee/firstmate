@@ -10,6 +10,15 @@ FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 mkdir -p "$STATE"
+if [ -L "$STATE" ] || [ ! -d "$STATE" ]; then
+  printf 'error: unsafe wake state directory: %s\n' "$STATE" >&2
+  # shellcheck disable=SC2317
+  return 1 2>/dev/null || exit 1
+fi
+
+fm_wake_safe_file_destination() {
+  [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
+}
 
 fm_current_pid() {
   printf '%s\n' "${BASHPID:-$$}"
@@ -352,7 +361,7 @@ fm_wake_clean_field() {
 }
 
 fm_wake_append() {
-  local kind=$1 key=$2 payload=$3 clean_key clean_payload epoch seq seq_file status
+  local kind=$1 key=$2 payload=$3 clean_key clean_payload epoch seq seq_file seq_tmp status
   case "$kind" in
     signal|stale|check|heartbeat) ;;
     *) printf 'fm_wake_append: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
@@ -365,12 +374,23 @@ fm_wake_append() {
   status=0
 
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if ! fm_wake_safe_file_destination "$seq_file" || ! fm_wake_safe_file_destination "$FM_WAKE_QUEUE"; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 1
+  fi
   seq=$(cat "$seq_file" 2>/dev/null || echo 0)
   case "$seq" in
     ''|*[!0-9]*) seq=0 ;;
   esac
   seq=$((seq + 1))
-  printf '%s\n' "$seq" > "$seq_file" || status=$?
+  seq_tmp=$(mktemp "$STATE/.wake-queue.seq.pending.XXXXXX") || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' "$seq" > "$seq_tmp" || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_wake_safe_file_destination "$seq_file" && mv "$seq_tmp" "$seq_file" || status=$?
+  fi
+  [ -z "${seq_tmp:-}" ] || [ ! -e "$seq_tmp" ] || rm -f "$seq_tmp"
   if [ "$status" -eq 0 ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
   fi
@@ -380,9 +400,14 @@ fm_wake_append() {
 
 fm_wake_restore_queue() {
   local drained=$1 restore
-  restore="$STATE/.wake-queue.restore.$(fm_current_pid)"
+  fm_wake_safe_file_destination "$FM_WAKE_QUEUE" || return 1
   if [ -e "$FM_WAKE_QUEUE" ]; then
-    cat "$drained" "$FM_WAKE_QUEUE" > "$restore" && mv "$restore" "$FM_WAKE_QUEUE"
+    restore=$(mktemp "$STATE/.wake-queue.restore.XXXXXX") || return 1
+    if cat "$drained" "$FM_WAKE_QUEUE" > "$restore" && fm_wake_safe_file_destination "$FM_WAKE_QUEUE" && mv "$restore" "$FM_WAKE_QUEUE"; then
+      return 0
+    fi
+    rm -f "$restore"
+    return 1
   else
     mv "$drained" "$FM_WAKE_QUEUE"
   fi

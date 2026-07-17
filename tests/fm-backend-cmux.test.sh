@@ -463,27 +463,47 @@ test_create_task_refuses_duplicate_label() {
   local dir fb out status title
   dir="$TMP_ROOT/dup-task"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-dup1)
-  cmux_workspace_list_response "$dir" 1 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "ffffffff-0000-0000-0000-000000000000" "other"
+  cmux_workspace_list_response "$dir" 3 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
   fb=$(make_cmux_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-dup1 /tmp/proj' "$ROOT" 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "create_task should refuse an existing workspace title (cmux itself does not enforce uniqueness)"
   assert_contains "$out" "already exists" "create_task did not report the duplicate name"
-  pass "fm_backend_cmux_create_task: refuses a duplicate workspace title (cmux's own new-workspace has no uniqueness check)"
+  pass "fm_backend_cmux_create_task: refuses a duplicate workspace title across every cmux window"
+}
+
+test_create_task_refuses_failed_duplicate_query() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-dup-query-failed"; mkdir -p "$dir/responses"
+  printf '1\n' > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-query-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse when the duplicate query fails"
+  assert_contains "$out" "could not inspect cmux workspaces before creating" "create_task did not report the failed duplicate query"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-workspace' "create_task must not create after a failed duplicate query"
+  pass "fm_backend_cmux_create_task: refuses creation when the duplicate query fails"
 }
 
 test_create_task_creates_and_parses_ids() {
   local dir fb out title
   dir="$TMP_ROOT/create-task"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-newtask)
-  # 1: workspace list --json (pre-create duplicate check) -> no match
-  printf '{"workspaces":[]}' > "$dir/responses/1.out"
-  # 2: new-workspace (silent on success)
-  # 3: workspace list --json (post-create id resolution) -> match
-  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
-  # 4: list-panes --json --id-format uuids -> default surface id
-  cmux_panes_response "$dir" 4 "cccccccc-2222-2222-2222-222222222222"
+  # 1-2: all-window pre-create duplicate check -> no match.
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  # 3: new-workspace (silent on success).
+  # 4-5: all-window post-create id resolution -> match.
+  cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 5 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  # 6: list-panes --json --id-format uuids -> default surface id.
+  cmux_panes_response "$dir" 6 "cccccccc-2222-2222-2222-222222222222"
   fb=$(make_cmux_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-newtask /tmp/proj' "$ROOT" )
@@ -494,6 +514,72 @@ test_create_task_creates_and_parses_ids() {
   assert_contains "$(cat "$dir/log")" $'\x1f''--focus'$'\x1f''false' \
     "create_task did not pass --focus false"
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
+}
+
+test_create_task_rolls_back_captured_workspace_when_resolution_fails() {
+  local dir fb out status created
+  dir="$TMP_ROOT/create-workspace-resolution-failed"; mkdir -p "$dir/responses"
+  created="aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  printf 'OK %s\n' "$created" > "$dir/responses/3.out"
+  printf '1\n' > "$dir/responses/4.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-resolution-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when post-create workspace resolution fails"
+  assert_contains "$out" "could not inspect cmux workspaces after creating" "create_task did not report post-create query failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back the exact workspace id captured from new-workspace output"
+  pass "fm_backend_cmux_create_task: rolls back the captured workspace when post-create resolution fails"
+}
+
+test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails() {
+  local dir fb out status title created
+  dir="$TMP_ROOT/create-surface-resolution-failed"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-surface-failed)
+  created="aaaaaaaa-4444-5555-6666-bbbbbbbbbbbb"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 5 "$created" "$title"
+  cmux_panes_empty_response "$dir" 6
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-surface-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the new workspace's surface cannot be resolved"
+  assert_contains "$out" "could not resolve the default surface" "create_task did not report surface resolution failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back the exact resolved workspace after surface resolution failed"
+  pass "fm_backend_cmux_create_task: rolls back the resolved workspace when surface resolution fails"
+}
+
+test_create_task_refuses_nonunique_post_create_title_without_adopting_foreign_workspace() {
+  local dir fb out status title created foreign log
+  dir="$TMP_ROOT/create-nonunique-post-create"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-concurrent-title)
+  created="aaaaaaaa-7777-8888-9999-bbbbbbbbbbbb"
+  foreign="cccccccc-7777-8888-9999-dddddddddddd"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 0
+  printf '{"workspaces":[]}' > "$dir/responses/2.out"
+  printf 'OK %s\n' "$created" > "$dir/responses/3.out"
+  cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 1
+  printf '{"workspaces":[{"id":"%s","title":"%s"},{"id":"%s","title":"%s"}]}' \
+    "$foreign" "$title" "$created" "$title" > "$dir/responses/5.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-concurrent-title /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task adopted a workspace from a nonunique post-create title"
+  assert_contains "$out" "conflicts with the post-create workspace listing" "nonunique post-create refusal was not actionable"
+  log=$(cat "$dir/log")
+  assert_contains "$log" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$created" \
+    "create_task did not roll back its exact captured workspace"
+  assert_not_contains "$log" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f'"$foreign" \
+    "create_task closed a foreign same-title workspace"
+  pass "fm_backend_cmux_create_task: refuses nonunique post-create titles and cleans only its captured workspace"
 }
 
 # --- target_ready / capture ---------------------------------------------------
@@ -515,9 +601,10 @@ test_target_ready_checks_expected_label() {
   local dir fb title
   dir="$TMP_ROOT/ready-label-ok"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-label)
-  cmux_workspace_list_response "$dir" 1 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
-  # 2: list-panes --json --id-format uuids -> matching surface
-  cmux_panes_response "$dir" 2 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  # 3: list-panes --json --id-format uuids -> matching surface
+  cmux_panes_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111"
   fb=$(make_cmux_fakebin "$dir")
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" fm-label' "$ROOT"
@@ -530,7 +617,8 @@ test_target_ready_checks_expected_label() {
 test_target_ready_rejects_label_mismatch() {
   local dir fb status
   dir="$TMP_ROOT/ready-label-mismatch"; mkdir -p "$dir/responses"
-  cmux_workspace_list_response "$dir" 1 "aaaaaaaa-0000-0000-0000-000000000000" "not-the-task"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "not-the-task"
   fb=$(make_cmux_fakebin "$dir")
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" fm-label' "$ROOT"
@@ -539,6 +627,25 @@ test_target_ready_rejects_label_mismatch() {
   assert_not_contains "$(cat "$dir/log")" $'\x1f''list-panes' \
     "target_ready should not call list-panes after a label mismatch"
   pass "fm_backend_cmux_target_ready: rejects a workspace id reused under a different title"
+}
+
+test_target_ready_refuses_ambiguous_surface_rebind() {
+  local dir fb status title
+  dir="$TMP_ROOT/ready-surface-ambiguous"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  printf '{"panes":[{"surface_ids":["cccccccc-2222-2222-2222-222222222222","dddddddd-3333-3333-3333-333333333333"]}]}' \
+    > "$dir/responses/3.out"
+  cp "$dir/responses/3.out" "$dir/responses/4.out"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" fm-label' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "target_ready rebound an absent recorded surface to an arbitrary replacement"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send' \
+    "ambiguous surface rebind attempted an active operation"
+  pass "fm_backend_cmux_target_ready: refuses ambiguous replacement surfaces"
 }
 
 test_capture_trims_locally() {
@@ -609,7 +716,7 @@ test_send_key_recovers_stale_target_by_label() {
   local dir fb title
   dir="$TMP_ROOT/sendkey-stale-target"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-label)
-  cmux_workspace_list_response "$dir" 1 "cccccccc-2222-2222-2222-222222222222" "$title"
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 1
   cmux_workspace_list_response "$dir" 2 "cccccccc-2222-2222-2222-222222222222" "$title"
   cmux_panes_response "$dir" 3 "dddddddd-3333-3333-3333-333333333333"
   fb=$(make_cmux_fakebin "$dir")
@@ -621,6 +728,27 @@ test_send_key_recovers_stale_target_by_label() {
   assert_not_contains "$(cat "$dir/log")" $'\x1f''send-key'$'\x1f''--workspace'$'\x1f''aaaaaaaa-0000-0000-0000-000000000000' \
     "send_key should not target the stale cmux workspace id after label recovery"
   pass "fm_backend_cmux_send_key: recovers stale workspace/surface ids by expected label"
+}
+
+test_send_key_refuses_duplicate_rebind_titles() {
+  local dir fb title status
+  dir="$TMP_ROOT/sendkey-duplicate-rebind"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "c1111111-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_send_key "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" Enter fm-label' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "send_key rebound an absent cmux workspace to an ambiguous duplicate title"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] \
+    || fail "duplicate cmux rebind inspected or steered an arbitrary matching workspace"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''send-key' \
+    "duplicate cmux rebind reached a mutation command"
+  pass "fm_backend_cmux_send_key refuses ambiguous same-title workspace rebinds"
 }
 
 test_send_literal_uses_separator_for_option_shaped_text() {
@@ -945,10 +1073,9 @@ test_kill_recovers_stale_target_by_label() {
   local dir fb title
   dir="$TMP_ROOT/kill-stale-target"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-label)
-  # target_ready label recovery: 1 workspace list (title lookup, misses stale id),
-  # 2 workspace list (id-for-label -> refreshed id), 3 list-panes (surface id).
-  cmux_workspace_list_response "$dir" 1 "cccccccc-2222-2222-2222-222222222222" "$title"
-  cmux_workspace_list_response "$dir" 2 "cccccccc-2222-2222-2222-222222222222" "$title"
+  # target_ready label recovery: 1 list-windows, 2 workspace list, 3 list-panes.
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 2
+  cmux_workspace_list_response "$dir" 2 "cccccccc-2222-2222-2222-222222222222" "$title" "ffffffff-0000-0000-0000-000000000000" "other"
   cmux_panes_response "$dir" 3 "dddddddd-3333-3333-3333-333333333333"
   # window_of_workspace on the REFRESHED id: 4 list-windows (not last), 5 workspace list --window.
   cmux_windows_response "$dir" 4 "eeeeeeee-0000-0000-0000-000000000000" 2
@@ -974,19 +1101,174 @@ test_list_live_filters_by_title_prefix() {
   other_root="$dir/other-root"; mkdir -p "$other_root"
   title=$(cmux_expected_scoped_title fm-task1)
   other_title=$(cmux_expected_scoped_title fm-task2 "$ROOT" "$other_root")
-  # 1: workspace list --json --id-format uuids -> one in-home task, two unrelated
-  cmux_workspace_list_response "$dir" 1 \
+  cmux_windows_response "$dir" 1 "eeeeeeee-0000-0000-0000-000000000000" 3
+  cmux_workspace_list_response "$dir" 2 \
     "aaaaaaaa-0000-0000-0000-000000000000" "$title" \
     "dddddddd-8888-8888-8888-888888888888" "$other_title" \
     "cccccccc-9999-9999-9999-999999999999" "zsh"
-  # 2: list-panes for this home's task1 workspace
-  cmux_panes_response "$dir" 2 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_panes_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111"
   fb=$(make_cmux_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_list_live' "$ROOT" )
   [ "$out" = $'aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111\tfm-task1' ] \
     || fail "list_live should list only the in-home task workspace with its plain label and surface id, got '$out'"
   pass "fm_backend_cmux_list_live: lists only this home's scoped task workspaces using plain fm-<id> labels"
+}
+
+test_target_state_finds_workspace_outside_current_window() {
+  local dir fb out title
+  dir="$TMP_ROOT/target-state-all-windows"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-parked)
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "ffffffff-0000-0000-0000-000000000000" "other"
+  cmux_workspace_list_response "$dir" 3 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_panes_response "$dir" 4 "bbbbbbbb-1111-1111-1111-111111111111"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/fm-backend.sh"; fm_backend_target_state cmux "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" fm-parked' "$ROOT")
+  [ "$out" = present ] || fail "target state should find a live workspace outside the current cmux window, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''--window'$'\x1f''e2222222-0000-0000-0000-000000000000' \
+    "target state did not search the non-current cmux window"
+  pass "fm_backend_target_state: finds cmux workspaces across all windows"
+}
+
+test_target_state_distinguishes_absent_from_malformed_workspaces() {
+  local dir fb out fixture workspace target window
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  window='eeeeeeee-0000-0000-0000-000000000000'
+  for fixture in missing-title non-object; do
+    dir="$TMP_ROOT/target-state-$fixture"; mkdir -p "$dir/responses"
+    cmux_windows_response "$dir" 1 "$window" 1
+    case "$fixture" in
+      missing-title) workspace='{"workspaces":[{"id":"aaaaaaaa-0000-0000-0000-000000000000"}]}' ;;
+      non-object) workspace='{"workspaces":["not-a-workspace-record"]}' ;;
+    esac
+    printf '%s\n' "$workspace" > "$dir/responses/2.out"
+    fb=$(make_cmux_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+      bash -c '
+        . "$0/bin/fm-backend.sh"
+        fm_backend_target_exists() { return 1; }
+        [ "$(fm_backend_target_state cmux "$1")" = unknown ]
+      ' "$ROOT" "$target" 2>&1) || fail "malformed cmux workspace record was not fail-closed: $out"
+  done
+  dir="$TMP_ROOT/target-state-absent"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 "$window" 1
+  printf '{"workspaces":[]}\n' > "$dir/responses/2.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      [ "$(fm_backend_target_state cmux "$1")" = absent ]
+    ' "$ROOT" "$target" 2>&1) || fail "well-formed missing cmux workspace lost its absent classification: $out"
+  pass "cmux target state distinguishes missing workspaces from malformed records"
+}
+
+test_target_state_refuses_duplicate_recovery_titles() {
+  local dir fb out title target
+  dir="$TMP_ROOT/target-state-duplicate-title"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-duplicate)
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "c1111111-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-duplicate
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "duplicate cmux recovery titles were not fail-closed (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] || fail "duplicate title recovery inspected an arbitrary matching workspace"
+  pass "cmux target recovery refuses ambiguous workspace titles"
+}
+
+test_target_state_refuses_duplicate_title_when_recorded_workspace_remains() {
+  local dir fb out title target
+  dir="$TMP_ROOT/target-state-recorded-duplicate-title"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-duplicate-recorded)
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-duplicate-recorded
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "recorded cmux workspace bypassed duplicate-title refusal (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] || fail "duplicate recorded title inspected an arbitrary workspace"
+  pass "cmux target recovery refuses duplicate titles even when the recorded workspace remains"
+}
+
+test_target_state_refuses_absence_for_renamed_recorded_workspace() {
+  local dir fb out target
+  dir="$TMP_ROOT/target-state-recorded-title-mismatch"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  cmux_windows_response "$dir" 1 "e1111111-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "renamed-task"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-recorded-task
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "renamed recorded cmux workspace was classified as absent (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 2 ] || fail "title mismatch inspected or mutated the ambiguous recorded workspace"
+  pass "cmux target recovery fails closed when the recorded workspace title disagrees"
+}
+
+test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement() {
+  local dir fb out target title
+  dir="$TMP_ROOT/target-state-recorded-and-replacement"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  title=$(cmux_expected_scoped_title fm-recorded-task)
+  cmux_windows_response "$dir" 1 \
+    "e1111111-0000-0000-0000-000000000000" 1 \
+    "e2222222-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "renamed-task"
+  cmux_workspace_list_response "$dir" 3 "c2222222-0000-0000-0000-000000000000" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-recorded-task
+    ' "$ROOT" "$target")
+  [ "$out" = unknown ] || fail "a renamed recorded cmux workspace was ignored in favor of an empty replacement (got '$out')"
+  [ "$(wc -l < "$dir/log" | tr -d ' ')" -eq 3 ] \
+    || fail "ambiguous recorded and replacement cmux workspaces reached an arbitrary pane inspection"
+  pass "cmux target recovery keeps renamed recorded identities fail-closed beside replacements"
+}
+
+test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced() {
+  local dir fb out target title
+  dir="$TMP_ROOT/target-state-replaced-surface"; mkdir -p "$dir/responses"
+  target='aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111'
+  title=$(cmux_expected_scoped_title fm-replaced-surface)
+  cmux_windows_response "$dir" 1 "e1111111-0000-0000-0000-000000000000" 1
+  cmux_workspace_list_response "$dir" 2 "aaaaaaaa-0000-0000-0000-000000000000" "$title"
+  cmux_panes_response "$dir" 3 "cccccccc-2222-2222-2222-222222222222"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state cmux "$1" fm-replaced-surface
+    ' "$ROOT" "$target")
+  [ "$out" = present ] || fail "a cmux task workspace with a replacement surface was classified as $out"
+  pass "cmux target state stays present when the expected task workspace has a replacement surface"
 }
 
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
@@ -1005,6 +1287,42 @@ test_secondmate_spawn_refuses_cmux_backend() {
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
+  test_target_state_refuses_duplicate_recovery_titles
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
+  test_target_state_refuses_duplicate_recovery_titles
+  test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_target_state_refuses_absence_for_renamed_recorded_workspace
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
+  test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
+  test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
+  test_send_key_refuses_duplicate_rebind_titles
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
+  test_target_ready_refuses_ambiguous_surface_rebind
+  exit 0
+fi
 
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
@@ -1032,15 +1350,21 @@ test_ensure_running_returns_immediately_when_already_ok
 test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
+test_create_task_refuses_failed_duplicate_query
 test_create_task_creates_and_parses_ids
+test_create_task_rolls_back_captured_workspace_when_resolution_fails
+test_create_task_rolls_back_resolved_workspace_when_surface_resolution_fails
+test_create_task_refuses_nonunique_post_create_title_without_adopting_foreign_workspace
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
+test_target_ready_refuses_ambiguous_surface_rebind
 test_capture_trims_locally
 test_capture_fails_when_read_screen_fails_empty
 test_capture_fails_when_target_not_ready
 test_send_key_normalizes_and_targets
 test_send_key_recovers_stale_target_by_label
+test_send_key_refuses_duplicate_rebind_titles
 test_send_literal_uses_separator_for_option_shaped_text
 test_current_path_probes_with_marker
 test_composer_state_bare_prompt_is_empty
@@ -1060,4 +1384,11 @@ test_kill_adds_sibling_when_last_in_window
 test_kill_is_best_effort_when_close_workspace_fails
 test_kill_recovers_stale_target_by_label
 test_list_live_filters_by_title_prefix
+test_target_state_finds_workspace_outside_current_window
+test_target_state_distinguishes_absent_from_malformed_workspaces
+test_target_state_refuses_duplicate_recovery_titles
+test_target_state_refuses_duplicate_title_when_recorded_workspace_remains
+test_target_state_refuses_absence_for_renamed_recorded_workspace
+test_target_state_does_not_ignore_renamed_recorded_workspace_for_replacement
+test_target_state_keeps_workspace_present_when_recorded_surface_is_replaced
 test_secondmate_spawn_refuses_cmux_backend

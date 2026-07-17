@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
-# secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
+# pre-cutover Orca respawn, or a secondmate in its isolated firstmate home.
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
+#        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -15,15 +16,16 @@
 #   $TMUX, HERDR_ENV=1, or cmux runtime signals; bin/fm-backend.sh's
 #   fm_backend_detect, with cmux fallback details in docs/cmux-backend.md),
 #   then tmux.
-#   Spawn-capable backends are the reference tmux adapter and experimental
-#   herdr, zellij, orca, and cmux. Orca owns both the task worktree and
-#   terminal, so ship/scout Orca spawns do not run treehouse get; cmux is a
-#   session provider only, exactly like herdr/zellij, so it does. An
-#   auto-detected herdr or cmux spawn prints a loud stderr notice;
+#   New-task spawn-capable backends are the reference tmux adapter and
+#   experimental herdr, zellij, and cmux. Orca is available only to respawn a
+#   pre-cutover task whose meta has no report_required marker; it owns both the
+#   task worktree and terminal, so an eligible Orca respawn does not run
+#   treehouse get. cmux is a session provider only, exactly like herdr/zellij,
+#   so it does. An auto-detected herdr or cmux spawn prints a loud stderr notice;
 #   auto-detected tmux stays silent; zellij and orca are never auto-detected.
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
 #   blocked backend contract. Default tmux spawns do not write backend= to meta;
-#   absent backend= means tmux. cmux does not support --secondmate spawns yet.
+#   absent backend= means tmux. orca and cmux do not support --secondmate spawns.
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
 #   callers must surface it instead of silently retrying another backend.
@@ -46,6 +48,28 @@
 #   the file governs the spawn, its model/effort tokens are re-resolved on every
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
+#   Account routing is independently default-off. Its precedence and off/observe/
+#   enforce behavior are owned by fm-account-routing-lib.sh. --account-pool asks
+#   Agent Fleet to atomically select one concrete profile; --account-profile pins
+#   a concrete profile (and optionally validates it belongs to --account-pool).
+#   Either explicit account flag enforces routing for this spawn even when the
+#   global mode is off/observe. --no-account-routing is the emergency per-spawn
+#   opt-out and cannot be combined with either account flag. Enforced routing is
+#   supported only for claude/codex and fails closed; it never silently launches
+#   the default account. The resolved profile wraps the provider command before
+#   it is submitted to the selected backend, so every backend receives the same
+#   launch string.
+#   config/secondmate-account-pool is the primary's durable, non-inherited pool
+#   for secondmate AGENTS. An explicit account flag overrides it. A secondmate's
+#   own crewmates use inherited crew dispatch/routing policy, not this pool.
+#   --resume-account is an internal recovery path. It requires existing sticky
+#   account/profile/session metadata plus Agent Fleet's matching SessionStart
+#   mapping, reuses the recorded worktree/home, and executes `agent-fleet resume
+#   --task`; any missing or mismatched recovery truth blocks before pane creation.
+#   --continue-account is the provider-neutral recovery path. It verifies a dead
+#   endpoint and current repository state, builds a task-owned continuation packet,
+#   launches a fresh provider session through a new namespaced Agent Fleet attempt,
+#   and releases the predecessor only after the new SessionStart mapping is bound.
 #   A --secondmate spawn also propagates the primary's declared inheritable config
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
@@ -60,7 +84,7 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend applies to every pair.
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/account flags apply to every pair.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
@@ -102,6 +126,10 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-report-contract-lib.sh
+. "$SCRIPT_DIR/fm-report-contract-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -109,6 +137,27 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+
+spawn_managed_endpoint_kill() {  # <backend> <target> <tab-id> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 tab_id=$3 label=$4 kind=$5 secondmate_home=${6:-} recorded_scoped_target=${7:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_kill "$backend" "$target" "$tab_id" "$label" "$recorded_scoped_target" )
+  else
+    fm_backend_kill "$backend" "$target" "$tab_id" "$label" "$recorded_scoped_target"
+  fi
+}
+
+spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} recorded_scoped_target=${6:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_target_state "$backend" "$target" "$label" "$recorded_scoped_target" )
+  else
+    fm_backend_target_state "$backend" "$target" "$label" "$recorded_scoped_target"
+  fi
+}
+
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -117,10 +166,22 @@ HARNESS_ARG=
 MODEL=
 EFFORT=
 BACKEND_ARG=
+ACCOUNT_POOL=
+ACCOUNT_PROFILE=
+NO_ACCOUNT_ROUTING=0
+RESUME_ACCOUNT=0
+CONTINUE_ACCOUNT=0
+CONTINUATION_LAUNCH_DIR=
+CONTINUATION_PROMPT_FILE=
+CONTINUATION_PROMPT_DIR_ID=
+CONTINUATION_PROMPT_FILE_ID=
+CONTINUATION_PROMPT_CONTENT_ID=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
 BACKEND_SET=0
+ACCOUNT_POOL_SET=0
+ACCOUNT_PROFILE_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -133,6 +194,8 @@ for a in "$@"; do
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
+      account-pool) ACCOUNT_POOL=$a; ACCOUNT_POOL_SET=1 ;;
+      account-profile) ACCOUNT_PROFILE=$a; ACCOUNT_PROFILE_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -149,6 +212,13 @@ for a in "$@"; do
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
+    --account-pool) want_value=account-pool ;;
+    --account-pool=*) ACCOUNT_POOL=${a#--account-pool=}; ACCOUNT_POOL_SET=1 ;;
+    --account-profile) want_value=account-profile ;;
+    --account-profile=*) ACCOUNT_PROFILE=${a#--account-profile=}; ACCOUNT_PROFILE_SET=1 ;;
+    --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
+    --resume-account) RESUME_ACCOUNT=1 ;;
+    --continue-account) CONTINUE_ACCOUNT=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -157,18 +227,103 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
+[ "$ACCOUNT_POOL_SET" -eq 0 ] || [ -n "$ACCOUNT_POOL" ] || { echo "error: --account-pool requires a non-empty value" >&2; exit 1; }
+[ "$ACCOUNT_PROFILE_SET" -eq 0 ] || [ -n "$ACCOUNT_PROFILE" ] || { echo "error: --account-profile requires a non-empty value" >&2; exit 1; }
+if [ "$NO_ACCOUNT_ROUTING" = 1 ] && { [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; }; then
+  echo "error: --no-account-routing cannot be combined with --account-pool or --account-profile" >&2
+  exit 1
+fi
+[ "$RESUME_ACCOUNT" = 0 ] || [ "$NO_ACCOUNT_ROUTING" = 0 ] || { echo "error: --resume-account cannot disable account routing" >&2; exit 1; }
+[ "$CONTINUE_ACCOUNT" = 0 ] || [ "$NO_ACCOUNT_ROUTING" = 0 ] || { echo "error: --continue-account cannot disable account routing" >&2; exit 1; }
+[ "$RESUME_ACCOUNT" = 0 ] || [ "$CONTINUE_ACCOUNT" = 0 ] || { echo "error: --resume-account and --continue-account are mutually exclusive" >&2; exit 1; }
+[ -z "$ACCOUNT_POOL" ] || fm_account_valid_id "$ACCOUNT_POOL" || { echo "error: invalid --account-pool '$ACCOUNT_POOL'" >&2; exit 1; }
+[ -z "$ACCOUNT_PROFILE" ] || fm_account_valid_id "$ACCOUNT_PROFILE" || { echo "error: invalid --account-profile '$ACCOUNT_PROFILE'" >&2; exit 1; }
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
 
-# Backend selection (data/fm-backend-design-d7): explicit --backend, else
-# FM_BACKEND env, else config/backend, else runtime auto-detection, else
-# default tmux (fm_backend_name). fm_backend_validate_spawn refuses unknown or
-# non-spawn-capable backends. The resolved value is
-# recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
-# window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
-# so the default path's meta stays byte-identical.
+RECOVERY_ACCOUNT=0
+[ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] || RECOVERY_ACCOUNT=1
+RESUME_META=
+LIFECYCLE_LOCK=
+LIFECYCLE_LOCK_OWNED=0
+LIFECYCLE_LOCK_INHERITED_PID=
+LIFECYCLE_LOCK_INHERITED_START=
+SPAWN_META_PRESENT=0
+SPAWN_META_SNAPSHOT=
+SPAWN_PREFLIGHT_ID=${POS[0]:-}
+spawn_idpart=${SPAWN_PREFLIGHT_ID%%=*}
+SPAWN_PREFLIGHT_BATCH=0
+if [ -n "$SPAWN_PREFLIGHT_ID" ] && [ "$SPAWN_PREFLIGHT_ID" != "$spawn_idpart" ] \
+  && case "$spawn_idpart" in */*) false ;; *) true ;; esac; then
+  SPAWN_PREFLIGHT_BATCH=1
+fi
+
+spawn_preflight_read_meta() {  # <meta>
+  node "$SCRIPT_DIR/fm-contained-read.cjs" "$STATE" "$1" 1048576
+}
+
+spawn_preflight_load_meta() {  # <required:0|1>
+  local required=$1
+  RESUME_META="$STATE/$SPAWN_PREFLIGHT_ID.meta"
+  if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+    [ -d "$STATE" ] && [ ! -L "$STATE" ] || {
+      echo "error: state directory must be a real directory before spawning: $STATE" >&2
+      return 1
+    }
+  else
+    [ "$required" = 0 ] || {
+      echo "error: no metadata for managed recovery at $RESUME_META" >&2
+      return 1
+    }
+    return 0
+  fi
+  if [ -e "$RESUME_META" ] || [ -L "$RESUME_META" ]; then
+    SPAWN_META_SNAPSHOT=$(spawn_preflight_read_meta "$RESUME_META") || {
+      echo "error: unsafe metadata for spawn preflight at $RESUME_META" >&2
+      return 1
+    }
+    SPAWN_META_PRESENT=1
+  elif [ "$required" = 1 ]; then
+    echo "error: no metadata for managed recovery at $RESUME_META" >&2
+    return 1
+  fi
+}
+
+spawn_preflight_meta_value() {  # <key>
+  printf '%s\n' "$SPAWN_META_SNAPSHOT" | sed -n "s/^$1=//p" | tail -1
+}
+
+spawn_refuse_report_required_orca() {
+  local report_required=1
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    if printf '%s\n' "$SPAWN_META_SNAPSHOT" | grep -q '^report_required='; then
+      [ "$(spawn_preflight_meta_value report_required)" = 1 ] || report_required=0
+    else
+      report_required=0
+    fi
+  fi
+  if [ "$report_required" = 1 ]; then
+    echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
+    return 1
+  fi
+}
+
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
+  case "$SPAWN_PREFLIGHT_ID" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
+  spawn_preflight_load_meta 1 || exit 1
+  recorded_backend=$(spawn_preflight_meta_value backend)
+  [ -n "$recorded_backend" ] || recorded_backend=tmux
+  if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
+    echo "error: account recovery backend override '$BACKEND_ARG' does not match recorded backend '$recorded_backend'" >&2
+    exit 1
+  fi
+  BACKEND_ARG=$recorded_backend
+  BACKEND_SET=1
+fi
+
 if [ "$BACKEND_SET" -eq 1 ]; then
   BACKEND=$BACKEND_ARG
 else
@@ -184,12 +339,253 @@ if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=cmux does not support --secondmate spawns yet" >&2
   exit 1
 fi
-if [ "$BACKEND" = orca ]; then
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] \
+  && { [ -e "$STATE/$SPAWN_PREFLIGHT_ID.meta" ] || [ -L "$STATE/$SPAWN_PREFLIGHT_ID.meta" ]; }; then
+  spawn_preflight_load_meta 0 || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 1 ]; then
+  spawn_refuse_report_required_orca || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ]; then
   fm_backend_orca_runtime_check || exit 1
+fi
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 0 ]; then
+  spawn_preflight_load_meta 0 || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ]; then
+  spawn_refuse_report_required_orca || exit 1
+fi
+
+if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
+  [ "${#POS[@]}" -ge 1 ] || { echo "error: inherited account lifecycle lock requires a task id" >&2; exit 1; }
+  inherited_lock_id=${POS[0]}
+  case "$inherited_lock_id" in *=*) echo "error: inherited account lifecycle lock does not support batch syntax" >&2; exit 1 ;; esac
+  expected_lifecycle_lock="$STATE/.account-lifecycle-$inherited_lock_id.lock"
+  inherited_lock_identity=
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_lifecycle_lock" ]; then
+    inherited_lock_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_lock_identity=
+  fi
+  case "$inherited_lock_identity" in
+    *$'\n'*)
+      LIFECYCLE_LOCK_INHERITED_PID=${inherited_lock_identity%%$'\n'*}
+      LIFECYCLE_LOCK_INHERITED_START=${inherited_lock_identity#*$'\n'}
+      ;;
+    *)
+      echo "error: invalid inherited account lifecycle lock for $inherited_lock_id" >&2
+      exit 1
+      ;;
+  esac
+  if [ -z "$LIFECYCLE_LOCK_INHERITED_PID" ] || [ -z "$LIFECYCLE_LOCK_INHERITED_START" ]; then
+    echo "error: invalid inherited account lifecycle lock for $inherited_lock_id" >&2
+    exit 1
+  fi
+  LIFECYCLE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+  if [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ]; then
+    echo "error: inherited account lifecycle lock for $inherited_lock_id cannot transfer ownership" >&2
+    exit 1
+  fi
+  lifecycle_handoff_start=$(fm_account_process_start_time "$$") || {
+    echo "error: cannot record inherited account lifecycle lock handoff for $inherited_lock_id" >&2
+    exit 1
+  }
+  lifecycle_handoff_tmp=$(mktemp "$STATE/.account-lifecycle-$inherited_lock_id.handoff.XXXXXX") || exit 1
+  if ! printf '%s\n%s\n' "$$" "$lifecycle_handoff_start" > "$lifecycle_handoff_tmp"; then
+    rm -f "$lifecycle_handoff_tmp"
+    exit 1
+  fi
+  current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
+  if [ "$current_lock_identity" != "$inherited_lock_identity" ] \
+    || [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ] \
+    || ! mv "$lifecycle_handoff_tmp" "$LIFECYCLE_LOCK"; then
+    rm -f "$lifecycle_handoff_tmp"
+    echo "error: inherited account lifecycle lock was lost before ownership handoff for $inherited_lock_id" >&2
+    exit 1
+  fi
+  LIFECYCLE_LOCK_OWNED=1
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  # The handoff replaces the lock inode while live ownership prevents reclaim until this child releases the replacement.
+  if ! fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK"; then
+    echo "error: inherited account lifecycle lock ownership handoff failed for $inherited_lock_id" >&2
+    exit 1
+  fi
+fi
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  fm_account_safe_file_destination "$RESUME_META" || { echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2; exit 1; }
+  if [ -z "$LIFECYCLE_LOCK" ]; then
+    LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
+    LIFECYCLE_LOCK_OWNED=1
+  fi
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  current_spawn_meta=$(spawn_preflight_read_meta "$RESUME_META") || {
+    echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2
+    exit 1
+  }
+  # The early snapshot owns preflight refusals only. Once lifecycle ownership
+  # serializes recovery, refresh it so a waiter validates the committed
+  # replacement generation instead of rejecting that generation as stale.
+  SPAWN_META_SNAPSHOT=$current_spawn_meta
+  rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
+  if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
+    rollback_id=${POS[0]}
+    rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
+    rollback_meta_lock=$(fm_account_meta_lock_acquire "$STATE" "$rollback_id") || exit 1
+    if [ ! -f "$RESUME_META" ] || [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" != pending ] \
+      || [ "$(fm_account_meta_value "$RESUME_META" account_task)" != "$rollback_account_task" ]; then
+      fm_account_meta_lock_release "$rollback_meta_lock" >/dev/null 2>&1 || true
+      echo "error: managed task generation changed before rollback cleanup for $rollback_id" >&2
+      exit 1
+    fi
+    rollback_kind=$(fm_account_meta_value "$RESUME_META" kind)
+    [ -n "$rollback_kind" ] || rollback_kind=ship
+    rollback_backend=$(fm_backend_of_meta "$RESUME_META")
+    rollback_target=$(fm_backend_target_of_meta "$RESUME_META")
+    rollback_tmux_session_target=$(fm_account_meta_value "$RESUME_META" tmux_session_target)
+    [ -n "$rollback_tmux_session_target" ] || rollback_tmux_session_target=$(fm_account_meta_value "$RESUME_META" window)
+    rollback_tab=$(fm_account_meta_value "$RESUME_META" zellij_tab_id)
+    rollback_home=$(fm_account_meta_value "$RESUME_META" home)
+    rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
+    rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
+    fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
+    rollback_meta_lock=
+    if [ -n "$rollback_tasktmp" ] && [ "$rollback_tasktmp" != "/tmp/fm-$rollback_id" ]; then
+      echo "error: unsafe task temp path in rollback metadata for $rollback_id: $rollback_tasktmp" >&2
+      exit 1
+    fi
+    if [ -n "$rollback_target" ]; then
+      spawn_managed_endpoint_kill "$rollback_backend" "$rollback_target" "$rollback_tab" "fm-$rollback_id" "$rollback_kind" "$rollback_home" "$rollback_tmux_session_target" 2>/dev/null || true
+    fi
+    rollback_endpoint_state=$(spawn_managed_endpoint_state "$rollback_backend" "$rollback_target" "fm-$rollback_id" "$rollback_kind" "$rollback_home" "$rollback_tmux_session_target" 2>/dev/null)
+    case "$rollback_endpoint_state" in
+      absent) ;;
+      present)
+        echo "error: failed Agent Fleet attempt endpoint is still alive for $rollback_id; retaining its lease and metadata" >&2
+        exit 1
+        ;;
+      *)
+        echo "error: failed Agent Fleet attempt endpoint state is unknown for $rollback_id; retaining its lease and metadata" >&2
+        exit 1
+        ;;
+    esac
+    if ! fm_account_cleanup_rollback "$RESUME_META" "$DATA" "$rollback_id"; then
+      echo "error: failed Agent Fleet attempt cleanup remains pending for $rollback_id" >&2
+      exit 1
+    fi
+    rollback_profile=$(fm_account_meta_value "$RESUME_META" account_profile)
+    if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ] && [ -z "$rollback_backup" ]; then
+      rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
+      [ -z "$rollback_tasktmp" ] || rm -rf "$rollback_tasktmp"
+    fi
+    if [ -z "$rollback_profile" ]; then
+      if [ -n "$rollback_backup" ]; then
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id and the previous task state was restored; rerun against the restored task generation" >&2
+      elif [ "$rollback_kind" = secondmate ]; then
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; retry the secondmate spawn without tearing down its home" >&2
+      else
+        echo "error: failed Agent Fleet attempt was cleaned for $rollback_id; tear down its retained worktree before spawning again" >&2
+      fi
+      exit 1
+    fi
+  fi
+  if [ "$(fm_account_meta_value "$RESUME_META" account_predecessor_cleanup)" = pending ]; then
+    cleanup_id=${POS[0]}
+    cleanup_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$cleanup_id" --require >/dev/null || exit 1
+    cleanup_lock=$(fm_account_meta_lock_acquire "$STATE" "$cleanup_id") || exit 1
+    if [ ! -f "$RESUME_META" ] || [ "$(fm_account_meta_value "$RESUME_META" account_task)" != "$cleanup_account_task" ]; then
+      fm_account_meta_lock_release "$cleanup_lock" >/dev/null 2>&1 || true
+      echo "error: managed task generation changed before predecessor cleanup for $cleanup_id" >&2
+      exit 1
+    fi
+    fm_account_meta_lock_release "$cleanup_lock" || exit 1
+    cleanup_lock=
+    if ! fm_account_cleanup_predecessor "$RESUME_META" "$DATA" "$cleanup_id"; then
+      echo "error: predecessor Agent Fleet cleanup remains pending for $cleanup_id" >&2
+      exit 1
+    fi
+    if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+      echo "completed predecessor Agent Fleet cleanup for $cleanup_id"
+      exit 0
+    fi
+  fi
+  recorded_backend=$(fm_backend_of_meta "$RESUME_META")
+  if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
+    echo "error: account recovery backend override '$BACKEND_ARG' does not match recorded backend '$recorded_backend'" >&2
+    exit 1
+  fi
+  BACKEND_ARG=$recorded_backend
+  BACKEND_SET=1
+fi
+
+# Backend selection (data/fm-backend-design-d7): explicit --backend, else
+# FM_BACKEND env, else config/backend, else runtime auto-detection, else
+# default tmux (fm_backend_name). fm_backend_validate_spawn refuses unknown or
+# non-spawn-capable backends. The resolved value is
+# recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
+# window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
+# so the default path's meta stays byte-identical.
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  echo "error: managed account recovery is not implemented for backend=orca" >&2
+  exit 1
 fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+ACCOUNT_LEASE_CREATED=0
+FM_ACCOUNT_MUTATION_ACQUIRED=0
+ACCOUNT_SPAWN_COMMITTED=0
+ACCOUNT_EFFECTIVE_MODE=off
+ACCOUNT_PRIMARY_MODE=off
+ACCOUNT_TASK=
+ACCOUNT_ATTEMPT=
+SPAWN_GENERATION_ID=
+ACCOUNT_PREDECESSOR_TASK=
+ACCOUNT_PREDECESSOR_ATTEMPT=
+ACCOUNT_PREDECESSOR_PROVIDER=
+ACCOUNT_PREDECESSOR_PROFILE=
+ACCOUNT_PREDECESSOR_POOL=
+ACCOUNT_PREDECESSOR_SESSION=
+CONTINUATION_PACKET=
+ENDPOINT_CREATED=0
+WORKTREE_CREATED=0
+META_INSTALLED=0
+META_BACKUP=
+EXISTING_ARTIFACT_BACKUP=
+META_WRITE_LOCK=
+RAW_LAUNCH=0
+ACCOUNT_NATIVE_LAUNCH_SCRIPT=
+ACCOUNT_NATIVE_LAUNCH_READY=
+ACCOUNT_NATIVE_LAUNCH_GO=
+ACCOUNT_NATIVE_LAUNCH_DIR=
+CONFIG_INHERIT_REPORT_TMP=
+ORIGINAL_STATUS_PRESENT=-1
+ORIGINAL_TURN_ENDED_PRESENT=-1
+ORIGINAL_CHECK_PRESENT=-1
+ORIGINAL_PI_EXT_PRESENT=-1
+ORIGINAL_GROK_TOKEN_PRESENT=-1
+ORIGINAL_TASK_TMP_PRESENT=-1
+
+snapshot_existing_artifacts() {
+  local backup name source tasktmp="/tmp/fm-$ID"
+  backup=$(mktemp -d "$STATE/.$ID.artifacts.rollback.XXXXXX") || return 1
+  for name in "$ID.status" "$ID.turn-ended" "$ID.check.sh" "$ID.pi-ext.ts" "$ID.grok-turnend-token"; do
+    source="$STATE/$name"
+    if [ -e "$source" ] || [ -L "$source" ]; then
+      if ! cp -Pp "$source" "$backup/$name"; then
+        rm -rf "$backup"
+        return 1
+      fi
+    fi
+  done
+  [ ! -e "$tasktmp" ] || : > "$backup/tasktmp-existed"
+  [ ! -e "$tasktmp/gotmp" ] || : > "$backup/gotmp-existed"
+  EXISTING_ARTIFACT_BACKUP=$backup
+}
+
+discard_existing_artifact_backup() {
+  [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
+  EXISTING_ARTIFACT_BACKUP=
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -208,38 +604,278 @@ parse_orca_worktree_result() {
   fi
 }
 
-orca_spawn_abort_cleanup() {
-  local status=$?
-  [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
-  ORCA_ABORT_CLEANUP=0
-  if [ -n "${ORCA_TERMINAL:-}" ]; then
-    fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+persist_failed_account_rollback() {
+  local meta tmp current_task backup_name artifact_backup_name rollback_window preserve_extensions=0
+  mkdir -p "$STATE" || return 1
+  fm_account_real_directory "$STATE" || return 1
+  meta="$STATE/$ID.meta"
+  tmp=$(mktemp "$STATE/.$ID.meta.rollback-pending.XXXXXX") || return 1
+  current_task=$(fm_account_meta_value "$meta" account_task)
+  if [ -f "$meta" ] && [ "$current_task" = "$ACCOUNT_TASK" ]; then
+    awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    [ ! -f "$meta" ] || preserve_extensions=1
+    rollback_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+    {
+      echo "window=$rollback_window"
+      echo "worktree=${WT:-}"
+      echo "project=${PROJ_ABS:-}"
+      echo "harness=${HARNESS:-}"
+      echo "kind=${KIND:-ship}"
+      echo "mode=${MODE:-no-mistakes}"
+      echo "yolo=${YOLO:-off}"
+      echo "tasktmp=${TASK_TMP:-}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      echo "generation_id=${SPAWN_GENERATION_ID:-account:$ACCOUNT_TASK:${ACCOUNT_ATTEMPT:-legacy}}"
+      [ -z "${ACCOUNT_POOL:-}" ] || echo "account_pool=$ACCOUNT_POOL"
+      [ -z "${ACCOUNT_PROFILE:-}" ] || echo "account_profile=$ACCOUNT_PROFILE"
+      echo "account_task=$ACCOUNT_TASK"
+      echo "account_attempt=${ACCOUNT_ATTEMPT:-legacy}"
+      [ -z "${ACCOUNT_PREDECESSOR_TASK:-}" ] || echo "account_predecessor_task=$ACCOUNT_PREDECESSOR_TASK"
+      [ -z "${ACCOUNT_PREDECESSOR_ATTEMPT:-}" ] || echo "account_predecessor_attempt=$ACCOUNT_PREDECESSOR_ATTEMPT"
+      [ -z "${ACCOUNT_PREDECESSOR_PROVIDER:-}" ] || echo "account_predecessor_provider=$ACCOUNT_PREDECESSOR_PROVIDER"
+      [ -z "${ACCOUNT_PREDECESSOR_PROFILE:-}" ] || echo "account_predecessor_profile=$ACCOUNT_PREDECESSOR_PROFILE"
+      [ -z "${ACCOUNT_PREDECESSOR_POOL:-}" ] || echo "account_predecessor_pool=$ACCOUNT_PREDECESSOR_POOL"
+      [ -z "${ACCOUNT_PREDECESSOR_SESSION:-}" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
+      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${META_WINDOW:-${T:-}}" ] || echo "tmux_session_target=${META_WINDOW:-$T}"
+      [ "${BACKEND:-tmux}" != herdr ] || {
+        echo "herdr_session=${HERDR_SES:-}"
+        echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+        echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+        echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != zellij ] || {
+        echo "zellij_session=${ZELLIJ_SES:-}"
+        echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+        echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != cmux ] || {
+        echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+        echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+      }
+      [ "${KIND:-ship}" != secondmate ] || {
+        echo "home=${PROJ_ABS:-}"
+        echo "projects=${SECONDMATE_PROJECTS:-}"
+      }
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
   fi
-  if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-    if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        {
-          echo "window=$W"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          echo "mode=${MODE:-no-mistakes}"
-          echo "yolo=${YOLO:-off}"
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=orca"
-          echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-          [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
+  if [ "$preserve_extensions" = 1 ]; then
+    fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  printf 'account_rollback_cleanup=pending\n' >> "$tmp"
+  if [ -n "$META_BACKUP" ]; then
+    backup_name=${META_BACKUP##*/}
+    printf 'account_rollback_backup=%s\n' "$backup_name" >> "$tmp"
+  fi
+  if [ -n "$EXISTING_ARTIFACT_BACKUP" ]; then
+    artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+    printf 'account_rollback_artifacts=%s\n' "$artifact_backup_name" >> "$tmp"
+  fi
+  [ "$RESUME_ACCOUNT" != 1 ] || printf 'account_rollback_preserve_session=1\n' >> "$tmp"
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
+clear_account_rollback_markers() {
+  local meta="$STATE/$ID.meta" tmp
+  tmp=$(mktemp "$STATE/.$ID.meta.rollback-commit.XXXXXX") || return 1
+  awk '!/^account_rollback_/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+}
+
+persist_failed_account_rollback_short() {
+  local lock status
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
+  if persist_failed_account_rollback; then status=0; else status=$?; fi
+  fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || status=1
+  return "$status"
+}
+
+cleanup_continuation_launch_transport() {
+  [ -n "${CONTINUATION_LAUNCH_DIR:-}" ] || return 0
+  if [ -n "${CONTINUATION_PROMPT_FILE:-}" ] && [ -n "${CONTINUATION_PROMPT_DIR_ID:-}" ] \
+    && [ -n "${CONTINUATION_PROMPT_FILE_ID:-}" ]; then
+    python3 "$SCRIPT_DIR/fm-prompt-exec.py" --cleanup "$CONTINUATION_PROMPT_FILE" \
+      "$CONTINUATION_PROMPT_DIR_ID" "$CONTINUATION_PROMPT_FILE_ID" >/dev/null 2>&1 || true
+  fi
+  CONTINUATION_LAUNCH_DIR=
+  CONTINUATION_PROMPT_FILE=
+  CONTINUATION_PROMPT_DIR_ID=
+  CONTINUATION_PROMPT_FILE_ID=
+  CONTINUATION_PROMPT_CONTENT_ID=
+}
+
+spawn_abort_cleanup() {
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp
+  trap - EXIT
+  # This is an EXIT trap whose job is to attempt every independent cleanup
+  # action and then return the original spawn status. The parent script runs
+  # with `set -e`; without disabling errexit here, a benign nonzero probe can
+  # stop the trap after endpoint removal but before lease/session/worktree
+  # rollback, leaking prepared resources.
+  set +e
+  [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
+  if [ -n "${META_WRITE_LOCK:-}" ]; then
+    rollback_lock=$META_WRITE_LOCK
+    META_WRITE_LOCK=
+  fi
+  if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
+    ORCA_ABORT_CLEANUP=0
+    if [ -n "${ORCA_TERMINAL:-}" ]; then
+      fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+        mkdir -p "$STATE" 2>/dev/null || true
+        if [ -d "$STATE" ] && [ ! -L "$STATE" ]; then
+          orca_meta_tmp=$(mktemp "$STATE/.${ID:-unknown}.meta.orca-cleanup.XXXXXX" 2>/dev/null) || orca_meta_tmp=
+        fi
+        if [ -n "${orca_meta_tmp:-}" ]; then
+          {
+            echo "window=${W:-fm-${ID:-unknown}}"
+            echo "worktree=${WT:-}"
+            echo "project=${PROJ_ABS:-}"
+            echo "harness=${HARNESS:-}"
+            echo "kind=${KIND:-ship}"
+            echo "mode=${MODE:-no-mistakes}"
+            echo "yolo=${YOLO:-off}"
+            echo "tasktmp=${TASK_TMP:-}"
+            echo "model=${MODEL:-default}"
+            echo "effort=${EFFORT:-default}"
+            echo "backend=orca"
+            echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+            [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+          } > "$orca_meta_tmp" 2>/dev/null || true
+          if fm_account_safe_file_destination "$STATE/${ID:-unknown}.meta"; then
+            mv "$orca_meta_tmp" "$STATE/${ID:-unknown}.meta" 2>/dev/null || true
+          fi
+          [ ! -e "$orca_meta_tmp" ] || rm -f "$orca_meta_tmp"
+        fi
       fi
     fi
   fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
+    spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
+    endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
+    case "$endpoint_state" in
+      absent) ;;
+      present)
+        endpoint_gone=0
+        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
+        ;;
+      *)
+        endpoint_gone=0
+        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint state is unknown" >&2
+        ;;
+    esac
+  fi
+  [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
+  cleanup_continuation_launch_transport
+  [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
+    if [ "$ACCOUNT_LEASE_CREATED" = 1 ] || fm_account_mutation_owned; then
+      if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
+        account_clean=0
+        echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown}" >&2
+      elif [ "$RESUME_ACCOUNT" != 1 ] && ! fm_account_session_remove "$ACCOUNT_TASK" 2>/dev/null; then
+        account_clean=0
+        echo "warning: failed to roll back Agent Fleet session for ${ID:-unknown}" >&2
+      else
+        fm_account_lineage_append "$DATA" "$ID" rolled-back "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" >/dev/null 2>&1 || true
+      fi
+    fi
+    if [ "$account_clean" = 1 ] && { [ "$WORKTREE_CREATED" = 1 ] || [ "$ORCA_ABORT_CLEANUP" = 1 ]; }; then
+      if [ "${BACKEND:-tmux}" = orca ]; then
+        [ -z "${ORCA_WORKTREE_ID:-}" ] || fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || worktree_clean=0
+      elif [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+        rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+        ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 || worktree_clean=0
+      fi
+      [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}; retaining unmanaged cleanup metadata" >&2
+    fi
+    if [ -z "$rollback_lock" ]; then
+      if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
+        :
+      else
+        account_clean=0
+      fi
+    fi
+    if [ "$account_clean" = 1 ]; then
+      if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
+        if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] \
+          || cmp -s "$STATE/$ID.meta" "$META_BACKUP"; then
+          artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+          if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
+            && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
+            && fm_account_safe_file_destination "$STATE/$ID.meta" \
+            && mv "$META_BACKUP" "$STATE/$ID.meta"; then
+            [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
+            EXISTING_ARTIFACT_BACKUP=
+            restored_existing_meta=1
+          else
+            account_clean=0
+            echo "warning: failed to restore prior task state for ${ID:-unknown}" >&2
+          fi
+        else
+          rm -f "$META_BACKUP"
+          discard_existing_artifact_backup
+        fi
+        [ -f "$META_BACKUP" ] || META_BACKUP=
+      elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] && [ "$worktree_clean" = 1 ]; then
+        rm -f "$STATE/$ID.meta"
+      elif [ "$META_INSTALLED" = 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ]; then
+        rollback_tmp=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX" 2>/dev/null) || rollback_tmp=
+        if [ -n "$rollback_tmp" ] \
+          && awk '!/^account_/ && !/^provider_session_id=/ && !/^continuation_packet=/' "$STATE/$ID.meta" > "$rollback_tmp" \
+          && printf 'rollback_pending=1\n' >> "$rollback_tmp" \
+          && fm_account_safe_file_destination "$STATE/$ID.meta" \
+          && mv "$rollback_tmp" "$STATE/$ID.meta"; then
+          rollback_tmp=
+        else
+          [ -z "$rollback_tmp" ] || rm -f "$rollback_tmp"
+          account_clean=0
+          echo "warning: failed to preserve rollback metadata for ${ID:-unknown}" >&2
+        fi
+      fi
+      if [ "$account_clean" = 1 ] && [ "$restored_existing_meta" != 1 ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$worktree_clean" = 1 ]; then
+        [ "$ORIGINAL_STATUS_PRESENT" != 0 ] || rm -f "$STATE/$ID.status"
+        [ "$ORIGINAL_TURN_ENDED_PRESENT" != 0 ] || rm -f "$STATE/$ID.turn-ended"
+        [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
+        [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
+        [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+      fi
+      if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
+        persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
+      fi
+    elif [ -n "$rollback_lock" ]; then
+      persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
+    fi
+    [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
+    rollback_lock=
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
+    fi
+  fi
+  [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
+  [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
+  [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
+  [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  LIFECYCLE_LOCK=
+  LIFECYCLE_LOCK_OWNED=0
   return "$status"
 }
-trap orca_spawn_abort_cleanup EXIT
+trap spawn_abort_cleanup EXIT
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -260,6 +896,13 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ -z "$ACCOUNT_POOL" ] || shared_args+=(--account-pool "$ACCOUNT_POOL")
+  [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
+  [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    echo "error: batch dispatch does not support account recovery; recover tasks individually" >&2
+    exit 1
+  fi
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -282,6 +925,33 @@ PROJ=
 ARG3=
 FIRSTMATE_HOME=
 
+if [ -z "$LIFECYCLE_LOCK" ]; then
+  LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  LIFECYCLE_LOCK_OWNED=1
+fi
+if [ "$RECOVERY_ACCOUNT" = 0 ]; then
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    current_spawn_meta=$(spawn_preflight_read_meta "$STATE/$ID.meta") || {
+      echo "error: unsafe metadata for spawn at $STATE/$ID.meta" >&2
+      exit 1
+    }
+    [ "$current_spawn_meta" = "$SPAWN_META_SNAPSHOT" ] || {
+      echo "error: task metadata changed before spawn mutation for $ID" >&2
+      exit 1
+    }
+  elif [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    echo "error: task metadata appeared before spawn mutation for $ID" >&2
+    exit 1
+  fi
+fi
+
+if [ -e "$STATE/$ID.status" ] || [ -L "$STATE/$ID.status" ]; then ORIGINAL_STATUS_PRESENT=1; else ORIGINAL_STATUS_PRESENT=0; fi
+if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGINAL_TURN_ENDED_PRESENT=1; else ORIGINAL_TURN_ENDED_PRESENT=0; fi
+if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
+if [ -e "$STATE/$ID.pi-ext.ts" ] || [ -L "$STATE/$ID.pi-ext.ts" ]; then ORIGINAL_PI_EXT_PRESENT=1; else ORIGINAL_PI_EXT_PRESENT=0; fi
+if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token" ]; then ORIGINAL_GROK_TOKEN_PRESENT=1; else ORIGINAL_GROK_TOKEN_PRESENT=0; fi
+if [ -e "/tmp/fm-$ID" ] || [ -L "/tmp/fm-$ID" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
+
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
     ''|claude|codex|opencode|pi|grok)
@@ -301,8 +971,87 @@ if [ "$KIND" = secondmate ]; then
       ;;
   esac
 else
-  PROJ=${POS[1]}
+  PROJ=${POS[1]:-}
   ARG3=${POS[2]:-}
+fi
+
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
+  [ -n "$RECORDED_KIND" ] || RECORDED_KIND=ship
+  if [ "$KIND" != ship ] && [ "$KIND" != "$RECORDED_KIND" ]; then
+    echo "error: account recovery kind '$KIND' does not match recorded kind '$RECORDED_KIND'" >&2
+    exit 1
+  fi
+  KIND=$RECORDED_KIND
+  RECORDED_HARNESS=$(fm_meta_get "$RESUME_META" harness)
+  RECORDED_PROFILE=$(fm_meta_get "$RESUME_META" account_profile)
+  RECORDED_POOL=$(fm_meta_get "$RESUME_META" account_pool)
+  RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+  RECORDED_ACCOUNT_TASK=$(fm_meta_get "$RESUME_META" account_task)
+  RECORDED_ATTEMPT=$(fm_meta_get "$RESUME_META" account_attempt)
+  RECORDED_PROJECT=$(fm_meta_get "$RESUME_META" project)
+  RECORDED_WORKTREE=$(fm_meta_get "$RESUME_META" worktree)
+  [ -n "$RECORDED_ACCOUNT_TASK" ] || RECORDED_ACCOUNT_TASK=$ID
+  [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
+  [ -n "$RECORDED_HARNESS" ] || { echo "error: managed recovery metadata has no harness for $ID" >&2; exit 1; }
+  [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
+  [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+    RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+    [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
+    if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
+      echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+      exit 1
+    fi
+    if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
+      echo "error: --resume-account pool override '$ACCOUNT_POOL' does not match recorded pool '$RECORDED_POOL'" >&2
+      exit 1
+    fi
+    if [ "$ACCOUNT_PROFILE_SET" = 1 ] && [ "$ACCOUNT_PROFILE" != "$RECORDED_PROFILE" ]; then
+      echo "error: --resume-account profile override '$ACCOUNT_PROFILE' does not match recorded profile '$RECORDED_PROFILE'" >&2
+      exit 1
+    fi
+    HARNESS_ARG=$RECORDED_HARNESS
+    ACCOUNT_POOL=$RECORDED_POOL
+    ACCOUNT_PROFILE=$RECORDED_PROFILE
+    ACCOUNT_POOL_SET=1
+    ACCOUNT_PROFILE_SET=1
+    ACCOUNT_TASK=$RECORDED_ACCOUNT_TASK
+    ACCOUNT_ATTEMPT=$RECORDED_ATTEMPT
+  else
+    [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
+    if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
+      if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+        ACCOUNT_POOL=$RECORDED_POOL
+      else
+        ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS_ARG") || {
+          echo "error: no default account pool for continuation harness '$HARNESS_ARG'" >&2
+          exit 1
+        }
+      fi
+      ACCOUNT_POOL_SET=1
+    fi
+    ACCOUNT_PREDECESSOR_TASK=$RECORDED_ACCOUNT_TASK
+    ACCOUNT_PREDECESSOR_ATTEMPT=$RECORDED_ATTEMPT
+    ACCOUNT_PREDECESSOR_PROVIDER=$RECORDED_HARNESS
+    ACCOUNT_PREDECESSOR_PROFILE=$RECORDED_PROFILE
+    ACCOUNT_PREDECESSOR_POOL=$RECORDED_POOL
+    ACCOUNT_PREDECESSOR_SESSION=$RECORDED_SESSION
+  fi
+  HARNESS_SET=1
+  ARG3=$HARNESS_ARG
+  if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+    [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
+    [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
+  fi
+  [ "$MODEL" = default ] && MODEL=
+  [ "$EFFORT" = default ] && EFFORT=
+  if [ "$KIND" = secondmate ]; then
+    FIRSTMATE_HOME=$(fm_meta_get "$RESUME_META" home)
+  else
+    PROJ=$(fm_meta_get "$RESUME_META" project)
+  fi
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
 
@@ -321,12 +1070,12 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
@@ -352,6 +1101,7 @@ launch_template() {
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
     LAUNCH=$ARG3
+    RAW_LAUNCH=1
     HARNESS=""
     for word in $LAUNCH; do
       case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
@@ -404,6 +1154,126 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
         *) echo "warning: config/secondmate-harness effort token '$SM_EFFORT' is not one of low, medium, high, xhigh, max; ignoring" >&2 ;;
       esac
     fi
+  fi
+fi
+
+ACCOUNT_EXPLICIT=0
+if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
+  ACCOUNT_EXPLICIT=1
+fi
+if [ "$KIND" = secondmate ]; then
+  ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 1
+fi
+ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
+  if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
+    ACCOUNT_POOL=$SM_ACCOUNT_POOL
+  else
+    sm_pool_status=$?
+    [ "$sm_pool_status" -eq 1 ] || exit "$sm_pool_status"
+  fi
+fi
+case "$HARNESS" in
+  claude|codex) ;;
+  *)
+    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+      echo "error: --account-pool/--account-profile requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
+    if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+      echo "error: enforced account routing requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
+    ACCOUNT_EFFECTIVE_MODE=off
+    ;;
+esac
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
+  if [ -n "$ACCOUNT_PROFILE" ]; then
+    ACCOUNT_POOL=explicit
+  else
+    ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS") || {
+      echo "error: no default account pool for harness '$HARNESS'" >&2
+      exit 1
+    }
+  fi
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$RAW_LAUNCH" = 1 ]; then
+  echo "error: enforced account routing does not accept raw launch commands" >&2
+  exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = orca ]; then
+  echo "error: enforced Agent Fleet routing does not support backend=orca" >&2
+  exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$RESUME_ACCOUNT" != 1 ]; then
+  ACCOUNT_ATTEMPT=$(fm_account_attempt_id "$FM_HOME" "$ID") || exit 1
+  ACCOUNT_TASK=$(fm_account_task_key "$FM_HOME" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  SPAWN_GENERATION_ID="account:$ACCOUNT_TASK:$ACCOUNT_ATTEMPT"
+else
+  SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
+  fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    current_recovery_task=$(fm_meta_get "$RESUME_META" account_task)
+    current_recovery_attempt=$(fm_meta_get "$RESUME_META" account_attempt)
+    [ -n "$current_recovery_task" ] || current_recovery_task=$ID
+    [ -n "$current_recovery_attempt" ] || current_recovery_attempt=legacy
+    if [ ! -f "$RESUME_META" ] \
+      || [ "$current_recovery_task" != "$RECORDED_ACCOUNT_TASK" ] \
+      || [ "$current_recovery_attempt" != "$RECORDED_ATTEMPT" ] \
+      || [ "$(fm_meta_get "$RESUME_META" harness)" != "$RECORDED_HARNESS" ] \
+      || [ "$(fm_meta_get "$RESUME_META" account_profile)" != "$RECORDED_PROFILE" ] \
+      || [ "$(fm_meta_get "$RESUME_META" account_pool)" != "$RECORDED_POOL" ] \
+      || [ "$(fm_meta_get "$RESUME_META" project)" != "$RECORDED_PROJECT" ] \
+      || [ "$(fm_meta_get "$RESUME_META" worktree)" != "$RECORDED_WORKTREE" ] \
+      || [ "$(fm_backend_of_meta "$RESUME_META")" != "$BACKEND" ] \
+      || [ -n "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] \
+      || [ -n "$(fm_meta_get "$RESUME_META" account_predecessor_cleanup)" ]; then
+      echo "error: managed task generation changed before recovery mutation for $ID" >&2
+      exit 1
+    fi
+    META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
+    cp -p "$RESUME_META" "$META_BACKUP" || exit 1
+  fi
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
+fi
+EXISTING_META=0
+EXISTING_REPORT_REQUIRED_SET=0
+EXISTING_REPORT_REQUIRED=
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
+  EXISTING_META=1
+  if grep -q '^report_required=' "$STATE/$ID.meta"; then
+    EXISTING_REPORT_REQUIRED_SET=1
+    EXISTING_REPORT_REQUIRED=$(fm_meta_get "$STATE/$ID.meta" report_required)
+  fi
+  if [ "$(fm_meta_get "$STATE/$ID.meta" rollback_pending)" = 1 ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_rollback_cleanup)" = pending ]; then
+    echo "error: rollback cleanup is pending for $ID; tear down the retained task state before spawning again" >&2
+    exit 1
+  fi
+  existing_profile=$(fm_meta_get "$STATE/$ID.meta" account_profile)
+  [ -z "$existing_profile" ] || {
+    echo "error: managed metadata already exists for $ID; use --resume-account or --continue-account" >&2
+    exit 1
+  }
+  existing_backend=$(fm_backend_of_meta "$STATE/$ID.meta")
+  existing_target=$(fm_backend_target_of_meta "$STATE/$ID.meta")
+  existing_endpoint_state=$(fm_backend_target_state "$existing_backend" "$existing_target" "fm-$ID" "$(fm_meta_get "$STATE/$ID.meta" tmux_session_target)" 2>/dev/null)
+  case "$existing_endpoint_state" in
+    absent) ;;
+    present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
+    *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
+  esac
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
+    cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
+    snapshot_existing_artifacts || exit 1
   fi
 fi
 
@@ -560,6 +1430,23 @@ validate_firstmate_home_for_spawn() {
   printf '%s\n' "$abs_home"
 }
 
+secondmate_home_supports_account_routing() {
+  local home=$1
+  [ -f "$home/bin/fm-account-routing-lib.sh" ] \
+    && [ -f "$home/bin/fm-spawn.sh" ] \
+    && grep -q '^fm_account_resolve_mode()' "$home/bin/fm-account-routing-lib.sh" \
+    && grep -Fq "ACCOUNT_EFFECTIVE_MODE=\$(fm_account_resolve_mode" "$home/bin/fm-spawn.sh"
+}
+
+secondmate_routing_config_inherited() {
+  local report=$1 status
+  status=$(awk -F '\t' '$1 == "account-routing-mode" { value=$2 } END { print value }' "$report" 2>/dev/null)
+  case "$status" in
+    pushed|unchanged) return 0 ;;
+  esac
+  return 1
+}
+
 validate_firstmate_operational_dirs() {
   local abs_home=$1 abs_active_home=$2 abs_root=$3 name dir abs_dir
   for name in data state config projects; do
@@ -604,6 +1491,35 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
   PROJ_ABS=$(validate_firstmate_home_for_spawn "$ID" "$FIRSTMATE_HOME")
   WT="$PROJ_ABS"
+else
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    PROJ_ABS=$(fm_meta_get "$RESUME_META" project)
+    WT=$(fm_meta_get "$RESUME_META" worktree)
+    [ -n "$PROJ_ABS" ] && [ -d "$PROJ_ABS" ] || { echo "error: recorded project is unavailable for managed recovery: ${PROJ_ABS:-<missing>}" >&2; exit 1; }
+    [ -n "$WT" ] && [ -d "$WT" ] || { echo "error: recorded worktree is unavailable for managed recovery: ${WT:-<missing>}" >&2; exit 1; }
+  else
+    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+    WT=""
+  fi
+fi
+
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
+  RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" "$(fm_meta_get "$RESUME_META" tmux_session_target)" 2>/dev/null)
+  case "$RECOVERY_ENDPOINT_STATE" in
+    absent) ;;
+    present)
+      echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: managed recovery endpoint state is unknown for $ID; refusing to create a duplicate" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ "$KIND" = secondmate ]; then
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
   # recovery-respawned secondmate always runs the primary's version (AGENTS.md
@@ -631,19 +1547,53 @@ if [ "$KIND" = secondmate ]; then
   # primary-authoritative and re-pushed on every convergence. config/secondmate-harness
   # is the primary's own knob and is deliberately NOT in the inheritable set
   # (fm-config-inherit-lib.sh). A primary with no inheritable config set is a no-op.
-  propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config" \
-    || echo "warning: secondmate $ID config inheritance failed for $PROJ_ABS/config" >&2
+  CONFIG_INHERIT_REPORT_TMP=$(mktemp "$STATE/.fm-config-inherit.$ID.XXXXXX") || exit 1
+  if ! FM_CONFIG_INHERIT_REPORT="$CONFIG_INHERIT_REPORT_TMP" \
+    propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config"; then
+    echo "warning: secondmate $ID config inheritance failed for $PROJ_ABS/config" >&2
+  fi
+  if ! secondmate_routing_config_inherited "$CONFIG_INHERIT_REPORT_TMP"; then
+    echo "error: refusing secondmate launch for $PROJ_ABS: account-routing-mode inheritance did not succeed. Reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+    exit 1
+  fi
+  if sm_inherited_routing_mode=$(fm_account_read_single_value "$PROJ_ABS/config/account-routing-mode" 2>/dev/null); then
+    :
+  else
+    sm_routing_status=$?
+    [ "$sm_routing_status" -eq 1 ] || {
+      echo "error: refusing secondmate launch for $PROJ_ABS: the inherited account-routing-mode is unreadable. Run bin/fm-config-push.sh and retry." >&2
+      exit 1
+    }
+    sm_inherited_routing_mode=off
+  fi
+  if [ "$sm_inherited_routing_mode" != "$ACCOUNT_PRIMARY_MODE" ]; then
+    echo "error: refusing secondmate launch for $PROJ_ABS: the primary's $ACCOUNT_PRIMARY_MODE routing mode is not authoritative in the home. Run bin/fm-config-push.sh and retry." >&2
+    exit 1
+  fi
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      exit 1
+    fi
+  elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+    echo "warning: secondmate $ID home $PROJ_ABS lacks Agent Fleet routing support; launching because account routing is $ACCOUNT_EFFECTIVE_MODE" >&2
+  fi
+  rm -f "$CONFIG_INHERIT_REPORT_TMP"
+  CONFIG_INHERIT_REPORT_TMP=
   if [ -f "$PROJ_ABS/data/charter.md" ]; then
     BRIEF="$PROJ_ABS/data/charter.md"
   else
     BRIEF="$DATA/$ID/brief.md"
   fi
 else
-  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
-  WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
-[ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+if [ "$RECOVERY_ACCOUNT" != 1 ]; then
+  [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+fi
+if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
+  fm_completion_report_contract_ensure "$DATA" "$ID" "$BRIEF"
+fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
@@ -692,7 +1642,50 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+  CONTINUATION_RESULT=$(FM_ACCOUNT_CONTINUATION_EMIT_PROMPT_B64=1 \
+    "$SCRIPT_DIR/fm-account-continuation.sh" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
+  case "$CONTINUATION_RESULT" in *$'\n'*) ;; *) echo "error: continuation prompt snapshot is incomplete for $ID" >&2; exit 1 ;; esac
+  CONTINUATION_PACKET=${CONTINUATION_RESULT%%$'\n'*}
+  CONTINUATION_PROMPT_B64=${CONTINUATION_RESULT#*$'\n'}
+  CONTINUATION_LAUNCH_DIR=$(mktemp -d "$STATE/.$ID.continuation-launch.XXXXXX") \
+    || { echo "error: cannot stage continuation native prompt for $ID" >&2; exit 1; }
+  chmod 700 "$CONTINUATION_LAUNCH_DIR" || exit 1
+  CONTINUATION_PROMPT_FILE="$CONTINUATION_LAUNCH_DIR/prompt"
+  if ! CONTINUATION_PROMPT_IDENTITIES=$(printf '%s' "$CONTINUATION_PROMPT_B64" | python3 -c '
+import base64, hashlib, os, sys
+data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+parent_path, name = os.path.split(os.path.abspath(sys.argv[1]))
+parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+try:
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+    os.fsync(fd)
+    parent = os.fstat(parent_fd)
+    prompt = os.fstat(fd)
+    sys.stdout.write(f"{parent.st_dev}:{parent.st_ino}\n{prompt.st_dev}:{prompt.st_ino}\n{hashlib.sha256(data).hexdigest()}\n")
+finally:
+    os.close(fd)
+    os.close(parent_fd)
+' "$CONTINUATION_PROMPT_FILE"); then
+    echo "error: continuation prompt snapshot cannot be transported byte-verbatim for $ID" >&2
+    exit 1
+  fi
+  CONTINUATION_PROMPT_DIR_ID=${CONTINUATION_PROMPT_IDENTITIES%%$'\n'*}
+  CONTINUATION_PROMPT_REMAINDER=${CONTINUATION_PROMPT_IDENTITIES#*$'\n'}
+  CONTINUATION_PROMPT_FILE_ID=${CONTINUATION_PROMPT_REMAINDER%%$'\n'*}
+  CONTINUATION_PROMPT_CONTENT_ID=${CONTINUATION_PROMPT_REMAINDER#*$'\n'}
+  [ -n "$CONTINUATION_PROMPT_DIR_ID" ] && [ -n "$CONTINUATION_PROMPT_FILE_ID" ] \
+    && [ -n "$CONTINUATION_PROMPT_CONTENT_ID" ] \
+    || { echo "error: continuation native prompt identity is unavailable for $ID" >&2; exit 1; }
+  BRIEF=$CONTINUATION_PACKET
+fi
+
 W="fm-$ID"
+SPAWN_CWD=$PROJ_ABS
+[ "$RECOVERY_ACCOUNT" != 1 ] || SPAWN_CWD=$WT
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -703,7 +1696,8 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_CWD") || exit 1
+    ENDPOINT_CREATED=1
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -722,7 +1716,7 @@ case "$BACKEND" in
     if [ "$KIND" = secondmate ]; then
       HERDR_LABEL_HOME=$PROJ_ABS
     fi
-    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
+    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$SPAWN_CWD") || exit 1
     # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
     # (the second field empty when this call ADOPTED a pre-existing workspace
     # rather than creating a fresh one). Split on the guaranteed single tab
@@ -733,7 +1727,7 @@ case "$BACKEND" in
     HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
     HERDR_SES=${CONTAINER%%:*}
     HERDR_WORKSPACE_ID=${CONTAINER#*:}
-    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_CWD" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
     read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -742,10 +1736,11 @@ EOF
       exit 1
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
+    ENDPOINT_CREATED=1
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_CWD") || exit 1
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -754,10 +1749,11 @@ EOF
       exit 1
     fi
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
+    ENDPOINT_CREATED=1
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_CWD") || exit 1
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -766,6 +1762,7 @@ EOF
       exit 1
     fi
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
+    ENDPOINT_CREATED=1
     ;;
   orca)
     set +e
@@ -791,8 +1788,13 @@ EOF
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
     T="$ORCA_TERMINAL"
+    ENDPOINT_CREATED=1
+    WORKTREE_CREATED=1
     ;;
 esac
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  persist_failed_account_rollback_short || exit 1
+fi
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
 # its rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
 # Every other backend addresses its pane/surface by the id already in $T, so default
@@ -834,7 +1836,7 @@ spawn_send_key() {  # <target> <key>
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
 }
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -859,6 +1861,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
+  WORKTREE_CREATED=1
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -873,6 +1876,7 @@ mkdir -p "$TASK_TMP/gotmp"
 # agent finishes a turn. Worktree-resident hooks are kept out of git's view so
 # they never block teardown's dirty check or leak into a commit.
 mkdir -p "$STATE"
+fm_account_real_directory "$STATE" || { echo "error: unsafe state directory at $STATE" >&2; exit 1; }
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
 exclude_path() {
@@ -988,8 +1992,68 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS"; then
+      ACCOUNT_LEASE_CREATED=1
+    else
+      persist_failed_account_rollback_short || true
+      exit 1
+    fi
+    persist_failed_account_rollback_short || exit 1
+    fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
+  else
+    persist_failed_account_rollback_short || exit 1
+    if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
+      :
+    else
+      account_select_status=$?
+      if [ "$account_select_status" -eq 2 ]; then
+        ACCOUNT_LEASE_CREATED=1
+        persist_failed_account_rollback_short || true
+      fi
+      exit 1
+    fi
+    ACCOUNT_PROFILE=$FM_ACCOUNT_SELECTED_PROFILE
+    ACCOUNT_LEASE_CREATED=1
+    FM_ACCOUNT_MUTATION_ACQUIRED=0
+    persist_failed_account_rollback_short || exit 1
+    fm_account_lineage_append "$DATA" "$ID" reserved "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" || exit 1
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+lifecycle_lock_valid=0
+if [ -n "$LIFECYCLE_LOCK" ]; then
+  if [ "$LIFECYCLE_LOCK_OWNED" = 1 ]; then
+    fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK" && lifecycle_lock_valid=1
+  elif [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" = "$LIFECYCLE_LOCK" ]; then
+    current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
+    case "$current_lock_identity" in
+      *$'\n'*)
+        current_lock_pid=${current_lock_identity%%$'\n'*}
+        current_lock_start=${current_lock_identity#*$'\n'}
+        if [ "$current_lock_pid" = "$LIFECYCLE_LOCK_INHERITED_PID" ] \
+          && [ "$current_lock_start" = "$LIFECYCLE_LOCK_INHERITED_START" ]; then
+          lifecycle_lock_valid=1
+        fi
+        ;;
+    esac
+  fi
+fi
+if [ "$lifecycle_lock_valid" != 1 ]; then
+  echo "error: managed lifecycle lock was lost before metadata install for $ID" >&2
+  exit 1
+fi
+META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
+    echo "error: managed task generation changed before metadata install for $ID" >&2
+    exit 1
+  fi
+fi
+META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
 {
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
@@ -1001,10 +2065,52 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  echo "generation_id=$SPAWN_GENERATION_ID"
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    if grep -q '^report_required=' "$RESUME_META"; then
+      RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
+      echo "report_required=$RECORDED_REPORT_REQUIRED"
+    fi
+  elif [ "$EXISTING_META" = 1 ]; then
+    [ "$EXISTING_REPORT_REQUIRED_SET" = 0 ] || echo "report_required=$EXISTING_REPORT_REQUIRED"
+  else
+    # Every NEW task is report-required; new report-required Orca spawns were
+    # already refused before any owned mutation (the backend=orca gate after
+    # task-id resolution above).
+    echo "report_required=1"
+  fi
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    echo "account_pool=$ACCOUNT_POOL"
+    echo "account_profile=$ACCOUNT_PROFILE"
+    echo "account_task=$ACCOUNT_TASK"
+    echo "account_attempt=$ACCOUNT_ATTEMPT"
+    [ -z "$ACCOUNT_PREDECESSOR_TASK" ] || echo "account_predecessor_task=$ACCOUNT_PREDECESSOR_TASK"
+    [ -z "$ACCOUNT_PREDECESSOR_ATTEMPT" ] || echo "account_predecessor_attempt=$ACCOUNT_PREDECESSOR_ATTEMPT"
+    [ -z "$ACCOUNT_PREDECESSOR_PROVIDER" ] || echo "account_predecessor_provider=$ACCOUNT_PREDECESSOR_PROVIDER"
+    [ -z "$ACCOUNT_PREDECESSOR_PROFILE" ] || echo "account_predecessor_profile=$ACCOUNT_PREDECESSOR_PROFILE"
+    [ -z "$ACCOUNT_PREDECESSOR_POOL" ] || echo "account_predecessor_pool=$ACCOUNT_PREDECESSOR_POOL"
+    [ -z "$ACCOUNT_PREDECESSOR_SESSION" ] || echo "account_predecessor_session=$ACCOUNT_PREDECESSOR_SESSION"
+    [ "$CONTINUE_ACCOUNT" != 1 ] || echo "account_predecessor_cleanup=pending"
+    [ -z "$CONTINUATION_PACKET" ] || echo "continuation_packet=$CONTINUATION_PACKET"
+    if [ "$RESUME_ACCOUNT" = 1 ]; then
+      echo "provider_session_id=$RECORDED_SESSION"
+    fi
+    echo "account_rollback_cleanup=pending"
+    rollback_backup_name=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_backup)
+    rollback_artifacts_name=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_artifacts)
+    rollback_preserve_session=$(fm_account_meta_value "$STATE/$ID.meta" account_rollback_preserve_session)
+    [ -z "$rollback_backup_name" ] || echo "account_rollback_backup=$rollback_backup_name"
+    [ -z "$rollback_artifacts_name" ] || echo "account_rollback_artifacts=$rollback_artifacts_name"
+    [ -z "$rollback_preserve_session" ] || echo "account_rollback_preserve_session=$rollback_preserve_session"
+  fi
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = tmux ]; then
+    echo "tmux_window_id=$WID"
+    echo "tmux_session_target=$META_WINDOW"
+  fi
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
@@ -1028,16 +2134,77 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-} > "$STATE/$ID.meta"
+} > "$META_TMP"
+if [ -f "$STATE/$ID.meta" ]; then
+  # Preserve every extension field not owned by this spawn rewrite (PR/X-mode
+  # pointers and future additive metadata) while replacing endpoint identity.
+  PRESERVE_META_SOURCE="$STATE/$ID.meta"
+  fm_account_meta_merge_extensions "$PRESERVE_META_SOURCE" "$META_TMP" || exit 1
+fi
+fm_account_safe_file_destination "$STATE/$ID.meta" || { echo "error: unsafe task metadata destination at $STATE/$ID.meta" >&2; exit 1; }
+mv "$META_TMP" "$STATE/$ID.meta"
+META_INSTALLED=1
+[ -z "$META_WRITE_LOCK" ] || fm_account_meta_lock_release "$META_WRITE_LOCK"
+META_WRITE_LOCK=
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
+if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+  continuation_prompt_command="\$(cat __BRIEF__)"
+  continuation_prompt_marker="\"$continuation_prompt_command\""
+  case "$HARNESS" in
+    claude) continuation_prompt_reference= ;;
+    codex) continuation_prompt_reference= ;;
+    *) echo "error: continuation native prompt launch supports only claude and codex" >&2; exit 1 ;;
+  esac
+  LAUNCH=${LAUNCH//$continuation_prompt_marker/$continuation_prompt_reference}
+  case "$LAUNCH" in *"$continuation_prompt_command"*) echo "error: continuation prompt was not bound to its verified generation" >&2; exit 1 ;; esac
+fi
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
+if [ "$RESUME_ACCOUNT" = 1 ]; then
+  case "$HARNESS:$KIND" in
+    claude:*) LAUNCH='CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__' ;;
+    codex:secondmate) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox' ;;
+    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]"' ;;
+    *) echo "error: managed recovery supports only claude and codex" >&2; exit 1 ;;
+  esac
+fi
+AGENT_COMMAND=$HARNESS
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    rm -rf "$STATE/.$ID.account-native-launch" "$STATE/.$ID.account-native-ready" "$STATE/.$ID.account-native-go" || exit 1
+    ACCOUNT_NATIVE_LAUNCH_DIR=$(mktemp -d "$STATE/.$ID.account-native-launch.XXXXXX") || exit 1
+    chmod 700 "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
+    ACCOUNT_NATIVE_LAUNCH_SCRIPT="$ACCOUNT_NATIVE_LAUNCH_DIR/account-native-launch"
+    ACCOUNT_NATIVE_LAUNCH_READY="$ACCOUNT_NATIVE_LAUNCH_DIR/ready"
+    ACCOUNT_NATIVE_LAUNCH_GO="$ACCOUNT_NATIVE_LAUNCH_DIR/go"
+    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK") || exit 1
+    native_ready_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_READY")
+    native_go_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_GO")
+    if ! ( set -C; cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euC
+: > $native_ready_q
+while [ ! -f $native_go_q ]; do sleep 0.05; done
+rm -f $native_ready_q $native_go_q
+exec $resume_command "\$@"
+EOF
+    ); then
+      echo "error: could not create private native provider launch wrapper for $ID" >&2
+      exit 1
+    fi
+    chmod +x "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
+    AGENT_COMMAND=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_SCRIPT")
+  else
+    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK") || exit 1
+  fi
+fi
+LAUNCH=${LAUNCH//__AGENT__/$AGENT_COMMAND}
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
@@ -1049,6 +2216,10 @@ if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
 fi
+if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+  continuation_launch_command=$LAUNCH
+  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
+fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
@@ -1057,5 +2228,67 @@ sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
+
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
+  if [ "$RESUME_ACCOUNT" = 1 ]; then
+    native_ready_wait=${FM_ACCOUNT_NATIVE_READY_WAIT_SECONDS:-5}
+    case "$native_ready_wait" in ''|*[!0-9]*) echo "error: invalid native launch ready wait '$native_ready_wait'" >&2; exit 1 ;; esac
+    native_ready_deadline=$(( $(date +%s) + native_ready_wait ))
+    while [ ! -f "$ACCOUNT_NATIVE_LAUNCH_READY" ]; do
+      [ "$(date +%s)" -lt "$native_ready_deadline" ] || {
+        echo "error: native provider wrapper for $ID did not reach its launch gate" >&2
+        exit 1
+      }
+      sleep 0.05
+    done
+    RECORDED_SESSION_UPDATED_AT=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
+    sleep 1
+    ( set -C; : > "$ACCOUNT_NATIVE_LAUNCH_GO" ) || exit 1
+    session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
+  fi
+  if ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
+    echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
+    exit 1
+  fi
+  [ -z "$ACCOUNT_NATIVE_LAUNCH_DIR" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
+  ACCOUNT_NATIVE_LAUNCH_DIR=
+  ACCOUNT_NATIVE_LAUNCH_GO=
+  ACCOUNT_NATIVE_LAUNCH_READY=
+  ACCOUNT_NATIVE_LAUNCH_SCRIPT=
+  COMMIT_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" "$META_WINDOW" 2>/dev/null)
+  case "$COMMIT_ENDPOINT_STATE" in
+    present) ;;
+    absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;
+    *) echo "error: managed endpoint state is unknown before launch commit for $ID" >&2; exit 1 ;;
+  esac
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
+    echo "error: managed task generation changed before launch commit for $ID" >&2
+    exit 1
+  fi
+  clear_account_rollback_markers || { echo "error: failed to commit managed rollback metadata for $ID" >&2; exit 1; }
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
+  ACCOUNT_SPAWN_COMMITTED=1
+  [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
+  META_BACKUP=
+  discard_existing_artifact_backup
+  if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+    if ! fm_account_cleanup_predecessor_serialized "$STATE/$ID.meta" "$DATA" "$ID"; then
+      echo "error: predecessor Agent Fleet cleanup remains pending for $ID" >&2
+      exit 1
+    fi
+  fi
+fi
+[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
+CONTINUATION_LAUNCH_DIR=
+CONTINUATION_PROMPT_FILE=
+[ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"
+META_BACKUP=
+discard_existing_artifact_backup
+[ "$LIFECYCLE_LOCK_OWNED" != 1 ] || [ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
+LIFECYCLE_LOCK=
+LIFECYCLE_LOCK_OWNED=0
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

@@ -61,7 +61,7 @@ Stalled escalation delivery writes `state/.subsuper-inject-wedged` and attempts 
 
 The runtime backend is the session-provider layer below firstmate's scripts.
 It owns task endpoint creation, bounded capture, text/key sends, current-path reads for spawn-time worktree discovery when the backend does not create the worktree itself, live-window fallback lookup, agent-process liveness probes where verified, and endpoint teardown.
-`bin/fm-backend.sh` centralizes backend selection, `state/<id>.meta` helpers, selector resolution, and operation dispatch; `bin/backends/tmux.sh` is the verified reference adapter ([`docs/tmux-backend.md`](tmux-backend.md)), and `bin/backends/herdr.sh` (P2), `bin/backends/zellij.sh` (P3), `bin/backends/orca.sh` (P4), and `bin/backends/cmux.sh` (P5) are experimental task-spawn adapters.
+`bin/fm-backend.sh` centralizes backend selection, `state/<id>.meta` helpers, selector resolution, and operation dispatch; `bin/backends/tmux.sh` is the verified reference adapter ([`docs/tmux-backend.md`](tmux-backend.md)), `bin/backends/herdr.sh` (P2), `bin/backends/zellij.sh` (P3), and `bin/backends/cmux.sh` (P5) are experimental new-task spawn adapters, and `bin/backends/orca.sh` (P4) remains an experimental legacy-task lifecycle adapter.
 New spawns select a backend from `--backend`, then `FM_BACKEND`, then local `config/backend`, then runtime auto-detection from `$TMUX`, `HERDR_ENV=1`, or cmux runtime signals, then default `tmux`.
 Runtime auto-detection is innermost-first: `$TMUX` wins over `HERDR_ENV=1`, which wins over cmux's primary `CMUX_WORKSPACE_ID` marker and documented fallback signals; auto-detected herdr or cmux prints a one-time opt-out notice, auto-detected tmux stays silent, and zellij and orca are never auto-detected (only explicit selection).
 Unknown backend names fail loudly.
@@ -74,14 +74,15 @@ Herdr is experimental and can be selected explicitly or by runtime auto-detectio
 Herdr's container shape is workspace-per-home plus tab-per-task: the primary home uses workspace label `firstmate`, secondmate homes use `2ndmate-<secondmate-id>`, and recovery/list-live scopes to the current `FM_HOME`'s workspace.
 Zellij is experimental and selected only explicitly: treehouse remains its worktree provider too, and its full verification - the resolved "gaps to verify" list from the original design report, the unconditional-exit-0 CLI quirk and its mitigation, the focus-steal-on-new-tab finding, the home-scoped tab-title collision fix, and known gaps - is recorded in `docs/zellij-backend.md`.
 Zellij's container shape is simpler than herdr's: one shared `firstmate` session, one tab per task, with no per-home workspace split; visible tab titles are scoped by the active home label plus a short hash of the resolved `FM_ROOT` path.
-Orca is experimental and selected only explicitly: Orca owns both worktree and terminal lifecycle, records `orca_worktree_id=` and `terminal=`, and removes worktrees through `orca worktree rm` only after the usual firstmate teardown checks pass. Its current behavior and limitations are recorded in `docs/orca-backend.md`.
+Orca is experimental and selected only explicitly for eligible pre-cutover tasks: Orca owns both worktree and terminal lifecycle, records `orca_worktree_id=` and `terminal=`, and removes worktrees through `orca worktree rm` only after the usual firstmate teardown checks pass.
+New tasks refuse Orca; [docs/orca-backend.md](orca-backend.md#eligibility) owns the rationale and exact legacy eligibility rule.
 cmux is experimental, GUI-first, macOS-only, and can be selected explicitly or by runtime auto-detection from its primary `CMUX_WORKSPACE_ID` marker plus documented fallback signals: treehouse remains its worktree provider (cmux is a session provider only, like herdr/zellij), and its full verification - the socket access setup requirement with Automation mode recommended, the read-screen-fails-on-a-fresh-surface finding, the close-surface-refuses-on-the-last-surface finding, the source-verified runtime marker and fallback behavior, and known gaps - is recorded in `docs/cmux-backend.md`.
 cmux's container shape is one workspace per task with one surface, no per-home container split; workspace titles are scoped by the active home label plus a short hash of the resolved `FM_ROOT` path, and `--secondmate` spawns are refused, mirroring Orca.
 Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectable as a runtime backend.
 
 ## Worktrees, not branches in your checkout
 
-Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
+Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for new tmux, herdr, zellij, and cmux tasks, while an eligible legacy Orca respawn creates its own worktree.
 For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
@@ -98,24 +99,36 @@ Ship briefs also tell the crewmate to verify `pwd -P` and `git rev-parse --show-
 
 Firstmate's own no-mistakes gate runs agents inside a checkout that also contains the fleet-captain identity in `AGENTS.md`, so gate execution needs an authority boundary separate from ordinary crewmate worktree isolation.
 The tracked `.no-mistakes.yaml` sets `disable_project_settings: true`; no-mistakes honors that setting only from the trusted default-branch copy, so a pushed branch cannot enable its own project instructions during validation.
-Independently, `fm-spawn.sh`, `fm-send.sh`, and `fm-teardown.sh` source `bin/fm-gate-refuse-lib.sh` and exit with status 3 before fleet mutation when the gate environment marker is present or the current checkout matches the default no-mistakes gate-repository topology.
+Independently, every directly invocable fleet, project, X-mode, watcher, wake-drain, report-stack, and merge mutator uses `bin/fm-gate-refuse-lib.sh`'s boundary and exits with status 3 before mutation when the gate environment marker is present or the current checkout matches the default no-mistakes gate-repository topology.
 A normal primary checkout or crewmate worktree has neither signal and remains unaffected.
-The helper's header owns the exact signal detection, relocated-home limitation, test-harness bypass, and relationship to no-mistakes' HEAD-continuity guard.
+The helper's header owns the exact guarded-entrypoint decision list, signal detection, relocated-home limitation, test-harness bypass, and relationship to no-mistakes' HEAD-continuity guard.
 
 ## Two task shapes
 
-Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
+Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`), then leave a completion report at `data/<id>/completion.md`.
+Scout tasks investigate, plan, reproduce bugs, or audit, then leave their report at `data/<id>/report.md` and never push.
+For tasks created after the report-stack cutover, both reports follow the same completion sections and publish through fail-closed teardown to the machine-global stack described in [report-stack.md](report-stack.md).
+
+## Durable completion reports
+
+Every post-cutover ship and scout task records `report_required=1`, produces a standalone completion report with optional visual artifacts, and publishes it before account lease release or worktree removal.
+The resulting machine-global stack is independent of Firstmate homes and Claude or Codex account profiles, so account recovery, cross-provider continuation, and home retirement do not strand the completion record.
+Publication is idempotent, fail-closed, and searchable; [report-stack.md](report-stack.md) owns the report schema, stored entry, teardown ordering, compatibility path, and browsing commands.
 
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.
-The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule directly or through a supported selector, and passes only concrete `--harness`, `--model`, and `--effort` axes to `fm-spawn.sh`.
+The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule directly or through a supported selector, and passes concrete harness/model/effort plus optional Agent Fleet account-pool/profile axes to `fm-spawn.sh`.
 The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns deterministic selector behavior, but they do not parse task intent or match the natural-language rules.
 The session-start bootstrap step surfaces either the active rule block or a concise invalid-config line at startup.
 When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit harness, so `config/crew-harness` is only automatic when no dispatch profile file is active.
 Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
+The account axis is independent across the supported tmux, Herdr, zellij, and cmux session backends, while enforced Agent Fleet routing rejects Orca until managed Orca recovery exists.
+Routing remains default-off and adds no managed account fields or provider wrapper until an explicit account flag or enforce policy enables it; observe performs only a dry-run selection.
+For quota-balanced account-pool candidates, dispatch compares Agent Fleet pool summaries and then atomically leases within the winning pool, never mixing that decision with quota-axi's default-account view.
+Enforced routing rejects poolless quota-balanced candidates, while off and observe retain the legacy quota-only selector path.
 
 ## Optional secondmates
 
@@ -138,6 +151,9 @@ Idle secondmate panes are healthy; teardown is explicit and refuses while the se
 
 Secondmate homes converge conservatively to the primary's version and declared inheritable configuration at launch and during locked session start.
 The [`secondmate-provisioning` skill](../.agents/skills/secondmate-provisioning/SKILL.md) owns the full guarded sync, propagation, nudge, and mid-session configuration-push contract.
+
+`config/secondmate-account-pool` is a primary-owned, non-inherited selection knob for secondmate launches when account routing is already enabled.
+`config/account-routing-mode` is inherited so the secondmate applies the same routing policy to its own crews without inheriting the primary's secondmate-only pool.
 
 Secondmate agents can run on a different verified harness than crewmates.
 `config/secondmate-harness` controls the primary's secondmate launch harness and may also carry optional model and effort tokens as `<harness> [<model>] [<effort>]` on the first non-empty, non-comment line.

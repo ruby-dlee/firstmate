@@ -143,6 +143,24 @@ test_herdr_agent_alive_maps_pane_agent_state() {
   pass "fm_backend_herdr_agent_alive: dead/no-agent->dead, live->alive, unknown->unknown"
 }
 
+test_herdr_agent_alive_preserves_identity_state() {
+  local out
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "absent"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = dead ] || fail "a confirmed absent expected Herdr pane should classify as dead, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "match"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = alive ] || fail "a matching Herdr pane should proceed to agent-state inspection, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "mismatch"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = unknown ] || fail "a mismatched expected Herdr pane should classify as unknown, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_identity_state() { printf "unknown"; }; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1" "fm-secondmate"' "$ROOT")
+  [ "$out" = unknown ] || fail "an inconclusive expected Herdr identity should classify as unknown, got '$out'"
+
+  pass "fm_backend_herdr_agent_alive: preserves absent/match/mismatch/unknown identity states"
+}
+
 # --- unit level: the generic fm_backend_agent_alive dispatcher --------------
 
 test_agent_alive_dispatcher_routes_and_falls_back() {
@@ -207,10 +225,58 @@ make_liveness_tmux() {
 set -u
 case "${1:-}" in
   display-message)
-    for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
-    exit 0 ;;
-  new-window|kill-window)
+    for a in "$@"; do
+      case "$a" in
+        *pane_current_command*)
+          [ -z "${FM_TEST_PROBE_LOG:-}" ] || printf 'probe\n' >> "$FM_TEST_PROBE_LOG"
+          if [ -n "${FM_TEST_PANE_CMD_FILE:-}" ]; then
+            cat "$FM_TEST_PANE_CMD_FILE"
+          else
+            printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"
+          fi
+          exit 0
+          ;;
+      esac
+    done
+    [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]
+    exit $? ;;
+  kill-window)
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    rm -f "$FM_TEST_ENDPOINT_FILE"
+    exit 0 ;;
+  new-window)
+    printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    touch "$FM_TEST_ENDPOINT_FILE"
+    exit 0 ;;
+  send-keys)
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = -l ]; then
+        case "$arg" in
+          *account-native-launch*)
+            native_path=$(printf '%s\n' "$arg" | sed -n "s#.*'\([^']*/account-native-launch\)'.*#\1#p")
+            [ -z "$native_path" ] \
+              || printf '%s\n' "${native_path%/account-native-launch}" > "${FM_MANAGED_NATIVE_DIR_FILE:?}"
+            ;;
+        esac
+      fi
+      prev=$arg
+    done
+    case "$*" in
+      *' Enter')
+        if [ -f "${FM_MANAGED_NATIVE_DIR_FILE:-/nonexistent}" ]; then
+          native_dir=$(cat "$FM_MANAGED_NATIVE_DIR_FILE")
+          touch "$native_dir/ready"
+          (
+            for _ in $(seq 1 200); do
+              [ -f "$native_dir/go" ] && break
+              sleep 0.05
+            done
+            [ ! -f "$native_dir/go" ] || touch "${FM_MANAGED_SESSION_REFRESHED:?}"
+          ) </dev/null >/dev/null 2>&1 &
+        fi
+        ;;
+    esac
     exit 0 ;;
   list-windows|has-session) exit 0 ;;
 esac
@@ -255,12 +321,14 @@ add_sm_home() {
     printf 'harness=%s\n' "$harness"
     printf 'home=%s\n' "$home"
   } > "$w/home/state/$id.meta"
+  touch "$w/home/state/.fake-endpoint"
 }
 
 run_bootstrap() {  # <fakebin> <home> <pane-cmd> <call-log> [extra env...] -> stdout
   local fb=$1 home=$2 cmd=$3 log=$4; shift 4
   PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" \
     FM_TEST_PANE_CMD="$cmd" FM_TMUX_CALL_LOG="$log" \
+    FM_TEST_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
 }
 
@@ -280,6 +348,282 @@ test_sweep_respawns_confirmed_dead_secondmate() {
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
+}
+
+test_sweep_rechecks_liveness_after_lifecycle_lock() {
+  local w fb tmuxfb log out_file cmd_file probe_log lock_ready lock_release lock_pid bootstrap_pid out
+  w=$(new_world sweep-lifecycle-recheck)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  out_file="$w/bootstrap.out"
+  cmd_file="$w/pane-command"
+  probe_log="$w/probes.log"
+  lock_ready="$w/lock-ready"
+  lock_release="$w/lock-release"
+  printf 'zsh\n' > "$cmd_file"
+
+  bash -c '
+    . "$1"
+    held=$(FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 fm_account_lifecycle_lock_acquire "$2" sm1) || exit 1
+    touch "$3"
+    while [ ! -f "$4" ]; do sleep 0.05; done
+    fm_account_lifecycle_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$w/home/state" "$lock_ready" "$lock_release" &
+  lock_pid=$!
+  for _ in $(seq 1 100); do [ -f "$lock_ready" ] && break; sleep 0.05; done
+  [ -f "$lock_ready" ] || { kill "$lock_pid" 2>/dev/null || true; fail "lifecycle recheck test did not acquire its blocker lock"; }
+
+  PATH="$tmuxfb:$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$w/home" \
+    FM_TEST_PANE_CMD_FILE="$cmd_file" FM_TEST_PROBE_LOG="$probe_log" \
+    FM_TMUX_CALL_LOG="$log" FM_TEST_ENDPOINT_FILE="$w/home/state/.fake-endpoint" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=5 "$ROOT/bin/fm-bootstrap.sh" > "$out_file" 2>&1 &
+  bootstrap_pid=$!
+  for _ in $(seq 1 100); do [ -s "$probe_log" ] && break; sleep 0.05; done
+  [ -s "$probe_log" ] || {
+    kill "$bootstrap_pid" "$lock_pid" 2>/dev/null || true
+    fail "lifecycle recheck test never reached its initial dead probe"
+  }
+  printf 'claude\n' > "$cmd_file"
+  touch "$lock_release"
+  wait "$lock_pid" || fail "lifecycle recheck blocker failed"
+  wait "$bootstrap_pid" || fail "lifecycle recheck bootstrap failed"
+  out=$(cat "$out_file")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: already-live" \
+    "secondmate recovery ignored the live under-lock recheck"
+  [ ! -s "$log" ] || fail "stale pre-lock liveness killed or respawned the replacement endpoint: $(cat "$log")"
+  [ "$(wc -l < "$probe_log" | tr -d ' ')" -ge 2 ] || fail "secondmate recovery did not probe again under the lifecycle lock"
+  pass "sweep: lifecycle lock recheck prevents stale endpoint termination"
+}
+
+test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-unmanaged-routing)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  mkdir -p "$w/home/config"
+  printf 'enforce\n' > "$w/home/config/account-routing-mode"
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "an unmanaged secondmate should retain legacy recovery after routing is enabled"
+  assert_contains "$(cat "$log")" "new-window" \
+    "the unmanaged secondmate was not relaunched under its original policy"
+  pass "unmanaged secondmate recovery explicitly stays outside newly enabled account routing"
+}
+
+test_pending_rollback_recovery_bypasses_session_gate_and_retries() {
+  local variant w fb tmuxfb log out fake_root meta
+  for variant in profile profileless; do
+    w=$(new_world "sweep-rollback-$variant")
+    add_sm_home "$w" sm1 firstmate:fm-sm1
+    meta="$w/home/state/sm1.meta"
+    printf '%s\n' 'account_rollback_cleanup=pending' >> "$meta"
+    if [ "$variant" = profile ]; then
+      printf '%s\n' 'account_profile=claude-2' >> "$meta"
+    fi
+    fake_root="$w/fake-root"
+    mkdir -p "$fake_root/bin"
+    cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'session-sync %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
+exit 0
+SH
+    cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'spawn %s\n' "$*" >> "$FM_ROLLBACK_CALL_LOG"
+count=$(grep -c '^spawn ' "$FM_ROLLBACK_CALL_LOG")
+meta="$FM_HOME/state/$1.meta"
+if [ "$count" -eq 1 ]; then
+  . "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
+  lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
+  start=$(fm_account_process_start_time "$$") || exit 1
+  handoff=$(mktemp "$FM_HOME/state/.rollback-handoff.XXXXXX") || exit 1
+  printf '%s\n%s\n' "$$" "$start" > "$handoff" || exit 1
+  mv "$handoff" "$lock" || exit 1
+  trap 'fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true' EXIT
+  tmp=$(mktemp "$FM_HOME/state/.rollback-test.XXXXXX") || exit 1
+  grep -v '^account_rollback_cleanup=pending$' "$meta" > "$tmp" || exit 1
+  mv "$tmp" "$meta" || exit 1
+  exit 1
+fi
+[ -f "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}" ] || exit 9
+printf 'fresh-lock %s\n' "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" >> "$FM_ROLLBACK_CALL_LOG"
+exit 0
+SH
+    chmod +x "$fake_root/bin/"*.sh
+    fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+    log="$w/calls.log"; : > "$log"
+
+    out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+      FM_ROOT_OVERRIDE="$fake_root" FM_ROLLBACK_CALL_LOG="$log" FM_TEST_REAL_ROOT="$ROOT")
+
+    assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: rollback reconciled and respawned" \
+      "$variant rollback recovery did not converge in the liveness sweep"
+    assert_contains "$(cat "$log")" "fresh-lock" \
+      "$variant rollback recovery reused the child-released lifecycle lock instead of acquiring a fresh one"
+    grep -q '^spawn sm1 --secondmate --resume-account$' "$log" \
+      || fail "$variant rollback recovery did not enter rollback-first resume: $(cat "$log")"
+    if [ "$variant" = profile ]; then
+      [ "$(grep -c '^spawn sm1 --secondmate --resume-account$' "$log")" -eq 2 ] \
+        || fail "profile rollback recovery did not retry the restored managed generation"
+      [ "$(grep -c '^session-sync ' "$log")" -eq 1 ] \
+        || fail "profile rollback recovery did not redo session sync exactly once under its fresh lock"
+    else
+      assert_not_contains "$(cat "$log")" "session-sync" \
+        "profileless rollback recovery unexpectedly ran managed session synchronization"
+      assert_contains "$(cat "$log")" "spawn sm1 --secondmate --no-account-routing" \
+        "profileless rollback recovery did not retry its restored unmanaged generation"
+    fi
+  done
+  pass "pending secondmate rollback recovery bypasses pre-bind gating and converges"
+}
+
+test_sweep_parent_skips_release_after_spawn_handoff() {
+  local w fb tmuxfb log out fake_root sleeper_pid lock
+  w=$(new_world sweep-parent-skip-release)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+. "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
+lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid=$!
+start=$(fm_account_process_start_time "$pid") || exit 1
+handoff=$(mktemp "$FM_HOME/state/.parent-skip-handoff.XXXXXX") || exit 1
+printf '%s\n%s\n' "$pid" "$start" > "$handoff" || exit 1
+mv "$handoff" "$lock" || exit 1
+printf '%s\n' "$pid" > "$FM_PARENT_SKIP_PID"
+exit 0
+SH
+  cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake_root/bin/"*.sh
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_PARENT_SKIP_PID="$w/sleeper-pid")
+  sleeper_pid=$(cat "$w/sleeper-pid" 2>/dev/null || true)
+  lock="$w/home/state/.account-lifecycle-sm1.lock"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "parent treated a successfully handed-off lock as its own release failure"
+  if [ -z "$sleeper_pid" ] || ! kill -0 "$sleeper_pid" 2>/dev/null; then
+    fail "handoff simulation did not leave its child owner alive"
+  fi
+  [ "$(sed -n '1p' "$lock" 2>/dev/null)" = "$sleeper_pid" ] \
+    || fail "parent released or replaced the child-owned lifecycle lock"
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -f "$lock"
+  pass "sweep: parent skips release after lifecycle ownership handoff"
+}
+
+test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
+  local w fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
+  w=$(new_world sweep-enforced-inherited-lock)
+  add_sm_home "$w" sm1 firstmate:fm-sm1 claude
+  meta="$w/home/state/sm1.meta"
+  account_task=fm-test-sm1-a1234
+  cat >> "$meta" <<EOF
+worktree=$w/sm1
+project=$w/sm1
+mode=secondmate
+yolo=off
+tasktmp=/tmp/fm-sm1
+account_pool=claude-crew
+account_profile=claude-2
+account_task=$account_task
+account_attempt=a1234
+provider_session_id=sess-$account_task
+generation_id=account:$account_task:a1234
+EOF
+  mkdir -p "$w/home/data/sm1"
+  printf 'enforce\n' > "$w/home/config/account-routing-mode"
+  cp "$ROOT/bin/fm-account-routing-lib.sh" "$w/sm1/bin/fm-account-routing-lib.sh"
+  cp "$ROOT/bin/fm-spawn.sh" "$w/sm1/bin/fm-spawn.sh"
+
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+status=$?
+cat "$FM_MANAGED_SPAWN_OUT"
+exit "$status"
+SH
+  cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
+SH
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake_root/bin/"*.sh
+
+  fake_af="$w/agent-fleet"
+  cat > "$fake_af" <<'SH'
+#!/usr/bin/env bash
+set -u
+task=
+pool=claude-crew
+profile=claude-2
+prev=
+for arg in "$@"; do
+  case "$prev" in --task) task=$arg ;; --pool) pool=$arg ;; --profile) profile=$arg ;; esac
+  prev=$arg
+done
+case "$*" in
+  '--format json contract') printf '{"contract_version":1}\n' ;;
+  *' lease recover '*)
+    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"claude","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile"
+    ;;
+  *' session status '*)
+    updated=2026-07-13T00:00:00Z
+    [ ! -f "${FM_MANAGED_SESSION_REFRESHED:-/nonexistent}" ] || updated=2026-07-13T00:00:01Z
+    printf '{"schema":1,"task":"%s","profile":"%s","provider":"claude","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$pool" "$task" "$updated"
+    ;;
+  *' lease release '*) printf '{"ok":true}\n' ;;
+  *) exit 64 ;;
+esac
+SH
+  chmod +x "$fake_af"
+
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  native_dir_file="$w/native-dir"
+  refreshed="$w/session-refreshed"
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
+    FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
+    FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \
+    FM_MANAGED_SPAWN_OUT="$w/spawn.out")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "enforced secondmate recovery did not complete through the bootstrap sweep: $(cat "$w/spawn.out" 2>/dev/null)"
+  assert_grep "account_task=$account_task" "$meta" \
+    "enforced secondmate recovery did not install the inherited-lock generation"
+  assert_no_grep '^account_rollback_cleanup=' "$meta" \
+    "enforced secondmate recovery did not commit its metadata installation"
+  assert_present "$refreshed" "enforced secondmate recovery never crossed its fresh SessionStart gate"
+  pass "sweep: enforced secondmate recovery installs metadata under the inherited lifecycle lock"
 }
 
 test_sweep_leaves_alive_secondmate_untouched() {
@@ -386,10 +730,32 @@ test_sweep_noop_with_no_secondmate_meta() {
   pass "sweep: a silent no-op with no kind=secondmate meta present (a secondmate home's own natural scoping)"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_sweep_respawns_confirmed_dead_secondmate
+  test_sweep_rechecks_liveness_after_lifecycle_lock
+  test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+  test_pending_rollback_recovery_bypasses_session_gate_and_retries
+  test_enforced_recovery_sweep_installs_meta_with_inherited_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  test_pending_rollback_recovery_bypasses_session_gate_and_retries
+  test_sweep_parent_skips_release_after_spawn_handoff
+  test_enforced_recovery_sweep_installs_meta_with_inherited_lock
+  exit 0
+fi
+
 test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
+test_herdr_agent_alive_preserves_identity_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
+test_sweep_rechecks_liveness_after_lifecycle_lock
+test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+test_pending_rollback_recovery_bypasses_session_gate_and_retries
+test_sweep_parent_skips_release_after_spawn_handoff
+test_enforced_recovery_sweep_installs_meta_with_inherited_lock
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_never_acts_on_inconclusive_reading
 test_sweep_never_acts_on_unverified_harness_dead_reading

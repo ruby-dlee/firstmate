@@ -24,8 +24,8 @@
 #
 # Fresh-link context resolution fills platform and explicit budget independently
 # through the durable per-request registry, inbox payload, then authoritative
-# relay lookup by request_id. If either axis remains missing, the link is still
-# recorded but a loud warning is printed and follow-ups fail closed.
+# relay lookup by request_id. A known platform or a valid explicit budget is
+# sufficient; follow-ups fail closed only when neither can be resolved.
 #
 # This is a separate step the fmx-respond skill runs AFTER fm-spawn.sh, so it
 # never changes fm-spawn's interface. The follow-up itself - detection, the
@@ -43,6 +43,9 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 
 usage() {
   echo "usage: fm-x-link.sh <task-id> <request_id> [--carry-count <n> --carry-ts <epoch> [--carry-platform <x|discord>] [--carry-max <n>]]" >&2
@@ -138,7 +141,9 @@ if [ -n "$CARRY_MAX" ]; then
 fi
 
 if [ -z "$CARRY_TS" ]; then
-  REPLY_CONTEXT=$(fmx_resolve_reply_context "$STATE" "$RID" 1) || {
+  ALLOW_RELAY=1
+  [ -z "$FMX_DRY" ] || ALLOW_RELAY=0
+  REPLY_CONTEXT=$(fmx_resolve_reply_context "$STATE" "$RID" "$ALLOW_RELAY") || {
     echo "fm-x-link: failed to resolve request reply context" >&2
     exit 1
   }
@@ -147,13 +152,13 @@ if [ -z "$CARRY_TS" ]; then
   REQ_REPLY_MAX=$REQ_EXPLICIT_MAX
 fi
 
-if [ -n "$CARRY_TS" ] && { [ -z "$REQ_PLATFORM" ] || [ -z "$REQ_REPLY_MAX" ]; }; then
-  echo "fm-x-link: relink requires carried reply context; pass --carry-platform and --carry-max from the prior task" >&2
+if [ -n "$CARRY_TS" ] && [ -z "$REQ_PLATFORM" ] && [ -z "$REQ_REPLY_MAX" ]; then
+  echo "fm-x-link: relink requires carried reply context; pass --carry-platform or --carry-max from the prior task" >&2
   exit 2
 fi
 
 if [ -z "$CARRY_TS" ] && { [ -z "$REQ_PLATFORM" ] || [ -z "$REQ_REPLY_MAX" ]; }; then
-  echo "fm-x-link: WARNING: incomplete authoritative reply context for request $RID; every completion follow-up will be HELD until both platform and explicit budget can be resolved. Ensure the relay request-context lookup supplies both values." >&2
+  echo "fm-x-link: WARNING: incomplete authoritative reply context for request $RID; follow-ups remain available when either platform or a valid explicit budget of at least $FMX_REPLY_MIN_CHARS characters is known, and are held only if neither is resolvable." >&2
 fi
 
 FOLLOWUPS=0

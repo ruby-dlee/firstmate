@@ -30,9 +30,9 @@
 #       locally-detected expiry, so an old relay (which only ever supported one
 #       follow-up) or an already-exhausted binding degrades gracefully instead
 #       of retrying forever.
-#       On fm-x-reply's fail-safe refusal (exit 8: platform or explicit budget
-#       unresolved): KEEPS the link and exits non-zero. This is a
-#       retryable hold, not an exhausted binding - retry once both values are
+#       On fm-x-reply's fail-safe refusal (exit 8: neither platform nor a valid
+#       explicit budget is resolved): KEEPS the link and exits non-zero. This is
+#       a retryable hold, not an exhausted binding - retry once either value is
 #       recoverable rather than posting with a local default.
 #       On any other post failure: leaves the link in place so it can be
 #       retried, exit non-zero.
@@ -61,6 +61,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 
@@ -235,11 +238,11 @@ case "$post_rc" in
     ;;
   8)
     # fm-x-reply.sh refused this follow-up (exit 8) because it could not
-    # authoritatively determine both the reply platform and explicit budget.
+    # authoritatively determine a reply platform or valid explicit budget.
     # That is a RETRYABLE HOLD, not an exhausted binding: keep the link so
-    # the follow-up can post once both values are recoverable. Never clear the
+    # the follow-up can post once either value is recoverable. Never clear the
     # link here.
-    echo "fm-x-followup: follow-up for $ID held: reply context lacks an authoritative platform or explicit budget; left the link in place to retry once both values are recoverable" >&2
+    echo "fm-x-followup: follow-up for $ID held: reply context has neither an authoritative platform nor a valid explicit budget of at least $FMX_REPLY_MIN_CHARS characters; left the link in place to retry once either value is recoverable" >&2
     exit 1
     ;;
   9)

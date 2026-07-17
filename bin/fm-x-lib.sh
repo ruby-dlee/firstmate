@@ -46,6 +46,13 @@
 #   fmx_meta_link_clear <meta> - remove the X-request link entirely
 # Callers must have FM_HOME set before calling fmx_load_config.
 
+FMX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FMX_REPLY_MIN_CHARS=50
+FMX_RESPONSE_BODY_MAX_BYTES=65536
+FMX_CONTEXT_RECORD_MAX_BYTES=131072
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$FMX_LIB_DIR/fm-account-routing-lib.sh"
+
 # Read the value of KEY from a .env-style file: last assignment wins; tolerates a
 # leading "export ", surrounding whitespace, and one layer of matching single or
 # double quotes. Prints nothing (and succeeds) when the file or key is absent, so
@@ -103,12 +110,12 @@ fmx_load_config() {
   local maxraw discordraw threadraw
   if [ -n "${FMX_X_REPLY_MAX_CHARS+x}" ]; then maxraw=${FMX_X_REPLY_MAX_CHARS-}; else maxraw=$(fmx_env_get FMX_X_REPLY_MAX_CHARS "$env_file"); fi
   case "$maxraw" in ''|*[!0-9]*) maxraw=280 ;; esac
-  [ "$maxraw" -ge 50 ] 2>/dev/null || maxraw=50
+  [ "$maxraw" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || maxraw=$FMX_REPLY_MIN_CHARS
   # shellcheck disable=SC2034 # FMX_MAX is read by callers (fm-x-reply.sh) after sourcing.
   FMX_MAX=$maxraw
   if [ -n "${FMX_DISCORD_REPLY_MAX_CHARS+x}" ]; then discordraw=${FMX_DISCORD_REPLY_MAX_CHARS-}; else discordraw=$(fmx_env_get FMX_DISCORD_REPLY_MAX_CHARS "$env_file"); fi
   case "$discordraw" in ''|*[!0-9]*) discordraw=1900 ;; esac
-  [ "$discordraw" -ge 50 ] 2>/dev/null || discordraw=50
+  [ "$discordraw" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null || discordraw=$FMX_REPLY_MIN_CHARS
   [ "$discordraw" -le 2000 ] 2>/dev/null || discordraw=1900
   # shellcheck disable=SC2034 # FMX_DISCORD_MAX is read by callers (fm-x-reply.sh) after sourcing.
   FMX_DISCORD_MAX=$discordraw
@@ -230,21 +237,58 @@ fmx_request_relay_context() {
 
 fmx_context_registry_mtime() {
   local file=$1 mtime
-  mtime=$(stat -f '%m' "$file" 2>/dev/null) || mtime=$(stat -c '%Y' "$file" 2>/dev/null) || return 1
+  if [ "$(uname)" = Darwin ]; then
+    mtime=$(stat -f '%m' "$file" 2>/dev/null) || return 1
+  else
+    mtime=$(stat -c '%Y' "$file" 2>/dev/null) || return 1
+  fi
   case "$mtime" in
     ''|*[!0-9]*) return 1 ;;
   esac
   printf '%s\n' "$mtime"
 }
 
+fmx_context_registry_file_stat() {
+  local file=$1 values size mtime
+  if [ "$(uname)" = Darwin ]; then
+    values=$(stat -f '%z %m' "$file" 2>/dev/null) || return 1
+  else
+    values=$(stat -c '%s %Y' "$file" 2>/dev/null) || return 1
+  fi
+  size=${values%% *}
+  mtime=${values#* }
+  case "$size:$mtime" in
+    *[!0-9:]*) return 1 ;;
+  esac
+  [ -n "$size" ] && [ -n "$mtime" ] || return 1
+  [ "${#size}" -le 18 ] && [ "${#mtime}" -le 18 ] || return 1
+  printf '%s %s\n' "$size" "$mtime"
+}
+
+fmx_context_registry_snapshot() {
+  local file=$1 size=$2 snapshot bytes sentinel=$'\036'
+  [ "$size" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
+  snapshot=$({ head -c "$((FMX_CONTEXT_RECORD_MAX_BYTES + 1))" "$file" 2>/dev/null || exit $?; printf '%s' "$sentinel"; }) || return 1
+  case "$snapshot" in *"$sentinel") ;; *) return 1 ;; esac
+  snapshot=${snapshot%"$sentinel"}
+  bytes=$(printf '%s' "$snapshot" | wc -c | tr -d '[:space:]')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le "$FMX_CONTEXT_RECORD_MAX_BYTES" ] || return 1
+  printf '%s' "$snapshot"
+}
+
 fmx_context_registry_recorded_at() {
-  local file=$1 now=${2:-} recorded_at
-  recorded_at=$(jq -r '
+  local file=$1 now=${2:-} recorded_at file_stat size mtime snapshot
+  file_stat=$(fmx_context_registry_file_stat "$file") || return 1
+  size=${file_stat%% *}
+  mtime=${file_stat#* }
+  snapshot=$(fmx_context_registry_snapshot "$file" "$size") || return 1
+  recorded_at=$(printf '%s\n' "$snapshot" | jq -r '
     .recorded_at
     | if type == "number" and floor == . and . >= 0 then tostring
       elif type == "string" and test("^[0-9]+$") then .
       else "" end
-  ' "$file" 2>/dev/null) || recorded_at=
+  ' 2>/dev/null) || recorded_at=
   case "$recorded_at" in
     ''|*[!0-9]*) recorded_at= ;;
   esac
@@ -253,7 +297,7 @@ fmx_context_registry_recorded_at() {
     recorded_at=
   fi
   if [ -z "$recorded_at" ]; then
-    recorded_at=$(fmx_context_registry_mtime "$file") || return 1
+    recorded_at=$mtime
     if [ -n "$now" ] && [ "$recorded_at" -gt "$now" ]; then
       return 1
     fi
@@ -261,15 +305,102 @@ fmx_context_registry_recorded_at() {
   printf '%s\n' "$recorded_at"
 }
 
+fmx_context_registry_lock_owner_publish() {
+  local lock=$1 start owner tmp tmp_inode owner_inode nested nested_inode
+  start=$(fm_account_process_start_time "$$") || return 1
+  owner="$lock/owner"
+  tmp=$(mktemp "$lock/.owner.XXXXXX" 2>/dev/null) || return 1
+  if ! printf '%s\n%s\n' "$$" "$start" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  tmp_inode=$(fm_account_path_inode "$tmp") || { rm -f "$tmp"; return 1; }
+  if ln -n "$tmp" "$owner" 2>/dev/null; then
+    owner_inode=$(fm_account_path_inode "$owner" 2>/dev/null || true)
+    if [ -f "$owner" ] && [ ! -L "$owner" ] && [ "$owner_inode" = "$tmp_inode" ]; then
+      rm -f "$tmp"
+      return 0
+    fi
+    nested="$owner/${tmp##*/}"
+    nested_inode=$(fm_account_path_inode "$nested" 2>/dev/null || true)
+    if [ -d "$owner" ] && [ ! -L "$owner" ] && [ -f "$nested" ] \
+      && [ ! -L "$nested" ] && [ "$nested_inode" = "$tmp_inode" ]; then
+      rm -f "$nested" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+fmx_context_registry_lock_acquire() {
+  local dir=$1 name=$2 lock now mtime observed quarantine quarantined nested nested_inode
+  case "$name" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  lock="$dir/.lock-$name"
+  if ! mkdir "$lock" 2>/dev/null; then
+    [ -d "$lock" ] && [ ! -L "$lock" ] || return 1
+    fm_account_reclaim_owner_alive "$lock" && return 1
+    now=$(date +%s) || return 1
+    mtime=$(fmx_context_registry_mtime "$lock") || return 1
+    case "$now:$mtime" in *[!0-9:]*) return 1 ;; esac
+    [ $((now - mtime)) -ge 30 ] || return 1
+    observed=$(fm_account_path_inode "$lock") || return 1
+    fm_account_reclaim_owner_alive "$lock" && return 1
+    [ "$(fm_account_path_inode "$lock" 2>/dev/null || true)" = "$observed" ] || return 1
+    quarantine=$(mktemp -d "$lock.stale.XXXXXX" 2>/dev/null) || return 1
+    rmdir "$quarantine" 2>/dev/null || return 1
+    mv "$lock" "$quarantine" 2>/dev/null || return 1
+    quarantined=$(fm_account_path_inode "$quarantine" 2>/dev/null || true)
+    if [ "$quarantined" != "$observed" ]; then
+      nested="$quarantine/${lock##*/}"
+      nested_inode=$(fm_account_path_inode "$nested" 2>/dev/null || true)
+      if [ -d "$quarantine" ] && [ ! -L "$quarantine" ] \
+        && [ "$nested_inode" = "$observed" ] && [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+        mv "$nested" "$lock" 2>/dev/null || true
+        rmdir "$quarantine" 2>/dev/null || true
+      fi
+      return 1
+    fi
+    rm -rf "$quarantine" 2>/dev/null || return 1
+    mkdir "$lock" 2>/dev/null || return 1
+  fi
+  if ! fmx_context_registry_lock_owner_publish "$lock"; then
+    [ -d "$lock" ] && [ ! -L "$lock" ] && rm -rf "$lock" 2>/dev/null
+    return 1
+  fi
+  printf '%s\n' "$lock"
+}
+
+fmx_context_registry_lock_release() {
+  local lock=$1
+  fm_account_reclaim_guard_owned "$lock" || return 1
+  rm -rf "$lock"
+}
+
+fmx_context_registry_lock_acquire_bounded() {
+  local dir=$1 name=$2 attempt=0 lock
+  while [ "$attempt" -lt 20 ]; do
+    if lock=$(fmx_context_registry_lock_acquire "$dir" "$name"); then
+      printf '%s\n' "$lock"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 20 ] || break
+    sleep 0.05
+  done
+  return 1
+}
+
 fmx_context_registry_prune() {
-  local state=$1 dir now max_age file recorded_at age
+  local state=$1 dir now max_age file recorded_at age lock rid_lock rid
   dir="$state/x-context"
   [ -d "$dir" ] || return 0
+  [ ! -L "$dir" ] || return 1
+  lock=$(fmx_context_registry_lock_acquire "$dir" registry) || return 0
   now=${FMX_NOW_OVERRIDE:-$(date +%s)}
   case "$now" in
-    ''|*[!0-9]*) return 0 ;;
+    ''|*[!0-9]*) fmx_context_registry_lock_release "$lock" 2>/dev/null || true; return 0 ;;
   esac
-  [ "${#now}" -le 18 ] || return 0
+  [ "${#now}" -le 18 ] || { fmx_context_registry_lock_release "$lock" 2>/dev/null || true; return 0; }
   max_age=${FMX_FOLLOWUP_MAX_AGE_SECS:-604800}
   case "$max_age" in
     ''|*[!0-9]*) max_age=604800 ;;
@@ -277,15 +408,21 @@ fmx_context_registry_prune() {
   [ "${#max_age}" -le 18 ] || max_age=604800
   [ "$max_age" -le 604800 ] || max_age=604800
   while IFS= read -r -d '' file; do
+    rid=${file##*/}
+    rid=${rid%.json}
+    rid_lock=$(fmx_context_registry_lock_acquire "$dir" "request-$rid") || continue
     if ! recorded_at=$(fmx_context_registry_recorded_at "$file" "$now"); then
       rm -f -- "$file" 2>/dev/null || true
+      fmx_context_registry_lock_release "$rid_lock" 2>/dev/null || true
       continue
     fi
     age=$((10#$now - 10#$recorded_at))
     if [ "$age" -gt "$max_age" ]; then
       rm -f -- "$file" 2>/dev/null || true
     fi
+    fmx_context_registry_lock_release "$rid_lock" 2>/dev/null || true
   done < <(find "$dir" -type f -name '*.json' -print0 2>/dev/null)
+  fmx_context_registry_lock_release "$lock" 2>/dev/null || true
   return 0
 }
 
@@ -297,7 +434,7 @@ fmx_context_registry_prune() {
 # never write an empty, useless record. Returns non-zero only on invalid input or
 # a write failure; callers treat the write as best-effort.
 fmx_context_registry_set() {
-  local state=$1 rid=$2 platform=${3:-} reply_max=${4:-} refresh=${5:-0} dir file tmp now recorded_at
+  local state=$1 rid=$2 platform=${3:-} reply_max=${4:-} refresh=${5:-0} dir file tmp now recorded_at existing lock status=0
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
@@ -313,50 +450,85 @@ fmx_context_registry_set() {
     0|1) ;;
     *) return 1 ;;
   esac
-  if [ -z "$platform" ] && [ -z "$reply_max" ]; then
-    return 0
-  fi
   dir="$state/x-context"
   mkdir -p "$dir" 2>/dev/null || return 1
-  fmx_context_registry_prune "$state"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  fmx_context_registry_prune "$state" || return 1
+  lock=$(fmx_context_registry_lock_acquire_bounded "$dir" "request-$rid") || return 1
   now=${FMX_NOW_OVERRIDE:-$(date +%s)}
-  case "$now" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "${#now}" -le 18 ] || return 1
+  case "$now" in ''|*[!0-9]*) status=1 ;; esac
+  [ "${#now}" -le 18 ] || status=1
   file="$dir/$rid.json"
+  if [ "$status" -eq 0 ] && { [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; }; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -f "$file" ]; then
+    existing=$(fmx_context_registry_get "$state" "$rid")
+    [ -n "$platform" ] || platform=$(printf '%s\n' "$existing" | jq -r '.platform // ""' 2>/dev/null)
+    [ -n "$reply_max" ] || reply_max=$(printf '%s\n' "$existing" | jq -r '.reply_max_chars // ""' 2>/dev/null)
+  fi
+  if [ "$status" -eq 0 ] && [ -z "$platform" ] && [ -z "$reply_max" ]; then
+    fmx_context_registry_lock_release "$lock" 2>/dev/null || true
+    return 0
+  fi
   recorded_at=
-  if [ "$refresh" = 0 ] && [ -f "$file" ]; then
+  if [ "$status" -eq 0 ] && [ "$refresh" = 0 ] && [ -f "$file" ]; then
     recorded_at=$(fmx_context_registry_recorded_at "$file" "$now") || recorded_at=
   fi
-  if [ -z "$recorded_at" ]; then
+  if [ "$status" -eq 0 ] && [ -z "$recorded_at" ]; then
     recorded_at=$now
   fi
-  tmp=$(mktemp "$dir/.${rid}.fm-x.XXXXXX" 2>/dev/null) || return 1
-  if jq -cn --arg rid "$rid" --arg platform "$platform" --arg max "$reply_max" \
+  if [ "$status" -eq 0 ]; then
+    tmp=$(mktemp "$dir/.${rid}.fm-x.XXXXXX" 2>/dev/null) || status=1
+  fi
+  if [ "$status" -eq 0 ] && jq -cn --arg rid "$rid" --arg platform "$platform" --arg max "$reply_max" \
       --argjson recorded_at "$recorded_at" \
       '{request_id:$rid, platform:$platform, reply_max_chars:$max, recorded_at:$recorded_at}' > "$tmp" 2>/dev/null; then
-    mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  else
-    rm -f "$tmp"; return 1
+    if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+      rm -f "$tmp"
+      status=1
+    elif ! mv -f "$tmp" "$file" 2>/dev/null; then
+      rm -f "$tmp"
+      status=1
+    fi
+  elif [ -n "${tmp:-}" ]; then
+    rm -f "$tmp"
+    status=1
   fi
+  fmx_context_registry_lock_release "$lock" 2>/dev/null || status=1
+  return "$status"
 }
 
 # fmx_context_registry_get <state> <request_id>: print the durable per-request
 # reply context as {"platform":"...","reply_max_chars":"..."} (the same shape as
 # the inbox and relay extractors), or the empty shape when no record exists.
 fmx_context_registry_get() {
-  local state=$1 rid=$2 file
+  local state=$1 rid=$2 dir file file_stat size snapshot
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) printf '{"platform":"","reply_max_chars":""}\n'; return 0 ;;
   esac
-  fmx_context_registry_prune "$state"
-  file="$state/x-context/$rid.json"
-  if [ ! -f "$file" ]; then
+  dir="$state/x-context"
+  if [ ! -d "$dir" ] || [ -L "$dir" ]; then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi
-  jq -c '{platform:(.platform // ""), reply_max_chars:(.reply_max_chars // "")}' "$file" 2>/dev/null \
+  fmx_context_registry_prune "$state" || { printf '{"platform":"","reply_max_chars":""}\n'; return 0; }
+  file="$dir/$rid.json"
+  if [ ! -f "$file" ] || [ -L "$file" ]; then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  file_stat=$(fmx_context_registry_file_stat "$file") || {
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  }
+  size=${file_stat%% *}
+  if ! snapshot=$(fmx_context_registry_snapshot "$file" "$size"); then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  printf '%s\n' "$snapshot" \
+    | jq -c '{platform:(.platform // ""), reply_max_chars:(.reply_max_chars // "")}' 2>/dev/null \
     || printf '{"platform":"","reply_max_chars":""}\n'
 }
 
@@ -364,11 +536,15 @@ fmx_context_registry_get() {
 # Idempotent and best-effort; a dismiss (no follow-up will ever come) uses it so
 # a skipped mention leaves no stray context behind.
 fmx_context_registry_clear() {
-  local state=$1 rid=$2
+  local state=$1 rid=$2 dir lock
   case "$rid" in
     ''|.*|*[!A-Za-z0-9._-]*) return 0 ;;
   esac
-  rm -f "$state/x-context/$rid.json" 2>/dev/null || true
+  dir="$state/x-context"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  lock=$(fmx_context_registry_lock_acquire "$dir" "request-$rid") || return 0
+  rm -f "$dir/$rid.json" 2>/dev/null || true
+  fmx_context_registry_lock_release "$lock" 2>/dev/null || true
   return 0
 }
 
@@ -401,7 +577,14 @@ fmx_resolve_reply_context() {
     source_p=$(printf '%s' "$ctx" | jq -r '.platform // ""' 2>/dev/null) || source_p=
     source_m=$(printf '%s' "$ctx" | jq -r '.reply_max_chars // ""' 2>/dev/null) || source_m=
     case "$source_p" in discord|x) [ -n "$p" ] || p=$source_p ;; esac
-    case "$source_m" in ''|*[!0-9]*) ;; *) [ -n "$m" ] || m=$source_m ;; esac
+    case "$source_m" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "${#source_m}" -le 18 ] && [ "$source_m" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null; then
+          [ -n "$m" ] || m=$source_m
+        fi
+        ;;
+    esac
     [ -n "$p" ] && [ -n "$m" ] && break
   done
   jq -cn --arg platform "$p" --arg max "$m" \
@@ -418,7 +601,7 @@ fmx_reply_limit_for_platform() {
   local platform=${1:-} explicit=${2:-}
   case "$explicit" in
     ''|*[!0-9]*) ;;
-    *) [ "$explicit" -ge 50 ] 2>/dev/null && { printf '%s\n' "$explicit"; return 0; } ;;
+    *) [ "$explicit" -ge "$FMX_REPLY_MIN_CHARS" ] 2>/dev/null && { printf '%s\n' "$explicit"; return 0; } ;;
   esac
   case "$platform" in
     discord) printf '%s\n' "${FMX_DISCORD_MAX:-1900}" ;;
@@ -654,13 +837,13 @@ fmx_reply_outbox_json() {
 }
 
 fmx_post_json() (
-  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} auth_header_file code rc
+  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} auth_header_file code rc body_size
   command -v curl >/dev/null 2>&1 || return 127
   [ -r "$payload_file" ] || return 2
   auth_header_file=$(fmx_auth_header_file) || return 3
   trap 'rm -f "$auth_header_file"' EXIT
   trap 'rm -f "$auth_header_file"; exit 143' HUP INT TERM
-  code=$(curl -m 10 -s -o "$body_file" -w '%{http_code}' \
+  code=$(curl -m 10 -s --max-filesize "$FMX_RESPONSE_BODY_MAX_BYTES" -o "$body_file" -w '%{http_code}' \
     -X POST \
     -H "@$auth_header_file" \
     -H 'Content-Type: application/json' \
@@ -670,6 +853,18 @@ fmx_post_json() (
   rm -f "$auth_header_file"
   trap - EXIT HUP INT TERM
   [ "$rc" = 0 ] || return 4
+  if [ "$body_file" != /dev/null ]; then
+    if [ "$(uname)" = Darwin ]; then
+      body_size=$(stat -f '%z' "$body_file" 2>/dev/null) || { rm -f "$body_file"; return 5; }
+    else
+      body_size=$(stat -c '%s' "$body_file" 2>/dev/null) || { rm -f "$body_file"; return 5; }
+    fi
+    case "$body_size" in ''|*[!0-9]*) rm -f "$body_file"; return 5 ;; esac
+    if [ "$body_size" -gt "$FMX_RESPONSE_BODY_MAX_BYTES" ]; then
+      rm -f "$body_file"
+      return 5
+    fi
+  fi
   printf '%s\n' "$code"
 )
 
@@ -693,6 +888,7 @@ fmx_post_json() (
 fmx_meta_get() {
   local meta=$1 key=$2 line
   [ -f "$meta" ] || return 0
+  [ ! -L "$meta" ] || return 0
   line=$(grep -E "^${key}=" "$meta" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   printf '%s' "${line#*=}"
@@ -703,7 +899,7 @@ fmx_meta_tmp() {
   dir=${meta%/*}
   base=${meta##*/}
   [ "$dir" != "$meta" ] || dir=.
-  [ -d "$dir" ] || return 1
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
   mktemp "$dir/.${base}.fm-x.XXXXXX"
 }
 
@@ -715,37 +911,75 @@ fmx_meta_tmp() {
 # budget against a binding the relay already knows about. Returns non-zero if
 # <meta> is missing or the rewrite fails.
 fmx_meta_link_set() {
-  local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp
-  [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+  local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp state task lock status=0
+  state=${meta%/*}
+  task=${meta##*/}
+  task=${task%.meta}
+  lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
+  if [ "$status" -eq 0 ]; then
+    tmp=$(fmx_meta_tmp "$meta") || status=1
   fi
-  printf 'x_request=%s\n' "$rid" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_request_ts=%s\n' "$ts" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_followups=%s\n' "$followups" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  if [ -n "$platform" ]; then
-    printf 'x_platform=%s\n' "$platform" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ] && ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
+    rm -f "$tmp"; status=1
   fi
-  case "$reply_max" in
-    ''|*[!0-9]*) ;;
-    *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
-  esac
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ]; then
+    printf 'x_request=%s\n' "$rid" >> "$tmp" || status=1
+    printf 'x_request_ts=%s\n' "$ts" >> "$tmp" || status=1
+    printf 'x_followups=%s\n' "$followups" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -n "$platform" ]; then
+    printf 'x_platform=%s\n' "$platform" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    case "$reply_max" in
+      ''|*[!0-9]*) ;;
+      *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || status=1 ;;
+    esac
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    mv -f "$tmp" "$meta" || status=1
+  fi
+  if [ "$status" -ne 0 ] && [ -n "${tmp:-}" ]; then
+    rm -f "$tmp"
+  fi
+  fm_account_meta_lock_release "$lock" || status=1
+  return "$status"
 }
 
 # fmx_meta_followups_set <meta> <n>: atomically rewrite just the x_followups
 # line, preserving every other meta line including link and reply context.
 # Returns non-zero if <meta> is missing or the rewrite fails.
 fmx_meta_followups_set() {
-  local meta=$1 n=$2 tmp
-  [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+  local meta=$1 n=$2 tmp state task lock status=0
+  state=${meta%/*}
+  task=${meta##*/}
+  task=${task%.meta}
+  lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
+  if [ "$status" -eq 0 ]; then
+    tmp=$(fmx_meta_tmp "$meta") || status=1
   fi
-  printf 'x_followups=%s\n' "$n" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ] && ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
+    rm -f "$tmp"; status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    printf 'x_followups=%s\n' "$n" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    mv -f "$tmp" "$meta" || status=1
+  fi
+  if [ "$status" -ne 0 ] && [ -n "${tmp:-}" ]; then
+    rm -f "$tmp"
+  fi
+  fm_account_meta_lock_release "$lock" || status=1
+  return "$status"
 }
 
 # fmx_meta_link_clear <meta>: atomically remove the x_request/x_request_ts/
@@ -753,11 +987,29 @@ fmx_meta_followups_set() {
 # succeeds whether or not a link is present, and is a no-op when <meta> is
 # missing.
 fmx_meta_link_clear() {
-  local meta=$1 tmp
-  [ -f "$meta" ] || return 0
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+  local meta=$1 tmp state task lock status=0
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
+  state=${meta%/*}
+  task=${meta##*/}
+  task=${task%.meta}
+  lock=$(fm_account_meta_lock_acquire "$state" "$task") || return 1
+  if [ ! -f "$meta" ] || [ -L "$meta" ]; then
+    fm_account_meta_lock_release "$lock"
+    return
   fi
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  tmp=$(fmx_meta_tmp "$meta") || status=1
+  if [ "$status" -eq 0 ] && ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
+    rm -f "$tmp"; status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_account_safe_file_destination "$meta" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    mv -f "$tmp" "$meta" || status=1
+  fi
+  if [ "$status" -ne 0 ] && [ -n "${tmp:-}" ]; then
+    rm -f "$tmp"
+  fi
+  fm_account_meta_lock_release "$lock" || status=1
+  return "$status"
 }

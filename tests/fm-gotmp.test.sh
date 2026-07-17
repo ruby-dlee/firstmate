@@ -63,6 +63,7 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-gate-refuse-lib.sh: teardown sources it before any fleet mutation.
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
+  ln -s "$ROOT/bin/fm-account-routing-lib.sh" "$fake/bin/fm-account-routing-lib.sh"
   # fm-guard.sh: stub (teardown calls it with `|| true`).
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
@@ -132,7 +133,7 @@ test_spawn_contract_and_mkdir_pattern() {
 
 test_teardown_removes_tasktmp_dir() {
   local id=td-rm-z2
-  local task_tmp="$TMP_ROOT/fm-$id"
+  local task_tmp="/tmp/fm-$id"
   mkdir -p "$task_tmp/gotmp"
   printf 'leftover\n' > "$task_tmp/gotmp/build-artifact"
   local fake
@@ -161,6 +162,7 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-gate-refuse-lib.sh: teardown sources it before any fleet mutation.
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
+  ln -s "$ROOT/bin/fm-account-routing-lib.sh" "$fake/bin/fm-account-routing-lib.sh"
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -192,7 +194,7 @@ META
 test_teardown_skips_gracefully_when_dir_missing() {
   # tasktmp= points to a path that does not exist. Teardown must not error.
   local id=td-missing-z4
-  local task_tmp="$TMP_ROOT/never-created-fm-$id"
+  local task_tmp="/tmp/fm-$id"
   # Intentionally do NOT create $task_tmp.
   [ ! -e "$task_tmp" ] || fail "precondition: task_tmp should not exist yet"
   local fake

@@ -100,6 +100,187 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+test_ship_completion_report_contract() {
+  local home id brief
+  home="$TMP_ROOT/completion-report-home"
+  mkdir -p "$home/data"
+  id="brief-report-c2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "# Completion report" "$brief" "ship brief has no completion-report contract"
+  assert_grep "data/$id/completion.md" "$brief" "ship brief has no durable report path"
+  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$brief" \
+    "ship brief has no review-oriented report schema"
+  assert_grep "data/$id/visuals/" "$brief" "ship brief has no visual evidence path"
+  assert_grep "Before the final \`done:\` status" "$brief" "ship brief does not order report publication before done"
+  assert_grep "no-mistakes pipeline changes the implementation" "$brief" \
+    "ship brief does not require a post-gate report refresh"
+  pass "fm-brief.sh: ship tasks require a structured completion report and visuals"
+}
+
+test_scout_completion_report_contract() {
+  local home id brief
+  home="$TMP_ROOT/scout-report-home"
+  mkdir -p "$home/data"
+  id="brief-scout-report-c2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "data/$id/report.md" "$brief" "scout brief has no durable report path"
+  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$brief" \
+    "scout brief does not name every enforced report section"
+  pass "fm-brief.sh: scout tasks receive the enforced completion-report schema"
+}
+
+test_promoted_scout_receives_completion_contract() {
+  local home data id out expected_report
+  home="$TMP_ROOT/promote-report-home"
+  data="$TMP_ROOT/promote report data"
+  id='promote-report-c3'
+  mkdir -p "$home/state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$home/state/$id.meta"
+  out=$(FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
+    || fail "scout promotion failed"
+  assert_grep 'kind=ship' "$home/state/$id.meta" "scout promotion did not update task kind"
+  assert_contains "$out" "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" \
+    "promoted scout did not receive the ship completion-report schema"
+  expected_report="$data/$id/completion.md"
+  assert_contains "$out" "$expected_report" "promoted scout did not receive the authoritative completion-report path"
+  assert_not_contains "$out" "write data/$id/completion.md" "promoted scout retained a worktree-relative report path"
+  pass "fm-promote.sh: promoted scouts receive the ship completion-report contract"
+}
+
+test_promote_serializes_with_account_session_updates() {
+  local home data state id meta ready release holder promote
+  home="$TMP_ROOT/promote-meta-lock-home"
+  data="$TMP_ROOT/promote-meta-lock-data"
+  state="$home/state"
+  id='promote-meta-lock-c4'
+  meta="$state/$id.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" "$3") || exit 1
+    touch "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    printf "provider_session_id=session-new\n" >> "$2/$3.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$id" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-promote.sh" "$id" > "$home/promote.out" 2> "$home/promote.err" &
+  promote=$!
+  sleep 0.1
+  assert_grep 'kind=scout' "$meta" "scout promotion bypassed the account metadata lock"
+  touch "$release"
+  wait "$holder" || fail "promotion account session update lock holder failed"
+  wait "$promote" || fail "promotion failed after the account metadata lock was released"
+  assert_grep 'provider_session_id=session-new' "$meta" "promotion lost the concurrent provider session update"
+  assert_grep 'kind=ship' "$meta" "promotion did not publish after the account metadata lock was released"
+  pass "fm-promote.sh: serializes with account session updates"
+}
+
+test_promote_locks_lifecycle_before_metadata_and_rechecks_kind() {
+  local home data state id meta ready release holder promote
+  home="$TMP_ROOT/promote-lifecycle-lock-home"
+  data="$TMP_ROOT/promote-lifecycle-lock-data"
+  state="$home/state"
+  id='promote-lifecycle-lock-c5'
+  meta="$state/$id.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    lifecycle=$(fm_account_lifecycle_lock_acquire "$2" "$3") || exit 1
+    touch "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    meta_lock=$(fm_account_meta_lock_acquire "$2" "$3") || exit 1
+    sed "s/^kind=scout$/kind=ship/" "$2/$3.meta" > "$2/.$3.meta.test"
+    mv "$2/.$3.meta.test" "$2/$3.meta"
+    fm_account_meta_lock_release "$meta_lock" || exit 1
+    fm_account_lifecycle_lock_release "$lifecycle"
+  ' _ "$ROOT" "$state" "$id" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-promote.sh" "$id" > "$home/promote.out" 2> "$home/promote.err" &
+  promote=$!
+  sleep 0.1
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" "$3") || exit 1
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$id" \
+    || { touch "$release"; wait "$holder" 2>/dev/null || true; wait "$promote" 2>/dev/null || true; fail "promotion acquired metadata before the lifecycle lock"; }
+  touch "$release"
+  wait "$holder" || fail "promotion lifecycle lock holder failed"
+  if wait "$promote"; then
+    fail "promotion accepted a task whose kind changed while waiting for the lifecycle lock"
+  fi
+  assert_grep 'kind=ship' "$meta" "promotion overwrote the serialized task generation"
+  assert_grep 'not a scout task' "$home/promote.err" "promotion kind recheck failure was unclear"
+  assert_absent "$state/.account-lifecycle-$id.lock" "promotion left the lifecycle lock behind"
+  assert_absent "$state/.account-meta-$id.lock" "promotion left the metadata lock behind"
+  pass "fm-promote.sh: locks lifecycle before metadata and rechecks task kind"
+}
+
+test_promote_refuses_pending_rollback_cleanup() {
+  local home data state id meta out status
+  home="$TMP_ROOT/promote-pending-rollback-home"
+  data="$TMP_ROOT/promote-pending-rollback-data"
+  state="$home/state"
+  id='promote-pending-rollback-c6'
+  meta="$state/$id.meta"
+  mkdir -p "$state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\naccount_rollback_cleanup=pending\n' "$id" > "$meta"
+  out=$(FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-promote.sh" "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "promotion accepted pending rollback cleanup"
+  assert_contains "$out" "rollback cleanup is pending" "pending rollback promotion refusal was unclear"
+  assert_grep 'kind=scout' "$meta" "pending rollback promotion changed the task kind"
+  assert_absent "$state/.account-lifecycle-$id.lock" "failed promotion left the lifecycle lock behind"
+  assert_absent "$state/.account-meta-$id.lock" "failed promotion left the metadata lock behind"
+  pass "fm-promote.sh: refuses promotion while rollback cleanup is pending"
+}
+
+test_promote_releases_lifecycle_when_metadata_lock_fails() {
+  local home data state id meta ready release holder out status
+  home="$TMP_ROOT/promote-meta-failure-home"
+  data="$TMP_ROOT/promote-meta-failure-data"
+  state="$home/state"
+  id='promote-meta-failure-c7'
+  meta="$state/$id.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state" "$data"
+  printf 'window=firstmate:fm-%s\nkind=scout\n' "$id" > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" "$3") || exit 1
+    touch "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$id" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  out=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-promote.sh" "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "promotion succeeded despite metadata lock acquisition failure"
+  assert_contains "$out" "timed out waiting for account metadata lock" "metadata lock failure was unclear"
+  assert_absent "$state/.account-lifecycle-$id.lock" "metadata lock failure leaked the lifecycle lock"
+  assert_grep 'kind=scout' "$meta" "metadata lock failure changed the task kind"
+  touch "$release"
+  wait "$holder" || fail "promotion metadata lock holder failed"
+  pass "fm-promote.sh: releases lifecycle ownership when metadata locking fails"
+}
+
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
@@ -265,6 +446,13 @@ test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_ship_completion_report_contract
+test_scout_completion_report_contract
+test_promoted_scout_receives_completion_contract
+test_promote_serializes_with_account_session_updates
+test_promote_locks_lifecycle_before_metadata_and_rechecks_kind
+test_promote_refuses_pending_rollback_cleanup
+test_promote_releases_lifecycle_when_metadata_lock_fails
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout

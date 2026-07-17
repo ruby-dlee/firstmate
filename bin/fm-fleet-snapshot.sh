@@ -342,7 +342,7 @@ task_json_lines() {
 
     endpoint_exists=null
     if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
+      if fm_backend_target_exists "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" >/dev/null 2>&1; then
         endpoint_exists=true
       else
         endpoint_exists=false
@@ -350,7 +350,7 @@ task_json_lines() {
     fi
     agent_alive=not_checked
     if [ "$kind" = secondmate ] && [ -n "$target" ]; then
-      agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)
+      agent_alive=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null || printf unknown)
     fi
 
     [ -f "$report_path" ] && report_present=1 || report_present=0

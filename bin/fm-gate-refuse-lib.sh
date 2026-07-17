@@ -13,20 +13,20 @@
 # instructions and stamps NO_MISTAKES_GATE into the gate agent's environment).
 # THIS is the firstmate capability-removal half: an enforceable script refusal,
 # not a prose rule the neutralized agent would never read. It is sourced at the
-# top of the three fleet-lifecycle entrypoints and called before any fleet
+# top of the fleet-lifecycle and merge entrypoints and called before any fleet
 # mutation, so a gate agent that still reaches for the fleet is stopped cold.
 #
 # Two independent signals, either of which refuses (fail closed):
 #
 #   1. NO_MISTAKES_GATE set - the durable env marker no-mistakes stamps into every
 #      gate agent. This is the primary signal and covers a relocated NM_HOME.
-#   2. The current worktree's git-common-dir resolves under a no-mistakes gate
-#      repo (.../.no-mistakes/repos/*.git) - the UNSPOOFABLE backstop. It derives
-#      from the checkout's real filesystem location, which the agent cannot
-#      relocate without breaking the gate's own git operations, so it still
-#      refuses even if the agent tampered NO_MISTAKES_GATE away. Its limit: the
-#      literal-path match only fires for the default NM_HOME (~/.no-mistakes); a
-#      relocated NM_HOME is covered by signal 1.
+#   2. Either the caller's current checkout or this script's checkout has a
+#      git-common-dir under a no-mistakes gate repo
+#      (.../.no-mistakes/repos/*.git) - the UNSPOOFABLE backstop. Checking both
+#      preserves refusal after cd-away and when a normal checkout's script is
+#      invoked by absolute path from a gate worktree. Its limit: the literal-path
+#      match only fires for the default NM_HOME (~/.no-mistakes); a relocated
+#      NM_HOME is covered by signal 1.
 #
 # A NORMAL firstmate session - a real primary checkout, a real treehouse/Orca
 # crew worktree - has NEITHER signal and is COMPLETELY unaffected: the function
@@ -53,7 +53,46 @@
 # neutral-execution-context and the HEAD-continuity guard. The dedicated
 # tests/fm-gate-refuse.test.sh strips the bypass so it still verifies real refusal.
 #
-# Sourced by bin/fm-spawn.sh, bin/fm-send.sh, bin/fm-teardown.sh, and the tests.
+# Guarded direct mutators: fm-account-continuation.sh,
+# fm-account-session-sync.sh, fm-afk-launch.sh, fm-afk-start.sh,
+# fm-backlog-handoff.sh, fm-bootstrap.sh, fm-brief.sh, fm-config-push.sh,
+# fm-ensure-agents-md.sh, fm-fleet-sync.sh, fm-home-seed.sh, fm-lock.sh,
+# fm-merge-local.sh, fm-pr-check.sh, fm-pr-merge.sh, fm-promote.sh,
+# fm-report-retention.sh, fm-report-stack.mjs, fm-review-diff.sh, fm-send.sh,
+# fm-session-start.sh, fm-spawn.sh, fm-supervise-daemon.sh,
+# fm-task-file-append.mjs, fm-teardown.sh, fm-update.sh, fm-wake-drain.sh,
+# fm-watch-arm.sh, fm-watch-checkpoint.sh, fm-watch.sh, fm-x-dismiss.sh,
+# fm-x-followup.sh, fm-x-link.sh, fm-x-poll.sh, and fm-x-reply.sh.
+# The Node entrypoints (fm-report-stack.mjs and fm-task-file-append.mjs)
+# cannot source this library; each replicates the refusal in-process with the
+# same signals, messages, and exit code - keep the replicas in lockstep.
+# Excluded read-only entrypoints: fm-arm-command-policy.mjs,
+# fm-arm-pretool-check.sh, fm-bearings-snapshot.sh, fm-cd-command-policy.mjs,
+# fm-cd-pretool-check.sh, fm-crew-state.sh, fm-dispatch-select.sh,
+# fm-fleet-snapshot.sh, fm-fleet-view.sh, fm-guard.sh, fm-harness.sh,
+# fm-peek.sh, fm-project-mode.sh, and fm-supervision-instructions.sh.
+# Excluded sourced libraries have no mutating command-line dispatch:
+# backends/cmux.sh, backends/herdr.sh, backends/orca.sh, backends/tmux.sh,
+# backends/zellij.sh, fm-account-routing-lib.sh, fm-backend-hometag-lib.sh,
+# fm-backend.sh, fm-classify-lib.sh, fm-composer-lib.sh,
+# fm-config-inherit-lib.sh, fm-ff-lib.sh, fm-gate-refuse-lib.sh,
+# fm-lock-lib.sh, fm-marker-lib.sh, fm-report-contract-lib.sh,
+# fm-supervision-lib.sh, fm-supervisor-target-lib.sh, fm-tangle-lib.sh,
+# fm-tasks-axi-lib.sh, fm-tmux-lib.sh, fm-transition-lib.sh, fm-wake-lib.sh,
+# and fm-x-lib.sh.
+# Excluded pure helpers are not entrypoints: backends/herdr-eventwait.py,
+# fm-contained-read.cjs, fm-contained-read.py, fm-file-transaction.cjs,
+# fm-markdown-structure.cjs, and fm-prompt-exec.py carry no fleet dispatch of
+# their own and are reached only through the entrypoints and libraries above,
+# so they inherit the caller's refusal.
+# fm-herdr-lab.sh is excluded because it accepts only isolated fm-lab-* sessions
+# and protects the live default session with its own tripwire.
+# fm-install-shellcheck.sh and fm-lint.sh are excluded developer verification
+# tools and never mutate fleet, project, or captain data.
+# fm-turnend-guard.sh and fm-turnend-guard-grok.sh are excluded harness hooks:
+# the predicate is read-only, and the Grok adapter invokes that predicate rather
+# than a fleet control-plane mutation.
+# Sourced by those guarded shell entrypoints and the tests.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a
 # gate context.
@@ -74,11 +113,21 @@ fm_refuse_if_gate_agent() {
     echo "error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)" >&2
     exit "$FM_GATE_REFUSE_EXIT"
   fi
-  local common
-  common=$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)
-  case "$common" in
-    */.no-mistakes/repos/*.git)
-      echo "error: refusing fleet lifecycle from inside a no-mistakes gate worktree ($common)" >&2
-      exit "$FM_GATE_REFUSE_EXIT" ;;
-  esac
+  local caller checkout common common_raw
+  caller=$(pwd -P 2>/dev/null || true)
+  checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
+  for checkout in "$caller" "$checkout"; do
+    [ -n "$checkout" ] || continue
+    common_raw=$(git -C "$checkout" rev-parse --git-common-dir 2>/dev/null || true)
+    case "$common_raw" in
+      /*) common=$(cd "$common_raw" 2>/dev/null && pwd -P || true) ;;
+      '') common= ;;
+      *) common=$(cd "$checkout/$common_raw" 2>/dev/null && pwd -P || true) ;;
+    esac
+    case "$common" in
+      */.no-mistakes/repos/*.git)
+        echo "error: refusing fleet lifecycle from inside a no-mistakes gate worktree ($common)" >&2
+        exit "$FM_GATE_REFUSE_EXIT" ;;
+    esac
+  done
 }

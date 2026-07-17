@@ -27,7 +27,9 @@
 # for the common case where there is no remote at all.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
-# product - teardown proceeds once the report exists, and refuses without it.
+# product. A pre-cutover scout proceeds once that report exists; a task carrying
+# report_required=1 must satisfy the shared completion and publication contract
+# owned by docs/report-stack.md before teardown discards the scratch worktree.
 # Orca tasks use the same safety checks, then close the recorded terminal and
 # remove the recorded worktree through `orca worktree rm`; teardown never guesses
 # an Orca target from ambient CLI state.
@@ -39,9 +41,10 @@
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force]
-#   --force skips ordinary-task dirty and landed-work checks, skips scout report
-#   checks, and discards secondmate child work for kind=secondmate. Only use it
-#   when the captain has explicitly said to discard the work.
+#   --force skips ordinary-task dirty and landed-work checks, skips scout and
+#   required-report publication checks, and discards secondmate child work for
+#   kind=secondmate. It is an explicit discard and never publishes completion.
+#   Only use it when the captain has explicitly said to discard the work.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
@@ -93,6 +96,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
 # down a worktree (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -100,6 +105,31 @@ FORCE=${2:-}
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+TEARDOWN_ACCOUNT_LOCKS=('')
+MANAGED_ACCOUNT_LOCK=
+ACCOUNT_DELETE_LOCK=
+
+release_teardown_account_locks() {
+  local lock
+  for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
+    [ -n "$lock" ] || continue
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+  done
+}
+trap release_teardown_account_locks EXIT
+
+managed_account_meta() {
+  [ -n "$(fm_meta_get "$1" account_profile)" ] || [ "$(fm_meta_get "$1" account_rollback_cleanup)" = pending ]
+}
+
+MANAGED_ACCOUNT=0
+ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+[ -f "$META" ] || { echo "error: task metadata disappeared while teardown waited for $ID" >&2; exit 1; }
+if managed_account_meta "$META"; then
+  MANAGED_ACCOUNT=1
+  managed_account_meta "$META" || { echo "error: managed task metadata changed while teardown waited for $ID" >&2; exit 1; }
+fi
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
@@ -113,13 +143,185 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
+if [ -n "$TASK_TMP" ] && [ "$TASK_TMP" != "/tmp/fm-$ID" ]; then
+  echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
+  exit 1
+fi
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
+SECONDMATE_ENDPOINT_QUIESCED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+REPORT_GATED=0
+REPORT_REQUIRED_COUNT=$(grep -c '^report_required=' "$META" 2>/dev/null || true)
+if [ "$REPORT_REQUIRED_COUNT" -gt 0 ]; then
+  if [ "$REPORT_REQUIRED_COUNT" -ne 1 ] || [ "$(fm_meta_get "$META" report_required)" != 1 ]; then
+    echo "error: invalid report_required metadata for $ID; refusing teardown" >&2
+    exit 1
+  fi
+  if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+    REPORT_GATED=1
+  fi
+fi
+
+managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]
+  local backend=$1 target=$2 expected=$3 probe_home=${4:-} recorded_scoped_target=${5:-} attempt state last=unknown
+  [ -n "$target" ] || return 2
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -n "$probe_home" ]; then
+      state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_target_state "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
+    else
+      state=$(fm_backend_target_state "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
+    fi
+    case "$state" in
+      absent) return 0 ;;
+      present|unknown) last=$state ;;
+      *) last=unknown ;;
+    esac
+    sleep 0.1
+  done
+  [ "$last" != unknown ] || return 2
+  return 1
+}
+
+managed_endpoint_blocker() {  # <status> <task> [restored]
+  local status=$1 task=$2 restored=${3:-} qualifier=
+  [ -z "$restored" ] || qualifier='restored '
+  if [ "$status" -eq 2 ]; then
+    echo "error: ${qualifier}managed endpoint state for $task is unknown; retaining its Agent Fleet lease and metadata" >&2
+  else
+    echo "error: ${qualifier}managed endpoint for $task is still alive; retaining its Agent Fleet lease and metadata" >&2
+  fi
+}
+
+quiesce_secondmate_endpoint() {
+  local endpoint_home probe_home='' endpoint_status
+  endpoint_home=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
+  [ "$endpoint_home" = "$FM_HOME" ] || probe_home=$endpoint_home
+  if [ -n "$T" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$probe_home" "$(meta_value "$META" tmux_session_target)"; then
+    SECONDMATE_ENDPOINT_QUIESCED=1
+    return 0
+  fi
+  endpoint_status=$?
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "error: secondmate endpoint state for $ID is unknown; refusing child cleanup" >&2
+  else
+    echo "error: secondmate endpoint for $ID is still alive; refusing child cleanup" >&2
+  fi
+  return 1
+}
+
+quiesce_managed_account_endpoint() {  # <meta> <task> [probe-home]
+  local meta=$1 task=$2 probe_home=${3:-} meta_state lock profile backend target zellij_tab tmux_session_target endpoint_status
+  meta_state=$(dirname "$meta")
+  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+  [ -f "$meta" ] || {
+    echo "error: managed metadata for $task disappeared during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  profile=$(fm_meta_get "$meta" account_profile)
+  if [ -z "$profile" ] && [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; then
+    echo "error: managed metadata for $task changed during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  zellij_tab=$(fm_meta_get "$meta" zellij_tab_id)
+  tmux_session_target=$(fm_meta_get "$meta" tmux_session_target)
+  [ -n "$tmux_session_target" ] || tmux_session_target=$(fm_meta_get "$meta" window)
+  fm_account_meta_lock_release "$lock" || return 1
+  if [ -n "$target" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$tmux_session_target" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$tmux_session_target" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$backend" "$target" "fm-$task" "$probe_home" "$tmux_session_target"; then
+    return 0
+  else
+    endpoint_status=$?
+  fi
+  managed_endpoint_blocker "$endpoint_status" "$task"
+  return 1
+}
+
+reconcile_managed_account_rollback() {  # <meta> <task> [data-dir]
+  local meta=$1 task=$2 owner_data=${3:-$DATA} rollback_backup
+  [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
+  rollback_backup=$(fm_meta_get "$meta" account_rollback_backup)
+  fm_account_cleanup_rollback "$meta" "$owner_data" "$task" || {
+    echo "error: failed to clean rolled-back Agent Fleet state for $task; retaining metadata for retry" >&2
+    return 1
+  }
+  if [ -n "$rollback_backup" ]; then
+    echo "error: rolled-back Agent Fleet state for $task was restored; rerun teardown against the restored task generation" >&2
+    return 2
+  fi
+}
+
+release_managed_account() {  # <meta> <task> [probe-home] [held-lock] [data-dir]
+  local meta=$1 task=$2 probe_home=${3:-} lifecycle_lock=${4:-} owner_data=${5:-$DATA} profile account_task meta_state lock
+  MANAGED_ACCOUNT_LOCK=
+  profile=$(fm_meta_get "$meta" account_profile)
+  [ -n "$profile" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ] || return 0
+  meta_state=$(dirname "$meta")
+  if [ -z "$lifecycle_lock" ]; then
+    lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$meta_state" "$task") || return 1
+    TEARDOWN_ACCOUNT_LOCKS+=("$lifecycle_lock")
+  fi
+  quiesce_managed_account_endpoint "$meta" "$task" "$probe_home" || return 1
+  lock=$(fm_account_meta_lock_acquire "$meta_state" "$task") || return 1
+  [ -f "$meta" ] || {
+    echo "error: managed metadata for $task disappeared during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  profile=$(fm_meta_get "$meta" account_profile)
+  if [ -z "$profile" ] && [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; then
+    echo "error: managed metadata for $task changed during teardown" >&2
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  account_task=$(fm_meta_get "$meta" account_task)
+  [ -n "$account_task" ] || account_task=$task
+  fm_account_meta_lock_release "$lock" || return 1
+  if [ "$(fm_meta_get "$meta" account_rollback_cleanup)" = pending ]; then
+    reconcile_managed_account_rollback "$meta" "$task" "$owner_data" || return $?
+    profile=$(fm_meta_get "$meta" account_profile)
+    if [ -z "$profile" ]; then
+      return 0
+    fi
+  fi
+  if [ "$(fm_meta_get "$meta" account_task)" != "$account_task" ]; then
+    echo "error: managed task generation changed during teardown for $task" >&2
+    return 1
+  fi
+  fm_account_release "$account_task" --force || {
+    echo "error: failed to release Agent Fleet lease for $task; retaining metadata for retry" >&2
+    return 1
+  }
+  fm_account_session_remove "$account_task" || {
+    echo "error: failed to remove Agent Fleet session mapping for $task; retaining metadata for retry" >&2
+    return 1
+  }
+  fm_account_cleanup_predecessor_serialized "$meta" "$owner_data" "$task" || {
+    echo "error: failed to clean predecessor Agent Fleet state for $task; retaining metadata for retry" >&2
+    return 1
+  }
+}
 
 default_branch() {
   local ref branch
@@ -838,6 +1040,11 @@ validate_firstmate_home_children_removal() {
     child_wt=$(meta_value "$child_meta" worktree)
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
+    child_home=
+    if [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+    fi
     child_backend=$(fm_backend_of_meta "$child_meta")
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
@@ -859,16 +1066,30 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_account_lock child_endpoint_home
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
+    child_account_lock=$(fm_account_lifecycle_lock_acquire "$sub_state" "$child_id") || return 1
+    TEARDOWN_ACCOUNT_LOCKS+=("$child_account_lock")
+    [ -f "$child_meta" ] || { echo "error: child metadata disappeared while teardown waited for $child_id" >&2; return 1; }
+    if managed_account_meta "$child_meta"; then
+      if [ ! -f "$child_meta" ] || ! managed_account_meta "$child_meta"; then
+        echo "error: managed child metadata changed while teardown waited for $child_id" >&2
+        return 1
+      fi
+    fi
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
+    child_home=
+    if [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+    fi
     child_backend=$(fm_backend_of_meta "$child_meta")
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
@@ -881,18 +1102,16 @@ cleanup_firstmate_home_children() {
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       fi
     fi
-    if [ -n "$child_t" ]; then
-      if [ "$child_backend" = zellij ]; then
-        # Zellij titles are scoped by the owning home tag, so forced secondmate
-        # cleanup must verify child tabs as that child home, not the parent.
-        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
-      else
-        fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
+    if managed_account_meta "$child_meta"; then
+      child_endpoint_home=$(fm_backend_endpoint_home "$child_backend" "$child_kind" "$home" "$child_home")
+      release_managed_account "$child_meta" "$child_id" "$child_endpoint_home" "$child_account_lock" "$home/data" || return 1
+      child_account_lock=$MANAGED_ACCOUNT_LOCK
+    else
+      if [ -n "$child_t" ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" "$(meta_value "$child_meta" tmux_session_target)" ) 2>/dev/null || true
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home"
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id"
@@ -922,14 +1141,17 @@ cleanup_firstmate_home_children() {
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
+    [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done
 }
 
 remove_secondmate_registry_entry() {
   local id=$1 tmp
   [ -f "$SECONDMATE_REG" ] || return 0
-  tmp="$SECONDMATE_REG.tmp.$$"
+  fm_account_safe_file_destination "$SECONDMATE_REG" || return 1
+  tmp=$(mktemp "$DATA/.secondmates.XXXXXX") || return 1
   grep -vE "^- $id( |$)" "$SECONDMATE_REG" > "$tmp" || true
+  fm_account_safe_file_destination "$SECONDMATE_REG" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$SECONDMATE_REG"
 }
 
@@ -938,6 +1160,7 @@ if [ "$KIND" = secondmate ]; then
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+    quiesce_secondmate_endpoint || exit 1
   fi
 fi
 
@@ -953,10 +1176,6 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH"
-fi
-
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
@@ -966,13 +1185,54 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+PROBE_HOME=
+ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
+[ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME
+
+quiesce_completion_report_endpoint() {
+  local endpoint_status zellij_tab
+  if [ "$MANAGED_ACCOUNT" = 1 ]; then
+    quiesce_managed_account_endpoint "$META" "$ID" "$PROBE_HOME"
+    return $?
+  fi
+  zellij_tab=$(meta_value "$META" zellij_tab_id)
+  if [ -n "$T" ]; then
+    if [ -n "$PROBE_HOME" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME" "$(meta_value "$META" tmux_session_target)"; then
+    return 0
+  else
+    endpoint_status=$?
+  fi
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "error: completion-report endpoint state for $ID is unknown; retaining metadata" >&2
+  else
+    echo "error: completion-report endpoint for $ID is still alive; retaining metadata" >&2
+  fi
+  return 1
+}
+
+report_gated_safety_refusal() {
+  [ "$REPORT_GATED" = 1 ] || return 0
+  echo "The completion-report endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
+}
+
+if [ "$REPORT_GATED" = 1 ]; then
+  quiesce_completion_report_endpoint || exit 1
+fi
+
 if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
   if ! inspectable_git_worktree "$WT"; then
     echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
     echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
+    report_gated_safety_refusal
     exit 1
   fi
-  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || exit 1
+  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || { report_gated_safety_refusal; exit 1; }
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
@@ -982,12 +1242,34 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   else
     safety_rc=$?
     if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
-      cleanup_stale_lock_for_safety_check "$WT" || exit 1
-      validate_worktree_teardown_safety || exit 1
+      cleanup_stale_lock_for_safety_check "$WT" || { report_gated_safety_refusal; exit 1; }
+      validate_worktree_teardown_safety || { report_gated_safety_refusal; exit 1; }
     else
+      report_gated_safety_refusal
       exit 1
     fi
   fi
+fi
+
+# New tasks quiesce their endpoint, restore any pending rollback generation,
+# and fail closed on their machine-global completion report before lease release
+# or worktree removal. Tasks already in flight when this feature lands have no
+# report_required marker and retain the legacy teardown contract. --force is an
+# explicit discard, not a completion.
+if [ "$REPORT_GATED" = 1 ]; then
+  if [ "$MANAGED_ACCOUNT" = 1 ]; then
+    reconcile_managed_account_rollback "$META" "$ID" "$DATA" || exit $?
+  fi
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+    "$FM_ROOT/bin/fm-report-stack.mjs" publish "$ID" || exit 1
+fi
+
+if [ "$MANAGED_ACCOUNT" = 1 ]; then
+  release_managed_account "$META" "$ID" "$PROBE_HOME" "$ACCOUNT_DELETE_LOCK" || exit 1
+fi
+
+if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
+  cleanup_firstmate_home_children "$HOME_PATH"
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
@@ -1005,7 +1287,9 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
-  [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if [ "$MANAGED_ACCOUNT" = 0 ]; then
+    [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
+  fi
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
@@ -1030,8 +1314,8 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$BACKEND" != orca ]; then
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ] && [ "$SECONDMATE_ENDPOINT_QUIESCED" = 0 ]; then
+  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
@@ -1044,6 +1328,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+[ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

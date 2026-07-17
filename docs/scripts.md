@@ -3,7 +3,7 @@
 The first mate drives these; interactive entrypoints work by hand too, while `*-lib.sh` files are sourced helpers.
 Each row is one purpose clause only: the script's own header comment is the authoritative description of its behavior, flags, and contracts, so read the header before first use.
 If you have changed away from the firstmate home in an interactive shell, invoke these scripts by absolute path through the repo's `bin/` directory; the scripts self-locate internally after they start.
-The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm-teardown.sh` is summarized in [architecture.md](architecture.md#no-mistakes-gate-authority-boundary); `fm-gate-refuse-lib.sh`'s header owns its exact contract.
+The shared no-mistakes gate refusal used by every directly invocable mutating control-plane entrypoint is summarized in [architecture.md](architecture.md#no-mistakes-gate-authority-boundary); `fm-gate-refuse-lib.sh`'s header owns its exact guarded and excluded scope.
 
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
@@ -27,8 +27,11 @@ The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm
 | `fm-cd-command-policy.mjs` | Semantic owner of the cd-guard's persistent-directory-change decision (docs/cd-guard.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
-| `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend |
-| `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile, owning `quota-balanced` selection |
+| `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crews on the resolved account and runtime backend |
+| `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule through legacy quota or Agent Fleet pool summaries |
+| `fm-account-routing-lib.sh` | Own Firstmate's shell-side Agent Fleet mode, lease, exec, resume, and release contract |
+| `fm-account-session-sync.sh` | Reconcile real Agent Fleet provider-session mappings into managed task metadata       |
+| `fm-account-continuation.sh` | Build a verified task-owned packet for fresh cross-profile continuation             |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
 | `fm-composer-lib.sh`     | Single fleet-wide owner of composer-content classification for all backends          |
@@ -68,7 +71,10 @@ The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm
 | `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's PR from its full GitHub URL                  |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
-| `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require scout reports, retire secondmate homes |
+| `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
+| `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |
+| `fm-report-retention.sh` | Maintain bounded, interruption-safe 30-day report retention independently of tasks   |
+| `fm-teardown.sh`         | Fail-closed teardown of worktrees, endpoints, secondmate homes, and managed account leases |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
 | `fm-lint.sh`             | Single owner of the shell-lint definition that CI and the no-mistakes gate both run  |

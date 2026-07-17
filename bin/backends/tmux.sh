@@ -34,24 +34,64 @@ fm_backend_tmux_resolve_bare_selector() {  # <name>
 
 # fm_backend_tmux_capture: bounded plain-text pane capture. Mirrors
 # fm-peek.sh's and fm-watch.sh's `tmux capture-pane -p -t "$T" -S -"$N"`.
-fm_backend_tmux_capture() {  # <target> <lines>
-  tmux capture-pane -p -t "$1" -S -"$2"
+fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorded-scoped-target]
+  local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} expected_session actual_identity actual_session actual_label
+  [ -n "$expected_label" ] || [ -n "$recorded_scoped_target" ] || return 0
+  case "$target" in @*) ;; *) return 0 ;; esac
+  if [ -n "$recorded_scoped_target" ]; then
+    case "$recorded_scoped_target" in
+      *:*) expected_session=${recorded_scoped_target%%:*} ;;
+      *) return 1 ;;
+    esac
+  fi
+  actual_identity=$(tmux display-message -p -t "$target" '#{session_name}	#{window_name}' 2>/dev/null) || return 1
+  actual_session=${actual_identity%%$'\t'*}
+  actual_label=${actual_identity#*$'\t'}
+  [ "$actual_identity" != "$actual_session" ] || return 1
+  [ -z "$expected_label" ] || [ "$actual_label" = "$expected_label" ] || return 1
+  [ -z "$expected_session" ] || [ "$actual_session" = "$expected_session" ]
+}
+
+fm_backend_tmux_operation_target() {  # <target> [expected-label] [recorded-scoped-target]
+  local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} recorded_session recorded_label
+  if [ -n "$recorded_scoped_target" ]; then
+    case "$recorded_scoped_target" in *:*) ;; *) return 1 ;; esac
+    recorded_session=${recorded_scoped_target%%:*}
+    recorded_label=${recorded_scoped_target#*:}
+    [ -n "$recorded_session" ] && [ -n "$recorded_label" ] || return 1
+    [ -z "$expected_label" ] || [ "$recorded_label" = "$expected_label" ] || return 1
+    fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target" || return 1
+    printf '%s\n' "$target"
+    return 0
+  fi
+  fm_backend_tmux_expected_label_matches "$target" "$expected_label" || return 1
+  printf '%s\n' "$target"
+}
+
+fm_backend_tmux_capture() {  # <target> <lines> [expected-label] [recorded-scoped-target]
+  local target
+  target=$(fm_backend_tmux_operation_target "$1" "${3:-}" "${4:-}") || return 1
+  tmux capture-pane -p -t "$target" -S -"$2"
 }
 
 # fm_backend_tmux_send_key: one named key. Mirrors fm-send.sh's --key path:
 # `tmux display-message -p -t "$T" '#{pane_id}' >/dev/null`, then
 # `tmux send-keys -t "$T" "$2"`.
-fm_backend_tmux_send_key() {  # <target> <key>
-  tmux display-message -p -t "$1" '#{pane_id}' >/dev/null
-  tmux send-keys -t "$1" "$2"
+fm_backend_tmux_send_key() {  # <target> <key> [expected-label] [recorded-scoped-target]
+  local target
+  target=$(fm_backend_tmux_operation_target "$1" "${3:-}" "${4:-}") || return 1
+  tmux display-message -p -t "$target" '#{pane_id}' >/dev/null
+  tmux send-keys -t "$target" "$2"
 }
 
 # fm_backend_tmux_send_text_submit: type <text> into <target> once, then
 # submit with Enter, retried (Enter only, never retyped) until the composer
 # clears. Re-exports fm_tmux_submit_core (bin/fm-tmux-lib.sh) verbatim; see
 # that file for the composer-verification contract and echoed verdicts.
-fm_backend_tmux_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  fm_tmux_submit_core "$@"
+fm_backend_tmux_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label] [recorded-scoped-target]
+  local target
+  target=$(fm_backend_tmux_operation_target "$1" "${6:-}" "${7:-}") || return 1
+  fm_tmux_submit_core "$target" "$2" "$3" "$4" "$5"
 }
 
 # fm_backend_tmux_container_ensure: reuse the current tmux session when
@@ -119,7 +159,8 @@ fm_backend_tmux_send_literal() {  # <target> <text>
 
 # fm_backend_tmux_kill: remove the task's window, best-effort. Mirrors
 # fm-teardown.sh's `tmux kill-window -t "$T" 2>/dev/null || true`.
-fm_backend_tmux_kill() {  # <target>
+fm_backend_tmux_kill() {  # <target> [backend-id] [expected-label] [recorded-scoped-target]
+  fm_backend_tmux_expected_label_matches "$1" "${3:-}" "${4:-}" || return 1
   tmux kill-window -t "$1" 2>/dev/null || true
 }
 
@@ -154,8 +195,9 @@ fm_backend_tmux_current_command() {  # <target>
 #             pane. Callers must never treat unknown as a confirmed-dead
 #             signal (bin/fm-bootstrap.sh's secondmate-liveness sweep gates a
 #             respawn on `dead` only).
-fm_backend_tmux_agent_alive() {  # <target>
-  local target=$1 comm
+fm_backend_tmux_agent_alive() {  # <target> [expected-label] [recorded-scoped-target]
+  local target expected_label=${2:-} recorded_scoped_target=${3:-} comm
+  target=$(fm_backend_tmux_operation_target "$1" "$expected_label" "$recorded_scoped_target") || { printf 'unknown'; return 0; }
   comm=$(fm_backend_tmux_current_command "$target") || { printf 'unknown'; return 0; }
   comm=${comm#-}
   case "$comm" in

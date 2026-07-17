@@ -43,7 +43,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 mkdir -p "$STATE"
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe watcher state directory: $STATE" >&2; exit 1; }
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -99,6 +103,11 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+ACCOUNT_SESSION_SYNC_INTERVAL=${FM_ACCOUNT_SESSION_SYNC_INTERVAL:-60}
+ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
+ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT:-$((ACCOUNT_SESSION_SYNC_TIMEOUT + 3))}
+REPORT_RETENTION_INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-86400}
+REPORT_RETENTION_TIMEOUT=${FM_REPORT_RETENTION_TIMEOUT:-30}
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -157,13 +166,19 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # size-capped so a long benign stretch cannot grow it without bound. Best-effort:
 # a logging hiccup never affects supervision.
 triage_log() {
-  local sz
+  local sz tmp
+  [ ! -L "$TRIAGE_LOG" ] && { [ ! -e "$TRIAGE_LOG" ] || [ -f "$TRIAGE_LOG" ]; } || return 0
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$TRIAGE_LOG" 2>/dev/null || return 0
   sz=$(wc -c < "$TRIAGE_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$sz" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$sz" -ge "$TRIAGE_LOG_MAX_BYTES" ]; then
-    tail -n 2000 "$TRIAGE_LOG" > "$TRIAGE_LOG.tmp" 2>/dev/null && mv -f "$TRIAGE_LOG.tmp" "$TRIAGE_LOG" 2>/dev/null
-    rm -f "$TRIAGE_LOG.tmp" 2>/dev/null || true
+    tmp=$(mktemp "$STATE/.watch-triage.pending.XXXXXX") || return 0
+    if tail -n 2000 "$TRIAGE_LOG" > "$tmp" 2>/dev/null \
+      && [ ! -L "$TRIAGE_LOG" ] \
+      && { [ ! -e "$TRIAGE_LOG" ] || [ -f "$TRIAGE_LOG" ]; }; then
+      mv -f "$tmp" "$TRIAGE_LOG" 2>/dev/null || true
+    fi
+    rm -f "$tmp" 2>/dev/null || true
   fi
 }
 
@@ -181,7 +196,7 @@ hash_pane() {
 # regex-fallback path.
 window_is_busy() {  # <window> <tail40>
   local w=$1 tail40=$2 bs
-  bs=$(fm_backend_busy_state "$(window_backend "$w")" "$w" 2>/dev/null)
+  bs=$(fm_backend_busy_state "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null)
   case "$bs" in
     busy) return 0 ;;
     idle) return 1 ;;
@@ -222,6 +237,12 @@ window_label() {
   local w=$1 task
   task=$(window_to_task "$w" "$STATE")
   [ -n "$task" ] && printf 'fm-%s' "$task"
+}
+
+window_scoped_target() {
+  local w=$1 meta
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] && fm_meta_get "$meta" tmux_session_target
 }
 
 recorded_windows() {
@@ -406,15 +427,74 @@ scan_signals() {
   return 0
 }
 
-run_check() {
-  local c=$1
+run_bounded() {  # <seconds> <command> [args...]
+  local seconds=$1
+  shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    timeout --kill-after=1 "$seconds" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    gtimeout --kill-after=1 "$seconds" "$@"
   else
     # shellcheck disable=SC2016  # single quotes are deliberate: Perl expands its own variables.
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
+  fi
+}
+
+run_check() {
+  local c=$1
+  run_bounded "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+}
+
+safe_touch_marker() {  # <path>
+  local marker=$1
+  if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+    return 1
+  fi
+  touch "$marker"
+}
+
+safe_marker_path() {  # <path>
+  local marker=$1
+  [ ! -L "$marker" ] && { [ ! -e "$marker" ] || [ -f "$marker" ]; }
+}
+
+UNSAFE_MARKERS_LOGGED='|'
+safe_touch_marker_or_log() {  # <path> <label>
+  local marker=$1 label=$2
+  safe_touch_marker "$marker" && return 0
+  case "$UNSAFE_MARKERS_LOGGED" in
+    *"|$label|"*) ;;
+    *)
+      triage_log "unsafe $label marker: $marker"
+      UNSAFE_MARKERS_LOGGED="$UNSAFE_MARKERS_LOGGED$label|"
+      ;;
+  esac
+  return 1
+}
+
+marker_due() {  # <path> <interval-seconds> <label>
+  local marker=$1 interval=$2 label=$3
+  if ! safe_marker_path "$marker"; then
+    safe_touch_marker_or_log "$marker" "$label" || true
+    return 0
+  fi
+  [ "$(age_of "$marker")" -ge "$interval" ]
+}
+
+sync_account_sessions_if_due() {
+  local cadence="$STATE/.last-account-session-sync"
+  marker_due "$cadence" "$ACCOUNT_SESSION_SYNC_INTERVAL" "watcher cadence" || return 0
+  safe_touch_marker_or_log "$cadence" "watcher cadence" || true
+  FM_ACCOUNT_SESSION_QUERY_TIMEOUT="$ACCOUNT_SESSION_SYNC_TIMEOUT" \
+    FM_ACCOUNT_SESSION_TASK_TIMEOUT="$ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT" \
+    "$FM_ROOT/bin/fm-account-session-sync.sh" --all >/dev/null 2>&1 || true
+}
+
+prune_reports_if_due() {
+  local cadence="$STATE/.last-report-retention"
+  marker_due "$cadence" "$REPORT_RETENTION_INTERVAL" "report retention cadence" || return 0
+  if run_bounded "$REPORT_RETENTION_TIMEOUT" "$FM_ROOT/bin/fm-report-stack.mjs" prune >/dev/null 2>&1; then
+    safe_touch_marker_or_log "$cadence" "report retention cadence" || true
   fi
 }
 
@@ -609,7 +689,9 @@ printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
-[ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
+if ! safe_marker_path "$STATE/.last-heartbeat" || [ ! -e "$STATE/.last-heartbeat" ]; then
+  safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
+fi
 
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -624,7 +706,15 @@ while :; do
 
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  touch "$STATE/.last-watcher-beat"
+  safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
+
+  prune_reports_if_due
+
+  # A managed provider's SessionStart hook may race the initial spawn return.
+  # Reconcile only metas still missing provider_session_id; failures stay
+  # silent and retry here, while recovery itself requires the mapping and
+  # fails closed.
+  sync_account_sessions_if_due
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -633,18 +723,18 @@ while :; do
   # keeps producing signals - the slow poll (e.g. merge detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
-  if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
+  if marker_due "$STATE/.last-check" "$CHECK_INTERVAL" "watcher check"; then
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
       out=$(run_check "$c")
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
-        touch "$STATE/.last-check"
+        safe_touch_marker_or_log "$STATE/.last-check" "watcher check" || true
         wake "$reason"
       fi
     done
-    touch "$STATE/.last-check"
+    safe_touch_marker_or_log "$STATE/.last-check" "watcher check" || true
   fi
 
   # On the first changed signal, linger one grace period and re-scan before
@@ -721,7 +811,7 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
-    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
@@ -868,7 +958,7 @@ EOF
   [ "$streak" -gt 12 ] && streak=12
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
-  if [ "$(age_of "$STATE/.last-heartbeat")" -ge "$hb" ]; then
+  if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
     # turns up a captain-relevant status the per-wake path missed. Absorb the
     # no-change case (advance the schedule and back off exactly as wake() would,
@@ -876,18 +966,18 @@ EOF
     # every heartbeat.
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       mark_all_captain_relevant_surfaced
       wake "heartbeat"
     else
-      touch "$STATE/.last-heartbeat"
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
       triage_log "absorbed heartbeat (no captain-relevant change)"
     fi

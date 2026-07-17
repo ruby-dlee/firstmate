@@ -32,20 +32,34 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 
 fmx_load_config
 # Hard no-op when X mode is off: this is what keeps the check shim inert.
 [ -n "$FMX_TOKEN" ] || exit 0
 
+mkdir -p "$STATE" 2>/dev/null || exit 0
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || exit 0
+
 ERROR_FILE="$STATE/x-poll.error"
 
 emit_error_once() {
-  local msg=$1
-  mkdir -p "$STATE" 2>/dev/null || true
+  local msg=$1 pending
   if [ -f "$ERROR_FILE" ] && [ "$(cat "$ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
     return 0
   fi
-  printf '%s\n' "$msg" > "$ERROR_FILE" 2>/dev/null || true
+  if [ -L "$ERROR_FILE" ] || { [ -e "$ERROR_FILE" ] && [ ! -f "$ERROR_FILE" ]; }; then
+    printf 'x-mode-error %s\n' "$msg"
+    return 0
+  fi
+  pending=$(mktemp "$STATE/.x-poll.error.XXXXXX" 2>/dev/null) || { printf 'x-mode-error %s\n' "$msg"; return 0; }
+  if ! printf '%s\n' "$msg" > "$pending" 2>/dev/null \
+    || [ -L "$ERROR_FILE" ] || { [ -e "$ERROR_FILE" ] && [ ! -f "$ERROR_FILE" ]; } \
+    || ! mv "$pending" "$ERROR_FILE" 2>/dev/null; then
+    rm -f "$pending"
+  fi
   printf 'x-mode-error %s\n' "$msg"
 }
 
@@ -60,7 +74,8 @@ fmx_context_registry_prune "$STATE"
 
 BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-x-poll.XXXXXX") || exit 0
 AUTH_HEADER_FILE=
-trap 'rm -f "$BODY_FILE" "$AUTH_HEADER_FILE"' EXIT
+INBOX_TMP=
+trap 'rm -f "$BODY_FILE" "$AUTH_HEADER_FILE" "$INBOX_TMP"' EXIT
 AUTH_HEADER_FILE=$(fmx_auth_header_file) || { emit_error_once "invalid token"; exit 0; }
 
 # Short, bounded poll: a failure or timeout simply means "no wake this cycle";
@@ -99,16 +114,26 @@ esac
 
 INBOX="$STATE/x-inbox"
 mkdir -p "$INBOX" 2>/dev/null || { emit_error_once "cannot create inbox"; exit 0; }
+[ -d "$INBOX" ] && [ ! -L "$INBOX" ] || { emit_error_once "cannot create inbox"; exit 0; }
+INBOX_DESTINATION="$INBOX/$REQ.json"
+if [ -L "$INBOX_DESTINATION" ] || { [ -e "$INBOX_DESTINATION" ] && [ ! -f "$INBOX_DESTINATION" ]; }; then
+  emit_error_once "cannot write inbox"
+  exit 0
+fi
+INBOX_TMP=$(mktemp "$INBOX/.${REQ}.XXXXXX" 2>/dev/null) || { emit_error_once "cannot write inbox"; exit 0; }
 # Stash the full mention object atomically so a concurrent reader never sees a
 # half-written file.
-if jq '.' "$BODY_FILE" > "$INBOX/$REQ.json.tmp" 2>/dev/null; then
-  if ! mv -f "$INBOX/$REQ.json.tmp" "$INBOX/$REQ.json" 2>/dev/null; then
-    rm -f "$INBOX/$REQ.json.tmp"
+if jq '.' "$BODY_FILE" > "$INBOX_TMP" 2>/dev/null; then
+  if [ -L "$INBOX_DESTINATION" ] || { [ -e "$INBOX_DESTINATION" ] && [ ! -f "$INBOX_DESTINATION" ]; } \
+    || ! mv "$INBOX_TMP" "$INBOX_DESTINATION" 2>/dev/null; then
+    rm -f "$INBOX_TMP"
     emit_error_once "cannot write inbox"
     exit 0
   fi
+  INBOX_TMP=
 else
-  rm -f "$INBOX/$REQ.json.tmp"
+  rm -f "$INBOX_TMP"
+  INBOX_TMP=
   emit_error_once "cannot write inbox"
   exit 0
 fi

@@ -29,6 +29,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 
 SESSION="fm-lab-backend-smoke-$$"
 export HERDR_SESSION="$SESSION"
+herdr_test_lab_available "$SESSION" || exit 0
 SM_SCRATCH=
 cleanup_all() {
   [ -n "$SM_SCRATCH" ] && rm -rf "$SM_SCRATCH"

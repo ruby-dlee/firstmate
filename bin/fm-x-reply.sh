@@ -84,6 +84,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 
@@ -231,18 +234,19 @@ case "$REQ_PLATFORM" in
 esac
 case "$REQ_EXPLICIT_MAX" in
   ''|*[!0-9]*) REQ_EXPLICIT_MAX= ;;
+  *) [ "$REQ_EXPLICIT_MAX" -ge "$FMX_REPLY_MIN_CHARS" ] || REQ_EXPLICIT_MAX= ;;
 esac
 # Was the platform/budget authoritatively resolved by any source (override,
 # registry, inbox, or relay)? Drives the follow-up fail-safe below.
 CONTEXT_RESOLVED=0
-if [ -n "$REQ_PLATFORM" ] && [ -n "$REQ_EXPLICIT_MAX" ]; then
+if [ -n "$REQ_PLATFORM" ] || [ -n "$REQ_EXPLICIT_MAX" ]; then
   CONTEXT_RESOLVED=1
 fi
 
 if [ "$FOLLOWUP" = 1 ] && [ "$CONTEXT_RESOLVED" = 0 ]; then
   relay_note=
   [ "$ALLOW_RELAY" = 1 ] && relay_note=", and the relay did not supply the missing value by request_id"
-  printf 'fm-x-reply: refusing follow-up for %s: could not authoritatively determine both the reply platform and explicit budget (local per-request context was incomplete%s). Hold and retry once both values are recoverable.\n' \
+  printf 'fm-x-reply: refusing follow-up for %s: could not authoritatively determine a reply platform or explicit budget (local per-request context was incomplete%s). Hold and retry once either value is recoverable.\n' \
     "$REQ" "$relay_note" >&2
   exit 8
 fi

@@ -27,6 +27,8 @@
 # or a status-pointed doc instead of stranding it in chat the main firstmate
 # never reads. A crewmate/scout target, an explicit backend-target escape-hatch
 # target, and the --key path are never marked - their behavior is unchanged.
+# Successful text steering for a managed account task is also appended to the
+# task-owned data/<id>/steering.md trail for provider-neutral continuation.
 # After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
 # 0 disables) before returning: submit confirmation only proves the text was
 # accepted, but the harness needs a beat to spin up the turn before its busy
@@ -50,6 +52,7 @@ if [ -z "${FM_HOME+x}" ] || [ -z "${FM_HOME:-}" ]; then
 fi
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 if [ ! -d "$FM_HOME" ]; then
   echo "error: FM_HOME '$FM_HOME' is not a directory; fm-send cannot resolve this home's state" >&2
   exit 1
@@ -61,6 +64,8 @@ fi
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-marker-lib.sh
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 
@@ -147,6 +152,8 @@ fm_send_resolve_target() {  # <raw-target>
     TARGET_BACKEND=$(fm_backend_of_meta "$meta")
     TARGET_META=$meta
     TARGET_HARNESS=$(fm_meta_get "$meta" harness)
+    id=$(fm_send_id_from_meta "$meta")
+    EXPECTED_LABEL="fm-$id"
     RESOLUTION_TRIED="explicit target '$raw' matched $meta; backend=$TARGET_BACKEND"
     return 0
   fi
@@ -203,15 +210,101 @@ fi
 # send implementation. A failed backend send is still surfaced below as a hard
 # error with the attempted resolution attached.
 
+MANAGED_LIFECYCLE_LOCK=
+MANAGED_STEERING_ID=
+EXPECTED_ACCOUNT_PROFILE=
+EXPECTED_GENERATION=
+RECORDED_SCOPED_TARGET=
+if [ -n "$TARGET_META" ]; then
+  EXPECTED_ACCOUNT_PROFILE=$(fm_meta_get "$TARGET_META" account_profile)
+  [ "$TARGET_BACKEND" != tmux ] || RECORDED_SCOPED_TARGET=$(fm_meta_get "$TARGET_META" tmux_session_target)
+fi
+if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
+  MANAGED_STEERING_ID=$(fm_send_id_from_meta "$TARGET_META")
+  EXPECTED_GENERATION=$(fm_meta_get "$TARGET_META" generation_id)
+  [ -n "$EXPECTED_GENERATION" ] || {
+    echo "error: managed task metadata has no generation_id: $TARGET_META" >&2
+    exit 1
+  }
+  MANAGED_LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$MANAGED_STEERING_ID") || exit 1
+  cleanup_managed_send_lifecycle() {
+    [ -z "$MANAGED_LIFECYCLE_LOCK" ] \
+      || fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK" >/dev/null 2>&1 \
+      || true
+  }
+  trap cleanup_managed_send_lifecycle EXIT
+  trap 'exit 1' HUP INT TERM
+  if [ ! -f "$TARGET_META" ] || [ -L "$TARGET_META" ] \
+    || [ "$(fm_meta_get "$TARGET_META" generation_id)" != "$EXPECTED_GENERATION" ] \
+    || [ "$(fm_meta_get "$TARGET_META" account_profile)" != "$EXPECTED_ACCOUNT_PROFILE" ] \
+    || [ "$(fm_backend_of_meta "$TARGET_META")" != "$TARGET_BACKEND" ] \
+    || [ "$(fm_backend_target_of_meta "$TARGET_META")" != "$T" ]; then
+    echo "error: managed task generation or endpoint changed while fm-send waited for $MANAGED_STEERING_ID" >&2
+    exit 1
+  fi
+fi
+
 if [ "${1:-}" = "--key" ]; then
-  if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL"; then
+  if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"; then
     echo "error: key '$2' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
+  fi
+  if [ -n "$MANAGED_LIFECYCLE_LOCK" ]; then
+    if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
+      MANAGED_LIFECYCLE_LOCK=
+    else
+      echo "warning: key '$2' was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
+    fi
   fi
 else
   MESSAGE=$*
   if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
+  fi
+  persist_managed_steering() (  # <file-name> <header> <annotation> <message...>
+    local file_name=$1 header=$2 annotation=$3
+    shift 3
+    local steering_id steering_dir steering_file steering_lock
+    steering_id=$(fm_send_id_from_meta "$TARGET_META")
+    steering_lock=$(fm_account_lock_acquire "$STATE" "$steering_id" account-steering "managed steering" "${FM_ACCOUNT_STEERING_LOCK_WAIT_SECONDS:-10}") || return 1
+    trap 'fm_account_meta_lock_release "$steering_lock" >/dev/null 2>&1 || true' EXIT
+    trap 'exit 1' HUP INT TERM
+    steering_dir=$(fm_account_task_dir "$DATA" "$steering_id" create) || return 1
+    steering_file="$steering_dir/$file_name"
+    fm_account_safe_task_file "$steering_file" || return 1
+    {
+      printf -- '- %s%s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$annotation"
+      if [ "$#" -gt 0 ]; then
+        printf '%s\n' "$*" | sed 's/^/> /'
+        printf '\n'
+      fi
+    } | node "$SCRIPT_DIR/fm-task-file-append.mjs" "$DATA" "$steering_id" "$file_name" "$header"
+  )
+  record_managed_steering() {
+    persist_managed_steering steering.md '# Steering trail' '' "$@"
+  }
+  record_pending_managed_steering() {
+    persist_managed_steering steering-pending.md '' ' (delivered; steering trail append pending)' "$@"
+  }
+  record_unconfirmed_managed_steering() {
+    persist_managed_steering steering-unconfirmed.md '# Unconfirmed steering' ' (delivery unconfirmed)' "$@"
+  }
+  record_managed_delivery_event() {
+    if [ "$#" -gt 1 ]; then
+      persist_managed_steering steering-journal.md '# Steering delivery journal' " (intent $STEERING_EVENT_ID $1)" "$2"
+    else
+      persist_managed_steering steering-journal.md '# Steering delivery journal' " (intent $STEERING_EVENT_ID $1)"
+    fi
+  }
+  if [ -n "$MANAGED_STEERING_ID" ]; then
+    STEERING_EVENT_ID=$(python3 -c 'import secrets; print(secrets.token_hex(16))') || {
+      echo "error: could not allocate a managed steering intent id" >&2
+      exit 1
+    }
+    if ! record_managed_delivery_event pending "$MESSAGE"; then
+      echo "error: managed steering intent could not be durably recorded before delivery" >&2
+      exit 1
+    fi
   fi
   # Slash commands open a completion popup in some TUIs (verified on codex);
   # submitting too fast selects nothing, so give the popup time to settle before
@@ -232,21 +325,54 @@ else
   sleep_s=${FM_SEND_SLEEP:-0.4}
   # Type once, submit, verify. Lenient: only a positively-confirmed swallow
   # (text still in the composer) is an error; an unreadable pane is assumed sent.
-  if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
+  if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"); then
+    [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
     echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
   fi
+  if [ -n "${FM_SEND_TEST_AFTER_SUBMIT_READY:-}" ] && [ -n "${FM_SEND_TEST_AFTER_SUBMIT_PROCEED:-}" ]; then
+    : > "$FM_SEND_TEST_AFTER_SUBMIT_READY"
+    while [ ! -e "$FM_SEND_TEST_AFTER_SUBMIT_PROCEED" ]; do sleep 0.01; done
+  fi
   case "$verdict" in
     pending)
+      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event not-submitted >/dev/null 2>&1 || true
       echo "error: text not submitted to $T (Enter swallowed; text left in composer; tried $RESOLUTION_TRIED)" >&2
       exit 1
       ;;
     send-failed)
+      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
       echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
       exit 1
       ;;
   esac
-  # Submit landed (verdict was not pending/send-failed). Confirmation only proves
+  if [ -n "$MANAGED_STEERING_ID" ]; then
+    if [ "$verdict" = unknown ]; then
+      record_managed_delivery_event unconfirmed >/dev/null 2>&1 || true
+      if record_unconfirmed_managed_steering "$MESSAGE"; then
+        echo "warning: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
+      else
+        echo "warning: text delivery to $T could not be confirmed or durably recorded" >&2
+      fi
+    else
+      record_managed_delivery_event confirmed >/dev/null 2>&1 || true
+    fi
+    if [ "$verdict" != unknown ] && ! record_managed_steering "$MESSAGE"; then
+      if record_pending_managed_steering "$MESSAGE"; then
+        echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
+      else
+        echo "warning: text was sent to $T but its managed steering delivery could not be durably recorded" >&2
+      fi
+    fi
+    if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
+      MANAGED_LIFECYCLE_LOCK=
+    elif [ "$verdict" = unknown ]; then
+      echo "warning: text delivery to $T was unconfirmed and its managed lifecycle lock could not be released cleanly" >&2
+    else
+      echo "warning: text was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
+    fi
+  fi
+  # The submit attempt finished without a positively-confirmed pending composer. Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the
   # turn before its busy footer shows. Pause so an immediate peek catches the
   # crewmate actually working instead of the stale idle pane. FM_SEND_SETTLE=0

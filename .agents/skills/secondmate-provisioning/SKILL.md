@@ -3,7 +3,7 @@ name: secondmate-provisioning
 description: >-
   Agent-only reference for persistent secondmate setup and retirement.
   Use when creating, seeding, validating, launching, recovering, handing backlog to, pushing inherited config into, or retiring a secondmate home, or when editing data/secondmates.md.
-  Covers home leases, transactional seeding, project clone restrictions, secondmate harness pins, inherited config push, idle charter, handoff helper, and teardown safety.
+  Covers home leases, transactional seeding, project clone restrictions, secondmate harness and account-pool pins, inherited config push, idle charter, handoff helper, and teardown safety.
 user-invocable: false
 metadata:
   internal: true
@@ -71,14 +71,19 @@ When the file's tokens do apply, an explicit per-spawn `--model` or `--effort` f
 Because this resolves from the file on every spawn, the pin is durable across every respawn (recovery, `/updatefirstmate`, restart) exactly like the harness axis itself - e.g. `config/secondmate-harness` containing `claude opus` keeps a secondmate pinned to Opus even if the primary's own default model later changes.
 This is secondmate-only: crewmate/scout model resolution is untouched by this file.
 
+`config/secondmate-account-pool` is the primary's optional Agent Fleet pool for launching secondmate agents when account routing is already enabled.
+The file contains one non-secret dynamic pool id, is re-read on every spawn, and does not activate account routing by itself.
+An explicit `--account-pool` or `--account-profile` overrides it for that spawn, and an explicit profile without a pool is never constrained by this file.
+This pool is not inherited into the secondmate home because it governs the primary's secondmate launch, while `config/account-routing-mode` is inherited so the secondmate applies the same off/observe/enforce policy to its own crewmates.
+
 This section is the single owner of the secondmate sync and inheritable-config propagation contract; `AGENTS.md` sections 3 and 4 point here.
 Before launch, `fm-spawn.sh --secondmate` locally fast-forwards the home to the primary firstmate checkout's current default-branch commit when it is safe; dirty, diverged, or in-flight homes launch unchanged with a warning.
 The locked session-start bootstrap sweep runs the same guarded fast-forward for every live secondmate home, discovered from `state/<id>.meta` records with `kind=secondmate` (`data/secondmates.md` only backfills `home=` for older records).
 That no-fetch path is a purely local fast-forward of tracked files, never an origin fetch, and it never touches the gitignored operational dirs, so a secondmate's backlog, projects, and in-flight work are never disturbed; a linked worktree advances immediately, while a standalone clone that lacks the target receives firstmate updates through `/updatefirstmate`'s origin refresh.
-The same launch and the same locked bootstrap sweep also propagate the primary's declared inheritable local config, currently `config/crew-dispatch.json`, `config/crew-harness`, and `config/backlog-backend`, into the secondmate home's `config/`.
+The same launch and the same locked bootstrap sweep also propagate the primary's declared inheritable local config, currently `config/crew-dispatch.json`, `config/crew-harness`, `config/backlog-backend`, and `config/account-routing-mode`, into the secondmate home's `config/`.
 Because `config/` is gitignored, that propagation is a separate, primary-authoritative copy independent of the tracked-files fast-forward: it re-converges every live home whether or not its tracked files advanced, and it touches only the declared items.
 Inheritance copies the literal `config/crew-harness` file, so a secondmate's own crewmates use the primary's crewmate harness only when it names a concrete adapter such as `codex`; an unset or `default` value has nothing concrete to inherit, and the secondmate's own crewmates fall back to the secondmate's own or detected harness instead.
-`config/secondmate-harness` is not inherited because it is only the primary's knob for launching secondmate agents.
+`config/secondmate-harness` and `config/secondmate-account-pool` are not inherited because they are only the primary's knobs for launching secondmate agents.
 No reread nudge is needed at spawn or respawn because the agent reads `AGENTS.md` fresh on launch; only the bootstrap sweep's `NUDGE_SECONDMATES:` case (a RUNNING home whose instruction surface advanced) needs one.
 For already-live secondmates, use `bin/fm-config-push.sh` to push a mid-session inherited-config change without running the tracked-file fast-forward or nudging the agents.
 It uses the same live-home discovery and propagation helper as bootstrap and reports each item as `pushed`, `unchanged`, `skipped`, or `error`.
@@ -118,7 +123,15 @@ Do not hand off `local-only` items.
 
 ## Recovery
 
-For `kind=secondmate` meta with no window, treat the secondmate as a dead persistent direct report and respawn it with:
+For managed `kind=secondmate` meta with `account_profile=`, preserve the sticky account and provider session by recovering it with:
+
+```sh
+bin/fm-spawn.sh <id> --resume-account
+```
+
+This path requires the recorded Agent Fleet SessionStart mapping and uses `lease recover` rather than new-task quota selection.
+If exact native resume is unavailable, recover the same task under a fresh Claude or Codex profile with `bin/fm-spawn.sh <id> --continue-account` after re-verifying the endpoint is dead; `bin/fm-account-continuation.sh` owns the provider-neutral packet and fail-closed state checks.
+For unmanaged `kind=secondmate` meta with no window, treat the secondmate as a dead persistent direct report and respawn it with:
 
 ```sh
 bin/fm-spawn.sh <id> --secondmate
@@ -126,7 +139,7 @@ bin/fm-spawn.sh <id> --secondmate
 
 Use the recorded `home=` in meta.
 If meta is missing but `data/secondmates.md` still registers the secondmate, respawn from the registry entry and its persistent on-disk home.
-Respawn re-resolves the secondmate harness from current config, uses the same guarded pre-launch sync, and re-propagates inheritable config, so recovered secondmates converge to the primary firstmate version and local dispatch, crew-harness, and backlog-backend settings whenever their home can be cleanly fast-forwarded.
+Respawn re-resolves the secondmate harness from current config, uses the same guarded pre-launch sync, and re-propagates inheritable config, so recovered secondmates converge to the primary firstmate version and local dispatch, crew-harness, backlog-backend, and account-routing settings whenever their home can be cleanly fast-forwarded.
 If the secondmate is already running and only inherited config changed, prefer `bin/fm-config-push.sh` over respawning.
 
 Do not reconstruct a secondmate's whole tree from the main home.

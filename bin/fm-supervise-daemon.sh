@@ -142,6 +142,9 @@ set -u
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_DAEMON_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$FM_DAEMON_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 
 # Shared tmux pane primitives for supervisor injection (busy/composer detection
 # + verify-retry submit). Sourced at top level so BOTH the executed daemon and
@@ -577,11 +580,14 @@ task_window_backend() {  # <window> <state>
 }
 
 stale_window_is_busy() {  # <window> <state>
-  local win=$1 state=$2 backend label tail40 bs
+  local win=$1 state=$2 backend label tail40 bs task meta scoped_target
   backend=$(task_window_backend "$win" "$state")
-  label="fm-$(window_to_task "$win" "$state")"
-  tail40=$(fm_backend_capture "$backend" "$win" 40 "$label" 2>/dev/null) || return 2
-  bs=$(fm_backend_busy_state "$backend" "$win" 2>/dev/null)
+  task=$(window_to_task "$win" "$state")
+  label="fm-$task"
+  meta="$state/$task.meta"
+  scoped_target=$(fm_meta_get "$meta" tmux_session_target)
+  tail40=$(fm_backend_capture "$backend" "$win" 40 "$label" "$scoped_target" 2>/dev/null) || return 2
+  bs=$(fm_backend_busy_state "$backend" "$win" "$label" 2>/dev/null)
   case "$bs" in
     busy) return 0 ;;
   esac
@@ -1226,10 +1232,15 @@ log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
 trim_log() {
   local sz tmp
   [ -n "${LOG:-}" ] || return 0
+  [ ! -L "$LOG" ] && [ -f "$LOG" ] || return 0
   sz=$(wc -c < "$LOG" 2>/dev/null) || return 0
   [ "$sz" -ge "${FM_LOG_MAX_BYTES:-$LOG_MAX_BYTES_DEFAULT}" ] || return 0
-  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-daemon-log.XXXXXX") || return 0
-  tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
+  tmp=$(mktemp "$STATE/.supervise-daemon.log.pending.XXXXXX") || return 0
+  if tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null \
+    && [ ! -L "$LOG" ] && [ -f "$LOG" ]; then
+    mv -f "$tmp" "$LOG" || true
+  fi
+  rm -f "$tmp" 2>/dev/null || true
 }
 
 # ============================================================================
@@ -1241,6 +1252,7 @@ fm_super_main() {
   local STATE
   STATE="$(_state_root)"
   mkdir -p "$STATE"
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe daemon state directory: $STATE" >&2; exit 1; }
 
   # Source the portable lock helpers (works on macOS where flock is absent).
   # Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
@@ -1257,6 +1269,13 @@ fm_super_main() {
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
   local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
+
+  for state_file in "$LOG" "$WATCH_ERR" "$PIDFILE"; do
+    if [ -L "$state_file" ] || { [ -e "$state_file" ] && [ ! -f "$state_file" ]; }; then
+      echo "error: unsafe daemon state destination: $state_file" >&2
+      exit 1
+    fi
+  done
 
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 

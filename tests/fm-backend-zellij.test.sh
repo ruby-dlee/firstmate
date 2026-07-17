@@ -219,6 +219,76 @@ test_parse_target() {
   pass "fm_backend_zellij_parse_target: splits '<session>:<pane_id>' on the first colon"
 }
 
+test_target_state_distinguishes_absent_from_malformed_panes() {
+  local dir fb out panes
+  for fixture in missing-tab non-object; do
+    dir="$TMP_ROOT/target-state-$fixture"; mkdir -p "$dir/responses"
+    case "$fixture" in
+      missing-tab) panes='[{"id":7,"is_plugin":false}]' ;;
+      non-object) panes='["not-a-pane-record"]' ;;
+    esac
+    printf '%s\n' "$panes" > "$dir/responses/1.out"
+    fb=$(make_zellij_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+      FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+        . "$0/bin/fm-backend.sh"
+        fm_backend_target_exists() { return 1; }
+        [ "$(fm_backend_target_state zellij firstmate:7)" = unknown ]
+      ' "$ROOT" 2>&1) || fail "malformed Zellij pane record was not fail-closed: $out"
+  done
+  dir="$TMP_ROOT/target-state-absent"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      [ "$(fm_backend_target_state zellij firstmate:7)" = absent ]
+    ' "$ROOT" 2>&1) || fail "well-formed missing Zellij pane lost its absent classification: $out"
+  pass "Zellij target state distinguishes missing panes from malformed records"
+}
+
+test_target_state_follows_replacement_pane_in_expected_tab() {
+  local dir fb out scoped
+  dir="$TMP_ROOT/target-state-replacement"; mkdir -p "$dir/responses"
+  scoped=$(zellij_expected_scoped_title fm-replacement)
+  zellij_pane_response "$dir" 1 9 3
+  zellij_tab_response "$dir" 2 3 "$scoped"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "replacement Zellij pane probe failed"
+  [ "$out" = present ] || fail "matching replacement pane was classified $out instead of present"
+
+  dir="$TMP_ROOT/target-state-replacement-mismatch"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 9 4
+  zellij_tab_response "$dir" 2 4 fm-another-task
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "mismatched replacement Zellij pane probe failed"
+  [ "$out" = absent ] || fail "foreign replacement pane was classified $out instead of absent"
+
+  dir="$TMP_ROOT/target-state-replacement-malformed"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 9 3
+  printf '{bad\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      fm_backend_target_state zellij firstmate:7 fm-replacement
+    ' "$ROOT") || fail "malformed replacement Zellij pane probe failed"
+  [ "$out" = unknown ] || fail "malformed replacement tab state was classified $out instead of unknown"
+  pass "Zellij target state follows replacement panes by task tab identity"
+}
+
 test_normalize_key() {
   ( . "$ROOT/bin/backends/zellij.sh"
     [ "$(fm_backend_zellij_normalize_key Enter)" = Enter ] || { echo "Enter failed" >&2; exit 1; }
@@ -463,6 +533,36 @@ test_create_task_refuses_duplicate_label() {
   pass "fm_backend_zellij_create_task: refuses a duplicate home-scoped tab title (zellij's own new-tab has no uniqueness check)"
 }
 
+test_create_task_refuses_failed_tab_listing() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-list-failed"; mkdir -p "$dir/responses"
+  printf '1\n' > "$dir/responses/1.exit"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-list-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse when list-tabs fails"
+  assert_contains "$out" "could not list zellij tabs" "create_task did not report the failed list-tabs preflight"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-tab' "create_task must not create when list-tabs fails"
+  pass "fm_backend_zellij_create_task: refuses creation when list-tabs fails"
+}
+
+test_create_task_refuses_malformed_tab_listing() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-list-malformed"; mkdir -p "$dir/responses"
+  printf 'not-json\n' > "$dir/responses/1.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-list-malformed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must refuse malformed list-tabs output"
+  assert_contains "$out" "could not parse zellij tab list" "create_task did not report malformed list-tabs output"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''new-tab' "create_task must not create after malformed list-tabs output"
+  pass "fm_backend_zellij_create_task: refuses creation on malformed list-tabs output"
+}
+
 test_create_task_creates_and_parses_ids() {
   local dir fb out title
   dir="$TMP_ROOT/create-task"; mkdir -p "$dir/responses"
@@ -518,6 +618,24 @@ test_create_task_no_restore_when_new_tab_was_already_active() {
   assert_not_contains "$(cat "$dir/log")" $'\x1f''go-to-tab-by-id' \
     "create_task should not call go-to-tab-by-id when there was no previously-active tab (no attached client)"
   pass "fm_backend_zellij_create_task: skips the restore call when there was no previously-active tab"
+}
+
+test_create_task_closes_new_tab_when_pane_resolution_fails() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-pane-failed"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '12\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-pane-failed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the new tab's terminal pane cannot be resolved"
+  assert_contains "$out" "could not find a terminal pane" "create_task did not report pane resolution failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''12' \
+    "create_task did not close the exact new tab after pane resolution failed"
+  pass "fm_backend_zellij_create_task: closes the exact new tab when pane resolution fails"
 }
 
 # --- capture / send_key / send_literal / current_path / kill -----------------
@@ -839,13 +957,27 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
     "project=$project" \
     "kind=scout"
   child_title=$(zellij_expected_scoped_title fm-childz "$home" "$home")
-  zellij_pane_response "$dir" 1 7 4
-  zellij_tab_response "$dir" 2 4 "$child_title"
-  printf '[]\n' > "$dir/responses/3.out"
-  fb=$(make_zellij_fakebin "$dir")
+  mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+{
+  printf 'ZELLIJ_SESSION_NAME=%s' "${ZELLIJ_SESSION_NAME:-}"
+  for a in "$@"; do printf '\x1f%s' "$a"; done
+  printf '\n'
+} >> "$FM_ZELLIJ_LOG"
+if [ "${1:-}" = list-sessions ]; then
+  printf 'firstmate\n'
+elif [[ "$*" == *'action list-panes --json'* ]]; then
+  printf '[{"id":7,"tab_id":4,"is_plugin":false}]\n'
+elif [[ "$*" == *'action list-tabs --json'* ]]; then
+  printf '[{"tab_id":4,"name":"%s"}]\n' "$FM_ZELLIJ_CHILD_TITLE"
+fi
+SH
+  chmod +x "$dir/fakebin/zellij"
+  fb="$dir/fakebin"
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ROOT_OVERRIDE="$ROOT" \
-    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
+    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_CHILD_TITLE="$child_title" \
     "$ROOT/bin/fm-teardown.sh" smz --force 2>&1 )
   status=$?
   expect_code 0 "$status" "fm-teardown should force-retire a secondmate with a zellij child: $out"
@@ -936,6 +1068,7 @@ test_scripts_route_explicit_target_through_meta_backend() {
   zellij_pane_response "$dir" 1 7 3
   printf 'captured zellij pane\n' > "$dir/responses/2.out"
   zellij_pane_response "$dir" 3 7 3
+  zellij_tab_response "$dir" 4 3 fm-zellij-stale
   fb=$(make_zellij_fakebin "$dir")
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -1011,6 +1144,11 @@ test_scripts_reject_fm_target_label_mismatch() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
+  test_target_state_follows_replacement_pane_in_expected_tab
+  exit 0
+fi
+
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
 test_version_check_refuses_old_version
@@ -1018,6 +1156,8 @@ test_version_check_refuses_missing_zellij
 test_session_defaults_to_firstmate
 test_session_honors_override
 test_parse_target
+test_target_state_distinguishes_absent_from_malformed_panes
+test_target_state_follows_replacement_pane_in_expected_tab
 test_normalize_key
 test_scoped_title_uses_primary_home_label
 test_scoped_title_uses_secondmate_home_label
@@ -1035,9 +1175,12 @@ test_server_ensure_skips_attach_when_already_exists
 test_dispatch_routes_zellij_backend
 test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
+test_create_task_refuses_failed_tab_listing
+test_create_task_refuses_malformed_tab_listing
 test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
+test_create_task_closes_new_tab_when_pane_resolution_fails
 test_capture_small_reads_use_viewport_and_trim
 test_capture_large_reads_use_full_scrollback_and_trim
 test_capture_fails_when_pane_absent

@@ -498,8 +498,50 @@ test_create_task_refuses_when_preexisting_husk_tab_remains() {
   [ "$status" -ne 0 ] || fail "create_task must fail when a preexisting same-labeled husk remains after close-and-replace"
   assert_contains "$out" "failed to remove preexisting herdr tab" "create_task did not report the stale preexisting husk tab"
   assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t2' "create_task did not close the stale husk by tab id"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t3' "create_task did not close the exact replacement tab after husk removal verification failed"
   assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f''w1:p2' "create_task should not rely on pane close for a preexisting husk"
-  pass "fm_backend_herdr_create_task: refuses success when a preexisting husk tab remains after replacement"
+  pass "fm_backend_herdr_create_task: closes the exact replacement when a preexisting husk remains"
+}
+
+test_create_task_closes_replacement_when_husk_verification_list_fails() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/husk-verify-list-fails"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-verify-fails","workspace_id":"w1"}]}}\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/3.out"
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/4.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/5.out"
+  printf '1\n' > "$resp/7.exit"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-verify-fails /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the post-removal tab listing fails"
+  assert_contains "$out" "could not verify herdr husk removal" "create_task did not report the failed verification listing"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t3' \
+    "create_task did not close the exact replacement tab after verification listing failed"
+  pass "fm_backend_herdr_create_task: closes the exact replacement when verification listing fails"
+}
+
+test_create_task_closes_replacement_when_husk_verification_list_is_malformed() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/husk-verify-list-malformed"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-verify-malformed","workspace_id":"w1"}]}}\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/3.out"
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/4.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/5.out"
+  printf '{"result":{"tabs":["malformed",{"tab_id":"w1:t3","label":"fm-verify-malformed","workspace_id":"w1"}]}}\n' > "$resp/7.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-verify-malformed /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the post-removal tab listing contains a malformed record"
+  assert_contains "$out" "could not parse herdr husk-removal verification listing" \
+    "create_task did not report the malformed verification listing"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t3' \
+    "create_task did not close the exact replacement tab after parsing the malformed verification listing failed"
+  pass "fm_backend_herdr_create_task: closes the exact replacement when the verification listing is malformed"
 }
 
 test_create_task_refuses_when_agent_state_ambiguous() {
@@ -750,6 +792,193 @@ test_kill_is_best_effort() {
   expect_code 0 $? "kill must be best-effort (never fail even when the pane close call itself fails)"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f''w1:p2' "kill did not call pane close on the right pane"
   pass "fm_backend_herdr_kill: calls pane close and stays best-effort on failure"
+}
+
+test_managed_identity_rejects_reused_pane() {
+  local dir home state log fb out
+  dir="$TMP_ROOT/managed-identity"; home="$dir/home"; state="$home/state"; log="$dir/log"
+  mkdir -p "$dir/fakebin" "$state"; : > "$log"
+  fm_write_meta "$state/intended-task.meta" \
+    "window=default:w1:p2" "backend=herdr" "kind=ship" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HERDR_LOG"
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  status\ --json*) printf '{"client":{"protocol":14},"server":{"running":true}}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w2:t2","workspace_id":"w2"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"},{"workspace_id":"w2","label":"2ndmate-other"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w2:t2","label":"fm-intended-task","workspace_id":"w2"}]}}\n' ;;
+  pane\ get*) printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' ;;
+  agent\ get*) printf '{"result":{"agent":{"agent_status":"working"}}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  out=$(PATH="$fb:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_HERDR_LOG="$log" bash -c '
+    . "$0/bin/fm-backend.sh"
+    [ "$(fm_backend_target_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 11
+    ! fm_backend_capture herdr default:w1:p2 10 fm-intended-task || exit 12
+    ! fm_backend_send_key herdr default:w1:p2 Enter fm-intended-task || exit 13
+    [ "$(fm_backend_send_text_submit herdr default:w1:p2 message 1 0 0 fm-intended-task)" = send-failed ] || exit 14
+    ! fm_backend_kill herdr default:w1:p2 "" fm-intended-task || exit 15
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 16
+    [ "$(fm_backend_busy_state herdr default:w1:p2 fm-intended-task)" = unknown ] || exit 17
+  ' "$ROOT" 2>&1) || fail "managed Herdr identity validation failed: $out"
+  if grep -Eq 'pane (read|send-text|send-keys|close)|agent get' "$log"; then
+    fail "a reused Herdr pane reached a read, mutation, or agent-state command"
+  fi
+  pass "managed Herdr operations reject same-labeled panes outside the recorded home workspace"
+}
+
+test_target_state_distinguishes_absent_from_malformed_panes() {
+  local dir fb identity panes out
+  dir="$TMP_ROOT/target-state-malformed"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '%s\n' "$FM_HERDR_PANES" ;;
+  workspace\ list*) printf '%s\n' "${FM_HERDR_WORKSPACES:-}" ;;
+  tab\ list*) printf '%s\n' "${FM_HERDR_TABS:-}" ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  for panes in \
+    '{"result":{"panes":[{"pane_id":"w1:p2"}]}}' \
+    '{"result":{"panes":["not-a-pane-record"]}}'; do
+    out=$(PATH="$fb:$PATH" FM_HERDR_PANES="$panes" bash -c '
+      . "$0/bin/fm-backend.sh"
+      fm_backend_target_exists() { return 1; }
+      [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 11
+      [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    ' "$ROOT" "$identity" 2>&1) || fail "malformed Herdr pane record was not fail-closed: $out"
+  done
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "a removed final Herdr pane and workspace were not classified as absent: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}' \
+    FM_HERDR_TABS='{"result":{"tabs":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "well-formed missing Herdr pane lost its absent/dead classification: $out"
+  pass "Herdr target state distinguishes missing panes from malformed records"
+}
+
+test_target_state_refuses_absence_on_workspace_identity_collisions() {
+  # B1 (review 2026-07-16): a missing exact workspace-id+label pair may be
+  # classified absent ONLY with three proofs - the recorded pane is gone, the
+  # recorded workspace id is gone under EVERY label, and no workspace still
+  # carrying the expected home label holds the expected fm-<task> tab. Each
+  # collision below must stay mismatch (unknown upstream) so teardown never
+  # releases a live target's lease.
+  local dir fb identity out
+  dir="$TMP_ROOT/target-state-collisions"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '%s\n' "$FM_HERDR_PANES" ;;
+  workspace\ list*) printf '%s\n' "${FM_HERDR_WORKSPACES:-}" ;;
+  tab\ list*) printf '%s\n' "${FM_HERDR_TABS:-}" ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w1","label":"2ndmate-other"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "a recorded workspace id recycled under a different label was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w9","label":"firstmate"}]}}' \
+    FM_HERDR_TABS='{"result":{"tabs":[{"tab_id":"w9:t1","workspace_id":"w9","label":"fm-task"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "an expected-label workspace still carrying the task tab was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "a live recorded pane with a missing exact workspace match was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w9","label":"firstmate"}]}}' \
+    FM_HERDR_TABS='{"result":{"tabs":[{"tab_id":"w9:t1","workspace_id":"w9","label":"fm-other-task"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "a replacement-generation workspace without the task tab blocked a true absence: $out"
+  pass "Herdr identity absence requires pane gone, workspace id gone under every label, and no expected-label task tab"
+}
+
+test_target_state_refuses_missing_recorded_pane_with_replacement() {
+  local dir fb identity out
+  dir="$TMP_ROOT/target-state-replacement"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t2"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t2","workspace_id":"w1","label":"fm-task"}]}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  out=$(PATH="$fb:$PATH" bash -c '
+    . "$0/bin/fm-backend.sh"
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "Herdr replacement pane was classified as absent: $out"
+  pass "Herdr target state refuses absence while the recorded task tab has a replacement pane"
+}
+
+test_target_state_refuses_missing_recorded_tab_with_same_label_replacement() {
+  local dir fb identity out
+  dir="$TMP_ROOT/target-state-tab-replacement"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t9"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t9","workspace_id":"w1","label":"fm-task"}]}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  out=$(PATH="$fb:$PATH" bash -c '
+    . "$0/bin/fm-backend.sh"
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "Herdr same-label replacement tab was classified as absent: $out"
+  pass "Herdr recovery refuses absence while a same-label replacement tab remains"
 }
 
 test_current_path_reads_cwd() {
@@ -1407,9 +1636,14 @@ test_scripts_route_explicit_target_through_meta_backend() {
   dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
   neutral="$dir/neutral-root"; mkdir -p "$neutral"
-  fm_write_meta "$state/herdr-stale.meta" "window=default:w1:p2" "backend=herdr"
+  fm_write_meta "$state/herdr-stale.meta" \
+    "window=default:w1:p2" "backend=herdr" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
   touch "$state/.last-watcher-beat"
   printf 'captured herdr pane\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' > "$resp/3.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-herdr-stale","workspace_id":"w1"}]}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -1971,6 +2205,23 @@ test_wait_transition_clean_timeout_returns_1() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-25 ]; then
+  test_target_state_distinguishes_absent_from_malformed_panes
+  test_target_state_refuses_missing_recorded_pane_with_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
+  test_target_state_refuses_missing_recorded_tab_with_same_label_replacement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = herdr-identity-absence ]; then
+  test_target_state_distinguishes_absent_from_malformed_panes
+  test_target_state_refuses_absence_on_workspace_identity_collisions
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
@@ -1997,6 +2248,8 @@ test_create_task_closes_and_replaces_dead_pane_husk
 test_create_task_closes_and_replaces_no_agent_husk
 test_create_task_closes_all_duplicate_husks_after_replacement
 test_create_task_refuses_when_preexisting_husk_tab_remains
+test_create_task_closes_replacement_when_husk_verification_list_fails
+test_create_task_closes_replacement_when_husk_verification_list_is_malformed
 test_create_task_refuses_when_agent_state_ambiguous
 test_create_task_husk_replacement_creates_before_closing
 test_create_task_creates_and_parses_ids
@@ -2010,6 +2263,11 @@ test_capture_works_around_small_lines_bug
 test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
+test_managed_identity_rejects_reused_pane
+test_target_state_distinguishes_absent_from_malformed_panes
+test_target_state_refuses_absence_on_workspace_identity_collisions
+test_target_state_refuses_missing_recorded_pane_with_replacement
+test_target_state_refuses_missing_recorded_tab_with_same_label_replacement
 test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle

@@ -17,7 +17,7 @@
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
 # install <tools> after consent, /updatefirstmate, the afk daemon, existing
 # tests) still call them directly. The one seam this script needed -
-# bootstrap running its detect-only diagnostics without its four mutating
+# bootstrap running its detect-only diagnostics without its five mutating
 # sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
 #
@@ -26,9 +26,9 @@
 #
 #   1. lock          - acquire the per-home session lock FIRST, before any
 #                       mutating step runs.
-#   2. bootstrap      - detect-only diagnostics always run. The four
-#                       MUTATING sweeps (secondmate fast-forward, secondmate
-#                       liveness, X-mode artifact writes, fleet sync) run only
+#   2. bootstrap      - detect-only diagnostics always run. The five
+#                       MUTATING sweeps (report retention, secondmate fast-forward,
+#                       secondmate liveness, X-mode artifact writes, fleet sync) run only
 #                       when this session actually holds the lock.
 #   3. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
@@ -47,20 +47,21 @@
 #
 # Why lock first: the old documented order (bootstrap, THEN lock) let a
 # SECOND concurrent session run bootstrap's mutating sweeps - fast-forwarding
-# secondmate homes, writing X-mode artifacts, fetching/fast-forwarding every
-# project clone - before ever discovering another session already holds the
-# lock. Two sessions racing those sweeps is exactly the hazard the lock
-# exists to prevent, so locking first closes the hole outright: only the
-# session that actually wins the lock ever touches shared mutable state.
+# secondmate homes, reconciling report-retention ownership, writing X-mode
+# artifacts, fetching/fast-forwarding every project clone - before ever
+# discovering another session already holds the lock. Two sessions racing
+# those sweeps is exactly the hazard the lock exists to prevent, so locking
+# first closes the hole outright: only the session that actually wins the
+# lock ever touches shared mutable state.
 #
 # The tradeoff this ordering accepts: a refused (read-only) session must not
 # go dark. So on refusal, bootstrap still runs (in FM_BOOTSTRAP_DETECT_ONLY=1
 # mode) for its read-only detect lines - missing tools, gh auth, the
-# worktree-tangle check, the harness override, crew-dispatch validation,
-# tasks-axi and quota-axi tool checks, and tasks-axi availability - none of
-# which mutate shared state and all of which are safe to compute from a second
-# session.
-# Only the four mutating sweeps and the wake-queue drain are skipped.
+# worktree-tangle check, the harness override, account-routing policy and
+# crew-dispatch validation, tasks-axi and quota-axi tool checks, and tasks-axi
+# availability - none of which mutate shared state and all of which are safe
+# to compute from a second session.
+# Only the five mutating sweeps and the wake-queue drain are skipped.
 # The context and fleet-state digests
 # below are always read-only, so they run unconditionally in both modes.
 #
@@ -77,6 +78,9 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-backend.sh
@@ -249,7 +253,7 @@ for meta in "$STATE"/*.meta; do
   target=$(fm_backend_target_of_meta "$meta")
   if [ -n "$window" ]; then
     backend=$(fm_backend_of_meta "$meta")
-    if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
+    if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)"; then
       printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
     else
       printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"

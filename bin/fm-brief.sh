@@ -48,6 +48,9 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
 
 usage() {
   awk '
@@ -65,6 +68,8 @@ esac
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-report-contract-lib.sh
+. "$SCRIPT_DIR/fm-report-contract-lib.sh"
 PAUSED_VERB=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -257,6 +262,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
+Use these level-two sections: Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
@@ -322,6 +328,8 @@ EOF
     ;;
 esac
 
+REPORT_CONTRACT=$(fm_completion_report_contract "$DATA" "$ID")
+
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -341,7 +349,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
+2. Stay inside this worktree except for the completion-report and status paths explicitly authorized below.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -361,6 +369,8 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$REPORT_CONTRACT
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

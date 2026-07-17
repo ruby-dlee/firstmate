@@ -103,10 +103,25 @@ case "${1:-}" in
     exit 0 ;;
   pane)
     case "${2:-}" in
+      list)
+        printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"},{"pane_id":"w1:p3","tab_id":"w1:t3"},{"pane_id":"w1:p4","tab_id":"w1:t4"}]}}\n'
+        exit 0 ;;
       read)
         [ "${FM_FAKE_HERDR_MISSING:-0}" = 1 ] && exit 1
         if [ "${FM_FAKE_HERDR_BUSY:-0}" = 1 ]; then printf 'work in progress\nesc to interrupt\n'
         else printf 'all quiet\n> \n'; fi
+        exit 0 ;;
+    esac ;;
+  tab)
+    case "${2:-}" in
+      list)
+        printf '{"result":{"tabs":[{"tab_id":"w1:t2","workspace_id":"ws-home","label":"fm-feat-herdr"},{"tab_id":"w1:t3","workspace_id":"ws-home","label":"fm-feat-herdr-idle"},{"tab_id":"w1:t4","workspace_id":"ws-home","label":"fm-feat-herdr-stopped"}]}}\n'
+        exit 0 ;;
+    esac ;;
+  workspace)
+    case "${2:-}" in
+      list)
+        printf '{"result":{"workspaces":[{"workspace_id":"ws-home","label":"firstmate"}]}}\n'
         exit 0 ;;
     esac ;;
   agent)

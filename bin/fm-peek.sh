@@ -21,5 +21,8 @@ N=${2:-40}
 
 BACKEND=$(fm_backend_of_selector "$RAW_TARGET" "$T" "$STATE")
 EXPECTED_LABEL=$(fm_backend_expected_label_of_selector "$RAW_TARGET" "$STATE")
+RECORDED_SCOPED_TARGET=
+META=$(fm_backend_meta_for_selector "$RAW_TARGET" "$STATE" 2>/dev/null || true)
+[ -z "$META" ] || [ "$BACKEND" != tmux ] || RECORDED_SCOPED_TARGET=$(fm_meta_get "$META" tmux_session_target)
 
-fm_backend_capture "$BACKEND" "$T" "$N" "$EXPECTED_LABEL"
+fm_backend_capture "$BACKEND" "$T" "$N" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"

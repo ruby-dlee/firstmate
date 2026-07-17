@@ -63,6 +63,7 @@ command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found (requi
 TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-herdr-e2e.XXXXXX")
 SESSION="fm-lab-herdr-e2e-$$"
 export HERDR_SESSION="$SESSION"
+herdr_test_lab_available "$SESSION" || exit 0
 WT1=; WT2=
 cleanup_all() {
   [ -n "$WT1" ] && command -v treehouse >/dev/null 2>&1 && treehouse return --force "$WT1" >/dev/null 2>&1
@@ -89,6 +90,14 @@ printf '# scratch secondmate home AGENTS.md placeholder\n' > "$SM_HOME/AGENTS.md
 printf 'e2esm1\n' > "$SM_HOME/.fm-secondmate-home"
 printf 'trivial e2e secondmate charter: nothing to do.\n' > "$SM_HOME/data/charter.md"
 printf 'trivial e2e secondmate-owned crewmate brief: nothing to do.\n' > "$SM_HOME/data/cm2/brief.md"
+
+write_completion_report() {  # <path> <summary>
+  printf '# Completion\n\n## Summary\n\n%s\n\n## What changed\n\nNo project files changed.\n\n## Verification\n\nThe task command ran in its isolated Herdr pane.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nThe captured pane output is the test artifact.\n\n## Follow-ups\n\nNone.\n' "$2" > "$1"
+}
+write_completion_report "$PRIMARY_HOME/data/cm1/completion.md" \
+  "The primary-home Herdr task completed."
+write_completion_report "$SM_HOME/data/cm2/completion.md" \
+  "The secondmate-home Herdr task completed."
 
 make_scratch_project() {  # <dir>
   local dir=$1
@@ -200,8 +209,8 @@ pass "real herdr E2E: list_live from the secondmate's own context sees only task
 # --- 5. teardown closes the RIGHT tab, and no other ------------------------
 
 TD1_OUT="$TMP_ROOT/td1.out"
-FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$PRIMARY_HOME/state" FM_DATA_OVERRIDE="$PRIMARY_HOME/data" \
-  FM_CONFIG_OVERRIDE="$PRIMARY_HOME/config" \
+FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$PRIMARY_HOME/state" FM_DATA_OVERRIDE="$PRIMARY_HOME/data" \
+  FM_CONFIG_OVERRIDE="$PRIMARY_HOME/config" FM_REPORT_STACK_ROOT="$TMP_ROOT/report-stack" \
   "$ROOT/bin/fm-teardown.sh" cm1 >"$TD1_OUT" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] || fail "fm-teardown.sh failed for the primary-shaped crewmate cm1"$'\n'"$(cat "$TD1_OUT")"
@@ -219,8 +228,8 @@ WT1=
 pass "real herdr E2E: tearing down cm1 closes only its own tab - the secondmate's and cm2's tabs survive untouched"
 
 TD2_OUT="$TMP_ROOT/td2.out"
-FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$SM_HOME/state" FM_DATA_OVERRIDE="$SM_HOME/data" \
-  FM_CONFIG_OVERRIDE="$SM_HOME/config" \
+FM_HOME="$SM_HOME" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$SM_HOME/state" FM_DATA_OVERRIDE="$SM_HOME/data" \
+  FM_CONFIG_OVERRIDE="$SM_HOME/config" FM_REPORT_STACK_ROOT="$TMP_ROOT/report-stack" \
   "$ROOT/bin/fm-teardown.sh" cm2 >"$TD2_OUT" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] || fail "fm-teardown.sh failed for the secondmate-owned crewmate cm2"$'\n'"$(cat "$TD2_OUT")"

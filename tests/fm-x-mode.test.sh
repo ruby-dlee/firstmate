@@ -31,7 +31,7 @@ make_fake_curl() {
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-ofile="" method=GET data="" url="" auth=""
+ofile="" method=GET data="" url="" auth="" max_filesize=""
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -m|-w) shift 2 ;;
+    --max-filesize) max_filesize=$2; shift 2 ;;
     -s) shift ;;
     http://*|https://*) url=$1; shift ;;
     *) shift ;;
@@ -80,7 +81,15 @@ case "$url" in
     printf '%s' "${FAKE_DISMISS_CODE:-200}"
     ;;
   */connector/request-context)
-    [ -n "$ofile" ] && printf '%s' "${FAKE_REQCTX_BODY:-}" > "$ofile"
+    if [ -n "$ofile" ] && [ "${FAKE_REQCTX_OVERSIZE:-0}" = 1 ]; then
+      if [ -n "$max_filesize" ]; then
+        dd if=/dev/zero bs="$max_filesize" count=1 2>/dev/null | tr '\0' x > "$ofile"
+        exit 63
+      fi
+      dd if=/dev/zero bs=1048576 count=8 2>/dev/null | tr '\0' x > "$ofile"
+    else
+      [ -n "$ofile" ] && printf '%s' "${FAKE_REQCTX_BODY:-}" > "$ofile"
+    fi
     printf '%s' "${FAKE_REQCTX_CODE:-200}"
     ;;
 esac
@@ -250,7 +259,10 @@ test_poll_inbox_commit_failure_reports_error() {
   fakebin=$(make_fake_curl "$home")
   cat > "$fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-exit 1
+for arg in "$@"; do
+  case "$arg" in */x-inbox/*) exit 1 ;; esac
+done
+exec /bin/mv "$@"
 SH
   chmod +x "$fakebin/mv"
   printf 'FMX_PAIRING_TOKEN=tok-q\n' > "$home/.env"
@@ -263,6 +275,9 @@ SH
     || fail "poll inbox commit failure must emit an error, not a wake marker (got: $out)"
   assert_absent "$home/state/x-inbox/req-rename.json" "poll must not report a committed inbox file that was not created"
   assert_absent "$home/state/x-inbox/req-rename.json.tmp" "poll must clean up the failed inbox temp file"
+  if find "$home/state/x-inbox" -maxdepth 1 -name '.req-rename.*' -print -quit | grep -q .; then
+    fail "poll retained a randomized failed inbox staging file"
+  fi
   assert_present "$home/state/x-poll.error" "poll inbox commit failure must write a dedupe marker"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
@@ -278,6 +293,38 @@ SH
     || fail "poll must emit the mention marker once the inbox write succeeds (got: $out)"
   assert_absent "$home/state/x-poll.error" "successful inbox write must clear the diagnostic marker"
   pass "fm-x-poll reports inbox commit failures without emitting a mention wake"
+}
+
+test_poll_refuses_unsafe_inbox_publication_paths() {
+  local home fakebin outside out rc body
+  body='{"request_id":"req-safe-path","platform":"x","reply_max_chars":280,"text":"question"}'
+
+  home="$TMP_ROOT/poll-inbox-dir-symlink"; mkdir -p "$home/state"
+  outside="$TMP_ROOT/poll-inbox-outside"; mkdir -p "$outside"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside" "$home/state/x-inbox"
+  fakebin=$(make_fake_curl "$home")
+  printf 'FMX_PAIRING_TOKEN=tok-safe-path\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" "$ROOT/bin/fm-x-poll.sh"); rc=$?
+  expect_code 0 "$rc" "poll symlinked inbox directory exit"
+  [ "$out" = "x-mode-error cannot create inbox" ] \
+    || fail "symlinked inbox directory emitted an unsafe wake payload (got: $out)"
+  assert_grep 'sentinel' "$outside/sentinel" "symlinked inbox directory changed outside data"
+  assert_absent "$outside/req-safe-path.json" "symlinked inbox directory published outside state"
+
+  home="$TMP_ROOT/poll-inbox-file-symlink"; mkdir -p "$home/state/x-inbox"
+  outside="$TMP_ROOT/poll-inbox-file-outside"; printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$home/state/x-inbox/req-safe-path.json"
+  fakebin=$(make_fake_curl "$home")
+  printf 'FMX_PAIRING_TOKEN=tok-safe-path\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" "$ROOT/bin/fm-x-poll.sh"); rc=$?
+  expect_code 0 "$rc" "poll symlinked inbox destination exit"
+  [ "$out" = "x-mode-error cannot write inbox" ] \
+    || fail "symlinked inbox destination emitted an unsafe wake payload (got: $out)"
+  assert_grep 'sentinel' "$outside" "symlinked inbox destination overwrote outside data"
+  pass "fm-x-poll keeps unsafe inbox paths fail-inert and contained"
 }
 
 test_poll_rejects_unsafe_request_id() {
@@ -1277,6 +1324,227 @@ test_context_registry_preserves_first_seen_timestamp() {
   pass "context registry rewrites preserve the first-seen timestamp"
 }
 
+test_context_registry_merges_partial_updates() {
+  local home reg
+  home="$TMP_ROOT/registry-partial-update"
+  mkdir -p "$home/state"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial discord 1900' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "initial partial-update registry write failed"
+  FMX_NOW_OVERRIDE=1700000100 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial x ""' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "platform-only registry update failed"
+  reg="$home/state/x-context/req-partial.json"
+  [ "$(jq -r .platform "$reg")" = x ] || fail "platform-only update did not replace the known platform"
+  [ "$(jq -r .reply_max_chars "$reg")" = 1900 ] || fail "platform-only update erased the known reply budget"
+  FMX_NOW_OVERRIDE=1700000200 bash -c '. "$1"; fmx_context_registry_set "$2" req-partial "" 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "budget-only registry update failed"
+  [ "$(jq -r .platform "$reg")" = x ] || fail "budget-only update erased the known platform"
+  [ "$(jq -r .reply_max_chars "$reg")" = 280 ] || fail "budget-only update did not replace the known reply budget"
+  pass "context registry merges partial relay updates"
+}
+
+test_context_registry_refuses_symlinked_storage() {
+  local home outside rc
+  home="$TMP_ROOT/registry-dir-symlink"; mkdir -p "$home/state"
+  outside="$TMP_ROOT/registry-dir-outside"; mkdir -p "$outside"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe x 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 0 "$rc" "registry real-directory precondition"
+  rm -rf "$home/state/x-context"
+  ln -s "$outside" "$home/state/x-context"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe x 280' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 1 "$rc" "registry symlinked directory refusal"
+  assert_absent "$outside/req-unsafe.json" "registry followed a symlinked directory"
+
+  rm -f "$home/state/x-context"; mkdir -p "$home/state/x-context"
+  printf 'sentinel\n' > "$outside/sentinel"
+  ln -s "$outside/sentinel" "$home/state/x-context/req-unsafe.json"
+  if bash -c '. "$1"; fmx_context_registry_set "$2" req-unsafe discord 1900' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state" 2>/dev/null; then rc=0; else rc=$?; fi
+  expect_code 1 "$rc" "registry symlinked record refusal"
+  assert_grep 'sentinel' "$outside/sentinel" "registry merged or overwrote a symlinked record"
+  pass "context registry refuses symlinked directories and records"
+}
+
+test_context_registry_serializes_prune_and_updates() {
+  local home dir record stale_lock
+  home="$TMP_ROOT/registry-locking"
+  dir="$home/state/x-context"
+  mkdir -p "$dir"
+  record="$dir/req-race.json"
+  jq -cn '{request_id:"req-race",platform:"x",reply_max_chars:"280",recorded_at:1}' > "$record"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2/x-context" request-req-race) || exit 1
+    fmx_context_registry_prune "$2" || exit 2
+    [ -f "$2/x-context/req-race.json" ] || exit 3
+    if fmx_context_registry_set "$2" req-race discord 1900; then exit 4; fi
+    [ "$(jq -r .platform "$2/x-context/req-race.json")" = x ] || exit 5
+    fmx_context_registry_lock_release "$lock" || exit 6
+    fmx_context_registry_set "$2" req-race discord 1900 || exit 7
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state" \
+    || fail "context registry lock serialization failed"
+  [ "$(jq -r .platform "$record")" = discord ] || fail "uncontended registry update did not land"
+
+  stale_lock="$dir/.lock-request-stale"
+  mkdir "$stale_lock"
+  printf '999999\nstale\n' > "$stale_lock/owner"
+  touch -t 200001010000 "$stale_lock"
+  bash -c '
+    . "$1"
+    acquired=$(fmx_context_registry_lock_acquire "$2" request-stale) || exit 1
+    fmx_context_registry_lock_release "$acquired"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" || fail "stale registry lock was not reclaimed and released"
+  pass "context registry serializes pruning and reports exhausted request-lock contention"
+}
+
+test_context_registry_retries_busy_request_lock() {
+  local home dir ready holder rc
+  home="$TMP_ROOT/registry-lock-retry"
+  dir="$home/state/x-context"
+  ready="$home/holder-ready"
+  mkdir -p "$dir"
+  bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2" request-req-retry) || exit 1
+    : > "$3"
+    sleep 0.2
+    fmx_context_registry_lock_release "$lock"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" "$ready" &
+  holder=$!
+  while [ ! -f "$ready" ] && kill -0 "$holder" 2>/dev/null; do sleep 0.01; done
+  assert_present "$ready" "request-lock holder did not publish its readiness marker"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    fmx_context_registry_set "$2" req-retry discord 1900
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state"; rc=$?
+  wait "$holder" || fail "request-lock holder failed"
+  expect_code 0 "$rc" "registry retry after request-lock release"
+  [ "$(jq -r .platform "$dir/req-retry.json")" = discord ] \
+    || fail "registry retry did not persist the context after lock release"
+  pass "context registry retries boundedly while a request lock is busy"
+}
+
+test_context_registry_lock_publication_and_quarantine_are_safe() {
+  local home dir outside sentinel fakebin out rc stale_lock
+  home="$TMP_ROOT/registry-lock-publication"
+  dir="$home/state/x-context"
+  outside="$home/outside"
+  sentinel="$outside/sentinel"
+  mkdir -p "$dir" "$outside"
+  printf 'sentinel\n' > "$sentinel"
+  fakebin=$(fm_fakebin "$home/owner-race")
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+out=$(/usr/bin/mktemp "$@") || exit 1
+case "$out" in
+  */.owner.*)
+    ln -s "$FM_TEST_SENTINEL" "${out%/*}/owner" 2>/dev/null || true
+    ;;
+esac
+printf '%s\n' "$out"
+SH
+  chmod +x "$fakebin/mktemp"
+  if out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_SENTINEL="$sentinel" bash -c '
+      . "$1"
+      fmx_context_registry_lock_acquire "$2" request-owner-race
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" 2>/dev/null); then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "registry lock acquisition accepted a raced owner symlink ($out)"
+  assert_grep 'sentinel' "$sentinel" "registry lock owner publication followed a planted symlink"
+
+  stale_lock="$dir/.lock-request-quarantine-race"
+  mkdir "$stale_lock"
+  printf '999999\nstale\n' > "$stale_lock/owner"
+  touch -t 200001010000 "$stale_lock"
+  fakebin=$(fm_fakebin "$home/quarantine-race")
+  cat > "$fakebin/rmdir" <<'SH'
+#!/usr/bin/env bash
+target=$1
+/bin/rmdir "$@" || exit 1
+case "$target" in
+  *.stale.*)
+    mkdir "$target" || exit 1
+    printf 'attacker\n' > "$target/attacker"
+    ;;
+esac
+SH
+  chmod +x "$fakebin/rmdir"
+  if out=$(PATH="$fakebin:$BASE_PATH" bash -c '
+      . "$1"
+      fmx_context_registry_lock_acquire "$2" request-quarantine-race
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$dir" 2>/dev/null); then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "registry lock acquisition accepted a raced stale quarantine ($out)"
+  assert_present "$stale_lock/owner" "stale quarantine race did not restore the original lock"
+  assert_grep '999999' "$stale_lock/owner" "stale quarantine race installed attacker state as the active lock"
+  pass "context registry lock publication and stale quarantine fail safely under races"
+}
+
+test_context_registry_records_are_bounded() {
+  local home dir file out fakebin real_head race_file
+  home="$TMP_ROOT/registry-record-bounds"
+  dir="$home/state/x-context"
+  file="$dir/req-oversized.json"
+  mkdir -p "$dir"
+  printf '{"request_id":"req-oversized","platform":"x","reply_max_chars":"280","recorded_at":1700000000,"padding":"' > "$file"
+  dd if=/dev/zero bs=131073 count=1 2>/dev/null | tr '\000' x >> "$file"
+  printf '"}\n' >> "$file"
+  out=$(FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    lock=$(fmx_context_registry_lock_acquire "$2/x-context" registry) || exit 1
+    fmx_context_registry_get "$2" req-oversized
+    fmx_context_registry_lock_release "$lock" || exit 2
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state") || fail "bounded registry get failed"
+  [ "$out" = '{"platform":"","reply_max_chars":""}' ] \
+    || fail "oversized registry get did not degrade to the empty context ($out)"
+  assert_present "$file" "bounded registry get unexpectedly mutated the record while prune was locked"
+  FMX_NOW_OVERRIDE=1700000000 bash -c '
+    . "$1"
+    fmx_context_registry_prune "$2"
+  ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state" || fail "bounded registry prune failed"
+  assert_absent "$file" "registry prune parsed rather than quarantining an oversized record"
+
+  race_file="$dir/req-raced.json"
+  jq -cn '{request_id:"req-raced",platform:"discord",reply_max_chars:"1900",recorded_at:1700000000}' > "$race_file"
+  fakebin=$(fm_fakebin "$home/raced-read")
+  real_head=$(command -v head)
+  cat > "$fakebin/head" <<'SH'
+#!/usr/bin/env bash
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$last" = "${FM_TEST_CONTEXT_RACE_FILE:-}" ] && [ ! -e "$last.mutated" ]; then
+  printf '{"request_id":"req-raced","padding":"' > "$last.replacement"
+  head -c 131073 /dev/zero | tr '\0' x >> "$last.replacement"
+  printf '"}\n' >> "$last.replacement"
+  mv "$last.replacement" "$last"
+  : > "$last.mutated"
+fi
+exec "$FM_TEST_REAL_HEAD" "$@"
+SH
+  chmod +x "$fakebin/head"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_REAL_HEAD="$real_head" \
+    FM_TEST_CONTEXT_RACE_FILE="$race_file" FMX_NOW_OVERRIDE=1700000000 bash -c '
+      . "$1"
+      lock=$(fmx_context_registry_lock_acquire "$2/x-context" registry) || exit 1
+      fmx_context_registry_get "$2" req-raced
+      fmx_context_registry_lock_release "$lock" || exit 2
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$home/state") || fail "raced registry get failed"
+  [ "$out" = '{"platform":"","reply_max_chars":""}' ] \
+    || fail "raced registry get parsed content beyond its cap ($out)"
+  assert_present "$race_file.mutated" "registry get bounded-read race hook did not run"
+
+  jq -cn '{request_id:"req-recorded-race",platform:"x",reply_max_chars:"280",recorded_at:1700000000}' > "$race_file"
+  rm -f "$race_file.mutated"
+  if PATH="$fakebin:$BASE_PATH" FM_TEST_REAL_HEAD="$real_head" \
+    FM_TEST_CONTEXT_RACE_FILE="$race_file" bash -c '
+      . "$1"
+      fmx_context_registry_recorded_at "$2" 1700000000
+    ' _ "$ROOT/bin/fm-x-lib.sh" "$race_file" >/dev/null 2>&1; then
+    fail "recorded-at reader accepted a record that grew beyond its cap after stat"
+  fi
+  assert_present "$race_file.mutated" "recorded-at bounded-read race hook did not run"
+  pass "context registry bounds records before parsing"
+}
+
 test_context_registry_retention_starts_on_successful_live_answer() {
   local home fakebin out rc reg
   home="$TMP_ROOT/registry-answer-window"
@@ -1411,6 +1679,63 @@ test_regression_unresolved_followup_fails_safe() {
   pass "every unresolved follow-up is refused before posting"
 }
 
+test_followup_ignores_subminimum_explicit_context_limit() {
+  local home out rc err reply
+  home="$TMP_ROOT/reg-subminimum-limit"; mkdir -p "$home/state/x-context"
+  err="$home/err.txt"
+  jq -cn '{request_id:"req-too-small",platform:"",reply_max_chars:"49",recorded_at:1700000000}' \
+    > "$home/state/x-context/req-too-small.json"
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 FMX_NOW_OVERRIDE=1700000000 \
+    "$ROOT/bin/fm-x-reply.sh" req-too-small --followup "Short follow-up." 2> "$err"); rc=$?
+  expect_code 8 "$rc" "subminimum-only follow-up context exit"
+  [ -z "$out" ] || fail "a refused subminimum-only follow-up must echo nothing"
+  assert_absent "$home/state/x-outbox/req-too-small.json" "a subminimum-only follow-up recorded an outbox preview"
+
+  jq -cn '{request_id:"req-small-discord",platform:"discord",reply_max_chars:"49",recorded_at:1700000000}' \
+    > "$home/state/x-context/req-small-discord.json"
+  reply="This Discord follow-up is valid because its known platform supplies the default when the recorded explicit limit is below the shared minimum."
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 FMX_NOW_OVERRIDE=1700000000 \
+    "$ROOT/bin/fm-x-reply.sh" req-small-discord --followup "$reply" 2> "$err"); rc=$?
+  expect_code 0 "$rc" "known-platform subminimum follow-up exit"
+  [ "$out" = req-small-discord ] || fail "known-platform subminimum follow-up did not complete"
+  jq -e 'has("texts") | not' "$home/state/x-outbox/req-small-discord.json" >/dev/null \
+    || fail "known Discord platform did not fall through to its default budget"
+  pass "follow-ups reject subminimum-only limits and preserve platform defaults"
+}
+
+test_reply_context_skips_subminimum_budget_for_later_source() {
+  local home context
+  home="$TMP_ROOT/reg-subminimum-fallback"
+  mkdir -p "$home/state/x-context" "$home/state/x-inbox"
+  jq -cn '{request_id:"req-fallback",platform:"",reply_max_chars:"49",recorded_at:1700000000}' \
+    > "$home/state/x-context/req-fallback.json"
+  jq -cn '{request_id:"req-fallback",platform:"",reply_max_chars:"90",text:"question"}' \
+    > "$home/state/x-inbox/req-fallback.json"
+  context=$(FMX_NOW_OVERRIDE=1700000000 bash -c \
+    '. "$1"; fmx_resolve_reply_context "$2" req-fallback 0' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state")
+  [ "$(printf '%s' "$context" | jq -r .reply_max_chars)" = 90 ] \
+    || fail "subminimum registry budget blocked the later valid inbox budget"
+  pass "reply context skips subminimum budgets while merging sources"
+}
+
+test_reply_context_skips_oversized_budget_for_later_source() {
+  local home context
+  home="$TMP_ROOT/reg-oversized-fallback"
+  mkdir -p "$home/state/x-context" "$home/state/x-inbox"
+  jq -cn --arg max '9999999999999999999999999999999999999999' \
+    '{request_id:"req-oversized-fallback",platform:"",reply_max_chars:$max,recorded_at:1700000000}' \
+    > "$home/state/x-context/req-oversized-fallback.json"
+  jq -cn '{request_id:"req-oversized-fallback",platform:"",reply_max_chars:"90",text:"question"}' \
+    > "$home/state/x-inbox/req-oversized-fallback.json"
+  context=$(FMX_NOW_OVERRIDE=1700000000 bash -c \
+    '. "$1"; fmx_resolve_reply_context "$2" req-oversized-fallback 0' \
+    _ "$ROOT/bin/fm-x-lib.sh" "$home/state")
+  [ "$(printf '%s' "$context" | jq -r .reply_max_chars)" = 90 ] \
+    || fail "oversized registry budget blocked the later valid inbox budget"
+  pass "reply context skips unrepresentable budgets while merging sources"
+}
+
 # Requirement 1 (authoritative relay recovery): a live follow-up with only a
 # registry platform recovers the missing explicit budget from the relay by
 # request_id, so a Discord reply stays one message.
@@ -1439,6 +1764,46 @@ TXT
   printf '%s' "$data" | jq -e 'has("texts")|not' >/dev/null \
     || fail "the relay-recovered Discord follow-up must post as ONE message, not a thread"
   pass "a partial registry platform combines with the relay's authoritative budget"
+}
+
+test_relay_context_response_is_bounded() {
+  local home fakebin log out rc err
+  home="$TMP_ROOT/reg-relay-context-limit"
+  mkdir -p "$home/tmp"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  err="$home/err.txt"
+  printf 'FMX_PAIRING_TOKEN=tok-limit\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" TMPDIR="$home/tmp" FM_HOME="$home" \
+    FMX_RELAY_URL="https://relay.test" FAKE_CURL_LOG="$log" \
+    FAKE_REQCTX_CODE=200 FAKE_REQCTX_OVERSIZE=1 \
+    "$ROOT/bin/fm-x-reply.sh" req-oversized-context --followup "Bounded lookup." 2> "$err")
+  rc=$?
+  expect_code 8 "$rc" "oversized relay context follow-up exit"
+  [ -z "$out" ] || fail "oversized relay context follow-up emitted a request id"
+  assert_grep "url=https://relay.test/connector/request-context" "$log" \
+    "oversized context test did not query the shared relay helper"
+  assert_grep '--max-filesize 65536' "$log" \
+    "relay response cap was not enforced by curl during transfer"
+  assert_no_grep "url=https://relay.test/connector/followup" "$log" \
+    "oversized relay context was truncated and posted instead of held"
+  [ -z "$(find "$home/tmp" -type f -print 2>/dev/null)" ] \
+    || fail "oversized relay context left response staging files"
+  pass "relay context responses reject oversized load-bearing JSON and remain unresolved"
+}
+
+test_followup_platform_only_context_uses_platform_default() {
+  local home out rc reply
+  home="$TMP_ROOT/reg-platform-default"; mkdir -p "$home/state/x-context"
+  jq -cn '{request_id:"req-platform-default",platform:"discord",reply_max_chars:""}' \
+    > "$home/state/x-context/req-platform-default.json"
+  reply="This Discord follow-up intentionally exceeds the X message budget while remaining below Discord's documented default. The durable context knows the platform but comes from a legacy record without an explicit relay limit, so the reply must use the Discord default and remain a single message instead of being refused or split into an X-sized thread."
+  out=$(FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-reply.sh" req-platform-default --followup - <<<"$reply" 2>/dev/null); rc=$?
+  expect_code 0 "$rc" "platform-only follow-up exit"
+  [ "$out" = "req-platform-default" ] || fail "platform-only follow-up must echo the request_id"
+  jq -e 'has("texts")|not' "$home/state/x-outbox/req-platform-default.json" >/dev/null \
+    || fail "platform-only Discord follow-up did not use the Discord default budget"
+  pass "platform-only follow-up context uses the documented platform default"
 }
 
 # Regression case 4: concurrent requests through one secondmate keep their own
@@ -1722,6 +2087,26 @@ TXT
   pass "fm-x-link resolves the platform by request_id so a post-cleanup link keeps the Discord budget"
 }
 
+test_link_dry_run_never_resolves_context_over_network() {
+  local home fakebin log meta err rc
+  home="$TMP_ROOT/link-dry-run-offline"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  err="$home/err.txt"
+  meta="$home/state/fix-dry-run.meta"
+  printf 'window=w\nkind=ship\n' > "$meta"
+  printf 'FMX_PAIRING_TOKEN=tok-dry-run\nFMX_DRY_RUN=1\n' > "$home/.env"
+
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_NOW_OVERRIDE=1700000000 FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-x-link.sh" fix-dry-run req-dry-run >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "dry-run link exit"
+  [ ! -s "$log" ] || fail "dry-run link contacted the relay while resolving request context"
+  assert_grep "WARNING" "$err" "offline dry-run link did not surface incomplete reply context"
+  assert_grep "x_request=req-dry-run" "$meta" "offline dry-run link was not recorded locally"
+  pass "fm-x-link dry-run keeps request-context resolution network-free"
+}
+
 # Criterion 2 loud-warning branch: when the inbox and relay cannot resolve both
 # axes, the link is still recorded but fm-x-link warns loudly and every follow-up
 # is refused.
@@ -1835,6 +2220,16 @@ test_link_carry_count_validation() {
   expect_code 2 "$rc" "link carry without reply context exit"
   assert_grep "relink requires carried reply context" "$err" "link must not silently drop reply context on relink"
   PATH="$BASE_PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-count 1 --carry-ts 1700000000 --carry-platform discord >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "link carry with platform-only context exit"
+  assert_grep "x_platform=discord" "$home/state/ok.meta" "platform-only relink did not preserve its authoritative context"
+  assert_no_grep "x_reply_max_chars=" "$home/state/ok.meta" "platform-only relink invented a reply budget"
+  PATH="$BASE_PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-count 1 --carry-ts 1700000000 --carry-max 280 >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "link carry with budget-only context exit"
+  assert_grep "x_reply_max_chars=280" "$home/state/ok.meta" "budget-only relink did not preserve its authoritative context"
+  assert_no_grep "x_platform=" "$home/state/ok.meta" "budget-only relink invented a platform"
+  PATH="$BASE_PATH" FM_HOME="$home" \
     "$ROOT/bin/fm-x-link.sh" ok req-1 --carry-platform discord >/dev/null 2>"$err"; rc=$?
   expect_code 2 "$rc" "link --carry-platform without paired carry flags exit"
   assert_grep "--carry-platform and --carry-max require --carry-count and --carry-ts" "$err" \
@@ -1866,6 +2261,37 @@ test_meta_rewrites_do_not_depend_on_tmpdir() {
   assert_no_grep "x_followups=" "$meta" "clear must remove the follow-up counter with an unusable TMPDIR"
   assert_grep "kind=ship" "$meta" "clear must preserve other meta lines"
   pass "meta rewrites are independent of TMPDIR"
+}
+
+test_meta_rewrites_serialize_with_account_session_updates() {
+  local home state meta ready release holder writer
+  home="$TMP_ROOT/link-account-meta-lock"
+  state="$home/state"
+  meta="$state/fix-meta-lock-k5.meta"
+  ready="$home/holder-ready"
+  release="$home/holder-release"
+  mkdir -p "$state"
+  printf 'window=w\nkind=ship\nx_request=req-lock\nx_request_ts=1700000000\nx_followups=0\n' > "$meta"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" fix-meta-lock-k5) || exit 1
+    touch "$3"
+    while [ ! -f "$4" ]; do sleep 0.05; done
+    printf "provider_session_id=session-new\n" >> "$2/fix-meta-lock-k5.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$ready" "$release" &
+  holder=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  bash -c '. "$1/bin/fm-x-lib.sh"; fmx_meta_followups_set "$2" 1' _ "$ROOT" "$meta" &
+  writer=$!
+  sleep 0.1
+  assert_grep 'x_followups=0' "$meta" "X metadata rewrite bypassed the account metadata lock"
+  touch "$release"
+  wait "$holder" || fail "account session update lock holder failed"
+  wait "$writer" || fail "X metadata rewrite failed after the account metadata lock was released"
+  assert_grep 'provider_session_id=session-new' "$meta" "X metadata rewrite lost the concurrent provider session update"
+  assert_grep 'x_followups=1' "$meta" "X metadata rewrite did not publish after the account metadata lock was released"
+  pass "X metadata rewrites serialize with account session updates"
 }
 
 test_link_rejects_unsafe_and_missing() {
@@ -2194,6 +2620,54 @@ test_followup_usage_errors() {
   pass "fm-x-followup rejects malformed invocations"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = subminimum-context ]; then
+  test_reply_context_skips_subminimum_budget_for_later_source
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
+  test_relay_context_response_is_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
+  test_reply_context_skips_oversized_budget_for_later_source
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
+  test_context_registry_serializes_prune_and_updates
+  test_link_dry_run_never_resolves_context_over_network
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
+  test_context_registry_lock_publication_and_quarantine_are_safe
+  test_context_registry_records_are_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
+  test_context_registry_records_are_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
+  test_context_registry_serializes_prune_and_updates
+  test_context_registry_retries_busy_request_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
+  test_relay_context_response_is_bounded
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
+  test_link_carry_count_validation
+  exit 0
+fi
+
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2202,6 +2676,7 @@ test_poll_auth_error_reports_once
 test_poll_question_stashes_and_marks
 test_poll_preserves_conversation_context
 test_poll_inbox_commit_failure_reports_error
+test_poll_refuses_unsafe_inbox_publication_paths
 test_poll_empty_text_is_silent
 test_poll_rejects_unsafe_request_id
 test_reply_success_posts_request_bound_only
@@ -2241,11 +2716,22 @@ test_reply_followup_image_dry_run_marks_endpoint_and_compacts_image
 test_poll_records_context_registry_from_relay_platform
 test_context_registry_prunes_expired_records
 test_context_registry_preserves_first_seen_timestamp
+test_context_registry_merges_partial_updates
+test_context_registry_refuses_symlinked_storage
+test_context_registry_serializes_prune_and_updates
+test_context_registry_retries_busy_request_lock
+test_context_registry_lock_publication_and_quarantine_are_safe
+test_context_registry_records_are_bounded
 test_context_registry_retention_starts_on_successful_live_answer
 test_regression_discord_followup_survives_inbox_cleanup
 test_regression_x_followup_still_splits_after_cleanup
 test_regression_unresolved_followup_fails_safe
+test_followup_ignores_subminimum_explicit_context_limit
+test_reply_context_skips_subminimum_budget_for_later_source
+test_reply_context_skips_oversized_budget_for_later_source
 test_followup_partial_registry_uses_relay_budget_live
+test_relay_context_response_is_bounded
+test_followup_platform_only_context_uses_platform_default
 test_regression_concurrent_requests_keep_own_platform
 test_dismiss_clears_context_registry
 test_dismiss_success_posts_request_only
@@ -2258,11 +2744,13 @@ test_dismiss_usage_error
 test_link_records_request_and_timestamp
 test_link_records_discord_platform_for_followups
 test_link_resolves_platform_by_request_id_after_inbox_cleanup
+test_link_dry_run_never_resolves_context_over_network
 test_link_warns_loudly_when_platform_unresolvable
 test_link_carry_count_and_ts_preserve_followup_binding
 test_link_recovery_relink_carries_discord_context_after_inbox_drain
 test_link_carry_count_validation
 test_meta_rewrites_do_not_depend_on_tmpdir
+test_meta_rewrites_serialize_with_account_session_updates
 test_link_rejects_unsafe_and_missing
 test_followup_check_states
 test_followup_check_expired_prunes_link

@@ -60,6 +60,8 @@ PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
+REAL_STAT_FOR_TEST=$(command -v stat)
+export REAL_STAT_FOR_TEST
 
 # Build a fresh sandbox for one test case. Sets up:
 #   $CASE/state/        - firstmate state dir (with a fresh watcher beacon)
@@ -79,6 +81,28 @@ make_case() {
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 # `treehouse return --force <wt>`: succeed silently.
+[ -z "${FM_EXPECT_CHILD_LINEAGE_PATH:-}" ] || [ -f "$FM_EXPECT_CHILD_LINEAGE_PATH" ] || {
+  echo "child lineage missing before home removal: $FM_EXPECT_CHILD_LINEAGE_PATH" >&2
+  exit 96
+}
+[ -z "${FM_EXPECT_CHILD_LINEAGE_PATH:-}" ] || grep -F 'event=predecessor-released' "$FM_EXPECT_CHILD_LINEAGE_PATH" >/dev/null || {
+  echo "child predecessor lineage missing before home removal: $FM_EXPECT_CHILD_LINEAGE_PATH" >&2
+  exit 94
+}
+[ -z "${FM_REJECT_CHILD_LINEAGE_PATH:-}" ] || [ ! -e "$FM_REJECT_CHILD_LINEAGE_PATH" ] || {
+  echo "child lineage written outside owning home: $FM_REJECT_CHILD_LINEAGE_PATH" >&2
+  exit 95
+}
+[ -z "${FM_EXPECT_CHILD_LINEAGE_MARKER:-}" ] || touch "$FM_EXPECT_CHILD_LINEAGE_MARKER"
+[ -z "${FM_EXPECT_REPORT_PATH:-}" ] || [ -f "$FM_EXPECT_REPORT_PATH" ] || {
+  echo "report missing before treehouse return: $FM_EXPECT_REPORT_PATH" >&2
+  exit 97
+}
+[ -z "${FM_EXPECT_PARENT_QUIESCED:-}" ] || [ -f "$FM_EXPECT_PARENT_QUIESCED" ] || {
+  echo "secondmate parent was not quiesced before child cleanup: $FM_EXPECT_PARENT_QUIESCED" >&2
+  exit 98
+}
+[ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'treehouse-return %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
 exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
@@ -159,7 +183,8 @@ write_meta() {
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
-    "mode=$mode"
+    "mode=$mode" \
+    "generation_id=generation-task-x1"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -445,8 +470,14 @@ add_stat_error() {
   local case_dir=$1
   cat > "$case_dir/fakebin/stat" <<'SH'
 #!/usr/bin/env bash
-echo "stat: simulated failure" >&2
-exit 1
+target=${FM_FAKE_STAT_ERROR_TARGET:?}
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$last" = "$target" ]; then
+  echo "stat: simulated failure" >&2
+  exit 1
+fi
+exec "${REAL_STAT_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/stat"
 }
@@ -509,7 +540,7 @@ test_local_only_fork_remote_allows() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "fork-allow: teardown should succeed when HEAD is on a fork remote"
+  [ "$rc" -eq 0 ] || fail "fork-allow: teardown should succeed when HEAD is on a fork remote: $(cat "$case_dir/stderr")"
   ! grep -q REFUSED "$case_dir/stderr" || fail "fork-allow: teardown printed a REFUSED line"
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
@@ -802,6 +833,171 @@ test_pr_check_records_remote_head_when_local_lags() {
   pass "fm-pr-check records the remote PR head when the local worktree lags"
 }
 
+test_pr_check_serializes_with_account_session_updates() {
+  local case_dir state meta lookup_ready lookup_release pr_check url head
+  case_dir=$(make_case pr-check-meta-lock)
+  state="$case_dir/state"
+  meta="$state/task-x1.meta"
+  lookup_ready="$case_dir/lookup-ready"
+  lookup_release="$case_dir/lookup-release"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  while [ ! -f "$lookup_ready" ]; do sleep 0.05; done
+  if ! bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    printf "provider_session_id=session-new\n" >> "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state"; then
+    touch "$lookup_release"
+    wait "$pr_check" || true
+    fail "PR lookup held the account metadata lock"
+  fi
+  assert_no_grep '^pr=' "$meta" "PR recording completed before the remote lookup"
+  assert_grep 'provider_session_id=session-new' "$meta" "PR recording lost the concurrent provider session update"
+  touch "$lookup_release"
+  wait "$pr_check" || fail "PR recording failed after the remote lookup completed"
+  assert_grep "pr=$url" "$meta" "PR recording did not publish after the account metadata lock was released"
+  assert_grep "pr_head=$head" "$meta" "PR recording lost the remote PR head"
+  pass "fm-pr-check keeps remote lookups outside account metadata serialization"
+}
+
+test_pr_check_rejects_reused_task_generation() {
+  local case_dir state meta lookup_ready lookup_release pr_check rc url head staged
+  case_dir=$(make_case pr-check-generation-race)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  lookup_ready="$case_dir/lookup-ready"; lookup_release="$case_dir/lookup-release"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.reused"
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  for _ in $(seq 1 100); do [ -e "$lookup_ready" ] && break; sleep 0.02; done
+  [ -e "$lookup_ready" ] || { kill -TERM "$pr_check" 2>/dev/null || true; fail "PR generation lookup gate did not open"; }
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    sed "s/^generation_id=.*/generation_id=generation-task-x1-reused/" "$2/task-x1.meta" > "$3"
+    mv "$3" "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$staged" || fail "PR generation-race setup could not replace metadata"
+  touch "$lookup_release"
+  set +e
+  wait "$pr_check"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "PR lookup attached stale results to a reused task generation"
+  assert_grep 'task generation changed' "$case_dir/pr-check.err" \
+    "PR generation mismatch failed without an actionable refusal"
+  assert_grep 'generation_id=generation-task-x1-reused' "$meta" \
+    "PR generation refusal overwrote the replacement task metadata"
+  assert_no_grep 'pr=' "$meta" "PR generation refusal attached an old PR to the replacement task"
+  assert_absent "$state/task-x1.check.sh" "PR generation refusal armed an orphaned merge poll"
+  pass "fm-pr-check binds slow lookup results to the original task generation"
+}
+
+test_pr_check_backfills_legacy_generation_and_records_state() {
+  local case_dir state meta url head staged count
+  case_dir=$(make_case pr-check-legacy-generation-success)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.legacy"
+  write_meta "$case_dir" no-mistakes ship
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' '$head'
+SH
+  chmod +x "$case_dir/fakebin/gh"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" >/dev/null \
+    || fail "PR check rejected legacy task metadata without a generation identity"
+  grep -Eq '^generation_id=legacy:a[0-9a-f]{15}$' "$meta" \
+    || fail "successful PR check did not backfill a legacy generation identity"
+  count=$(grep -c '^generation_id=' "$meta" || true)
+  expect_code 1 "$count" "successful legacy PR generation backfill count"
+  assert_grep "pr=$url" "$meta" "successful legacy PR check did not record the PR URL"
+  assert_grep "pr_head=$head" "$meta" "successful legacy PR check did not record the PR head"
+  assert_present "$state/task-x1.check.sh" "successful legacy PR check did not arm the merge poll"
+  pass "fm-pr-check upgrades legacy task metadata without breaking PR handling"
+}
+
+test_pr_check_backfills_legacy_generation_before_race_check() {
+  local case_dir state meta lookup_ready lookup_release pr_check rc url head staged count
+  case_dir=$(make_case pr-check-legacy-generation-race)
+  state="$case_dir/state"; meta="$state/task-x1.meta"
+  lookup_ready="$case_dir/lookup-ready"; lookup_release="$case_dir/lookup-release"
+  url=https://github.com/example/repo/pull/7
+  head=deadbeefcafefeed0000000000000000deadbeef
+  staged="$state/.task-x1.meta.reused"
+  write_meta "$case_dir" no-mistakes ship
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_LOOKUP_READY"
+while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
+printf '%s\n' "$FM_TEST_PR_HEAD"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
+  FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/pr-check.out" 2> "$case_dir/pr-check.err" &
+  pr_check=$!
+  for _ in $(seq 1 100); do [ -e "$lookup_ready" ] && break; sleep 0.02; done
+  [ -e "$lookup_ready" ] || { kill -TERM "$pr_check" 2>/dev/null || true; fail "legacy PR generation lookup gate did not open"; }
+  grep -Eq '^generation_id=legacy:a[0-9a-f]{15}$' "$meta" \
+    || fail "PR check did not atomically backfill a legacy generation identity"
+  count=$(grep -c '^generation_id=' "$meta" || true)
+  expect_code 1 "$count" "legacy PR generation backfill count"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    held=$(fm_account_meta_lock_acquire "$2" task-x1) || exit 1
+    sed "s/^generation_id=.*/generation_id=generation-task-x1-reused/" "$2/task-x1.meta" > "$3"
+    mv "$3" "$2/task-x1.meta"
+    fm_account_meta_lock_release "$held"
+  ' _ "$ROOT" "$state" "$staged" || fail "legacy PR generation-race setup could not replace metadata"
+  touch "$lookup_release"
+  set +e
+  wait "$pr_check"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "legacy PR lookup attached stale results to a reused task generation"
+  assert_grep 'task generation changed' "$case_dir/pr-check.err" \
+    "legacy PR generation mismatch failed without an actionable refusal"
+  assert_grep 'generation_id=generation-task-x1-reused' "$meta" \
+    "legacy PR generation refusal overwrote replacement task metadata"
+  assert_no_grep 'pr=' "$meta" "legacy PR generation refusal attached an old PR to the replacement task"
+  assert_absent "$state/task-x1.check.sh" "legacy PR generation refusal armed an orphaned merge poll"
+  pass "fm-pr-check backfills legacy identity before generation race checks"
+}
+
 test_content_in_default_fallback_allows() {
   local case_dir rc
   case_dir=$(make_case content-landed)
@@ -1064,7 +1260,7 @@ test_index_lock_mtime_read_failure_refuses() {
   touch -t 200001010000 "$lock"
 
   set +e
-  FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
+  FM_FAKE_STAT_ERROR_TARGET="$lock" FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
@@ -1242,6 +1438,449 @@ test_local_only_force_overrides_unpushed() {
   pass "local-only worktree with unpushed work is torn down under --force (escape hatch)"
 }
 
+add_fake_agent_fleet() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
+case "$*" in
+  '--format json contract')
+    printf '{"contract_version":1}\n'
+    exit 0
+    ;;
+  *"lease release"*)
+    [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'lease-release %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
+    [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 42
+    ;;
+  *"session remove"*)
+    [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'session-remove %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
+    ;;
+esac
+printf '{"ok":true}\n'
+SH
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/agent-fleet" "$case_dir/fakebin/tmux"
+}
+
+test_managed_force_teardown_releases_lease_and_session() {
+  local case_dir af_log rc
+  case_dir=$(make_case managed-force-release)
+  af_log="$case_dir/agent-fleet.log"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-attempt-a1' \
+    'provider_session_id=session-123' >> "$case_dir/state/task-x1.meta"
+  wt_commit "$case_dir" "managed unpushed work"
+  add_fake_agent_fleet "$case_dir"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "managed-force-release: teardown should succeed: $(cat "$case_dir/stderr")"
+  assert_grep 'lease release --task fm-home-task-x1-attempt-a1 --force' "$af_log" "managed teardown did not release the lease"
+  assert_grep 'session remove --task fm-home-task-x1-attempt-a1' "$af_log" "managed teardown did not remove the session mapping"
+  assert_absent "$case_dir/state/task-x1.meta" "managed teardown left task metadata"
+  pass "managed teardown releases its lease and session mapping only after endpoint removal"
+}
+
+test_managed_teardown_retains_lease_when_endpoint_state_is_unknown() {
+  local case_dir af_log rc
+  case_dir=$(make_case managed-unknown-endpoint)
+  af_log="$case_dir/agent-fleet.log"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-attempt-unknown' \
+    'provider_session_id=session-unknown' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  list-panes) echo 'permission denied' >&2; exit 74 ;;
+  kill-window) exit 74 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "managed-unknown-endpoint: teardown should fail closed"
+  assert_not_contains "$(cat "$af_log")" 'lease release' "unknown endpoint state released the Agent Fleet lease"
+  assert_present "$case_dir/state/task-x1.meta" "unknown endpoint state erased retry metadata"
+  assert_present "$case_dir/wt/.git" "unknown endpoint state recycled the worktree"
+  assert_grep 'managed endpoint state for task-x1 is unknown' "$case_dir/stderr" "unknown endpoint blocker was not reported"
+  pass "managed teardown releases only after confirmed endpoint absence"
+}
+
+test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
+  local case_dir af_log order_log rc release_line session_line return_line
+  case_dir=$(make_case managed-release-failure)
+  af_log="$case_dir/agent-fleet.log"
+  order_log="$case_dir/teardown-order.log"
+  : > "$af_log"
+  : > "$order_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'account_pool=codex-crew' \
+    'account_profile=codex-2' \
+    'account_task=fm-home-task-x1-attempt-b2' \
+    'provider_session_id=session-456' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_FAKE_AF_RELEASE_FAIL=1 FM_TEARDOWN_ORDER_LOG="$order_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "managed-release-failure: teardown should fail closed"
+  assert_grep 'lease release --task fm-home-task-x1-attempt-b2 --force' "$af_log" "managed teardown never attempted release"
+  ! grep -q 'session remove --task fm-home-task-x1-attempt-b2' "$af_log" || fail "managed teardown removed the mapping after release failed"
+  assert_present "$case_dir/state/task-x1.meta" "managed teardown erased retry metadata after release failed"
+  assert_grep 'account_profile=codex-2' "$case_dir/state/task-x1.meta" "managed teardown lost sticky account metadata"
+  assert_present "$case_dir/wt/.git" "managed teardown recycled the worktree after release failed"
+  assert_not_contains "$(cat "$order_log")" 'treehouse-return' "managed teardown returned the worktree before account cleanup succeeded"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" FM_TEARDOWN_ORDER_LOG="$order_log" \
+    run_teardown "$case_dir" --force > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" \
+    || fail "managed-release-failure: cleanup retry should succeed"
+
+  release_line=$(grep -n 'lease-release .*fm-home-task-x1-attempt-b2' "$order_log" | tail -1 | cut -d: -f1)
+  session_line=$(grep -n 'session-remove .*fm-home-task-x1-attempt-b2' "$order_log" | tail -1 | cut -d: -f1)
+  return_line=$(grep -n 'treehouse-return' "$order_log" | tail -1 | cut -d: -f1)
+  [ "$release_line" -lt "$session_line" ] && [ "$session_line" -lt "$return_line" ] \
+    || fail "managed-release-failure: retry recycled the worktree before account cleanup"
+  assert_absent "$case_dir/state/task-x1.meta" "managed cleanup retry left task metadata"
+  pass "a failed managed release preserves the unrecycled worktree and retry ordering"
+}
+
+test_managed_teardown_locks_generation_before_endpoint_cleanup() {
+  local case_dir af_log kill_started allow_kill teardown_pid teardown_rc updater_rc
+  case_dir=$(make_case managed-generation-lock)
+  af_log="$case_dir/agent-fleet.log"
+  kill_started="$case_dir/kill-started"
+  allow_kill="$case_dir/allow-kill"
+  : > "$af_log"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-old-attempt' \
+    'account_attempt=old-attempt' \
+    'provider_session_id=session-old' >> "$case_dir/state/task-x1.meta"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  kill-window)
+    : > "$FM_FAKE_KILL_STARTED"
+    while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+    exit 0
+    ;;
+  display-message) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  teardown_pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$kill_started" ] && break
+    sleep 0.05
+  done
+  [ -f "$kill_started" ] || { kill "$teardown_pid" 2>/dev/null || true; fail "managed generation teardown never reached endpoint cleanup"; }
+
+  set +e
+  FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 bash -c '
+    . "$1"
+    state=$2
+    meta=$state/task-x1.meta
+    held=$(fm_account_lifecycle_lock_acquire "$state" task-x1) || exit 75
+    awk "!/^window=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
+    printf "%s\n" "window=firstmate:fm-task-x1-replacement" "account_task=fm-home-task-x1-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
+    mv "$state/.replacement.meta" "$meta"
+    fm_account_lifecycle_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/state" \
+    > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
+  updater_rc=$?
+  set -e
+  : > "$allow_kill"
+  set +e
+  wait "$teardown_pid"
+  teardown_rc=$?
+  set -e
+
+  [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced metadata after teardown began"
+  expect_code 0 "$teardown_rc" "managed generation teardown should complete with its original locked generation"
+  assert_grep 'lease release --task fm-home-task-x1-old-attempt --force' "$af_log" "teardown did not release its locked generation"
+  assert_not_contains "$(cat "$af_log")" 'fm-home-task-x1-new-attempt' "teardown targeted a concurrent replacement generation"
+  assert_absent "$case_dir/state/.replacement.meta" "blocked continuation left replacement scratch metadata"
+  assert_absent "$case_dir/state/task-x1.meta" "managed generation teardown left metadata"
+  pass "managed teardown serializes generation identity through account cleanup and recycling"
+}
+
+test_managed_child_teardown_locks_generation_before_snapshot() {
+  local case_dir af_log child_id child_project child_worktree kill_started allow_kill teardown_pid teardown_rc updater_rc
+  case_dir=$(make_case managed-child-generation-lock)
+  af_log="$case_dir/agent-fleet.log"
+  child_id=child-lock-x3
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  kill_started="$case_dir/kill-started"
+  allow_kill="$case_dir/allow-kill"
+  : > "$af_log"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    "window=fm-$child_id" \
+    "tmux_session_target=firstmate:fm-$child_id" \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=local-only' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-child-old-attempt' \
+    'account_attempt=old-attempt' \
+    'account_predecessor_task=fm-child-predecessor' \
+    'account_predecessor_attempt=predecessor-attempt' \
+    'account_predecessor_provider=claude' \
+    'account_predecessor_pool=claude-crew' \
+    'account_predecessor_profile=claude-1' \
+    'account_predecessor_session=session-predecessor' \
+    'account_predecessor_cleanup=pending' \
+    'provider_session_id=session-old'
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  kill-window)
+    case "$*" in
+      *fm-child-lock-x3*)
+        : > "$FM_FAKE_KILL_STARTED"
+        while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+        ;;
+    esac
+    exit 0
+    ;;
+  display-message) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    FM_EXPECT_CHILD_LINEAGE_PATH="$case_dir/wt/data/$child_id/account-attempts.md" \
+    FM_REJECT_CHILD_LINEAGE_PATH="$case_dir/data/$child_id/account-attempts.md" \
+    FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  teardown_pid=$!
+  for _ in $(seq 1 100); do
+    [ -f "$kill_started" ] && break
+    sleep 0.05
+  done
+  [ -f "$kill_started" ] || {
+    kill "$teardown_pid" 2>/dev/null || true
+    fail "managed child teardown never reached endpoint cleanup: $(cat "$case_dir/stderr")"
+  }
+
+  set +e
+  FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 bash -c '
+    . "$1"
+    state=$2
+    meta=$state/child-lock-x3.meta
+    held=$(fm_account_lifecycle_lock_acquire "$state" child-lock-x3) || exit 75
+    awk "!/^window=/ && !/^worktree=/ && !/^account_task=/ && !/^account_attempt=/" "$meta" > "$state/.replacement.meta"
+    printf "%s\n" "window=fm-child-lock-x3-replacement" "worktree=$3" "account_task=fm-child-new-attempt" "account_attempt=new-attempt" >> "$state/.replacement.meta"
+    mv "$state/.replacement.meta" "$meta"
+    fm_account_lifecycle_lock_release "$held"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$case_dir/wt/state" "$case_dir/replacement-worktree" \
+    > "$case_dir/updater-stdout" 2> "$case_dir/updater-stderr"
+  updater_rc=$?
+  set -e
+  : > "$allow_kill"
+  set +e
+  wait "$teardown_pid"
+  teardown_rc=$?
+  set -e
+
+  [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced managed child metadata after teardown began"
+  expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation"
+  assert_grep 'lease release --task fm-child-old-attempt --force' "$af_log" "child teardown did not release its locked generation"
+  assert_grep 'lease release --task fm-child-predecessor --force' "$af_log" "child teardown did not clean its predecessor generation"
+  assert_not_contains "$(cat "$af_log")" 'fm-child-new-attempt' "child teardown targeted a concurrent replacement generation"
+  assert_absent "$case_dir/wt/state/.replacement.meta" "blocked child continuation left replacement scratch metadata"
+  assert_present "$case_dir/child-lineage-verified" "child account lineage was not verified in the owning home before retirement"
+  pass "managed child teardown locks generation before snapshot and recycling"
+}
+
+test_forced_secondmate_child_uses_child_home_for_endpoint_verification() {
+  local case_dir af_log zellij_log child_project child_worktree child_id rc
+  case_dir=$(make_case secondmate-child-home-probe)
+  af_log="$case_dir/agent-fleet.log"
+  zellij_log="$case_dir/zellij.log"
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  child_id=child-zellij-x2
+  : > "$af_log"
+  : > "$zellij_log"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    'window=firstmate:9' \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=zellij' \
+    'zellij_tab_id=7' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-child-home-attempt-c3' \
+    'provider_session_id=session-child'
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\t%s\n' "${FM_HOME:-}" "$*" >> "$FM_FAKE_ZELLIJ_LOG"
+if [ "${1:-}" = list-sessions ]; then
+  printf 'firstmate\n'
+  exit 0
+fi
+if [ "${FM_HOME:-}" = "${FM_FAKE_ZELLIJ_HOME:-}" ]; then
+  case "$*" in
+    *'action list-panes --json'*) printf '[{"id":9,"tab_id":7,"is_plugin":false}]\n'; exit 0 ;;
+    *'action list-tabs --json'*) printf '[{"tab_id":7,"name":"fm-child-zellij-x2","active":true}]\n'; exit 0 ;;
+    *'action close-tab-by-id 7'*) exit 0 ;;
+  esac
+fi
+case "$*" in
+  *'action list-panes --json'*|*'action list-tabs --json'*) printf '[]\n'; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/zellij"
+
+  set +e
+  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_ZELLIJ_HOME="$case_dir/wt" FM_FAKE_ZELLIJ_LOG="$zellij_log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "secondmate-child-home-probe: live child endpoint should block account release"
+  assert_grep "$case_dir/wt" "$zellij_log" "child endpoint was not verified under the child firstmate home"
+  assert_not_contains "$(cat "$af_log")" 'lease release' "live child endpoint allowed Agent Fleet release"
+  assert_present "$case_dir/wt/state/$child_id.meta" "live child endpoint lost retry metadata"
+  assert_present "$child_worktree/.git" "live child endpoint worktree was recycled"
+  assert_grep 'managed endpoint for child-zellij-x2 is still alive' "$case_dir/stderr" "child endpoint blocker was not reported"
+  pass "forced secondmate cleanup verifies managed children in the child home"
+}
+
+test_forced_secondmate_quiesces_parent_before_child_cleanup() {
+  local case_dir child_project child_worktree child_id parent_live parent_quiesced rc
+  case_dir=$(make_case secondmate-parent-quiesce)
+  child_project="$case_dir/child-project"
+  child_worktree="$case_dir/child-worktree"
+  child_id=child-after-quiesce-x4
+  parent_live="$case_dir/parent-live"
+  parent_quiesced="$case_dir/parent-quiesced"
+  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$case_dir/wt"
+  fm_git_worktree "$child_project" "$child_worktree" child-branch
+  fm_write_meta "$case_dir/wt/state/$child_id.meta" \
+    "window=fm-$child_id" \
+    "worktree=$child_worktree" \
+    "project=$child_project" \
+    'kind=ship' \
+    'mode=local-only'
+  : > "$parent_live"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_PARENT_LIVE" ] ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    case "$*" in
+      *fm-task-x1*) rm -f "$FM_FAKE_PARENT_LIVE"; : > "$FM_FAKE_PARENT_QUIESCED" ;;
+    esac
+    exit 0
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  set +e
+  FM_FAKE_PARENT_LIVE="$parent_live" FM_FAKE_PARENT_QUIESCED="$parent_quiesced" \
+    FM_EXPECT_PARENT_QUIESCED="$parent_quiesced" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "secondmate-parent-quiesce: forced teardown should succeed"
+  assert_present "$parent_quiesced" "forced secondmate teardown did not quiesce its parent endpoint"
+  assert_absent "$case_dir/wt" "forced secondmate teardown retained the retired home"
+  pass "forced secondmate teardown quiesces and verifies the parent before child cleanup"
+}
+
 test_herdr_teardown_clears_escalation_marker() {
   local case_dir marker
   case_dir=$(make_case herdr-marker-cleanup)
@@ -1263,6 +1902,261 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+test_required_report_blocks_then_publishes_before_cleanup() {
+  local case_dir data stack live quiesced rc
+  case_dir=$(make_case report-publication)
+  data="$case_dir/data"
+  stack="$case_dir/report-stack"
+  live="$case_dir/report-endpoint-live"
+  quiesced="$case_dir/report-endpoint-quiesced"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$data/task-x1"
+  printf '# Task\n\nPublish before cleanup\n' > "$data/task-x1/brief.md"
+  printf 'done: implementation landed\n' > "$case_dir/state/task-x1.status"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    if [ -f "$FM_FAKE_COMPLETION_PATH" ]; then
+      printf '\nQuiesced final state.\n' >> "$FM_FAKE_COMPLETION_PATH"
+    fi
+    rm -f "$FM_FAKE_REPORT_LIVE"
+    touch "$FM_FAKE_REPORT_QUIESCED"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  touch "$live"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" FM_FAKE_REPORT_LIVE="$live" \
+    FM_FAKE_REPORT_QUIESCED="$quiesced" FM_FAKE_COMPLETION_PATH="$data/task-x1/completion.md" \
+    run_teardown "$case_dir" > "$case_dir/missing-stdout" 2> "$case_dir/missing-stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "required report: teardown without completion.md must fail"
+  assert_present "$quiesced" "required report failure did not quiesce its endpoint before publication"
+  assert_present "$case_dir/state/task-x1.meta" "required report failure erased task metadata"
+  assert_grep 'required completion report is missing' "$case_dir/missing-stderr" \
+    "required report failure did not explain the missing artifact"
+
+  printf '# Completion\n\n## Summary\n\nPublication is ready.\n\n## What changed\n\nHooked teardown.\n\n## Verification\n\nTested.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport stack.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  rm -f "$quiesced"
+  touch "$live"
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+    FM_FAKE_REPORT_LIVE="$live" FM_FAKE_REPORT_QUIESCED="$quiesced" \
+    FM_FAKE_COMPLETION_PATH="$data/task-x1/completion.md" FM_EXPECT_REPORT_PATH="$stack/index.html" \
+    run_teardown "$case_dir" \
+      > "$case_dir/report-stdout" 2> "$case_dir/report-stderr" \
+    || fail "required report: teardown failed after completion report was ready: $(cat "$case_dir/report-stderr")"
+  assert_present "$quiesced" "required report publication did not confirm endpoint quiescence"
+  assert_present "$stack/index.html" "required report was not published"
+  grep -R -F 'Quiesced final state.' "$stack/entries" >/dev/null \
+    || fail "required report was published from stale pre-quiescence content"
+  assert_absent "$case_dir/state/task-x1.meta" "successful report teardown left task metadata"
+  pass "teardown quiesces before publishing and still publishes before cleanup"
+}
+
+test_required_report_restores_rollback_generation_before_publish() {
+  local case_dir data stack af_log live backup rc
+  case_dir=$(make_case report-rollback-generation)
+  data="$case_dir/data"
+  stack="$case_dir/report-stack"
+  af_log="$case_dir/agent-fleet.log"
+  live="$case_dir/report-endpoint-live"
+  backup="$case_dir/state/.task-x1.meta.rollback.restore1"
+  : > "$af_log"
+  mkdir -p "$data/task-x1"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'harness=codex' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
+  cp "$case_dir/state/task-x1.meta" "$backup"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'harness=claude' \
+    'kind=ship' \
+    'mode=no-mistakes' \
+    'report_required=1' \
+    'account_pool=claude-crew' \
+    'account_profile=claude-2' \
+    'account_task=fm-home-task-x1-failed' \
+    'account_attempt=failed' \
+    'provider_session_id=session-failed' \
+    'account_rollback_cleanup=pending' \
+    'account_rollback_backup=.task-x1.meta.rollback.restore1'
+  printf '# Task\n\nRestored report generation\n' > "$data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nSettled generation.\n\n## What changed\n\nRestored metadata.\n\n## Verification\n\nTested.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  add_fake_agent_fleet "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window) rm -f "$FM_FAKE_REPORT_LIVE"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  : > "$live"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" \
+    FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+    FM_FAKE_REPORT_LIVE="$live" run_teardown "$case_dir" \
+      > "$case_dir/rollback-stdout" 2> "$case_dir/rollback-stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "required rollback report: restoration pass should stop before publication"
+  assert_grep 'rerun teardown against the restored task generation' "$case_dir/rollback-stderr" \
+    "required rollback report did not request a fresh settled-generation pass"
+  grep -qx 'harness=codex' "$case_dir/state/task-x1.meta" \
+    || fail "rollback did not restore predecessor metadata"
+  assert_absent "$stack/index.html" "failed generation was published before rollback restoration"
+
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$stack" FM_FAKE_REPORT_LIVE="$live" \
+    run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" \
+    || fail "required rollback report: settled-generation retry failed: $(cat "$case_dir/retry-stderr")"
+  assert_grep '"harness": "codex"' "$(find "$stack/entries" -name manifest.json -print -quit)" \
+    "settled-generation report retained the failed generation harness"
+  assert_absent "$case_dir/state/task-x1.meta" "settled-generation teardown retained task metadata"
+  pass "teardown restores pending rollback state before required report publication"
+}
+
+test_required_report_revalidates_after_quiescence() {
+  local case_dir data live rc
+  case_dir=$(make_case report-post-quiesce-safety)
+  data="$case_dir/data"
+  live="$case_dir/report-endpoint-live"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' \
+    'tmux_session_target=firstmate:fm-task-x1' \
+    'report_required=1' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$data/task-x1"
+  printf '# Task\n\nQuiesce before validation\n' > "$data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nReady.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$data/task-x1/completion.md"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  list-panes) exit 0 ;;
+  kill-window)
+    printf 'late work\n' > "$FM_FAKE_WORKTREE/late-work.txt"
+    rm -f "$FM_FAKE_REPORT_LIVE"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  : > "$live"
+
+  set +e
+  FM_DATA_OVERRIDE="$data" FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+    FM_FAKE_REPORT_LIVE="$live" FM_FAKE_WORKTREE="$case_dir/wt" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "required report: post-quiescence dirty work must refuse teardown"
+  assert_absent "$live" "required report validation ran before endpoint quiescence"
+  assert_present "$case_dir/wt/late-work.txt" "post-quiescence safety refusal discarded late work"
+  assert_present "$case_dir/state/task-x1.meta" "post-quiescence safety refusal removed metadata"
+  assert_grep 'endpoint has already been shut down; the worktree and task metadata are preserved' "$case_dir/stderr" \
+    "post-quiescence safety refusal did not explain the fail-safe state"
+  assert_absent "$case_dir/report-stack/index.html" "unsafe post-quiescence state was published"
+  pass "required report teardown quiesces before its final safety validation"
+}
+
+test_teardown_refuses_unsafe_tasktmp_metadata() {
+  local case_dir sentinel rc
+  case_dir=$(make_case unsafe-tasktmp)
+  sentinel="$case_dir/must-survive"
+  write_meta "$case_dir" local-only ship
+  mkdir -p "$sentinel"
+  printf 'preserve\n' > "$sentinel/marker"
+  printf 'tasktmp=%s\n' "$sentinel" >> "$case_dir/state/task-x1.meta"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unsafe tasktmp teardown exit"
+  assert_present "$sentinel/marker" "teardown deleted a metadata-selected arbitrary directory"
+  assert_present "$case_dir/state/task-x1.meta" "unsafe tasktmp refusal removed task metadata"
+  assert_grep 'unsafe task temp path' "$case_dir/stderr" "unsafe teardown tasktmp refusal was unclear"
+  pass "teardown only removes its exact task temp root"
+}
+
+test_teardown_rejects_malformed_report_requirement() {
+  local case_dir rc
+  case_dir=$(make_case malformed-report-required)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=0\n' >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "malformed report_required teardown exit"
+  assert_present "$case_dir/state/task-x1.meta" "malformed report_required metadata was destructively bypassed"
+  assert_grep 'invalid report_required metadata' "$case_dir/stderr" \
+    "malformed report_required refusal was unclear"
+
+  case_dir=$(make_case duplicate-report-required)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=1\nreport_required=1\n' >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "duplicate report_required teardown exit"
+  assert_present "$case_dir/state/task-x1.meta" "duplicate report_required metadata was destructively bypassed"
+  pass "teardown treats only one exact report_required marker as valid"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
+  test_teardown_refuses_unsafe_tasktmp_metadata
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-force-release ]; then
+  test_managed_force_teardown_releases_lease_and_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-endpoint-identity ]; then
+  test_managed_force_teardown_releases_lease_and_session
+  test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-34-report-required ]; then
+  test_teardown_rejects_malformed_report_requirement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35-pr ]; then
+  test_pr_check_serializes_with_account_session_updates
+  test_pr_check_rejects_reused_task_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = legacy-pr-generation ]; then
+  test_pr_check_backfills_legacy_generation_and_records_state
+  test_pr_check_backfills_legacy_generation_before_race_check
+  exit 0
+fi
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1271,7 +2165,19 @@ test_local_only_merged_to_local_main_allows
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
+test_managed_force_teardown_releases_lease_and_session
+test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
+test_managed_release_failure_preserves_unrecycled_worktree_for_retry
+test_managed_teardown_locks_generation_before_endpoint_cleanup
+test_managed_child_teardown_locks_generation_before_snapshot
+test_forced_secondmate_child_uses_child_home_for_endpoint_verification
+test_forced_secondmate_quiesces_parent_before_child_cleanup
 test_herdr_teardown_clears_escalation_marker
+test_required_report_blocks_then_publishes_before_cleanup
+test_required_report_restores_rollback_generation_before_publish
+test_required_report_revalidates_after_quiescence
+test_teardown_refuses_unsafe_tasktmp_metadata
+test_teardown_rejects_malformed_report_requirement
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
@@ -1279,6 +2185,8 @@ test_squash_merged_pr_allows_replayed_unpushed_patch
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
+test_pr_check_serializes_with_account_session_updates
+test_pr_check_rejects_reused_task_generation
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses

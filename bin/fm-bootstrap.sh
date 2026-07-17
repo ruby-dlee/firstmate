@@ -6,6 +6,7 @@
 #          Lines: "MISSING: <tool> (install: <command>)",
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
+#                 "ACCOUNT_ROUTING: invalid routing policy - <reason>",
 #                 "CREW_HARNESS_OVERRIDE: <name>",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "CREW_DISPATCH: active config/crew-dispatch.json" plus indented rules,
@@ -13,6 +14,7 @@
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
+#                 "REPORT_RETENTION: unavailable: <reason>",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
@@ -65,16 +67,18 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the four MUTATING sweeps
-#          (secondmate_sync, secondmate_liveness_sweep, x_mode_setup,
-#          fleet_sync) while still printing every read-only detect line
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          (report_retention_ensure, secondmate_sync,
+#          secondmate_liveness_sweep, x_mode_setup, fleet_sync) while still
+#          printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
 #          the fleet lock, so a second concurrent session never race-mutates
-#          secondmate homes, X-mode artifacts, project clones, or repair
-#          instructions. Unset/0 (the default) runs every sweep exactly as
-#          before - this flag is purely additive.
+#          report-retention installation state, secondmate homes, X-mode
+#          artifacts, project clones, or repair instructions. Unset/0 (the
+#          default) runs every sweep exactly as before - this flag is purely
+#          additive.
 #        fm-bootstrap.sh install <tool>...
 #          Install the named tools (only ones the captain approved).
 set -u
@@ -97,6 +101,22 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-gate-refuse-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+fm_refuse_if_gate_agent
+
+report_retention_ensure() {
+  local out
+  if [ "${FM_GATE_REFUSE_BYPASS:-0}" = 1 ] && [ -z "${FM_REPORT_STACK_ROOT:-}" ]; then
+    return 0
+  fi
+  if ! out=$("$SCRIPT_DIR/fm-report-retention.sh" ensure 2>&1); then
+    [ -n "$out" ] || out="persistent owner did not start"
+    echo "REPORT_RETENTION: unavailable: ${out%%$'\n'*}"
+  fi
+}
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -275,7 +295,9 @@ secondmate_liveness_sweep() {
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out
+  local meta id window harness backend target verdict out account_profile rollback_pending retry_profile retry_out
+  local lifecycle_lock recheck spawn_message
+  local -a resume_args retry_args
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -286,7 +308,7 @@ secondmate_liveness_sweep() {
     backend=$(fm_backend_of_meta "$meta")
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
-    verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown"
+    verdict=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null) || verdict="unknown"
     case "$harness" in
       claude|codex|opencode|pi|grok) ;;
       *) [ "$verdict" = dead ] && verdict=unknown ;;
@@ -296,12 +318,98 @@ secondmate_liveness_sweep() {
         echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
         ;;
       dead)
-        fm_backend_kill "$backend" "$target" 2>/dev/null || true
-        if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
-          echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
-        else
-          echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
+        lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$id" 2>/dev/null) || {
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: lifecycle recovery lock unavailable; respawn deferred"
+          continue
+        }
+        if [ ! -f "$meta" ] || ! grep -q '^kind=secondmate$' "$meta" 2>/dev/null; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: task generation changed before recovery"
+          continue
         fi
+        window=$(fm_meta_get "$meta" window)
+        if [ -z "$window" ]; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: task generation has no endpoint target"
+          continue
+        fi
+        harness=$(fm_meta_get "$meta" harness)
+        backend=$(fm_backend_of_meta "$meta")
+        target=$(fm_backend_target_of_meta "$meta")
+        [ -n "$target" ] || target="$window"
+        recheck=$(fm_backend_agent_alive "$backend" "$target" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null) || recheck=unknown
+        case "$harness" in
+          claude|codex|opencode|pi|grok) ;;
+          *) [ "$recheck" = dead ] && recheck=unknown ;;
+        esac
+        case "$recheck" in
+          alive)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
+            continue
+            ;;
+          dead) ;;
+          *)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: skipped: liveness probe inconclusive (backend=$backend)"
+            continue
+            ;;
+        esac
+        account_profile=$(fm_meta_get "$meta" account_profile)
+        rollback_pending=$(fm_meta_get "$meta" account_rollback_cleanup)
+        if [ "$rollback_pending" != pending ] && [ -n "$account_profile" ] \
+          && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed: managed account recovery has no verified provider-session mapping"
+          continue
+        fi
+        fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null || true
+        resume_args=()
+        if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
+          resume_args+=(--resume-account)
+        else
+          resume_args+=(--no-account-routing)
+        fi
+        if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
+          "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
+          spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawned"
+        elif [ "$rollback_pending" = pending ] && { [ ! -f "$meta" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; }; then
+          if fm_account_lifecycle_lock_owned "$lifecycle_lock"; then
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          fi
+          lifecycle_lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$id" 2>/dev/null) || {
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: fresh lifecycle recovery lock unavailable"
+            continue
+          }
+          retry_profile=
+          [ ! -f "$meta" ] || retry_profile=$(fm_meta_get "$meta" account_profile)
+          retry_args=()
+          if [ -n "$retry_profile" ]; then
+            retry_args+=(--resume-account)
+          else
+            retry_args+=(--no-account-routing)
+          fi
+          if [ -n "$retry_profile" ] \
+            && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: restored managed generation has no verified provider-session mapping"
+            continue
+          fi
+          if retry_out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
+            "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
+          else
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
+          fi
+        else
+          spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
+        fi
+        if fm_account_lifecycle_lock_owned "$lifecycle_lock" \
+          && ! fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1; then
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: lifecycle recovery lock release failed; inspect before retrying"
+          continue
+        fi
+        echo "$spawn_message"
         ;;
       *)
         echo "SECONDMATE_LIVENESS: secondmate $id: skipped: liveness probe inconclusive (backend=$backend)"
@@ -314,6 +422,7 @@ secondmate_liveness_sweep() {
 install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
+    python3) echo "brew install python  # or the platform's package manager" ;;
     cmux) echo "brew install --cask cmux  # or see https://cmux.com" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
@@ -326,6 +435,7 @@ install_cmd() {
 manual_install_url() {
   case "$1" in
     herdr) echo "https://herdr.dev" ;;
+    agent-fleet) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing" ;;
     *) return 1 ;;
   esac
 }
@@ -344,7 +454,7 @@ missing_tool_diagnostic() {
 # fm_backend_required_tools (bin/fm-backend.sh). So a herdr/zellij/cmux home is
 # never told tmux is missing, and only orca drops treehouse. A backend value with
 # no verified dependency set is reported before the universal checks continue.
-COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi"
+COMMON_TOOLS="node python3 git gh no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi"
 BACKEND=$(fm_backend_name)
 BACKEND_VALID=1
 if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
@@ -487,20 +597,56 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+BOOTSTRAP_JQ_REPORTED=0
+ACCOUNT_ROUTING_MODE=off
+
+account_routing_preflight() {
+  local mode mode_error needs_agent_fleet=0 dispatch
+  if mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>&1); then
+    ACCOUNT_ROUTING_MODE=$mode
+  else
+    mode_error=${mode#error: }
+    echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
+  fi
+  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || needs_agent_fleet=1
+  dispatch="$CONFIG/crew-dispatch.json"
+  if [ -f "$dispatch" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_agent_fleet=1
+    elif grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
+      needs_agent_fleet=1
+    fi
+  fi
+  [ "$needs_agent_fleet" = 1 ] || return 0
+  if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
+    [ -x "$FM_AGENT_FLEET_BIN" ] || missing_tool_diagnostic agent-fleet
+  else
+    command -v agent-fleet >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "MISSING: jq (install: $(install_cmd jq))"
+    BOOTSTRAP_JQ_REPORTED=1
+  fi
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
   [ -f "$file" ] || return 0
   if ! command -v jq >/dev/null 2>&1; then
-    echo "MISSING: jq (install: $(install_cmd jq))"
+    [ "$BOOTSTRAP_JQ_REPORTED" = 1 ] || echo "MISSING: jq (install: $(install_cmd jq))"
     return 0
   fi
   if ! jq -e . "$file" >/dev/null 2>&1; then
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - malformed JSON"
     return 0
   fi
-  err=$(jq -r '
+  err=$(jq -r --arg routing_mode "$ACCOUNT_ROUTING_MODE" '
     def verified($h): ["claude","codex","opencode","pi","grok"] | index($h);
+    def safe_account_id($v):
+      ($v | type) == "string"
+      and ($v | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+      and ($v | contains("@") | not);
     def effort_ok($h; $e):
       if $e == null then true
       elif ($e | type) != "string" then false
@@ -531,11 +677,22 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | select((.use? | type) == "array" and (.use | length) == 0)] | length > 0 then "each rule needs at least one use profile"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(type != "object")] | length > 0 then "each use profile must be an object"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select((.harness? | type) != "string" or (.harness | length) == 0)] | length > 0 then "each use profile needs harness"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_pool") and (safe_account_id(.account_pool) | not))] | length > 0 then "invalid account_pool"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (safe_account_id(.account_profile) | not))] | length > 0 then "invalid account_profile"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_pool") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_pool requires claude or codex harness"
+    elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(has("account_profile") and (.harness != "claude" and .harness != "codex"))] | length > 0 then "account_profile requires claude or codex harness"
+    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | select(([use_profiles(.use?)[] | has("account_pool")] | any) and ([use_profiles(.use?)[] | has("account_pool")] | all | not))] | length > 0 then "quota-balanced account_pool candidates must all carry account_pool"
+    elif [(.rules // [])[]? | select(.select? == "quota-balanced") | use_profiles(.use?)[] | select(has("account_profile"))] | length > 0 then "quota-balanced candidates cannot carry account_profile"
+    elif ($routing_mode == "enforce" and (([(.rules // [])[]? | select(.select? == "quota-balanced") | select([use_profiles(.use?)[] | has("account_pool")] | all | not)] | length) > 0)) then "enforced quota-balanced candidates must all carry account_pool"
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
     elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced")] | length > 0 then
       "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced") ] | unique | join(", "))
     elif has("default") and (.default | type) != "object" then "default must be an object"
     elif has("default") and ((.default.harness? | type) != "string" or (.default.harness | length) == 0) then "default needs harness when present"
+    elif has("default") and (.default | has("account_pool")) and (safe_account_id(.default.account_pool) | not) then "invalid default account_pool"
+    elif has("default") and (.default | has("account_profile")) and (safe_account_id(.default.account_profile) | not) then "invalid default account_profile"
+    elif has("default") and (.default | has("account_pool")) and (.default.harness != "claude" and .default.harness != "codex") then "default account_pool requires claude or codex harness"
+    elif has("default") and (.default | has("account_profile")) and (.default.harness != "claude" and .default.harness != "codex") then "default account_profile requires claude or codex harness"
     else
       ([(.rules // [])[]? | use_profiles(.use?)[]?.harness] + [.default?.harness?]
         | map(select(. != null))
@@ -557,7 +714,9 @@ crew_dispatch_validate() {
       + (if ($p.model? != null) then "/" + ($p.model | tostring)
          elif ($p.effort? != null) then "/default"
          else "" end)
-      + (if ($p.effort? != null) then "/" + ($p.effort | tostring) else "" end);
+      + (if ($p.effort? != null) then "/" + ($p.effort | tostring) else "" end)
+      + (if ($p.account_pool? != null) then "@" + ($p.account_pool | tostring) else "" end)
+      + (if ($p.account_profile? != null) then "#" + ($p.account_profile | tostring) else "" end);
     def use_label($r):
       if ($r.use | type) == "array" then
         ((if ($r.select? != null) then ($r.select | tostring) else "first" end)
@@ -575,6 +734,11 @@ if [ "${1:-}" = "install" ]; then
   shift
   [ $# -gt 0 ] || { echo "usage: fm-bootstrap.sh install <tool>..." >&2; exit 1; }
   for t in "$@"; do
+    if [ "$t" = report-retention ]; then
+      echo "installing report-retention LaunchAgent"
+      "$SCRIPT_DIR/fm-report-retention.sh" install
+      continue
+    fi
     if ! cmd=$(install_cmd "$t"); then
       instructions=$(manual_install_url "$t") || { echo "error: unknown tool $t" >&2; exit 1; }
       echo "error: $t requires manual installation (instructions: $instructions)" >&2
@@ -626,11 +790,13 @@ fi
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"
+account_routing_preflight
 crew_dispatch_validate
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+  report_retention_ensure
   secondmate_sync
   secondmate_liveness_sweep
   x_mode_setup

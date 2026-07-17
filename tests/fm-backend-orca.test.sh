@@ -70,9 +70,55 @@ LOG="${FM_ORCA_LOG:?}"
   for a in "$@"; do printf '\x1f%s' "$a"; done
   printf '\n'
 } >> "$LOG"
+case "${1:-}" in
+  kill-window)
+    prev=
+    for arg in "$@"; do
+      [ "$prev" = -t ] && printf '%s\n' "$arg" >> "$LOG.killed"
+      prev=$arg
+    done
+    ;;
+  display-message)
+    target=
+    prev=
+    for arg in "$@"; do
+      [ "$prev" = -t ] && target=$arg
+      prev=$arg
+    done
+    if [ -n "$target" ] && [ -f "$LOG.killed" ] && grep -qxF "$target" "$LOG.killed"; then
+      exit 1
+    fi
+    printf '%%1\n'
+    ;;
+esac
 exit 0
 SH
   chmod +x "$fb/tmux"
+}
+
+add_dead_tmux_fake() {  # <fakebin-dir>
+  # A tmux whose recorded endpoint is provably gone: existence probes fail and
+  # list-windows reports no windows, so fm-spawn's duplicate-endpoint check
+  # resolves `absent` for a recorded legacy tmux window.
+  local fb=$1
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+}
+
+seed_legacy_task_meta() {  # <state-dir> <id> <project>
+  # A pre-cutover task meta: no report_required marker (legacy teardown
+  # contract) and a dead tmux window - the one task shape that may still
+  # respawn onto backend=orca after the new-report-required spawn refusal.
+  local state=$1 id=$2 proj=$3
+  fm_write_meta "$state/$id.meta" \
+    "window=legacy:fm-$id" "worktree=$TMP_ROOT/legacy-$id-wt" "project=$proj" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off"
 }
 
 test_capture_reads_terminal_tail_json() {
@@ -446,6 +492,8 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case pathless-cleanup-fail
+  seed_legacy_task_meta "$state" "$id" "$proj"
+  add_dead_tmux_fake "$FB"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-pathless-cleanup"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-pathless-cleanup"}}}\n' > "$RESP/3.out"
@@ -466,10 +514,11 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   assert_grep "backend=orca" "$state/$id.meta" "preserved pathless metadata missing backend=orca"
   assert_grep "orca_worktree_id=wt-pathless-cleanup" "$state/$id.meta" "preserved pathless metadata missing Orca worktree id"
   assert_no_grep "terminal=" "$state/$id.meta" "preserved pathless metadata should not invent a terminal handle"
+  assert_no_grep "report_required=" "$state/$id.meta" "preserved pathless metadata must keep the legacy no-report contract"
   pass "fm-spawn.sh --backend orca: preserves metadata when pathless cleanup fails"
 }
 
-test_spawn_writes_orca_metadata_and_launches_harness() {
+test_legacy_respawn_writes_orca_metadata_and_launches_harness() {
   local proj wt data state config id out log
   id="orcaspawnz1"
   proj="$TMP_ROOT/spawn-project"
@@ -482,6 +531,8 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case spawn
+  seed_legacy_task_meta "$state" "$id" "$proj"
+  add_dead_tmux_fake "$FB"
   log="$LOG"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-spawn"}}}\n' > "$RESP/2.out"
@@ -490,7 +541,7 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
-  expect_code 0 $? "fm-spawn.sh --backend orca should succeed with fake Orca"$'\n'"$out"
+  expect_code 0 $? "fm-spawn.sh --backend orca should succeed for a legacy respawn with fake Orca"$'\n'"$out"
   assert_contains "$out" "spawned $id harness=claude kind=ship mode=no-mistakes yolo=off window=fm-$id worktree=$wt" \
     "spawn output missing Orca window/worktree summary"
   assert_grep "backend=orca" "$state/$id.meta" "meta missing backend=orca"
@@ -498,6 +549,7 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   assert_grep "terminal=term-spawn" "$state/$id.meta" "meta missing terminal handle"
   assert_grep "orca_worktree_id=wt-spawn" "$state/$id.meta" "meta missing Orca worktree id"
   assert_grep "worktree=$wt" "$state/$id.meta" "meta missing Orca worktree path"
+  assert_no_grep "report_required=" "$state/$id.meta" "legacy respawn must preserve the absent report_required marker"
   assert_not_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''create' \
     "spawn should reuse the implicit terminal returned by Orca worktree creation"
   assert_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''send'$'\x1f''--terminal'$'\x1f''term-spawn'$'\x1f''--text'$'\x1f''export GOTMPDIR=/tmp/fm-orcaspawnz1/gotmp'$'\x1f''--enter'$'\x1f''--json' \
@@ -505,7 +557,232 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   assert_contains "$(cat "$log")" "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions" \
     "spawn did not send the selected harness launch command through Orca"
   rm -rf "/tmp/fm-$id"
-  pass "fm-spawn.sh --backend orca: reuses implicit terminal, records metadata, launches harness"
+  pass "fm-spawn.sh --backend orca: legacy respawn reuses implicit terminal, records metadata, launches harness"
+}
+
+test_spawn_refuses_new_report_required_orca_task_before_mutation() {
+  local proj data state config id out status
+  id="orcareportrefusez3"
+  proj="$TMP_ROOT/report-refusal-project"
+  data="$TMP_ROOT/report-refusal-data"
+  state="$TMP_ROOT/report-refusal-state"
+  config="$TMP_ROOT/report-refusal-config"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case report-refusal
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-spawn.sh --backend orca should refuse a new report-required task"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca refusal should explain the missing absence proof"
+  assert_contains "$out" "report-gated teardown could never complete" \
+    "report-required Orca refusal should explain the permanent teardown wedge"
+  assert_contains "$out" "tmux, herdr, zellij, or cmux" \
+    "report-required Orca refusal should name the supported backends"
+  assert_absent "$state/$id.meta" "report-required Orca refusal must not record metadata"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
+    "report-required Orca refusal should fire before Orca repository mutation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree' \
+    "report-required Orca refusal should fire before Orca worktree creation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal' \
+    "report-required Orca refusal should fire before Orca terminal creation"
+  pass "fm-spawn.sh --backend orca: refuses new report-required tasks before any owned mutation"
+}
+
+test_spawn_refuses_orca_respawn_of_report_required_task() {
+  local proj data state config id out status
+  id="orcareportrespawnz5"
+  proj="$TMP_ROOT/report-respawn-project"
+  data="$TMP_ROOT/report-respawn-data"
+  state="$TMP_ROOT/report-respawn-state"
+  config="$TMP_ROOT/report-respawn-config"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  fm_write_meta "$state/$id.meta" \
+    "window=legacy:fm-$id" "project=$proj" "harness=claude" "kind=ship" \
+    "mode=no-mistakes" "yolo=off" "report_required=1"
+  orca_case report-respawn-refusal
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-spawn.sh --backend orca should refuse respawning a report-required task"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca respawn refusal should explain the missing absence proof"
+  assert_grep "report_required=1" "$state/$id.meta" "refused respawn must leave the recorded report marker unchanged"
+  assert_no_grep "backend=orca" "$state/$id.meta" "refused respawn must not rewrite the task metadata onto Orca"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
+    "report-required Orca respawn refusal should fire before Orca repository mutation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree' \
+    "report-required Orca respawn refusal should fire before Orca worktree creation"
+  pass "fm-spawn.sh --backend orca: refuses respawning a report-required task before any owned mutation"
+}
+
+test_spawn_refuses_report_required_orca_batch_pair_before_mutation() {
+  local proj data state config id out status
+  id="orcabatchrefusez7"
+  proj="$TMP_ROOT/batch-refusal-project"
+  data="$TMP_ROOT/batch-refusal-data"
+  state="$TMP_ROOT/batch-refusal-state"
+  config="$TMP_ROOT/batch-refusal-config"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case batch-report-refusal
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id=$proj" --harness claude --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "batch fm-spawn.sh --backend orca should refuse a new report-required pair"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "batch report-required Orca refusal should explain the missing absence proof"
+  assert_contains "$out" "batch: FAILED to spawn $id" \
+    "batch dispatch should surface the refused Orca pair"
+  assert_absent "$state/$id.meta" "batch report-required Orca refusal must not record metadata"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
+    "batch report-required Orca refusal should fire before Orca repository mutation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree' \
+    "batch report-required Orca refusal should fire before Orca worktree creation"
+  pass "fm-spawn.sh batch pairs: refuse new report-required Orca spawns before any owned mutation"
+}
+
+test_report_required_orca_refusal_preserves_competing_lifecycle_state() {
+  local proj data state config id out status held lock_identity state_snapshot data_snapshot af_log
+  id="orcareportlockz8"
+  proj="$TMP_ROOT/report-lock-project"
+  data="$TMP_ROOT/report-lock-data"
+  state="$TMP_ROOT/report-lock-state"
+  config="$TMP_ROOT/report-lock-config"
+  state_snapshot="$TMP_ROOT/report-lock-state.snapshot"
+  data_snapshot="$TMP_ROOT/report-lock-data.snapshot"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  printf 'trail\n' > "$data/$id/account-attempts.md"
+  fm_write_meta "$state/$id.meta" \
+    "window=legacy:fm-$id" "project=$proj" "harness=claude" "kind=ship" \
+    "mode=no-mistakes" "yolo=off" "report_required=1"
+  printf 'status\n' > "$state/$id.status"
+  printf 'turn\n' > "$state/$id.turn-ended"
+  printf 'check\n' > "$state/$id.check.sh"
+  printf 'extension\n' > "$state/$id.pi-ext.ts"
+  printf 'token\n' > "$state/$id.grok-turnend-token"
+  for suffix in account-native-launch account-native-ready account-native-go; do
+    mkdir "$state/.$id.$suffix"
+    printf 'sentinel\n' > "$state/.$id.$suffix/sentinel"
+  done
+  orca_case report-lock-refusal
+  af_log="$CASE_DIR/agent-fleet.log"
+  : > "$af_log"
+  cat > "$FB/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ORCA_AF_LOG:?}"
+exit 1
+SH
+  chmod +x "$FB/agent-fleet"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$state" "$id") \
+    || fail "report-required Orca fixture could not acquire its competing lifecycle lock"
+  lock_identity=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "report-required Orca fixture could not read its lifecycle lock identity"
+  cp -R "$state" "$state_snapshot"
+  cp -R "$data" "$data_snapshot"
+
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_AF_LOG="$af_log" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "report-required Orca spawn bypassed its competing-lock refusal"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca spawn waited on the lifecycle lock instead of refusing in preflight"
+  [ "$(fm_account_lifecycle_lock_identity "$held")" = "$lock_identity" ] \
+    || fail "report-required Orca refusal changed the competing lifecycle lock identity"
+  diff -r "$state_snapshot" "$state" >/dev/null \
+    || fail "report-required Orca refusal changed task metadata, sidecars, or launch sentinels"
+  diff -r "$data_snapshot" "$data" >/dev/null \
+    || fail "report-required Orca refusal changed the task-owned account trail"
+  [ ! -s "$af_log" ] || fail "report-required Orca refusal called Agent Fleet"
+  [ ! -s "$LOG" ] || fail "report-required Orca refusal called its backend"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "report-required Orca fixture could not release its competing lifecycle lock"
+  pass "report-required Orca preflight leaves competing lifecycle state byte-stable"
+}
+
+test_report_required_orca_recovery_preserves_inherited_lifecycle_state() {
+  local data state config id out status held lock_identity state_snapshot data_snapshot af_log
+  id="orcareportrecoveryz9"
+  data="$TMP_ROOT/report-recovery-data"
+  state="$TMP_ROOT/report-recovery-state"
+  config="$TMP_ROOT/report-recovery-config"
+  state_snapshot="$TMP_ROOT/report-recovery-state.snapshot"
+  data_snapshot="$TMP_ROOT/report-recovery-data.snapshot"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  printf 'trail\n' > "$data/$id/account-attempts.md"
+  fm_write_meta "$state/$id.meta" \
+    "window=fm-$id" "terminal=term-$id" "worktree=$TMP_ROOT/missing-worktree" \
+    "project=$TMP_ROOT/missing-project" "harness=claude" "kind=ship" "mode=no-mistakes" \
+    "report_required=1" "backend=orca" "account_pool=claude-crew" "account_profile=claude-1" \
+    "account_task=fleet-$id" "account_attempt=attempt-$id" "provider_session_id=session-$id" \
+    "account_rollback_cleanup=pending" "account_predecessor_cleanup=pending"
+  printf 'status\n' > "$state/$id.status"
+  printf 'turn\n' > "$state/$id.turn-ended"
+  printf 'check\n' > "$state/$id.check.sh"
+  printf 'extension\n' > "$state/$id.pi-ext.ts"
+  printf 'token\n' > "$state/$id.grok-turnend-token"
+  for suffix in account-native-launch account-native-ready account-native-go; do
+    mkdir "$state/.$id.$suffix"
+    printf 'sentinel\n' > "$state/.$id.$suffix/sentinel"
+  done
+  orca_case report-recovery-refusal
+  af_log="$CASE_DIR/agent-fleet.log"
+  : > "$af_log"
+  cat > "$FB/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ORCA_AF_LOG:?}"
+exit 1
+SH
+  chmod +x "$FB/agent-fleet"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$state" "$id") \
+    || fail "report-required recovery fixture could not acquire its inherited lifecycle lock"
+  lock_identity=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "report-required recovery fixture could not read its inherited lifecycle lock identity"
+  cp -R "$state" "$state_snapshot"
+  cp -R "$data" "$data_snapshot"
+
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_AF_LOG="$af_log" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" \
+    "$ROOT/bin/fm-spawn.sh" "$id" --resume-account 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "report-required Orca recovery bypassed its inherited-lock refusal"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca recovery did not refuse before inherited-lock handoff"
+  [ "$(fm_account_lifecycle_lock_identity "$held")" = "$lock_identity" ] \
+    || fail "report-required Orca recovery changed the inherited lifecycle lock identity"
+  diff -r "$state_snapshot" "$state" >/dev/null \
+    || fail "report-required Orca recovery changed metadata, sidecars, or launch sentinels"
+  diff -r "$data_snapshot" "$data" >/dev/null \
+    || fail "report-required Orca recovery changed the task-owned account trail"
+  [ ! -s "$af_log" ] || fail "report-required Orca recovery called Agent Fleet"
+  [ ! -s "$LOG" ] || fail "report-required Orca recovery called its backend"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "report-required recovery fixture could not release its inherited lifecycle lock"
+  pass "report-required Orca recovery leaves inherited lifecycle state byte-stable"
 }
 
 test_spawn_refuses_orca_secondmate_before_home_mutation() {
@@ -576,6 +853,8 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case bad-spawn
+  seed_legacy_task_meta "$state" "$id" "$proj"
+  add_dead_tmux_fake "$FB"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-bad"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-bad","path":"%s"},"terminal":{"handle":"term-bad"}}}\n' "$proj" > "$RESP/3.out"
@@ -587,7 +866,9 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   expect_code 1 "$status" "fm-spawn.sh --backend orca should refuse a primary checkout worktree"
   assert_contains "$out" "orca worktree create did not yield an isolated worktree" \
     "Orca spawn should reuse the isolated-worktree guard"
-  assert_absent "$state/$id.meta" "aborted Orca spawn must not record meta"
+  assert_grep "window=legacy:fm-$id" "$state/$id.meta" "aborted Orca spawn must leave the legacy meta unchanged"
+  assert_no_grep "backend=orca" "$state/$id.meta" "aborted Orca spawn must not record Orca endpoint metadata"
+  assert_no_grep "orca_worktree_id=" "$state/$id.meta" "aborted Orca spawn must not record an Orca worktree id"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create' \
     "Orca spawn should validate the worktree before creating a terminal"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-bad'$'\x1f''--json' \
@@ -610,6 +891,8 @@ test_spawn_removes_orca_worktree_when_terminal_create_fails() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case terminal-fail
+  seed_legacy_task_meta "$state" "$id" "$proj"
+  add_dead_tmux_fake "$FB"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-terminal-fail"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-terminal-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
@@ -620,7 +903,9 @@ test_spawn_removes_orca_worktree_when_terminal_create_fails() {
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when terminal creation fails"
-  assert_absent "$state/$id.meta" "terminal-create abort should not record metadata after successful cleanup"
+  assert_grep "window=legacy:fm-$id" "$state/$id.meta" "terminal-create abort must leave the legacy meta unchanged after successful cleanup"
+  assert_no_grep "backend=orca" "$state/$id.meta" "terminal-create abort should not record Orca metadata after successful cleanup"
+  assert_no_grep "orca_worktree_id=" "$state/$id.meta" "terminal-create abort should not record an Orca worktree id after successful cleanup"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create'$'\x1f''--worktree'$'\x1f''id:wt-terminal-fail'$'\x1f''--title'$'\x1f'"fm-$id"$'\x1f''--json' \
     "Orca spawn should attempt terminal creation before abort cleanup"
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-terminal-fail'$'\x1f''--force'$'\x1f''--json' \
@@ -643,6 +928,8 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case cleanup-fail
+  seed_legacy_task_meta "$state" "$id" "$proj"
+  add_dead_tmux_fake "$FB"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-cleanup-fail"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-cleanup-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
@@ -664,36 +951,36 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
 }
 
-test_spawn_releases_orca_resources_when_metadata_write_fails() {
-  local proj wt data state_file config id out status
+test_spawn_refuses_invalid_state_before_orca_resource_creation() {
+  local proj data state_file config id out status
   id="orcametafailz9"
   proj="$TMP_ROOT/meta-fail-project"
-  wt="$TMP_ROOT/meta-fail-wt"
   data="$TMP_ROOT/meta-fail-data"
   state_file="$TMP_ROOT/meta-fail-state-file"
   config="$TMP_ROOT/meta-fail-config"
-  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$config"
   : > "$state_file"
   printf 'brief\n' > "$data/$id/brief.md"
   orca_case meta-fail
   printf '1\n' > "$RESP/1.exit"
-  printf '{"ok":true,"result":{"repo":{"id":"repo-meta-fail"}}}\n' > "$RESP/2.out"
-  printf '{"ok":true,"result":{"worktree":{"id":"wt-meta-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
-  printf '{"ok":true,"result":{"terminal":{"handle":"term-meta-fail"}}}\n' > "$RESP/4.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state_file" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
-  [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
-  assert_contains "$out" "File exists" "spawn should fail at the state directory creation point"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
-    "Orca spawn should close the recorded terminal when a later abort occurs"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-meta-fail'$'\x1f''--force'$'\x1f''--json' \
-    "Orca spawn should remove the recorded worktree when a later abort occurs"
-  assert_absent "$state_file/$id.meta" "metadata-write abort should not leave metadata after successful cleanup"
-  pass "fm-spawn.sh --backend orca: releases terminal and worktree on later aborts"
+  [ "$status" -ne 0 ] || fail "Orca spawn should fail when the state path is not a directory"
+  assert_contains "$out" "state directory must be a real directory" \
+    "spawn should reject unsafe state during read-only preflight"
+  assert_not_contains "$out" "account lifecycle lock" \
+    "unsafe state validation should not attempt lifecycle-lock acquisition"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
+    "invalid local state should be rejected before Orca repository mutation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree' \
+    "invalid local state should be rejected before Orca worktree mutation"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal' \
+    "invalid local state should be rejected before Orca terminal mutation"
+  pass "fm-spawn.sh --backend orca: invalid state refuses before resource creation"
 }
 
 test_peek_send_and_crew_state_route_through_orca_meta() {
@@ -1298,13 +1585,18 @@ test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
-test_spawn_writes_orca_metadata_and_launches_harness
+test_legacy_respawn_writes_orca_metadata_and_launches_harness
+test_spawn_refuses_new_report_required_orca_task_before_mutation
+test_spawn_refuses_orca_respawn_of_report_required_task
+test_spawn_refuses_report_required_orca_batch_pair_before_mutation
+test_report_required_orca_refusal_preserves_competing_lifecycle_state
+test_report_required_orca_recovery_preserves_inherited_lifecycle_state
 test_spawn_refuses_orca_secondmate_before_home_mutation
 test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
-test_spawn_releases_orca_resources_when_metadata_write_fails
+test_spawn_refuses_invalid_state_before_orca_resource_creation
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json
 test_target_exists_rejects_orca_error_json

@@ -190,13 +190,14 @@ status_open_decisions() {  # <status-file>
 # task id from a recorded window target, falling back to the tmux-shaped
 # "<session>:fm-<id>" form when no metadata state is available.
 window_to_task() {
-  local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta mw mt t
+  local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta mw mt mi t
   if [ -n "$state" ]; then
     for meta in "$state"/*.meta; do
       [ -e "$meta" ] || continue
       mw=$(grep '^window=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
       mt=$(grep '^terminal=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-      [ "$mw" = "$w" ] || [ "$mt" = "$w" ] || continue
+      mi=$(grep '^tmux_window_id=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+      [ "$mw" = "$w" ] || [ "$mt" = "$w" ] || [ "$mi" = "$w" ] || continue
       t=$(basename "$meta")
       t=${t%.meta}
       printf '%s' "$t"

@@ -145,6 +145,28 @@ test_classifier_primitives() {
   pass "classifier primitives: last line, captain-relevance, window->task, FM_CAPTAIN_RE override"
 }
 
+test_managed_tmux_window_id_reverse_mapping() {
+  local dir state
+  dir=$(make_case managed-tmux-reverse-map); state="$dir/state"
+  fm_write_meta "$state/managed-tmux-task.meta" \
+    "window=firstmate:fm-managed-tmux-task" \
+    "tmux_window_id=@stale" \
+    "tmux_window_id=@7"
+  fm_write_meta "$state/zz-duplicate.meta" \
+    "window=firstmate:fm-zz-duplicate" \
+    "tmux_window_id=@7"
+
+  [ "$(window_to_task '@7' "$state")" = "managed-tmux-task" ] \
+    || fail "managed tmux @id did not reverse-map to the first matching task"
+  [ "$(window_to_task '@stale' "$state")" = "@stale" ] \
+    || fail "window_to_task did not use the last tmux_window_id metadata value"
+  printf 'done: managed tmux task complete\n' > "$state/managed-tmux-task.status"
+  stale_is_terminal '@7' "$state" \
+    || fail "watcher stale classification did not consume the managed tmux @id mapping"
+
+  pass "managed tmux @id reverse-maps through last-value metadata and watcher classification"
+}
+
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
 # benign (absorb) ONLY when fm-crew-state.sh reports the crew as working from an
 # actively-running pipeline step (source run-step) or a busy pane (source pane);
@@ -1218,10 +1240,16 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = managed-tmux-reverse-map ]; then
+  test_managed_tmux_window_id_reverse_mapping
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
+test_managed_tmux_window_id_reverse_mapping
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier

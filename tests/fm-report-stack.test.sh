@@ -754,6 +754,167 @@ EOF
   pass "report stack requires substantive content in every completion section"
 }
 
+test_fenced_required_section_bodies_use_scoped_content() {
+  local id source out status
+
+  id=report-fenced-body-content-b3n
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+```console
+$ firstmate status
+crew ready
+```
+
+## What changed
+
+Recorded work.
+
+## Verification
+
+```text
+{}
+```
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null \
+    || fail "meaningful transcript and punctuation-only fenced bodies were rejected"
+
+  id=report-empty-fenced-body-b3o
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+```text
+
+```
+
+## What changed
+
+Recorded work.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "empty fenced body unexpectedly satisfied the Summary section"
+  assert_contains "$out" "## Summary" "empty fenced-body failure omitted the blank Summary section"
+
+  id=report-control-only-fenced-body-b3q
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  {
+    cat <<'EOF'
+# Completion
+
+## Summary
+
+```text
+EOF
+    printf '\342\200\213\n'
+    cat <<'EOF'
+```
+
+## What changed
+
+Recorded work.
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+Report.
+
+## Follow-ups
+
+None.
+EOF
+  } > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "format-control-only fenced body unexpectedly satisfied the Summary section"
+  assert_contains "$out" "## Summary" "control-only fenced-body failure omitted the blank Summary section"
+
+  id=report-container-whitespace-fenced-body-b3p
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Completion
+
+## Summary
+
+Complete.
+
+## What changed
+
+> ```text
+>
+> ```
+
+## Verification
+
+Verified.
+
+## Visual evidence
+
+None.
+
+## Artifacts
+
+- ```text
+
+  ```
+
+## Follow-ups
+
+None.
+EOF
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "container-scoped whitespace fences unexpectedly satisfied required sections"
+  assert_contains "$out" "## What changed" "blank blockquote fence failure omitted What changed"
+  assert_contains "$out" "## Artifacts" "blank list fence failure omitted Artifacts"
+  pass "report sections accept meaningful fenced content but reject empty scoped fence bodies"
+}
+
 test_nested_short_fences_do_not_satisfy_required_sections() {
   local id source out status heading
 
@@ -3838,6 +3999,13 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = fenced-report-body-final ]; then
+  test_fenced_required_section_bodies_use_scoped_content
+  test_nested_short_fences_do_not_satisfy_required_sections
+  test_container_scoped_fences_do_not_close_from_top_level
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   test_required_sections_fail_actionably
   test_required_sections_reject_empty_bodies
@@ -3907,6 +4075,7 @@ test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
 test_required_sections_fail_actionably
 test_required_sections_reject_empty_bodies
+test_fenced_required_section_bodies_use_scoped_content
 test_nested_short_fences_do_not_satisfy_required_sections
 test_raw_html_does_not_satisfy_required_sections
 test_container_scoped_fences_do_not_close_from_top_level

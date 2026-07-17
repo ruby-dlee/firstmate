@@ -146,7 +146,7 @@ function firstSummary(markdown, fallback) {
 function requireCompletionSections(markdown, sourceFile, taskId) {
   const sections = new Map(requiredSections.map((section) => [section.toLowerCase(), { present: false, body: [] }]));
   let currentSection;
-  for (const entry of markdownStructure(markdown)) {
+  for (const entry of markdownStructure(markdown, { includeFenceContent: true })) {
     if (entry.heading?.level === 2) {
       currentSection = sections.get(entry.heading.content.toLowerCase());
       if (currentSection) currentSection.present = true;
@@ -154,8 +154,9 @@ function requireCompletionSections(markdown, sourceFile, taskId) {
       currentSection.body.push(entry);
     }
   }
-  const substantive = ({ line, heading }) => {
+  const substantive = ({ line, heading, fenced }) => {
     if (heading) return false;
+    if (fenced) return /[\p{L}\p{N}\p{S}\p{P}]/u.test(line);
     const text = line
       .replace(/!\[([^\]]*)\]\(([^)]*)\)/g, "$1 $2")
       .replace(/\[([^\]]*)\]\(([^)]*)\)/g, "$1 $2")

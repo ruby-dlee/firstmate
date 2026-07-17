@@ -99,7 +99,7 @@ function htmlBlockStart(line, paragraphOpen) {
   return undefined;
 }
 
-function markdownStructure(markdown) {
+function markdownStructure(markdown, { includeFenceContent = false } = {}) {
   const visible = [];
   let fence;
   let htmlBlock;
@@ -133,6 +133,8 @@ function markdownStructure(markdown) {
         if (closing && closing.character === fence.character
           && closing.length >= fence.length && closing.suffix.trim() === "") {
           fence = undefined;
+        } else if (includeFenceContent) {
+          visible.push({ line: scoped.text, heading: undefined, fenced: true });
         }
         paragraphOpen = false;
         consumed = true;

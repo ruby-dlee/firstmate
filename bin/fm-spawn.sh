@@ -249,6 +249,112 @@ LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
 LIFECYCLE_LOCK_INHERITED_PID=
 LIFECYCLE_LOCK_INHERITED_START=
+SPAWN_META_PRESENT=0
+SPAWN_META_SNAPSHOT=
+SPAWN_PREFLIGHT_ID=${POS[0]:-}
+spawn_idpart=${SPAWN_PREFLIGHT_ID%%=*}
+SPAWN_PREFLIGHT_BATCH=0
+if [ -n "$SPAWN_PREFLIGHT_ID" ] && [ "$SPAWN_PREFLIGHT_ID" != "$spawn_idpart" ] \
+  && case "$spawn_idpart" in */*) false ;; *) true ;; esac; then
+  SPAWN_PREFLIGHT_BATCH=1
+fi
+
+spawn_preflight_read_meta() {  # <meta>
+  node "$SCRIPT_DIR/fm-contained-read.cjs" "$STATE" "$1" 1048576
+}
+
+spawn_preflight_load_meta() {  # <required:0|1>
+  local required=$1
+  RESUME_META="$STATE/$SPAWN_PREFLIGHT_ID.meta"
+  if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+    [ -d "$STATE" ] && [ ! -L "$STATE" ] || {
+      echo "error: state directory must be a real directory before spawning: $STATE" >&2
+      return 1
+    }
+  else
+    [ "$required" = 0 ] || {
+      echo "error: no metadata for managed recovery at $RESUME_META" >&2
+      return 1
+    }
+    return 0
+  fi
+  if [ -e "$RESUME_META" ] || [ -L "$RESUME_META" ]; then
+    SPAWN_META_SNAPSHOT=$(spawn_preflight_read_meta "$RESUME_META") || {
+      echo "error: unsafe metadata for spawn preflight at $RESUME_META" >&2
+      return 1
+    }
+    SPAWN_META_PRESENT=1
+  elif [ "$required" = 1 ]; then
+    echo "error: no metadata for managed recovery at $RESUME_META" >&2
+    return 1
+  fi
+}
+
+spawn_preflight_meta_value() {  # <key>
+  printf '%s\n' "$SPAWN_META_SNAPSHOT" | sed -n "s/^$1=//p" | tail -1
+}
+
+spawn_refuse_report_required_orca() {
+  local report_required=1
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    if printf '%s\n' "$SPAWN_META_SNAPSHOT" | grep -q '^report_required='; then
+      [ "$(spawn_preflight_meta_value report_required)" = 1 ] || report_required=0
+    else
+      report_required=0
+    fi
+  fi
+  if [ "$report_required" = 1 ]; then
+    echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
+    return 1
+  fi
+}
+
+if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+  [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
+  case "$SPAWN_PREFLIGHT_ID" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
+  spawn_preflight_load_meta 1 || exit 1
+  recorded_backend=$(spawn_preflight_meta_value backend)
+  [ -n "$recorded_backend" ] || recorded_backend=tmux
+  if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
+    echo "error: account recovery backend override '$BACKEND_ARG' does not match recorded backend '$recorded_backend'" >&2
+    exit 1
+  fi
+  BACKEND_ARG=$recorded_backend
+  BACKEND_SET=1
+fi
+
+if [ "$BACKEND_SET" -eq 1 ]; then
+  BACKEND=$BACKEND_ARG
+else
+  BACKEND=$(fm_backend_name)
+fi
+fm_backend_validate_spawn "$BACKEND" || exit 1
+fm_backend_source "$BACKEND" || exit 1
+if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
+  echo "error: backend=orca does not support --secondmate spawns yet" >&2
+  exit 1
+fi
+if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
+  echo "error: backend=cmux does not support --secondmate spawns yet" >&2
+  exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] \
+  && { [ -e "$STATE/$SPAWN_PREFLIGHT_ID.meta" ] || [ -L "$STATE/$SPAWN_PREFLIGHT_ID.meta" ]; }; then
+  spawn_preflight_load_meta 0 || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 1 ]; then
+  spawn_refuse_report_required_orca || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ]; then
+  fm_backend_orca_runtime_check || exit 1
+fi
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 0 ]; then
+  spawn_preflight_load_meta 0 || exit 1
+fi
+if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ]; then
+  spawn_refuse_report_required_orca || exit 1
+fi
+
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: inherited account lifecycle lock requires a task id" >&2; exit 1; }
   inherited_lock_id=${POS[0]}
@@ -303,9 +409,6 @@ if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   fi
 fi
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-  [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
-  case "${POS[0]}" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
-  RESUME_META="$STATE/${POS[0]}.meta"
   [ -f "$RESUME_META" ] || { echo "error: no metadata for managed recovery at $RESUME_META" >&2; exit 1; }
   fm_account_safe_file_destination "$RESUME_META" || { echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2; exit 1; }
   if [ -z "$LIFECYCLE_LOCK" ]; then
@@ -313,6 +416,14 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     LIFECYCLE_LOCK_OWNED=1
   fi
   trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  current_spawn_meta=$(spawn_preflight_read_meta "$RESUME_META") || {
+    echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2
+    exit 1
+  }
+  [ "$current_spawn_meta" = "$SPAWN_META_SNAPSHOT" ] || {
+    echo "error: managed task generation changed before recovery mutation for ${POS[0]}" >&2
+    exit 1
+  }
   rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}
@@ -412,27 +523,9 @@ fi
 # recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
 # window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
 # so the default path's meta stays byte-identical.
-if [ "$BACKEND_SET" -eq 1 ]; then
-  BACKEND=$BACKEND_ARG
-else
-  BACKEND=$(fm_backend_name)
-fi
-fm_backend_validate_spawn "$BACKEND" || exit 1
-fm_backend_source "$BACKEND" || exit 1
-if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
-  echo "error: backend=orca does not support --secondmate spawns yet" >&2
-  exit 1
-fi
 if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 1 ]; then
   echo "error: managed account recovery is not implemented for backend=orca" >&2
   exit 1
-fi
-if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
-  echo "error: backend=cmux does not support --secondmate spawns yet" >&2
-  exit 1
-fi
-if [ "$BACKEND" = orca ]; then
-  fm_backend_orca_runtime_check || exit 1
 fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
@@ -835,28 +928,18 @@ if [ -z "$LIFECYCLE_LOCK" ]; then
   LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
   LIFECYCLE_LOCK_OWNED=1
 fi
-
-# Report-gated teardown releases a task's lease/worktree only after
-# fm_backend_target_state proves the endpoint absent, and that check has no
-# orca arm (Orca exposes no reliable endpoint-absence proof), so a
-# report-required Orca task could never complete teardown. Every NEW task meta
-# written below carries report_required=1, so refuse such spawns here - after
-# backend resolution but before any owned mutation (worktree acquisition,
-# endpoint creation, account lease, metadata writes). A pre-existing task
-# whose meta carries no report_required marker keeps the legacy teardown
-# contract and may still respawn; the meta rewrite below preserves the
-# marker's absence.
-if [ "$BACKEND" = orca ]; then
-  ORCA_SPAWN_REPORT_REQUIRED=1
-  if [ -f "$STATE/$ID.meta" ]; then
-    if grep -q '^report_required=' "$STATE/$ID.meta"; then
-      [ "$(fm_meta_get "$STATE/$ID.meta" report_required)" = 1 ] || ORCA_SPAWN_REPORT_REQUIRED=0
-    else
-      ORCA_SPAWN_REPORT_REQUIRED=0
-    fi
-  fi
-  if [ "$ORCA_SPAWN_REPORT_REQUIRED" = 1 ]; then
-    echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
+if [ "$RECOVERY_ACCOUNT" = 0 ]; then
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    current_spawn_meta=$(spawn_preflight_read_meta "$STATE/$ID.meta") || {
+      echo "error: unsafe metadata for spawn at $STATE/$ID.meta" >&2
+      exit 1
+    }
+    [ "$current_spawn_meta" = "$SPAWN_META_SNAPSHOT" ] || {
+      echo "error: task metadata changed before spawn mutation for $ID" >&2
+      exit 1
+    }
+  elif [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    echo "error: task metadata appeared before spawn mutation for $ID" >&2
     exit 1
   fi
 fi

@@ -522,6 +522,60 @@ test_same_generation_republish_preserves_revision_without_worktree() {
   pass "same-generation report retries preserve unavailable revision provenance"
 }
 
+test_generation_identity_falls_back_only_when_both_sides_are_legacy() {
+  local id meta staged entry manifest first second
+
+  id=report-new-id-over-legacy-a4c
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "New identity over legacy manifest."
+  run_stack publish "$id" >/dev/null || fail "new-id-over-legacy precondition publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  staged="$manifest.staged"
+  grep -v '"generationId":' "$manifest" > "$staged"
+  mv "$staged" "$manifest"
+  first=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  /bin/sleep 0.02
+  run_stack publish "$id" >/dev/null || fail "new-id-over-legacy publication failed"
+  second=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  [ -n "$second" ] && [ "$second" != "$first" ] \
+    || fail "a new generation id reused a legacy manifest completion time"
+
+  id=report-legacy-over-new-id-a4d
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Legacy metadata over new identity."
+  run_stack publish "$id" >/dev/null || fail "legacy-over-new-id precondition publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  meta="$HOME_DIR/state/$id.meta"
+  staged="$HOME_DIR/state/.$id.meta.legacy"
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  first=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  /bin/sleep 0.02
+  run_stack publish "$id" >/dev/null || fail "legacy-over-new-id publication failed"
+  second=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  [ -n "$second" ] && [ "$second" != "$first" ] \
+    || fail "legacy metadata reused a generation-bound manifest completion time"
+
+  id=report-both-legacy-a4e
+  write_task "$id" ship
+  meta="$HOME_DIR/state/$id.meta"
+  staged="$HOME_DIR/state/.$id.meta.legacy"
+  grep -v '^generation_id=' "$meta" > "$staged"
+  mv "$staged" "$meta"
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Both sides legacy."
+  run_stack publish "$id" >/dev/null || fail "both-legacy precondition publication failed"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  first=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  /bin/sleep 0.02
+  run_stack publish "$id" >/dev/null || fail "both-legacy compatibility publication failed"
+  second=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
+  [ "$second" = "$first" ] || fail "both-legacy retry lost compatibility generation matching"
+  pass "generation matching uses legacy heuristics only for two legacy identities"
+}
+
 test_text_sources_are_stored_verbatim_and_completion_is_bounded() {
   local id entry stored_brief stored_status oversized out status
   id=report-bounded-trails-a5
@@ -1438,6 +1492,84 @@ test_lock_control_files_are_bounded_and_nonfollowing() {
   run_stack render >/dev/null || fail "oversized report-lock owner permanently blocked recovery"
   assert_absent "$STACK/.publish.lock" "report stack retained a lock with an oversized owner control file"
   pass "report lock control reads are bounded, nonfollowing, and recoverable"
+}
+
+test_namespace_cutover_waiter_pins_entries_after_lock_acquisition() {
+  local id=report-cutover-waiter-k2b stack entry owner_ready owner_proceed waiter_ready owner_out waiter_out
+  local owner_pid waiter_pid owner_status waiter_status
+  stack="$STACK"
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Namespace cutover waiter."
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" publish "$id" >/dev/null \
+    || fail "namespace-cutover waiter precondition publication failed"
+  entry=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" path "$id") \
+    || fail "namespace-cutover waiter precondition path failed"
+  expire_report_entry "$entry" >/dev/null || fail "namespace-cutover waiter report could not be aged"
+  owner_ready="$TMP_ROOT/cutover-owner.ready"
+  owner_proceed="$TMP_ROOT/cutover-owner.proceed"
+  waiter_ready="$TMP_ROOT/cutover-waiter.ready"
+  owner_out="$TMP_ROOT/cutover-owner.out"
+  waiter_out="$TMP_ROOT/cutover-waiter.out"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_READY="$owner_ready" FM_REPORT_LOCK_TEST_PROCEED="$owner_proceed" \
+    "$SCRIPT" prune --status > "$owner_out" 2>&1 &
+  owner_pid=$!
+  for _ in $(seq 1 100); do [ -e "$owner_ready" ] && break; sleep 0.02; done
+  [ -e "$owner_ready" ] || { kill -TERM "$owner_pid" 2>/dev/null || true; fail "namespace-cutover owner did not acquire its publication lock"; }
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_LOCK_WAITER_TEST_READY="$waiter_ready" \
+    "$SCRIPT" render > "$waiter_out" 2>&1 &
+  waiter_pid=$!
+  for _ in $(seq 1 100); do [ -e "$waiter_ready" ] && break; sleep 0.02; done
+  [ -e "$waiter_ready" ] || {
+    kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
+    fail "namespace-cutover waiter did not observe the held publication lock"
+  }
+  touch "$owner_proceed"
+  if wait "$owner_pid"; then owner_status=0; else owner_status=$?; fi
+  if wait "$waiter_pid"; then waiter_status=0; else waiter_status=$?; fi
+  [ "$owner_status" -eq 0 ] || fail "namespace-cutover owner failed: $(cat "$owner_out")"
+  [ "$waiter_status" -eq 0 ] || fail "namespace-cutover waiter failed after lock acquisition: $(cat "$waiter_out")"
+  assert_absent "$stack/.publish.lock" "namespace-cutover waiter retained its publication lock"
+  pass "publication waiters pin mutable namespaces only after acquiring the lock"
+}
+
+test_post_rename_lock_setup_failure_releases_owned_lock() {
+  local stack="$TMP_ROOT/post-rename-setup-stack" out status
+  out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 \
+    "$SCRIPT" render 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "synthetic post-rename lock setup failure unexpectedly succeeded"
+  assert_contains "$out" "synthetic report publication lock setup failure" \
+    "post-rename setup failure did not preserve its primary error"
+  assert_absent "$stack/.publish.lock" "post-rename setup failure retained its owned publication lock"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" render >/dev/null \
+    || fail "post-rename setup cleanup left the report stack blocked"
+  pass "post-rename publication setup failures release their owned lock"
+}
+
+test_publication_lock_release_failures_are_observable() {
+  local stack="$TMP_ROOT/release-failure-stack" setup_stack="$TMP_ROOT/setup-release-failure-stack" out status
+  out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_LOCK_TEST_RELEASE_FAILURE=1 \
+    "$SCRIPT" render 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "synthetic publication lock release failure was hidden"
+  assert_contains "$out" "synthetic report publication lock release failure" \
+    "normal publication lock release failure was not observable"
+  rm -rf "$stack/.publish.lock"
+
+  out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$setup_stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 FM_REPORT_LOCK_TEST_RELEASE_FAILURE=1 \
+    "$SCRIPT" render 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "combined setup and release failure unexpectedly succeeded"
+  assert_contains "$out" "synthetic report publication lock setup failure" \
+    "release failure replaced the primary setup error"
+  assert_contains "$out" "publication lock release also failed" \
+    "secondary setup-cleanup release failure was hidden"
+  rm -rf "$setup_stack/.publish.lock"
+  pass "publication lock release failures remain observable without replacing primary errors"
 }
 
 test_previous_generation_is_recovered_for_readers() {
@@ -3400,6 +3532,7 @@ test_pr_url_strips_query_and_fragment
 test_revision_fields_distinguish_pr_head_from_worktree_head
 test_republish_new_generation_refreshes_completion_time
 test_same_generation_republish_preserves_revision_without_worktree
+test_generation_identity_falls_back_only_when_both_sides_are_legacy
 test_text_sources_are_stored_verbatim_and_completion_is_bounded
 test_metadata_is_bounded_before_reading
 test_report_temps_are_exclusive_and_randomized
@@ -3428,6 +3561,9 @@ test_abandoned_reclaim_marker_is_recovered
 test_abandoned_reclaim_directory_is_recovered
 test_publish_lock_directory_symlink_fails_closed
 test_lock_control_files_are_bounded_and_nonfollowing
+test_namespace_cutover_waiter_pins_entries_after_lock_acquisition
+test_post_rename_lock_setup_failure_releases_owned_lock
+test_publication_lock_release_failures_are_observable
 test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry

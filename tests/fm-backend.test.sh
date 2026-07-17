@@ -652,8 +652,8 @@ test_managed_tmux_target_identity_checks_recorded_session() {
   [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
     || fail "a live stable id moved intact to another session was classified absent"
   fake_label=fm-other-task
-  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
-    || fail "a genuinely recycled stable id blocked confident absence after the recorded-session scan"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a moved and renamed live stable id was classified absent"
   fake_label=fm-intended-task
   ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-other-task \
     || fail "managed tmux capture accepted a scoped target with the wrong task label"
@@ -732,6 +732,30 @@ test_managed_tmux_target_state_finds_replacement_window() {
   [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = present ] \
     || fail "stable tmux metadata did not find a replacement in its recorded session"
   pass "managed tmux target state scopes plausible replacement windows to the recorded session"
+}
+
+test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears() {
+  local resolved=1
+  tmux() {
+    case "${1:-}" in
+      list-windows)
+        printf "can't find session: recorded-session\n" >&2
+        return 1
+        ;;
+      display-message)
+        [ "$resolved" = 1 ] || return 1
+        printf 'other-session\tfm-renamed-task\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a live stable id moved out of a destroyed recorded session was classified absent"
+  resolved=0
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
+    || fail "a truly unresolvable stable id did not establish absence after its recorded session disappeared"
+  pass "managed tmux target state resolves stable ids after recorded-session loss"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------
@@ -1226,6 +1250,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
+  test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
   exit 0
 fi
 
@@ -1248,6 +1273,8 @@ test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_managed_tmux_target_identity
 test_managed_tmux_target_identity_checks_recorded_session
+test_managed_tmux_target_state_finds_replacement_window
+test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

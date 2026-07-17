@@ -721,7 +721,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 # absent; a control-plane or parse failure is always unknown.
 fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-scoped-target]
   local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
-  local tmux_identity tmux_identity_session tmux_identity_label
+  local tmux_identity
   local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
   session=
   [ -n "$target" ] || { printf 'unknown'; return 0; }
@@ -752,15 +752,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
               case "$target" in
                 @*) tmux_identity=$(tmux display-message -p -t "$target" $'#{session_name}\t#{window_name}' 2>/dev/null || true) ;;
               esac
-              tmux_identity_session=${tmux_identity%%$'\t'*}
-              tmux_identity_label=${tmux_identity#*$'\t'}
-              # A live recorded @id is unknown when it was renamed in place
-              # (recorded session, other label) or moved intact to another
-              # session (other session, expected label); only a genuinely
-              # recycled id (other session, other label) stays absent.
-              if [ -n "$tmux_identity" ] && [ "$tmux_identity" != "$tmux_identity_session" ] \
-                && { { [ "$tmux_identity_session" = "$session" ] && [ "$tmux_identity_label" != "$expected_label" ]; } \
-                  || { [ "$tmux_identity_session" != "$session" ] && [ "$tmux_identity_label" = "$expected_label" ]; }; }; then
+              if [ -n "$tmux_identity" ]; then
                 printf 'unknown'
               else
                 printf 'absent'
@@ -774,7 +766,17 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
         fi
       else
         case "$windows" in
-          *'no server running on '*|*'failed to connect to server: No such file or directory'*|*'can'\''t find session:'*) printf 'absent' ;;
+          *'no server running on '*|*'failed to connect to server: No such file or directory'*|*'can'\''t find session:'*)
+            tmux_identity=
+            case "$target" in
+              @*) tmux_identity=$(tmux display-message -p -t "$target" $'#{session_name}\t#{window_name}' 2>/dev/null || true) ;;
+            esac
+            if [ -n "$tmux_identity" ]; then
+              printf 'unknown'
+            else
+              printf 'absent'
+            fi
+            ;;
           *) printf 'unknown' ;;
         esac
       fi

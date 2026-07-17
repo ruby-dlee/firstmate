@@ -442,20 +442,6 @@ function acquireLock() {
   }
   stackRootDescriptor = pinnedStackRoot.descriptor;
   stackRoot = ".";
-  entriesDir = "entries";
-  try {
-    fs.mkdirSync(entriesDir, { mode: 0o700 });
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-  const pinnedEntries = pinnedDirectory(entriesDir, pinnedStackRoot.real, "report entries directory");
-  try {
-    fs.mkdirSync(".retention-tombstones", { mode: 0o700 });
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-  const pinnedTombstones = pinnedDirectory(".retention-tombstones", pinnedStackRoot.real, "report retention tombstone directory");
-  retentionTombstoneDescriptor = pinnedTombstones.descriptor;
   const lock = path.join(stackRoot, ".publish.lock");
   const lockDeadline = Date.now() + reportLockWaitMs;
   while (Date.now() < lockDeadline) {
@@ -478,32 +464,80 @@ function acquireLock() {
         fs.rmSync(candidate, { recursive: true, force: true });
         throw error;
       }
-      process.chdir(entriesDir);
-      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
-        fs.closeSync(pinnedEntries.descriptor);
-        throw new Error("report entries directory changed while entering it");
-      }
-      entriesDir = ".";
-      entriesDescriptor = pinnedEntries.descriptor;
-      if (process.env.FM_REPORT_STACK_DESTINATION_TEST_READY && process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED) {
-        fs.writeFileSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_READY, "ready\n", { flag: "wx" });
-        const deadline = Date.now() + 5000;
-        while (!fs.existsSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED)) {
-          if (Date.now() >= deadline) throw new Error("report destination test gate timed out");
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      const release = () => {
+        if (process.env.FM_REPORT_LOCK_TEST_RELEASE_FAILURE === "1") {
+          throw new Error("synthetic report publication lock release failure");
         }
-      }
-      return () => {
-        try {
-          runContainedHelper(
-            ["remove-owned-directory-fd", ".publish.lock", "owner", token],
-            [stackRootDescriptor],
-            1024 * 1024,
-          );
-        } catch {}
+        runContainedHelper(
+          ["remove-owned-directory-fd", ".publish.lock", "owner", token],
+          [stackRootDescriptor],
+          1024 * 1024,
+        );
       };
+      let pinnedEntries;
+      let pinnedTombstones;
+      try {
+        if (process.env.FM_REPORT_LOCK_TEST_READY) {
+          fs.writeFileSync(process.env.FM_REPORT_LOCK_TEST_READY, "ready\n", { flag: "wx" });
+          if (process.env.FM_REPORT_LOCK_TEST_PROCEED) {
+            const deadline = Date.now() + 5000;
+            while (!fs.existsSync(process.env.FM_REPORT_LOCK_TEST_PROCEED)) {
+              if (Date.now() >= deadline) throw new Error("report lock test gate timed out");
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            }
+          }
+        }
+        if (process.env.FM_REPORT_LOCK_TEST_SETUP_FAILURE === "1") {
+          throw new Error("synthetic report publication lock setup failure");
+        }
+        entriesDir = "entries";
+        try {
+          fs.mkdirSync(entriesDir, { mode: 0o700 });
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+        }
+        pinnedEntries = pinnedDirectory(entriesDir, pinnedStackRoot.real, "report entries directory");
+        try {
+          fs.mkdirSync(".retention-tombstones", { mode: 0o700 });
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+        }
+        pinnedTombstones = pinnedDirectory(".retention-tombstones", pinnedStackRoot.real, "report retention tombstone directory");
+        process.chdir(entriesDir);
+        if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
+          throw new Error("report entries directory changed while entering it");
+        }
+        entriesDir = ".";
+        entriesDescriptor = pinnedEntries.descriptor;
+        retentionTombstoneDescriptor = pinnedTombstones.descriptor;
+        if (process.env.FM_REPORT_STACK_DESTINATION_TEST_READY && process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED) {
+          fs.writeFileSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_READY, "ready\n", { flag: "wx" });
+          const deadline = Date.now() + 5000;
+          while (!fs.existsSync(process.env.FM_REPORT_STACK_DESTINATION_TEST_PROCEED)) {
+            if (Date.now() >= deadline) throw new Error("report destination test gate timed out");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        }
+        return release;
+      } catch (setupError) {
+        try { fs.closeSync(pinnedEntries?.descriptor); } catch {}
+        try { fs.closeSync(pinnedTombstones?.descriptor); } catch {}
+        entriesDescriptor = undefined;
+        retentionTombstoneDescriptor = undefined;
+        try {
+          release();
+        } catch (releaseError) {
+          console.error(`warning: report publication lock release also failed: ${releaseError.message}`);
+        }
+        try { fs.closeSync(stackRootDescriptor); } catch {}
+        stackRootDescriptor = undefined;
+        throw setupError;
+      }
     } catch (error) {
       if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
+      if (process.env.FM_REPORT_LOCK_WAITER_TEST_READY && !fs.existsSync(process.env.FM_REPORT_LOCK_WAITER_TEST_READY)) {
+        fs.writeFileSync(process.env.FM_REPORT_LOCK_WAITER_TEST_READY, "ready\n", { flag: "wx" });
+      }
       try {
         const lockStat = fs.lstatSync(lock);
         if (lockStat.isSymbolicLink() || !lockStat.isDirectory()) {
@@ -616,6 +650,7 @@ let lastPruneStatus = { pruned: 0, pending: false };
 
 function withLock(callback) {
   const release = acquireLock();
+  let operationError;
   try {
     recoverRetentionCutover();
     const retentionPolicy = nextRetentionPolicy();
@@ -630,8 +665,23 @@ function withLock(callback) {
     renderIndex(readRetentionPolicy());
     lastPruneStatus = pruneExpiredEntries();
     return callback();
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    release();
+    try {
+      release();
+    } catch (releaseError) {
+      if (!operationError) throw releaseError;
+      console.error(`warning: report publication lock release also failed: ${releaseError.message}`);
+    } finally {
+      try { fs.closeSync(entriesDescriptor); } catch {}
+      try { fs.closeSync(retentionTombstoneDescriptor); } catch {}
+      try { fs.closeSync(stackRootDescriptor); } catch {}
+      entriesDescriptor = undefined;
+      retentionTombstoneDescriptor = undefined;
+      stackRootDescriptor = undefined;
+    }
   }
 }
 
@@ -1383,8 +1433,8 @@ function publish(taskId, legacy) {
       const prHead = displaySha(meta.pr_head);
       const generationId = meta.generation_id || "";
       const previousWorktreeHead = previousManifest?.worktreeHead || previousManifest?.commit || "";
-      const sameGeneration = previousManifest && generationId && previousManifest.generationId
-        ? generationId === previousManifest.generationId
+      const sameGeneration = previousManifest && (generationId || previousManifest.generationId)
+        ? Boolean(generationId && previousManifest.generationId && generationId === previousManifest.generationId)
         : previousManifest
           && (!worktreeHead || previousWorktreeHead === worktreeHead)
           && previousManifest.harness === (meta.harness || "unknown")

@@ -656,6 +656,135 @@ test_spawn_refuses_report_required_orca_batch_pair_before_mutation() {
   pass "fm-spawn.sh batch pairs: refuse new report-required Orca spawns before any owned mutation"
 }
 
+test_report_required_orca_refusal_preserves_competing_lifecycle_state() {
+  local proj data state config id out status held lock_identity state_snapshot data_snapshot af_log
+  id="orcareportlockz8"
+  proj="$TMP_ROOT/report-lock-project"
+  data="$TMP_ROOT/report-lock-data"
+  state="$TMP_ROOT/report-lock-state"
+  config="$TMP_ROOT/report-lock-config"
+  state_snapshot="$TMP_ROOT/report-lock-state.snapshot"
+  data_snapshot="$TMP_ROOT/report-lock-data.snapshot"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  printf 'trail\n' > "$data/$id/account-attempts.md"
+  fm_write_meta "$state/$id.meta" \
+    "window=legacy:fm-$id" "project=$proj" "harness=claude" "kind=ship" \
+    "mode=no-mistakes" "yolo=off" "report_required=1"
+  printf 'status\n' > "$state/$id.status"
+  printf 'turn\n' > "$state/$id.turn-ended"
+  printf 'check\n' > "$state/$id.check.sh"
+  printf 'extension\n' > "$state/$id.pi-ext.ts"
+  printf 'token\n' > "$state/$id.grok-turnend-token"
+  for suffix in account-native-launch account-native-ready account-native-go; do
+    mkdir "$state/.$id.$suffix"
+    printf 'sentinel\n' > "$state/.$id.$suffix/sentinel"
+  done
+  orca_case report-lock-refusal
+  af_log="$CASE_DIR/agent-fleet.log"
+  : > "$af_log"
+  cat > "$FB/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ORCA_AF_LOG:?}"
+exit 1
+SH
+  chmod +x "$FB/agent-fleet"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$state" "$id") \
+    || fail "report-required Orca fixture could not acquire its competing lifecycle lock"
+  lock_identity=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "report-required Orca fixture could not read its lifecycle lock identity"
+  cp -R "$state" "$state_snapshot"
+  cp -R "$data" "$data_snapshot"
+
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_AF_LOG="$af_log" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "report-required Orca spawn bypassed its competing-lock refusal"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca spawn waited on the lifecycle lock instead of refusing in preflight"
+  [ "$(fm_account_lifecycle_lock_identity "$held")" = "$lock_identity" ] \
+    || fail "report-required Orca refusal changed the competing lifecycle lock identity"
+  diff -r "$state_snapshot" "$state" >/dev/null \
+    || fail "report-required Orca refusal changed task metadata, sidecars, or launch sentinels"
+  diff -r "$data_snapshot" "$data" >/dev/null \
+    || fail "report-required Orca refusal changed the task-owned account trail"
+  [ ! -s "$af_log" ] || fail "report-required Orca refusal called Agent Fleet"
+  [ ! -s "$LOG" ] || fail "report-required Orca refusal called its backend"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "report-required Orca fixture could not release its competing lifecycle lock"
+  pass "report-required Orca preflight leaves competing lifecycle state byte-stable"
+}
+
+test_report_required_orca_recovery_preserves_inherited_lifecycle_state() {
+  local data state config id out status held lock_identity state_snapshot data_snapshot af_log
+  id="orcareportrecoveryz9"
+  data="$TMP_ROOT/report-recovery-data"
+  state="$TMP_ROOT/report-recovery-state"
+  config="$TMP_ROOT/report-recovery-config"
+  state_snapshot="$TMP_ROOT/report-recovery-state.snapshot"
+  data_snapshot="$TMP_ROOT/report-recovery-data.snapshot"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  printf 'trail\n' > "$data/$id/account-attempts.md"
+  fm_write_meta "$state/$id.meta" \
+    "window=fm-$id" "terminal=term-$id" "worktree=$TMP_ROOT/missing-worktree" \
+    "project=$TMP_ROOT/missing-project" "harness=claude" "kind=ship" "mode=no-mistakes" \
+    "report_required=1" "backend=orca" "account_pool=claude-crew" "account_profile=claude-1" \
+    "account_task=fleet-$id" "account_attempt=attempt-$id" "provider_session_id=session-$id" \
+    "account_rollback_cleanup=pending" "account_predecessor_cleanup=pending"
+  printf 'status\n' > "$state/$id.status"
+  printf 'turn\n' > "$state/$id.turn-ended"
+  printf 'check\n' > "$state/$id.check.sh"
+  printf 'extension\n' > "$state/$id.pi-ext.ts"
+  printf 'token\n' > "$state/$id.grok-turnend-token"
+  for suffix in account-native-launch account-native-ready account-native-go; do
+    mkdir "$state/.$id.$suffix"
+    printf 'sentinel\n' > "$state/.$id.$suffix/sentinel"
+  done
+  orca_case report-recovery-refusal
+  af_log="$CASE_DIR/agent-fleet.log"
+  : > "$af_log"
+  cat > "$FB/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ORCA_AF_LOG:?}"
+exit 1
+SH
+  chmod +x "$FB/agent-fleet"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_lifecycle_lock_acquire "$state" "$id") \
+    || fail "report-required recovery fixture could not acquire its inherited lifecycle lock"
+  lock_identity=$(fm_account_lifecycle_lock_identity "$held") \
+    || fail "report-required recovery fixture could not read its inherited lifecycle lock identity"
+  cp -R "$state" "$state_snapshot"
+  cp -R "$data" "$data_snapshot"
+
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_AF_LOG="$af_log" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" \
+    "$ROOT/bin/fm-spawn.sh" "$id" --resume-account 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "report-required Orca recovery bypassed its inherited-lock refusal"
+  assert_contains "$out" "no reliable endpoint-absence proof" \
+    "report-required Orca recovery did not refuse before inherited-lock handoff"
+  [ "$(fm_account_lifecycle_lock_identity "$held")" = "$lock_identity" ] \
+    || fail "report-required Orca recovery changed the inherited lifecycle lock identity"
+  diff -r "$state_snapshot" "$state" >/dev/null \
+    || fail "report-required Orca recovery changed metadata, sidecars, or launch sentinels"
+  diff -r "$data_snapshot" "$data" >/dev/null \
+    || fail "report-required Orca recovery changed the task-owned account trail"
+  [ ! -s "$af_log" ] || fail "report-required Orca recovery called Agent Fleet"
+  [ ! -s "$LOG" ] || fail "report-required Orca recovery called its backend"
+  fm_account_lifecycle_lock_release "$held" \
+    || fail "report-required recovery fixture could not release its inherited lifecycle lock"
+  pass "report-required Orca recovery leaves inherited lifecycle state byte-stable"
+}
+
 test_spawn_refuses_orca_secondmate_before_home_mutation() {
   local home subhome data state config id out status
   id="orcasmz1"
@@ -841,7 +970,10 @@ test_spawn_refuses_invalid_state_before_orca_resource_creation() {
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when the state path is not a directory"
-  assert_contains "$out" "File exists" "spawn should fail while acquiring the lifecycle lock"
+  assert_contains "$out" "state directory must be a real directory" \
+    "spawn should reject unsafe state during read-only preflight"
+  assert_not_contains "$out" "account lifecycle lock" \
+    "unsafe state validation should not attempt lifecycle-lock acquisition"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
     "invalid local state should be rejected before Orca repository mutation"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree' \
@@ -1457,6 +1589,8 @@ test_legacy_respawn_writes_orca_metadata_and_launches_harness
 test_spawn_refuses_new_report_required_orca_task_before_mutation
 test_spawn_refuses_orca_respawn_of_report_required_task
 test_spawn_refuses_report_required_orca_batch_pair_before_mutation
+test_report_required_orca_refusal_preserves_competing_lifecycle_state
+test_report_required_orca_recovery_preserves_inherited_lifecycle_state
 test_spawn_refuses_orca_secondmate_before_home_mutation
 test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree

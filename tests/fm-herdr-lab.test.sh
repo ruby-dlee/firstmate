@@ -182,16 +182,51 @@ test_changed_default_trips_after_teardown() {
   pass "fm-herdr-lab: changed default fleet state is a hard failure"
 }
 
-test_stopped_default_is_stable_tripwire_state() {
-  local name="fm-lab-stopped-default-$$"
+test_stopped_default_refuses_provision() {
+  local name="fm-lab-stopped-default-$$" status=0
   : > "$FAKE_LOG"
-  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_provision "$name" \
-    || fail "stopped-default fixture provision failed"
-  grep -F '"running":false' "$TRIPWIRES/$name.fleet-state.json" >/dev/null \
-    || fail "stopped default state was not recorded in the fleet-state tripwire"
-  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_teardown "$name" \
-    || fail "stable stopped-default tripwire blocked guarded teardown"
-  pass "fm-herdr-lab: a stopped default session remains a stable tripwire baseline"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a stopped default session must refuse provisioning"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "refused provisioning still recorded a fleet-state tripwire"
+  assert_absent "$FAKE_STATE/$name" "refused provisioning still launched the lab session"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "provision with a running default session failed"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown after the running-default provision failed"
+  pass "fm-herdr-lab: provisioning requires a proven-running default session"
+}
+
+test_malformed_default_running_refuses_provision() {
+  local name="fm-lab-malformed-default-$$" status=0
+  : > "$FAKE_LOG"
+  FM_FAKE_HERDR_DEFAULT_RUNNING='"true"' run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a string-valued default running state must refuse provisioning"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "malformed running state still recorded a fleet-state tripwire"
+  assert_absent "$FAKE_STATE/$name" "malformed running state still launched the lab session"
+  if grep -F "server --session" "$FAKE_LOG" >/dev/null; then
+    fail "malformed running state reached the lab server launch"
+  fi
+  pass "fm-herdr-lab: default running proof requires the JSON Boolean true"
+}
+
+test_stopped_default_blocks_destructive_boundaries() {
+  local name="fm-lab-default-stops-$$" status=0
+  : > "$FAKE_LOG"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "running-default fixture provision failed"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_cli "$name" workspace close main >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "a mutating run command with a stopped default session must refuse"
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_cli "$name" workspace list >/dev/null \
+    || fail "a read-only run command was blocked by the stopped default session"
+  status=0
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_stop "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "guarded stop with a stopped default session must refuse"
+  [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "refused stop still reached the lab session"
+  status=0
+  FM_FAKE_HERDR_DEFAULT_RUNNING=false run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "teardown with a stopped default session must refuse"
+  [ "$(cat "$FAKE_STATE/$name")" = running ] || fail "refused teardown still reached the lab session"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "refused teardown removed the ownership tripwire"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown after the default session resumed failed"
+  assert_absent "$TRIPWIRES/$name.fleet-state.json" "teardown after resume left its tripwire behind"
+  pass "fm-herdr-lab: destructive lab boundaries re-prove the running default session"
 }
 
 test_stopped_owned_lab_can_reprovision() {
@@ -251,7 +286,9 @@ test_refuses_unsafe_names
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown
-test_stopped_default_is_stable_tripwire_state
+test_stopped_default_refuses_provision
+test_malformed_default_running_refuses_provision
+test_stopped_default_blocks_destructive_boundaries
 test_stopped_owned_lab_can_reprovision
 test_failed_delete_retains_tripwire
 test_timed_out_provision_cancels_late_launch

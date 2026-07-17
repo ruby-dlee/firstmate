@@ -836,6 +836,31 @@ if [ -z "$LIFECYCLE_LOCK" ]; then
   LIFECYCLE_LOCK_OWNED=1
 fi
 
+# Report-gated teardown releases a task's lease/worktree only after
+# fm_backend_target_state proves the endpoint absent, and that check has no
+# orca arm (Orca exposes no reliable endpoint-absence proof), so a
+# report-required Orca task could never complete teardown. Every NEW task meta
+# written below carries report_required=1, so refuse such spawns here - after
+# backend resolution but before any owned mutation (worktree acquisition,
+# endpoint creation, account lease, metadata writes). A pre-existing task
+# whose meta carries no report_required marker keeps the legacy teardown
+# contract and may still respawn; the meta rewrite below preserves the
+# marker's absence.
+if [ "$BACKEND" = orca ]; then
+  ORCA_SPAWN_REPORT_REQUIRED=1
+  if [ -f "$STATE/$ID.meta" ]; then
+    if grep -q '^report_required=' "$STATE/$ID.meta"; then
+      [ "$(fm_meta_get "$STATE/$ID.meta" report_required)" = 1 ] || ORCA_SPAWN_REPORT_REQUIRED=0
+    else
+      ORCA_SPAWN_REPORT_REQUIRED=0
+    fi
+  fi
+  if [ "$ORCA_SPAWN_REPORT_REQUIRED" = 1 ]; then
+    echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
+    exit 1
+  fi
+fi
+
 if [ -e "$STATE/$ID.status" ] || [ -L "$STATE/$ID.status" ]; then ORIGINAL_STATUS_PRESENT=1; else ORIGINAL_STATUS_PRESENT=0; fi
 if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGINAL_TURN_ENDED_PRESENT=1; else ORIGINAL_TURN_ENDED_PRESENT=0; fi
 if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
@@ -1965,6 +1990,9 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   elif [ "$EXISTING_META" = 1 ]; then
     [ "$EXISTING_REPORT_REQUIRED_SET" = 0 ] || echo "report_required=$EXISTING_REPORT_REQUIRED"
   else
+    # Every NEW task is report-required; new report-required Orca spawns were
+    # already refused before any owned mutation (the backend=orca gate after
+    # task-id resolution above).
     echo "report_required=1"
   fi
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then

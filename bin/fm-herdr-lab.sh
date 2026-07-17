@@ -19,7 +19,11 @@
 # delete is available only through teardown.
 # Both paths perform a fresh refuse-default check immediately before each
 # destructive call.
-# Provision records the default session as a fleet-state tripwire and
+# Provisioning and every destructive boundary (the lab server launch, guarded
+# stop and delete, and forwarded run commands other than plain status/list
+# reads) also first re-prove that the default session is running, refusing
+# loudly on a stopped or unreadable default.
+# Provision records the running default session as a fleet-state tripwire and
 # teardown requires that record to be identical afterward.
 set -u
 
@@ -90,6 +94,7 @@ fm_herdr_lab_prepare() { # <session>
     fm_herdr_lab_error "session '$name' already exists; refusing to adopt or overwrite it"
     return 1
   fi
+  fm_herdr_lab_require_default_running "$name" prepare || return 1
 
   state_dir=$(fm_herdr_lab_state_dir)
   tripwire=$(fm_herdr_lab_tripwire_path "$name")
@@ -115,6 +120,28 @@ fm_herdr_lab_refuse_if_default() { # <session>
     '.sessions[]? | select(.name == $name) | .default' 2>/dev/null)
   [ "$flag" = false ] && return 0
   fm_herdr_lab_error "refusing destructive call for '$name': session is absent or default (default=${flag:-<not found>})"
+  return 1
+}
+
+fm_herdr_lab_require_default_running() { # <session> <operation>
+  local name=$1 operation=$2 sessions running
+  sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
+    fm_herdr_lab_error "refusing $operation for '$name': cannot read Herdr sessions to prove the default session is running"
+    return 1
+  }
+  running=$(printf '%s' "$sessions" | jq -r '
+    if (.sessions | type) == "array" then
+      [.sessions[] | select(type == "object" and .default == true)]
+      | if length == 1 and .[0].name == "default" and .[0].running == true
+        then "true"
+        else empty
+        end
+    else
+      empty
+    end
+  ' 2>/dev/null)
+  [ "$running" = true ] && return 0
+  fm_herdr_lab_error "refusing $operation for '$name': the default Herdr session is not proven running (running=${running:-<not found>}); start the default session and retry once 'herdr session list --json' reports it running"
   return 1
 }
 
@@ -146,6 +173,15 @@ fm_herdr_lab_cli() { # <session> <herdr arguments...>
     "session "*)
       fm_herdr_lab_error "run forbids session lifecycle operations; use guarded teardown"
       return 1
+      ;;
+  esac
+  case "$1 ${2:-}" in
+    "status "*|*" list") ;;
+    *)
+      # Plain status/list reads stay available for diagnosis; any other
+      # forwarded command may mutate lab state, so re-prove the running
+      # default session first.
+      fm_herdr_lab_require_default_running "$name" run || return 1
       ;;
   esac
   fm_herdr_lab_raw "$name" "$@"
@@ -193,6 +229,7 @@ fm_herdr_lab_provision() { # <session>
   else
     fm_herdr_lab_prepare "$name" || return 1
   fi
+  fm_herdr_lab_require_default_running "$name" provision || return 1
   fm_herdr_lab_raw "$name" server >/dev/null 2>&1 &
   server_pid=$!
   attempt=0
@@ -246,6 +283,7 @@ fm_herdr_lab_stop() { # <session>
     return 1
   }
   fm_herdr_lab_refuse_if_default "$name" || return 1
+  fm_herdr_lab_require_default_running "$name" stop || return 1
   fm_herdr_lab_raw "$name" session stop "$name" --json
 }
 
@@ -268,6 +306,7 @@ fm_herdr_lab_teardown() { # <session>
   fm_herdr_lab_stop "$name" >/dev/null 2>&1 || true
   sleep 0.5
   fm_herdr_lab_refuse_if_default "$name" || return 1
+  fm_herdr_lab_require_default_running "$name" teardown || return 1
   fm_herdr_lab_raw "$name" session delete "$name" --json >/dev/null 2>&1 || delete_status=$?
   sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
     fm_herdr_lab_error "cannot confirm removal of lab session '$name' after teardown"

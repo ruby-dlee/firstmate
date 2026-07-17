@@ -650,7 +650,7 @@ fm_backend_herdr_expected_identity() {  # <target> <expected-label-or-identity>
 }
 
 fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
-  local target=$1 expected=${2:-} identity panes pane_record tabs tab_id workspaces
+  local target=$1 expected=${2:-} identity panes pane_record tabs tab_id workspaces labeled_workspaces labeled_workspace
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   if [ -n "$expected" ]; then
     identity=$(fm_backend_herdr_expected_identity "$target" "$expected") \
@@ -695,7 +695,53 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
     --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
     'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace and .label == $want_label)' >/dev/null 2>&1; then
-    if [ "$pane_record" = null ]; then printf 'absent'; else printf 'mismatch'; fi
+    # The recorded workspace-id+label pair is gone (killing a workspace's last
+    # tab auto-deletes the workspace, so this IS the normal shape of a
+    # torn-down task). Absence still needs three independent proofs: the
+    # recorded pane is gone, the recorded workspace id no longer exists under
+    # ANY label (a recycled or relabeled id is a collision, not absence), and
+    # no workspace still carrying the expected home label holds the expected
+    # fm-<task> tab (a replacement generation). Anything short of all three -
+    # including any CLI or parse failure below - stays mismatch/unknown so
+    # callers fail closed instead of releasing a live target's lease.
+    if [ "$pane_record" != null ]; then printf 'mismatch'; return 0; fi
+    if printf '%s\n' "$workspaces" | jq -e \
+      --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
+      'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace)' >/dev/null 2>&1; then
+      printf 'mismatch'
+      return 0
+    fi
+    labeled_workspaces=$(printf '%s\n' "$workspaces" | jq -r \
+      --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
+      '.result.workspaces[]? | select(.label == $want_label) | .workspace_id' 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    while IFS= read -r labeled_workspace; do
+      [ -n "$labeled_workspace" ] || continue
+      tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$labeled_workspace" 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      if ! printf '%s\n' "$tabs" | jq -e '
+        (.result.tabs | type) == "array"
+        and all(.result.tabs[];
+          type == "object"
+          and (.tab_id | type) == "string"
+          and (.tab_id | length) > 0
+          and (.workspace_id | type) == "string"
+          and (.workspace_id | length) > 0
+          and (.label | type) == "string")
+      ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      if printf '%s\n' "$tabs" | jq -e \
+        --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
+        'any(.result.tabs[]?; .label == $want_label)' >/dev/null 2>&1; then
+        printf 'mismatch'
+        return 0
+      fi
+    done <<EOF
+$labeled_workspaces
+EOF
+    printf 'absent'
     return 0
   fi
   tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \

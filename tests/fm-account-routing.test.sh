@@ -2225,6 +2225,15 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
   id=account-orca-z20b
   rec=$(make_case orca claude "$id")
   read_case "$rec"
+  mkdir -p "$CASE_DIR/legacy-wt"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=legacy:fm-$id" \
+    "worktree=$CASE_DIR/legacy-wt" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off"
   out=$(run_spawn "$id" "$PROJ_DIR" --backend orca --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "enforced Orca spawn unexpectedly succeeded"
@@ -2763,13 +2772,52 @@ test_session_sync_lineage_failure_restores_unbound_metadata() {
 }
 
 test_oversized_continuation_stops_before_mutation() {
-  local id rec out status
+  local id rec out status later_source
   id=account-continuation-size-z28
   rec=$(make_case continuation-size claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation size precondition spawn failed"
-  dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$HOME_DIR/state/$id.status"
   rm -f "$CASE_DIR/endpoint-live"
+
+  # Sentinel control: the wake-status source is assembled after the brief, and
+  # a symlink planted there is refused with an observable error while the
+  # packet budget still has room, so the ordering probe below can rely on that
+  # error's absence.
+  later_source="$CASE_DIR/later-source"
+  printf 'later source\n' > "$later_source"
+  ln -s "$later_source" "$HOME_DIR/state/$id.status"
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=1 \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" ordering-control 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "symlinked wake-status continuation source was accepted"
+  assert_contains "$out" 'refusing symlinked continuation source' "sentinel wake-status refusal was not observable"
+  assert_absent "$HOME_DIR/data/$id/continuation-ordering-control.md" "sentinel control run installed a continuation packet"
+
+  # Ordering probe: the brief section is assembled before the wake-status
+  # source, so once an oversized brief already exhausts the packet budget the
+  # later wake-status sentinel must never be opened or inspected.
+  dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' b > "$HOME_DIR/data/$id/brief.md"
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=1 \
+    PATH="$FAKEBIN_DIR:$PATH" "$CONTINUATION" "$id" ordering-probe 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "oversized continuation packet was accepted by the ordering probe"
+  assert_contains "$out" 'maximum is 65536' "ordering probe rejection did not report its bound"
+  assert_not_contains "$out" 'symlinked continuation source' "continuation inspected later artifacts after the packet budget was already exhausted"
+  assert_absent "$HOME_DIR/data/$id/continuation-ordering-probe.md" "ordering probe installed a packet after the budget was exhausted"
+
+  # Full spawn path: an oversized wake-status is rejected before any external
+  # mutation.
+  printf 'brief for %s\n' "$id" > "$HOME_DIR/data/$id/brief.md"
+  rm -f "$HOME_DIR/state/$id.status"
+  dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$HOME_DIR/state/$id.status"
   clear_case_logs
 
   set +e
@@ -4671,14 +4719,56 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   pass "teardown stops and revalidates after rollback restores predecessor state"
 }
 
+test_release_helpers_preserve_caller_errexit_state() {
+  local id rec status
+  id=account-errexit-preserve-z29
+  rec=$(make_case errexit-preserve claude "$id")
+  read_case "$rec"
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet"
+  export FM_AGENT_FLEET_BIN
+
+  # spawn_abort_cleanup keeps errexit off for its whole rollback trap; the
+  # release helpers must restore the caller's entry state, never force it on.
+  set +e
+  fm_account_release fm-errexit-release --force >/dev/null 2>&1
+  status=$?
+  case $- in *e*) fail "fm_account_release re-enabled errexit for an errexit-off caller" ;; esac
+  [ "$status" -eq 0 ] || fail "fm_account_release failed under an errexit-off caller (exit $status)"
+
+  FM_FAKE_AF_RELEASE_FAIL=1 fm_account_release fm-errexit-release --force >/dev/null 2>&1
+  status=$?
+  case $- in *e*) fail "failed fm_account_release re-enabled errexit for an errexit-off caller" ;; esac
+  [ "$status" -eq 43 ] || fail "failed fm_account_release did not propagate its release status (exit $status)"
+
+  fm_account_session_remove fm-errexit-release >/dev/null 2>&1
+  status=$?
+  case $- in *e*) fail "fm_account_session_remove re-enabled errexit for an errexit-off caller" ;; esac
+  [ "$status" -eq 0 ] || fail "fm_account_session_remove failed under an errexit-off caller (exit $status)"
+
+  FM_FAKE_AF_SESSION_REMOVE_FAIL=1 fm_account_session_remove fm-errexit-release >/dev/null 2>&1
+  status=$?
+  case $- in *e*) fail "failed fm_account_session_remove re-enabled errexit for an errexit-off caller" ;; esac
+  [ "$status" -eq 44 ] || fail "failed fm_account_session_remove did not propagate its removal status (exit $status)"
+
+  set -e
+  fm_account_release fm-errexit-release --force >/dev/null 2>&1
+  case $- in *e*) : ;; *) fail "fm_account_release dropped errexit for an errexit-on caller" ;; esac
+  fm_account_session_remove fm-errexit-release >/dev/null 2>&1
+  case $- in *e*) : ;; *) fail "fm_account_session_remove dropped errexit for an errexit-on caller" ;; esac
+  set +e
+  pass "release helpers preserve the caller's errexit state"
+}
+
 run_isolated_test() {
+  # Run the isolating subshell as a plain command, never as an `if` condition:
+  # a condition context suppresses errexit for the whole test body, so an
+  # in-test `set -e` would be silently ignored.
   local status
-  if ( "$@" ); then
-    return 0
-  else
-    status=$?
-  fi
-  exit "$status"
+  ( "$@" )
+  status=$?
+  [ "$status" -eq 0 ] || exit "$status"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = continuation-status-timeout ]; then
@@ -4939,6 +5029,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-18 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = errexit-preserve ]; then
+  run_isolated_test test_release_helpers_preserve_caller_errexit_state
+  exit 0
+fi
+
 run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
 run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
 run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
@@ -5044,5 +5139,6 @@ run_isolated_test test_unsuccessful_recovery_mutation_is_retried
 run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
 run_isolated_test test_account_timeout_wrapper_uses_hard_kill_fallback
 run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
+run_isolated_test test_release_helpers_preserve_caller_errexit_state
 
 echo "# all fm-account-routing tests passed"

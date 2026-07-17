@@ -55,6 +55,7 @@ command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found (requi
 TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-backend-autodetect-smoke.XXXXXX")
 SESSION="fm-lab-autodetect-smoke-$$"
 export HERDR_SESSION="$SESSION"
+herdr_test_lab_available "$SESSION" || exit 0
 ID="autodetectsmoke1"
 WT=
 cleanup_all() {

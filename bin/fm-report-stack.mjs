@@ -762,7 +762,8 @@ function readManifests(policy = readRetentionPolicy()) {
   const manifests = [];
   for (const cohort of fs.readdirSync(entriesDir, { withFileTypes: true })) {
     if (!cohort.isDirectory() || cohort.name.startsWith(".")) continue;
-    if (!Number.isFinite(retentionCohortDeadline(cohort.name))) {
+    const cohortDeadline = retentionCohortDeadline(cohort.name);
+    if (!Number.isFinite(cohortDeadline)) {
       throw new Error(`invalid report retention cohort at ${path.join(entriesDir, cohort.name)}`);
     }
     for (const entry of fs.readdirSync(path.join(entriesDir, cohort.name), { withFileTypes: true })) {
@@ -773,15 +774,15 @@ function readManifests(policy = readRetentionPolicy()) {
       const file = path.join(entriesDir, cohort.name, entry.name, "manifest.json");
       const manifest = readEntryManifest(cohort.name, entry.name);
       if (!manifest) continue;
-      const expectedCohort = retentionCohortFor(manifest.completedAt);
+      const completedAt = Date.parse(manifest.completedAt);
       if (manifest.reportId !== entry.name
-        || (manifest.retentionCohort === undefined && expectedCohort !== cohort.name)
-        || (manifest.retentionCohort !== undefined
-          && (manifest.retentionCohort !== cohort.name || manifest.retentionCohort !== expectedCohort))) {
+        || (manifest.retentionCohort !== undefined && manifest.retentionCohort !== cohort.name)
+        || !Number.isFinite(completedAt)
+        || cohortDeadline < completedAt + reportRetentionMs
+        || cohortDeadline > completedAt + reportRetentionMs + reportRetentionDriftMs) {
         throw new Error(`report manifest identity mismatch at ${file}`);
       }
-      const completedAt = Date.parse(manifest.completedAt);
-      if (Number.isFinite(policy.cutoffMs) && Number.isFinite(completedAt) && completedAt <= policy.cutoffMs) continue;
+      if (Number.isFinite(policy.cutoffMs) && completedAt <= policy.cutoffMs) continue;
       manifests.push({ ...manifest, retentionCohort: cohort.name });
     }
   }
@@ -1061,6 +1062,17 @@ function removeAgedOrphanStaging(transactionIds) {
   }
 }
 
+function entryRemainsIntact(cohortName, reportId) {
+  if (!fs.existsSync(path.join(entriesDir, cohortName, reportId))) return false;
+  let manifest;
+  try {
+    manifest = readEntryManifest(cohortName, reportId);
+  } catch {
+    return false;
+  }
+  return Boolean(manifest) && manifest.reportId === reportId;
+}
+
 function recoverPreviousEntries() {
   if (!fs.existsSync(entriesDir)) return;
   const transactions = [];
@@ -1090,7 +1102,7 @@ function recoverPreviousEntries() {
         }
         realDirectory(restoredCohort, fs.realpathSync(entriesDir), "restored report retention cohort");
         fs.renameSync(previous, path.join(restoredCohort, reportId));
-      } else if (!fs.existsSync(destination)) {
+      } else if (!fs.existsSync(destination) && !entryRemainsIntact(record.previousCohort, reportId)) {
         throw new Error(`report transaction lost both generations for ${reportId}`);
       }
     } else {

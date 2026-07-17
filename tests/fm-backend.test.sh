@@ -649,8 +649,12 @@ test_managed_tmux_target_identity_checks_recorded_session() {
 
   ! fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
     || fail "a reused tmux window id in another session passed existence validation"
+  [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = unknown ] \
+    || fail "a live stable id moved intact to another session was classified absent"
+  fake_label=fm-other-task
   [ "$(fm_backend_target_state tmux @77 fm-intended-task recorded-session:fm-intended-task)" = absent ] \
-    || fail "a reused stable id blocked confident absence after the recorded-session scan"
+    || fail "a genuinely recycled stable id blocked confident absence after the recorded-session scan"
+  fake_label=fm-intended-task
   ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-other-task \
     || fail "managed tmux capture accepted a scoped target with the wrong task label"
   ! fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
@@ -1216,6 +1220,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   test_managed_tmux_target_identity_checks_recorded_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
+  test_managed_tmux_target_identity_checks_recorded_session
+  test_managed_tmux_target_state_finds_replacement_window
   exit 0
 fi
 

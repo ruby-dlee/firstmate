@@ -958,7 +958,7 @@ SH
     [ -e "$st/reached" ] && break
     sleep 0.02
   done
-  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "native entry never reached the pre-daemon handoff window"; }
+  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "native entry never reached the pre-daemon handoff window"; return; }
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
@@ -972,6 +972,10 @@ SH
 
   : > "$st/go"
   wait "$stopper" || fail "stop failed after the native entry completed its handoff"
+  # Reap the exec'd infinite-loop fixture daemon unconditionally: a stop
+  # regression that refuses before signaling must not hang the suite, and the
+  # state assertions below still capture stop's outcome.
+  kill -KILL "$starter" 2>/dev/null || true
   wait "$starter" 2>/dev/null || true
   [ ! -e "$st/state/.afk" ] || fail "atomic native stop retained away mode"
   [ ! -e "$st/state/.afk-native-process" ] || fail "atomic native stop retained the native process marker"
@@ -1007,7 +1011,7 @@ SH
     [ -e "$st/reached" ] && break
     sleep 0.02
   done
-  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "direct native entry never reached the pre-daemon handoff window"; }
+  [ -e "$st/reached" ] || { kill "$starter" 2>/dev/null || true; fail "direct native entry never reached the pre-daemon handoff window"; return; }
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
@@ -1021,6 +1025,10 @@ SH
 
   : > "$st/go"
   wait "$stopper" || fail "stop failed after the direct native entry completed its handoff"
+  # Reap the exec'd infinite-loop fixture daemon unconditionally: a stop
+  # regression that refuses before signaling must not hang the suite, and the
+  # state assertions below still capture stop's outcome.
+  kill -KILL "$starter" 2>/dev/null || true
   wait "$starter" 2>/dev/null || true
   [ ! -e "$st/state/.afk" ] || fail "atomic direct native stop retained away mode"
   [ ! -e "$st/state/.afk-native-process" ] || fail "atomic direct native stop retained the native process marker"
@@ -1663,6 +1671,7 @@ e2e_herdr() {
   local before during after ws_before ws_during ws_after out dtgt dtab
   SESSION="fm-lab-afk-launch-e2e-$$"
   export HERDR_SESSION="$SESSION"
+  herdr_test_lab_available "$SESSION" || return 0
   home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-e2e-home.XXXXXX")
   E2E_HERDR_CLEANUP() {
     FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" \

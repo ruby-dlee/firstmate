@@ -27,6 +27,7 @@ Watching and attaching: Orca owns both the worktree and the terminal for its tas
 You do not need to open the app for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's terminal without opening Orca, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it unless `FM_HOME` is already set to the active firstmate home (the stable `fm-<id>` alias also works; Enter and Ctrl-C are supported; Escape is not).
 
 Verify it works by spawning a trivial task with `--backend orca` and confirming the task's meta records `backend=orca`, `terminal=`, `orca_worktree_id=`, and `worktree=`; the Orca app should show a new terminal for the task.
+New task spawns now refuse `backend=orca` because every new task is report-required (see "Limitations"), so this end-to-end check works only for a pre-existing task without a `report_required` marker.
 
 Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semantics need a separate design), Escape is unsupported, Orca is macOS-only and explicit-only, and it exposes no stable CLI version marker, so spawn gates on runtime reachability instead of a version floor - see "Limitations" below for the complete list.
 
@@ -34,6 +35,7 @@ Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semant
 
 PR #210 landed the primitive Orca terminal adapter: bounded capture, text send, Enter, Ctrl-C interrupt, and close for already-created Orca terminals.
 This follow-up adds full ship/scout task lifecycle support for `backend=orca`: spawn, metadata, send/peek/watch/crew-state routing from metadata, and guarded teardown through Orca.
+Since completion reports became mandatory for new tasks, new task spawns refuse `backend=orca` (see "Limitations"); the lifecycle support above remains for pre-existing tasks without a `report_required` marker.
 
 Orca remains explicit-only.
 Select it by putting `orca` in a local `config/backend` file, by exporting `FM_BACKEND=orca`, or by telling the first mate in chat to use Orca.
@@ -94,6 +96,8 @@ Teardown:
 
 ## Limitations
 
+- New task spawns refuse `backend=orca`: every new task is report-required, and Orca exposes no reliable endpoint-absence proof, so report-gated teardown could never complete - spawn report-required work on tmux, herdr, zellij, or cmux.
+- Pre-existing tasks whose meta carries no `report_required` marker keep the legacy teardown contract and may still respawn onto Orca.
 - `--secondmate` spawns still refuse `backend=orca`; secondmate-home semantics need a separate design.
 - Escape is unsupported because the current Orca terminal send primitive exposes Enter and interrupt-style input but no verified Escape operation.
 - Orca is explicit-only and is not selected by runtime auto-detection.

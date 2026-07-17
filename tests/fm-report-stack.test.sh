@@ -332,6 +332,38 @@ test_manifest_cohort_must_match_completion_time() {
   pass "report manifests bind cohort metadata to completion time"
 }
 
+test_manifest_cohort_deadline_cannot_precede_expiry() {
+  local stack="$TMP_ROOT/manifest-early-cohort-stack" completed cohort out status
+  completed=$(node -e 'process.stdout.write(new Date().toISOString())')
+  cohort=$(node -e '
+    const deadline = Math.ceil((Date.parse(process.argv[1]) + 15 * 24 * 60 * 60 * 1000) / 300000) * 300000;
+    process.stdout.write("cohort-" + deadline);
+  ' "$completed") || fail "early cohort-deadline fixture could not be computed"
+  mkdir -p "$stack/entries/$cohort/early-cohort"
+  printf '{"schemaVersion":1,"reportId":"early-cohort","taskId":"early-cohort","title":"Early","summary":"Early","completedAt":"%s","retentionCohort":"%s","kind":"ship","project":"example","harness":"codex"}\n' \
+    "$completed" "$cohort" > "$stack/entries/$cohort/early-cohort/manifest.json"
+  if out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" render 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "manifest cohort deadline preceding the 30-day expiry was accepted"
+  assert_contains "$out" "manifest identity mismatch" "early cohort-deadline refusal was unclear"
+  pass "report manifests reject cohort deadlines that precede the 30-day expiry"
+}
+
+test_manifest_validation_is_cohort_width_independent() {
+  local id=report-cohort-width-shift-z37a entry json
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Width-shift stable report."
+  run_stack publish "$id" >/dev/null || fail "cohort width-shift publication failed"
+  entry=$(run_stack path "$id") || fail "cohort width-shift path failed"
+  json=$(FM_REPORT_RETENTION_COHORT_MS=3600000 run_stack list --json) \
+    || fail "report list rejected existing entries after a cohort width change"
+  printf '%s\n' "$json" | grep -F "\"taskId\": \"$id\"" >/dev/null \
+    || fail "cohort width change hid an existing report entry"
+  FM_REPORT_RETENTION_COHORT_MS=1295000000 run_stack render >/dev/null \
+    || fail "report render rejected existing entries after a cohort width change"
+  assert_present "$entry" "cohort width change displaced an existing report entry"
+  pass "report manifest validation is independent of the retention cohort width"
+}
+
 test_retention_cohort_never_precedes_exact_expiry() {
   local id=report-cohort-ceiling-z36a entry manifest completed cohort deadline expiry
   write_task "$id" ship
@@ -1492,6 +1524,57 @@ test_first_publication_transaction_recovery_removes_unindexed_entry() {
   pass "report recovery removes interrupted first publications and rebuilds the index"
 }
 
+test_pre_rename_transaction_recovery_keeps_previous_generation() {
+  local id=report-pre-rename-recovery-k2u entry destination report_id cohort destination_cohort transaction staged json
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Pre-rename crash generation."
+  run_stack publish "$id" >/dev/null || fail "pre-rename transaction precondition failed"
+  entry=$(run_stack path "$id")
+  destination=$(dirname "$entry")
+  report_id=$(basename "$destination")
+  cohort=$(basename "$(dirname "$destination")")
+  destination_cohort="cohort-$((${cohort#cohort-} + 300000))"
+  transaction="$STACK/entries/.$report_id.transaction"
+  staged="$STACK/entries/.$report_id.999.tmp"
+  mkdir -p "$staged"
+  printf 'stale index\n' > "$STACK/index.html"
+  printf '{"schemaVersion":2,"reportId":"%s","destinationCohort":"%s","previousCohort":"%s"}\n' \
+    "$report_id" "$destination_cohort" "$cohort" > "$transaction"
+
+  json=$(run_stack list --json) || fail "report list did not recover a pre-rename report transaction"
+  printf '%s\n' "$json" | grep -F '"taskId": "report-pre-rename-recovery-k2u"' >/dev/null \
+    || fail "pre-rename recovery lost the intact previous generation"
+  assert_present "$destination/report.html" "pre-rename recovery displaced the intact previous generation"
+  assert_absent "$STACK/entries/$destination_cohort/$report_id" "pre-rename recovery fabricated a destination generation"
+  assert_absent "$transaction" "pre-rename recovery retained its transaction marker"
+  assert_absent "$staged" "pre-rename recovery retained transaction staging"
+  assert_no_grep 'stale index' "$STACK/index.html" "pre-rename recovery did not rebuild the report index"
+  pass "report recovery keeps the intact previous generation when publication never started"
+}
+
+test_transaction_recovery_fails_when_every_generation_is_lost() {
+  local id=report-lost-generations-k2v entry destination report_id cohort destination_cohort transaction out status
+  write_task "$id" ship
+  write_required_report "$HOME_DIR/data/$id/completion.md" "Lost generations."
+  run_stack publish "$id" >/dev/null || fail "lost-generation precondition failed"
+  entry=$(run_stack path "$id")
+  destination=$(dirname "$entry")
+  report_id=$(basename "$destination")
+  cohort=$(basename "$(dirname "$destination")")
+  destination_cohort="cohort-$((${cohort#cohort-} + 300000))"
+  transaction="$STACK/entries/.$report_id.transaction"
+  rm -rf "$destination"
+  printf '{"schemaVersion":2,"reportId":"%s","destinationCohort":"%s","previousCohort":"%s"}\n' \
+    "$report_id" "$destination_cohort" "$cohort" > "$transaction"
+
+  if out=$(run_stack list --json 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "report recovery accepted a transaction with no surviving generation"
+  assert_contains "$out" "lost both generations" "lost-generation refusal was unclear"
+  assert_present "$transaction" "failed lost-generation recovery cleared its transaction marker"
+  rm -f "$transaction"
+  pass "report recovery still fails closed when every generation is lost"
+}
+
 test_aged_transactionless_staging_is_reclaimed() {
   local old fresh
   mkdir -p "$STACK/entries"
@@ -1664,6 +1747,8 @@ SH
     "retention LaunchAgent did not persist the absolute Node runtime"
   assert_grep "<key>FM_REPORT_PYTHON</key><string>$python_runtime</string>" "$plist" \
     "retention LaunchAgent did not persist the absolute Python runtime"
+  assert_grep "<key>FM_REPORT_RETENTION_COHORT_MS</key><string>${FM_REPORT_RETENTION_COHORT_MS:-300000}</string>" "$plist" \
+    "retention LaunchAgent did not pin the publisher cohort width"
   assert_absent "$(dirname "$entry")" "installed retention owner did not enforce retention"
   heartbeat="$STACK/.retention-heartbeat"
   assert_present "$heartbeat" "installed retention owner did not record a successful-prune heartbeat"
@@ -3267,6 +3352,8 @@ if [ "${FM_TEST_FOCUSED:-}" = report-generation-recovery ]; then
   test_previous_generation_is_recovered_for_readers
   test_replacement_transaction_recovery_restores_entry_and_index
   test_first_publication_transaction_recovery_removes_unindexed_entry
+  test_pre_rename_transaction_recovery_keeps_previous_generation
+  test_transaction_recovery_fails_when_every_generation_is_lost
   exit 0
 fi
 
@@ -3279,6 +3366,14 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-fixtures ]; then
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
   test_retention_cutoff_is_authoritative_before_cleanup
   test_retention_cohort_tombstone_is_noreplace_owned
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-width ]; then
+  test_manifest_cohort_must_match_completion_time
+  test_manifest_cohort_deadline_cannot_precede_expiry
+  test_manifest_validation_is_cohort_width_independent
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher
   exit 0
 fi
 
@@ -3336,6 +3431,8 @@ test_lock_control_files_are_bounded_and_nonfollowing
 test_previous_generation_is_recovered_for_readers
 test_replacement_transaction_recovery_restores_entry_and_index
 test_first_publication_transaction_recovery_removes_unindexed_entry
+test_pre_rename_transaction_recovery_keeps_previous_generation
+test_transaction_recovery_fails_when_every_generation_is_lost
 test_aged_transactionless_staging_is_reclaimed
 test_completed_reports_prune_after_minimum_age
 test_retention_binds_manifests_to_entry_directories
@@ -3347,6 +3444,8 @@ test_retention_error_publication_is_atomic_and_nonfollowing
 test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
 test_retention_owner_advances_pending_legacy_migration
 test_manifest_cohort_must_match_completion_time
+test_manifest_cohort_deadline_cannot_precede_expiry
+test_manifest_validation_is_cohort_width_independent
 test_retention_cohort_never_precedes_exact_expiry
 test_retention_cohort_and_sweep_share_drift_budget
 test_retention_cutoff_is_authoritative_before_cleanup

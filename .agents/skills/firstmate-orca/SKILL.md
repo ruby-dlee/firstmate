@@ -37,6 +37,7 @@ Before switching or spawning against Orca:
 
 Use `bin/fm-spawn.sh` so firstmate creates the brief, worktree, terminal, metadata, status file, and watcher surface together.
 Pass `--backend orca` for a one-off Orca task, or rely on the already-selected Orca backend when that selection is intentional.
+New task spawns refuse `backend=orca` before any owned mutation because every new task is report-required and Orca has no reliable endpoint-absence proof for report-gated teardown; only a pre-existing task without a `report_required` marker may respawn onto Orca (see `docs/orca-backend.md` "Limitations").
 
 After spawn, check the task with firstmate helpers:
 

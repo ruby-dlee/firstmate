@@ -46,6 +46,7 @@ pass() { printf 'ok - %s\n' "$1"; }
 
 SESSION="fm-lab-afk-herdr-e2e-$$"
 export HERDR_SESSION="$SESSION"
+herdr_test_lab_available "$SESSION" || exit 0
 STATE_DIR=
 HERDR_SHIM_DIR=
 LOG_FILE=

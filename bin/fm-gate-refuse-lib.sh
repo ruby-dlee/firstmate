@@ -58,11 +58,14 @@
 # fm-backlog-handoff.sh, fm-bootstrap.sh, fm-brief.sh, fm-config-push.sh,
 # fm-ensure-agents-md.sh, fm-fleet-sync.sh, fm-home-seed.sh, fm-lock.sh,
 # fm-merge-local.sh, fm-pr-check.sh, fm-pr-merge.sh, fm-promote.sh,
-# fm-report-stack.mjs, fm-review-diff.sh, fm-send.sh, fm-session-start.sh,
-# fm-spawn.sh, fm-supervise-daemon.sh, fm-teardown.sh, fm-update.sh,
-# fm-wake-drain.sh, fm-watch-arm.sh, fm-watch-checkpoint.sh, fm-watch.sh,
-# fm-x-dismiss.sh, fm-x-followup.sh, fm-x-link.sh, fm-x-poll.sh, and
-# fm-x-reply.sh.
+# fm-report-retention.sh, fm-report-stack.mjs, fm-review-diff.sh, fm-send.sh,
+# fm-session-start.sh, fm-spawn.sh, fm-supervise-daemon.sh,
+# fm-task-file-append.mjs, fm-teardown.sh, fm-update.sh, fm-wake-drain.sh,
+# fm-watch-arm.sh, fm-watch-checkpoint.sh, fm-watch.sh, fm-x-dismiss.sh,
+# fm-x-followup.sh, fm-x-link.sh, fm-x-poll.sh, and fm-x-reply.sh.
+# The Node entrypoints (fm-report-stack.mjs and fm-task-file-append.mjs)
+# cannot source this library; each replicates the refusal in-process with the
+# same signals, messages, and exit code - keep the replicas in lockstep.
 # Excluded read-only entrypoints: fm-arm-command-policy.mjs,
 # fm-arm-pretool-check.sh, fm-bearings-snapshot.sh, fm-cd-command-policy.mjs,
 # fm-cd-pretool-check.sh, fm-crew-state.sh, fm-dispatch-select.sh,
@@ -74,8 +77,14 @@
 # fm-backend.sh, fm-classify-lib.sh, fm-composer-lib.sh,
 # fm-config-inherit-lib.sh, fm-ff-lib.sh, fm-gate-refuse-lib.sh,
 # fm-lock-lib.sh, fm-marker-lib.sh, fm-report-contract-lib.sh,
-# fm-supervisor-target-lib.sh, fm-tangle-lib.sh, fm-tasks-axi-lib.sh,
-# fm-tmux-lib.sh, fm-transition-lib.sh, fm-wake-lib.sh, and fm-x-lib.sh.
+# fm-supervision-lib.sh, fm-supervisor-target-lib.sh, fm-tangle-lib.sh,
+# fm-tasks-axi-lib.sh, fm-tmux-lib.sh, fm-transition-lib.sh, fm-wake-lib.sh,
+# and fm-x-lib.sh.
+# Excluded pure helpers are not entrypoints: backends/herdr-eventwait.py,
+# fm-contained-read.cjs, fm-contained-read.py, fm-file-transaction.cjs,
+# fm-markdown-structure.cjs, and fm-prompt-exec.py carry no fleet dispatch of
+# their own and are reached only through the entrypoints and libraries above,
+# so they inherit the caller's refusal.
 # fm-herdr-lab.sh is excluded because it accepts only isolated fm-lab-* sessions
 # and protects the live default session with its own tripwire.
 # fm-install-shellcheck.sh and fm-lint.sh are excluded developer verification

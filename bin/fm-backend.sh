@@ -754,8 +754,13 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
               esac
               tmux_identity_session=${tmux_identity%%$'\t'*}
               tmux_identity_label=${tmux_identity#*$'\t'}
+              # A live recorded @id is unknown when it was renamed in place
+              # (recorded session, other label) or moved intact to another
+              # session (other session, expected label); only a genuinely
+              # recycled id (other session, other label) stays absent.
               if [ -n "$tmux_identity" ] && [ "$tmux_identity" != "$tmux_identity_session" ] \
-                && [ "$tmux_identity_session" = "$session" ] && [ "$tmux_identity_label" != "$expected_label" ]; then
+                && { { [ "$tmux_identity_session" = "$session" ] && [ "$tmux_identity_label" != "$expected_label" ]; } \
+                  || { [ "$tmux_identity_session" != "$session" ] && [ "$tmux_identity_label" = "$expected_label" ]; }; }; then
                 printf 'unknown'
               else
                 printf 'absent'

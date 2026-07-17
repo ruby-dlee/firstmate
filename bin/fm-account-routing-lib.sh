@@ -1056,7 +1056,11 @@ fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-pr
 }
 
 fm_account_release() {  # <task> [--force]
-  local binary task=$1 force=${2:-} out status
+  local binary task=$1 force=${2:-} out status errexit_was_on=0
+  # Callers like spawn_abort_cleanup run their whole rollback with errexit
+  # off; restore the caller's entry state instead of unconditionally
+  # re-enabling errexit.
+  case $- in *e*) errexit_was_on=1 ;; esac
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
   set +e
@@ -1074,7 +1078,7 @@ fm_account_release() {  # <task> [--force]
     fi
     status=$?
   fi
-  set -e
+  [ "$errexit_was_on" -eq 0 ] || set -e
   if [ "$status" -eq 0 ]; then
     return 0
   fi
@@ -1086,7 +1090,9 @@ fm_account_release() {  # <task> [--force]
 }
 
 fm_account_session_remove() {  # <task>
-  local binary out status
+  local binary out status errexit_was_on=0
+  # Same errexit contract as fm_account_release.
+  case $- in *e*) errexit_was_on=1 ;; esac
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
   set +e
@@ -1096,7 +1102,7 @@ fm_account_session_remove() {  # <task>
     out=$(fm_account_run_control "$binary" --format json session remove --task "$1" 2>&1)
     status=$?
   fi
-  set -e
+  [ "$errexit_was_on" -eq 0 ] || set -e
   if [ "$status" -eq 0 ]; then
     return 0
   fi

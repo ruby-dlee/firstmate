@@ -59,6 +59,7 @@ WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
 WATCH_CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 WAKE_DRAIN="$ROOT/bin/fm-wake-drain.sh"
 REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
+TASK_FILE_APPEND="$ROOT/bin/fm-task-file-append.mjs"
 BRIEF="$ROOT/bin/fm-brief.sh"
 ENSURE_AGENTS="$ROOT/bin/fm-ensure-agents-md.sh"
 LOCK="$ROOT/bin/fm-lock.sh"
@@ -679,6 +680,57 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   pass "every directly invocable control-plane mutator and report command refuses gate contexts"
 }
 
+# --- fm-task-file-append ----------------------------------------------------
+
+# run_task_append <cwd> <script-cwd> <home> <task> [ASSIGN...] -> combined output.
+# One line is piped on stdin and the script is run via node, the way the
+# fm-send/account-routing callers invoke it; a refused run must exit 3 before
+# reading stdin or touching data/<task>.
+run_task_append() {
+  local cwd=$1 script_cwd=$2 home=$3 task=$4; shift 4
+  ( cd "$cwd" && printf 'appended line\n' \
+      | env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS "$@" \
+        node "$(guarded_script "$script_cwd" "$TASK_FILE_APPEND")" \
+        "$home/data" "$task" trail.md '# Trail' ) 2>&1
+}
+
+test_task_file_append_refuses_and_admits() {
+  local home out rc
+  home="$TMP/task-append-home"
+  # Every task dir pre-exists, so a refused run is blocked ONLY by the gate
+  # refusal - without the guard these appends would succeed and exit 0.
+  mkdir -p "$home/data/append-envmark" "$home/data/append-script" \
+    "$home/data/append-caller" "$home/data/append-ok"
+
+  # env-marker refuse: neutral cwd, marker set; the trail must not be written.
+  out=$(run_task_append "$NORMAL_CWD" "$NORMAL_CWD" "$home" append-envmark NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "task append: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "task append: env-marker refusal message"
+  assert_absent "$home/data/append-envmark/trail.md" "task append: refused env-marker append must not write the trail"
+
+  # path-backstop refuse via the script checkout (marker UNSET).
+  out=$(run_task_append "$NORMAL_CWD" "$GATE_WT" "$home" append-script); rc=$?
+  expect_code 3 "$rc" "task append: gate script checkout must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "task append: script-checkout backstop refusal message"
+  assert_absent "$home/data/append-script/trail.md" "task append: script-backstop refused append must not write the trail"
+
+  # path-backstop refuse via the caller checkout (marker UNSET).
+  out=$(run_task_append "$GATE_WT" "$NORMAL_CWD" "$home" append-caller); rc=$?
+  expect_code 3 "$rc" "task append: gate caller checkout must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "task append: caller-checkout backstop refusal message"
+  assert_absent "$home/data/append-caller/trail.md" "task append: caller-backstop refused append must not write the trail"
+
+  # no-regression: a normal session still appends, with the first-write header.
+  out=$(run_task_append "$NORMAL_CWD" "$NORMAL_CWD" "$home" append-ok); rc=$?
+  expect_code 0 "$rc" "task append: a normal session must still append"
+  assert_not_contains "$out" "$ENV_MSG" "task append: normal append must not print the gate refusal"
+  assert_not_contains "$out" "$PATH_MSG" "task append: normal append must not print the backstop refusal"
+  assert_present "$home/data/append-ok/trail.md" "task append: normal append should create the trail file"
+  assert_grep '# Trail' "$home/data/append-ok/trail.md" "task append: normal append should write the first-write header"
+  assert_grep 'appended line' "$home/data/append-ok/trail.md" "task append: normal append should write the piped addition"
+  pass "fm-task-file-append: refuses on marker and gate-worktree backstop; a normal trail append is unaffected"
+}
+
 # --- tracked .no-mistakes.yaml ----------------------------------------------
 
 test_no_mistakes_yaml_disables_project_settings() {
@@ -721,4 +773,5 @@ test_merge_entrypoints_refuse_gate_contexts
 test_promote_refuses_gate_contexts
 test_primary_mutators_refuse_gate_contexts
 test_extended_mutating_entrypoints_refuse_gate_context
+test_task_file_append_refuses_and_admits
 test_no_mistakes_yaml_disables_project_settings

@@ -18,6 +18,7 @@ fm_refuse_if_gate_agent
 STACK_ROOT="${FM_REPORT_STACK_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/firstmate/report-stack}"
 INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-300}
 PROGRESS_INTERVAL=${FM_REPORT_RETENTION_PROGRESS_INTERVAL:-1}
+COHORT_MS=${FM_REPORT_RETENTION_COHORT_MS:-300000}
 ACTIVATION_WAIT_MS=${FM_REPORT_RETENTION_ACTIVATION_WAIT_MS:-}
 LABEL=${FM_REPORT_RETENTION_LABEL:-com.firstmate.report-retention}
 PLATFORM=${FM_REPORT_RETENTION_PLATFORM:-$(uname)}
@@ -37,6 +38,7 @@ SOURCE_FILES=(fm-report-retention.sh fm-report-stack.mjs fm-markdown-structure.c
 
 case "$INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
 case "$PROGRESS_INTERVAL" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_PROGRESS_INTERVAL must be a positive integer" >&2; exit 2 ;; esac
+case "$COHORT_MS" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_COHORT_MS must be a positive integer" >&2; exit 2 ;; esac
 [ -n "$ACTIVATION_WAIT_MS" ] || ACTIVATION_WAIT_MS=$((INTERVAL * 2000 + 60000))
 case "$ACTIVATION_WAIT_MS" in ''|*[!0-9]*|0) echo "error: FM_REPORT_RETENTION_ACTIVATION_WAIT_MS must be a positive integer" >&2; exit 2 ;; esac
 [ "$INTERVAL" -lt 1296000 ] || { echo "error: FM_REPORT_RETENTION_INTERVAL must be below 15 days" >&2; exit 2; }
@@ -399,6 +401,7 @@ write_generation_plist() {
 <key>FM_REPORT_PYTHON</key><string>$(xml_escape "$python_runtime")</string>
 <key>FM_REPORT_STACK_ROOT</key><string>$(xml_escape "$STACK_ROOT")</string>
 <key>FM_REPORT_RETENTION_INTERVAL</key><string>$(xml_escape "$INTERVAL")</string>
+<key>FM_REPORT_RETENTION_COHORT_MS</key><string>$(xml_escape "$COHORT_MS")</string>
 <key>FM_REPORT_RETENTION_PROGRESS_INTERVAL</key><string>$(xml_escape "$PROGRESS_INTERVAL")</string>
 <key>FM_REPORT_RETENTION_ACTIVATION_NONCE</key><string>$(xml_escape "$activation_nonce")</string>
 </dict>

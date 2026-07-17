@@ -875,6 +875,66 @@ SH
   pass "Herdr target state distinguishes missing panes from malformed records"
 }
 
+test_target_state_refuses_absence_on_workspace_identity_collisions() {
+  # B1 (review 2026-07-16): a missing exact workspace-id+label pair may be
+  # classified absent ONLY with three proofs - the recorded pane is gone, the
+  # recorded workspace id is gone under EVERY label, and no workspace still
+  # carrying the expected home label holds the expected fm-<task> tab. Each
+  # collision below must stay mismatch (unknown upstream) so teardown never
+  # releases a live target's lease.
+  local dir fb identity out
+  dir="$TMP_ROOT/target-state-collisions"; mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[{"name":"default","running":true}]}\n' ;;
+  pane\ list*) printf '%s\n' "$FM_HERDR_PANES" ;;
+  workspace\ list*) printf '%s\n' "${FM_HERDR_WORKSPACES:-}" ;;
+  tab\ list*) printf '%s\n' "${FM_HERDR_TABS:-}" ;;
+esac
+SH
+  chmod +x "$dir/fakebin/herdr"
+  fb="$dir/fakebin"
+  identity='fm-task|w1|firstmate|w1:t2'
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w1","label":"2ndmate-other"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "a recorded workspace id recycled under a different label was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w9","label":"firstmate"}]}}' \
+    FM_HERDR_TABS='{"result":{"tabs":[{"tab_id":"w9:t1","workspace_id":"w9","label":"fm-task"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "an expected-label workspace still carrying the task tab was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 10
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_herdr_identity_state default:w1:p2 "$1")" = mismatch ] || exit 11
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = unknown ] || exit 12
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = unknown ] || exit 13
+  ' "$ROOT" "$identity" 2>&1) || fail "a live recorded pane with a missing exact workspace match was not fail-closed: $out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_PANES='{"result":{"panes":[]}}' \
+    FM_HERDR_WORKSPACES='{"result":{"workspaces":[{"workspace_id":"w9","label":"firstmate"}]}}' \
+    FM_HERDR_TABS='{"result":{"tabs":[{"tab_id":"w9:t1","workspace_id":"w9","label":"fm-other-task"}]}}' bash -c '
+    . "$0/bin/fm-backend.sh"
+    fm_backend_target_exists() { return 1; }
+    [ "$(fm_backend_target_state herdr default:w1:p2 "$1")" = absent ] || exit 11
+    [ "$(fm_backend_agent_alive herdr default:w1:p2 "$1")" = dead ] || exit 12
+  ' "$ROOT" "$identity" 2>&1) || fail "a replacement-generation workspace without the task tab blocked a true absence: $out"
+  pass "Herdr identity absence requires pane gone, workspace id gone under every label, and no expected-label task tab"
+}
+
 test_target_state_refuses_missing_recorded_pane_with_replacement() {
   local dir fb identity out
   dir="$TMP_ROOT/target-state-replacement"; mkdir -p "$dir/fakebin"
@@ -2156,6 +2216,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-26 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = herdr-identity-absence ]; then
+  test_target_state_distinguishes_absent_from_malformed_panes
+  test_target_state_refuses_absence_on_workspace_identity_collisions
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
@@ -2199,6 +2265,7 @@ test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
 test_managed_identity_rejects_reused_pane
 test_target_state_distinguishes_absent_from_malformed_panes
+test_target_state_refuses_absence_on_workspace_identity_collisions
 test_target_state_refuses_missing_recorded_pane_with_replacement
 test_target_state_refuses_missing_recorded_tab_with_same_label_replacement
 test_current_path_reads_cwd

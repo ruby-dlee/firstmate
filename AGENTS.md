@@ -34,7 +34,7 @@ Hard rules, in priority order:
    `bin/fm-teardown.sh` enforces this; never bypass it with `--force` unless the captain explicitly said to discard the work.
    Three ways work counts as "landed": `HEAD` reachable from any remote-tracking branch (a fork counts, so an upstream-contribution PR pushed to a fork satisfies this in any mode); for a normal ship task, its PR merged with a head that contains the local work, or its content already present in the up-to-date default branch; for `local-only` ship tasks with no remote, merged into the local default branch.
    Uncommitted changes are never landed.
-   The scout carve-out: a scout task's worktree is declared scratch from the start - its deliverable is the report, and teardown lets the worktree go once that report exists (section 7).
+   The scout carve-out: a scout task's worktree is declared scratch from the start - its deliverable is the report, and teardown lets the worktree go once the applicable report contract is satisfied (section 7; `docs/report-stack.md`).
    The full PR-containment mechanics and the `pr=` discovery fallback are owned by `bin/fm-teardown.sh`'s header, not restated here.
 4. **Crewmates never address the captain.**
    All crewmate communication flows through you.

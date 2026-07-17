@@ -166,6 +166,7 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
 Agent Fleet is a private CLI with no Firstmate-managed installer; obtain an approved release bundle from the maintainer, follow that bundle's installation instructions, and ensure `agent-fleet` is on `PATH` before enabling routing.
 Account routing is default-off, so an unchanged installation makes no Agent Fleet calls and preserves the legacy provider launch and task metadata.
+Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
 The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.
 The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
@@ -178,6 +179,7 @@ Managed task metadata records `account_pool=`, `account_profile=`, a home-namesp
 Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
 Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a newer SessionStart update after its local launch gate before committing the recovered lease.
 When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
+Continuation verifies a bounded repository identity before replacement and fails closed when the file, byte, enumeration, or time limit cannot cover the repository; the environment-variable table below owns those tuning defaults.
 Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
 If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
@@ -362,11 +364,17 @@ FM_ACCOUNT_SESSION_WAIT_SECONDS=10  # seconds a managed spawn waits for its requ
 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5  # seconds allowed per Agent Fleet session-status query
 FM_ACCOUNT_SESSION_SYNC_INTERVAL=60  # watcher cadence for reconciling missing managed provider-session mappings
 FM_ACCOUNT_SESSION_SYNC_TIMEOUT=5  # seconds allowed for each watcher reconciliation command
+FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=8  # seconds allowed per rotating watcher reconciliation worker
 FM_ACCOUNT_SESSION_MAX_PARALLEL=4  # maximum managed mappings attempted in one rotating watcher batch
 FM_ACCOUNT_NATIVE_READY_WAIT_SECONDS=5  # seconds sticky recovery waits for its native provider wrapper launch gate
 FM_ACCOUNT_CONTINUATION_STATUS_TIMEOUT=5  # seconds allowed for the no-mistakes status snapshot in a provider-neutral continuation packet
+FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES=100000  # maximum repository entries verified for a provider-neutral continuation
+FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository content bytes verified for a provider-neutral continuation
+FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
+FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=5  # seconds quota-balanced dispatch waits for each Agent Fleet pool summary
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
+FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
 HERDR_SESSION=default  # herdr-only: named session for normal backend ops; not enough for destructive cleanup (docs/herdr-backend.md)
 FM_BACKEND_HERDR_COMPOSER_LINES=20  # herdr-only: tail lines scanned by composer-state guard/fallback paths; idle-baseline submit confirmation uses agent-state
 FM_BACKEND_HERDR_IDLE_RE='^Type a message\.\.\.$'  # herdr-only: empty-composer placeholder regex after shared ghost extraction plus border and prompt stripping

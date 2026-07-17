@@ -11,6 +11,7 @@ The installed owner is a stable self-contained bundle, runs at boot and every fi
 Merging the code does not install or activate the owner.
 The authoritative visibility cutoff advances monotonically to the exact `now - 30 days` boundary and never advances past it.
 Physical cleanup waits for the report's five-minute cohort deadline and a later owner sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its 30-day minimum age.
+The cohort width plus owner sweep interval may total at most 15 days, bounding scheduled visibility removal and tombstoning to 45 days after completion while physical tombstone deletion remains best-effort and bounded per sweep.
 Expired entries are renamed to deletion tombstones before the index changes, and interrupted recursive deletion resumes from those tombstones without restoring partial entries.
 
 ## Completion contract

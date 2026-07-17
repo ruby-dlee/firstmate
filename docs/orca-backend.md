@@ -86,7 +86,7 @@ Operation routing:
 
 Teardown:
 
-- Scout teardown still requires `data/<id>/report.md` unless `--force` is explicitly used.
+- Scout teardown follows the shared completion and publication gate in [report-stack.md](report-stack.md); `--force` remains an explicit discard.
 - Ship teardown still refuses dirty or unlanded work before any terminal/worktree cleanup.
 - Ship teardown resolves `orca_worktree_id` back through Orca and verifies it matches the inspected `worktree=` path before removing anything; mismatches or uninspectable paths preserve metadata and fail closed.
 - After the existing firstmate safety checks pass, teardown closes the recorded Orca terminal and releases the recorded worktree through `orca worktree rm --worktree id:<orca_worktree_id> --force`.

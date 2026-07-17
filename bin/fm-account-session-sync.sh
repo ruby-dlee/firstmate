@@ -11,6 +11,7 @@
 # quietly non-zero so spawn or the watcher can retry later.
 # --require turns the missing mapping into a fail-closed recovery blocker.
 # --all scans a rotating bounded batch of managed metas that still lack provider_session_id.
+# --all bounds each worker with FM_ACCOUNT_SESSION_TASK_TIMEOUT (the query timeout plus two seconds by default).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

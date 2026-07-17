@@ -321,8 +321,9 @@ SH
   IFS=$'\t' read -r _parent parent_pid parent_pgid <<< "$parent"
   IFS=$'\t' read -r _child child_pid child_ppid child_pgid child_tty child_args <<< "$child"
 
-  [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null \
-    || fail "the detached fake server did not survive its launching shell"
+  if [ -z "$child_pid" ] || ! kill -0 "$child_pid" 2>/dev/null; then
+    fail "the detached fake server did not survive its launching shell"
+  fi
   [ "$child_pgid" != "$parent_pgid" ] \
     || fail "the detached fake server remained in the caller process group $parent_pgid"
   [ "$child_ppid" != "$parent_pid" ] \

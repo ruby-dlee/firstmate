@@ -188,6 +188,8 @@ fm_backend_herdr_server_launch_detached() {  # <session>
   perl_bin=$(command -v perl) || return 1
   command -v nohup >/dev/null 2>&1 || return 1
   (
+    # Dollar expressions in the single-quoted program below belong to Perl.
+    # shellcheck disable=SC2016
     HERDR_SESSION="$session" nohup "$perl_bin" -MPOSIX -e '
       my $pid = fork();
       defined $pid or die "first fork: $!";

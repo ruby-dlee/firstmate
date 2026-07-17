@@ -138,8 +138,13 @@ fm_afk_launch_lock_owned() {
 }
 
 fm_afk_launch_lock_identity() {
+  local path_identity token
   [ -d "$FM_AFK_LAUNCH_LOCK" ] && [ ! -L "$FM_AFK_LAUNCH_LOCK" ] || return 1
-  fm_afk_launch_path_identity "$FM_AFK_LAUNCH_LOCK"
+  path_identity=$(fm_afk_launch_path_identity "$FM_AFK_LAUNCH_LOCK") || return 1
+  # Filesystems can reuse an inode within the birth-time stat's one-second
+  # precision, so bind the path identity to this lock generation's token.
+  token=$(fm_afk_launch_read_control "$FM_AFK_LAUNCH_LOCK/token" 2>/dev/null || true)
+  printf '%s:%s\n' "$path_identity" "$token"
 }
 
 fm_afk_launch_atomic_rename() {

@@ -340,6 +340,7 @@ unit_stale_lock_reclaim_is_serialized() {
   for i in 1 2 3 4 5 6 7 8; do
     FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" MARKER="$marker" bash -c '
       . "$1"
+      fm_afk_launch_path_identity() { printf "reused-lock-identity\n"; }
       fm_afk_launch_lock_acquire || exit 1
       printf "%s\n" "$2" >> "$MARKER"
       sleep 0.02

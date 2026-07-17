@@ -24,7 +24,7 @@ Every required section must contain substantive body content, with an explicit `
 
 For `report_required` tasks, `fm-teardown.sh` first quiesces the endpoint and confirms it gone while failing closed on an alive or unknown state, then runs non-destructive safety validation including the Orca path match and worktree checks, reconciles rollback state, and publishes before releasing an account lease or removing a worktree.
 A safety refusal after quiescence preserves all work and metadata but leaves the crewmate endpoint stopped.
-If a required heading is absent, publication names every missing heading, identifies the exact report source to edit, and gives the publish and teardown retry commands.
+If a required heading is absent or lacks substantive content, publication names every missing or empty section, identifies the exact report source to edit, and gives the publish and teardown retry commands.
 Publication failure leaves the prior durable entry unchanged and stops teardown before destructive cleanup, preserving the task for repair and retry.
 Tasks that were already in flight at cutover lack the marker and retain the earlier teardown contract.
 An explicit `--force` teardown is a discard and does not create a completion report.

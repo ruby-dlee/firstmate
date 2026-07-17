@@ -47,19 +47,20 @@
 #
 # Why lock first: the old documented order (bootstrap, THEN lock) let a
 # SECOND concurrent session run bootstrap's mutating sweeps - fast-forwarding
-# secondmate homes, writing X-mode artifacts, fetching/fast-forwarding every
-# project clone - before ever discovering another session already holds the
-# lock. Two sessions racing those sweeps is exactly the hazard the lock
-# exists to prevent, so locking first closes the hole outright: only the
-# session that actually wins the lock ever touches shared mutable state.
+# secondmate homes, reconciling report-retention ownership, writing X-mode
+# artifacts, fetching/fast-forwarding every project clone - before ever
+# discovering another session already holds the lock. Two sessions racing
+# those sweeps is exactly the hazard the lock exists to prevent, so locking
+# first closes the hole outright: only the session that actually wins the
+# lock ever touches shared mutable state.
 #
 # The tradeoff this ordering accepts: a refused (read-only) session must not
 # go dark. So on refusal, bootstrap still runs (in FM_BOOTSTRAP_DETECT_ONLY=1
 # mode) for its read-only detect lines - missing tools, gh auth, the
-# worktree-tangle check, the harness override, crew-dispatch validation,
-# tasks-axi and quota-axi tool checks, and tasks-axi availability - none of
-# which mutate shared state and all of which are safe to compute from a second
-# session.
+# worktree-tangle check, the harness override, account-routing policy and
+# crew-dispatch validation, tasks-axi and quota-axi tool checks, and tasks-axi
+# availability - none of which mutate shared state and all of which are safe
+# to compute from a second session.
 # Only the five mutating sweeps and the wake-queue drain are skipped.
 # The context and fleet-state digests
 # below are always read-only, so they run unconditionally in both modes.

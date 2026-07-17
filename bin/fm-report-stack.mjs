@@ -46,6 +46,7 @@ const metadataLimit = 1024 * 1024;
 const manifestLimit = 1024 * 1024;
 const transactionLimit = 64 * 1024;
 const lockControlLimit = 4 * 1024;
+const reportLockWaitMs = 60_000;
 const visualEntryLimit = 512;
 const visualDepthLimit = 24;
 const visualBytesLimit = 20 * 1024 * 1024;
@@ -456,7 +457,8 @@ function acquireLock() {
   const pinnedTombstones = pinnedDirectory(".retention-tombstones", pinnedStackRoot.real, "report retention tombstone directory");
   retentionTombstoneDescriptor = pinnedTombstones.descriptor;
   const lock = path.join(stackRoot, ".publish.lock");
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  const lockDeadline = Date.now() + reportLockWaitMs;
+  while (Date.now() < lockDeadline) {
     const token = crypto.randomUUID();
     const candidate = path.join(stackRoot, `.publish.lock.candidate.${process.pid}.${token}`);
     try {

@@ -84,7 +84,7 @@ SH
 # A push workflow for an integrated commit can have main/origin-main at HEAD.
 # In that shape, its first parent is the pre-feature main baseline.
 resolve_base_ref() {  # [repo-root]
-  local root=${1:-$ROOT} ref ref_commit base head parent_count main_at_head
+  local root=${1:-$ROOT} ref ref_commit base head main_at_head
   head=$(git -C "$root" rev-parse HEAD) || return 1
   main_at_head=0
   for ref in origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD main refs/heads/main; do
@@ -103,15 +103,10 @@ resolve_base_ref() {  # [repo-root]
     git -C "$root" rev-parse "$head^1"
     return 0
   fi
-  parent_count=$(git -C "$root" rev-list --parents -n 1 "$head" | awk '{ print NF - 1 }')
-  if [ "$parent_count" -ge 2 ]; then
-    git -C "$root" rev-parse "$head^1"
-    return 0
-  fi
   return 1
 }
 BASE_REF=$(resolve_base_ref) \
-  || fail "fm-backend baseline requires a distinct main merge-base or an integrated commit first parent"
+  || fail "fm-backend baseline requires a distinct main merge-base or verified main-at-HEAD first parent"
 
 # --- shared: a pre-refactor bin/ shim --------------------------------------
 #
@@ -165,6 +160,30 @@ test_resolve_base_ref_uses_single_parent_when_main_is_head() {
   [ "$actual" = "$expected" ] \
     || fail "resolve_base_ref should use HEAD^1 when verified main is a single-parent HEAD"
   pass "resolve_base_ref: verified main-at-HEAD single-parent commits use their first parent"
+}
+
+test_resolve_base_ref_refuses_unverified_merge_parent() {
+  local repo actual
+  repo="$TMP_ROOT/base-unverified-merge"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" symbolic-ref HEAD refs/heads/topic
+  printf 'root\n' > "$repo/fixture"
+  git -C "$repo" add fixture
+  git -C "$repo" commit -qm root
+  git -C "$repo" branch side
+  printf 'topic\n' >> "$repo/fixture"
+  git -C "$repo" commit -qam topic
+  git -C "$repo" checkout -q side
+  printf 'side\n' > "$repo/side"
+  git -C "$repo" add side
+  git -C "$repo" commit -qm side
+  git -C "$repo" checkout -q topic
+  git -C "$repo" merge -q --no-edit side
+  if actual=$(resolve_base_ref "$repo"); then
+    fail "resolve_base_ref should refuse an unverified topic merge parent, got $actual"
+  fi
+  pass "resolve_base_ref: unverified topic merges do not supply a baseline"
 }
 
 test_herdr_required_tools_include_detached_launcher_dependencies() {
@@ -1304,6 +1323,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-34 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
+  test_resolve_base_ref_uses_single_parent_when_main_is_head
+  test_resolve_base_ref_refuses_unverified_merge_parent
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
@@ -1312,6 +1337,7 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
 fi
 
 test_resolve_base_ref_uses_single_parent_when_main_is_head
+test_resolve_base_ref_refuses_unverified_merge_parent
 test_herdr_required_tools_include_detached_launcher_dependencies
 test_backend_name_precedence
 test_backend_detect_precedence

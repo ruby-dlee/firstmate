@@ -279,6 +279,13 @@ It uses the same live secondmate discovery and propagation helper as bootstrap, 
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+### Herdr detached launcher prerequisites
+
+The Herdr adapter requires the exact `nohup` and `perl` commands on `PATH` for its portable detached `setsid` server launcher.
+Both commands ship with macOS and are commonly supplied by the platform's coreutils and Perl packages on other Unix-like systems.
+If bootstrap reports either command missing, restore or install the corresponding platform package, confirm it with `command -v nohup` or `command -v perl`, and rerun bootstrap.
+Bootstrap treats these as manual prerequisites because package names and command exposure differ across supported platforms.
+
 ## X mode (.env)
 
 X mode lets a firstmate instance answer public `@myfirstmate` mentions and act on normal reversible mention requests through firstmate's normal lifecycle.

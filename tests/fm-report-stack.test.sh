@@ -46,6 +46,7 @@ expire_report_entry() {  # <report.html> [completed-at] -> updated report.html
   local report_dir report_id cohort manifest destination
   report_dir=$(dirname "$entry")
   report_id=$(basename "$report_dir")
+  # shellcheck disable=SC2016
   cohort=$(node -e '
     const timestamp = Date.parse(process.argv[1]);
     const retention = 30 * 24 * 60 * 60 * 1000;

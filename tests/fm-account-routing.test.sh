@@ -2518,7 +2518,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
 }
 
 test_concurrent_continuations_serialize_before_mutation() {
-  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count second_lock_waiter
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
@@ -2539,7 +2539,18 @@ test_concurrent_continuations_serialize_before_mutation() {
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
   second_pid=$!
-  sleep 0.2
+  second_lock_waiter=
+  for _ in $(seq 1 100); do
+    second_lock_waiter=$(find "$HOME_DIR/state" -maxdepth 1 -type f \
+      -name ".account-lifecycle-$id.owner.*" -print -quit)
+    [ -n "$second_lock_waiter" ] && break
+    sleep 0.05
+  done
+  if [ -z "$second_lock_waiter" ]; then
+    touch "$gate"
+    kill "$first_pid" "$second_pid" 2>/dev/null || true
+    fail "second continuation never waited behind the first lifecycle owner"
+  fi
   touch "$gate"
   wait "$first_pid"
   first_rc=$?
@@ -4811,6 +4822,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = unknown-continuation ]; then
   run_isolated_test test_continuation_refuses_unknown_endpoint_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = concurrent-continuation ]; then
+  run_isolated_test test_concurrent_continuations_serialize_before_mutation
   exit 0
 fi
 

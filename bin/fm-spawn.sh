@@ -420,10 +420,10 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2
     exit 1
   }
-  [ "$current_spawn_meta" = "$SPAWN_META_SNAPSHOT" ] || {
-    echo "error: managed task generation changed before recovery mutation for ${POS[0]}" >&2
-    exit 1
-  }
+  # The early snapshot owns preflight refusals only. Once lifecycle ownership
+  # serializes recovery, refresh it so a waiter validates the committed
+  # replacement generation instead of rejecting that generation as stale.
+  SPAWN_META_SNAPSHOT=$current_spawn_meta
   rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}

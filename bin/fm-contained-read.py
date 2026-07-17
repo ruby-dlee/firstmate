@@ -23,6 +23,52 @@ def fail(message):
     raise RuntimeError(message)
 
 
+_completed_test_fifo_handshakes = set()
+
+
+def test_fifo_handshake(ready_name, proceed_name, payload, label):
+    ready_path = os.environ.get(ready_name)
+    proceed_path = os.environ.get(proceed_name)
+    if not ready_path and not proceed_path:
+        return
+    if not ready_path or not proceed_path:
+        fail(f"{label} requires both FIFO endpoints")
+    handshake = (ready_name, proceed_name)
+    if handshake in _completed_test_fifo_handshakes:
+        return
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    for path, endpoint in ((ready_path, "ready"), (proceed_path, "proceed")):
+        observed = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISFIFO(observed.st_mode):
+            fail(f"{label} {endpoint} endpoint must be a real FIFO")
+    ready = os.open(ready_path, os.O_WRONLY | os.O_NONBLOCK | nofollow)
+    proceed = os.open(proceed_path, os.O_RDONLY | os.O_NONBLOCK | nofollow)
+    selector = selectors.DefaultSelector()
+    try:
+        os.write(ready, payload.encode("utf-8"))
+        selector.register(proceed, selectors.EVENT_READ)
+        deadline = time.monotonic() + 10
+        permit = b""
+        while b"\n" not in permit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(timeout=remaining):
+                fail(f"{label} timed out")
+            chunk = os.read(proceed, 256)
+            if not chunk:
+                fail(f"{label} closed without a permit")
+            permit += chunk
+            if len(permit) > 256:
+                fail(f"{label} permit is oversized")
+        line, trailing = permit.split(b"\n", 1)
+        if line != b"continue" or trailing:
+            fail(f"{label} received an invalid permit")
+        _completed_test_fifo_handshakes.add(handshake)
+    finally:
+        selector.close()
+        os.close(ready)
+        os.close(proceed)
+
+
 def checked_root(descriptor):
     opened = os.fstat(descriptor)
     if not stat.S_ISDIR(opened.st_mode):
@@ -1680,16 +1726,12 @@ def command_publish_report_fd(arguments):
             if f"{moved_previous.st_dev}:{moved_previous.st_ino}" != previous_id:
                 fail("previous report generation changed during publication")
             displaced = True
-        rename_ready = os.environ.get("FM_CONTAINED_REPORT_RENAME_TEST_READY")
-        rename_proceed = os.environ.get("FM_CONTAINED_REPORT_RENAME_TEST_PROCEED")
-        if rename_ready and rename_proceed:
-            with open(rename_ready, "x", encoding="utf-8") as marker:
-                marker.write(f"{staged_name}\n")
-            deadline = time.monotonic() + 5
-            while not os.path.exists(rename_proceed):
-                if time.monotonic() >= deadline:
-                    fail("report rename test gate timed out")
-                time.sleep(0.01)
+        test_fifo_handshake(
+            "FM_CONTAINED_REPORT_RENAME_TEST_READY",
+            "FM_CONTAINED_REPORT_RENAME_TEST_PROCEED",
+            f"{staged_name}\n",
+            "report rename test gate",
+        )
         rename_noreplace(root, destination, staged_name, report_name)
         installed = os.stat(report_name, dir_fd=destination, follow_symlinks=False)
         if f"{installed.st_dev}:{installed.st_ino}" != staged_id:

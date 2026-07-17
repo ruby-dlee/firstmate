@@ -383,6 +383,280 @@ unit_abandoned_reclaim_is_recovered() {
   rm -rf "$st"
 }
 
+unit_reclaim_owner_liveness_is_tristate() {
+  local st lock owner_identity state
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-liveness.XXXXXX")
+  lock="$st/state/.afk-launch.lock"
+  mkdir -p "$lock"
+  printf '%s' "$$" > "$lock/pid"
+  : > "$lock/pid-identity"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_directory_owner_state "$FM_AFK_LAUNCH_LOCK"' _ "$LAUNCH")
+  [ "$state" = unknown ] || fail "launcher lock treated an empty owner identity as proof of death"
+  owner_identity=$( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$$" ) \
+    || { fail "launcher liveness fixture could not identify its live owner"; rm -rf "$st"; return; }
+  printf 'different-process-identity' > "$lock/pid-identity"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_directory_owner_state "$FM_AFK_LAUNCH_LOCK"' _ "$LAUNCH")
+  [ "$state" = dead ] || fail "launcher lock did not classify a reused owner PID as dead"
+  printf '%s' "$owner_identity" > "$lock/pid-identity"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
+    '. "$1"; fm_afk_launch_directory_owner_state "$FM_AFK_LAUNCH_LOCK"' _ "$LAUNCH")
+  [ "$state" = alive ] || fail "launcher lock did not classify exact process ownership as alive"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_pid_identity() { return 1; }
+    fm_afk_launch_pid_existence_state() { printf "exists\n"; }
+    fm_afk_launch_directory_owner_state "$FM_AFK_LAUNCH_LOCK"
+  ' _ "$LAUNCH")
+  [ "$state" = unknown ] || fail "launcher lock treated an identity-probe error as proof of death"
+  rm -rf "$st"
+  pass "launcher reclaim liveness distinguishes alive, dead, and unknown owners"
+}
+
+unit_reclaim_test_handshake_requires_inherited_fds() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-test-seam.XXXXXX")
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    FM_AFK_LAUNCH_RECLAIM_TEST_READY="$st/ready" \
+    FM_AFK_LAUNCH_RECLAIM_TEST_PROCEED="$st/proceed" \
+    FM_AFK_LAUNCH_RECLAIM_TEST_PHASES=probe bash -c '
+      . "$1"
+      ! fm_afk_launch_reclaim_test_handshake probe
+    ' _ "$LAUNCH" && [ ! -e "$st/ready" ] && [ ! -e "$st/proceed" ]; then
+    pass "launcher reclaim test seam accepts inherited numeric descriptors only"
+  else
+    fail "launcher reclaim test seam accepted an arbitrary path"
+  fi
+  rm -rf "$st"
+}
+
+unit_namespace_guard_releases_when_owner_crashes() {
+  local st event owner waiter phase waiter_status=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-namespace-crash.XXXXXX")
+  event="$st/event"
+  mkdir -p "$st/state"
+  mkfifo "$event"
+  exec 8<> "$event"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_state_prepare
+    fm_afk_launch_namespace_guard_acquire
+    [ "$FM_AFK_LAUNCH_NAMESPACE_GUARD_HELD" -eq 1 ]
+    [ -z "$FM_AFK_LAUNCH_NAMESPACE_GUARD_PID" ]
+    printf "owner-held\n" >&8
+    while :; do :; done
+  ' _ "$LAUNCH" > "$st/owner.out" 2>&1 &
+  owner=$!
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != owner-held ]; then
+    fail "launcher namespace-guard owner did not acquire the kernel lock"
+    kill -KILL "$owner" 2>/dev/null || true; wait "$owner" 2>/dev/null || true
+    exec 8>&-; rm -rf "$st"; return
+  fi
+  kill -KILL "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_namespace_guard_acquire
+    printf "waiter-acquired\n" >&8
+    fm_afk_launch_namespace_guard_release
+  ' _ "$LAUNCH" > "$st/waiter.out" 2>&1 &
+  waiter=$!
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != waiter-acquired ]; then
+    fail "launcher namespace guard remained locked after its owner was killed"
+    kill -KILL "$waiter" 2>/dev/null || true; wait "$waiter" 2>/dev/null || true
+    exec 8>&-; rm -rf "$st"; return
+  fi
+  wait "$waiter" || waiter_status=$?
+  [ "$waiter_status" -eq 0 ] \
+    || fail "launcher namespace-guard waiter failed after owner crash: $(cat "$st/waiter.out")"
+  if find "$st/state" -maxdepth 1 -type d -name '.afk-namespace-guard.*' | grep . >/dev/null 2>&1; then
+    fail "launcher namespace guard left private FIFO state after owner crash"
+  fi
+  exec 8>&-
+  rm -rf "$st"
+  pass "launcher namespace guard releases and cleans up when its owning shell is killed"
+}
+
+unit_abandoned_reclaim_parent_aba_is_fenced() {
+  local st lock old preserved ready proceed child phase owner_identity child_status=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-abandoned-aba.XXXXXX")
+  lock="$st/state/.afk-launch.lock"
+  old="$st/old-lock"
+  preserved="$st/preserved-live-lock"
+  ready="$st/ready"
+  proceed="$st/proceed"
+  mkdir -p "$lock/.reclaim"
+  printf '%s' "$$" > "$lock/pid"
+  printf 'different-process-identity' > "$lock/pid-identity"
+  printf 'stale-parent' > "$lock/token"
+  printf '%s' "$$" > "$lock/.reclaim/pid"
+  printf 'different-process-identity' > "$lock/.reclaim/pid-identity"
+  printf 'abandoned' > "$lock/.reclaim/token"
+  owner_identity=$( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$$" ) \
+    || { fail "launcher abandoned-reclaim ABA fixture could not identify its live owner"; rm -rf "$st"; return; }
+  mkfifo "$ready" "$proceed"
+  exec 8<> "$ready"
+  exec 9<> "$proceed"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS=0 \
+    FM_AFK_LAUNCH_RECLAIM_TEST_READY=8 FM_AFK_LAUNCH_RECLAIM_TEST_PROCEED=9 \
+    FM_AFK_LAUNCH_RECLAIM_TEST_PHASES=abandoned-before-revalidate:abandoned-after-revalidate:abandoned-after-quarantine:abandoned-quarantine-restored \
+    bash -c '. "$1"; fm_afk_launch_lock_acquire; rc=$?; [ "$rc" -ne 0 ] || fm_afk_launch_lock_release; exit "$rc"' \
+      _ "$LAUNCH" > "$st/child.out" 2>&1 &
+  child=$!
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != abandoned-before-revalidate ]; then
+    fail "launcher abandoned-reclaim ABA did not reach its pre-revalidation fence"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != abandoned-after-revalidate ]; then
+    fail "launcher abandoned-reclaim ABA did not reach the guarded post-revalidation point"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  mv "$lock" "$old"
+  mkdir -p "$lock/.reclaim"
+  printf '%s' "$$" > "$lock/pid"
+  printf '%s' "$owner_identity" > "$lock/pid-identity"
+  printf 'live-parent' > "$lock/token"
+  printf 'new-parent-sentinel' > "$lock/sentinel"
+  printf '%s' "$$" > "$lock/.reclaim/pid"
+  printf '%s' "$owner_identity" > "$lock/.reclaim/pid-identity"
+  printf 'live-reclaim' > "$lock/.reclaim/token"
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != abandoned-after-quarantine ]; then
+    fail "launcher abandoned-reclaim ABA did not expose its guarded quarantine checkpoint"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != abandoned-quarantine-restored ]; then
+    fail "launcher abandoned-reclaim ABA did not restore the swapped reclaim generation"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  [ "$(cat "$lock/sentinel" 2>/dev/null || true)" = new-parent-sentinel ] \
+    || fail "launcher abandoned-reclaim ABA changed the newer parent generation"
+  [ "$(cat "$lock/.reclaim/token" 2>/dev/null || true)" = live-reclaim ] \
+    || fail "launcher abandoned-reclaim ABA renamed or deleted the newer live reclaim"
+  if find "$lock" -maxdepth 1 -name '.reclaim.stale.*' | grep . >/dev/null 2>&1; then
+    fail "launcher abandoned-reclaim ABA stranded the newer reclaim in quarantine"
+  fi
+  mv "$lock" "$preserved"
+  mv "$old" "$lock"
+  printf 'proceed\n' >&9
+  wait "$child" || child_status=$?
+  [ "$child_status" -eq 0 ] || fail "launcher abandoned-reclaim ABA child failed: $(cat "$st/child.out")"
+  [ "$(cat "$preserved/sentinel" 2>/dev/null || true)" = new-parent-sentinel ] \
+    || fail "launcher abandoned-reclaim ABA did not preserve the swapped live generation"
+  [ "$(cat "$preserved/.reclaim/token" 2>/dev/null || true)" = live-reclaim ] \
+    || fail "launcher abandoned-reclaim ABA did not preserve live reclaim ownership"
+  [ ! -e "$lock" ] || fail "launcher abandoned-reclaim ABA retained its final acquired lock"
+  exec 8>&-
+  exec 9>&-
+  rm -rf "$st"
+  pass "launcher abandoned reclaim revalidates parent, reclaim, and liveness before quarantine"
+}
+
+unit_claimed_parent_swap_restores_quarantine() {
+  local st lock old preserved ready proceed child third phase owner_identity child_status=0 third_status=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-claimed-aba.XXXXXX")
+  lock="$st/state/.afk-launch.lock"
+  old="$st/old-lock"
+  preserved="$st/preserved-live-lock"
+  ready="$st/ready"
+  proceed="$st/proceed"
+  mkdir -p "$lock"
+  printf '%s' "$$" > "$lock/pid"
+  printf 'different-process-identity' > "$lock/pid-identity"
+  printf 'stale-parent' > "$lock/token"
+  owner_identity=$( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$$" ) \
+    || { fail "launcher claimed-parent ABA fixture could not identify its live owner"; rm -rf "$st"; return; }
+  mkfifo "$ready" "$proceed"
+  exec 8<> "$ready"
+  exec 9<> "$proceed"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_RECLAIM_GRACE_SECONDS=0 \
+    FM_AFK_LAUNCH_RECLAIM_TEST_READY=8 FM_AFK_LAUNCH_RECLAIM_TEST_PROCEED=9 \
+    FM_AFK_LAUNCH_RECLAIM_TEST_PHASES=claimed-before-revalidate:claimed-after-revalidate:claimed-after-quarantine:claimed-quarantine-restored \
+    bash -c '. "$1"; fm_afk_launch_lock_acquire; rc=$?; [ "$rc" -ne 0 ] || fm_afk_launch_lock_release; exit "$rc"' \
+      _ "$LAUNCH" > "$st/child.out" 2>&1 &
+  child=$!
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != claimed-before-revalidate ]; then
+    fail "launcher claimed-parent ABA did not reach final generation revalidation"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != claimed-after-revalidate ]; then
+    fail "launcher claimed-parent ABA did not reach the post-fence rename point"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  mv "$lock" "$old"
+  mkdir "$lock"
+  printf '%s' "$$" > "$lock/pid"
+  printf '%s' "$owner_identity" > "$lock/pid-identity"
+  printf 'live-parent' > "$lock/token"
+  printf 'new-parent-sentinel' > "$lock/sentinel"
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != claimed-after-quarantine ]; then
+    fail "launcher claimed-parent ABA did not reach its guarded post-quarantine checkpoint"
+    kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    printf "third-started\n" >&8
+    . "$1"
+    fm_afk_launch_lock_acquire || exit 1
+    printf "third-acquired\n" >&8
+    fm_afk_launch_lock_release
+  ' _ "$LAUNCH" > "$st/third.out" 2>&1 &
+  third=$!
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != third-started ]; then
+    fail "launcher namespace-guard contender did not start during the canonical-name gap"
+    kill "$child" "$third" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true; wait "$third" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  printf 'proceed\n' >&9
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != claimed-quarantine-restored ]; then
+    fail "launcher claimed-parent ABA did not restore the mismatched quarantine"
+    [ "$phase" != third-acquired ] \
+      || fail "launcher namespace guard admitted a third installer before quarantine restoration"
+    kill "$child" "$third" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true; wait "$third" 2>/dev/null || true
+    exec 8>&-; exec 9>&-; rm -rf "$st"; return
+  fi
+  [ "$(cat "$lock/sentinel" 2>/dev/null || true)" = new-parent-sentinel ] \
+    || fail "launcher claimed-parent ABA did not restore the newer parent generation"
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = live-parent ] \
+    || fail "launcher claimed-parent ABA restored the wrong lock generation"
+  if find "$st/state" -maxdepth 1 -name '.afk-launch.lock.stale.*' | grep . >/dev/null 2>&1; then
+    fail "launcher claimed-parent ABA leaked the restored live generation in quarantine"
+  fi
+  mv "$lock" "$preserved"
+  rm -rf "$old"
+  printf 'proceed\n' >&9
+  wait "$child" || child_status=$?
+  [ "$child_status" -eq 0 ] || fail "launcher claimed-parent ABA child failed: $(cat "$st/child.out")"
+  if ! IFS= read -r -t 5 phase <&8 || [ "$phase" != third-acquired ]; then
+    fail "launcher namespace guard did not admit the third installer after restoration completed"
+  fi
+  wait "$third" || third_status=$?
+  [ "$third_status" -eq 0 ] || fail "launcher namespace-guard contender failed: $(cat "$st/third.out")"
+  [ "$(cat "$preserved/sentinel" 2>/dev/null || true)" = new-parent-sentinel ] \
+    || fail "launcher claimed-parent ABA changed the preserved live generation"
+  [ ! -e "$lock" ] || fail "launcher claimed-parent ABA retained its final acquired lock"
+  if find "$st/state" -maxdepth 1 -name '.afk-launch.lock.stale.*' | grep . >/dev/null 2>&1; then
+    fail "launcher claimed-parent ABA left quarantine state after recovery"
+  fi
+  exec 8>&-
+  exec 9>&-
+  rm -rf "$st"
+  pass "launcher post-fence parent swaps restore the live generation on mismatch or control-read failure"
+}
+
 unit_launcher_lock_symlinks_are_refused() {
   local st outside out rc
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-symlink.XXXXXX")
@@ -1822,6 +2096,18 @@ if [ "${FM_TEST_FOCUSED:-}" = signal-lock-cleanup ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = afk-lock-aba ]; then
+  unit_stale_lock_reclaim_is_serialized
+  unit_abandoned_reclaim_is_recovered
+  unit_reclaim_owner_liveness_is_tristate
+  unit_reclaim_test_handshake_requires_inherited_fds
+  unit_namespace_guard_releases_when_owner_crashes
+  unit_abandoned_reclaim_parent_aba_is_fenced
+  unit_claimed_parent_swap_restores_quarantine
+  [ "$FAILED" -eq 0 ] || exit 1
+  exit 0
+fi
+
 unit_detached_daemons_receive_state_override
 unit_clear_stale
 unit_fresh_vs_refresh
@@ -1835,6 +2121,11 @@ unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_stale_lock_reclaim_is_serialized
 unit_abandoned_reclaim_is_recovered
+unit_reclaim_owner_liveness_is_tristate
+unit_reclaim_test_handshake_requires_inherited_fds
+unit_namespace_guard_releases_when_owner_crashes
+unit_abandoned_reclaim_parent_aba_is_fenced
+unit_claimed_parent_swap_restores_quarantine
 unit_launcher_lock_symlinks_are_refused
 unit_launcher_control_files_are_bounded_and_nonfollowing
 unit_terminal_record_symlink_is_malformed

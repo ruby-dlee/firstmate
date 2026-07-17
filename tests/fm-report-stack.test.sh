@@ -1432,59 +1432,256 @@ test_stale_lock_reclaim_is_serialized() {
   pass "report stack serializes concurrent stale-lock reclamation"
 }
 
-test_reclaim_guard_fences_the_stale_generation_gap() {
-  local stack="$TMP_ROOT/reclaim-fence-stack" reclaimer_ready reclaimer_proceed waiter_seen waiter_acquired
-  local reclaimer_out waiter_out reclaimer_pid waiter_pid reclaimer_status waiter_status
-  mkdir -p "$stack/.publish.lock"
-  printf '{"pid":%s,"startedAt":"different-process-start"}\n' "$$" > "$stack/.publish.lock/owner"
-  touch -t 200001010000 "$stack/.publish.lock"
-  reclaimer_ready="$TMP_ROOT/reclaim-fence.ready"
-  reclaimer_proceed="$TMP_ROOT/reclaim-fence.proceed"
-  waiter_seen="$TMP_ROOT/reclaim-waiter-seen.ready"
-  waiter_acquired="$TMP_ROOT/reclaim-waiter-acquired.ready"
-  reclaimer_out="$TMP_ROOT/reclaim-fence.out"
-  waiter_out="$TMP_ROOT/reclaim-waiter.out"
+test_install_guard_release_failure_cleans_owned_lock() {
+  local stack="$TMP_ROOT/install-guard-release-stack" out status residue
+  mkdir -p "$stack"
+  out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_INSTALL_GUARD_RELEASE_TEST_FAILURE=1 "$SCRIPT" render 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "synthetic install-guard release failure exited successfully"
+  assert_contains "$out" "synthetic report install-guard release failure" \
+    "install-guard release failure was not observable"
+  assert_absent "$stack/.publish.lock" \
+    "install-guard release failure retained its newly installed canonical lock"
+  assert_present "$stack/.publish.lock.reclaim" \
+    "install-guard release failure did not leave an owned recoverable guard"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" render >/dev/null \
+    || fail "next publisher did not recover the failed install guard"
+  assert_absent "$stack/.publish.lock" "recovery retained the canonical publication lock"
+  assert_absent "$stack/.publish.lock.reclaim" "recovery retained the install guard"
+  residue=$(find "$stack" -maxdepth 1 \( \
+    -name '.publish.lock.candidate.*' -o \
+    -name '.publish.lock.reclaim.candidate.*' -o \
+    -name '.publish.lock.reclaim.pin.*' -o \
+    -name '..publish.lock.reclaim.removed.*' -o \
+    -name '..publish.lock.released.*' -o \
+    -name '.publish.lock.stale.*' \
+    \) -print)
+  [ -z "$residue" ] || fail "install-guard recovery leaked owned residue: $residue"
+  pass "install-guard release failure cleans its lock and remains recoverable"
+}
+
+test_post_install_guard_owner_death_is_recovered() {
+  local stack="$TMP_ROOT/post-install-owner-death-stack"
+  local precheck_ready="$TMP_ROOT/post-install-precheck.ready"
+  local precheck_proceed="$TMP_ROOT/post-install-precheck.proceed"
+  local owner_ready="$TMP_ROOT/post-install-owner.ready"
+  local owner_proceed="$TMP_ROOT/post-install-owner.proceed"
+  local observed_ready="$TMP_ROOT/post-install-observed.ready"
+  local observed_proceed="$TMP_ROOT/post-install-observed.proceed"
+  local acquired_ready="$TMP_ROOT/post-install-acquired.ready"
+  local acquired_proceed="$TMP_ROOT/post-install-acquired.proceed"
+  local owner_out="$TMP_ROOT/post-install-owner.out"
+  local waiter_out="$TMP_ROOT/post-install-waiter.out"
+  local owner_pid waiter_pid owner_status waiter_status state started_at elapsed residue
+  mkdir -p "$stack"
+  mkfifo "$precheck_ready" "$precheck_proceed" "$owner_ready" "$owner_proceed" \
+    "$observed_ready" "$observed_proceed" "$acquired_ready" "$acquired_proceed"
+  exec 7<>"$precheck_ready"
+  exec 8<>"$precheck_proceed"
+  exec 9<>"$owner_ready"
+  exec 10<>"$owner_proceed"
+  exec 11<>"$observed_ready"
+  exec 12<>"$observed_proceed"
+  exec 13<>"$acquired_ready"
+  exec 14<>"$acquired_proceed"
 
   FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
-    FM_REPORT_RECLAIM_TEST_READY="$reclaimer_ready" FM_REPORT_RECLAIM_TEST_PROCEED="$reclaimer_proceed" \
-    "$SCRIPT" render > "$reclaimer_out" 2>&1 &
-  reclaimer_pid=$!
-  for _ in $(seq 1 1000); do
-    [ -e "$reclaimer_ready" ] && break
-    kill -0 "$reclaimer_pid" 2>/dev/null || break
-    sleep 0.01
-  done
-  [ -e "$reclaimer_ready" ] || {
-    kill -TERM "$reclaimer_pid" 2>/dev/null || true
-    fail "report reclaimer did not enter its fenced generation gap: $(cat "$reclaimer_out")"
-  }
-
-  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
-    FM_REPORT_RECLAIM_WAITER_TEST_READY="$waiter_seen" FM_REPORT_LOCK_TEST_READY="$waiter_acquired" \
+    FM_REPORT_LOCK_PRECHECK_TEST_READY="$precheck_ready" \
+    FM_REPORT_LOCK_PRECHECK_TEST_PROCEED="$precheck_proceed" \
+    FM_REPORT_RECLAIM_WAITER_TEST_READY="$observed_ready" \
+    FM_REPORT_RECLAIM_WAITER_TEST_PROCEED="$observed_proceed" \
+    FM_REPORT_LOCK_ACQUIRED_TEST_READY="$acquired_ready" \
+    FM_REPORT_LOCK_ACQUIRED_TEST_PROCEED="$acquired_proceed" \
     "$SCRIPT" render > "$waiter_out" 2>&1 &
   waiter_pid=$!
-  for _ in $(seq 1 1000); do
-    [ -e "$waiter_seen" ] && break
-    kill -0 "$waiter_pid" 2>/dev/null || break
-    sleep 0.01
-  done
-  [ -e "$waiter_seen" ] || {
-    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
-    fail "report waiter did not observe the active reclaim guard: $(cat "$waiter_out")"
-  }
-  [ ! -e "$waiter_acquired" ] || {
-    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
-    fail "report waiter acquired a replacement lock before stale reclamation released its guard"
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "report waiter did not reach its pre-install check: $(cat "$waiter_out")"
+  fi
+  [ "$state" = "guard-absent" ] || {
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "report waiter emitted an unexpected pre-install state: $state"
   }
 
-  touch "$reclaimer_proceed"
-  if wait "$reclaimer_pid"; then reclaimer_status=0; else reclaimer_status=$?; fi
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_INSTALLED_GUARD_TEST_READY="$owner_ready" \
+    FM_REPORT_LOCK_INSTALLED_GUARD_TEST_PROCEED="$owner_proceed" \
+    "$SCRIPT" render > "$owner_out" 2>&1 &
+  owner_pid=$!
+  if ! IFS= read -r -t 10 state <&9; then
+    kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report owner did not pause after installing its lock: $(cat "$owner_out")"
+  fi
+  [ "$state" = "lock-installed-guard-held" ] || {
+    kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report owner emitted an unexpected post-install state: $state"
+  }
+  assert_present "$stack/.publish.lock" "post-install owner did not install the canonical lock"
+  assert_present "$stack/.publish.lock.reclaim" "post-install owner released its guard before the crash gate"
+
+  printf 'continue\n' >&8
+  if ! IFS= read -r -t 10 state <&11; then
+    kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
+    fail "already-running report waiter did not observe the installed owner's guard: $(cat "$waiter_out")"
+  fi
+  [ "$state" = "guard-observed" ] || {
+    kill -TERM "$owner_pid" "$waiter_pid" 2>/dev/null || true
+    fail "already-running report waiter emitted an unexpected guard state: $state"
+  }
+
+  started_at=$(date +%s)
+  kill -TERM "$owner_pid" 2>/dev/null || true
+  if wait "$owner_pid"; then owner_status=0; else owner_status=$?; fi
+  [ "$owner_status" -ne 0 ] || fail "synthetically terminated post-install owner exited successfully"
+  printf 'continue\n' >&10
+  printf 'continue\n' >&12
+  if ! IFS= read -r -t 10 state <&13; then
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "report waiter did not recover the freshly installed dead-owner lock: $(cat "$waiter_out")"
+  fi
+  [ "$state" = "lock-acquired" ] || {
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "recovered report waiter emitted an unexpected acquisition state: $state"
+  }
+  assert_present "$stack/.publish.lock" "recovered report waiter did not own the canonical lock"
+  assert_absent "$stack/.publish.lock.reclaim" "recovered report waiter retained the outer guard"
+  printf 'continue\n' >&14
   if wait "$waiter_pid"; then waiter_status=0; else waiter_status=$?; fi
-  [ "$reclaimer_status" -eq 0 ] || fail "fenced report reclaimer failed: $(cat "$reclaimer_out")"
+  elapsed=$(( $(date +%s) - started_at ))
+  [ "$waiter_status" -eq 0 ] || fail "fresh dead-owner recovery failed: $(cat "$waiter_out")"
+  [ "$elapsed" -le 15 ] || fail "fresh dead-owner recovery took ${elapsed}s"
+  assert_absent "$stack/.publish.lock" "fresh dead-owner recovery retained the canonical lock"
+  assert_absent "$stack/.publish.lock.reclaim" "fresh dead-owner recovery retained the outer guard"
+  residue=$(find "$stack" -maxdepth 1 \( \
+    -name '.publish.lock.candidate.*' -o \
+    -name '.publish.lock.reclaim.candidate.*' -o \
+    -name '.publish.lock.reclaim.pin.*' -o \
+    -name '..publish.lock.reclaim.removed.*' -o \
+    -name '..publish.lock.released.*' -o \
+    -name '.publish.lock.stale.*' \
+    \) -print)
+  [ -z "$residue" ] || fail "fresh dead-owner recovery leaked owned residue: $residue"
+  exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-; exec 11>&-; exec 12>&-
+  exec 13>&-; exec 14>&-
+  pass "already-running report waiters recover a freshly installed dead-owner lock"
+}
+
+test_reclaim_guard_fences_the_stale_generation_gap() {
+  local stack="$TMP_ROOT/reclaim-fence-stack" precheck_ready precheck_proceed
+  local reclaimer_ready reclaimer_proceed waiter_ready waiter_proceed acquired_ready acquired_proceed
+  local released_ready released_proceed
+  local reclaimer_out waiter_out reclaimer_pid waiter_pid reclaimer_status waiter_status
+  local precheck_state waiter_state started_at elapsed
+  mkdir -p "$stack"
+  precheck_ready="$TMP_ROOT/reclaim-precheck.ready"
+  precheck_proceed="$TMP_ROOT/reclaim-precheck.proceed"
+  reclaimer_ready="$TMP_ROOT/reclaim-fence.ready"
+  reclaimer_proceed="$TMP_ROOT/reclaim-fence.proceed"
+  waiter_ready="$TMP_ROOT/reclaim-waiter.ready"
+  waiter_proceed="$TMP_ROOT/reclaim-waiter.proceed"
+  acquired_ready="$TMP_ROOT/reclaim-acquired.ready"
+  acquired_proceed="$TMP_ROOT/reclaim-acquired.proceed"
+  released_ready="$TMP_ROOT/reclaim-released.ready"
+  released_proceed="$TMP_ROOT/reclaim-released.proceed"
+  reclaimer_out="$TMP_ROOT/reclaim-fence.out"
+  waiter_out="$TMP_ROOT/reclaim-waiter.out"
+  mkfifo "$precheck_ready" "$precheck_proceed" "$reclaimer_ready" "$reclaimer_proceed" \
+    "$waiter_ready" "$waiter_proceed" "$released_ready" "$released_proceed" \
+    "$acquired_ready" "$acquired_proceed"
+  exec 7<>"$precheck_ready"
+  exec 8<>"$precheck_proceed"
+  exec 9<>"$reclaimer_ready"
+  exec 10<>"$reclaimer_proceed"
+  exec 11<>"$waiter_ready"
+  exec 12<>"$waiter_proceed"
+  exec 13<>"$acquired_ready"
+  exec 14<>"$acquired_proceed"
+  exec 15<>"$released_ready"
+  exec 16<>"$released_proceed"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_PRECHECK_TEST_READY="$precheck_ready" FM_REPORT_LOCK_PRECHECK_TEST_PROCEED="$precheck_proceed" \
+    FM_REPORT_RECLAIM_WAITER_TEST_READY="$waiter_ready" FM_REPORT_RECLAIM_WAITER_TEST_PROCEED="$waiter_proceed" \
+    FM_REPORT_RECLAIM_GUARD_RELEASED_TEST_READY="$released_ready" \
+    FM_REPORT_RECLAIM_GUARD_RELEASED_TEST_PROCEED="$released_proceed" \
+    FM_REPORT_LOCK_ACQUIRED_TEST_READY="$acquired_ready" FM_REPORT_LOCK_ACQUIRED_TEST_PROCEED="$acquired_proceed" \
+    "$SCRIPT" render > "$waiter_out" 2>&1 &
+  waiter_pid=$!
+  if ! IFS= read -r -t 10 precheck_state <&7; then
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "report contender did not reach its prechecked state: $(cat "$waiter_out")"
+  fi
+  [ "$precheck_state" = "guard-absent" ] || {
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "report contender observed an unexpected precheck state: $precheck_state"
+  }
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_INSTALL_GUARD_TEST_READY="$reclaimer_ready" FM_REPORT_INSTALL_GUARD_TEST_PROCEED="$reclaimer_proceed" \
+    "$SCRIPT" render > "$reclaimer_out" 2>&1 &
+  reclaimer_pid=$!
+  if ! IFS= read -r -t 10 waiter_state <&9; then
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report publisher did not pause while holding the install guard: $(cat "$reclaimer_out")"
+  fi
+  [ "$waiter_state" = "install-guard-held" ] || {
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "report install-guard owner emitted an unexpected gate state: $waiter_state"
+  }
+
+  printf 'continue\n' >&8
+  if ! IFS= read -r -t 10 waiter_state <&11; then
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender did not observe the active reclaim guard: $(cat "$waiter_out")"
+  fi
+  [ "$waiter_state" = "guard-observed" ] || {
+    kill -TERM "$reclaimer_pid" "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender emitted an unexpected guard state: $waiter_state"
+  }
+  assert_absent "$stack/.publish.lock" \
+    "prechecked contender installed a replacement lock while the reclaim guard was held"
+  assert_present "$stack/.publish.lock.reclaim" \
+    "prechecked contender did not remain behind the publisher's install guard"
+
+  started_at=$(date +%s)
+  kill -TERM "$reclaimer_pid" 2>/dev/null || true
+  if wait "$reclaimer_pid"; then reclaimer_status=0; else reclaimer_status=$?; fi
+  [ "$reclaimer_status" -ne 0 ] || fail "synthetically terminated install-guard owner exited successfully"
+  printf 'continue\n' >&10
+  printf 'continue\n' >&12
+  if ! IFS= read -r -t 10 waiter_state <&15; then
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender did not release the dead reclaim guard: $(cat "$waiter_out")"
+  fi
+  [ "$waiter_state" = "guard-released" ] || {
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender emitted an unexpected guard-release state: $waiter_state"
+  }
+  assert_absent "$stack/.publish.lock.reclaim" "dead reclaim guard remained after its release event"
+  assert_absent "$stack/.publish.lock" "report contender installed before its guard-release event completed"
+  printf 'continue\n' >&16
+  if ! IFS= read -r -t 10 waiter_state <&13; then
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender did not acquire after guard-owner death: $(cat "$waiter_out")"
+  fi
+  [ "$waiter_state" = "lock-acquired" ] || {
+    kill -TERM "$waiter_pid" 2>/dev/null || true
+    fail "prechecked report contender emitted an unexpected acquisition state: $waiter_state"
+  }
+  assert_present "$stack/.publish.lock" "guard-released contender did not own the canonical report lock"
+  assert_absent "$stack/.publish.lock.reclaim" "guard-released contender acquired before reclaim-guard cleanup"
+  printf 'continue\n' >&14
+  if wait "$waiter_pid"; then waiter_status=0; else waiter_status=$?; fi
+  elapsed=$(( $(date +%s) - started_at ))
   [ "$waiter_status" -eq 0 ] || fail "fenced report waiter failed: $(cat "$waiter_out")"
+  [ "$elapsed" -le 15 ] || fail "report waiter took ${elapsed}s to recover its dead reclaim-guard owner"
   assert_absent "$stack/.publish.lock" "fenced stale-lock test retained the publication lock"
   assert_absent "$stack/.publish.lock.reclaim" "fenced stale-lock test retained the reclaim guard"
-  pass "report reclaim guard fences the absent-lock generation gap"
+  exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-; exec 11>&-; exec 12>&-
+  exec 13>&-; exec 14>&-; exec 15>&-; exec 16>&-
+  pass "report install guard fences a negative precheck and is recovered inside the wait budget"
 }
 
 test_abandoned_reclaim_guard_is_recovered() {
@@ -3326,22 +3523,22 @@ test_report_publication_restores_swapped_staging_generation() {
   write_required_report "$HOME_DIR/data/$id/completion.md" "Replacement report attempt."
   ready="$TMP_ROOT/report-publish-generation.ready"; proceed="$TMP_ROOT/report-publish-generation.proceed"
   output="$TMP_ROOT/report-publish-generation.out"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
   FM_CONTAINED_REPORT_RENAME_TEST_READY="$ready" FM_CONTAINED_REPORT_RENAME_TEST_PROCEED="$proceed" \
     run_stack publish "$id" > "$output" 2>&1 &
   pid=$!
-  for _ in $(seq 1 1000); do
-    [ -e "$ready" ] && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.02
-  done
-  [ -e "$ready" ] \
-    || { kill -TERM "$pid" 2>/dev/null || true; fail "report generation rename gate did not open: $(cat "$output")"; }
-  staged="$STACK/entries/$(cat "$ready")"
+  if ! IFS= read -r -t 10 staged <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "report generation rename gate did not open: $(cat "$output")"
+  fi
+  staged="$STACK/entries/$staged"
   saved="$staged.saved"
   mv "$staged" "$saved"
   mkdir "$staged"
   printf 'unowned replacement\n' > "$staged/sentinel"
-  touch "$proceed"
+  printf 'continue\n' >&8
   if wait "$pid"; then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "report publication accepted a swapped staging generation"
   assert_grep 'Original published report' "$(dirname "$entry")/report.md" \
@@ -3351,6 +3548,7 @@ test_report_publication_restores_swapped_staging_generation() {
     "failed report publication did not restore the unowned staging replacement"
   assert_present "$saved/manifest.json" "failed report publication lost its displaced owned staging generation"
   rm -rf "$staged" "$saved"
+  exec 7>&-; exec 8>&-
   pass "report publication restores a staging generation raced through rename"
 }
 
@@ -3407,6 +3605,16 @@ test_interrupted_owned_tree_cleanup_enters_retention_recovery() {
   assert_absent "$tombstones/$quarantine" "retention recovery left the interrupted owned tree indefinitely"
   pass "interrupted owned tree cleanup remains enrolled in retention recovery"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = report-lock-handshakes ]; then
+  test_stale_lock_reclaim_is_serialized
+  test_install_guard_release_failure_cleans_owned_lock
+  test_post_install_guard_owner_death_is_recovered
+  test_reclaim_guard_fences_the_stale_generation_gap
+  test_abandoned_reclaim_guard_is_recovered
+  test_report_publication_restores_swapped_staging_generation
+  exit 0
+fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_retention_batches_make_interruption_safe_progress
@@ -3630,6 +3838,8 @@ test_large_visual_inventory_does_not_share_text_buffer_headroom
 test_scout_and_legacy_sources
 test_stale_lock_rejects_reused_pid
 test_stale_lock_reclaim_is_serialized
+test_install_guard_release_failure_cleans_owned_lock
+test_post_install_guard_owner_death_is_recovered
 test_reclaim_guard_fences_the_stale_generation_gap
 test_abandoned_reclaim_guard_is_recovered
 test_abandoned_reclaim_marker_is_recovered

@@ -373,14 +373,61 @@ function reportLockControlOwner(file, label) {
   return owner;
 }
 
-function reportLockControlOwnerAlive(owner) {
+function reportLockControlOwnerLiveness(owner) {
   try {
     process.kill(owner.pid, 0);
   } catch (error) {
-    if (error.code === "ESRCH") return false;
-    return true;
+    if (error.code === "ESRCH") return "dead";
+    return "unknown";
   }
-  return processStartIdentity(owner.pid) === owner.startedAt;
+  const startedAt = processStartIdentity(owner.pid);
+  if (!startedAt) return "unknown";
+  return startedAt === owner.startedAt ? "live" : "dead";
+}
+
+function reportPublicationOwnerState(file, label, requireToken = false) {
+  let observed;
+  try {
+    observed = fs.lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return { kind: "legacy-unowned", reason: "owner metadata is absent" };
+    return { kind: "unknown", reason: error.message };
+  }
+  if (observed.isSymbolicLink() || !observed.isFile()) {
+    return { kind: "legacy-unowned", reason: "owner metadata is not a regular file" };
+  }
+  if (observed.size > lockControlLimit) {
+    return { kind: "legacy-unowned", reason: "owner metadata is oversized" };
+  }
+  let raw;
+  try {
+    raw = readLockControl(file, label).trim();
+  } catch (error) {
+    return { kind: "unknown", reason: error.message };
+  }
+  try {
+    const owner = JSON.parse(raw);
+    const identified = Number.isInteger(owner.pid) && owner.pid > 0
+      && typeof owner.startedAt === "string" && owner.startedAt.length > 0;
+    const tokenValid = typeof owner.token === "string" && owner.token.length > 0;
+    if (identified && (!requireToken || tokenValid)) return { kind: "identified", owner };
+  } catch {}
+  return { kind: "legacy-unowned", reason: "owner metadata has no verifiable process generation" };
+}
+
+function reportPublicationOwnerLiveness(state) {
+  if (state.kind !== "identified") return state.kind;
+  return reportLockControlOwnerLiveness(state.owner);
+}
+
+function reportLockGenerationMtime(lockStat, ownerFile) {
+  let staleMtimeMs = lockStat.mtimeMs;
+  try {
+    staleMtimeMs = Math.min(staleMtimeMs, fs.lstatSync(ownerFile).mtimeMs);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  return staleMtimeMs;
 }
 
 function removeOwnedReportLockControl(file, token, label) {
@@ -421,7 +468,7 @@ function recoverReportLockReclaimGuard(file) {
     throw new Error(`report lock reclaim guard must be a real regular file at ${file}`);
   }
   const owner = reportLockControlOwner(file, "report lock reclaim guard");
-  if (reportLockControlOwnerAlive(owner) || Date.now() - observed.mtimeMs <= reportLockStaleMs) return false;
+  if (reportLockControlOwnerLiveness(owner) !== "dead") return false;
   removeOwnedReportLockControl(file, owner.token, "report lock reclaim guard");
   return true;
 }
@@ -439,6 +486,72 @@ function tryAcquireReportLockReclaimGuard(file, token) {
     throw error;
   } finally {
     fs.rmSync(candidate, { force: true });
+  }
+}
+
+const completedTestFifoHandshakes = new Set();
+
+function runTestFifoHandshake(readyName, proceedName, payload, label) {
+  const ready = process.env[readyName];
+  const proceed = process.env[proceedName];
+  if (!ready && !proceed) return;
+  if (!ready || !proceed) throw new Error(`${label} requires both FIFO endpoints`);
+  const handshake = `${readyName}\0${proceedName}`;
+  if (completedTestFifoHandshakes.has(handshake)) return;
+  for (const [file, endpoint] of [[ready, "ready"], [proceed, "proceed"]]) {
+    const observed = fs.lstatSync(file);
+    if (observed.isSymbolicLink() || !observed.isFIFO()) {
+      throw new Error(`${label} ${endpoint} endpoint must be a real FIFO at ${file}`);
+    }
+  }
+  const program = [
+    "import os, select, sys, time",
+    "ready = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)",
+    "proceed = os.open(sys.argv[2], os.O_RDONLY | os.O_NONBLOCK)",
+    "try:",
+    "    os.write(ready, sys.argv[3].encode('utf-8'))",
+    "    deadline = time.monotonic() + 10",
+    "    permit = b''",
+    "    while b'\\n' not in permit:",
+    "        remaining = deadline - time.monotonic()",
+    "        if remaining <= 0:",
+    "            raise RuntimeError(sys.argv[4] + ' timed out')",
+    "        readable, _, _ = select.select([proceed], [], [], remaining)",
+    "        if not readable:",
+    "            raise RuntimeError(sys.argv[4] + ' timed out')",
+    "        chunk = os.read(proceed, 256)",
+    "        if not chunk:",
+    "            raise RuntimeError(sys.argv[4] + ' closed without a permit')",
+    "        permit += chunk",
+    "        if len(permit) > 256:",
+    "            raise RuntimeError(sys.argv[4] + ' permit is oversized')",
+    "    line, trailing = permit.split(b'\\n', 1)",
+    "    if line != b'continue' or trailing:",
+    "        raise RuntimeError(sys.argv[4] + ' received an invalid permit')",
+    "finally:",
+    "    os.close(ready)",
+    "    os.close(proceed)",
+  ].join("\n");
+  try {
+    execFileSync(pythonRuntime, ["-c", program, ready, proceed, payload, label], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 11_000,
+    });
+    completedTestFifoHandshakes.add(handshake);
+  } catch (error) {
+    const detail = error.stderr?.toString("utf8").trim();
+    throw new Error(detail || `${label} failed`);
+  }
+}
+
+function pathExistsNoFollow(file) {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -523,20 +636,38 @@ function acquireLock() {
   stackRoot = ".";
   const lock = path.join(stackRoot, ".publish.lock");
   const reclaimGuard = path.join(stackRoot, ".publish.lock.reclaim");
-  const lockDeadline = Date.now() + reportLockWaitMs;
-  while (Date.now() < lockDeadline) {
+  let lockDeadline = Date.now() + reportLockWaitMs;
+  let reclaimGuardWaiterSignaled = false;
+  while (true) {
+    const deadlineExpired = Date.now() >= lockDeadline;
     try {
       fs.lstatSync(reclaimGuard);
-      if (process.env.FM_REPORT_RECLAIM_WAITER_TEST_READY
-        && !fs.existsSync(process.env.FM_REPORT_RECLAIM_WAITER_TEST_READY)) {
-        fs.writeFileSync(process.env.FM_REPORT_RECLAIM_WAITER_TEST_READY, "ready\n", { flag: "wx" });
+      if (!reclaimGuardWaiterSignaled) {
+        runTestFifoHandshake(
+          "FM_REPORT_RECLAIM_WAITER_TEST_READY",
+          "FM_REPORT_RECLAIM_WAITER_TEST_PROCEED",
+          "guard-observed\n",
+          "report reclaim waiter test gate",
+        );
+        reclaimGuardWaiterSignaled = true;
       }
-      recoverReportLockReclaimGuard(reclaimGuard);
+      if (recoverReportLockReclaimGuard(reclaimGuard)) {
+        runTestFifoHandshake(
+          "FM_REPORT_RECLAIM_GUARD_RELEASED_TEST_READY",
+          "FM_REPORT_RECLAIM_GUARD_RELEASED_TEST_PROCEED",
+          "guard-released\n",
+          "report reclaim guard released test gate",
+        );
+        if (Date.now() >= lockDeadline) lockDeadline = Date.now() + 1_000;
+        continue;
+      }
+      if (deadlineExpired) break;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
       continue;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    if (deadlineExpired) break;
     const token = crypto.randomUUID();
     const candidate = path.join(stackRoot, `.publish.lock.candidate.${process.pid}.${token}`);
     try {
@@ -547,13 +678,73 @@ function acquireLock() {
         fs.writeFileSync(path.join(candidate, "owner"), `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, { mode: 0o600 });
         let reclaimGuardExists = true;
         try { fs.lstatSync(reclaimGuard); } catch (error) { if (error.code === "ENOENT") reclaimGuardExists = false; else throw error; }
-        if (reclaimGuardExists || fs.existsSync(lock)) {
+        if (!reclaimGuardExists) {
+          runTestFifoHandshake(
+            "FM_REPORT_LOCK_PRECHECK_TEST_READY",
+            "FM_REPORT_LOCK_PRECHECK_TEST_PROCEED",
+            "guard-absent\n",
+            "report lock precheck test gate",
+          );
+        }
+        const lockExists = pathExistsNoFollow(lock);
+        if (reclaimGuardExists || lockExists) {
           fs.rmSync(candidate, { recursive: true, force: true });
           const existsError = new Error(`report lock exists at ${lock}`);
           existsError.code = "EEXIST";
           throw existsError;
         }
-        fs.renameSync(candidate, lock);
+        const installGuardToken = crypto.randomUUID();
+        if (!tryAcquireReportLockReclaimGuard(reclaimGuard, installGuardToken)) {
+          recoverReportLockReclaimGuard(reclaimGuard);
+          const existsError = new Error(`report lock reclaim guard exists at ${reclaimGuard}`);
+          existsError.code = "EEXIST";
+          throw existsError;
+        }
+        runTestFifoHandshake(
+          "FM_REPORT_INSTALL_GUARD_TEST_READY",
+          "FM_REPORT_INSTALL_GUARD_TEST_PROCEED",
+          "install-guard-held\n",
+          "report install guard test gate",
+        );
+        let installedLock = false;
+        try {
+          if (pathExistsNoFollow(lock)) {
+            const existsError = new Error(`report lock exists at ${lock}`);
+            existsError.code = "EEXIST";
+            throw existsError;
+          }
+          fs.renameSync(candidate, lock);
+          installedLock = true;
+          runTestFifoHandshake(
+            "FM_REPORT_LOCK_INSTALLED_GUARD_TEST_READY",
+            "FM_REPORT_LOCK_INSTALLED_GUARD_TEST_PROCEED",
+            "lock-installed-guard-held\n",
+            "report installed-lock guard test gate",
+          );
+        } finally {
+          try {
+            if (installedLock && process.env.FM_REPORT_INSTALL_GUARD_RELEASE_TEST_FAILURE === "1") {
+              throw new Error("synthetic report install-guard release failure");
+            }
+            removeOwnedReportLockControl(reclaimGuard, installGuardToken, "report lock reclaim guard");
+          } catch (guardReleaseError) {
+            if (installedLock) {
+              try {
+                runContainedHelper(
+                  ["remove-owned-directory-fd", ".publish.lock", "owner", token],
+                  [stackRootDescriptor],
+                  1024 * 1024,
+                );
+              } catch (lockReleaseError) {
+                throw new Error(
+                  `report reclaim guard release failed (${guardReleaseError.message}); `
+                  + `newly installed report lock release also failed (${lockReleaseError.message})`,
+                );
+              }
+            }
+            throw guardReleaseError;
+          }
+        }
       } catch (error) {
         fs.rmSync(candidate, { recursive: true, force: true });
         throw error;
@@ -571,6 +762,12 @@ function acquireLock() {
       let pinnedEntries;
       let pinnedTombstones;
       try {
+        runTestFifoHandshake(
+          "FM_REPORT_LOCK_ACQUIRED_TEST_READY",
+          "FM_REPORT_LOCK_ACQUIRED_TEST_PROCEED",
+          "lock-acquired\n",
+          "report lock acquired test gate",
+        );
         if (process.env.FM_REPORT_LOCK_TEST_READY) {
           fs.writeFileSync(process.env.FM_REPORT_LOCK_TEST_READY, "ready\n", { flag: "wx" });
           if (process.env.FM_REPORT_LOCK_TEST_PROCEED) {
@@ -637,26 +834,13 @@ function acquireLock() {
         if (lockStat.isSymbolicLink() || !lockStat.isDirectory()) {
           throw new Error(`report lock must be a real directory at ${lock}`);
         }
-        let owner = Number.NaN;
-        let ownerStartedAt = "";
-        try {
-          const rawOwner = readLockControl(path.join(lock, "owner"), "report lock owner").trim();
-          try {
-            const parsedOwner = JSON.parse(rawOwner);
-            owner = Number(parsedOwner.pid);
-            ownerStartedAt = typeof parsedOwner.startedAt === "string" ? parsedOwner.startedAt : "";
-          } catch {
-            owner = Number.parseInt(rawOwner, 10);
-          }
-        } catch {}
-        let ownerAlive = Number.isInteger(owner) && owner > 0 && Boolean(ownerStartedAt);
-        if (ownerAlive) {
-          try { process.kill(owner, 0); } catch (killError) { if (killError.code === "ESRCH") ownerAlive = false; }
-        }
-        if (ownerAlive) ownerAlive = processStartIdentity(owner) === ownerStartedAt;
-        let staleMtimeMs = lockStat.mtimeMs;
-        try { staleMtimeMs = Math.min(staleMtimeMs, fs.lstatSync(path.join(lock, "owner")).mtimeMs); } catch (ownerStatError) { if (ownerStatError.code !== "ENOENT") throw ownerStatError; }
-        if (!ownerAlive && Date.now() - staleMtimeMs > reportLockStaleMs) {
+        const ownerFile = path.join(lock, "owner");
+        const ownerState = reportPublicationOwnerState(ownerFile, "report lock owner");
+        const ownerLiveness = reportPublicationOwnerLiveness(ownerState);
+        const staleMtimeMs = reportLockGenerationMtime(lockStat, ownerFile);
+        const ownerReclaimable = ownerLiveness === "dead"
+          || (ownerLiveness === "legacy-unowned" && Date.now() - staleMtimeMs > reportLockStaleMs);
+        if (ownerReclaimable) {
           const reclaimGuardToken = crypto.randomUUID();
           if (!tryAcquireReportLockReclaimGuard(reclaimGuard, reclaimGuardToken)) {
             recoverReportLockReclaimGuard(reclaimGuard);
@@ -667,30 +851,14 @@ function acquireLock() {
             if (guardedLockStat.isSymbolicLink() || !guardedLockStat.isDirectory()) {
               throw new Error(`report lock must be a real directory at ${lock}`);
             }
-            let guardedOwner = Number.NaN;
-            let guardedOwnerStartedAt = "";
-            try {
-              const rawOwner = readLockControl(path.join(lock, "owner"), "report lock owner").trim();
-              try {
-                const parsedOwner = JSON.parse(rawOwner);
-                guardedOwner = Number(parsedOwner.pid);
-                guardedOwnerStartedAt = typeof parsedOwner.startedAt === "string" ? parsedOwner.startedAt : "";
-              } catch {
-                guardedOwner = Number.parseInt(rawOwner, 10);
-              }
-            } catch {}
-            let guardedOwnerAlive = Number.isInteger(guardedOwner) && guardedOwner > 0 && Boolean(guardedOwnerStartedAt);
-            if (guardedOwnerAlive) {
-              try { process.kill(guardedOwner, 0); } catch (killError) { if (killError.code === "ESRCH") guardedOwnerAlive = false; }
-            }
-            if (guardedOwnerAlive) guardedOwnerAlive = processStartIdentity(guardedOwner) === guardedOwnerStartedAt;
-            let guardedStaleMtimeMs = guardedLockStat.mtimeMs;
-            try {
-              guardedStaleMtimeMs = Math.min(guardedStaleMtimeMs, fs.lstatSync(path.join(lock, "owner")).mtimeMs);
-            } catch (ownerStatError) {
-              if (ownerStatError.code !== "ENOENT") throw ownerStatError;
-            }
-            if (guardedOwnerAlive || Date.now() - guardedStaleMtimeMs <= reportLockStaleMs) continue;
+            const guardedOwnerFile = path.join(lock, "owner");
+            const guardedOwnerState = reportPublicationOwnerState(guardedOwnerFile, "report lock owner");
+            const guardedOwnerLiveness = reportPublicationOwnerLiveness(guardedOwnerState);
+            const guardedStaleMtimeMs = reportLockGenerationMtime(guardedLockStat, guardedOwnerFile);
+            const guardedOwnerReclaimable = guardedOwnerLiveness === "dead"
+              || (guardedOwnerLiveness === "legacy-unowned"
+                && Date.now() - guardedStaleMtimeMs > reportLockStaleMs);
+            if (!guardedOwnerReclaimable) continue;
             const reclaim = path.join(lock, ".reclaim");
             const reclaimToken = crypto.randomUUID();
             let claimed = false;
@@ -713,47 +881,44 @@ function acquireLock() {
                 throw new Error(`report lock changed while reclaiming ${lock}`);
               }
               fs.rmSync(quarantine, { recursive: true, force: true });
-              if (process.env.FM_REPORT_RECLAIM_TEST_READY && process.env.FM_REPORT_RECLAIM_TEST_PROCEED) {
-                fs.writeFileSync(process.env.FM_REPORT_RECLAIM_TEST_READY, "ready\n", { flag: "wx" });
-                const deadline = Date.now() + 20_000;
-                while (!fs.existsSync(process.env.FM_REPORT_RECLAIM_TEST_PROCEED)) {
-                  if (Date.now() >= deadline) throw new Error("report reclaim test gate timed out");
-                  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-                }
-              }
+              runTestFifoHandshake(
+                "FM_REPORT_RECLAIM_TEST_READY",
+                "FM_REPORT_RECLAIM_TEST_PROCEED",
+                "lock-quarantined\n",
+                "report reclaim test gate",
+              );
               continue;
             } catch (reclaimError) {
               if (reclaimError.code === "EEXIST") {
                 try {
                   const reclaimStat = fs.lstatSync(reclaim);
-                  let reclaimRaw = "";
-                  try { reclaimRaw = readLockControl(reclaim, "report reclaim marker").trim(); } catch {}
-                  let reclaimOwner;
-                  try {
-                    reclaimOwner = JSON.parse(reclaimRaw);
-                  } catch {
-                    reclaimOwner = { pid: Number.NaN, startedAt: "", token: reclaimRaw };
-                  }
-                  let reclaimAlive = Number.isInteger(reclaimOwner.pid) && reclaimOwner.pid > 0 && typeof reclaimOwner.startedAt === "string" && reclaimOwner.startedAt.length > 0;
-                  if (reclaimAlive) {
-                    try { process.kill(reclaimOwner.pid, 0); } catch (killError) { if (killError.code === "ESRCH") reclaimAlive = false; }
-                  }
-                  if (reclaimAlive) reclaimAlive = processStartIdentity(reclaimOwner.pid) === reclaimOwner.startedAt;
+                  const reclaimState = reportPublicationOwnerState(
+                    reclaim,
+                    "report reclaim marker",
+                    true,
+                  );
+                  const reclaimLiveness = reportPublicationOwnerLiveness(reclaimState);
+                  const reclaimOwnerReclaimable = reclaimLiveness === "dead"
+                    || reclaimLiveness === "legacy-unowned";
                   const currentLockStat = fs.lstatSync(lock);
-                  if (!reclaimAlive && Date.now() - reclaimStat.mtimeMs > reportLockStaleMs
+                  if (reclaimOwnerReclaimable && Date.now() - reclaimStat.mtimeMs > reportLockStaleMs
                     && currentLockStat.dev === guardedLockStat.dev && currentLockStat.ino === guardedLockStat.ino) {
                     const quarantine = path.join(lock, `.reclaim.abandoned.${process.pid}.${crypto.randomUUID()}`);
                     fs.renameSync(reclaim, quarantine);
                     const quarantinedReclaimStat = fs.lstatSync(quarantine);
-                    let quarantinedToken;
-                    try {
-                      quarantinedToken = JSON.parse(readLockControl(quarantine, "quarantined report reclaim marker")).token;
-                    } catch {
-                      try { quarantinedToken = readLockControl(quarantine, "quarantined report reclaim marker").trim(); } catch { quarantinedToken = ""; }
+                    const expectedToken = reclaimState.kind === "identified" ? reclaimState.owner.token : "";
+                    let quarantinedToken = "";
+                    if (expectedToken) {
+                      const quarantinedState = reportPublicationOwnerState(
+                        quarantine,
+                        "quarantined report reclaim marker",
+                        true,
+                      );
+                      if (quarantinedState.kind === "identified") quarantinedToken = quarantinedState.owner.token;
                     }
                     if (quarantinedReclaimStat.dev !== reclaimStat.dev || quarantinedReclaimStat.ino !== reclaimStat.ino
-                      || quarantinedToken !== reclaimOwner.token) {
-                      if (!fs.existsSync(reclaim)) fs.renameSync(quarantine, reclaim);
+                      || (expectedToken && quarantinedToken !== expectedToken)) {
+                      if (!pathExistsNoFollow(reclaim)) fs.renameSync(quarantine, reclaim);
                       throw new Error(`report reclaim ownership changed while recovering ${lock}`);
                     }
                     fs.rmSync(quarantine, { recursive: true, force: true });

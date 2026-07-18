@@ -928,13 +928,27 @@ def _copy_private_file(
     destination: Path,
     *,
     destination_created: Callable[[os.stat_result], None] | None = None,
+    expected_source_generation: object | None = None,
 ) -> os.stat_result:
     source_before = _private_file(source, "credential transaction source")
     source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     destination_fd = -1
     try:
-        if _stat_payload(os.fstat(source_fd)) != _stat_payload(source_before):
+        opened_source = _stat_payload(os.fstat(source_fd))
+        if opened_source != _stat_payload(source_before):
             raise ValueError("credential transaction source changed while opening")
+        if expected_source_generation is not None and not (
+            isinstance(expected_source_generation, dict)
+            and set(expected_source_generation) == {"stat", "sha256"}
+            and isinstance(expected_source_generation.get("sha256"), str)
+            and len(expected_source_generation["sha256"]) == 64
+            and _stat_matches_generation(
+                opened_source,
+                expected_source_generation.get("stat"),
+                ctime=True,
+            )
+        ):
+            raise ValueError("credential transaction source changed from its bound generation")
         destination_fd = os.open(
             destination,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -943,12 +957,18 @@ def _copy_private_file(
         os.fchmod(destination_fd, 0o600)
         if destination_created is not None:
             destination_created(os.fstat(destination_fd))
+        source_digest = sha256()
         while chunk := os.read(source_fd, 1024 * 1024):
+            source_digest.update(chunk)
             view = memoryview(chunk)
             while view:
                 view = view[os.write(destination_fd, view) :]
-        if _stat_payload(os.fstat(source_fd)) != _stat_payload(source_before):
+        if _stat_payload(os.fstat(source_fd)) != opened_source:
             raise ValueError("credential transaction source changed while copying")
+        if expected_source_generation is not None and (
+            source_digest.hexdigest() != expected_source_generation.get("sha256")
+        ):
+            raise ValueError("credential transaction source content changed while copying")
         os.fsync(destination_fd)
         installed = os.fstat(destination_fd)
     finally:
@@ -1258,6 +1278,7 @@ def _prepare_owned_copy(
         source,
         destination,
         destination_created=record_identity,
+        expected_source_generation=expected_source_generation,
     )
     observed = _file_generation(destination, f"prepared {label}")
     if not _stat_matches_inode(
@@ -2229,10 +2250,19 @@ def _restore_snapshot_file(
         _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
         return
     backup_generation = _file_generation(backup, f"{label} backup")
-    if not isinstance(original_generation, dict) or backup_generation[
-        "sha256"
-    ] != original_generation.get("sha256"):
+    backup_key = f"{key.replace('_', '-')}-backup"
+    durable_backup_key = f"{backup_key}_prepared_generation"
+    durable_backup = journal.get(durable_backup_key)
+    if not isinstance(original_generation, dict) or (
+        backup_generation["sha256"] != original_generation.get("sha256")
+    ):
         raise ValueError(f"{label} backup is not the snapshotted generation")
+    if durable_backup is None:
+        journal[durable_backup_key] = backup_generation
+        durable_backup = backup_generation
+        _write_recovery_journal(journal_path, journal, f"{backup_key}-legacy-generation-bound")
+    elif not _generation_matches(backup_generation, durable_backup, ctime=True):
+        raise ValueError(f"{label} backup changed from its durable snapshot generation")
     prepared = _prepare_owned_copy(
         backup,
         temporary,
@@ -2241,7 +2271,7 @@ def _restore_snapshot_file(
         label=f"{label} rollback generation",
         journal_path=journal_path,
         journal=journal,
-        expected_source_generation=backup_generation,
+        expected_source_generation=durable_backup,
     )
     journal[f"{key}_restore_prepared_generation"] = prepared
     restored_generation = _publish_owned_generation(
@@ -2992,6 +3022,14 @@ def _rollback_file_credential(
             isinstance(original, dict) and backup_generation.get("sha256") == original.get("sha256")
         ):
             raise ValueError("credential recovery backup changed before rollback")
+        if durable_backup is None:
+            durable_backup = backup_generation
+            journal[f"{backup_key}_prepared_generation"] = durable_backup
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                f"{backup_key}-legacy-generation-bound",
+            )
         prepared = _prepare_owned_copy(
             backup,
             rollback,
@@ -3000,7 +3038,7 @@ def _rollback_file_credential(
             label="credential rollback generation",
             journal_path=journal_path,
             journal=journal,
-            expected_source_generation=backup_generation,
+            expected_source_generation=durable_backup,
         )
         published = _publish_owned_generation(
             rollback,

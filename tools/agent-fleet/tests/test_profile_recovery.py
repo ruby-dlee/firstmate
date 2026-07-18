@@ -1523,6 +1523,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
         destination: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ):
         if rollback_crash == "mid-copy" and destination == rollback:
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1537,6 +1538,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
             source,
             destination,
             destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
         )
 
     def crash_after_atomic_move(source: Path, destination: Path) -> None:
@@ -1690,6 +1692,7 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
         destination: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ):
         if restore_crash == "mid-copy" and destination == restore_temp:
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1704,6 +1707,7 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
             source,
             destination,
             destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
         )
 
     def crash_restore_replace(source: Path, destination: Path) -> None:
@@ -3066,11 +3070,13 @@ def test_file_credential_rollback_binds_copy_fd_before_path_attribution(
         destination: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ) -> os.stat_result:
         copied = real_copy(
             source,
             destination,
             destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
         )
         if destination == rollback:
             atomic_write_bytes(rollback, foreign)
@@ -3276,6 +3282,7 @@ def test_owned_copy_kill_after_create_before_callback_preserves_ambiguity(
         created: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ) -> os.stat_result:
         descriptor = os.open(created, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.fchmod(descriptor, 0o600)
@@ -3334,6 +3341,7 @@ def test_repeated_partial_copy_crashes_use_bounded_distinct_retired_markers(
         created: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ) -> os.stat_result:
         descriptor = os.open(created, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.fchmod(descriptor, 0o600)
@@ -3451,7 +3459,7 @@ def test_metadata_restore_copy_binds_digest_verified_backup_generation(
         return real_prepare(source, prepared, cleanup, **kwargs)
 
     monkeypatch.setattr(recovery, "_prepare_owned_copy", mutate_after_digest_validation)
-    with pytest.raises(ValueError, match="does not match its bound source content"):
+    with pytest.raises(ValueError, match="bound (?:source content|generation)"):
         recovery._restore_snapshot_file(
             target=destination,
             backup=backup,
@@ -3467,6 +3475,70 @@ def test_metadata_restore_copy_binds_digest_verified_backup_generation(
         )
     assert not destination.exists()
     assert backup.read_bytes() == tampered
+
+
+def test_metadata_restore_rejects_same_content_backup_inode_substitution(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    destination = target.home / ".metadata-inode-target"
+    backup = target.home / ".metadata-inode-backup"
+    temporary = target.home / ".metadata-inode-temporary"
+    temporary_cleanup = target.home / ".metadata-inode-temporary-retired"
+    quarantine = target.home / ".metadata-inode-forward"
+    original_quarantine = target.home / ".metadata-inode-original"
+    journal_path = target.home / ".metadata-inode-journal"
+    original = b"metadata-original"
+    atomic_write_bytes(destination, original)
+    original_generation = recovery._file_generation(destination, "original metadata")
+    atomic_write_bytes(backup, original)
+    backup_generation = recovery._file_generation(backup, "metadata backup")
+    original_backup_inode = backup_generation["stat"]["ino"]
+    destination.unlink()
+    journal: dict[str, Any] = {
+        "bundle_original_generation": original_generation,
+        "bundle_forward_absent": True,
+        "bundle-backup_prepared_generation": backup_generation,
+    }
+    atomic_write_json(journal_path, journal)
+    real_copy = recovery._copy_private_file
+
+    def substitute_before_descriptor_open(
+        source: Path,
+        prepared: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
+    ) -> os.stat_result:
+        assert source == backup
+        atomic_write_bytes(source, original)
+        return real_copy(
+            source,
+            prepared,
+            destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
+        )
+
+    monkeypatch.setattr(recovery, "_copy_private_file", substitute_before_descriptor_open)
+    with pytest.raises(ValueError, match="bound generation"):
+        recovery._restore_snapshot_file(
+            target=destination,
+            backup=backup,
+            temporary=temporary,
+            temporary_cleanup=temporary_cleanup,
+            quarantine=quarantine,
+            original_quarantine=original_quarantine,
+            existed=True,
+            key="bundle",
+            label="provider identity bundle",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    assert backup.read_bytes() == original
+    assert backup.stat().st_ino != original_backup_inode
+    assert not destination.exists()
+    assert not temporary.exists()
 
 
 def test_credential_rollback_copy_binds_digest_verified_backup_generation(
@@ -3513,7 +3585,7 @@ def test_credential_rollback_copy_binds_digest_verified_backup_generation(
         return real_prepare(source, prepared, cleanup, **kwargs)
 
     monkeypatch.setattr(recovery, "_prepare_owned_copy", mutate_after_digest_validation)
-    with pytest.raises(ValueError, match="does not match its bound source content"):
+    with pytest.raises(ValueError, match="bound (?:source content|generation)"):
         recovery._rollback_file_credential(
             target,
             "auth.json",
@@ -3530,6 +3602,73 @@ def test_credential_rollback_copy_binds_digest_verified_backup_generation(
     assert not stable.exists()
     assert quarantine.read_bytes() == forward
     assert backup.read_bytes() == tampered
+
+
+def test_credential_rollback_rejects_same_content_backup_inode_substitution(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable = target.home / "auth.json"
+    backup = target.home / ".credential-inode-backup"
+    rollback = target.home / ".credential-inode-temporary"
+    rollback_cleanup = target.home / ".credential-inode-temporary-retired"
+    quarantine = target.home / ".credential-inode-forward"
+    original_quarantine = target.home / ".credential-inode-original"
+    journal_path = target.home / ".credential-inode-journal"
+    original = b"credential-original"
+    forward = b"credential-forward!"
+    atomic_write_bytes(stable, original)
+    original_generation = recovery._file_generation(stable, "original credential")
+    atomic_write_bytes(backup, original)
+    backup_generation = recovery._file_generation(backup, "credential backup")
+    original_backup_inode = backup_generation["stat"]["ino"]
+    atomic_write_bytes(stable, forward)
+    installed_generation = recovery._file_generation(stable, "installed credential")
+    journal: dict[str, Any] = {
+        "original_credential_generation": original_generation,
+        "installed_credential_generation": installed_generation,
+        "codex_backup-snapshot_prepared_generation": backup_generation,
+    }
+    atomic_write_json(journal_path, journal)
+    real_copy = recovery._copy_private_file
+
+    def substitute_before_descriptor_open(
+        source: Path,
+        prepared: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
+    ) -> os.stat_result:
+        assert source == backup
+        atomic_write_bytes(source, original)
+        return real_copy(
+            source,
+            prepared,
+            destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
+        )
+
+    monkeypatch.setattr(recovery, "_copy_private_file", substitute_before_descriptor_open)
+    with pytest.raises(ValueError, match="bound generation"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
+                "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
+            },
+            journal_path,
+            journal,
+        )
+    assert backup.read_bytes() == original
+    assert backup.stat().st_ino != original_backup_inode
+    assert not stable.exists()
+    assert quarantine.read_bytes() == forward
+    assert not rollback.exists()
 
 
 def test_publish_never_overwrites_destination_reappearance(
@@ -3698,6 +3837,7 @@ def test_owned_backup_mid_copy_sigkill_is_collected_after_rollback(
         destination: Path,
         *,
         destination_created: Callable[[os.stat_result], None] | None = None,
+        expected_source_generation: object | None = None,
     ) -> os.stat_result:
         credential_boundary = (
             backup_component == "credential" and destination.name == ".stable-auth.backup"
@@ -3722,6 +3862,7 @@ def test_owned_backup_mid_copy_sigkill_is_collected_after_rollback(
             source,
             destination,
             destination_created=destination_created,
+            expected_source_generation=expected_source_generation,
         )
 
     monkeypatch.setattr(recovery, "_copy_private_file", kill_mid_backup)

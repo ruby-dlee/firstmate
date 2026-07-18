@@ -56,15 +56,24 @@ The transaction driver remains a current-user-owned mutable control-plane input 
 
 ## Offline Quota build proof
 
-Generated Quota AXI `dist/**` bytes are accepted only through a separate producer/consumer contract. The producer is `tools/bridge-cutover/build_quota_axi_offline_proof.py`; the sealed-runtime builder independently consumes and revalidates its strict schema-v1 proof.
+Generated Quota AXI `dist/**` bytes are accepted only through a separate producer/consumer contract.
+The producer is `tools/bridge-cutover/build_quota_axi_offline_proof.py`; the sealed-runtime builder independently consumes and revalidates its strict schema-v1 proof.
 
-The producer requires an exact Git commit and canonical archive-tree digest, root-owned `/usr/bin/git`, Node 20, an exact npm closure and empirical npm version, a pinned initial offline cache, an exact build `package-lock.json`, an exact build-only `package.json`, every retained `file:` artifact, and the exact compiler path, digest, and arguments. A build-lock record must have an exact version, npm SHA-512 SRI, and either a retained hash-pinned `file:` artifact or an npm-registry URL satisfiable from the pinned offline cache. No ambient cache or network fallback is permitted.
+The producer requires an exact Git commit and canonical archive-tree digest, root-owned `/usr/bin/git`, Node 20, an exact npm closure and empirical npm version, a pinned initial offline cache, an exact build `package-lock.json`, an exact build-only `package.json`, every retained `file:` artifact, and the exact compiler path, digest, and arguments.
+A build-lock record must have an exact version, npm SHA-512 SRI, and either a retained hash-pinned `file:` artifact or an npm-registry URL satisfiable from the pinned offline cache.
+No ambient cache or network fallback is permitted.
 
-The build-only `package.json` may reduce the source development closure to the exact compiler and runtime dependencies. Its complete JSON difference from the source commit is recorded. The exact source `package.json` is restored before packing, and npm's subsequent packing normalization is recorded separately.
+The build-only `package.json` may reduce the source development closure to the exact compiler and runtime dependencies.
+Its complete JSON difference from the source commit is recorded.
+The exact source `package.json` is restored before packing, and npm's subsequent packing normalization is recorded separately.
 
-The producer archives and builds the exact source commit twice in deterministic, attributed workspaces. Both source archives, package member maps, and complete tarball digests must match. The proof inventories every package member, every generated member (which must be under `dist/`), the build-lock graph and SRI records, both package-normalization maps, the full toolchain, and the final tarball digest.
+The producer archives and builds the exact source commit twice in deterministic, attributed workspaces.
+Both source archives, package member maps, and complete tarball digests must match.
+The proof inventories every package member, every generated member (which must be under `dist/`), the build-lock graph and SRI records, both package-normalization maps, the full toolchain, and the final tarball digest.
 
-The consumer reopens and hash-verifies the producer helper, Git, Node, npm tree, cache tree, build package, build lock, retained file artifacts, and proof itself. It recomputes the source binding, lock graph, normalization maps, generated `dist/` closure, member inventory, and tarball binding. A proof that merely asserts success without those retained bytes is refused.
+The consumer reopens and hash-verifies the producer helper, Git, Node, npm tree, cache tree, build package, build lock, retained file artifacts, and proof itself.
+It recomputes the source binding, lock graph, normalization maps, generated `dist/` closure, member inventory, and tarball binding.
+A proof that merely asserts success without those retained bytes is refused.
 
 ## Runtime closure
 
@@ -72,7 +81,9 @@ Agent Fleet wheels must match their exact source commits and may contain only th
 
 Each Agent Fleet role explicitly binds `source_subdirectory` to `.` for a standalone source repository or to the normalized embedded package root such as `tools/agent-fleet`; the wheel must match that exact committed subtree.
 
-The pinned Python 3.11 runtime may contain relative symlinks only when they resolve to regular files inside that same runtime. The source-tree digest binds the lexical link target and resolved file digest. Sealed releases materialize each accepted link as a regular file and record the complete transformation list; absolute, dangling, non-file, and escaping links are refused.
+The pinned Python 3.11 runtime may contain relative symlinks only when they resolve to regular files inside that same runtime.
+The source-tree digest binds the lexical link target and resolved file digest.
+Sealed releases materialize each accepted link as a regular file and record the complete transformation list; absolute, dangling, non-file, and escaping links are refused.
 
 The candidate wheel and proof set require the enrollment, identity, provision, and recovery modules that implement the sealed activation contract.
 
@@ -104,9 +115,12 @@ The installed front door is always a regular mode-0555 single-link file after ad
 
 Each invocation builds all four roles twice with one publication identifier and requires identical transaction-driver tree digests.
 
-The proof retains the byte-for-byte schema-v2 builder manifest and canonical digest, builder, bootstrap, transaction driver, all system tools, Python source tree and link transformations, Node runtime, source repositories and commits, wheels, Quota packages, locks, build proofs, dependency tarballs, and dependency SRI values. Preparation reopens these retained inputs instead of trusting labels copied into a release.
+The proof retains the byte-for-byte schema-v2 builder manifest and canonical digest, builder, bootstrap, transaction driver, all system tools, Python source tree and link transformations, Node runtime, source repositories and commits, wheels, Quota packages, locks, build proofs, dependency tarballs, and dependency SRI values.
+Preparation reopens these retained inputs instead of trusting labels copied into a release.
 
-Both rebuilt Agent Fleet releases execute their copied Python with a closed environment and must report the pinned `Python 3.11.x` version. Both rebuilt Quota releases execute their copied Node with the same closed environment and must report the pinned `v20.x` version. The exact four observations are retained in `runtime_versions` and independently checked by preparation.
+Both rebuilt Agent Fleet releases execute their copied Python with a closed environment and must report the pinned `Python 3.11.x` version.
+Both rebuilt Quota releases execute their copied Node with the same closed environment and must report the pinned `v20.x` version.
+The exact four observations are retained in `runtime_versions` and independently checked by preparation.
 
 Each role is copied to a relocated path and must keep the same tree digest and pass its runtime and tamper probes.
 
@@ -118,7 +132,9 @@ The front-door plan and proof manifest are created without overwrite and fsync t
 
 A private durable build journal is written before the first release publication.
 
-Builder workspaces, release staging directories, proof-file staging, worker snapshot staging, and preparation staging all use deterministic names derived from their sealed transaction/publication inputs. Each directory has an exact ownership marker or journal binding. Restart removes or completes only an exact attributed partial object; unknown, drifted, or foreign paths are preserved and refused.
+Builder workspaces, release staging directories, proof-file staging, worker snapshot staging, and preparation staging all use deterministic names derived from their sealed transaction/publication inputs.
+Each directory has an exact ownership marker or journal binding.
+Restart removes or completes only an exact attributed partial object; unknown, drifted, or foreign paths are preserved and refused.
 
 Each release contains a build-owned publication marker that binds it to the journal.
 
@@ -162,7 +178,9 @@ The Codex Desktop session may use `codex-5`, but Bridge never counts or routes t
 
 No Desktop login, logout, or relogin is part of Fleet cutover.
 
-Worker-state guards open and read only the exact six routed workers' declared credential guard files. Credential bytes are hashed in memory for private rollback invalidation and are never copied into snapshots, journals, proof manifests, logs, or public artifacts. Reserve homes and Desktop-shared homes are never `stat`ed, opened, read, snapshotted, or compared.
+Worker-state guards open and read only the exact six routed workers' declared credential guard files.
+Credential bytes are hashed in memory for private rollback invalidation and are never copied into snapshots, journals, proof manifests, logs, or public artifacts.
+Reserve homes and Desktop-shared homes are never `stat`ed, opened, read, snapshotted, or compared.
 
 ## Authentication activation contract
 
@@ -198,7 +216,10 @@ Local credential changes are transactional, but provider-side token rotation or 
 
 `tests/bridge-cutover-python.test.sh` is the single Python 3.11 test entrypoint used by both CI and the repository no-mistakes test loop.
 
-`tests/test_build_quota_axi_offline_real_inputs.py` is an opt-in macOS host integration gate. With its six retained-input variables and two rehearsal-artifact variables set, it uses the real UV CPython 3.11.9 runtime, a retained Node 20 runtime, exact candidate and rollback Git worktrees, and real npm/compiler/dependency closures. It builds both Quota roles twice without network access, requires the rebuilt package-member maps to equal the retained rehearsal packages, and passes both proofs through the independent sealed-runtime consumer. Without all variables, CI reports the host-only gate as skipped.
+`tests/test_build_quota_axi_offline_real_inputs.py` is an opt-in macOS host integration gate.
+With its six retained-input variables and two rehearsal-artifact variables set, it uses the real UV CPython 3.11.9 runtime, a retained Node 20 runtime, exact candidate and rollback Git worktrees, and real npm/compiler/dependency closures.
+It builds both Quota roles twice without network access, requires the rebuilt package-member maps to equal the retained rehearsal packages, and passes both proofs through the independent sealed-runtime consumer.
+Without all variables, CI reports the host-only gate as skipped.
 
 The same host gate accepts exact Agent Fleet candidate and rollback repository, commit, and wheel variables; it archives both commits and requires the independent wheel consumer to match the embedded `tools/agent-fleet` candidate subtree and standalone rollback source exactly.
 

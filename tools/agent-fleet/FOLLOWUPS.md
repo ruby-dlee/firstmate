@@ -1,6 +1,6 @@
 # Agent Fleet versioned follow-ups
 
-## AF-ENROLLMENT-V1 — generational credential maintenance
+## AF-ENROLLMENT-V1 - generational credential maintenance
 
 Status: open, nonblocking for the sealed Bridge cutover release.
 

@@ -267,7 +267,8 @@ callers cannot widen or replace that provider-native setting-source policy.
 
 Claude provisioning writes a closed `settings.json` and a closed `.claude.json` containing only onboarding plus registered-project trust state; it strips opaque oauth, refresh, MCP, plugin, and unrelated project keys rather than preserving unknown state.
 Credential identity remains solely in the source-attested `.credentials.json` or exact path-scoped Keychain service, never in `.claude.json`.
-Static fixtures prove this closed rewrite and idempotence. The first real Claude canary is still a mandatory rollback boundary: an auth/onboarding prompt or any mutation of the closed state aborts activation, disables routing, and must not be "fixed" by widening the schema ad hoc.
+Static fixtures prove this closed rewrite and idempotence.
+The first real Claude canary is still a mandatory rollback boundary: an auth/onboarding prompt or any mutation of the closed state aborts activation, disables routing, and must not be "fixed" by widening the schema ad hoc.
 Readiness derives the command and source hash independently, so stale, duplicate, spoofed, co-tampered, unsafe, or source-drifted hook files fail closed.
 Provisioning also sets completed onboarding and project trust for every canonical registered project; a linked worktree receives its matching active-root trust only immediately before execution.
 Codex launches require an exact current-version profile hook set derived from the declared hook source plus Agent Fleet SessionStart, disable `plugins` and `plugin_sharing`, and apply trust only to the validated active root.

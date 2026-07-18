@@ -604,21 +604,28 @@ EOF
 
 BOOTSTRAP_JQ_REPORTED=0
 ACCOUNT_ROUTING_MODE=off
+ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=0
+CREW_DISPATCH_ROUTING_VALID=unknown
 
 account_routing_preflight() {
-  local mode mode_error needs_agent_fleet=0 dispatch
+  local mode mode_error
   if mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>&1); then
     ACCOUNT_ROUTING_MODE=$mode
   else
     mode_error=${mode#error: }
     echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
   fi
-  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || needs_agent_fleet=1
+  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=1
+}
+
+account_routing_dependency_preflight() {
+  local needs_agent_fleet=$ACCOUNT_ROUTING_NEEDS_AGENT_FLEET dispatch
   dispatch="$CONFIG/crew-dispatch.json"
   if [ -f "$dispatch" ]; then
-    if command -v jq >/dev/null 2>&1; then
+    if [ "$CREW_DISPATCH_ROUTING_VALID" = 1 ]; then
       jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_agent_fleet=1
-    elif grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
+    elif [ "$CREW_DISPATCH_ROUTING_VALID" = unknown ] \
+      && grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
       needs_agent_fleet=1
     fi
   fi
@@ -633,12 +640,16 @@ account_routing_preflight() {
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
-  [ -f "$file" ] || return 0
+  if [ ! -f "$file" ]; then
+    CREW_DISPATCH_ROUTING_VALID=0
+    return 0
+  fi
   if ! command -v jq >/dev/null 2>&1; then
     [ "$BOOTSTRAP_JQ_REPORTED" = 1 ] || echo "MISSING: jq (install: $(install_cmd jq))"
     return 0
   fi
   if ! jq -e . "$file" >/dev/null 2>&1; then
+    CREW_DISPATCH_ROUTING_VALID=0
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - malformed JSON"
     return 0
   fi
@@ -706,9 +717,11 @@ crew_dispatch_validate() {
     end
   ' "$file" 2>/dev/null || true)
   if [ -n "$err" ]; then
+    CREW_DISPATCH_ROUTING_VALID=0
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0
   fi
+  CREW_DISPATCH_ROUTING_VALID=1
   jq -r '
     def profile($p):
       ($p.harness | tostring)
@@ -793,6 +806,7 @@ crew=
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"
 account_routing_preflight
 crew_dispatch_validate
+account_routing_dependency_preflight
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi

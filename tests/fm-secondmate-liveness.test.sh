@@ -495,6 +495,7 @@ test_sweep_parent_skips_release_after_spawn_handoff() {
   local w fb tmuxfb log out fake_root sleeper_pid lock
   w=$(new_world sweep-parent-skip-release)
   add_sm_home "$w" sm1 firstmate:fm-sm1
+  printf 'account_profile=claude-1\n' >> "$w/home/state/sm1.meta"
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'

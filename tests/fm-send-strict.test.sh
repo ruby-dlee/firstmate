@@ -217,6 +217,7 @@ test_explicit_herdr_target_matching_meta_is_identity_bound() {
     "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_HERDR_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
     "$SEND" default:w1:p2 --key Enter >/dev/null 2>"$err"; rc=$?
   [ "$rc" -ne 0 ] || fail "explicit Herdr target matched to local metadata should reject a reused pane"
   if grep -Eq 'pane (send-text|send-keys)' "$log"; then
@@ -232,6 +233,7 @@ test_metadata_free_explicit_herdr_target_remains_unbound() {
   err="$dir/send.err"; log="$dir/herdr.log"; : > "$log"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_HERDR_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
     "$SEND" default:w1:p2 --key Enter >/dev/null 2>"$err"; rc=$?
   expect_code 0 "$rc" "metadata-free explicit Herdr target should remain an unbound escape hatch"
   assert_contains "$(cat "$log")" "pane send-keys w1:p2 enter" "unbound explicit Herdr target should receive the key"

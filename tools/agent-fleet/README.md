@@ -406,7 +406,7 @@ Defaults:
 - Hash-pinned profile-aware quota reader: the exact regular `node_modules/quota-axi/dist/bin/quota-axi.js` file inside one immutable release.
 - Hash-pinned Quota interpreter: an exact regular standalone Node executable stored inside that same immutable release and invoked directly before the verified JavaScript path.
 
-The current release layout stores those files at `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d/node_modules/quota-axi/dist/bin/quota-axi.js` and `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d/runtime/node`.
+The current release layout stores those files at `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.7-9f2dde87-sealed/node_modules/quota-axi/dist/bin/quota-axi.js` and `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.7-9f2dde87-sealed/runtime/node`.
 
 `agent-fleet init` may resolve a caller-supplied convenience symlink once, but the generated registry stores only the two resolved non-symlink release paths and their SHA-256 digests.
 

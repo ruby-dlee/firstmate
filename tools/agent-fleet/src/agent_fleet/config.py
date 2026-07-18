@@ -30,7 +30,7 @@ from .paths import (
 from .transaction_fence import assert_no_pending_credential_recovery
 from .util import read_private_bytes, validate_id
 
-DEFAULT_QUOTA_RELEASE = "~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d"
+DEFAULT_QUOTA_RELEASE = "~/.local/libexec/agent-fleet/quota-axi/releases/0.1.7-9f2dde87-sealed"
 DEFAULT_QUOTA_BINARY = f"{DEFAULT_QUOTA_RELEASE}/bin/quota-axi"
 DEFAULT_QUOTA_NODE_BINARY = f"{DEFAULT_QUOTA_RELEASE}/runtime/node"
 

@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from agent_fleet.config import (
+    DEFAULT_QUOTA_BINARY,
+    DEFAULT_QUOTA_NODE_BINARY,
+    DEFAULT_QUOTA_RELEASE,
     initial_registry,
     load_registry,
     quota_binary_digest,
@@ -31,6 +34,17 @@ from agent_fleet.provision import (
 )
 from agent_fleet.quota import refresh_quota
 from agent_fleet.scheduler import select_and_acquire
+
+
+def test_default_quota_paths_pin_the_sealed_017_release() -> None:
+    release = "~/.local/libexec/agent-fleet/quota-axi/releases/0.1.7-9f2dde87-sealed"
+    assert release == DEFAULT_QUOTA_RELEASE
+    assert f"{release}/bin/quota-axi" == DEFAULT_QUOTA_BINARY
+    assert f"{release}/runtime/node" == DEFAULT_QUOTA_NODE_BINARY
+    assert all(
+        "0.1.6" not in path
+        for path in (DEFAULT_QUOTA_RELEASE, DEFAULT_QUOTA_BINARY, DEFAULT_QUOTA_NODE_BINARY)
+    )
 
 
 def test_initial_registry_is_dynamic_disabled_and_private(

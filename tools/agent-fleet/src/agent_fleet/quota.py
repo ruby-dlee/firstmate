@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import unicodedata
@@ -586,16 +585,11 @@ def inspect_credential_source_contract(
         expected_account = current_user_name()
         if (
             file_source.get("path") != expected_file
-            or keychain_source.get("path") is not None
             or "account" in file_source
+            or keychain_source.get("path") is not None
+            or keychain_source.get("account") != expected_account
         ):
             raise ValueError(f"Claude credential source scope mismatch for {profile.id}")
-        if (
-            not expected_account
-            or keychain_source.get("account") != expected_account
-            or "account" in file_source
-        ):
-            raise ValueError(f"Claude Keychain account mismatch for {profile.id}")
         available = [
             source
             for source in (file_source, keychain_source)

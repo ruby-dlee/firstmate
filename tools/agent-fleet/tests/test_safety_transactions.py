@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from dataclasses import replace
@@ -19,6 +20,7 @@ from agent_fleet.enrollment import (
     finalize_codex_promotion,
     prepare_codex_promotion,
     recover_pending_codex_transaction,
+    rollback_codex_promotion,
 )
 from agent_fleet.leases import bind_lease, new_lease
 from agent_fleet.locks import provider_enrollment_lock
@@ -51,7 +53,7 @@ def _prepared_codex_transaction(registry):
     old_auth.chmod(0o600)
     old_quota = quota_path(registry, target.id).read_bytes()
     snapshot = snapshot_quota_cache(registry, target.id)
-    stage = create_codex_login_stage(target)
+    stage = create_codex_login_stage(registry, target)
     staged_auth = stage.home / "auth.json"
     staged_auth.write_text('{"token":"new-test-token"}\n', encoding="utf-8")
     staged_auth.chmod(0o600)
@@ -85,7 +87,7 @@ def test_codex_crash_recovery_rolls_back_auth_and_quota_before_cleanup(
     assert quota_path(registry, target.id).read_bytes() == old_quota
     assert not transaction.journal_path.exists()
     discard_codex_promotion(promotion, target)
-    discard_codex_stage(stage, target)
+    discard_codex_stage(registry, stage, target)
 
 
 def test_codex_activation_failure_after_replace_is_recovered(
@@ -118,7 +120,7 @@ def test_codex_activation_failure_after_replace_is_recovered(
     assert "old-test-token" in old_auth.read_text(encoding="utf-8")
     assert quota_path(registry, target.id).read_bytes() == old_quota
     discard_codex_promotion(promotion, target)
-    discard_codex_stage(stage, target)
+    discard_codex_stage(registry, stage, target)
 
 
 def test_codex_committed_crash_recovery_keeps_promoted_auth(
@@ -149,7 +151,52 @@ def test_codex_committed_crash_recovery_keeps_promoted_auth(
     assert "new-test-token" in target_auth.read_text(encoding="utf-8")
     assert not transaction.journal_path.exists()
     discard_codex_promotion(promotion, target)
-    discard_codex_stage(stage, target)
+    discard_codex_stage(registry, stage, target)
+
+
+def test_codex_rollback_recovery_is_idempotent_after_auth_restore(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    target, stage, promotion, snapshot, target_auth, old_quota = _prepared_codex_transaction(
+        registry
+    )
+    transaction = activate_codex_promotion(registry, target, promotion, snapshot)
+    real_write_phase = enrollment._write_journal_phase
+
+    def fail_after_auth_restore(path: Path, journal: dict, phase: str) -> None:
+        if phase == "auth_restored":
+            raise OSError("injected crash after auth restore")
+        real_write_phase(path, journal, phase)
+
+    monkeypatch.setattr(enrollment, "_write_journal_phase", fail_after_auth_restore)
+    with pytest.raises(OSError, match="injected crash"):
+        rollback_codex_promotion(registry, target, transaction)
+    monkeypatch.setattr(enrollment, "_write_journal_phase", real_write_phase)
+
+    assert recover_pending_codex_transaction(registry, target) is True
+    assert "old-test-token" in target_auth.read_text(encoding="utf-8")
+    assert quota_path(registry, target.id).read_bytes() == old_quota
+    assert not transaction.journal_path.exists()
+    discard_codex_promotion(promotion, target)
+    discard_codex_stage(registry, stage, target)
+
+
+def test_codex_stage_does_not_modify_custom_existing_parent(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    parent = tmp_path / "shared-parent"
+    parent.mkdir(mode=0o755)
+    profile = replace(registry.require_profile("codex-1"), home=parent / "codex-home")
+
+    stage = create_codex_login_stage(registry, profile)
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stage.home.parent == registry.settings.state_dir / "staging" / "codex"
+    discard_codex_stage(registry, stage, profile)
 
 
 def test_provider_maintenance_marker_blocks_new_lease(
@@ -201,7 +248,7 @@ def test_profile_add_obeys_provider_maintenance_lock(
                 "--provider",
                 "claude",
             ],
-            cwd=project_root,
+            cwd=Path.cwd(),
             env=env,
             text=True,
             capture_output=True,
@@ -277,7 +324,7 @@ def test_enrollment_refuses_while_managed_provider_launch_is_alive(
             "enroll",
             profile.id,
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,

@@ -9,6 +9,7 @@ from typing import Any
 
 from .models import (
     PROFILE_SAFETY_POLICIES,
+    SHARED_WORKFLOW_ENTRIES,
     SUPPORTED_PROVIDERS,
     Profile,
     ProviderConfig,
@@ -149,6 +150,7 @@ def load_registry(path: Path | None = None) -> Registry:
             "~/Library/Application Support/Claude/config.json" if provider == "claude" else None,
         )
         shared_raw = item.get("shared_entries", [])
+        trusted_projects_raw = item.get("trusted_projects", [])
         if base_home_raw is not None and not isinstance(base_home_raw, str):
             raise ValueError(f"providers.{provider}.base_home must be a path string")
         if hooks_source_raw is not None and not isinstance(hooks_source_raw, str):
@@ -173,6 +175,16 @@ def load_registry(path: Path | None = None) -> Registry:
             for entry in shared_raw
         ):
             raise ValueError(f"providers.{provider}.shared_entries must contain simple file names")
+        disallowed_shared = sorted(set(shared_raw) - SHARED_WORKFLOW_ENTRIES[provider])
+        if disallowed_shared:
+            raise ValueError(
+                f"providers.{provider}.shared_entries contains non-workflow assets: "
+                + ", ".join(disallowed_shared)
+            )
+        if not isinstance(trusted_projects_raw, list) or not all(
+            isinstance(entry, str) and entry for entry in trusted_projects_raw
+        ):
+            raise ValueError(f"providers.{provider}.trusted_projects must contain path strings")
         providers[provider] = ProviderConfig(
             provider,
             expand_path(binary_raw),
@@ -184,6 +196,7 @@ def load_registry(path: Path | None = None) -> Registry:
                 if isinstance(desktop_identity_file_raw, str) and desktop_identity_file_raw
                 else None
             ),
+            tuple(expand_path(entry) for entry in trusted_projects_raw),
         )
 
     profiles_raw = raw.get("profiles", {})
@@ -214,6 +227,7 @@ def initial_registry(claude_count: int, codex_count: int) -> Registry:
             expand_path("~/.claude/settings.json"),
             ("CLAUDE.md", "skills", "plugins"),
             expand_path("~/Library/Application Support/Claude/config.json"),
+            (),
         ),
         "codex": ProviderConfig(
             "codex",
@@ -226,6 +240,8 @@ def initial_registry(claude_count: int, codex_count: int) -> Registry:
             expand_path("~/.codex"),
             expand_path("~/.codex/hooks.json"),
             ("AGENTS.md", "skills", "plugins", "rules"),
+            None,
+            (),
         ),
     }
     profiles: dict[str, Profile] = {}
@@ -264,6 +280,12 @@ def with_profile(registry: Registry, profile: Profile) -> Registry:
     return updated
 
 
+def with_provider(registry: Registry, provider: ProviderConfig) -> Registry:
+    providers = dict(registry.providers)
+    providers[provider.name] = provider
+    return replace(registry, providers=providers)
+
+
 def without_profile(registry: Registry, profile_id: str) -> Registry:
     registry.require_profile(profile_id)
     profiles = dict(registry.profiles)
@@ -276,6 +298,13 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 
 
 def _validate_profile_invariants(registry: Registry) -> None:
+    for provider_name, provider in registry.providers.items():
+        disallowed = sorted(set(provider.shared_entries) - SHARED_WORKFLOW_ENTRIES[provider_name])
+        if disallowed:
+            raise ValueError(
+                f"providers.{provider_name}.shared_entries contains non-workflow assets: "
+                + ", ".join(disallowed)
+            )
     profiles = list(registry.profiles.values())
     for profile in profiles:
         if profile.safety_policy not in PROFILE_SAFETY_POLICIES:
@@ -401,6 +430,9 @@ def save_registry(registry: Registry, path: Path | None = None) -> Path:
                 ),
                 "shared_entries = ["
                 + ", ".join(_toml_string(entry) for entry in provider_config.shared_entries)
+                + "]",
+                "trusted_projects = ["
+                + ", ".join(_toml_string(entry) for entry in provider_config.trusted_projects)
                 + "]",
             ]
         )

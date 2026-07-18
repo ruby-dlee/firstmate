@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import Profile, Registry
 from .providers import identity_fingerprint
-from .quota import probe_quota, read_quota
+from .quota import has_remote_identity_proof, probe_quota, read_quota
 from .util import atomic_write_json, utc_now
 
 
@@ -43,14 +43,7 @@ def _read_anchor(registry: Registry, provider: str, kind: str) -> dict[str, Any]
 
 
 def _quota_identity_is_verified(quota: dict[str, Any]) -> bool:
-    fingerprint = quota.get("identity_fingerprint")
-    return (
-        quota.get("status") == "fresh"
-        and quota.get("verified_at") is not None
-        and quota.get("headroom_percent") is not None
-        and isinstance(fingerprint, str)
-        and len(fingerprint) == 64
-    )
+    return has_remote_identity_proof(quota)
 
 
 def _managed_identity_has_recent_proof(quota: dict[str, Any]) -> bool:

@@ -118,3 +118,24 @@ def test_shared_asset_install_refuses_existing_non_symlink(
     (profile.home / "AGENTS.md").write_text("attacker-owned\n", encoding="utf-8")
     with pytest.raises(ValueError, match="refusing to replace"):
         provision_profile(registry, profile)
+
+
+@pytest.mark.parametrize(
+    ("provider", "entry"),
+    [("claude", ".claude.json"), ("codex", "auth.json")],
+)
+def test_registry_rejects_non_workflow_shared_entries(
+    fleet: tuple[object, Path], provider: str, entry: str
+) -> None:
+    _, path = fleet
+    text = path.read_text(encoding="utf-8")
+    marker = f"[providers.{provider}]"
+    before, after = text.split(marker, 1)
+    section, remainder = after.split("\n[", 1)
+    lines = [
+        f'shared_entries = ["{entry}"]' if line.startswith("shared_entries =") else line
+        for line in section.splitlines()
+    ]
+    path.write_text(before + marker + "\n".join(lines) + "\n[" + remainder, encoding="utf-8")
+    with pytest.raises(ValueError, match="non-workflow assets"):
+        load_registry(path)

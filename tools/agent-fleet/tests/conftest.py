@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,6 +29,15 @@ def fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Registry, Pa
     monkeypatch.setenv("AGENT_FLEET_CONFIG", str(config))
     monkeypatch.setenv("AGENT_FLEET_STATE_DIR", str(state))
     monkeypatch.setenv("AGENT_FLEET_SHARE_DIR", str(share))
+    trusted_project = tmp_path / "trusted-project"
+    trusted_project.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", str(trusted_project)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.chdir(trusted_project)
     registry = initial_registry(3, 2)
     quota_binary = tmp_path / "quota-axi"
     quota_binary.write_text(
@@ -99,6 +109,7 @@ print(json.dumps({
             hooks_source=hooks,
             shared_entries=(shared,),
             desktop_identity_file=desktop_file if name == "claude" else None,
+            trusted_projects=(trusted_project.resolve(),),
         )
     registry = replace(registry, providers=providers)
     save_registry(registry, config)

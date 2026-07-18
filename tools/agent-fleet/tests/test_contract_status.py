@@ -39,7 +39,7 @@ def test_contract_and_version_do_not_require_registry(tmp_path: Path) -> None:
                 str(missing),
                 command,
             ],
-            cwd=project_root,
+            cwd=Path.cwd(),
             env=env,
             text=True,
             capture_output=True,
@@ -107,7 +107,7 @@ def test_pool_status_reports_provider_level_fallback(
             "--provider",
             "codex",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -163,7 +163,7 @@ with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as handle:
             "enroll",
             "codex-1",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -219,7 +219,7 @@ def test_verify_keeps_a_remotely_rejected_profile_disabled(
             "verify",
             "codex-1",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -230,3 +230,96 @@ def test_verify_keeps_a_remotely_rejected_profile_disabled(
     assert payload["ready"] is False
     assert payload["profiles"][0]["enabled"] is False
     assert load_registry(config).require_profile("codex-1").enabled is False
+
+
+def test_claude_enrollment_discards_prelogin_identity_proof(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    old_quota = json.loads(quota_path(registry, "claude-1").read_text(encoding="utf-8"))
+    assert old_quota.get("identity_fingerprint")
+    fixtures = tmp_path / "quota"
+    fixtures.mkdir()
+    keychain_required = {
+        "providers": [
+            {
+                "provider": "claude",
+                "state": {"status": "auth_required", "reason": "keychain_access_required"},
+                "windows": [],
+            }
+        ]
+    }
+    (fixtures / "claude-1.json").write_text(json.dumps(keychain_required), encoding="utf-8")
+    base = {
+        "providers": [
+            {
+                "provider": "claude",
+                "account": {"accountId": "base-account"},
+                "state": {"status": "fresh", "refreshedAt": utc_now()},
+                "windows": [{"id": "five_hour", "kind": "session", "percentRemaining": 80}],
+            }
+        ]
+    }
+    (fixtures / "claude-base-anchor.json").write_text(json.dumps(base), encoding="utf-8")
+
+    project_root = Path(__file__).parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(project_root / "src")
+    env["AGENT_FLEET_QUOTA_FIXTURE_DIR"] = str(fixtures)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--format",
+            "json",
+            "--config",
+            str(config),
+            "profile",
+            "enroll",
+            "claude-1",
+        ],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    stored = json.loads(quota_path(registry, "claude-1").read_text(encoding="utf-8"))
+    assert payload["verification_pending"] is True
+    assert payload["credential_verified"] is False
+    assert stored.get("identity_fingerprint") is None
+    assert stored["reason"] == "keychain_access_required"
+
+
+def test_toon_preflight_precedes_registry_mutation(tmp_path: Path) -> None:
+    project_root = Path(__file__).parents[1]
+    config = tmp_path / "accounts.toml"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(project_root / "src")
+    env["PATH"] = str(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--config",
+            str(config),
+            "init",
+            "--claude",
+            "1",
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "TOON output requested" in result.stderr
+    assert not config.exists()

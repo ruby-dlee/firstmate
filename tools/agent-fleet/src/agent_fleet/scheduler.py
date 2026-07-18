@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .audit import append_audit
@@ -15,8 +16,9 @@ from .locks import (
     state_lock,
 )
 from .models import Profile, Registry
+from .projects import invocation_workspace
 from .providers import auth_status
-from .provision import profile_is_provisioned
+from .provision import prepare_profile_launch, profile_is_provisioned
 from .quota import quota_routeability, read_quota, refresh_due_quotas
 from .util import atomic_write_json, task_key
 
@@ -129,6 +131,7 @@ def _select_and_acquire(
     explicit_profile: bool = False,
     ignore_reserve: bool = False,
     recovery_reservation: bool = False,
+    workspace: Path | None = None,
 ) -> dict[str, Any]:
     if ignore_reserve and profile_id is None:
         raise ValueError("ignoring quota reserve requires an explicit profile")
@@ -152,6 +155,7 @@ def _select_and_acquire(
         and (profile_id is None or profile.id == profile_id)
         and profile_is_provisioned(profile)
     ]
+    active_workspace = workspace or invocation_workspace()
     # Quota/identity writes share the provider maintenance interlock, but a
     # selection does not hold it while committing its lease. The state-lock
     # check below closes both races: maintenance either owns the marker first
@@ -173,6 +177,9 @@ def _select_and_acquire(
                 registry.settings.lock_stale_seconds,
             ):
                 recover_pending_codex_transactions(registry, provider_name)
+                for profile in scoped_profiles:
+                    if profile.provider == provider_name:
+                        prepare_profile_launch(registry, profile, active_workspace)
                 refresh_provider_identity_anchors_if_due(registry, provider_name)
                 refresh_due_quotas(
                     registry,
@@ -366,6 +373,7 @@ def select_and_acquire(
     explicit_profile: bool = False,
     ignore_reserve: bool = False,
     recovery_reservation: bool = False,
+    workspace: Path | None = None,
 ) -> dict[str, Any]:
     return _select_and_acquire(
         registry,
@@ -378,4 +386,5 @@ def select_and_acquire(
         explicit_profile=explicit_profile,
         ignore_reserve=ignore_reserve,
         recovery_reservation=recovery_reservation,
+        workspace=workspace,
     )

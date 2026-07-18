@@ -174,13 +174,18 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
-def create_codex_login_stage(profile: Profile) -> Profile:
-    ensure_private_dir(profile.home.parent)
-    _private_directory(profile.home.parent, "managed Codex accounts directory")
+def _codex_stage_root(registry: Registry) -> Path:
+    return registry.settings.state_dir / "staging" / "codex"
+
+
+def create_codex_login_stage(registry: Registry, profile: Profile) -> Profile:
+    stage_root = _codex_stage_root(registry)
+    ensure_private_dir(stage_root)
+    _private_directory(stage_root, "managed Codex staging directory")
     stage = Path(
         tempfile.mkdtemp(
             prefix=f".{profile.home.name}.login-",
-            dir=profile.home.parent,
+            dir=stage_root,
         )
     )
     stage.chmod(0o700)
@@ -197,9 +202,11 @@ def _remove_private_tree(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def discard_codex_stage(stage: Profile, target: Profile) -> None:
+def discard_codex_stage(registry: Registry, stage: Profile, target: Profile) -> None:
     expected_prefix = f".{target.home.name}.login-"
-    if stage.home.parent != target.home.parent or not stage.home.name.startswith(expected_prefix):
+    if stage.home.parent != _codex_stage_root(registry) or not stage.home.name.startswith(
+        expected_prefix
+    ):
         raise ValueError(f"refusing to discard unrecognized Codex stage: {stage.home}")
     _remove_private_tree(stage.home)
 
@@ -378,24 +385,8 @@ def rollback_codex_promotion(
     transaction: CodexAuthTransaction,
 ) -> None:
     _private_directory(target.home, "managed Codex profile home")
-    _validate_transaction(registry, target, transaction)
-    backup = transaction.backup_auth
-    if backup is None:
-        transaction.target_auth.unlink()
-    else:
-        expected_prefix = f".{CODEX_AUTH_FILE}.backup-"
-        if backup.parent != target.home or not backup.name.startswith(expected_prefix):
-            raise ValueError("Codex auth backup is outside the target profile")
-        _regular_file_stat(backup, "Codex auth backup")
-        os.replace(backup, transaction.target_auth)
-        transaction.target_auth.chmod(0o600)
-    _fsync_directory(target.home)
-    journal = _read_journal(transaction.journal_path)
-    restore_quota_cache(
-        registry,
-        target.id,
-        _snapshot_from_payload(journal.get("quota_snapshot")),
-    )
+    journal = _validate_transaction(registry, target, transaction)
+    _recover_rollback(registry, target, journal)
     transaction.journal_path.unlink()
     _fsync_directory(transaction.journal_path.parent)
 
@@ -433,11 +424,16 @@ def recover_pending_codex_transaction(registry: Registry, target: Profile) -> bo
     journal = _read_journal(journal_path)
     target_auth, backup, temporary = _validate_journal_paths(registry, target, journal)
     installed_stat = _decoded_stat(journal.get("installed_stat"), "installed stat")
-    original_stat = _decoded_stat(journal.get("original_stat"), "original stat")
     if installed_stat is None:
         raise ValueError("Codex auth transaction has no installed stat")
     phase = journal.get("phase")
-    if phase not in {"prepared", "committed"}:
+    if phase not in {
+        "prepared",
+        "rolling_back",
+        "auth_restored",
+        "quota_restored",
+        "committed",
+    }:
         raise ValueError("Codex auth transaction has an invalid phase")
     _private_directory(target.home, "managed Codex profile home")
 
@@ -451,22 +447,7 @@ def recover_pending_codex_transaction(registry: Registry, target: Profile) -> bo
         if current_stat != installed_stat:
             raise ValueError("committed Codex auth changed before crash recovery")
     else:
-        if current_stat == installed_stat:
-            if backup is None:
-                target_auth.unlink()
-            else:
-                _regular_file_stat(backup, "Codex auth backup")
-                os.replace(backup, target_auth)
-                target_auth.chmod(0o600)
-            _fsync_directory(target.home)
-        elif current_stat != original_stat:
-            raise ValueError("Codex auth changed outside the interrupted transaction")
-        # Restore normalized quota evidence before deleting any recovery artifact.
-        restore_quota_cache(
-            registry,
-            target.id,
-            _snapshot_from_payload(journal.get("quota_snapshot")),
-        )
+        _recover_rollback(registry, target, journal)
 
     # Cleanup happens only after rollback+quota restore or a durable commit.
     temporary.unlink(missing_ok=True)
@@ -476,6 +457,85 @@ def recover_pending_codex_transaction(registry: Registry, target: Profile) -> bo
     _fsync_directory(target.home)
     _fsync_directory(journal_path.parent)
     return True
+
+
+def _write_journal_phase(path: Path, journal: dict[str, Any], phase: str) -> None:
+    journal["phase"] = phase
+    atomic_write_json(path, journal)
+    _fsync_directory(path.parent)
+
+
+def _recover_rollback(
+    registry: Registry,
+    target: Profile,
+    journal: dict[str, Any],
+) -> None:
+    target_auth, backup, _ = _validate_journal_paths(registry, target, journal)
+    journal_path = _journal_path(registry, target)
+    installed_stat = _decoded_stat(journal.get("installed_stat"), "installed stat")
+    original_stat = _decoded_stat(journal.get("original_stat"), "original stat")
+    if installed_stat is None:
+        raise ValueError("Codex auth transaction has no installed stat")
+    phase = journal.get("phase")
+    current_stat = (
+        _stat_identity(_regular_file_stat(target_auth, "managed Codex auth"))
+        if target_auth.exists() or target_auth.is_symlink()
+        else None
+    )
+    if phase == "prepared":
+        if current_stat == installed_stat:
+            rollback_stat = (
+                _stat_identity(_regular_file_stat(backup, "Codex auth backup"))
+                if backup is not None
+                else None
+            )
+        elif current_stat == original_stat:
+            rollback_stat = original_stat
+        else:
+            raise ValueError("Codex auth changed outside the interrupted transaction")
+        journal["rollback_stat"] = _encoded_stat(rollback_stat)
+        _write_journal_phase(journal_path, journal, "rolling_back")
+        phase = "rolling_back"
+    rollback_stat = _decoded_stat(journal.get("rollback_stat"), "rollback stat")
+    if phase != "prepared" and "rollback_stat" not in journal:
+        raise ValueError("Codex auth transaction has no rollback stat")
+    if phase == "rolling_back":
+        current_stat = (
+            _stat_identity(_regular_file_stat(target_auth, "managed Codex auth"))
+            if target_auth.exists() or target_auth.is_symlink()
+            else None
+        )
+        if current_stat == installed_stat:
+            if backup is None:
+                target_auth.unlink()
+            else:
+                backup_stat = _stat_identity(_regular_file_stat(backup, "Codex auth backup"))
+                if backup_stat != rollback_stat:
+                    raise ValueError("Codex auth backup changed during rollback")
+                os.replace(backup, target_auth)
+                target_auth.chmod(0o600)
+            _fsync_directory(target.home)
+        elif current_stat != rollback_stat:
+            raise ValueError("Codex auth changed outside the interrupted rollback")
+        _write_journal_phase(journal_path, journal, "auth_restored")
+        phase = "auth_restored"
+    if phase == "auth_restored":
+        current_stat = (
+            _stat_identity(_regular_file_stat(target_auth, "managed Codex auth"))
+            if target_auth.exists() or target_auth.is_symlink()
+            else None
+        )
+        if current_stat != rollback_stat:
+            raise ValueError("restored Codex auth changed before quota recovery")
+        restore_quota_cache(
+            registry,
+            target.id,
+            _snapshot_from_payload(journal.get("quota_snapshot")),
+        )
+        _write_journal_phase(journal_path, journal, "quota_restored")
+        phase = "quota_restored"
+    if phase != "quota_restored":
+        raise ValueError("Codex auth transaction has an invalid rollback phase")
 
 
 def recover_pending_codex_transactions(registry: Registry, provider: str) -> list[str]:

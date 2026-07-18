@@ -6,6 +6,10 @@ from typing import Any
 
 SUPPORTED_PROVIDERS = ("claude", "codex")
 PROFILE_SAFETY_POLICIES = ("worker", "manual_only", "desktop_shared")
+SHARED_WORKFLOW_ENTRIES = {
+    "claude": frozenset({"CLAUDE.md", "skills", "plugins"}),
+    "codex": frozenset({"AGENTS.md", "skills", "plugins", "rules"}),
+}
 
 
 @dataclass(frozen=True)
@@ -16,6 +20,7 @@ class ProviderConfig:
     hooks_source: Path | None = None
     shared_entries: tuple[str, ...] = ()
     desktop_identity_file: Path | None = None
+    trusted_projects: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)

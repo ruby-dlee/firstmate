@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable
 from hashlib import sha256
+from pathlib import Path
 
 from .models import Profile, Registry
 
@@ -39,6 +41,85 @@ def provider_argv(registry: Registry, profile: Profile, command: Iterable[str] =
     binary = registry.require_provider(profile.provider).binary
     suffix = list(command)
     return [str(binary), *suffix]
+
+
+def validate_worker_arguments(profile: Profile, arguments: list[str]) -> None:
+    blocked = {
+        "login",
+        "logout",
+        "resume",
+        "fork",
+        "auth",
+        "-r",
+        "--resume",
+        "--continue",
+    }
+    if any(
+        argument in blocked
+        or argument.startswith("--resume=")
+        or argument.startswith("--continue=")
+        for argument in arguments
+    ):
+        raise ValueError("worker exec refuses provider auth and resume commands")
+    if any(
+        argument in {"-C", "--cd", "--cwd", "--directory", "--add-dir"}
+        or argument.startswith(("-C", "--cd=", "--cwd=", "--directory=", "--add-dir="))
+        for argument in arguments
+    ):
+        raise ValueError("worker exec refuses provider working-directory overrides")
+    if profile.provider != "codex":
+        return
+    if any(argument in {"plugin", "features", "mcp"} for argument in arguments):
+        raise ValueError("worker exec refuses Codex plugin and configuration administration")
+    for index, argument in enumerate(arguments):
+        if argument in {"-p", "--profile", "--remote"} or argument.startswith(
+            ("-p=", "--profile=", "--remote=")
+        ):
+            raise ValueError("worker exec refuses alternate Codex config and runtime profiles")
+        if argument == "--dangerously-bypass-hook-trust":
+            raise ValueError("worker exec owns the Codex hook-trust override")
+        if (
+            argument == "--enable"
+            and index + 1 < len(arguments)
+            and arguments[index + 1] in {"plugins", "plugin_sharing"}
+        ):
+            raise ValueError("managed Codex launches keep plugins disabled")
+        if argument.startswith("--enable=") and argument.split("=", 1)[1] in {
+            "plugins",
+            "plugin_sharing",
+        }:
+            raise ValueError("managed Codex launches keep plugins disabled")
+        if argument in {"-c", "--config"} and index + 1 < len(arguments):
+            value = arguments[index + 1].lower()
+            if any(token in value for token in ("project", "trust", "hook", "plugin")):
+                raise ValueError("worker exec refuses managed Codex config overrides")
+        if argument.startswith("--config=") and any(
+            token in argument.lower() for token in ("project", "trust", "hook", "plugin")
+        ):
+            raise ValueError("worker exec refuses managed Codex config overrides")
+
+
+def codex_launch_prefix(active_root: Path) -> list[str]:
+    trust_override = f'projects.{json.dumps(str(active_root))}.trust_level="trusted"'
+    return [
+        "--disable",
+        "plugins",
+        "--disable",
+        "plugin_sharing",
+        "-c",
+        trust_override,
+        "--dangerously-bypass-hook-trust",
+    ]
+
+
+def managed_argv(
+    registry: Registry,
+    profile: Profile,
+    active_root: Path,
+    extra: list[str],
+) -> list[str]:
+    prefix = codex_launch_prefix(active_root) if profile.provider == "codex" else []
+    return provider_argv(registry, profile, [*prefix, *extra])
 
 
 def login_argv(
@@ -104,7 +185,13 @@ def resume_argv(
     profile: Profile,
     session_id: str,
     extra: list[str],
+    *,
+    active_root: Path,
 ) -> list[str]:
     if profile.provider == "claude":
         return provider_argv(registry, profile, ["--resume", session_id, *extra])
-    return provider_argv(registry, profile, ["resume", session_id, *extra])
+    return provider_argv(
+        registry,
+        profile,
+        ["resume", *codex_launch_prefix(active_root), session_id, *extra],
+    )

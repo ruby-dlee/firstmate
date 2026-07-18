@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from .models import Registry
+from .projects import canonical_git_project
 from .providers import auth_status
 from .provision import (
     profile_hook_health,
     profile_is_provisioned,
+    profile_launch_ready,
     profile_shared_assets_healthy,
 )
+from .quota import has_remote_identity_proof, read_quota
 
 
 def _mode(path: Path) -> str | None:
@@ -62,6 +65,18 @@ def run_doctor(
             binary_ok,
             f"{config.binary}",
         )
+        projects_ready = bool(config.trusted_projects)
+        if projects_ready:
+            try:
+                for project in config.trusted_projects:
+                    canonical_git_project(project)
+            except ValueError:
+                projects_ready = False
+        add(
+            f"trusted-projects:{provider}",
+            projects_ready,
+            ",".join(str(path) for path in config.trusted_projects) or "none",
+        )
     for profile in sorted(registry.profiles.values(), key=lambda item: item.id):
         provisioned = profile_is_provisioned(profile)
         add(
@@ -74,6 +89,18 @@ def run_doctor(
             f"profile:{profile.id}:auth",
             status == "authenticated" or not profile.enabled,
             status,
+        )
+        quota = read_quota(registry, profile.id)
+        remote_verified = (
+            provisioned
+            and status == "authenticated"
+            and quota.get("fresh") is True
+            and has_remote_identity_proof(quota)
+        )
+        add(
+            f"profile:{profile.id}:remote-identity-proof",
+            remote_verified,
+            "fresh" if remote_verified else str(quota.get("reason") or quota.get("status")),
         )
         if provisioned:
             home_mode = _mode(profile.home)
@@ -96,15 +123,27 @@ def run_doctor(
                 "healthy" if shared_healthy else "missing or redirected link",
             )
     if workspace is not None:
-        workspace = workspace.resolve()
         claude_events = _workspace_hook_events(workspace / ".claude" / "settings.json")
-        codex_events = _workspace_hook_events(workspace / ".codex" / "hooks.json")
-        for provider, events in (("claude", claude_events), ("codex", codex_events)):
-            required = {"PreToolUse", "Stop"}
+        required = {"PreToolUse", "Stop"}
+        add(
+            "workspace:claude:supervision-hooks",
+            required.issubset(claude_events),
+            f"{workspace}: events={','.join(sorted(claude_events)) or 'none'}",
+        )
+        codex_project_hooks = workspace / ".codex" / "hooks.json"
+        add(
+            "workspace:codex:project-hooks-absent",
+            not (codex_project_hooks.exists() or codex_project_hooks.is_symlink()),
+            str(codex_project_hooks),
+        )
+        for profile in sorted(registry.profiles.values(), key=lambda item: item.id):
+            ready = profile_is_provisioned(profile) and profile_launch_ready(
+                registry, profile, workspace
+            )
             add(
-                f"workspace:{provider}:supervision-hooks",
-                required.issubset(events),
-                f"{workspace}: events={','.join(sorted(events)) or 'none'}",
+                f"workspace:{profile.id}:provider-bootstrap",
+                ready,
+                "ready" if ready else "project, onboarding, or hook readiness failed",
             )
     required_failures = [check for check in checks if check["required"] and not check["ok"]]
     return {

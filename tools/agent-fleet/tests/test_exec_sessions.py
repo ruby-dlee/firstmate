@@ -73,7 +73,7 @@ def test_exec_uses_selected_home_and_clears_ambient_credentials(
             "--",
             "example-argument",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -81,7 +81,13 @@ def test_exec_uses_selected_home_and_clears_ambient_credentials(
         check=True,
     )
     payload = json.loads(result.stdout)
-    assert payload["argv"] == ["example-argument"]
+    assert payload["argv"][-1:] == ["example-argument"]
+    assert payload["argv"][:4] == [
+        "--disable",
+        "plugins",
+        "--disable",
+        "plugin_sharing",
+    ]
     assert payload["profile"] == "codex-1"
     assert payload["task"] == "exec-task"
     assert payload["codex_home"] == str(profile.home)
@@ -139,7 +145,7 @@ def test_session_hook_persists_profile_and_provider_session(
             "--task",
             "hook-task",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -162,7 +168,7 @@ def test_session_hook_persists_profile_and_provider_session(
             "--task",
             "hook-task",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -207,7 +213,7 @@ def test_direct_resume_without_managed_task_is_refused(
             "--",
             "extra",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -250,7 +256,7 @@ def test_direct_worker_exec_without_managed_task_is_refused(
             "--",
             "example-argument",
         ],
-        cwd=project_root,
+        cwd=Path.cwd(),
         env=env,
         text=True,
         capture_output=True,
@@ -259,6 +265,78 @@ def test_direct_worker_exec_without_managed_task_is_refused(
     )
     assert result.returncode == 2
     assert "worker exec requires --task" in result.stderr
+
+
+def test_worker_exec_refuses_auth_resume_and_plugin_overrides(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    project_root = Path(__file__).parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(project_root / "src")
+    for provider_args in (
+        ["login"],
+        ["resume", "foreign-session"],
+        ["--enable", "plugins"],
+        ["-c", 'projects."/tmp".trust_level="trusted"'],
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agent_fleet",
+                "--format",
+                "json",
+                "--config",
+                str(config),
+                "exec",
+                "--task",
+                "guarded-exec",
+                "--profile",
+                "codex-1",
+                "--",
+                *provider_args,
+            ],
+            cwd=Path.cwd(),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert (
+            "refuses" in json.loads(result.stdout)["error"]
+            or "disabled" in json.loads(result.stdout)["error"]
+        )
+
+
+def test_init_has_no_force_replacement_path(tmp_path: Path) -> None:
+    project_root = Path(__file__).parents[1]
+    config = tmp_path / "accounts.toml"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(project_root / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--config",
+            str(config),
+            "init",
+            "--claude",
+            "1",
+            "--force",
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert not config.exists()
 
 
 def test_live_task_cannot_be_rebound(fleet: tuple[object, Path]) -> None:

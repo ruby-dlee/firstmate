@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import stat
@@ -7,12 +9,15 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .models import Profile, ProviderConfig, Registry
+from . import __version__
+from .models import SHARED_WORKFLOW_ENTRIES, Profile, ProviderConfig, Registry
 from .paths import ensure_private_dir
+from .projects import TrustedProject, resolve_trusted_project
 from .providers import session_hook_command
 from .util import atomic_write_json
 
 HOOK_MARKER = " hook session-start"
+CODEX_HOOK_MARKER_FILE = ".agent-fleet-hooks.json"
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -25,6 +30,20 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"refusing to modify non-object JSON: {path}")
     return value
+
+
+def _read_owned_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists() and not path.is_symlink():
+        return {}
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return {}
+    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+        raise ValueError(f"managed JSON must be a current-user regular file: {path}")
+    if stat.S_IMODE(current.st_mode) & 0o077:
+        raise ValueError(f"managed JSON must not grant group/world access: {path}")
+    return _read_json_object(path)
 
 
 def _merge_source_hooks(payload: dict[str, Any], source: Path | None) -> None:
@@ -82,15 +101,227 @@ def _install_session_hook(path: Path, source: Path | None) -> None:
     atomic_write_json(path, payload)
 
 
+def _source_hash(source: Path | None) -> str | None:
+    if source is None:
+        return None
+    if not source.exists() and not source.is_symlink():
+        return None
+    current = source.lstat()
+    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+        raise ValueError(f"hook source must be a current-user regular file: {source}")
+    return hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def _hook_payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _agent_fleet_session_group(command: str) -> dict[str, Any]:
+    return {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "statusMessage": "Recording Agent Fleet session identity",
+            }
+        ],
+    }
+
+
+def _codex_hook_payload(source: Path | None, command: str) -> dict[str, Any]:
+    source_payload = _read_json_object(source) if source is not None and source.exists() else {}
+    source_hooks = source_payload.get("hooks", {})
+    if not isinstance(source_hooks, dict):
+        raise ValueError(f"hooks must be an object: {source}")
+    hooks = copy.deepcopy(source_hooks)
+    for event, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            raise ValueError(f"hooks.{event} must be an array: {source}")
+        canonical_groups: list[Any] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError(f"hooks.{event} entries must be objects: {source}")
+            entries = group.get("hooks", [])
+            if not isinstance(entries, list):
+                raise ValueError(f"hooks.{event} hook entries must be an array: {source}")
+            canonical_entries = [
+                entry
+                for entry in entries
+                if not (isinstance(entry, dict) and HOOK_MARKER in str(entry.get("command", "")))
+            ]
+            if canonical_entries:
+                group["hooks"] = canonical_entries
+                canonical_groups.append(group)
+        hooks[event] = canonical_groups
+    groups = hooks.setdefault("SessionStart", [])
+    groups.append(_agent_fleet_session_group(command))
+    return {"hooks": hooks}
+
+
+def _install_codex_hooks(profile: Profile, provider: ProviderConfig) -> None:
+    command = session_hook_command()
+    source_hash = _source_hash(provider.hooks_source)
+    payload = _codex_hook_payload(provider.hooks_source, command)
+    if source_hash != _source_hash(provider.hooks_source):
+        raise ValueError("Codex hook source changed during provisioning")
+    path = profile.home / "hooks.json"
+    atomic_write_json(path, payload)
+    atomic_write_json(
+        profile.home / CODEX_HOOK_MARKER_FILE,
+        {
+            "schema": 1,
+            "agent_fleet_version": __version__,
+            "profile": profile.id,
+            "provider": profile.provider,
+            "source": str(provider.hooks_source) if provider.hooks_source is not None else None,
+            "source_hash": source_hash,
+            "session_command": command,
+            "hooks_hash": _hook_payload_hash(payload),
+        },
+    )
+
+
+def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
+    provider = registry.require_provider(profile.provider)
+    try:
+        marker = _read_owned_json_object(profile.home / CODEX_HOOK_MARKER_FILE)
+        if (
+            set(marker)
+            != {
+                "schema",
+                "agent_fleet_version",
+                "profile",
+                "provider",
+                "source",
+                "source_hash",
+                "session_command",
+                "hooks_hash",
+            }
+            or marker.get("schema") != 1
+            or marker.get("agent_fleet_version") != __version__
+            or marker.get("profile") != profile.id
+            or marker.get("provider") != "codex"
+            or marker.get("source")
+            != (str(provider.hooks_source) if provider.hooks_source is not None else None)
+            or marker.get("source_hash") != _source_hash(provider.hooks_source)
+            or not isinstance(marker.get("session_command"), str)
+        ):
+            return False
+        payload = _read_owned_json_object(profile.home / "hooks.json")
+        expected = _codex_hook_payload(provider.hooks_source, marker["session_command"])
+    except (OSError, ValueError):
+        return False
+    expected_hash = _hook_payload_hash(expected)
+    return (
+        payload == expected
+        and marker.get("hooks_hash") == expected_hash
+        and _hook_payload_hash(payload) == expected_hash
+    )
+
+
+def _merge_claude_project_trust(profile: Profile, project: TrustedProject) -> None:
+    path = profile.home / ".claude.json"
+    payload = _read_owned_json_object(path)
+    projects = payload.setdefault("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError(f"Claude projects state must be an object: {path}")
+    changed = payload.get("hasCompletedOnboarding") is not True
+    payload["hasCompletedOnboarding"] = True
+    for root in {project.active_root, project.canonical_root}:
+        key = str(root)
+        existing = projects.setdefault(key, {})
+        if not isinstance(existing, dict):
+            raise ValueError(f"Claude project state must be an object: {key}")
+        if existing.get("hasTrustDialogAccepted") is not True:
+            changed = True
+            existing["hasTrustDialogAccepted"] = True
+    if changed:
+        atomic_write_json(path, payload)
+
+
+def claude_project_ready(profile: Profile, project: TrustedProject) -> bool:
+    try:
+        payload = _read_owned_json_object(profile.home / ".claude.json")
+    except ValueError:
+        return False
+    projects = payload.get("projects")
+    return (
+        payload.get("hasCompletedOnboarding") is True
+        and isinstance(projects, dict)
+        and all(
+            isinstance(projects.get(str(root)), dict)
+            and projects[str(root)].get("hasTrustDialogAccepted") is True
+            for root in {project.active_root, project.canonical_root}
+        )
+    )
+
+
+def prepare_profile_launch(
+    registry: Registry,
+    profile: Profile,
+    workspace: Path,
+) -> TrustedProject:
+    if not profile_is_provisioned(profile):
+        raise ValueError(f"profile is not provisioned: {profile.id}")
+    project = resolve_trusted_project(registry, profile.provider, workspace)
+    if profile.provider == "claude":
+        _merge_claude_project_trust(profile, project)
+        if not claude_project_ready(profile, project):
+            raise ValueError(f"Claude project trust bootstrap failed for {profile.id}")
+        hook_health = profile_hook_health(registry, profile)
+        if not (
+            hook_health["agent_fleet_session_hook"] and hook_health["inherited_workflow_hooks"]
+        ):
+            raise ValueError(f"managed Claude hook set is not ready for {profile.id}")
+    else:
+        project_hook = project.active_root / ".codex" / "hooks.json"
+        if project_hook.exists() or project_hook.is_symlink():
+            raise ValueError(f"managed Codex launch refuses project hooks: {project_hook}")
+        if not _codex_config_ready(profile.home):
+            raise ValueError(f"managed Codex config is not ready for {profile.id}")
+        if not codex_hooks_ready(registry, profile):
+            raise ValueError(f"managed Codex hook set is not ready for {profile.id}")
+    return project
+
+
+def profile_launch_ready(
+    registry: Registry,
+    profile: Profile,
+    workspace: Path,
+) -> bool:
+    try:
+        project = resolve_trusted_project(registry, profile.provider, workspace)
+    except ValueError:
+        return False
+    if profile.provider == "claude":
+        hook_health = profile_hook_health(registry, profile)
+        return (
+            claude_project_ready(profile, project)
+            and hook_health["agent_fleet_session_hook"]
+            and hook_health["inherited_workflow_hooks"]
+        )
+    project_hook = project.active_root / ".codex" / "hooks.json"
+    return (
+        not (project_hook.exists() or project_hook.is_symlink())
+        and _codex_config_ready(profile.home)
+        and codex_hooks_ready(registry, profile)
+    )
+
+
 def _ensure_codex_config(home: Path) -> None:
     path = home / "config.toml"
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         path.write_text(
             'cli_auth_credentials_store = "file"\n\n[features]\nhooks = true\n',
             encoding="utf-8",
         )
         path.chmod(0o600)
         return
+    current = path.lstat()
+    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+        raise ValueError(f"managed Codex config must be a current-user regular file: {path}")
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
@@ -103,10 +334,43 @@ def _ensure_codex_config(home: Path) -> None:
     features = raw.get("features", {})
     if not isinstance(features, dict) or features.get("hooks") is not True:
         raise ValueError(f"managed Codex profile requires [features] hooks=true: {path}")
+    projects = raw.get("projects", {})
+    if not isinstance(projects, dict) or projects:
+        raise ValueError(f"managed Codex profile cannot persist project trust: {path}")
     path.chmod(0o600)
 
 
+def _codex_config_ready(home: Path) -> bool:
+    path = home / "config.toml"
+    try:
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) & 0o077
+        ):
+            return False
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    features = raw.get("features", {})
+    projects = raw.get("projects", {})
+    return (
+        raw.get("cli_auth_credentials_store") == "file"
+        and isinstance(features, dict)
+        and features.get("hooks") is True
+        and isinstance(projects, dict)
+        and not projects
+    )
+
+
 def _share_workflow_entries(profile: Profile, provider: ProviderConfig) -> list[str]:
+    disallowed = sorted(set(provider.shared_entries) - SHARED_WORKFLOW_ENTRIES[provider.name])
+    if disallowed:
+        raise ValueError(
+            f"providers.{provider.name}.shared_entries contains non-workflow assets: "
+            + ", ".join(disallowed)
+        )
     if provider.base_home is None:
         return []
     shared: list[str] = []
@@ -172,11 +436,16 @@ def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
     elif profile.provider == "codex":
         ensure_private_dir(profile.home / "hooks")
         _ensure_codex_config(profile.home)
-        _install_session_hook(profile.home / "hooks.json", provider.hooks_source)
+        _install_codex_hooks(profile, provider)
     marker = profile.home / ".agent-fleet-profile.json"
     atomic_write_json(
         marker,
-        {"schema": 1, "profile": profile.id, "provider": profile.provider},
+        {
+            "schema": 2,
+            "agent_fleet_version": __version__,
+            "profile": profile.id,
+            "provider": profile.provider,
+        },
     )
     os.chmod(marker, 0o600)
     return {
@@ -190,13 +459,25 @@ def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
 
 def profile_is_provisioned(profile: Profile) -> bool:
     marker = profile.home / ".agent-fleet-profile.json"
-    if not profile.home.is_dir() or not marker.is_file():
+    if not profile.home.is_dir():
         return False
     try:
+        current = marker.lstat()
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+        ):
+            return False
         raw = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return raw.get("profile") == profile.id and raw.get("provider") == profile.provider
+    return raw == {
+        "schema": 2,
+        "agent_fleet_version": __version__,
+        "profile": profile.id,
+        "provider": profile.provider,
+    }
 
 
 def profile_hook_health(registry: Registry, profile: Profile) -> dict[str, bool]:
@@ -250,11 +531,16 @@ def profile_hook_health(registry: Registry, profile: Profile) -> dict[str, bool]
                     ):
                         source_ok = False
                         break
-    return {
+    if profile.provider == "codex":
+        source_ok = codex_hooks_ready(registry, profile)
+    health = {
         "agent_fleet_session_hook": any(HOOK_MARKER in command for command in commands),
         "herdr_session_hook": any("herdr-agent-state" in command for command in commands),
         "inherited_workflow_hooks": source_ok,
     }
+    if profile.provider == "codex":
+        health["closed_profile_hooks"] = codex_hooks_ready(registry, profile)
+    return health
 
 
 def profile_shared_assets_healthy(registry: Registry, profile: Profile) -> bool:

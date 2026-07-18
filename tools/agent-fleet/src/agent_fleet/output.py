@@ -7,6 +7,23 @@ import sys
 from typing import Any
 
 
+def preflight(output_format: str) -> None:
+    if output_format != "toon":
+        return
+    toon = shutil.which("toon")
+    if toon is None:
+        raise ValueError("TOON output requested but `toon` is not on PATH; use --format json")
+    result = subprocess.run(
+        [toon],
+        input="{}",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"TOON encoder preflight failed: {result.stderr.strip()}")
+
+
 def emit(payload: Any, output_format: str) -> None:
     if output_format == "json":
         json.dump(payload, sys.stdout, sort_keys=True, separators=(",", ":"))

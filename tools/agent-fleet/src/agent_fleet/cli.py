@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from .config import (
     set_profile_enabled,
     set_profile_safety_policy,
     with_profile,
+    with_provider,
     without_profile,
 )
 from .cooldowns import clear_cooldown, set_cooldown
@@ -42,18 +44,22 @@ from .identity import (
 from .leases import active_leases, release_lease
 from .locks import provider_enrollment_lock, state_lock
 from .models import PROFILE_SAFETY_POLICIES, SUPPORTED_PROVIDERS, Profile, Registry
-from .output import emit
+from .output import emit, preflight
 from .paths import default_config_path, expand_path
+from .projects import invocation_workspace, lexical_path, register_trusted_project
 from .providers import (
     auth_probe,
     auth_status,
     login_argv,
-    provider_argv,
+    managed_argv,
     provider_environment,
     resume_argv,
+    validate_worker_arguments,
 )
-from .provision import profile_is_provisioned, provision_profile
+from .provision import prepare_profile_launch, profile_is_provisioned, provision_profile
 from .quota import (
+    discard_quota_cache,
+    has_remote_identity_proof,
     probe_quota,
     quota_routeability,
     read_quota,
@@ -81,7 +87,15 @@ def _parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="create a disabled profile registry")
     init.add_argument("--claude", type=int, default=0)
     init.add_argument("--codex", type=int, default=0)
-    init.add_argument("--force", action="store_true")
+
+    project = commands.add_parser("project")
+    project_commands = project.add_subparsers(dest="project_command", required=True)
+    project_list = project_commands.add_parser("list")
+    project_list.add_argument("--provider", choices=SUPPORTED_PROVIDERS)
+    for name in ("register", "remove"):
+        item = project_commands.add_parser(name)
+        item.add_argument("path", type=Path)
+        item.add_argument("--provider", choices=SUPPORTED_PROVIDERS, required=True)
 
     profile = commands.add_parser("profile")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)
@@ -308,21 +322,15 @@ def _contract() -> dict[str, Any]:
             "session_remove": "session remove --task <task>",
             "profile_enroll": "profile enroll <profile>",
             "profile_verify": "profile verify <profile>|--all",
+            "project_register": "project register --provider <provider> <git-worktree>",
+            "project_remove": "project remove --provider <provider> <git-worktree>",
+            "project_list": "project list [--provider <provider>]",
         },
     }
 
 
 def _credential_is_remotely_verified(quota: dict[str, Any]) -> bool:
-    fingerprint = quota.get("identity_fingerprint")
-    return (
-        quota.get("status") == "fresh"
-        and quota.get("verified_at") is not None
-        and quota.get("headroom_percent") is not None
-        and isinstance(quota.get("windows"), list)
-        and bool(quota["windows"])
-        and isinstance(fingerprint, str)
-        and len(fingerprint) == 64
-    )
+    return has_remote_identity_proof(quota)
 
 
 def _cached_credential_proof_is_usable(quota: dict[str, Any]) -> bool:
@@ -466,7 +474,7 @@ def _enroll_codex_profile(
     browser_login: bool,
     access_token: bool,
 ) -> dict[str, Any]:
-    stage = create_codex_login_stage(target)
+    stage = create_codex_login_stage(registry, target)
     promotion: Profile | None = None
     transaction: CodexAuthTransaction | None = None
     quota_snapshot = snapshot_quota_cache(registry, target.id)
@@ -543,7 +551,7 @@ def _enroll_codex_profile(
         if promotion is not None and promotion.home.exists():
             discard_codex_promotion(promotion, target)
         if stage.home.exists():
-            discard_codex_stage(stage, target)
+            discard_codex_stage(registry, stage, target)
 
 
 def _run_profile_enrollment(
@@ -623,6 +631,7 @@ def _run_profile_enrollment(
                 )
             else:
                 provision_profile(registry, profile)
+                discard_quota_cache(registry, profile.id)
                 completed = subprocess.run(
                     login_argv(registry, profile),
                     env=provider_environment(profile),
@@ -689,7 +698,7 @@ def _run(args: argparse.Namespace) -> Any | None:
     if args.command == "contract":
         return _contract()
     if args.command == "init":
-        if config_path.exists() and not args.force:
+        if config_path.exists():
             raise ValueError(f"registry already exists: {config_path}")
         registry = initial_registry(args.claude, args.codex)
         save_registry(registry, config_path)
@@ -700,6 +709,48 @@ def _run(args: argparse.Namespace) -> Any | None:
         }
 
     registry = load_registry(config_path)
+    if args.command == "project":
+        if args.project_command == "list":
+            providers = [args.provider] if args.provider else list(SUPPORTED_PROVIDERS)
+            return {
+                "providers": [
+                    {
+                        "provider": provider,
+                        "trusted_projects": [
+                            str(path)
+                            for path in registry.require_provider(provider).trusted_projects
+                        ],
+                    }
+                    for provider in providers
+                ]
+            }
+        project_root = register_trusted_project(args.path)
+        with _provider_maintenance(registry, config_path, {args.provider}) as current:
+            if _provider_has_active_lease(current, args.provider):
+                raise ValueError(
+                    f"refusing {args.provider} project maintenance while a Fleet lease is active"
+                )
+            provider = current.require_provider(args.provider)
+            projects = set(provider.trusted_projects)
+            if args.project_command == "register":
+                projects.add(project_root)
+            else:
+                projects.discard(project_root)
+            updated = _mutate(
+                current,
+                lambda item: with_provider(
+                    item,
+                    replace(provider, trusted_projects=tuple(sorted(projects, key=str))),
+                ),
+                config_path,
+            )
+        return {
+            "provider": args.provider,
+            "trusted_projects": [
+                str(path) for path in updated.require_provider(args.provider).trusted_projects
+            ],
+        }
+
     if args.command == "profile":
         if args.profile_command == "list":
             return {
@@ -973,6 +1024,26 @@ def _run(args: argparse.Namespace) -> Any | None:
         )
 
     if args.command == "exec":
+        provider_args = _strip_separator(args.provider_args)
+        if args.profile:
+            validate_worker_arguments(registry.require_profile(args.profile), provider_args)
+        elif args.provider:
+            for profile in registry.profiles.values():
+                if profile.provider == args.provider:
+                    validate_worker_arguments(profile, provider_args)
+                    break
+        else:
+            for provider in SUPPORTED_PROVIDERS:
+                candidate = next(
+                    (
+                        profile
+                        for profile in registry.profiles.values()
+                        if profile.provider == provider
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    validate_worker_arguments(candidate, provider_args)
         task = _task(args.task) if args.task else None
         if task is None:
             raise ValueError("worker exec requires --task so its provider lease is tracked")
@@ -989,15 +1060,19 @@ def _run(args: argparse.Namespace) -> Any | None:
             explicit_profile=pool == "explicit",
         )
         profile = registry.require_profile(str(selected["profile"]))
-        argv = provider_argv(registry, profile, _strip_separator(args.provider_args))
+        validate_worker_arguments(profile, provider_args)
+        project = prepare_profile_launch(registry, profile, invocation_workspace())
+        argv = managed_argv(registry, profile, project.active_root, provider_args)
         os.execvpe(argv[0], argv, provider_environment(profile, task))
 
     if args.command == "resume":
+        provider_args = _strip_separator(args.provider_args)
         task = _task(args.task) if args.task else None
         if task is None:
             raise ValueError("worker resume requires --task so its provider lease is tracked")
         mapping = get_session(registry, task)
         profile = registry.require_profile(str(mapping.get("profile")))
+        validate_worker_arguments(profile, provider_args)
         if args.profile and args.profile != profile.id:
             raise ValueError("explicit profile does not match task session mapping")
         session_id = mapping.get("session_id")
@@ -1022,7 +1097,10 @@ def _run(args: argparse.Namespace) -> Any | None:
             registry,
             profile,
             session_id,
-            _strip_separator(args.provider_args),
+            provider_args,
+            active_root=prepare_profile_launch(
+                registry, profile, invocation_workspace()
+            ).active_root,
         )
         os.execvpe(argv[0], argv, provider_environment(profile, task))
 
@@ -1043,7 +1121,7 @@ def _run(args: argparse.Namespace) -> Any | None:
         return run_doctor(
             registry,
             config_path,
-            workspace=expand_path(args.workspace) if args.workspace else None,
+            workspace=lexical_path(args.workspace) if args.workspace else None,
         )
     if args.command == "status":
         with _provider_maintenance(
@@ -1067,6 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        preflight(args.format)
         payload = _run(args)
         if payload is not None:
             emit(payload, args.format)

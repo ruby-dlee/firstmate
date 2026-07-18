@@ -50,10 +50,16 @@ task-to-provider-session mappings and resumes through the original profile.
 ## Initial setup
 
 ```sh
-agent-fleet init --claude 3 --codex 2
+agent-fleet init --claude 1 --codex 1
+agent-fleet project register --provider claude /absolute/path/to/project
+agent-fleet project register --provider codex /absolute/path/to/project
 agent-fleet profile enroll claude-1
 agent-fleet profile enroll codex-1
 ```
+
+Register every Git project that may host a managed worker before enrollment and launch.
+Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
+Broad, symlinked, unrelated, and unregistered working directories fail closed before a provider process or lease starts.
 
 `profile enroll` is the login transaction: the profile must already be disabled
 and every same-provider Fleet lease must be drained. It provisions the isolated
@@ -64,7 +70,9 @@ after reviewing verification:
 
 ```sh
 agent-fleet profile verify claude-1 --allow-keychain-prompt
+agent-fleet profile verify codex-1
 agent-fleet profile enable claude-1
+agent-fleet profile enable codex-1
 ```
 
 Codex enrollment uses device authorization by default and a fresh staging home,
@@ -138,6 +146,10 @@ while a live worker lease requires an explicit forced release after the worker
 has stopped. Worker `exec` and `resume` require a managed task id, and every live
 lease and lock requires a verified process-start token; missing tokens fail
 closed. A live task can never be rebound to a different process.
+Raw provider auth and resume subcommands are refused by `exec` so credential maintenance and sticky session recovery cannot bypass their dedicated paths.
+
+Claude launch bootstrap atomically preserves opaque profile state while setting only completed onboarding and trust for the validated active and canonical project roots.
+Codex launches require an exact current-version profile hook set derived from the declared hook source plus Agent Fleet SessionStart, reject project hooks, disable `plugins` and `plugin_sharing`, and apply trust only to the validated active root.
 
 Task resume is fail-closed: it requires the recorded provider session and
 reuses that session's exact profile. The new-task quota reserve does not block
@@ -184,10 +196,8 @@ routing activation are deliberately separate phases. On macOS,
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
 never requests Keychain access and fails closed when verification is unavailable.
 
-`doctor` verifies private profile homes, the Agent Fleet SessionStart hook,
-current Herdr session-identity hooks, inherited workflow hooks/assets, provider
-auth state, pinned binaries, and (when `--workspace` is supplied) that both
-Claude and Codex supervision hooks expose `PreToolUse` and `Stop` there.
+`doctor` verifies private profile homes, fresh remote identity proof, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
+When `--workspace` is supplied, it also verifies provider onboarding/project/hook readiness, Claude supervision hooks, and the required absence of Codex project hooks.
 
 ## Isolation and shared workflow assets
 
@@ -196,8 +206,8 @@ force file-backed credentials inside that home. Homes and state are mode 0700;
 registry, lease, quota, and session files are mode 0600. Ambient provider API
 key and access-token variables are removed before every provider launch.
 
-The provider registry can declare a base home, hook source, and simple shared
-entries. Initial profiles share only account-neutral workflow assets:
+The provider registry can declare a base home, hook source, trusted Git projects, and allowlisted shared entries.
+Initial profiles share only account-neutral workflow assets:
 
 - Claude: `CLAUDE.md`, skills, plugins, and hook definitions.
 - Codex: `AGENTS.md`, skills, plugins, rules, and hook definitions.

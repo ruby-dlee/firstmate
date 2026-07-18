@@ -70,6 +70,23 @@ def restore_quota_cache(
     path.unlink()
 
 
+def discard_quota_cache(registry: Registry, profile_id: str) -> None:
+    restore_quota_cache(registry, profile_id, QuotaCacheSnapshot(False))
+
+
+def has_remote_identity_proof(quota: dict[str, Any]) -> bool:
+    fingerprint = quota.get("identity_fingerprint")
+    return (
+        quota.get("status") == "fresh"
+        and quota.get("verified_at") is not None
+        and quota.get("headroom_percent") is not None
+        and isinstance(quota.get("windows"), list)
+        and bool(quota["windows"])
+        and isinstance(fingerprint, str)
+        and len(fingerprint) == 64
+    )
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return max(0.0, min(100.0, float(value)))

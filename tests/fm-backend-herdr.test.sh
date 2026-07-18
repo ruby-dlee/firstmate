@@ -706,6 +706,281 @@ SH
   pass "managed artifact recovery deletes only proven generations and quarantines last-check substitutions without data loss"
 }
 
+test_managed_artifact_recovers_every_published_pair_crash_boundary() {
+  local dir lock_root source ps_fake helper helper_candidate helper_marker recovered
+  local config config_candidate config_marker helper_quarantine_marker helper_quarantine
+  local empty_marker config_empty_quarantine foreign foreign_candidate helper_before
+  local substitution_config substitution_candidate substitution_marker substitution_ready substitution_proceed
+  local substitution_original substitution_expected recovery_pid recovery_status artifact
+  dir="$TMP_ROOT/herdr-published-pair-crashes"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  lock_root=$(cd "$lock_root" && pwd -P) || fail "could not resolve artifact test lock root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  chmod 755 "$ps_fake"
+
+  artifact_inode() {
+    if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$1"; else stat -c '%d:%i' "$1"; fi
+  }
+  artifact_nlink() {
+    if [ "$(uname)" = Darwin ]; then stat -f %l "$1"; else stat -c %h "$1"; fi
+  }
+  first_candidate() {
+    local found
+    for found in "$1".candidate.*; do
+      [ -f "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  first_candidate_quarantine() {
+    local found
+    for found in "$1".candidate.*.quarantine.*; do
+      [ -d "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  artifact_bash() {
+    local program=$1
+    shift
+    PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" \
+      FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" \
+      FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_READY="${FM_TEST_HERDR_ARTIFACT_PAIR_READY:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED="${FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED:-}" \
+      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+  }
+
+  # Helper: kill immediately after no-replace link publication, then converge
+  # the exact target/candidate nlink=2 pair to one validated target.
+  helper_marker="$dir/helper-linked"
+  if FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="$helper_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "managed helper publisher survived its post-link SIGKILL fixture"
+  fi
+  [ -e "$helper_marker" ] || fail "managed helper publisher never reached its post-link kill boundary"
+  helper=
+  for artifact in "$lock_root"/managed-worker-shell-v1-*; do
+    case "$artifact" in *.candidate.*|*.quarantine.*) continue ;; esac
+    [ -f "$artifact" ] || continue
+    helper=$artifact
+    break
+  done
+  [ -n "$helper" ] || fail "killed helper publisher left no installed target"
+  helper_candidate=$(first_candidate "$helper") || fail "killed helper publisher left no candidate alias"
+  if [ "$(artifact_inode "$helper")" != "$(artifact_inode "$helper_candidate")" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 2 ]; then
+    fail "killed helper publisher did not leave one exact two-link inode"
+  fi
+  touch -t 202001010000 "$helper_candidate"
+  recovered=$(artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin') \
+    || fail "managed helper did not recover its killed post-link publisher"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$helper")" ] \
+    || [ -e "$helper_candidate" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 1 ]; then
+    fail "managed helper post-link recovery did not converge to one validated target"
+  fi
+
+  # Config: exercise the same direct post-link recovery independently.
+  config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-link "$1"
+  ' "$helper") || fail "could not derive post-link config path"
+  config_marker="$dir/config-linked"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$config_marker" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "managed config publisher survived its post-link SIGKILL fixture"
+  fi
+  [ -e "$config_marker" ] || fail "managed config publisher never reached its post-link kill boundary"
+  config_candidate=$(first_candidate "$config") || fail "killed config publisher left no candidate alias"
+  if [ "$(artifact_inode "$config")" != "$(artifact_inode "$config_candidate")" ] \
+    || [ "$(artifact_nlink "$config")" -ne 2 ]; then
+    fail "killed config publisher did not leave one exact two-link inode"
+  fi
+  touch -t 202001010000 "$config_candidate"
+  recovered=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+  ' "$helper") || fail "managed config did not recover its killed post-link publisher"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$config")" ] \
+    || [ -e "$config_candidate" ] \
+    || [ "$(artifact_nlink "$config")" -ne 1 ]; then
+    fail "managed config post-link recovery did not converge to one validated target"
+  fi
+
+  # Kill after the helper candidate alias has moved to its attributed
+  # quarantine but before unlink. The next call must recover that exact
+  # target/quarantine-artifact pair and remove the quarantine.
+  printf '\n# second helper generation\n' >> "$source"
+  helper_quarantine_marker="$dir/helper-quarantined"
+  if FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="$dir/helper-linked-2" artifact_bash \
+    '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' >/dev/null 2>&1; then
+    fail "second helper publisher survived its post-link SIGKILL fixture"
+  fi
+  helper=
+  for artifact in "$lock_root"/managed-worker-shell-v1-*; do
+    case "$artifact" in *.candidate.*|*.quarantine.*) continue ;; esac
+    [ -f "$artifact" ] || continue
+    [ "$(artifact_nlink "$artifact")" -eq 2 ] || continue
+    helper=$artifact
+    break
+  done
+  [ -n "$helper" ] || fail "second killed helper publisher left no two-link target"
+  helper_candidate=$(first_candidate "$helper") || fail "second killed helper publisher left no candidate"
+  touch -t 202001010000 "$helper_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$helper_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$helper_quarantine_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "helper recovery survived its post-quarantine SIGKILL fixture"
+  fi
+  [ -e "$helper_quarantine_marker" ] || fail "helper recovery never reached its post-quarantine kill boundary"
+  [ ! -e "$helper_candidate" ] || fail "post-quarantine helper crash retained the public candidate alias"
+  helper_quarantine=$(first_candidate_quarantine "$helper") \
+    || fail "post-quarantine helper crash left no recoverable quarantine"
+  if [ ! -f "$helper_quarantine/artifact" ] \
+    || [ "$(artifact_inode "$helper_quarantine/artifact")" != "$(artifact_inode "$helper")" ]; then
+    fail "post-quarantine helper crash lost its attributed target alias"
+  fi
+  touch -t 202001010000 "$helper_quarantine" "$helper_quarantine/artifact"
+  recovered=$(artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin') \
+    || fail "managed helper did not recover its post-quarantine crash"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$helper")" ] \
+    || [ -e "$helper_quarantine" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 1 ]; then
+    fail "post-quarantine helper recovery did not converge without transients"
+  fi
+
+  # Kill after the config candidate's quarantined alias is unlinked but before
+  # rmdir. Recovery must prove the target inode and remove only the empty owned
+  # quarantine.
+  config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-empty-q "$1"
+  ' "$helper") || fail "could not derive empty-quarantine config path"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$dir/config-linked-2" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "second config publisher survived its post-link SIGKILL fixture"
+  fi
+  config_candidate=$(first_candidate "$config") || fail "second killed config publisher left no candidate"
+  touch -t 202001010000 "$config_candidate"
+  empty_marker="$dir/config-artifact-unlinked"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$config_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$empty_marker" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+    ' "$helper" >/dev/null 2>&1; then
+    fail "config recovery survived its post-unlink SIGKILL fixture"
+  fi
+  [ -e "$empty_marker" ] || fail "config recovery never reached its post-unlink kill boundary"
+  config_empty_quarantine=$(first_candidate_quarantine "$config") \
+    || fail "post-unlink config crash left no empty quarantine"
+  if [ -e "$config_empty_quarantine/artifact" ] \
+    || [ "$(artifact_nlink "$config")" -ne 1 ]; then
+    fail "post-unlink config crash did not preserve exactly one target alias"
+  fi
+  touch -t 202001010000 "$config_empty_quarantine"
+  recovered=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+  ' "$helper") || fail "managed config did not recover its empty quarantine"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$config")" ] \
+    || [ -e "$config_empty_quarantine" ]; then
+    fail "empty config quarantine recovery did not converge"
+  fi
+
+  # A stale two-link candidate that is not the target's inode is foreign and
+  # must block recovery without losing either generation.
+  helper_before=$(cat "$helper")
+  foreign="$dir/foreign-helper"
+  foreign_candidate="$helper.candidate.999999"
+  printf 'foreign helper generation\n' > "$foreign"
+  chmod 500 "$foreign"
+  ln "$foreign" "$foreign_candidate"
+  touch -t 202001010000 "$foreign_candidate"
+  if artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_artifact_recover_candidates "$1" 0500
+  ' "$helper" >/dev/null 2>&1; then
+    fail "foreign two-link helper candidate was accepted as a published pair"
+  fi
+  if [ "$(cat "$helper")" != "$helper_before" ] \
+    || [ ! -e "$foreign" ] \
+    || [ ! -e "$foreign_candidate" ]; then
+    fail "foreign two-link refusal deleted or changed a generation"
+  fi
+
+  # Substitute the config target after the last pair proof and before the
+  # candidate's quarantine rename. Recovery may delete its attributed stale
+  # alias, but must refuse and preserve both the substituted target and the
+  # displaced original generation.
+  substitution_config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-substitute "$1"
+  ' "$helper") || fail "could not derive substitution config path"
+  substitution_marker="$dir/config-linked-substitute"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$substitution_marker" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-substitute "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "substitution config publisher survived its post-link SIGKILL fixture"
+  fi
+  substitution_candidate=$(first_candidate "$substitution_config") \
+    || fail "substitution fixture left no published candidate pair"
+  touch -t 202001010000 "$substitution_candidate"
+  substitution_expected=$(cat "$substitution_config")
+  substitution_original="$substitution_config.attributed"
+  substitution_ready="$dir/pair-ready"
+  substitution_proceed="$dir/pair-proceed"
+  FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="$substitution_config" \
+    FM_TEST_HERDR_ARTIFACT_PAIR_READY="$substitution_ready" \
+    FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED="$substitution_proceed" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+    ' "$substitution_config" >/dev/null 2>&1 &
+  recovery_pid=$!
+  for _attempt in $(seq 1 100); do [ -e "$substitution_ready" ] && break; sleep 0.02; done
+  [ -e "$substitution_ready" ] \
+    || { kill "$recovery_pid" 2>/dev/null || true; fail "published-pair recovery never reached its substitution barrier"; }
+  mv "$substitution_config" "$substitution_original"
+  printf 'foreign substituted config\n' > "$substitution_config"
+  chmod 600 "$substitution_config"
+  : > "$substitution_proceed"
+  if wait "$recovery_pid" >/dev/null 2>&1; then recovery_status=0; else recovery_status=$?; fi
+  [ "$recovery_status" -ne 0 ] || fail "published-pair recovery accepted a substituted target generation"
+  if [ "$(cat "$substitution_config")" != 'foreign substituted config' ] \
+    || [ "$(cat "$substitution_original")" != "$substitution_expected" ]; then
+    fail "published-pair substitution refusal deleted or changed a target generation"
+  fi
+  pass "managed helper/config publication recovers every two-link cleanup crash boundary and refuses foreign/substituted pairs"
+}
+
 test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
   local dir fb fake source mode case_dir lock_root running pids state log mutation old_pid new_pid out status
   dir="$TMP_ROOT/herdr-certified-lifecycle"
@@ -3542,6 +3817,12 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
   test_managed_shell_and_server_certificate_close_startup_before_bash
   test_managed_shell_certificate_rejects_release_and_artifact_drift
   test_managed_artifact_candidate_recovery_is_guarded
+  test_managed_artifact_recovers_every_published_pair_crash_boundary
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = published-pair ]; then
+  test_managed_artifact_recovers_every_published_pair_crash_boundary
   exit 0
 fi
 
@@ -3565,6 +3846,7 @@ test_server_launch_preserves_only_safe_worker_tool_paths
 test_managed_shell_and_server_certificate_close_startup_before_bash
 test_managed_shell_certificate_rejects_release_and_artifact_drift
 test_managed_artifact_candidate_recovery_is_guarded
+test_managed_artifact_recovers_every_published_pair_crash_boundary
 test_server_ensure_converges_only_adapter_owned_exact_empty_drift
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker

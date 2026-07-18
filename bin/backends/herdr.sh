@@ -709,6 +709,61 @@ fm_backend_herdr_file_snapshot() {  # <path> <mode|executable> <owner-policy>
   fm_backend_herdr_file_read_verified snapshot "$@"
 }
 
+# Prove that <candidate> and <target> are the two names of exactly one regular,
+# current-user-owned inode left by no-replace publication. This proof is kept
+# separate from ordinary artifact reads, which intentionally require nlink=1.
+fm_backend_herdr_hardlink_pair_identity() {  # <candidate> <target> <mode>
+  local candidate=$1 target=$2 mode=$3
+  case "$candidate:$target" in *$'\n'*) return 1 ;; esac
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -e '
+    my ($candidate, $target, $expected_mode) = @ARGV;
+    my $nofollow = eval { O_NOFOLLOW() };
+    defined $nofollow or die "O_NOFOLLOW unavailable";
+    sysopen my $candidate_fh, $candidate, O_RDONLY | $nofollow
+      or die "candidate open: $!";
+    sysopen my $target_fh, $target, O_RDONLY | $nofollow
+      or die "target open: $!";
+    my @candidate_before = stat($candidate_fh);
+    my @target_before = stat($target_fh);
+    @candidate_before && @target_before or die "fstat";
+    -f $candidate_fh && -f $target_fh or die "not regular";
+    ($candidate_before[2] & 07777) == oct($expected_mode) or die "candidate mode";
+    ($target_before[2] & 07777) == oct($expected_mode) or die "target mode";
+    $candidate_before[3] == 2 && $target_before[3] == 2 or die "link count";
+    $candidate_before[4] == $< && $target_before[4] == $< or die "owner";
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $candidate_before[$index] == $target_before[$index] or die "not one inode";
+    }
+    my $sha = Digest::SHA->new(256);
+    while (1) {
+      my $count = sysread($candidate_fh, my $chunk, 65536);
+      defined $count or die "read: $!";
+      last unless $count;
+      $sha->add($chunk);
+    }
+    my @candidate_after = stat($candidate_fh);
+    my @target_after = stat($target_fh);
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $candidate_before[$index] == $candidate_after[$index]
+        && $target_before[$index] == $target_after[$index]
+        or die "changed during read";
+    }
+    my @candidate_path = lstat($candidate);
+    my @target_path = lstat($target);
+    @candidate_path && @target_path or die "path disappeared";
+    $candidate_path[0] == $candidate_after[0]
+      && $candidate_path[1] == $candidate_after[1]
+      && $target_path[0] == $target_after[0]
+      && $target_path[1] == $target_after[1]
+      or die "path replaced";
+    close $candidate_fh or die "candidate close: $!";
+    close $target_fh or die "target close: $!";
+    print $sha->hexdigest, "\n",
+      join(":", @candidate_after[0, 1, 7, 9]), "\n";
+  ' "$candidate" "$target" "$mode" 2>/dev/null
+}
+
 fm_backend_herdr_managed_shell_source() {
   local physical candidate="$FM_BACKEND_HERDR_ROOT/bin/fm-herdr-worker-shell"
   if fm_backend_herdr_test_hooks_enabled \
@@ -774,31 +829,159 @@ fm_backend_herdr_artifact_remove_attributed() {  # <path> <expected-dev:ino>
     echo "error: preserved ambiguous Herdr artifact generation at $quarantine/artifact" >&2
     return 1
   fi
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE"
+    kill -KILL "${BASHPID:-$$}"
+  fi
   fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK"
+    kill -KILL "${BASHPID:-$$}"
+  fi
   fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
 }
 
+# Recover either crash boundary after an attributed published candidate was
+# moved into its private quarantine: artifact still linked to <target>, or the
+# artifact already unlinked with only the empty owned quarantine remaining.
+fm_backend_herdr_artifact_recover_candidate_quarantines() {  # <target> <mode>
+  local target=$1 mode=$2 quarantine candidate pid key expected_inode quarantine_inode contents
+  local identity_before identity_after artifact_inode target_after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  for quarantine in "$target".candidate.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    candidate=${quarantine%.quarantine.*}
+    pid=${candidate##*.candidate.}
+    key=${quarantine##*.quarantine.}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case "$key" in ''|*[!0-9_]*|_*|*_|*_*_*) return 1 ;; esac
+    expected_inode=${key/_/:}
+    fm_backend_herdr_server_lock_is_stale_age "$quarantine" || continue
+    fm_backend_herdr_process_absent "$pid" || continue
+    [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    [ -d "$quarantine" ] && [ ! -L "$quarantine" ] && [ -O "$quarantine" ] \
+      && [ "$(fm_backend_herdr_path_mode "$quarantine")" = 700 ] || return 1
+    quarantine_inode=$(fm_backend_herdr_path_inode "$quarantine") || return 1
+    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+    contents=$(fm_backend_herdr_control_perl -e '
+      opendir my $dir, $ARGV[0] or die $!;
+      my @names = sort grep { $_ ne "." && $_ ne ".." } readdir $dir;
+      closedir $dir or die $!;
+      if (!@names) { print "empty"; exit 0; }
+      if (@names == 1 && $names[0] eq "artifact") { print "artifact"; exit 0; }
+      exit 1;
+    ' "$quarantine" 2>/dev/null) || return 1
+    case "$contents" in
+      artifact)
+        identity_before=$(fm_backend_herdr_hardlink_pair_identity \
+          "$quarantine/artifact" "$target" "$mode") || return 1
+        artifact_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact") || return 1
+        [ "$artifact_inode" = "$expected_inode" ] || return 1
+        identity_after=$(fm_backend_herdr_hardlink_pair_identity \
+          "$quarantine/artifact" "$target" "$mode") || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$quarantine_inode" ] \
+          || return 1
+        fm_backend_herdr_process_absent "$pid" || return 1
+        fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+        fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
+        target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
+          || return 1
+        [ "$target_after" = "$identity_after" ] || return 1
+        ;;
+      empty)
+        identity_before=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
+          || return 1
+        [ "$(fm_backend_herdr_path_inode "$target" 2>/dev/null)" = "$expected_inode" ] \
+          || return 1
+        identity_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
+          || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$quarantine_inode" ] \
+      || return 1
+    contents=$(fm_backend_herdr_control_perl -e '
+      opendir my $dir, $ARGV[0] or die $!;
+      my @names = grep { $_ ne "." && $_ ne ".." } readdir $dir;
+      closedir $dir or die $!;
+      print @names ? "occupied" : "empty";
+    ' "$quarantine" 2>/dev/null) || return 1
+    [ "$contents" = empty ] || return 1
+    fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
+  done
+}
+
 fm_backend_herdr_artifact_recover_candidates() {  # <target> <mode>
-  local target=$1 mode=$2 candidate pid inode identity_before identity_after
+  local target=$1 mode=$2 candidate pid inode links identity_before identity_after target_after
   fm_backend_herdr_artifact_has_quarantine "$target" && return 1
+  fm_backend_herdr_artifact_recover_candidate_quarantines "$target" "$mode" || return 1
   for candidate in "$target".candidate.*; do
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     pid=${candidate##*.candidate.}
     case "$pid" in ''|*[!0-9]*) continue ;; esac
-    identity_before=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
-    fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
-    fm_backend_herdr_process_absent "$pid" || continue
-    inode=$(fm_backend_herdr_path_inode "$candidate") || continue
-    identity_after=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
-    [ "$identity_after" = "$identity_before" ] || continue
-    fm_backend_herdr_process_absent "$pid" || continue
-    fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
-    fm_backend_herdr_artifact_remove_attributed "$candidate" "$inode" || return 1
+    links=$(fm_backend_herdr_path_nlink "$candidate" 2>/dev/null) || continue
+    case "$links" in
+      1)
+        identity_before=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        inode=$(fm_backend_herdr_path_inode "$candidate") || continue
+        identity_after=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+        [ "$identity_after" = "$identity_before" ] || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_artifact_remove_attributed "$candidate" "$inode" || return 1
+        ;;
+      2)
+        identity_before=$(fm_backend_herdr_hardlink_pair_identity "$candidate" "$target" "$mode") || {
+          if fm_backend_herdr_server_lock_is_stale_age "$candidate" \
+            && fm_backend_herdr_process_absent "$pid"; then
+            echo "error: refusing ambiguous Herdr published candidate pair: $candidate" >&2
+            return 1
+          fi
+          continue
+        }
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        inode=$(fm_backend_herdr_path_inode "$candidate") || continue
+        identity_after=$(fm_backend_herdr_hardlink_pair_identity "$candidate" "$target" "$mode") || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        fm_backend_herdr_process_absent "$pid" || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        if fm_backend_herdr_test_hooks_enabled \
+          && [ "${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" = "$target" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_PAIR_READY:-}" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED:-}" ]; then
+          : > "$FM_TEST_HERDR_ARTIFACT_PAIR_READY"
+          while [ ! -e "$FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED" ]; do
+            fm_backend_herdr_control_exec sleep 0.01
+          done
+        fi
+        fm_backend_herdr_artifact_remove_attributed "$candidate" "$inode" || return 1
+        target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) || return 1
+        if [ "$target_after" != "$identity_after" ]; then
+          echo "error: Herdr published target changed during candidate recovery: $target" >&2
+          return 1
+        fi
+        ;;
+      *)
+        if fm_backend_herdr_server_lock_is_stale_age "$candidate" \
+          && fm_backend_herdr_process_absent "$pid"; then
+          echo "error: refusing Herdr candidate with ambiguous link count: $candidate" >&2
+          return 1
+        fi
+        ;;
+    esac
   done
 }
 
 fm_backend_herdr_managed_shell_bin() {
-  local source source_identity digest target target_identity publication candidate candidate_inode
+  local source source_identity digest target target_identity publication candidate candidate_inode kill_after_link=
   fm_backend_herdr_server_lock_root_prepare || return 1
   source=$(fm_backend_herdr_managed_shell_source) || return 1
   source_identity=$(fm_backend_herdr_file_identity "$source" executable root-or-owner) || return 1
@@ -810,8 +993,12 @@ fm_backend_herdr_managed_shell_bin() {
     # link, and verify both the source snapshot and installed digest. A racing
     # installer may win the link; both converge on the same content address.
     # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" ]; then
+      kill_after_link=$FM_TEST_HERDR_KILL_AFTER_HELPER_LINK
+    fi
     publication=$(fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -MIO::Handle -e '
-      my ($source, $target, $expected_digest) = @ARGV;
+      my ($source, $target, $expected_digest, $kill_after_link) = @ARGV;
       my $nofollow = eval { O_NOFOLLOW() };
       defined $nofollow or die "O_NOFOLLOW unavailable";
       sysopen my $input, $source, O_RDONLY | $nofollow or die "source: $!";
@@ -849,14 +1036,22 @@ fm_backend_herdr_managed_shell_bin() {
       $output->sync or die "candidate sync: $!";
       my @candidate = stat($output);
       close $output or die "candidate close: $!";
-      if (!link($candidate, $target)) {
+      my $published = link($candidate, $target);
+      if (!$published) {
         die "publish: $!" unless -e $target;
+      }
+      if ($published && length $kill_after_link) {
+        sysopen my $marker, $kill_after_link, O_WRONLY | O_CREAT | O_EXCL, 0600
+          or die "kill marker: $!";
+        close $marker or die "kill marker close: $!";
+        kill "KILL", $$;
+        die "post-link kill failed";
       }
       my @candidate_path = lstat($candidate);
       @candidate_path && $candidate_path[0] == $candidate[0]
         && $candidate_path[1] == $candidate[1] or die "candidate replaced";
       print "$candidate\n$candidate[0]:$candidate[1]\n";
-    ' "$source" "$target" "$digest") || return 1
+    ' "$source" "$target" "$digest" "$kill_after_link") || return 1
     case "$publication" in *$'\n'*) ;; *) return 1 ;; esac
     candidate=${publication%%$'\n'*}
     candidate_inode=${publication#*$'\n'}
@@ -910,20 +1105,24 @@ fm_backend_herdr_managed_config_ready() {  # <session> [managed-shell]
 }
 
 fm_backend_herdr_managed_config_ensure() {  # <session> [managed-shell]; prints path
-  local path expected shell_bin publication candidate candidate_inode
+  local path expected shell_bin publication candidate candidate_inode kill_after_link=
   shell_bin=${2:-}
   [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
   path=$(fm_backend_herdr_managed_config_path "$1" "$shell_bin") || return 1
   expected=$(fm_backend_herdr_managed_config_expected "$shell_bin") || return 1
+  fm_backend_herdr_artifact_recover_candidates "$path" 0600 || return 1
   if [ -e "$path" ] || [ -L "$path" ]; then
     fm_backend_herdr_managed_config_ready "$1" "$shell_bin" || return 1
     printf '%s\n' "$path"
     return 0
   fi
-  fm_backend_herdr_artifact_recover_candidates "$path" 0600 || return 1
   # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" ]; then
+    kill_after_link=$FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK
+  fi
   publication=$(fm_backend_herdr_control_perl -MFcntl=:DEFAULT -MIO::Handle -e '
-    my ($path, $payload) = @ARGV;
+    my ($path, $payload, $kill_after_link) = @ARGV;
     my $candidate = "$path.candidate.$$";
     sysopen my $fh, $candidate, O_WRONLY | O_CREAT | O_EXCL, 0600 or die $!;
     chmod 0600, $candidate or die $!;
@@ -931,13 +1130,21 @@ fm_backend_herdr_managed_config_ensure() {  # <session> [managed-shell]; prints 
     $fh->flush or die $!;
     $fh->sync or die $!;
     close $fh or die $!;
-    if (!link($candidate, $path)) {
+    my $published = link($candidate, $path);
+    if (!$published) {
       die $! unless -e $path;
+    }
+    if ($published && length $kill_after_link) {
+      sysopen my $marker, $kill_after_link, O_WRONLY | O_CREAT | O_EXCL, 0600
+        or die "kill marker: $!";
+      close $marker or die "kill marker close: $!";
+      kill "KILL", $$;
+      die "post-link kill failed";
     }
     my @candidate = lstat($candidate);
     @candidate or die "candidate identity: $!";
     print "$candidate\n$candidate[0]:$candidate[1]\n";
-  ' "$path" "$expected") || return 1
+  ' "$path" "$expected" "$kill_after_link") || return 1
   case "$publication" in *$'\n'*) ;; *) return 1 ;; esac
   candidate=${publication%%$'\n'*}
   candidate_inode=${publication#*$'\n'}

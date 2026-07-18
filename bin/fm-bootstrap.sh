@@ -15,7 +15,7 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
-#                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
+#                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
@@ -32,12 +32,11 @@
 #          and successful updates stay quiet.
 #          SECONDMATE_LIVENESS lines report every live secondmate's deeper
 #          agent-liveness verdict (bin/fm-backend.sh's fm_backend_agent_alive,
-#          distinct from the endpoint pane-presence check): already-live is a
-#          no-op, respawned means a confirmed-dead endpoint (a bare shell left
-#          behind by an exited secondmate agent) was killed and relaunched via
-#          bin/fm-spawn.sh --secondmate, and skipped means the probe could not
-#          confidently classify the endpoint (never acted on - a false-dead
-#          reading would spin up a duplicate agent). Session-start scope only;
+#          distinct from the endpoint pane-presence check): outcomes distinguish
+#          no-op, successful respawn, explicit-routing deferral, skipped
+#          recovery, and failed recovery. A confirmed-dead unmanaged generation
+#          is deferred until an operator chooses whether to preserve unmanaged
+#          routing or convert it to managed routing. Session-start scope only;
 #          see AGENTS.md "Session start" and docs/tmux-backend.md /
 #          docs/herdr-backend.md "Agent liveness probe" for the empirical basis.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded

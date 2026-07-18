@@ -278,10 +278,12 @@ case "$*" in
     fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     updated_at=${FM_FAKE_AF_UPDATED_AT_BEFORE:-2026-07-13T00:00:00Z}
-    session_event_seq=1
+    session_schema=${FM_FAKE_AF_SESSION_SCHEMA_BEFORE:-2}
+    session_event_seq=${FM_FAKE_AF_SESSION_EVENT_SEQ_BEFORE:-1}
     if [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; then
       updated_at=${FM_FAKE_AF_UPDATED_AT_AFTER:-2026-07-13T00:00:01Z}
-      session_event_seq=2
+      session_schema=${FM_FAKE_AF_SESSION_SCHEMA_AFTER:-2}
+      session_event_seq=${FM_FAKE_AF_SESSION_EVENT_SEQ_AFTER:-2}
     fi
     workspace=${FM_FAKE_AF_WORKSPACE:-}
     if [ -z "$workspace" ] && [ -n "${FM_STATE_OVERRIDE:-}" ]; then
@@ -292,7 +294,7 @@ case "$*" in
         break
       done
     fi
-    printf '{"schema":2,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$session_event_seq" "$updated_at"
+    printf '{"schema":%s,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$session_schema" "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$session_event_seq" "$updated_at"
     ;;
   *" lease release "*)
     [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
@@ -1500,6 +1502,46 @@ test_native_resume_accepts_same_wallclock_sessionstart_evidence() {
   [ "$status" -eq 0 ] || fail "same-wallclock SessionStart evidence was rejected after its event sequence advanced: $out"
   assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "same-wallclock native resume lost its provider session binding"
   pass "native resume freshness is independent of wall-clock timestamp granularity"
+}
+
+test_native_resume_migrates_legacy_session_mapping_after_launch_gate() {
+  local id rec out status
+  id=account-resume-legacy-seq-z9g
+  rec=$(make_case resume-legacy-seq claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "legacy-sequence resume precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
+  clear_case_logs
+
+  if out=$(FM_FAKE_AF_SESSION_SCHEMA_BEFORE=1 FM_FAKE_AF_SESSION_EVENT_SEQ_BEFORE=0 \
+    FM_FAKE_AF_SESSION_SCHEMA_AFTER=2 FM_FAKE_AF_SESSION_EVENT_SEQ_AFTER=1 \
+    run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] \
+    || fail "legacy schema-1 native resume did not accept its same-binding 0 -> 1 SessionStart migration: $out"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+    "legacy schema-1 native resume lost its provider session binding"
+  pass "native resume accepts legacy sequence zero only as the baseline for a fresh same-binding SessionStart migration"
+}
+
+test_native_resume_rejects_zero_sequence_on_current_schema() {
+  local id rec out status
+  id=account-resume-current-zero-z9h
+  rec=$(make_case resume-current-zero claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "current-schema zero-sequence precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
+  clear_case_logs
+
+  if out=$(FM_FAKE_AF_SESSION_SCHEMA_BEFORE=2 FM_FAKE_AF_SESSION_EVENT_SEQ_BEFORE=0 \
+    run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "schema-2 native resume accepted reserved legacy sequence zero"
+  assert_contains "$out" "event sequence does not match mapping schema" \
+    "schema-2 zero-sequence refusal was not explicit"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "schema-2 zero-sequence refusal created an endpoint"
+  pass "session event sequence zero is accepted only for a legacy schema-1 baseline"
 }
 
 test_native_resume_accepts_agent_fleet_utc_offset_timestamps() {
@@ -5513,6 +5555,8 @@ if [ "${FM_TEST_FOCUSED:-}" = session-event-seq ]; then
   run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
   run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
   run_isolated_test test_native_resume_accepts_same_wallclock_sessionstart_evidence
+  run_isolated_test test_native_resume_migrates_legacy_session_mapping_after_launch_gate
+  run_isolated_test test_native_resume_rejects_zero_sequence_on_current_schema
   run_isolated_test test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances
   exit 0
 fi
@@ -5707,6 +5751,8 @@ run_isolated_test test_recovered_reservations_are_owned_only_after_validated_rec
 run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
 run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
 run_isolated_test test_native_resume_accepts_same_wallclock_sessionstart_evidence
+run_isolated_test test_native_resume_migrates_legacy_session_mapping_after_launch_gate
+run_isolated_test test_native_resume_rejects_zero_sequence_on_current_schema
 run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
 run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
 run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited

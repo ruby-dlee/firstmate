@@ -526,6 +526,29 @@ def test_legacy_session_mapping_migrates_only_on_same_binding_sessionstart(
         record_session_from_hook(registry, {"session_id": "changed-session"})
     assert session_path(registry, "legacy-session-task").read_bytes() == before
 
+    original_environment = {
+        "AGENT_FLEET_TASK_ID": "legacy-session-task",
+        "AGENT_FLEET_PROFILE": "claude-1",
+        "AGENT_FLEET_PROVIDER": "claude",
+        "AGENT_FLEET_POOL": "claude-crew",
+        "AGENT_FLEET_WORKSPACE": str(Path.cwd()),
+        "AGENT_FLEET_TURN_END": str(turn_end),
+    }
+    changed_bindings = (
+        ("AGENT_FLEET_TASK_ID", "changed-task"),
+        ("AGENT_FLEET_PROFILE", "claude-2"),
+        ("AGENT_FLEET_PROVIDER", "codex"),
+        ("AGENT_FLEET_POOL", "changed-pool"),
+        ("AGENT_FLEET_WORKSPACE", str(tmp_path)),
+        ("AGENT_FLEET_TURN_END", str(tmp_path / "changed.turn-ended")),
+    )
+    for name, changed in changed_bindings:
+        monkeypatch.setenv(name, changed)
+        with pytest.raises(ValueError):
+            record_session_from_hook(registry, {"session_id": "legacy-session"})
+        assert session_path(registry, "legacy-session-task").read_bytes() == before
+        monkeypatch.setenv(name, original_environment[name])
+
     result = record_session_from_hook(registry, {"session_id": "legacy-session"})
     migrated = get_session(registry, "legacy-session-task")
     assert result["idempotent"] is True

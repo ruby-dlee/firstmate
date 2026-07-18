@@ -90,8 +90,8 @@ session_event_seq_valid() {  # <value> <allow-zero>
   # shellcheck disable=SC2071  # Deliberate lexical comparison avoids signed-64 overflow.
   [[ "$value" < 9223372036854775807 || "$value" == 9223372036854775807 ]]
 }
-if [ -n "$AFTER_EVENT_SEQ" ] && ! session_event_seq_valid "$AFTER_EVENT_SEQ" 0; then
-  echo "error: --after-event-seq must be a positive signed 64-bit integer" >&2
+if [ -n "$AFTER_EVENT_SEQ" ] && ! session_event_seq_valid "$AFTER_EVENT_SEQ" 1; then
+  echo "error: --after-event-seq must be a non-negative signed 64-bit integer" >&2
   exit 2
 fi
 case "$QUERY_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_QUERY_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
@@ -292,6 +292,7 @@ fm_account_validate_contract "$binary" || exit 1
 deadline=$(( $(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) + WAIT ))
 while :; do
   if json=$(fm_account_run_fleet_bounded "$QUERY_TIMEOUT" "$binary" --format json session status --task "$ACCOUNT_TASK" 2>/dev/null); then
+    session_schema=$(fm_account_json_field "$json" '.schema | select(type == "number" and floor == . and (. == 1 or . == 2))' session) || exit 1
     mapped_task=$(fm_account_json_field "$json" '.task | select(type == "string")' session) || exit 1
     mapped_profile=$(fm_account_json_field "$json" '.profile | select(type == "string")' session) || exit 1
     mapped_provider=$(fm_account_json_field "$json" '.provider | select(type == "string")' session) || exit 1
@@ -308,6 +309,11 @@ while :; do
     case "$session_id" in ''|*$'\n'*|*=*) echo "error: unsafe provider session id for $ID" >&2; exit 1 ;; esac
     session_event_seq_valid "$session_event_seq" 1 \
       || { echo "error: unsafe provider session event sequence for $ID" >&2; exit 1; }
+    if { [ "$session_schema" = 1 ] && [ "$session_event_seq" != 0 ]; } \
+      || { [ "$session_schema" = 2 ] && [ "$session_event_seq" = 0 ]; }; then
+      echo "error: Agent Fleet session event sequence does not match mapping schema for $ID" >&2
+      exit 1
+    fi
     if [ -z "$AFTER_EVENT_SEQ" ]; then
       break
     fi

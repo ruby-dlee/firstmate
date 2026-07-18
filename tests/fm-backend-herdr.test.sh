@@ -28,7 +28,7 @@ assert_no_server_transients() {  # <lock-root> <label>
     [ -e "$artifact" ] || [ -L "$artifact" ] || continue
     leaf=${artifact##*/}
     case "$leaf" in
-      *.closed-shell-v2|*.closed-shell-config-v2.toml)
+      *.closed-shell-v2|*.closed-shell-config-v2.toml|*.closed-shell-config-v2-*.toml)
         if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$artifact"); else mode=$(stat -c %a "$artifact"); fi
         [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$mode" = 600 ] \
           || fail "$label left an unsafe persistent managed artifact: $artifact"
@@ -598,7 +598,8 @@ SH
 }
 
 test_managed_artifact_candidate_recovery_is_guarded() {
-  local dir lock_root source ps_fake result config certificate stale_config stale_certificate foreign_config foreign_certificate indeterminate_certificate
+  local dir lock_root source ps_fake result config certificate helper stale_config stale_certificate stale_helper
+  local foreign_config foreign_certificate indeterminate_certificate raced_config raced_original ready proceed preserved recovery_pid candidate
   dir="$TMP_ROOT/herdr-managed-candidates"
   lock_root="$dir/locks"
   source="$dir/fm-herdr-worker-shell"
@@ -615,7 +616,7 @@ if [ "$pid" = 999996 ]; then
   printf 'indeterminate process probe\n' >&2
   exit 1
 fi
-case "$pid" in 999998|999999) exit 1 ;; esac
+case "$pid" in 999995|999998|999999) exit 1 ;; esac
 printf 'Mon Jan  1 00:00:00 2024\n'
 SH
   chmod 755 "$ps_fake"
@@ -623,25 +624,31 @@ SH
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" /bin/bash --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
-      printf "%s\n%s\n" \
+      printf "%s\n%s\n%s\n" \
         "$(fm_backend_herdr_managed_config_path fm-candidates)" \
-        "$(fm_backend_herdr_server_env_certificate_path fm-candidates)"
+        "$(fm_backend_herdr_server_env_certificate_path fm-candidates)" \
+        "$(fm_backend_herdr_managed_shell_bin)"
     ' "$ROOT") || fail "candidate recovery paths were unavailable"
   config=${result%%$'\n'*}
-  certificate=${result#*$'\n'}
+  result=${result#*$'\n'}
+  certificate=${result%%$'\n'*}
+  helper=${result#*$'\n'}
   stale_config="$config.candidate.999999"
   stale_certificate="$certificate.candidate.999998"
+  stale_helper="$helper.candidate.999995"
   foreign_config="$config.candidate.foreign"
   foreign_certificate="$certificate.candidate.999997"
   indeterminate_certificate="$certificate.candidate.999996"
   printf 'stale config candidate\n' > "$stale_config"
   printf 'stale certificate candidate\n' > "$stale_certificate"
+  printf 'stale helper candidate\n' > "$stale_helper"
   printf 'foreign suffix\n' > "$foreign_config"
   printf 'foreign mode\n' > "$foreign_certificate"
   printf 'indeterminate owner\n' > "$indeterminate_certificate"
   chmod 600 "$stale_config" "$stale_certificate" "$foreign_config" "$indeterminate_certificate"
+  chmod 500 "$stale_helper"
   chmod 640 "$foreign_certificate"
-  touch -t 202001010000 "$stale_config" "$stale_certificate" "$foreign_config" "$foreign_certificate" "$indeterminate_certificate"
+  touch -t 202001010000 "$stale_config" "$stale_certificate" "$stale_helper" "$foreign_config" "$foreign_certificate" "$indeterminate_certificate"
 
   FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
@@ -650,14 +657,202 @@ SH
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_artifact_recover_candidates "$1" 0600
       fm_backend_herdr_artifact_recover_candidates "$2" 0600
-    ' "$ROOT" "$config" "$certificate" \
+      fm_backend_herdr_artifact_recover_candidates "$3" 0500
+    ' "$ROOT" "$config" "$certificate" "$helper" \
     || fail "guarded artifact candidate recovery failed"
   [ ! -e "$stale_config" ] || fail "proven-stale config candidate was not recovered"
   [ ! -e "$stale_certificate" ] || fail "proven-stale certificate candidate was not recovered"
+  [ ! -e "$stale_helper" ] || fail "proven-stale helper candidate was not recovered"
   [ -e "$foreign_config" ] || fail "non-numeric foreign candidate was deleted"
   [ -e "$foreign_certificate" ] || fail "wrong-mode indeterminate candidate was deleted"
   [ -e "$indeterminate_certificate" ] || fail "output-bearing indeterminate PID candidate was deleted"
-  pass "managed artifact recovery deletes only proven-stale owned numeric candidates"
+
+  raced_config="$config.candidate.999999"
+  raced_original="$raced_config.original"
+  ready="$dir/remove-ready"
+  proceed="$dir/remove-proceed"
+  printf 'attributed generation\n' > "$raced_config"
+  chmod 600 "$raced_config"
+  touch -t 202001010000 "$raced_config"
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$raced_config" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_READY="$ready" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED="$proceed" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+    ' "$ROOT" "$config" >/dev/null 2>&1 &
+  recovery_pid=$!
+  for _attempt in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill "$recovery_pid" 2>/dev/null || true; fail "artifact substitution fixture never reached its final mutation barrier"; }
+  mv "$raced_config" "$raced_original"
+  printf 'foreign replacement\n' > "$raced_config"
+  chmod 600 "$raced_config"
+  : > "$proceed"
+  wait "$recovery_pid" >/dev/null 2>&1 \
+    && fail "candidate cleanup accepted a last-check-to-rename substitution"
+  preserved=
+  for candidate in "$raced_config".quarantine.*/artifact; do
+    [ -f "$candidate" ] || continue
+    preserved=$candidate
+    break
+  done
+  [ -n "$preserved" ] && [ "$(cat "$preserved")" = 'foreign replacement' ] \
+    || fail "candidate cleanup deleted or lost the substituted foreign generation"
+  [ "$(cat "$raced_original")" = 'attributed generation' ] \
+    || fail "candidate cleanup mutated the originally attributed generation after substitution"
+  pass "managed artifact recovery deletes only proven generations and quarantines last-check substitutions without data loss"
+}
+
+test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
+  local dir fb fake source mode case_dir lock_root running pids state log mutation old_pid new_pid out status
+  dir="$TMP_ROOT/herdr-certified-lifecycle"
+  fb="$dir/fakebin"
+  fake="$fb/herdr"
+  source="$dir/fm-herdr-worker-shell"
+  mkdir -p "$fb"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  cat > "$fake" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+mode=$(cat "${FM_FAKE_HERDR_STATE:?}")
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then running=true; else running=false; fi
+    printf '{"client":{"version":"0.7.3","protocol":16},"server":{"running":%s}}\n' "$running"
+    ;;
+  "workspace list")
+    case "$mode" in
+      empty) printf '{"result":{"workspaces":[]}}\n' ;;
+      occupied) printf '{"result":{"workspaces":[{"workspace_id":"foreign-w1","label":"captain"}]}}\n' ;;
+      indeterminate) printf '{not-json\n' ;;
+    esac
+    ;;
+  "tab list") printf '{"result":{"tabs":[]}}\n' ;;
+  "pane list") printf '{"result":{"panes":[]}}\n' ;;
+  "session stop")
+    [ "${3:-}" = "${HERDR_SESSION:-}" ] || exit 71
+    kill "$(tail -1 "${FM_FAKE_HERDR_SERVER_PIDS:?}")" 2>/dev/null || true
+    rm -f "$FM_FAKE_HERDR_RUNNING"
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    : > "$FM_FAKE_HERDR_RUNNING"
+    exec /bin/sleep 30
+    ;;
+  "workspace create")
+    : > "${FM_FAKE_HERDR_MUTATION:?}"
+    printf '{"result":{"workspace":{"workspace_id":"w1"},"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p1"}}}\n'
+    ;;
+esac
+SH
+  chmod 755 "$fake"
+
+  write_legacy_certificate() {
+    PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" OLD_PID="$old_pid" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        key=$(fm_backend_herdr_server_lock_key "$1") || exit 1
+        certificate=$(fm_backend_herdr_server_legacy_env_certificate_path "$1") || exit 1
+        start=$(fm_backend_herdr_process_start "$OLD_PID") || exit 1
+        printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+          "$key" "$OLD_PID" "$start" > "$certificate" || exit 1
+        chmod 600 "$certificate"
+      ' "$ROOT" "$1"
+  }
+
+  case_dir="$dir/empty"
+  lock_root="$case_dir/locks"
+  running="$case_dir/running"
+  pids="$case_dir/pids"
+  state="$case_dir/state"
+  log="$case_dir/log"
+  mutation="$case_dir/workspace-created"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  printf 'empty\n' > "$state"
+  : > "$log"
+  /bin/sleep 30 & old_pid=$!
+  printf '%s\n' "$old_pid" > "$pids"
+  : > "$running"
+  write_legacy_certificate default || fail "could not establish legacy adapter ownership for empty restart"
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+    FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_ensure default || exit 1
+      fm_backend_herdr_server_closed_shell_environment_ready default
+    ' "$ROOT" || fail "adapter-owned exact-empty drift did not stop, relaunch, and recertify"
+  wait "$old_pid" >/dev/null 2>&1 || true
+  kill -0 "$old_pid" 2>/dev/null \
+    && fail "exact-empty restart left the release-drifted adapter server alive"
+  new_pid=$(tail -1 "$pids")
+  if [ "$new_pid" = "$old_pid" ] || ! kill -0 "$new_pid" 2>/dev/null; then
+    fail "exact-empty restart did not leave one newly certified server alive"
+  fi
+  assert_grep $'\x1fsession\x1fstop\x1fdefault\x1f--json\x1f--session\x1fdefault' "$log" \
+    "empty drift restart did not use the positional exact-default session stop"
+  assert_no_grep $'\x1fserver\x1fstop' "$log" \
+    "empty drift restart used a generic server stop"
+  assert_no_grep $'\x1fsession\x1fdelete' "$log" \
+    "empty drift restart deleted session state"
+  [ ! -e "$mutation" ] || fail "server lifecycle decision created a workspace before recertification"
+  kill "$new_pid" 2>/dev/null || true
+
+  for mode in occupied indeterminate; do
+    case_dir="$dir/$mode"
+    lock_root="$case_dir/locks"
+    running="$case_dir/running"
+    pids="$case_dir/pids"
+    state="$case_dir/state"
+    log="$case_dir/log"
+    mutation="$case_dir/workspace-created"
+    mkdir -p "$lock_root"
+    chmod 700 "$lock_root"
+    printf '%s\n' "$mode" > "$state"
+    : > "$log"
+    /bin/sleep 30 & old_pid=$!
+    printf '%s\n' "$old_pid" > "$pids"
+    : > "$running"
+    write_legacy_certificate "fm-$mode" || fail "could not establish legacy adapter ownership for $mode refusal"
+    if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+      FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+      FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" HERDR_SESSION="fm-$mode" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_container_ensure "$PWD"
+      ' "$ROOT" "fm-$mode" 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "$mode release-drifted server was restarted or routed"
+    assert_contains "$out" "$mode" "$mode drift refusal was not explicit"
+    kill -0 "$old_pid" 2>/dev/null || fail "$mode refusal stopped the existing adapter server"
+    assert_no_grep $'\x1fsession\x1fstop' "$log" \
+      "$mode refusal stopped the server before its lifecycle decision"
+    assert_no_grep $'\x1fserver\x1f--session' "$log" \
+      "$mode refusal launched a server before its lifecycle decision"
+    assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
+      "$mode refusal created a workspace before its lifecycle decision"
+    [ ! -e "$mutation" ] || fail "$mode refusal reached workspace creation"
+    kill "$old_pid" 2>/dev/null || true
+    wait "$old_pid" >/dev/null 2>&1 || true
+  done
+  pass "server ensure serializes certificate drift: exact-empty restarts safely; occupied/indeterminate refuse before workspace mutation"
 }
 
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir() {
@@ -3350,6 +3545,11 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = server-cert-lifecycle ]; then
+  test_server_ensure_converges_only_adapter_owned_exact_empty_drift
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   test_workspace_ensure_prunes_default_tab
   exit 0
@@ -3365,6 +3565,7 @@ test_server_launch_preserves_only_safe_worker_tool_paths
 test_managed_shell_and_server_certificate_close_startup_before_bash
 test_managed_shell_certificate_rejects_release_and_artifact_drift
 test_managed_artifact_candidate_recovery_is_guarded
+test_server_ensure_converges_only_adapter_owned_exact_empty_drift
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id

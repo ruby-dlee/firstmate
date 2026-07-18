@@ -3204,8 +3204,58 @@ def test_cleanup_sigkill_after_real_rename_is_restart_discoverable(
         journal=restarted,
     )
     assert not source.exists()
-    assert not cleanup.exists()
+    assert cleanup.read_bytes() == b""
     assert restarted["test-cleanup-kill_cleanup_complete"] is True
+    retired_generation = restarted["test-cleanup-kill_retired_generation"]
+    recovery._cleanup_owned_generation(
+        source,
+        cleanup,
+        expected,
+        key="test-cleanup-kill",
+        label="test cleanup kill generation",
+        journal_path=journal_path,
+        journal=restarted,
+    )
+    assert recovery._same_file_generation(cleanup, retired_generation)
+
+
+def test_retirement_scrubs_owned_inode_and_preserves_syscall_boundary_replacement(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / ".retire-race-source"
+    cleanup = target.home / ".retire-race-marker"
+    journal_path = target.home / ".retire-race-journal"
+    secret = b"transaction-owned-secret-generation"
+    foreign = b"foreign-replacement-must-survive"
+    atomic_write_bytes(source, secret)
+    expected = recovery._file_generation(source, "retirement race source")
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_ftruncate = recovery.os.ftruncate
+
+    def replace_at_descriptor_scrub(descriptor: int, length: int) -> None:
+        atomic_write_bytes(cleanup, foreign)
+        real_ftruncate(descriptor, length)
+
+    monkeypatch.setattr(recovery.os, "ftruncate", replace_at_descriptor_scrub)
+    with pytest.raises(ValueError, match="path changed while its owned inode was retired"):
+        recovery._cleanup_owned_generation(
+            source,
+            cleanup,
+            expected,
+            key="test-retire-race",
+            label="test retirement race generation",
+            journal_path=journal_path,
+            journal=journal,
+        )
+
+    assert not source.exists()
+    assert cleanup.read_bytes() == foreign
+    assert secret not in b"".join(
+        path.read_bytes() for path in target.home.iterdir() if path.is_file()
+    )
 
 
 def test_owned_copy_kill_after_create_before_callback_preserves_ambiguity(
@@ -3266,6 +3316,66 @@ def test_owned_copy_kill_after_create_before_callback_preserves_ambiguity(
     assert journal_path.exists()
 
 
+def test_repeated_partial_copy_crashes_use_bounded_distinct_retired_markers(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / "auth.json"
+    destination = target.home / ".repeated-partial-copy"
+    cleanup = target.home / ".repeated-partial-copy-retired"
+    journal_path = target.home / ".repeated-partial-copy-journal"
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_copy = recovery._copy_private_file
+
+    def interrupt_copy(
+        _source: Path,
+        created: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ) -> os.stat_result:
+        descriptor = os.open(created, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(descriptor, 0o600)
+        if destination_created is not None:
+            destination_created(os.fstat(descriptor))
+        os.write(descriptor, b"partial owned credential bytes")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        raise RuntimeError("simulated repeated copy crash")
+
+    monkeypatch.setattr(recovery, "_copy_private_file", interrupt_copy)
+    for _attempt in range(2):
+        restarted = json.loads(journal_path.read_text(encoding="utf-8"))
+        with pytest.raises(RuntimeError, match="simulated repeated copy crash"):
+            recovery._prepare_owned_copy(
+                source,
+                destination,
+                cleanup,
+                key="test-repeated-copy",
+                label="test repeated copy",
+                journal_path=journal_path,
+                journal=restarted,
+            )
+
+    monkeypatch.setattr(recovery, "_copy_private_file", real_copy)
+    restarted = json.loads(journal_path.read_text(encoding="utf-8"))
+    prepared = recovery._prepare_owned_copy(
+        source,
+        destination,
+        cleanup,
+        key="test-repeated-copy",
+        label="test repeated copy",
+        journal_path=journal_path,
+        journal=restarted,
+    )
+    assert prepared["sha256"] == recovery._file_generation(source, "copy source")["sha256"]
+    retired = sorted(target.home.glob(f"{cleanup.name}.test-repeated-copy.partial-*"))
+    assert len(retired) == 2
+    assert all(path.read_bytes() == b"" for path in retired)
+    assert restarted["test-repeated-copy_partial_retirement_count"] == 2
+
+
 def test_publish_rejects_same_inode_content_mutation_with_restored_mtime(
     fleet: tuple[Registry, Path],
 ) -> None:
@@ -3299,6 +3409,127 @@ def test_publish_rejects_same_inode_content_mutation_with_restored_mtime(
         )
     assert source.read_bytes() == b"tampered-generation"
     assert not destination.exists()
+
+
+def test_metadata_restore_copy_binds_digest_verified_backup_generation(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    destination = target.home / ".metadata-restore-target"
+    backup = target.home / ".metadata-restore-backup"
+    temporary = target.home / ".metadata-restore-temporary"
+    temporary_cleanup = target.home / ".metadata-restore-temporary-retired"
+    quarantine = target.home / ".metadata-restore-forward"
+    original_quarantine = target.home / ".metadata-restore-original"
+    journal_path = target.home / ".metadata-restore-journal"
+    original = b"metadata-original"
+    tampered = b"metadata-tampered"
+    atomic_write_bytes(destination, original)
+    original_generation = recovery._file_generation(destination, "original metadata")
+    atomic_write_bytes(backup, original)
+    destination.unlink()
+    journal: dict[str, Any] = {
+        "bundle_original_generation": original_generation,
+        "bundle_forward_absent": True,
+    }
+    atomic_write_json(journal_path, journal)
+    real_prepare = recovery._prepare_owned_copy
+
+    def mutate_after_digest_validation(
+        source: Path,
+        prepared: Path,
+        cleanup: Path,
+        **kwargs,
+    ) -> dict[str, Any]:
+        metadata = source.stat()
+        with source.open("r+b") as handle:
+            handle.write(tampered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        return real_prepare(source, prepared, cleanup, **kwargs)
+
+    monkeypatch.setattr(recovery, "_prepare_owned_copy", mutate_after_digest_validation)
+    with pytest.raises(ValueError, match="does not match its bound source content"):
+        recovery._restore_snapshot_file(
+            target=destination,
+            backup=backup,
+            temporary=temporary,
+            temporary_cleanup=temporary_cleanup,
+            quarantine=quarantine,
+            original_quarantine=original_quarantine,
+            existed=True,
+            key="bundle",
+            label="provider identity bundle",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    assert not destination.exists()
+    assert backup.read_bytes() == tampered
+
+
+def test_credential_rollback_copy_binds_digest_verified_backup_generation(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable = target.home / "auth.json"
+    backup = target.home / ".credential-restore-backup"
+    rollback = target.home / ".credential-restore-temporary"
+    rollback_cleanup = target.home / ".credential-restore-temporary-retired"
+    quarantine = target.home / ".credential-restore-forward"
+    original_quarantine = target.home / ".credential-restore-original"
+    journal_path = target.home / ".credential-restore-journal"
+    original = b"credential-original"
+    tampered = b"credential-tampered"
+    forward = b"credential-forward!"
+    atomic_write_bytes(stable, original)
+    original_generation = recovery._file_generation(stable, "original credential")
+    atomic_write_bytes(backup, original)
+    backup_generation = recovery._file_generation(backup, "credential backup")
+    atomic_write_bytes(stable, forward)
+    installed_generation = recovery._file_generation(stable, "installed credential")
+    journal: dict[str, Any] = {
+        "original_credential_generation": original_generation,
+        "installed_credential_generation": installed_generation,
+        "codex_backup-snapshot_prepared_generation": backup_generation,
+    }
+    atomic_write_json(journal_path, journal)
+    real_prepare = recovery._prepare_owned_copy
+
+    def mutate_after_digest_validation(
+        source: Path,
+        prepared: Path,
+        cleanup: Path,
+        **kwargs,
+    ) -> dict[str, Any]:
+        metadata = source.stat()
+        with source.open("r+b") as handle:
+            handle.write(tampered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        return real_prepare(source, prepared, cleanup, **kwargs)
+
+    monkeypatch.setattr(recovery, "_prepare_owned_copy", mutate_after_digest_validation)
+    with pytest.raises(ValueError, match="does not match its bound source content"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
+                "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
+            },
+            journal_path,
+            journal,
+        )
+    assert not stable.exists()
+    assert quarantine.read_bytes() == forward
+    assert backup.read_bytes() == tampered
 
 
 def test_publish_never_overwrites_destination_reappearance(
@@ -3398,6 +3629,54 @@ def test_forward_install_sigkill_after_original_quarantine_restores_on_restart(
     assert not list(
         (reloaded.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
+
+
+def test_forward_credential_publish_sigkill_before_installed_journal_converges(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable_auth = target.home / "auth.json"
+    original_auth = stable_auth.read_bytes()
+    real_rename = recovery._rename_noreplace
+
+    def kill_after_forward_publication(source: Path, destination: Path) -> None:
+        real_rename(source, destination)
+        if source.name.endswith(".new") and destination == stable_auth:
+            os._exit(100)
+
+    monkeypatch.setattr(recovery, "_rename_noreplace", kill_after_forward_publication)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional forward publication crash child
+        recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=FakeRecovery(registry).hooks(),
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 100
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename)
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recovered = recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert recovered[0]["committed"] is False
+    assert stable_auth.read_bytes() == original_auth
+    retirement = reloaded.settings.state_dir / "retired" / "credential-recovery"
+    retired_files = [path for path in retirement.rglob("*") if path.is_file()]
+    assert retired_files
+    assert all(path.read_bytes() == b"" for path in retired_files)
 
 
 @pytest.mark.parametrize("backup_component", ["credential", "bundle"])

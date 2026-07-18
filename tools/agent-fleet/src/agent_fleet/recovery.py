@@ -59,6 +59,7 @@ from .util import (
 
 RECOVERY_SCHEMA = 1
 INITIALIZATION_CONTRACT_VERSION = 1
+MAX_PARTIAL_RETIREMENTS = 8
 RECOVERY_MARKER = ".agent-fleet-recovery-stage.json"
 CODEX_AUTH = "auth.json"
 CLAUDE_AUTH = ".credentials.json"
@@ -798,9 +799,16 @@ def _transaction_paths(
     nonce: str,
 ) -> dict[str, str]:
     stage = _stage_root(registry, profile.provider) / f".{profile.id}.login-{nonce}"
+    retirement = (
+        registry.settings.state_dir
+        / "retired"
+        / "credential-recovery"
+        / f"{profile.provider}-{profile.id}-{nonce}"
+    )
     paths = {
         "stage": str(stage),
         "quarantine": str(stage.with_name(f".{stage.name}.cleanup-{nonce}")),
+        "retirement": str(retirement),
         "codex_backup": str(stage / ".stable-auth.backup"),
         "claude_file_backup": str(stage / ".stable-claude-auth.backup"),
         "bundle_backup": str(stage / ".identity-bundle.backup"),
@@ -896,8 +904,7 @@ def _transaction_paths(
         "provisional_restore_quarantine",
         "provisional_guard_restore_quarantine",
     ):
-        path = Path(paths[name])
-        paths[f"{name}_cleanup"] = str(path.with_name(f".{path.name}.cleanup-{nonce}"))
+        paths[f"{name}_cleanup"] = str(retirement / f"{name}.retired")
     return paths
 
 
@@ -1000,20 +1007,26 @@ def _read_fd_generation(descriptor: int) -> dict[str, Any]:
     return {"stat": _stat_payload(after), "sha256": digest.hexdigest()}
 
 
-def _unlink_prequarantined_generation(
+def _retire_prequarantined_generation(
     path: Path,
     expected: dict[str, Any],
     *,
     label: str,
-) -> None:
-    """Unlink a deterministic private tombstone through its verified parent fd."""
+) -> dict[str, Any]:
+    """Scrub an owned tombstone through its fd and retain a zero-byte marker.
+
+    Darwin has no unlink-by-descriptor primitive. Retaining the deterministic,
+    journal-owned zero-byte marker avoids a final validate-then-unlink pathname
+    race in which a same-UID replacement could otherwise be destroyed. The
+    transaction path set bounds these retired markers to one per artifact.
+    """
 
     parent_fd = open_private_dir(path.parent)
     descriptor = -1
     try:
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
         opened = os.fstat(descriptor)
@@ -1025,19 +1038,37 @@ def _unlink_prequarantined_generation(
         ):
             raise ValueError(f"{label} is not a private transaction tombstone")
         observed = _read_fd_generation(descriptor)
-        if not _generation_matches(observed, expected, ctime=True):
-            raise ValueError(f"{label} changed before attributed unlink")
+        already_retired = (
+            observed["sha256"] == sha256(b"").hexdigest()
+            and observed["stat"]["size"] == 0
+            and isinstance(expected, dict)
+            and isinstance(expected.get("stat"), dict)
+            and _stat_matches_inode(observed["stat"], expected["stat"])
+        )
+        if not already_retired and not _generation_matches(observed, expected, ctime=True):
+            raise ValueError(f"{label} changed before attributed retirement")
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         if _stat_payload(current) != observed["stat"]:
-            raise ValueError(f"{label} changed immediately before attributed unlink")
-        os.unlink(path.name, dir_fd=parent_fd)
-        after = os.fstat(descriptor)
-        if after.st_nlink != 0 or (after.st_dev, after.st_ino) != (
-            opened.st_dev,
-            opened.st_ino,
+            raise ValueError(f"{label} changed immediately before attributed retirement")
+        if not already_retired:
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+        retired = _read_fd_generation(descriptor)
+        if (
+            retired["sha256"] != sha256(b"").hexdigest()
+            or retired["stat"]["size"] != 0
+            or any(
+                retired["stat"][field] != _inode_payload(opened)[field]
+                for field in ("dev", "ino", "uid", "mode")
+            )
+            or retired["stat"]["nlink"] not in {0, 1}
         ):
-            raise RuntimeError(f"{label} unlink identity was not stable")
+            raise RuntimeError(f"{label} retirement identity was not stable")
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if _stat_payload(current) != retired["stat"]:
+            raise ValueError(f"{label} path changed while its owned inode was retired")
         os.fsync(parent_fd)
+        return retired
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -1057,11 +1088,21 @@ def _cleanup_owned_generation(
     """Remove only an attributed generation through a deterministic tombstone."""
 
     moved_key = f"{key}_cleanup_generation"
+    retired_key = f"{key}_retired_generation"
+    absent_key = f"{key}_retired_absent"
     complete_key = f"{key}_cleanup_complete"
     if journal.get(complete_key) is True:
-        if any(candidate.exists() or candidate.is_symlink() for candidate in (path, cleanup)):
+        if path.exists() or path.is_symlink():
             raise ValueError(f"{label} reappeared after attributed cleanup")
+        if journal.get(absent_key) is True:
+            if cleanup.exists() or cleanup.is_symlink():
+                raise ValueError(f"{label} cleanup marker appeared after absent retirement")
+            return
+        retired = _file_generation(cleanup, f"retired {label}")
+        if not _generation_matches(retired, journal.get(retired_key), ctime=True):
+            raise ValueError(f"retired {label} changed after attributed cleanup")
         return
+    ensure_private_dir(cleanup.parent)
     path_exists = path.exists() or path.is_symlink()
     cleanup_exists = cleanup.exists() or cleanup.is_symlink()
     if path_exists and cleanup_exists:
@@ -1069,7 +1110,11 @@ def _cleanup_owned_generation(
     if cleanup_exists:
         moved = _file_generation(cleanup, f"quarantined {label}")
         durable = journal.get(moved_key)
-        if durable is not None:
+        durable_retired = journal.get(retired_key)
+        if durable_retired is not None:
+            if not _generation_matches(moved, durable_retired, ctime=True):
+                raise ValueError(f"retired {label} changed after retirement")
+        elif durable is not None:
             if not _generation_matches(moved, durable, ctime=True):
                 raise ValueError(f"quarantined {label} changed after cleanup move")
         elif not _generation_matches(moved, expected, ctime=False):
@@ -1098,16 +1143,66 @@ def _cleanup_owned_generation(
         journal[moved_key] = moved
         _write_recovery_journal(journal_path, journal, f"{key}-cleanup-moved")
     else:
+        journal[absent_key] = True
         journal[complete_key] = True
         _write_recovery_journal(journal_path, journal, f"{key}-cleanup-complete")
         return
     moved = journal.get(moved_key)
     if not isinstance(moved, dict):
         raise ValueError(f"{label} cleanup generation is not durable")
-    _write_recovery_journal(journal_path, journal, f"{key}-cleanup-unlink-authorized")
-    _unlink_prequarantined_generation(cleanup, moved, label=f"quarantined {label}")
+    _write_recovery_journal(journal_path, journal, f"{key}-cleanup-retire-authorized")
+    retired = _retire_prequarantined_generation(
+        cleanup,
+        moved,
+        label=f"quarantined {label}",
+    )
+    journal[retired_key] = retired
+    _write_recovery_journal(journal_path, journal, f"{key}-cleanup-retired")
+    observed_retired = _file_generation(cleanup, f"retired {label}")
+    if not _generation_matches(observed_retired, retired, ctime=True):
+        raise ValueError(f"retired {label} changed before cleanup completion")
     journal[complete_key] = True
     _write_recovery_journal(journal_path, journal, f"{key}-cleanup-complete")
+    observed_retired = _file_generation(cleanup, f"retired {label}")
+    if not _generation_matches(observed_retired, retired, ctime=True):
+        raise ValueError(f"retired {label} changed after cleanup completion")
+
+
+def _retire_partial_generation(
+    destination: Path,
+    cleanup: Path,
+    identity: dict[str, int],
+    *,
+    key: str,
+    identity_key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    """Retire one interrupted O_EXCL generation into a bounded attempt slot."""
+
+    count_key = f"{key}_partial_retirement_count"
+    count = journal.get(count_key, 0)
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or not 0 <= count < MAX_PARTIAL_RETIREMENTS
+    ):
+        raise ValueError(f"{label} exceeded its bounded partial-retirement allowance")
+    partial_key = f"{key}-partial-{count}"
+    partial_cleanup = cleanup.with_name(f"{cleanup.name}.{key}.partial-{count}")
+    _cleanup_owned_generation(
+        destination,
+        partial_cleanup,
+        identity,
+        key=partial_key,
+        label=f"partial {label}",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal[count_key] = count + 1
+    journal.pop(identity_key, None)
+    _write_recovery_journal(journal_path, journal, f"{key}-copy-reset")
 
 
 def _prepare_owned_copy(
@@ -1119,6 +1214,7 @@ def _prepare_owned_copy(
     label: str,
     journal_path: Path,
     journal: dict[str, Any],
+    expected_source_generation: object | None = None,
 ) -> dict[str, Any]:
     """Create a restart-attributed O_EXCL copy and bind its final digest."""
 
@@ -1130,23 +1226,28 @@ def _prepare_owned_copy(
         observed = _file_generation(destination, f"prepared {label}")
         if not _generation_matches(observed, prepared, ctime=True):
             raise ValueError(f"prepared {label} changed")
+        if expected_source_generation is not None and not (
+            isinstance(expected_source_generation, dict)
+            and observed.get("sha256") == expected_source_generation.get("sha256")
+        ):
+            raise ValueError(f"prepared {label} does not match its bound source content")
         return observed
     if identity is not None and not _valid_inode_payload(identity):
         raise ValueError(f"{label} copy ownership is invalid")
-    if destination.exists() or destination.is_symlink():
-        if identity is None:
-            raise ValueError(f"partial {label} has no durable transaction ownership")
-        _cleanup_owned_generation(
+    if identity is not None:
+        _retire_partial_generation(
             destination,
             cleanup,
             identity,
-            key=f"{key}-partial",
-            label=f"partial {label}",
+            key=key,
+            identity_key=identity_key,
+            label=label,
             journal_path=journal_path,
             journal=journal,
         )
-        journal.pop(identity_key, None)
-        _write_recovery_journal(journal_path, journal, f"{key}-copy-reset")
+        identity = None
+    elif destination.exists() or destination.is_symlink():
+        raise ValueError(f"partial {label} has no durable transaction ownership")
     _write_recovery_journal(journal_path, journal, f"{key}-copy-running")
 
     def record_identity(metadata: os.stat_result) -> None:
@@ -1163,6 +1264,11 @@ def _prepare_owned_copy(
         observed["stat"], journal.get(identity_key)
     ) or not _stat_matches_inode(_stat_payload(copied), journal.get(identity_key)):
         raise ValueError(f"prepared {label} changed before final attribution")
+    if expected_source_generation is not None and not (
+        isinstance(expected_source_generation, dict)
+        and observed.get("sha256") == expected_source_generation.get("sha256")
+    ):
+        raise ValueError(f"prepared {label} does not match its bound source content")
     journal[prepared_key] = observed
     journal.pop(identity_key, None)
     _write_recovery_journal(journal_path, journal, f"{key}-prepared")
@@ -1192,20 +1298,20 @@ def _prepare_owned_payload(
         return observed
     if identity is not None and not _valid_inode_payload(identity):
         raise ValueError(f"{label} payload ownership is invalid")
-    if destination.exists() or destination.is_symlink():
-        if identity is None:
-            raise ValueError(f"partial {label} has no durable transaction ownership")
-        _cleanup_owned_generation(
+    if identity is not None:
+        _retire_partial_generation(
             destination,
             cleanup,
             identity,
-            key=f"{key}-partial",
-            label=f"partial {label}",
+            key=key,
+            identity_key=identity_key,
+            label=label,
             journal_path=journal_path,
             journal=journal,
         )
-        journal.pop(identity_key, None)
-        _write_recovery_journal(journal_path, journal, f"{key}-copy-reset")
+        identity = None
+    elif destination.exists() or destination.is_symlink():
+        raise ValueError(f"partial {label} has no durable transaction ownership")
     _write_recovery_journal(journal_path, journal, f"{key}-copy-running")
     parent_fd = open_private_dir(destination.parent)
     descriptor = -1
@@ -2135,6 +2241,7 @@ def _restore_snapshot_file(
         label=f"{label} rollback generation",
         journal_path=journal_path,
         journal=journal,
+        expected_source_generation=backup_generation,
     )
     journal[f"{key}_restore_prepared_generation"] = prepared
     restored_generation = _publish_owned_generation(
@@ -2757,6 +2864,9 @@ def _rollback_file_credential(
     installed = journal.get("installed_credential_generation") or journal.get(
         "credential-forward_installed_generation"
     )
+    prepared_forward = journal.get("prepared_credential_generation") or journal.get(
+        "credential-install_prepared_generation"
+    )
     if (
         installed is None
         and isinstance(journal.get("installed_credential_stat"), dict)
@@ -2769,6 +2879,20 @@ def _rollback_file_credential(
             ctime=True,
         ):
             installed = candidate
+    if (
+        installed is None
+        and prepared_forward is not None
+        and (stable.exists() or stable.is_symlink())
+    ):
+        candidate = _file_generation(stable, "transaction-published stable credential")
+        if _generation_matches(candidate, prepared_forward, ctime=False):
+            installed = candidate
+            journal["installed_credential_generation"] = candidate
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                "credential-forward-publication-recovered",
+            )
     restored = journal.get("rollback-file_installed_generation")
     rollback_prepared = journal.get("rollback-file_prepared_generation")
 
@@ -2854,6 +2978,20 @@ def _rollback_file_credential(
             journal=journal,
         )
     else:
+        backup_key = (
+            "codex_backup-snapshot" if stable_name == CODEX_AUTH else "claude_file_backup-snapshot"
+        )
+        durable_backup = journal.get(f"{backup_key}_prepared_generation")
+        backup_generation = _file_generation(backup, "credential recovery backup")
+        durable_backup_changed = durable_backup is not None and not _generation_matches(
+            backup_generation,
+            durable_backup,
+            ctime=True,
+        )
+        if durable_backup_changed or not (
+            isinstance(original, dict) and backup_generation.get("sha256") == original.get("sha256")
+        ):
+            raise ValueError("credential recovery backup changed before rollback")
         prepared = _prepare_owned_copy(
             backup,
             rollback,
@@ -2862,6 +3000,7 @@ def _rollback_file_credential(
             label="credential rollback generation",
             journal_path=journal_path,
             journal=journal,
+            expected_source_generation=backup_generation,
         )
         published = _publish_owned_generation(
             rollback,

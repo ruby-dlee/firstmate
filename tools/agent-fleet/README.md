@@ -176,7 +176,9 @@ Recovery never auto-enables routing.
 
 The transaction can restore the previous local file or exact scoped-Keychain generation after an error or process crash.
 Rollback generations, Keychain cleanup, metadata restoration, and staged-home quarantine are separately journaled so another process crash during recovery resumes the same exact generation without discarding the rollback source or orphaning credential-bearing state.
-Bundle, provisional-manifest, and locator rollback accept only the exact snapshotted generation or the exact transaction-planned generation, with a final compare immediately before every replace or removal; unknown drift is preserved and refused.
+Bundle, provisional-manifest, locator, and credential rollback accept only the exact digest-bound snapshotted generation or the exact transaction-planned generation; unknown drift is preserved and refused.
+File cleanup never pathname-unlinks after a generation check: each attributed artifact is moved without replacement into a deterministic per-transaction retirement directory, scrubbed to zero bytes through its still-open descriptor, fsynced, and retained as a private zero-byte marker.
+This intentionally leaves a bounded set of non-secret markers for each explicit recovery transaction (one normal marker and at most eight interrupted-copy markers per artifact) so a same-UID pathname substitution can be preserved and refused instead of being accidentally deleted.
 It cannot undo provider-side token family rotation or revocation caused by the provider login itself.
 On any such failure, keep the provider disabled, preserve unaffected worker credentials, and complete worker-set recovery before the enable gate.
 Never use provider logout as cleanup.

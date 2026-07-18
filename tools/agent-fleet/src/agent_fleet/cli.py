@@ -1207,7 +1207,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        preflight(args.format)
+        if args.command not in {"exec", "resume"}:
+            preflight(args.format)
         payload = _run(args)
         if payload is not None:
             emit(payload, args.format)

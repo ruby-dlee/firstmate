@@ -27,6 +27,7 @@ from agent_fleet.config import (
     without_profile,
 )
 from agent_fleet.doctor import run_doctor
+from agent_fleet.paths import current_user_home
 from agent_fleet.provision import (
     profile_hook_health,
     profile_is_provisioned,
@@ -366,9 +367,7 @@ def test_bridge_topology_keeps_desktop_and_manual_reserves_out_of_routing(
         assert registry.require_profile(profile_id).pools == ("claude-crew", "claude-manual")
     for profile_id in ("codex-1", "codex-2", "codex-3", "codex-4"):
         assert registry.require_profile(profile_id).pools == ("codex-crew", "codex-manual")
-    assert all(
-        "claude-captain" not in profile.pools for profile in registry.profiles.values()
-    )
+    assert all("claude-captain" not in profile.pools for profile in registry.profiles.values())
     for profile_id in ("claude-3", "codex-5"):
         profile = registry.require_profile(profile_id)
         assert profile.safety_policy == "desktop_shared"
@@ -561,7 +560,7 @@ def test_legacy_registry_without_desktop_field_migrates_to_safe_default(
     registry = load_registry(path)
     assert (
         registry.require_provider("claude").desktop_identity_file
-        == (Path.home() / "Library/Application Support/Claude/config.json").resolve()
+        == (current_user_home() / "Library/Application Support/Claude/config.json").resolve()
     )
 
 

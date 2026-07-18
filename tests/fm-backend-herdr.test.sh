@@ -1964,6 +1964,8 @@ test_server_test_hooks_are_inert_without_explicit_opt_in() {
     ' "$ROOT" || fail "inherited test-hook variables affected production lock acquisition"
   [ ! -e "$ready" ] && [ ! -e "$kill_marker" ] \
     || fail "a Herdr test hook ran without the validated test-only opt-in"
+  # $1 is intentionally expanded by bash -c.
+  # shellcheck disable=SC2016
   hook_probe='. "$1"; fm_backend_herdr_test_hooks_enabled'
   if env -u FM_BACKEND_HERDR_TEST_LAB \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \

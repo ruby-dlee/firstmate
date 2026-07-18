@@ -4895,6 +4895,8 @@ SH
   fake_ps="$dir/fake-ps"
   printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_ps"
   chmod 755 "$fake_ps"
+  # $1 is intentionally expanded by bash -c.
+  # shellcheck disable=SC2016
   ps_probe='. "$1"; fm_account_ps_bin'
   selected_ps=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB \
     FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \

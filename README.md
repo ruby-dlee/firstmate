@@ -47,7 +47,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 - **Two task shapes** - ship tasks deliver a change; scout tasks investigate, plan, reproduce, or audit and leave a report.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
 - **Optional secondmates** - opt in to persistent domain supervisors that run from isolated firstmate homes with their own `FM_HOME`, state, projects, and session lock, supervising project clones or a project-less firstmate-repo domain, kept on the primary firstmate version by guarded local fast-forwards and checked for live agent processes at session start.
-- **Optional multi-account routing** - route Claude and Codex crews through explicit or pooled Agent Fleet profiles while preserving sticky recovery and provider-neutral continuation.
+- **Optional multi-account routing** - route Claude and Codex crews through explicit or pooled [Agent Fleet](tools/agent-fleet/) profiles while preserving sticky recovery and provider-neutral continuation.
 - **Durable completion reports** - every new ship and scout task publishes a detailed, visual, searchable report to one machine-global stack through fail-closed teardown.
 - **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; verified primary harnesses also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post up to three public-safe completion follow-ups within seven days for genuine milestones and the final outcome without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
@@ -200,6 +200,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/codex-app-backend.md](docs/codex-app-backend.md) - Codex App backend boundary, evidence, and rollout contract.
 - [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: verified per-harness hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
 - [docs/report-stack.md](docs/report-stack.md) - completion-report requirements, publication safety, stored artifacts, and browsing commands.
+- [tools/agent-fleet/](tools/agent-fleet/) - public source, installation, tests, and release procedure for the provider-neutral account router used by optional multi-account routing.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi, Grok, and unknown harness fallback.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
 - [`AGENTS.md`](AGENTS.md) - the distro's core instruction file and the first mate's full operating manual.

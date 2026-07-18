@@ -166,7 +166,7 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 ## Agent Fleet account routing
 
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
-Agent Fleet is a private CLI with no Firstmate-managed installer; obtain an approved release bundle from the maintainer, follow that bundle's installation instructions, and ensure `agent-fleet` is on `PATH` before enabling routing.
+Agent Fleet's public, provider-neutral source and installation instructions live under [`tools/agent-fleet`](../tools/agent-fleet/README.md); install an immutable release tag and ensure `agent-fleet` is on `PATH` before enabling routing.
 Account routing is default-off, so an unchanged installation makes no Agent Fleet calls, does not wrap the provider launch, and adds no managed account-routing fields to task metadata.
 Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
 The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.

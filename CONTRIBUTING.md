@@ -34,7 +34,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 
 - This repo is a template for running a firstmate orchestrator agent.
   `AGENTS.md` is the agent's main job description and names when to load bundled firstmate skills; `CLAUDE.md` is a symlink to it, and `.claude/skills` is a symlink to `.agents/skills`.
-- Only shared material is tracked: `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/`.
+- Only shared material is tracked: `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, `skills/`, and provider-neutral components under `tools/`.
   `.agents/skills/` holds agent-loaded skills that assume a live firstmate home and carry `metadata.internal: true` so installers such as [skills.sh](https://skills.sh) hide them from discovery; `skills/` holds standalone, installer-facing public skills with no firstmate dependency (see the README's "Two-tier skill layout").
   Everything personal to one captain's fleet (`.env`, `data/`, `state/`, `config/`, `projects/`, `.no-mistakes/`) is gitignored; never commit it.
   The root `.tasks.toml` is tracked `tasks-axi` config for `data/backlog.md`; compatible `tasks-axi` is the default backend for routine backlog mutations, with the compatibility definition owned by [`docs/configuration.md`](docs/configuration.md) ("Backlog backend").
@@ -75,6 +75,19 @@ for test_script in tests/*.test.sh; do bash "$test_script"; done   # behavior te
 [ "$(readlink .claude/skills)" = "../.agents/skills" ]
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
 ```
+
+Agent Fleet is independently packaged under `tools/agent-fleet` and requires Python 3.11 or newer plus `uv`.
+Run its locked checks from that directory before pushing:
+
+```sh
+uv sync --locked
+uv run --locked ruff check .
+uv run --locked pytest
+uv run --locked python -m compileall -q src
+uv build --out-dir dist
+```
+
+The complete versioning, tagging, and clean-install verification procedure lives in [`tools/agent-fleet/RELEASING.md`](tools/agent-fleet/RELEASING.md).
 
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
 Tests that need a real optional backend, an explicit opt-in, or an ambient toolchain capability (real herdr/zellij/cmux smoke tests, the live Pi regression, the Pi TypeScript-extension checks when node cannot import `.ts` modules directly) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.

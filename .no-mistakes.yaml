@@ -14,16 +14,17 @@ disable_project_settings: true
 # commands.lint, the gate's lint step never ran the deterministic
 # `shellcheck bin/*.sh bin/backends/*.sh tests/*.sh` that CI runs, so info-level
 # ShellCheck findings (e.g. SC2015) were not surfaced locally before CI rejected
-# them. commands.lint delegates to bin/fm-lint.sh, the single owner of the lint
-# definition that .github/workflows/ci.yml also invokes, so local can never
-# diverge from CI again (parity asserted by tests/fm-lint.test.sh).
-# The test command mirrors .github/workflows/ci.yml: iterate every
-# tests/*.test.sh, run each, and fail the step if any one exits non-zero (an
-# agent-driven test step has crashed the daemon). The e2e tests need tmux on
-# PATH, which the firstmate environment provides.
+# them. commands.lint delegates the shell definition to bin/fm-lint.sh and runs
+# the locked Agent Fleet ruff check that .github/workflows/ci.yml also invokes.
+# The shell definition stays single-owned, so local and CI cannot diverge
+# (parity asserted by tests/fm-lint.test.sh).
+# The test command mirrors the source checks in .github/workflows/ci.yml:
+# iterate every tests/*.test.sh, then run Agent Fleet's locked pytest and
+# compileall checks, and fail if any check exits non-zero. The e2e tests need
+# tmux on PATH, which the firstmate environment provides.
 commands:
-  lint: 'bin/fm-lint.sh'
-  test: 'command -v tmux >/dev/null || { echo "tmux is required for e2e tests" >&2; exit 1; }; tmux -V; rc=0; for t in tests/*.test.sh; do echo "== $t =="; bash "$t" || rc=1; done; exit "$rc"'
+  lint: 'bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check .'
+  test: 'command -v tmux >/dev/null || { echo "tmux is required for e2e tests" >&2; exit 1; }; tmux -V; rc=0; for t in tests/*.test.sh; do echo "== $t =="; bash "$t" || rc=1; done; uv run --directory tools/agent-fleet --locked pytest || rc=1; uv run --directory tools/agent-fleet --locked python -m compileall -q src || rc=1; exit "$rc"'
 
 # Keep test evidence out of this repo; it stays in a temp dir instead.
 test:

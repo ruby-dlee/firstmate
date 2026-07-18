@@ -28,7 +28,7 @@ Release tags use `agent-fleet-v<version>` and point at the Firstmate merge commi
    ```sh
    uv tool install --force \
      "agent-fleet @ git+https://github.com/ruby-dlee/firstmate.git@agent-fleet-v<version>#subdirectory=tools/agent-fleet"
-   agent-fleet version
+   agent-fleet --format json version
    ```
 
 4. Confirm that the reported CLI version matches the tag before announcing the release.

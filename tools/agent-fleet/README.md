@@ -13,12 +13,16 @@ repository under `tools/agent-fleet`.
 Its original standalone history and import boundary are recorded in
 [PROVENANCE.md](PROVENANCE.md).
 
+Installing and developing the package requires `uv` and Python 3.11 or newer.
+Managed routing also requires configured Claude Code or Codex CLI binaries and a profile-aware `quota-axi` executable.
+Default TOON output requires the `toon` executable on `PATH`; pass `--format json` when TOON output is not needed.
+
 Install a tagged release directly from the public repository:
 
 ```sh
 uv tool install --force \
   "agent-fleet @ git+https://github.com/ruby-dlee/firstmate.git@agent-fleet-v0.2.0#subdirectory=tools/agent-fleet"
-agent-fleet version
+agent-fleet --format json version
 ```
 
 For development from a Firstmate checkout, install the local package instead:
@@ -55,16 +59,19 @@ agent-fleet profile enroll claude-1
 agent-fleet profile enroll codex-1
 ```
 
+Before `init`, set `AGENT_FLEET_CLAUDE_BIN`, `AGENT_FLEET_CODEX_BIN`, or `AGENT_FLEET_QUOTA_BIN` when the executable defaults in "State" do not match the local installation.
+The generated registry pins the resolved executable paths.
+
 Register every Git project that may host a managed worker before enrollment and launch.
 Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
 Broad, symlinked, unrelated, and unregistered working directories fail closed before a provider process or lease starts.
 
 `profile enroll` is the login transaction: the profile must already be disabled
-and every same-provider Fleet lease must be drained. It provisions the isolated
-home and hooks, runs provider login, verifies the credential against the live
-quota endpoint, and checks for duplicate provider identities. The profile stays
-disabled after both success and failure. Enable it only in a separate command
-after reviewing verification:
+and every same-provider Fleet lease must be drained.
+It provisions the isolated home and hooks, runs provider login, and attempts live remote verification and duplicate-identity checks.
+Claude enrollment reports a separate verification step when Keychain access has not yet been granted.
+The profile stays disabled after both success and failure.
+Enable it only in a separate command after reviewing verification:
 
 ```sh
 agent-fleet profile verify claude-1 --allow-keychain-prompt
@@ -171,13 +178,10 @@ view.
 
 ## Selection policy
 
-`quota refresh` invokes `quota-axi` inside each profile environment and stores
-only normalized status, an opaque provider-identity fingerprint when available,
-and percentage windows. Before every selection, old quota evidence is refreshed
-automatically. `auth_required`, `rate_limited`, provider errors, duplicate
-identities, missing remote verification, and expired verification are hard
-blocks. A cached response whose live probe says sign-in is required is also a
-hard block; cached percentages can never hide revoked credentials.
+`quota refresh` invokes `quota-axi` inside each profile environment and stores normalized routing evidence rather than provider payloads, including status and reason, timestamps, aggregate headroom, percentage windows, and an opaque provider-identity fingerprint when available.
+Before every selection, old quota evidence is refreshed automatically.
+`auth_required`, `rate_limited`, provider errors, duplicate identities, missing remote verification, and expired verification are hard blocks.
+A cached response whose live probe says sign-in is required is also a hard block; cached percentages can never hide revoked credentials.
 
 When fresh quota exists, Agent Fleet selects the highest safe headroom after
 reserve and active-lease penalties. A transient stale/unavailable response may
@@ -200,16 +204,16 @@ routing activation are deliberately separate phases. On macOS,
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
 never requests Keychain access and fails closed when verification is unavailable.
 
-`doctor` verifies private profile homes, fresh remote identity proof for enabled workers, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
+`doctor` checks private profile homes, cached fresh remote identity proof for enabled workers, Agent Fleet and inherited workflow hooks/assets, provider auth state, trusted-project configuration, and configured binaries.
+It does not refresh quota evidence or change provider or project configuration.
 Disabled and non-worker reserve profiles report remote-proof state without making it a health requirement.
-`--workspace` checks Firstmate's Claude and Codex supervision hooks, while `--project` independently checks provider onboarding, registered-project, profile-hook, plugin, and project-hook readiness without changing either location.
+`--workspace` checks for Firstmate's required Claude and Codex supervision-hook events, while `--project` independently checks provider onboarding, registered-project, profile-hook, plugin, and project-hook readiness.
 
 ## Isolation and shared workflow assets
 
-Claude profiles set `CLAUDE_CONFIG_DIR`; Codex profiles set `CODEX_HOME` and
-force file-backed credentials inside that home. Homes and state are mode 0700;
-registry, lease, quota, and session files are mode 0600. Ambient provider API
-key and access-token variables are removed before every provider launch.
+Claude profiles set `CLAUDE_CONFIG_DIR`; Codex profiles set `CODEX_HOME` and `CODEX_SQLITE_HOME` and force file-backed credentials inside that home.
+Homes and state are mode 0700; registry, lease, quota, and session files are mode 0600.
+Before every provider subprocess, Agent Fleet scrubs ambient `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, and `CODEX_*` variables, then sets the managed profile-home and task/workspace variables it owns.
 
 The provider registry can declare a base home, hook source, trusted Git projects, and allowlisted shared entries.
 Initial profiles share only account-neutral workflow assets:
@@ -228,12 +232,13 @@ Defaults:
 - Profile homes: paths recorded in the registry, under `~/.local/share/agent-fleet/accounts/<provider>/` by default
 - Leases, normalized quota, and session mappings:
   `~/.local/state/agent-fleet`
-- Neutral provider runtimes: `~/.local/libexec/agent-fleet/runtime`
-- Pinned profile-aware quota reader:
+- Claude Code binary: `~/.local/bin/claude`
+- Codex CLI binary: `~/.local/libexec/agent-fleet/runtime/codex`
+- Profile-aware quota reader:
   `~/.local/libexec/agent-fleet/quota-axi/current/bin/quota-axi`
 
-All paths can be redirected in tests through `AGENT_FLEET_CONFIG`,
-`AGENT_FLEET_STATE_DIR`, and `AGENT_FLEET_SHARE_DIR`.
+`AGENT_FLEET_CONFIG`, `AGENT_FLEET_STATE_DIR`, and `AGENT_FLEET_SHARE_DIR` redirect the registry, state, and share/profile-home defaults.
+The init-time executable overrides documented under "Initial setup" set the three generated binary paths; afterward, the registry owns those values.
 
 ## Development and releases
 

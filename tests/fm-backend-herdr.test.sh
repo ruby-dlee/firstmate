@@ -22,6 +22,27 @@ TMP_ROOT=$(fm_test_tmproot fm-backend-herdr-tests)
 export FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=0
 export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 
+assert_no_server_transients() {  # <lock-root> <label>
+  local root=$1 label=$2 artifact leaf mode
+  for artifact in "$root"/*; do
+    [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    leaf=${artifact##*/}
+    case "$leaf" in
+      *.closed-shell-v2|*.closed-shell-config-v2.toml)
+        if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$artifact"); else mode=$(stat -c %a "$artifact"); fi
+        [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$mode" = 600 ] \
+          || fail "$label left an unsafe persistent managed artifact: $artifact"
+        ;;
+      managed-worker-shell-v1-*)
+        if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$artifact"); else mode=$(stat -c %a "$artifact"); fi
+        [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$mode" = 500 ] \
+          || fail "$label left an unsafe persistent managed helper: $artifact"
+        ;;
+      *) fail "$label left a lock, candidate, quarantine, or unknown artifact: $artifact" ;;
+    esac
+  done
+}
+
 # make_herdr_fakebin: a `herdr` stub that logs every invocation (one line,
 # unit-separated args, to $FM_HERDR_LOG) and returns the canned response for
 # that call read from $FM_HERDR_RESPONSES/<n>.out, consumed IN ORDER (call 1
@@ -368,7 +389,7 @@ SH
 }
 
 test_managed_shell_and_server_certificate_close_startup_before_bash() {
-  local dir fb lock_root server_marker shell_marker bash_env shell_dump ps_fake ps_dead result certificate config wrapper pid
+  local dir fb lock_root lock_physical server_marker shell_marker bash_env shell_dump ps_fake ps_dead result certificate config wrapper helper_digest pid
   dir="$TMP_ROOT/herdr-managed-shell-certificate"
   fb="$dir/fakebin"
   lock_root="$dir/locks"
@@ -380,6 +401,7 @@ test_managed_shell_and_server_certificate_close_startup_before_bash() {
   ps_dead="$dir/ps-dead"
   mkdir -p "$fb" "$lock_root"
   chmod 700 "$lock_root"
+  lock_physical=$(cd "$lock_root" && pwd -P)
   cat > "$fb/herdr" <<'SH'
 #!/bin/sh
 printf '%s\n%s\n%s\n' "${HERDR_CONFIG_PATH-}" "${SHELL-}" "$*" \
@@ -424,6 +446,16 @@ SH
     || fail "Herdr server did not receive the pre-Bash managed shell"
   [ "$(sed -n '3p' "$server_marker")" = 'server --session fmtest' ] \
     || fail "certified server launch changed its scoped command"
+  [ "$(sed -n '1p' "$certificate")" = firstmate-herdr-closed-env-v2 ] \
+    || fail "Herdr server published the wrong closed-shell certificate schema"
+  [ "$(sed -n '5p' "$certificate")" = "$wrapper" ] \
+    || fail "Herdr certificate did not bind the exact managed helper path"
+  [ "$(sed -n '8p' "$certificate")" = "$config" ] \
+    || fail "Herdr certificate did not bind the exact managed config path"
+  helper_digest=$(sed -n '6p' "$certificate")
+  [ "${#helper_digest}" -eq 64 ] \
+    && [ "$wrapper" = "$lock_physical/managed-worker-shell-v1-$helper_digest" ] \
+    || fail "managed Herdr worker shell was not installed at its certified content address: $wrapper"
   assert_grep "default_shell = \"$wrapper\"" "$config" \
     "managed Herdr config did not force the pre-Bash worker shell"
   assert_grep 'shell_mode = "non_login"' "$config" \
@@ -460,6 +492,172 @@ SH
     fail "dead certified Herdr server retained closed-shell authority"
   fi
   pass "Herdr managed config, process certificate, and pre-Bash shell close hostile startup state"
+}
+
+test_managed_shell_certificate_rejects_release_and_artifact_drift() {
+  local dir fb lock_root source ps_fake result certificate config wrapper pid replacement session marker
+  dir="$TMP_ROOT/herdr-managed-shell-drift"
+  fb="$dir/fakebin"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  cat > "$fb/herdr" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "${FM_HERDR_DETACH_MARKER:?}"
+exec /bin/sleep 20
+SH
+  chmod 755 "$fb/herdr"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+
+  launch_fixture() {
+    local fixture_session=$1 fixture_marker="$dir/$1.server"
+    PATH="$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$fixture_marker" \
+      FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_server_launch_detached "$1" || exit 1
+        for _attempt in $(seq 1 100); do
+          [ -s "$FM_HERDR_DETACH_MARKER" ] && break
+          /bin/sleep 0.02
+        done
+        [ -s "$FM_HERDR_DETACH_MARKER" ] || exit 2
+        fm_backend_herdr_server_closed_shell_environment_ready "$1" || exit 3
+        printf "%s\n%s\n%s\n" \
+          "$(fm_backend_herdr_server_env_certificate_path "$1")" \
+          "$(fm_backend_herdr_managed_config_path "$1")" \
+          "$(fm_backend_herdr_managed_shell_bin)"
+      ' "$ROOT" "$fixture_session"
+  }
+
+  certificate_ready() {
+    local fixture_session=$1
+    PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      /bin/bash --noprofile --norc -c \
+        '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_closed_shell_environment_ready "$1"' \
+        "$ROOT" "$fixture_session"
+  }
+
+  session=fm-config-drift
+  result=$(launch_fixture "$session") || fail "config-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  config=${result%%$'\n'*}
+  wrapper=${result#*$'\n'}
+  replacement="$dir/config-replacement"
+  cp "$config" "$replacement"
+  chmod 600 "$replacement"
+  mv "$replacement" "$config"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "identical-byte managed-config replacement retained certificate authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+
+  session=fm-helper-drift
+  result=$(launch_fixture "$session") || fail "helper-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  config=${result%%$'\n'*}
+  wrapper=${result#*$'\n'}
+  replacement="$dir/helper-replacement"
+  cp "$wrapper" "$replacement"
+  chmod 500 "$replacement"
+  mv "$replacement" "$wrapper"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "identical-byte managed helper replacement retained certificate authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+
+  session=fm-source-drift
+  result=$(launch_fixture "$session") || fail "source-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  replacement="$dir/source-replacement"
+  cp "$source" "$replacement"
+  printf '\n# release drift fixture\n' >> "$replacement"
+  chmod 755 "$replacement"
+  mv "$replacement" "$source"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "post-launch reviewed helper-source update retained old server authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+  pass "Herdr certificate rejects config/helper inode replacement and release-source drift"
+}
+
+test_managed_artifact_candidate_recovery_is_guarded() {
+  local dir lock_root source ps_fake result config certificate stale_config stale_certificate foreign_config foreign_certificate indeterminate_certificate
+  dir="$TMP_ROOT/herdr-managed-candidates"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+if [ "$pid" = 999996 ]; then
+  printf 'indeterminate process probe\n' >&2
+  exit 1
+fi
+case "$pid" in 999998|999999) exit 1 ;; esac
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+  result=$(FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      printf "%s\n%s\n" \
+        "$(fm_backend_herdr_managed_config_path fm-candidates)" \
+        "$(fm_backend_herdr_server_env_certificate_path fm-candidates)"
+    ' "$ROOT") || fail "candidate recovery paths were unavailable"
+  config=${result%%$'\n'*}
+  certificate=${result#*$'\n'}
+  stale_config="$config.candidate.999999"
+  stale_certificate="$certificate.candidate.999998"
+  foreign_config="$config.candidate.foreign"
+  foreign_certificate="$certificate.candidate.999997"
+  indeterminate_certificate="$certificate.candidate.999996"
+  printf 'stale config candidate\n' > "$stale_config"
+  printf 'stale certificate candidate\n' > "$stale_certificate"
+  printf 'foreign suffix\n' > "$foreign_config"
+  printf 'foreign mode\n' > "$foreign_certificate"
+  printf 'indeterminate owner\n' > "$indeterminate_certificate"
+  chmod 600 "$stale_config" "$stale_certificate" "$foreign_config" "$indeterminate_certificate"
+  chmod 640 "$foreign_certificate"
+  touch -t 202001010000 "$stale_config" "$stale_certificate" "$foreign_config" "$foreign_certificate" "$indeterminate_certificate"
+
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+      fm_backend_herdr_artifact_recover_candidates "$2" 0600
+    ' "$ROOT" "$config" "$certificate" \
+    || fail "guarded artifact candidate recovery failed"
+  [ ! -e "$stale_config" ] || fail "proven-stale config candidate was not recovered"
+  [ ! -e "$stale_certificate" ] || fail "proven-stale certificate candidate was not recovered"
+  [ -e "$foreign_config" ] || fail "non-numeric foreign candidate was deleted"
+  [ -e "$foreign_certificate" ] || fail "wrong-mode indeterminate candidate was deleted"
+  [ -e "$indeterminate_certificate" ] || fail "output-bearing indeterminate PID candidate was deleted"
+  pass "managed artifact recovery deletes only proven-stale owned numeric candidates"
 }
 
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir() {
@@ -714,8 +912,7 @@ SH
   done
   kill -0 "$server_pid" 2>/dev/null \
     && fail "concurrent server ensure left the fake detached server orphaned"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "concurrent server ensure leaked its serialization lock"
+  assert_no_server_transients "$lock_root" "concurrent server ensure"
   pass "fm_backend_herdr_server_ensure: concurrent callers launch one detached server and leave no lock or process orphan"
 }
 
@@ -790,8 +987,7 @@ SH
     || fail "server ensure could not reclaim a lock whose exact owner was killed"
   launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
   [ "$launch_count" -eq 1 ] || fail "stale-lock recovery launched $launch_count servers instead of one"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "stale-lock recovery leaked a lock or owner token"
+  assert_no_server_transients "$lock_root" "stale-lock recovery"
 
   # A contender delayed before the atomic hard-link publication owns only its
   # private candidate. Even after the stale threshold, it cannot be mistaken
@@ -825,8 +1021,7 @@ SH
   wait "$first" || fail "delayed candidate owner did not converge on server readiness"
   launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
   [ "$launch_count" -eq 1 ] || fail "candidate-publication race launched $launch_count servers instead of one"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "candidate-publication race leaked a lock, quarantine, or candidate file"
+  assert_no_server_transients "$lock_root" "candidate-publication race"
 
   rm -f "$running"
   chmod 755 "$lock_root"
@@ -926,8 +1121,7 @@ SH
   PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_try_reclaim "$1"' "$ROOT" "$lock" \
     || fail "could not clean the killed indeterminate-owner fixture"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "indeterminate-owner boundary left a lock or quarantine artifact"
+  assert_no_server_transients "$lock_root" "indeterminate-owner boundary"
   pass "fm_backend_herdr_server_ensure: an indeterminate ps probe never steals a live owner and readiness still unblocks waiters"
 }
 
@@ -1017,8 +1211,7 @@ SH
     || fail "server ensure could not recover a stale post-rename quarantine"
   launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
   [ "$launch_count" -eq 1 ] || fail "quarantine crash recovery launched $launch_count servers instead of one"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "quarantine crash recovery left a lock or quarantine artifact"
+  assert_no_server_transients "$lock_root" "quarantine crash recovery"
 
   rm -f "$running"
   : > "$log"
@@ -1060,8 +1253,7 @@ SH
     || fail "server ensure could not recover a killed post-link owner"
   launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
   [ "$launch_count" -eq 1 ] || fail "post-link crash recovery launched $launch_count servers instead of one"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "post-link crash recovery left a candidate, lock, or quarantine artifact"
+  assert_no_server_transients "$lock_root" "post-link crash recovery"
   pass "fm_backend_herdr_server_ensure: crashes after quarantine rename or atomic link publication recover without leaks or duplicate launch"
 }
 
@@ -1093,8 +1285,7 @@ test_server_test_hooks_are_inert_without_explicit_opt_in() {
     ' "$ROOT" || fail "inherited test-hook variables affected production lock acquisition"
   [ ! -e "$ready" ] && [ ! -e "$kill_marker" ] \
     || fail "a Herdr test hook ran without the validated test-only opt-in"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "inert test-hook check leaked a lock or candidate"
+  assert_no_server_transients "$lock_root" "inert test-hook check"
   pass "Herdr launch-lock fault hooks are inert unless the validated test-only opt-in is present"
 }
 
@@ -1173,8 +1364,7 @@ SH
   PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_try_reclaim "$1"' "$ROOT" "$lock" \
     || fail "could not clean the completed inflight-launch fixture"
-  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
-    || fail "inflight-launch boundary left a lock or quarantine artifact"
+  assert_no_server_transients "$lock_root" "inflight-launch boundary"
   pass "fm_backend_herdr_server_ensure: the lock-file launch epoch prevents stale prelaunch time from duplicating a detached server after owner death"
 }
 
@@ -3153,6 +3343,13 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-shell-cert ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
+  test_managed_shell_and_server_certificate_close_startup_before_bash
+  test_managed_shell_certificate_rejects_release_and_artifact_drift
+  test_managed_artifact_candidate_recovery_is_guarded
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   test_workspace_ensure_prunes_default_tab
   exit 0
@@ -3166,6 +3363,8 @@ test_herdr_binary_revalidates_leaf_and_physical_ancestry
 test_server_launch_scrubs_hostile_perl_and_control_environment
 test_server_launch_preserves_only_safe_worker_tool_paths
 test_managed_shell_and_server_certificate_close_startup_before_bash
+test_managed_shell_certificate_rejects_release_and_artifact_drift
+test_managed_artifact_candidate_recovery_is_guarded
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id

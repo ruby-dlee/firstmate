@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -251,17 +252,35 @@ def test_session_hook_persists_profile_and_provider_session(
     assert mapping["pool"] == "claude-crew"
     assert mapping["workspace"] == str(Path.cwd())
     assert mapping["turn_end"] == str(tmp_path / "hook-task.turn-ended")
+    assert mapping["schema"] == 2
+    assert mapping["session_event_seq"] == 1
     original_mapping = session_path(registry, "hook-task").read_bytes()
     repeated = record_session_from_hook(
         registry, {"hook_event_name": "SessionStart", "session_id": "session-123"}
     )
     assert repeated["idempotent"] is True
-    assert session_path(registry, "hook-task").read_bytes() == original_mapping
+    assert repeated["session_event_seq"] == 2
+    refreshed_mapping = session_path(registry, "hook-task").read_bytes()
+    assert refreshed_mapping != original_mapping
+    assert get_session(registry, "hook-task")["session_event_seq"] == 2
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        concurrent = list(
+            executor.map(
+                lambda _: record_session_from_hook(
+                    registry,
+                    {"hook_event_name": "SessionStart", "session_id": "session-123"},
+                ),
+                range(8),
+            )
+        )
+    assert sorted(result["session_event_seq"] for result in concurrent) == list(range(3, 11))
+    refreshed_mapping = session_path(registry, "hook-task").read_bytes()
+    assert get_session(registry, "hook-task")["session_event_seq"] == 10
     with pytest.raises(ValueError, match="already bound to another identity"):
         record_session_from_hook(
             registry, {"hook_event_name": "SessionStart", "session_id": "session-other"}
         )
-    assert session_path(registry, "hook-task").read_bytes() == original_mapping
+    assert session_path(registry, "hook-task").read_bytes() == refreshed_mapping
 
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
@@ -462,6 +481,57 @@ def test_session_mapping_requires_exact_workspace_schema(
     atomic_write_json(session_path(registry, "missing-workspace"), mapping)
     with pytest.raises(ValueError, match="corrupt session mapping"):
         get_session(registry, "missing-workspace")
+
+
+def test_legacy_session_mapping_migrates_only_on_same_binding_sessionstart(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profiles = dict(registry.profiles)
+    profiles["claude-1"] = replace(profiles["claude-1"], enabled=True)
+    registry = replace(registry, profiles=profiles)
+    provision_profile(registry, registry.require_profile("claude-1"))
+    select_and_acquire(
+        registry,
+        task="legacy-session-task",
+        pool="claude-crew",
+        profile_id="claude-1",
+        bind_pid=os.getpid(),
+        workspace=Path.cwd(),
+    )
+    turn_end = tmp_path / "legacy-session-task.turn-ended"
+    legacy = {
+        "schema": 1,
+        "task": "legacy-session-task",
+        "profile": "claude-1",
+        "provider": "claude",
+        "pool": "claude-crew",
+        "workspace": str(Path.cwd()),
+        "turn_end": str(turn_end),
+        "session_id": "legacy-session",
+        "updated_at": utc_now(),
+    }
+    atomic_write_json(session_path(registry, "legacy-session-task"), legacy)
+    assert get_session(registry, "legacy-session-task")["session_event_seq"] == 0
+    monkeypatch.setenv("AGENT_FLEET_TASK_ID", "legacy-session-task")
+    monkeypatch.setenv("AGENT_FLEET_PROFILE", "claude-1")
+    monkeypatch.setenv("AGENT_FLEET_PROVIDER", "claude")
+    monkeypatch.setenv("AGENT_FLEET_POOL", "claude-crew")
+    monkeypatch.setenv("AGENT_FLEET_WORKSPACE", str(Path.cwd()))
+    monkeypatch.setenv("AGENT_FLEET_TURN_END", str(turn_end))
+
+    before = session_path(registry, "legacy-session-task").read_bytes()
+    with pytest.raises(ValueError, match="already bound to another identity"):
+        record_session_from_hook(registry, {"session_id": "changed-session"})
+    assert session_path(registry, "legacy-session-task").read_bytes() == before
+
+    result = record_session_from_hook(registry, {"session_id": "legacy-session"})
+    migrated = get_session(registry, "legacy-session-task")
+    assert result["idempotent"] is True
+    assert result["session_event_seq"] == 1
+    assert migrated["schema"] == 2
+    assert migrated["session_event_seq"] == 1
 
 
 def test_live_task_cannot_cross_workspaces(fleet: tuple[object, Path], tmp_path: Path) -> None:

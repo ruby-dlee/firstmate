@@ -72,8 +72,12 @@ Provider-owned project control files (`.mcp.json` for Claude and
 `.codex/config.toml` for Codex) are rejected during preparation and rechecked
 immediately before the final enter/exec boundary. A same-uid process can still
 create one after that last portable filesystem check and before the provider
-opens the project; eliminating that residual race requires the provider to
-disable project-local controls itself.
+opens the project. Managed Claude closes that residual with the provider-native
+`--setting-sources user` launch option, retaining the isolated profile's hooks
+while excluding project and local settings. The sealed Codex launch contract
+exposes no equivalent source-exclusion option; its project-control-file race remains an
+explicit same-uid residual, bounded by the immediate final preflight plus
+managed plugin disablement and active-root-only trust.
 
 The sealed cutover release never starts provider login or a browser. Credentials
 must already exist in each isolated worker home. `profile identity adopt` is a
@@ -166,6 +170,8 @@ Provider arguments use a strict operation-aware positive grammar matching FirstM
 `exec` requires the provider autonomy flag, accepts only FirstMate's optional model, effort, and Codex turn-end notification fields, and requires exactly one prompt.
 Agent Fleet reconstructs the provider argv from the parsed fields and inserts a provider-level `--` before that prompt, so prompt text that resembles a command remains prompt text.
 `resume` accepts the same safe option family but no caller prompt, session id, alternate command, attached flag form, or arbitrary provider config.
+Every reconstructed Claude exec and resume also adds `--setting-sources user`;
+callers cannot widen or replace that provider-native setting-source policy.
 
 Claude provisioning writes a closed `settings.json` and a closed `.claude.json` containing only onboarding plus registered-project trust state; it strips opaque oauth, refresh, MCP, plugin, and unrelated project keys rather than preserving unknown state.
 Credential identity remains solely in the source-attested `.credentials.json` or exact path-scoped Keychain service, never in `.claude.json`.
@@ -183,6 +189,11 @@ Task resume is fail-closed: it requires the recorded provider session and
 reuses that session's exact profile. The new-task quota reserve does not block
 recovery of an existing conversation, but disabled, unprovisioned, cooled-down,
 or capacity-exhausted profiles still do.
+Each accepted same-binding SessionStart advances the mapping's schema-2
+`session_event_seq` under the state lock. Resume freshness compares only that
+monotonic sequence, never `updated_at`. Legacy schema-1 mappings remain readable
+with virtual sequence zero and migrate atomically on their next same-binding
+SessionStart; a changed binding fails before any migration write.
 
 Orchestrators that create a terminal endpoint before launching its command use
 `lease recover` for an atomic, below-reserve-safe recovery reservation, then

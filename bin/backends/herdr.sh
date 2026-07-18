@@ -306,6 +306,7 @@ fm_backend_herdr_session() {
 # the single lifecycle owner; captain launchers never start or stop Herdr.
 fm_backend_herdr_server_launch_detached() {  # <session>
   local session=$1 herdr_bin perl_bin passwd_home worker_path certificate certificate_key managed_config managed_shell ps_bin name value launch_env=()
+  local managed_shell_proof managed_shell_digest managed_shell_identity managed_config_proof managed_config_digest managed_config_identity
   herdr_bin=$(fm_backend_herdr_bin) || return 1
   perl_bin=$FM_BACKEND_HERDR_PERL_BIN
   passwd_home=$(fm_backend_herdr_passwd_home 2>/dev/null) || return 1
@@ -320,8 +321,15 @@ fm_backend_herdr_server_launch_detached() {  # <session>
     || [ -n "${FM_BACKEND_HERDR_SERVER_LOCK_ROOT:-}" ]; then
     certificate=$(fm_backend_herdr_server_env_certificate_path "$session") || return 1
     certificate_key=$(fm_backend_herdr_server_lock_key "$session") || return 1
-    managed_config=$(fm_backend_herdr_managed_config_ensure "$session") || return 1
     managed_shell=$(fm_backend_herdr_managed_shell_bin) || return 1
+    managed_config=$(fm_backend_herdr_managed_config_ensure "$session" "$managed_shell") || return 1
+    managed_shell_proof=$(fm_backend_herdr_file_identity "$managed_shell" 0500 owner) || return 1
+    managed_shell_digest=${managed_shell_proof%%$'\n'*}
+    managed_shell_identity=${managed_shell_proof#*$'\n'}
+    managed_config_proof=$(fm_backend_herdr_file_identity "$managed_config" 0600 owner) || return 1
+    managed_config_digest=${managed_config_proof%%$'\n'*}
+    managed_config_identity=${managed_config_proof#*$'\n'}
+    fm_backend_herdr_artifact_recover_candidates "$certificate" 0600 || return 1
     ps_bin=$(fm_backend_herdr_ps_bin) || return 1
   fi
   [ -n "$perl_bin" ] && [ -n "$FM_BACKEND_HERDR_NOHUP_BIN" ] \
@@ -350,7 +358,9 @@ fm_backend_herdr_server_launch_detached() {  # <session>
     # shellcheck disable=SC2016
     "$FM_BACKEND_HERDR_ENV_BIN" -i "${launch_env[@]}" \
       "$FM_BACKEND_HERDR_NOHUP_BIN" "$perl_bin" -MFcntl=:DEFAULT -MIO::Handle -MPOSIX -e '
-      my ($certificate, $certificate_key, $ps, @command) = @ARGV;
+      my ($certificate, $certificate_key, $ps, $managed_shell,
+          $managed_shell_digest, $managed_shell_identity, $managed_config,
+          $managed_config_digest, $managed_config_identity, @command) = @ARGV;
       my $pid = fork();
       defined $pid or die "first fork: $!";
       exit 0 if $pid;
@@ -370,8 +380,11 @@ fm_backend_herdr_server_launch_detached() {  # <session>
         sysopen my $owner, $candidate, O_WRONLY | O_CREAT | O_EXCL, 0600
           or die "certificate candidate: $!";
         chmod 0600, $candidate or die "certificate mode: $!";
-        print {$owner} "firstmate-herdr-closed-env-v1\n",
-          "$certificate_key\n", "$$\n", "$start\n"
+        print {$owner} "firstmate-herdr-closed-env-v2\n",
+          "$certificate_key\n", "$$\n", "$start\n",
+          "$managed_shell\n", "$managed_shell_digest\n",
+          "$managed_shell_identity\n", "$managed_config\n",
+          "$managed_config_digest\n", "$managed_config_identity\n"
           or die "certificate write: $!";
         $owner->flush or die "certificate flush: $!";
         $owner->sync or die "certificate sync: $!";
@@ -381,6 +394,8 @@ fm_backend_herdr_server_launch_detached() {  # <session>
       exec { $command[0] } @command;
       die "exec $command[0]: $!";
     ' -- "$certificate" "$certificate_key" "${ps_bin:-}" \
+      "${managed_shell:-}" "${managed_shell_digest:-}" "${managed_shell_identity:-}" \
+      "${managed_config:-}" "${managed_config_digest:-}" "${managed_config_identity:-}" \
       "$herdr_bin" server --session "$session" </dev/null >/dev/null 2>&1 &
   ) || return 1
 }
@@ -546,6 +561,23 @@ fm_backend_herdr_process_start() {
   printf '%s\n' "$value"
 }
 
+# Return success only when ps proves a PID is absent. Any output-bearing error,
+# successful-but-empty result, or unavailable probe is indeterminate and must
+# never authorize artifact deletion.
+fm_backend_herdr_process_absent() {  # <pid>
+  local probe status ps_bin PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  ps_bin=$(fm_backend_herdr_ps_bin) || return 2
+  probe=$(LC_ALL=C fm_backend_herdr_scrubbed_exec "$ps_bin" -o lstart= -p "$1" 2>&1)
+  status=$?
+  probe=$(printf '%s\n' "$probe" | fm_backend_herdr_control_exec sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ "$status" -eq 0 ]; then
+    [ -n "$probe" ] || return 2
+    return 1
+  fi
+  [ -z "$probe" ] || return 2
+  return 0
+}
+
 fm_backend_herdr_server_lock_root() {
   local raw parent_raw parent leaf owner_uid PATH=$FM_BACKEND_HERDR_CONTROL_PATH
   if fm_backend_herdr_test_lab_enabled && [ -n "${FM_BACKEND_HERDR_SERVER_LOCK_ROOT:-}" ]; then
@@ -596,11 +628,80 @@ fm_backend_herdr_server_env_certificate_path() {  # <session>
   fm_backend_herdr_server_lock_root_prepare || return 1
   root=$(fm_backend_herdr_server_lock_root) || return 1
   key=$(fm_backend_herdr_server_lock_key "$1") || return 1
-  printf '%s/%s.closed-shell-v1\n' "$root" "$key"
+  printf '%s/%s.closed-shell-v2\n' "$root" "$key"
 }
 
-fm_backend_herdr_managed_shell_bin() {
+fm_backend_herdr_file_read_verified() {  # <identity|snapshot> <path> <mode|executable> <owner|root-or-owner>
+  local operation=$1 path=$2 expected_mode=$3 owner_policy=$4
+  case "$path" in /*) ;; *) return 1 ;; esac
+  case "$path" in *$'\n'*) return 1 ;; esac
+  # The descriptor, both fstat snapshots, and the final lstat all have to name
+  # one regular file. O_NOFOLLOW prevents a symlink from entering between the
+  # shell's ancestry check and the actual read. The first two output lines are
+  # always SHA-256 and a supplemental dev:ino:size:mtime identity.
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -e '
+    my ($operation, $path, $expected_mode, $owner_policy) = @ARGV;
+    my $nofollow = eval { O_NOFOLLOW() };
+    defined $nofollow or die "O_NOFOLLOW unavailable";
+    sysopen my $fh, $path, O_RDONLY | $nofollow or die "open: $!";
+    my @before = stat($fh);
+    @before or die "fstat before: $!";
+    -f $fh or die "not regular";
+    my $mode = $before[2] & 07777;
+    $before[3] == 1 or die "link count";
+    if ($expected_mode eq "executable") {
+      ($mode & 0111) && !($mode & 0022) or die "unsafe executable mode";
+    } else {
+      $mode == oct($expected_mode) or die "mode";
+    }
+    if ($owner_policy eq "owner") {
+      $before[4] == $< or die "owner";
+    } elsif ($owner_policy eq "root-or-owner") {
+      ($before[4] == 0 || $before[4] == $<) or die "owner";
+    } else {
+      die "owner policy";
+    }
+    my $sha = Digest::SHA->new(256);
+    my $payload = "";
+    while (1) {
+      my $count = sysread($fh, my $chunk, 65536);
+      defined $count or die "read: $!";
+      last unless $count;
+      $sha->add($chunk);
+      $payload .= $chunk if $operation eq "snapshot";
+    }
+    my @after = stat($fh);
+    @after or die "fstat after: $!";
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $before[$index] == $after[$index] or die "changed during read";
+    }
+    my @path_after = lstat($path);
+    @path_after or die "lstat after: $!";
+    ($path_after[0] == $after[0] && $path_after[1] == $after[1])
+      or die "path replaced after read";
+    close $fh or die "close: $!";
+    my $digest = $sha->hexdigest;
+    my $identity = join(":", @after[0, 1, 7, 9]);
+    print "$digest\n$identity\n";
+    print $payload if $operation eq "snapshot";
+  ' "$operation" "$path" "$expected_mode" "$owner_policy" 2>/dev/null
+}
+
+fm_backend_herdr_file_identity() {  # <path> <mode|executable> <owner-policy>
+  fm_backend_herdr_file_read_verified identity "$@"
+}
+
+fm_backend_herdr_file_snapshot() {  # <path> <mode|executable> <owner-policy>
+  fm_backend_herdr_file_read_verified snapshot "$@"
+}
+
+fm_backend_herdr_managed_shell_source() {
   local physical candidate="$FM_BACKEND_HERDR_ROOT/bin/fm-herdr-worker-shell"
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_MANAGED_SHELL_SOURCE:-}" ]; then
+    candidate=$FM_TEST_HERDR_MANAGED_SHELL_SOURCE
+  fi
   # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
   physical=$(fm_backend_herdr_control_perl -MCwd=abs_path -e \
     'my $p = abs_path($ARGV[0]); exit 1 unless defined $p; print $p' \
@@ -609,17 +710,113 @@ fm_backend_herdr_managed_shell_bin() {
   printf '%s\n' "$physical"
 }
 
+fm_backend_herdr_managed_shell_path_for_digest() {  # <sha256>
+  local digest=$1 root
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  printf '%s/managed-worker-shell-v1-%s\n' "$root" "$digest"
+}
+
+fm_backend_herdr_artifact_recover_candidates() {  # <target> <mode>
+  local target=$1 mode=$2 candidate pid inode identity_before identity_after
+  for candidate in "$target".candidate.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    pid=${candidate##*.candidate.}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    identity_before=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+    fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+    fm_backend_herdr_process_absent "$pid" || continue
+    inode=$(fm_backend_herdr_path_inode "$candidate") || continue
+    identity_after=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+    [ "$identity_after" = "$identity_before" ] || continue
+    fm_backend_herdr_process_absent "$pid" || continue
+    fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+    fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode" || return 1
+  done
+}
+
+fm_backend_herdr_managed_shell_bin() {
+  local source source_identity digest target target_identity
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  source=$(fm_backend_herdr_managed_shell_source) || return 1
+  source_identity=$(fm_backend_herdr_file_identity "$source" executable root-or-owner) || return 1
+  digest=${source_identity%%$'\n'*}
+  target=$(fm_backend_herdr_managed_shell_path_for_digest "$digest") || return 1
+  fm_backend_herdr_artifact_recover_candidates "$target" 0500 || return 1
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    # Copy through O_NOFOLLOW descriptors, publish with a no-overwrite hard
+    # link, and verify both the source snapshot and installed digest. A racing
+    # installer may win the link; both converge on the same content address.
+    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+    fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -MIO::Handle -e '
+      my ($source, $target, $expected_digest) = @ARGV;
+      my $nofollow = eval { O_NOFOLLOW() };
+      defined $nofollow or die "O_NOFOLLOW unavailable";
+      sysopen my $input, $source, O_RDONLY | $nofollow or die "source: $!";
+      my @before = stat($input);
+      @before && -f $input && $before[3] == 1 or die "source identity";
+      my $payload = "";
+      my $sha = Digest::SHA->new(256);
+      while (1) {
+        my $count = sysread($input, my $chunk, 65536);
+        defined $count or die "source read: $!";
+        last unless $count;
+        $payload .= $chunk;
+        $sha->add($chunk);
+      }
+      my @after = stat($input);
+      for my $index (0, 1, 2, 3, 4, 7, 9) {
+        $before[$index] == $after[$index] or die "source changed";
+      }
+      my @source_path = lstat($source);
+      ($source_path[0] == $after[0] && $source_path[1] == $after[1])
+        or die "source path changed";
+      $sha->hexdigest eq $expected_digest or die "source digest changed";
+      close $input or die "source close: $!";
+      my $candidate = "$target.candidate.$$";
+      sysopen my $output, $candidate,
+        O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0500 or die "candidate: $!";
+      chmod 0500, $candidate or die "candidate mode: $!";
+      my $offset = 0;
+      while ($offset < length $payload) {
+        my $count = syswrite($output, $payload, length($payload) - $offset, $offset);
+        defined $count && $count > 0 or die "candidate write: $!";
+        $offset += $count;
+      }
+      $output->flush or die "candidate flush: $!";
+      $output->sync or die "candidate sync: $!";
+      my @candidate = stat($output);
+      close $output or die "candidate close: $!";
+      if (!link($candidate, $target)) {
+        die "publish: $!" unless -e $target;
+      }
+      my @candidate_path = lstat($candidate);
+      if (@candidate_path && $candidate_path[0] == $candidate[0]
+          && $candidate_path[1] == $candidate[1]) {
+        unlink $candidate or die "candidate unlink: $!";
+      } else {
+        die "candidate replaced";
+      }
+    ' "$source" "$target" "$digest" || return 1
+  fi
+  target_identity=$(fm_backend_herdr_file_identity "$target" 0500 owner) || return 1
+  [ "${target_identity%%$'\n'*}" = "$digest" ] || return 1
+  [ "$(fm_backend_herdr_file_identity "$source" executable root-or-owner)" = "$source_identity" ] || return 1
+  printf '%s\n' "$target"
+}
+
 fm_backend_herdr_managed_config_path() {  # <session>
   local root key
   fm_backend_herdr_server_lock_root_prepare || return 1
   root=$(fm_backend_herdr_server_lock_root) || return 1
   key=$(fm_backend_herdr_server_lock_key "$1") || return 1
-  printf '%s/%s.closed-shell-config-v1.toml\n' "$root" "$key"
+  printf '%s/%s.closed-shell-config-v2.toml\n' "$root" "$key"
 }
 
-fm_backend_herdr_managed_config_expected() {
-  local shell_bin
-  shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
+fm_backend_herdr_managed_config_expected() {  # [managed-shell]
+  local shell_bin=${1:-}
+  [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
   # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
   fm_backend_herdr_control_perl -e '
     my $shell = $ARGV[0];
@@ -635,24 +832,28 @@ fm_backend_herdr_managed_config_expected() {
   ' "$shell_bin"
 }
 
-fm_backend_herdr_managed_config_ready() {  # <session>
-  local path expected actual
+fm_backend_herdr_managed_config_ready() {  # <session> [managed-shell]
+  local path expected snapshot actual
   path=$(fm_backend_herdr_managed_config_path "$1") || return 1
-  fm_backend_herdr_server_lock_file_ready "$path" || return 1
-  expected=$(fm_backend_herdr_managed_config_expected) || return 1
-  actual=$(fm_backend_herdr_control_exec cat "$path" 2>/dev/null) || return 1
+  expected=$(fm_backend_herdr_managed_config_expected "${2:-}") || return 1
+  snapshot=$(fm_backend_herdr_file_snapshot "$path" 0600 owner) || return 1
+  snapshot=${snapshot#*$'\n'}
+  actual=${snapshot#*$'\n'}
   [ "$actual" = "$expected" ]
 }
 
-fm_backend_herdr_managed_config_ensure() {  # <session>; prints path
-  local path expected
+fm_backend_herdr_managed_config_ensure() {  # <session> [managed-shell]; prints path
+  local path expected shell_bin
+  shell_bin=${2:-}
+  [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
   path=$(fm_backend_herdr_managed_config_path "$1") || return 1
-  expected=$(fm_backend_herdr_managed_config_expected) || return 1
+  expected=$(fm_backend_herdr_managed_config_expected "$shell_bin") || return 1
   if [ -e "$path" ] || [ -L "$path" ]; then
-    fm_backend_herdr_managed_config_ready "$1" || return 1
+    fm_backend_herdr_managed_config_ready "$1" "$shell_bin" || return 1
     printf '%s\n' "$path"
     return 0
   fi
+  fm_backend_herdr_artifact_recover_candidates "$path" 0600 || return 1
   # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
   fm_backend_herdr_control_perl -MFcntl=:DEFAULT -MIO::Handle -e '
     my ($path, $payload) = @ARGV;
@@ -663,9 +864,12 @@ fm_backend_herdr_managed_config_ensure() {  # <session>; prints path
     $fh->flush or die $!;
     $fh->sync or die $!;
     close $fh or die $!;
-    rename $candidate, $path or die $!;
+    if (!link($candidate, $path)) {
+      die $! unless -e $path;
+    }
+    unlink $candidate or die $!;
   ' "$path" "$expected" || return 1
-  fm_backend_herdr_managed_config_ready "$1" || return 1
+  fm_backend_herdr_managed_config_ready "$1" "$shell_bin" || return 1
   printf '%s\n' "$path"
 }
 
@@ -674,27 +878,61 @@ fm_backend_herdr_managed_config_ensure() {  # <session>; prints path
 # workers may enter a pane only while this process-bound certificate remains
 # valid. A restored/manual/older server has no usable proof and fails closed.
 fm_backend_herdr_server_closed_shell_environment_ready() {  # <session>
-  local session=$1 certificate key inode payload schema recorded_key pid start current
-  fm_backend_herdr_managed_config_ready "$session" || return 1
-  fm_backend_herdr_managed_shell_bin >/dev/null || return 1
+  local session=$1 certificate key certificate_snapshot payload schema recorded_key pid start current
+  local managed_shell managed_shell_digest managed_shell_identity managed_shell_proof expected_shell
+  local source source_proof source_digest managed_config managed_config_digest managed_config_identity expected_config
+  local config_snapshot config_proof_digest config_proof_identity config_payload expected_config_payload
   certificate=$(fm_backend_herdr_server_env_certificate_path "$session") || return 1
   key=$(fm_backend_herdr_server_lock_key "$session") || return 1
-  fm_backend_herdr_server_lock_file_ready "$certificate" || return 1
-  inode=$(fm_backend_herdr_path_inode "$certificate") || return 1
-  payload=$(fm_backend_herdr_control_exec cat "$certificate" 2>/dev/null) || return 1
-  [ "$(fm_backend_herdr_path_inode "$certificate" 2>/dev/null)" = "$inode" ] \
-    && fm_backend_herdr_server_lock_file_ready "$certificate" || return 1
-  case "$payload" in *$'\n'*$'\n'*$'\n'*) ;; *) return 1 ;; esac
+  certificate_snapshot=$(fm_backend_herdr_file_snapshot "$certificate" 0600 owner) || return 1
+  certificate_snapshot=${certificate_snapshot#*$'\n'}
+  payload=${certificate_snapshot#*$'\n'}
   schema=${payload%%$'\n'*}
   payload=${payload#*$'\n'}
   recorded_key=${payload%%$'\n'*}
   payload=${payload#*$'\n'}
   pid=${payload%%$'\n'*}
-  start=${payload#*$'\n'}
-  case "$start" in ''|*$'\n'*) return 1 ;; esac
-  [ "$schema" = firstmate-herdr-closed-env-v1 ] \
+  payload=${payload#*$'\n'}
+  start=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell_digest=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell_identity=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_config=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_config_digest=${payload%%$'\n'*}
+  managed_config_identity=${payload#*$'\n'}
+  case "$managed_config_identity" in ''|*$'\n'*) return 1 ;; esac
+  [ "$schema" = firstmate-herdr-closed-env-v2 ] \
     && [ "$recorded_key" = "$key" ] || return 1
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$start" ] || return 1
+  expected_shell=$(fm_backend_herdr_managed_shell_path_for_digest "$managed_shell_digest") || return 1
+  [ "$managed_shell" = "$expected_shell" ] || return 1
+  managed_shell_proof=$(fm_backend_herdr_file_identity "$managed_shell" 0500 owner) || return 1
+  [ "${managed_shell_proof%%$'\n'*}" = "$managed_shell_digest" ] \
+    && [ "${managed_shell_proof#*$'\n'}" = "$managed_shell_identity" ] || return 1
+  # An fm-update that changes the reviewed source wrapper invalidates an old
+  # live server even though its immutable content-addressed copy still exists.
+  # The adapter must restart that server while idle before routing any worker.
+  source=$(fm_backend_herdr_managed_shell_source) || return 1
+  source_proof=$(fm_backend_herdr_file_identity "$source" executable root-or-owner) || return 1
+  source_digest=${source_proof%%$'\n'*}
+  [ "$source_digest" = "$managed_shell_digest" ] || return 1
+  expected_config=$(fm_backend_herdr_managed_config_path "$session") || return 1
+  [ "$managed_config" = "$expected_config" ] || return 1
+  config_snapshot=$(fm_backend_herdr_file_snapshot "$managed_config" 0600 owner) || return 1
+  config_proof_digest=${config_snapshot%%$'\n'*}
+  config_snapshot=${config_snapshot#*$'\n'}
+  config_proof_identity=${config_snapshot%%$'\n'*}
+  config_payload=${config_snapshot#*$'\n'}
+  [ "$config_proof_digest" = "$managed_config_digest" ] \
+    && [ "$config_proof_identity" = "$managed_config_identity" ] || return 1
+  expected_config_payload=$(fm_backend_herdr_managed_config_expected "$managed_shell") || return 1
+  [ "$config_payload" = "$expected_config_payload" ] || return 1
   current=$(fm_backend_herdr_process_start "$pid") || return 1
   [ "$current" = "$start" ]
 }

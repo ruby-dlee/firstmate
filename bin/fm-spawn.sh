@@ -2274,10 +2274,9 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       }
       sleep 0.05
     done
-    RECORDED_SESSION_UPDATED_AT=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --updated-at) || exit 1
-    sleep 1
+    RECORDED_SESSION_EVENT_SEQ=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require --event-seq) || exit 1
     ( set -C; : > "$ACCOUNT_NATIVE_LAUNCH_GO" ) || exit 1
-    session_sync_args+=(--after-updated-at "$RECORDED_SESSION_UPDATED_AT")
+    session_sync_args+=(--after-event-seq "$RECORDED_SESSION_EVENT_SEQ")
   fi
   if ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "${session_sync_args[@]}" >/dev/null; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2

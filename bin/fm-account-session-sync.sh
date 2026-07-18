@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reconcile Agent Fleet's real SessionStart mapping into Firstmate task meta.
-# Usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require] [--updated-at] [--after-updated-at <timestamp>]
+# Usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require] [--event-seq] [--after-event-seq <integer>]
 #        fm-account-session-sync.sh --all
 #
 # Only managed tasks (meta with account_profile=) are touched.
@@ -48,20 +48,24 @@ ALL_TASK_TIMEOUT=${FM_ACCOUNT_SESSION_TASK_TIMEOUT:-}
 ALL_MAX_PARALLEL=${FM_ACCOUNT_SESSION_MAX_PARALLEL:-4}
 REQUIRE=0
 ALL=0
-PRINT_UPDATED_AT=0
-AFTER_UPDATED_AT=
+PRINT_EVENT_SEQ=0
+AFTER_EVENT_SEQ=
 ID=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --all) ALL=1; shift ;;
     --require) REQUIRE=1; shift ;;
-    --updated-at) PRINT_UPDATED_AT=1; shift ;;
-    --after-updated-at)
-      [ "$#" -gt 1 ] || { echo "error: --after-updated-at requires a timestamp" >&2; exit 2; }
-      AFTER_UPDATED_AT=$2
+    --event-seq) PRINT_EVENT_SEQ=1; shift ;;
+    --after-event-seq)
+      [ "$#" -gt 1 ] || { echo "error: --after-event-seq requires an integer" >&2; exit 2; }
+      AFTER_EVENT_SEQ=$2
       shift 2
       ;;
-    --after-updated-at=*) AFTER_UPDATED_AT=${1#--after-updated-at=}; shift ;;
+    --after-event-seq=*) AFTER_EVENT_SEQ=${1#--after-event-seq=}; shift ;;
+    --updated-at|--after-updated-at|--after-updated-at=*)
+      echo "error: timestamp freshness options are unsupported; use the monotonic session event sequence" >&2
+      exit 2
+      ;;
     --wait)
       [ "$#" -gt 1 ] || { echo "error: --wait requires seconds" >&2; exit 2; }
       WAIT=$2
@@ -74,47 +78,28 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$WAIT" in ''|*[!0-9]*) echo "error: --wait must be a non-negative integer" >&2; exit 2 ;; esac
+session_event_seq_valid() {  # <value> <allow-zero>
+  local value=$1 allow_zero=$2
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  case "$value" in
+    0) [ "$allow_zero" = 1 ]; return ;;
+    0*) return 1 ;;
+  esac
+  [ "${#value}" -lt 19 ] && return 0
+  [ "${#value}" -eq 19 ] || return 1
+  # shellcheck disable=SC2071  # Deliberate lexical comparison avoids signed-64 overflow.
+  [[ "$value" < 9223372036854775807 || "$value" == 9223372036854775807 ]]
+}
+if [ -n "$AFTER_EVENT_SEQ" ] && ! session_event_seq_valid "$AFTER_EVENT_SEQ" 0; then
+  echo "error: --after-event-seq must be a positive signed 64-bit integer" >&2
+  exit 2
+fi
 case "$QUERY_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_QUERY_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
 if [ -z "$ALL_TASK_TIMEOUT" ]; then
   ALL_TASK_TIMEOUT=$((QUERY_TIMEOUT + 2))
 fi
 case "$ALL_TASK_TIMEOUT" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_TASK_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
 case "$ALL_MAX_PARALLEL" in ''|*[!0-9]*|0) echo "error: FM_ACCOUNT_SESSION_MAX_PARALLEL must be a positive integer" >&2; exit 2 ;; esac
-session_timestamp_advances() {  # <candidate> <baseline>
-  [ -n "$FM_ACCOUNT_SYSTEM_AWK_BIN" ] || return 2
-  LC_ALL=C fm_account_system_exec "$FM_ACCOUNT_SYSTEM_AWK_BIN" -v candidate="$1" -v baseline="$2" '
-    function valid(value) {
-      return value ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]([.][0-9]+)?(Z|[+]00:00)$/
-    }
-    function normalized(value) {
-      sub(/[+]00:00$/, "Z", value)
-      return value
-    }
-    function whole(value) {
-      value = normalized(value)
-      sub(/[.][0-9]+Z$/, "Z", value)
-      return value
-    }
-    function fraction(value, result) {
-      value = normalized(value)
-      if (value !~ /[.][0-9]+Z$/) return "0"
-      result = value
-      sub(/^.*[.]/, "", result)
-      sub(/Z$/, "", result)
-      return result
-    }
-    BEGIN {
-      if (!valid(candidate) || !valid(baseline)) exit 2
-      if (whole(candidate) > whole(baseline)) exit 0
-      if (whole(candidate) < whole(baseline)) exit 1
-      candidate_fraction = fraction(candidate)
-      baseline_fraction = fraction(baseline)
-      while (length(candidate_fraction) < length(baseline_fraction)) candidate_fraction = candidate_fraction "0"
-      while (length(baseline_fraction) < length(candidate_fraction)) baseline_fraction = baseline_fraction "0"
-      exit !("x" candidate_fraction > "x" baseline_fraction)
-    }
-  '
-}
 if [ "$ALL" = 1 ]; then
   [ -z "$ID" ] || { echo "error: --all does not accept a task id" >&2; exit 2; }
   ALL_LOCK=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$STATE" session-sync-all 2>/dev/null) || exit 0
@@ -244,8 +229,7 @@ if [ "$ALL" = 1 ]; then
   done
   exit "$rc"
 fi
-[ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require]" >&2; exit 2; }
-case "$AFTER_UPDATED_AT" in *$'\n'*|*=*) echo "error: unsafe --after-updated-at value" >&2; exit 2 ;; esac
+[ -n "$ID" ] || { echo "usage: fm-account-session-sync.sh <task-id> [--wait <seconds>] [--require] [--event-seq] [--after-event-seq <integer>]" >&2; exit 2; }
 META="$STATE/$ID.meta"
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
@@ -315,27 +299,25 @@ while :; do
     mapped_workspace=$(fm_account_json_field "$json" '.workspace | select(type == "string" and length > 0)' session) \
       || { echo "error: Agent Fleet session mapping has no valid workspace for $ID" >&2; exit 1; }
     session_id=$(fm_account_json_field "$json" '.session_id | select(type == "string" and length > 0)' session) || exit 1
-    updated_at=$(fm_account_json_field "$json" '.updated_at | select(type == "string" and length > 0)' session) || exit 1
+    session_event_seq=$(fm_account_json_field "$json" '.session_event_seq | select(type == "number" and floor == . and . >= 0 and . <= 9223372036854775807)' session) || exit 1
     [ "$mapped_task" = "$ACCOUNT_TASK" ] || { echo "error: Agent Fleet session task mismatch for $ID attempt $ATTEMPT" >&2; exit 1; }
     [ "$mapped_profile" = "$PROFILE" ] || { echo "error: Agent Fleet session profile mismatch for $ID" >&2; exit 1; }
     [ "$mapped_pool" = "$POOL" ] || { echo "error: Agent Fleet session pool mismatch for $ID" >&2; exit 1; }
     [ "$mapped_provider" = "$HARNESS" ] || { echo "error: Agent Fleet session provider mismatch for $ID" >&2; exit 1; }
     [ "$mapped_workspace" = "$WORKSPACE" ] || { echo "error: Agent Fleet session workspace mismatch for $ID" >&2; exit 1; }
     case "$session_id" in ''|*$'\n'*|*=*) echo "error: unsafe provider session id for $ID" >&2; exit 1 ;; esac
-    case "$updated_at" in ''|*$'\n'*|*=*) echo "error: unsafe provider session update timestamp for $ID" >&2; exit 1 ;; esac
-    if [ -z "$AFTER_UPDATED_AT" ]; then
+    session_event_seq_valid "$session_event_seq" 1 \
+      || { echo "error: unsafe provider session event sequence for $ID" >&2; exit 1; }
+    if [ -z "$AFTER_EVENT_SEQ" ]; then
       break
     fi
-    if session_timestamp_advances "$updated_at" "$AFTER_UPDATED_AT"; then
+    if [ "$session_event_seq" -gt "$AFTER_EVENT_SEQ" ]; then
       break
-    else
-      timestamp_status=$?
-      [ "$timestamp_status" -ne 2 ] || { echo "error: invalid Agent Fleet session update timestamp for $ID" >&2; exit 1; }
     fi
   fi
   [ "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s)" -lt "$deadline" ] || {
     if [ "$REQUIRE" = 1 ]; then
-      if [ -n "$AFTER_UPDATED_AT" ]; then
+      if [ -n "$AFTER_EVENT_SEQ" ]; then
         echo "error: no fresh Agent Fleet SessionStart update for managed task $ID attempt $ATTEMPT; refusing recovery" >&2
       else
         echo "error: no Agent Fleet provider-session mapping for managed task $ID attempt $ATTEMPT; refusing recovery" >&2
@@ -408,8 +390,8 @@ if [ -z "$EXISTING" ]; then
   META_ROLLBACK_TMP=
 fi
 fm_account_meta_lock_release "$META_LOCK" || exit 1
-if [ "$PRINT_UPDATED_AT" = 1 ]; then
-  printf '%s\n' "$updated_at"
+if [ "$PRINT_EVENT_SEQ" = 1 ]; then
+  printf '%s\n' "$session_event_seq"
 else
   printf '%s\n' "$session_id"
 fi

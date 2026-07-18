@@ -78,6 +78,7 @@ INJECTION_ENV_EXACT = frozenset(
     }
 )
 
+
 def scrub_injection_environment(environment: dict[str, str]) -> dict[str, str]:
     cleaned = dict(environment)
     for name in tuple(cleaned):
@@ -386,7 +387,11 @@ def _worker_launch_options(
 ) -> list[str]:
     options: list[str] = []
     if arguments.provider == "claude":
-        options.append("--dangerously-skip-permissions")
+        # Claude exposes a provider-native source selector. Keep the isolated
+        # profile's user settings (which own Agent Fleet's hooks) while making
+        # project and local settings ineligible even if a same-uid race creates
+        # them after our final filesystem preflight.
+        options.extend(["--dangerously-skip-permissions", "--setting-sources", "user"])
         if arguments.model is not None:
             options.extend(["--model", arguments.model])
         if arguments.effort is not None:

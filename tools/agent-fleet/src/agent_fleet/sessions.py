@@ -24,6 +24,7 @@ from .util import (
 )
 
 SESSION_KEYS = ("session_id", "sessionId")
+MAX_SESSION_EVENT_SEQ = (1 << 63) - 1
 UTC_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|\+00:00)\Z"
@@ -197,15 +198,43 @@ def record_session_from_hook(registry: Registry, payload: dict[str, Any]) -> dic
             }
             if any(existing.get(key) != value for key, value in binding.items()):
                 raise ValueError("SessionStart mapping is already bound to another identity")
+            previous_sequence = existing.get("session_event_seq")
+            if (
+                not isinstance(previous_sequence, int)
+                or isinstance(previous_sequence, bool)
+                or previous_sequence < 0
+                or previous_sequence >= MAX_SESSION_EVENT_SEQ
+            ):
+                raise ValueError("SessionStart mapping event sequence cannot advance")
+            event_sequence = previous_sequence + 1
+            mapping = {
+                "schema": 2,
+                **binding,
+                "session_event_seq": event_sequence,
+                "updated_at": utc_now(),
+            }
+            atomic_write_json(existing_path, mapping)
+            append_audit(
+                registry,
+                "session-refreshed",
+                {
+                    "task_key": task_key(task),
+                    "profile": profile.id,
+                    "provider": profile.provider,
+                    "pool": pool,
+                    "session_event_seq": event_sequence,
+                },
+            )
             return {
                 "recorded": True,
                 "idempotent": True,
                 "task": task,
                 "profile": profile.id,
                 "provider": profile.provider,
+                "session_event_seq": event_sequence,
             }
         mapping = {
-            "schema": 1,
+            "schema": 2,
             "task": task,
             "profile": profile.id,
             "provider": profile.provider,
@@ -213,6 +242,7 @@ def record_session_from_hook(registry: Registry, payload: dict[str, Any]) -> dic
             "workspace": str(exact_workspace),
             "turn_end": str(exact_turn_end),
             "session_id": session_id,
+            "session_event_seq": 1,
             "updated_at": utc_now(),
         }
         atomic_write_json(session_path(registry, task), mapping)
@@ -232,6 +262,7 @@ def record_session_from_hook(registry: Registry, payload: dict[str, Any]) -> dic
         "task": task,
         "profile": profile.id,
         "provider": profile.provider,
+        "session_event_seq": 1,
     }
 
 
@@ -286,7 +317,7 @@ def get_session(registry: Registry, task: str) -> dict[str, Any]:
         value = read_private_json(path, label="session mapping")
     except FileNotFoundError as exc:
         raise ValueError(f"no recorded provider session for task: {task}") from exc
-    required = {
+    required_v1 = {
         "schema",
         "task",
         "profile",
@@ -297,7 +328,15 @@ def get_session(registry: Registry, task: str) -> dict[str, Any]:
         "session_id",
         "updated_at",
     }
-    if not isinstance(value, dict) or set(value) != required or value.get("schema") != 1:
+    required_v2 = {*required_v1, "session_event_seq"}
+    if not isinstance(value, dict):
+        raise ValueError(f"corrupt session mapping: {path}")
+    schema = value.get("schema")
+    if (
+        (schema == 1 and set(value) != required_v1)
+        or (schema == 2 and set(value) != required_v2)
+        or schema not in {1, 2}
+    ):
         raise ValueError(f"corrupt session mapping: {path}")
     if value.get("task") != task or any(
         not isinstance(value.get(field), str) or not value[field]
@@ -313,6 +352,21 @@ def get_session(registry: Registry, task: str) -> dict[str, Any]:
         or not _valid_timestamp(value.get("updated_at"))
     ):
         raise ValueError(f"corrupt session mapping: {path}")
+    if schema == 2:
+        event_sequence = value.get("session_event_seq")
+        if (
+            not isinstance(event_sequence, int)
+            or isinstance(event_sequence, bool)
+            or not 1 <= event_sequence <= MAX_SESSION_EVENT_SEQ
+        ):
+            raise ValueError(f"corrupt session mapping: {path}")
+    else:
+        # Schema 1 predates launch-event freshness. It remains readable so an
+        # already-bound native session can resume, but exposes sequence zero;
+        # the next accepted same-binding SessionStart atomically migrates it to
+        # schema 2 / sequence 1. Changed bindings are still rejected before the
+        # migration write in record_session_from_hook.
+        value = {**value, "session_event_seq": 0}
     profile = registry.require_profile(str(value["profile"]))
     if value["provider"] != profile.provider:
         raise ValueError("session mapping provider does not match its profile")

@@ -513,6 +513,15 @@ def test_claude_launch_uses_positive_grammar_and_prompt_separator(
         operation="exec",
     )
     parsed_resume = validate_worker_arguments(profile, arguments, operation="resume")
+    managed_arguments = [
+        "--dangerously-skip-permissions",
+        "--setting-sources",
+        "user",
+        "--model",
+        "claude-opus-4-1",
+        "--effort",
+        "xhigh",
+    ]
 
     assert managed_argv(
         registry,
@@ -521,7 +530,7 @@ def test_claude_launch_uses_positive_grammar_and_prompt_separator(
         parsed_exec,
         binary=binary,
     )[1:] == [
-        *arguments,
+        *managed_arguments,
         "--",
         "setup-token",
     ]
@@ -532,7 +541,7 @@ def test_claude_launch_uses_positive_grammar_and_prompt_separator(
         parsed_resume,
         active_root=Path.cwd(),
         binary=binary,
-    )[1:] == ["--resume", "claude-session", *arguments]
+    )[1:] == ["--resume", "claude-session", *managed_arguments]
 
 
 def test_codex_launch_refuses_changed_hooks_markers_sources_and_project_hooks(
@@ -1258,6 +1267,12 @@ def test_claude_worker_arguments_accept_only_firstmate_templates(
         ["-rsession"],
         ["--settings=other.json"],
         ["--setting-sources", "project"],
+        [
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "project",
+            "prompt",
+        ],
         ["--bare"],
         ["--safe-mode"],
         ["--no-session-persistence"],

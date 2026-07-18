@@ -278,15 +278,10 @@ case "$*" in
     fi
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     updated_at=${FM_FAKE_AF_UPDATED_AT_BEFORE:-2026-07-13T00:00:00Z}
+    session_event_seq=1
     if [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; then
       updated_at=${FM_FAKE_AF_UPDATED_AT_AFTER:-2026-07-13T00:00:01Z}
-    fi
-    if [ -n "${FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE:-}" ]; then
-      if [ ! -f "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE" ] \
-        || { [ -n "${FM_FAKE_AF_SESSION_REFRESHED:-}" ] && [ -f "$FM_FAKE_AF_SESSION_REFRESHED" ]; }; then
-        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE"
-      fi
-      updated_at=$(cat "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE")
+      session_event_seq=2
     fi
     workspace=${FM_FAKE_AF_WORKSPACE:-}
     if [ -z "$workspace" ] && [ -n "${FM_STATE_OVERRIDE:-}" ]; then
@@ -297,7 +292,7 @@ case "$*" in
         break
       done
     fi
-    printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$updated_at"
+    printf '{"schema":2,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$session_event_seq" "$updated_at"
     ;;
   *" lease release "*)
     [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
@@ -1489,20 +1484,22 @@ test_native_resume_rejects_prelaunch_sessionstart_evidence() {
   pass "native resume requires SessionStart evidence after its own launch gate"
 }
 
-test_native_resume_separates_whole_second_sessionstart_evidence() {
-  local id rec out status timestamp_file
+test_native_resume_accepts_same_wallclock_sessionstart_evidence() {
+  local id rec out status timestamp
   id=account-resume-whole-second-z9e
   rec=$(make_case resume-whole-second claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "whole-second resume precondition spawn failed"
+  if out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "whole-second resume precondition spawn failed: $out"
   rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
   clear_case_logs
-  timestamp_file="$CASE_DIR/session-updated-at"
+  timestamp=2026-07-13T00:00:00Z
 
-  if out=$(FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE="$timestamp_file" run_spawn "$id" --resume-account); then status=0; else status=$?; fi
-  [ "$status" -eq 0 ] || fail "whole-second SessionStart evidence was rejected after the launch gate: $out"
-  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "whole-second native resume lost its provider session binding"
-  pass "native resume separates whole-second SessionStart evidence across its launch gate"
+  if out=$(FM_FAKE_AF_UPDATED_AT_BEFORE="$timestamp" FM_FAKE_AF_UPDATED_AT_AFTER="$timestamp" \
+    run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "same-wallclock SessionStart evidence was rejected after its event sequence advanced: $out"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "same-wallclock native resume lost its provider session binding"
+  pass "native resume freshness is independent of wall-clock timestamp granularity"
 }
 
 test_native_resume_accepts_agent_fleet_utc_offset_timestamps() {
@@ -1523,7 +1520,7 @@ test_native_resume_accepts_agent_fleet_utc_offset_timestamps() {
     || fail "real Agent Fleet +00:00 SessionStart timestamp was rejected: $out"
   assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
     "Agent Fleet timestamp resume lost its provider session binding"
-  pass "native resume accepts and orders Agent Fleet's RFC3339 +00:00 timestamps"
+  pass "native resume remains compatible with Agent Fleet's RFC3339 +00:00 metadata"
 }
 
 test_native_resume_uses_private_launch_directory_and_cleans_it() {
@@ -2765,25 +2762,21 @@ test_managed_tmux_identity_survives_window_rename() {
   pass "managed tmux lifecycle uses rename-stable endpoint identity"
 }
 
-test_native_resume_rejects_regressed_sessionstart_evidence() {
-  local id rec out status account_task
+test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances() {
+  local id rec out status
   id=account-resume-regressed-z26
   rec=$(make_case resume-regressed claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "regressed resume precondition spawn failed"
-  account_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
-  set +e
-  out=$(FM_FAKE_AF_UPDATED_AT_BEFORE=2026-07-13T00:00:01Z FM_FAKE_AF_UPDATED_AT_AFTER=2026-07-13T00:00:00Z \
-    run_spawn "$id" --resume-account)
-  status=$?
-  set -e
-  [ "$status" -ne 0 ] || fail "native resume accepted a regressed SessionStart timestamp"
-  assert_contains "$out" "no fresh Agent Fleet SessionStart update" "regressed SessionStart evidence did not fail as stale"
-  assert_grep "lease release --task $account_task --force" "$AF_LOG" "regressed SessionStart failure leaked its recovered reservation"
-  pass "native resume requires monotonically newer SessionStart evidence"
+  if out=$(FM_FAKE_AF_UPDATED_AT_BEFORE=2026-07-13T00:00:01Z FM_FAKE_AF_UPDATED_AT_AFTER=2026-07-13T00:00:00Z \
+    run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "native resume rejected an advanced event sequence because its diagnostic timestamp regressed: $out"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+    "regressed-wallclock native resume lost its provider session binding"
+  pass "native resume freshness depends only on the monotonic SessionStart event sequence"
 }
 
 test_session_sync_metadata_publish_failure_is_closed() {
@@ -5510,9 +5503,17 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-24 ]; then
-  run_isolated_test test_native_resume_separates_whole_second_sessionstart_evidence
+  run_isolated_test test_native_resume_accepts_same_wallclock_sessionstart_evidence
   run_isolated_test test_session_sync_removes_reaped_workers_from_cleanup_state
   run_isolated_test test_continuation_pins_packet_destination_directory
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = session-event-seq ]; then
+  run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
+  run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
+  run_isolated_test test_native_resume_accepts_same_wallclock_sessionstart_evidence
+  run_isolated_test test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances
   exit 0
 fi
 
@@ -5705,7 +5706,7 @@ run_isolated_test test_continuation_rejects_present_empty_charter
 run_isolated_test test_recovered_reservations_are_owned_only_after_validated_recovery
 run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
 run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
-run_isolated_test test_native_resume_separates_whole_second_sessionstart_evidence
+run_isolated_test test_native_resume_accepts_same_wallclock_sessionstart_evidence
 run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
 run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
 run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
@@ -5745,7 +5746,7 @@ run_isolated_test test_continuation_fails_closed_without_original_brief
 run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
 run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
 run_isolated_test test_managed_tmux_identity_survives_window_rename
-run_isolated_test test_native_resume_rejects_regressed_sessionstart_evidence
+run_isolated_test test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances
 run_isolated_test test_session_sync_metadata_publish_failure_is_closed
 run_isolated_test test_session_sync_lineage_failure_restores_unbound_metadata
 run_isolated_test test_oversized_continuation_stops_before_mutation

@@ -101,13 +101,93 @@ three-state contract:
 - A fresh existing credential that is not yet durably pinned directs the
   operator to the provider-batch `profile identity adopt` command.
 - Missing, remotely unverifiable, or identity-replacing credentials are refused
-  before any provider/browser login. They require future transactional
-  maintenance tooling.
+  before any provider/browser login. Use the explicit disabled-provider
+  recovery workflow below; ordinary enroll/login remains browser-free.
+
+### First-bundle credential initialization
+
+`profile initialize-login` is the only provider-login workflow allowed when a provider has no identity bundle.
+It is a separate trust-on-first-use ceremony, not a fallback hidden inside recovery.
+It refuses if a bundle already exists and directs the operator to `recover-login` instead.
+The same provider-wide maintenance conditions apply: every worker disabled, every worker lease drained, every continuable provider session mapping removed, exact registry and sealed binaries unchanged, and only an explicitly selected `safety_policy=worker` target.
+A dormant mapped session is still resumable and therefore blocks rotation even when its process lease has ended.
+Desktop-shared reserves are excluded before any home, credential, journal, or Keychain path is derived.
+
+Initialize each isolated worker explicitly.
+Codex uses its isolated device flow; Claude requires the explicit browser and exact-account Keychain gates:
+
+```sh
+agent-fleet profile initialize-login codex-1
+agent-fleet profile initialize-login claude-1 \
+  --browser --allow-keychain-prompt
+```
+
+After a successful partial ceremony, Fleet commits a provider-scoped provisional manifest instead of pretending the provider is ready.
+That closed manifest pins the exact expected worker set, topology and binary contract, and each completed worker's fresh identity fingerprint, normalized credential source, source stat, and transaction generation.
+Every later invocation reproves every recorded peer before another provider login and again before commit.
+Drift, tamper, an ejected recorded peer, duplicate worker identities, or a base/Desktop identity collision fails closed.
+A recorded worker cannot be silently initialized again; select one of the named pending workers.
+
+The provisional generation also has a non-secret locator in the deterministic first worker home.
+Its contract binds the registry path and content digest, state and share roots, Agent Fleet/runtime contract version, complete relevant settings, topology, provider binary markers, and sealed Quota runtime.
+Thus a changed state root or config cannot make an unfinished batch disappear and silently begin a second trust ceremony.
+
+Only the exact complete, freshly proved, identity-distinct worker set is adopted as the provider identity bundle.
+Bundle adoption and provisional manifest removal share the crash-recoverable transaction: a crash between them restores the preceding provisional generation.
+Initialization never uses the default/Desktop identity as a login target, never writes, copies, or logs it out, never includes reserves in the worker set, and never auto-enables routing.
+Its only external-identity access is the existing read-only fingerprint anchor comparison required to reject account collisions.
+
+### Explicit credential recovery
+
+`profile recover-login` is an exceptional maintenance command for restoring the already pinned identity of one worker.
+It is not initial enrollment and it cannot replace a worker with a different account.
+Before any provider action it requires an existing identity binding, every same-provider worker disabled, zero same-provider worker leases, zero continuable same-provider session mappings, the exact registry unchanged, and the target provisioned against its sealed provider binary.
+The provider maintenance lock stays held through staged login, local promotion, whole-provider verification, commit, and cleanup.
+
+Codex defaults to its device flow and never uses the base/Desktop home:
+
+```sh
+agent-fleet profile recover-login codex-1
+```
+
+Claude's current login is browser-capable, so both browser and scoped-Keychain interaction must be explicit.
+Use a private browser context and do not change Claude Desktop's login:
+
+```sh
+agent-fleet profile recover-login claude-1 \
+  --browser --allow-keychain-prompt
+```
+
+The provider runs only in a private transaction-owned staged home.
+Codex promotes a staged `auth.json` generation.
+On macOS, Claude promotes only the staged home's uniquely suffixed `Claude Code-credentials-<hash>` Keychain item to the stable worker's uniquely suffixed service, using the verified passwd username as the exact Keychain account, and that account is part of the normalized source contract.
+The unsuffixed/default Claude service, base homes, Desktop homes, browser sessions, and logout commands are never staging or promotion targets and are never changed or invoked by recovery.
+They are observed only through the existing read-only identity-anchor path needed for collision rejection.
+Keychain secret bytes travel only over an OS pipe and never enter argv, environment, journals, audit output, or command results.
+
+After local promotion, recovery freshly proves every same-provider worker in the same maintenance attempt.
+If all workers are valid and identity-distinct, the existing provider identity bundle is rebuilt under the same adoption semantics and the result points to the normal explicit enable gate.
+If a peer worker is ejected or indeterminate, the repaired target remains disabled and the result names only the blocked worker labels; recover or verify the whole worker set before enabling anything.
+Recovery never auto-enables routing.
+
+The transaction can restore the previous local file or exact scoped-Keychain generation after an error or process crash.
+It cannot undo provider-side token family rotation or revocation caused by the provider login itself.
+On any such failure, keep the provider disabled, preserve unaffected worker credentials, and complete worker-set recovery before the enable gate.
+Never use provider logout as cleanup.
+
+Fresh quota proofs are cached only after the credential and identity-binding transaction is durably committed.
+Any pre-commit error or crash restores the previous credential generation without changing quota cache bytes; blocked or unproved workers are never written as successful cache entries.
+
+The Relvino Bridge topology is fixed during cutover:
+
+- `claude-1` and `claude-2` are isolated workers in `claude-crew` and `claude-manual`.
+- `codex-1` through `codex-4` are isolated workers in `codex-crew` and `codex-manual`.
+- `claude-3` and `codex-5` are disabled, unprovisioned `desktop_shared` manual-only reserves; they are structurally excluded from recovery, remote proof, cleanup, enable, and routed pools.
+- The captain is outside Agent Fleet; there is no `claude-captain` pool.
 
 Do not run raw provider login/logout, relogin the Desktop apps, or treat login as
 idempotent. Those actions can rotate or revoke sessions shared by other
-processes. The versioned follow-up for safe generational enrollment is tracked
-in [FOLLOWUPS.md](FOLLOWUPS.md).
+processes.
 
 Add or remove profiles at any time; the registry has no fixed account count:
 

@@ -543,6 +543,10 @@ def recover_pending_codex_transactions(registry: Registry, provider: str) -> lis
         return []
     recovered: list[str] = []
     for profile in registry.profiles.values():
-        if profile.provider == provider and recover_pending_codex_transaction(registry, profile):
+        if (
+            profile.safety_policy == "worker"
+            and profile.provider == provider
+            and recover_pending_codex_transaction(registry, profile)
+        ):
             recovered.append(profile.id)
     return recovered

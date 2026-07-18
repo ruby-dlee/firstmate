@@ -73,6 +73,7 @@ from .quota import (
     refresh_quota,
     store_quota,
 )
+from .recovery import initialize_profile_login, recover_profile_login
 from .scheduler import select_and_acquire
 from .sessions import (
     get_session,
@@ -162,6 +163,28 @@ def _parser() -> argparse.ArgumentParser:
             help="verify an already pinned credential without invoking provider login",
         )
         item.add_argument("profile_id")
+    recover_login = profile_commands.add_parser(
+        "recover-login",
+        help="transactionally replace one disabled worker credential",
+    )
+    recover_login.add_argument("profile_id")
+    recover_login.add_argument(
+        "--browser",
+        action="store_true",
+        help="explicitly allow a browser-capable provider login",
+    )
+    recover_login.add_argument("--allow-keychain-prompt", action="store_true")
+    initialize_login = profile_commands.add_parser(
+        "initialize-login",
+        help="transactionally establish the first identity bundle for disabled workers",
+    )
+    initialize_login.add_argument("profile_id")
+    initialize_login.add_argument(
+        "--browser",
+        action="store_true",
+        help="explicitly allow a browser-capable provider login",
+    )
+    initialize_login.add_argument("--allow-keychain-prompt", action="store_true")
     identity = profile_commands.add_parser("identity")
     identity_commands = identity.add_subparsers(dest="identity_command", required=True)
     identity_adopt = identity_commands.add_parser("adopt")
@@ -407,6 +430,14 @@ def _contract() -> dict[str, Any]:
             "session_status": "session status --task <task>",
             "session_remove": "session remove --task <task>",
             "profile_enroll": "profile enroll <profile> (verified pinned no-op only)",
+            "profile_recover_login": (
+                "profile recover-login <worker> [--browser] "
+                "[--allow-keychain-prompt] (disabled/drained maintenance only)"
+            ),
+            "profile_initialize_login": (
+                "profile initialize-login <worker> [--browser] "
+                "[--allow-keychain-prompt] (first-bundle disabled/drained maintenance only)"
+            ),
             "profile_verify": "profile verify <profile>|--all",
             "project_register": "project register --provider <provider> <git-worktree>",
             "project_remove": "project remove --provider <provider> <git-worktree>",
@@ -1237,6 +1268,22 @@ def _run(args: argparse.Namespace) -> Any | None:
             return updated.require_profile(profile.id).public_dict()
         if args.profile_command in {"login", "enroll"}:
             return _run_profile_enrollment(registry, profile, config_path)
+        if args.profile_command == "recover-login":
+            return recover_profile_login(
+                registry,
+                profile.id,
+                config_path,
+                browser_login=args.browser,
+                allow_keychain_prompt=args.allow_keychain_prompt,
+            )
+        if args.profile_command == "initialize-login":
+            return initialize_profile_login(
+                registry,
+                profile.id,
+                config_path,
+                browser_login=args.browser,
+                allow_keychain_prompt=args.allow_keychain_prompt,
+            )
 
     if args.command == "pool" and args.pool_command == "status":
         validate_id(args.pool, "pool id")

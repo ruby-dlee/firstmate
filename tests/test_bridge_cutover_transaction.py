@@ -1044,6 +1044,41 @@ class BridgeCutoverTransactionTests(unittest.TestCase):
                 cutover.execute(manifest, "forward")
         self.assertEqual(fixture.registry.read_bytes(), racer)
 
+    def test_symlink_change_at_exchange_syscall_is_swapped_back_and_preserved(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        unknown = fixture.releases / "unknown-at-exchange"
+        unknown.mkdir()
+
+        class ChangeAtExchange(cutover.BoundaryController):
+            def hit(self, label: str) -> None:
+                super().hit(label)
+                if label == "immediately_before_exchange:forward:quota-current":
+                    atomic_link(fixture.link_paths[0], unknown)
+
+        with self.assertRaisesRegex(cutover.CutoverError, "displaced live state"):
+            cutover.execute(fixture.load(), "forward", ChangeAtExchange())
+        self.assertEqual(os.readlink(fixture.link_paths[0]), str(unknown))
+        self.assertEqual(
+            os.readlink(fixture.link_paths[1]), str(fixture.releases / "agent-fleet-old")
+        )
+
+    def test_regular_change_at_exchange_syscall_is_swapped_back_and_preserved(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        racer = b'version = 1\nmode = "syscall-racer"\n'
+
+        class ChangeAtExchange(cutover.BoundaryController):
+            def hit(self, label: str) -> None:
+                super().hit(label)
+                if label == "immediately_before_exchange:forward:accounts-registry":
+                    fixture.registry.write_bytes(racer)
+                    fixture.registry.chmod(0o600)
+
+        with self.assertRaisesRegex(cutover.CutoverError, "displaced live state"):
+            cutover.execute(fixture.load(), "forward", ChangeAtExchange())
+        self.assertEqual(fixture.registry.read_bytes(), racer)
+
     def test_activity_appearing_between_operations_stops_cutover_and_recovery(self) -> None:
         fixture = Fixture(relative_targets=True)
         self.addCleanup(fixture.close)

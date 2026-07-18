@@ -876,6 +876,64 @@ def _observe_operation(operation: Operation) -> str:
     raise AdoptionError(f"live adoption registry has unknown SHA-256: {digest}")
 
 
+def _operation_path_matches(operation: Operation, path: Path, state: str) -> bool:
+    try:
+        info = os.lstat(path)
+        if isinstance(operation, SealedLinkOperation):
+            target = (
+                operation.initial_target if state == "initial" else operation.sealed_target
+            )
+            return stat.S_ISLNK(info.st_mode) and os.readlink(path) == target
+        if isinstance(operation, FrontDoorOperation):
+            if state == "initial":
+                return (
+                    stat.S_ISLNK(info.st_mode)
+                    and os.readlink(path) == operation.initial_target
+                )
+            return (
+                stat.S_ISREG(info.st_mode)
+                and _sha256(path, "sealed front-door exchange object", operation.mode)
+                == operation.sealed_sha256
+            )
+        expected = (
+            operation.initial_sha256 if state == "initial" else operation.sealed_sha256
+        )
+        return (
+            stat.S_ISREG(info.st_mode)
+            and _sha256(path, "sealed registry exchange object", operation.mode)
+            == expected
+        )
+    except (FileNotFoundError, AdoptionError, OSError):
+        return False
+
+
+def _exchange_and_commit(
+    operation: Operation,
+    temp: Path,
+    direction: str,
+    displaced_state: str,
+    boundaries: BoundaryController,
+) -> None:
+    boundaries.hit(f"immediately_before_exchange:{direction}:{operation.name}")
+    try:
+        transaction._rename_exchange(temp, operation.path)
+    except transaction.CutoverError as exc:
+        raise AdoptionError(str(exc)) from exc
+    boundaries.hit(f"after_exchange:{direction}:{operation.name}")
+    if not _operation_path_matches(operation, temp, displaced_state):
+        try:
+            transaction._rename_exchange(temp, operation.path)
+            transaction._fsync_directory(operation.path.parent)
+        except transaction.CutoverError as restore_exc:
+            raise AdoptionError(
+                f"{operation.name} displaced live state is ambiguous and could not be restored"
+            ) from restore_exc
+        raise AdoptionError(
+            f"{operation.name} displaced live state changed at the exchange syscall"
+        )
+    os.unlink(temp)
+
+
 def observe(manifest: Manifest) -> tuple[list[str], int]:
     for operation in manifest.link_operations:
         _validate_sealed_operation(operation)
@@ -1050,7 +1108,7 @@ def _replace_link(
         raise AdoptionError(f"staged adoption link changed: {temp}")
     if _observe_operation(operation) != expected:
         raise AdoptionError(f"{operation.name} changed immediately before replacement")
-    os.replace(temp, operation.path)
+    _exchange_and_commit(operation, temp, direction, expected, boundaries)
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
     transaction._fsync_directory(operation.path.parent)
@@ -1173,7 +1231,7 @@ def _replace_front_door(
             )
     if _observe_operation(operation) != expected_state:
         raise AdoptionError("live Agent Fleet front door changed before replacement")
-    os.replace(temp, operation.path)
+    _exchange_and_commit(operation, temp, direction, expected_state, boundaries)
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
     transaction._fsync_directory(operation.path.parent)
@@ -1243,7 +1301,7 @@ def _replace_registry(
         )
     if _observe_operation(operation) != expected_state:
         raise AdoptionError("live adoption registry changed before replacement")
-    os.replace(temp, operation.path)
+    _exchange_and_commit(operation, temp, direction, expected_state, boundaries)
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
     transaction._fsync_directory(operation.path.parent)
@@ -1273,23 +1331,16 @@ def _cleanup_temps(manifest: Manifest) -> None:
             )
             if not os.path.lexists(path):
                 continue
-            info = os.lstat(path)
-            if isinstance(operation, SealedLinkOperation):
-                if not stat.S_ISLNK(info.st_mode):
-                    raise AdoptionError(f"unexpected adoption temp artifact: {path}")
-            elif isinstance(operation, FrontDoorOperation):
-                if direction == "rollback":
-                    if (
-                        not stat.S_ISLNK(info.st_mode)
-                        or os.readlink(path) != operation.initial_target
-                    ):
-                        raise AdoptionError(f"unexpected adoption temp artifact: {path}")
-                else:
-                    _require_regular(path, "adoption front-door temp")
-                    if stat.S_IMODE(info.st_mode) not in {0o600, operation.mode}:
-                        raise AdoptionError(f"unexpected adoption temp mode: {path}")
-            else:
-                _require_regular(path, "adoption registry temp", operation.mode)
+            staged = "sealed" if direction == "forward" else "initial"
+            displaced = "initial" if direction == "forward" else "sealed"
+            if not _operation_path_matches(operation, path, staged):
+                if not (
+                    _operation_path_matches(operation, path, displaced)
+                    and _operation_path_matches(operation, operation.path, staged)
+                ):
+                    raise AdoptionError(
+                        f"ambiguous adoption exchange artifact is preserved: {path}"
+                    )
             os.unlink(path)
             parents.add(path.parent)
     for parent in parents:
@@ -1303,6 +1354,7 @@ def _recover_locked(
 ) -> dict[str, Any]:
     _validate_quiet_point(manifest)
     states, prefix = observe(manifest)
+    _cleanup_temps(manifest)
     if journal.get("sealed"):
         raise AdoptionError("sealed adoption is irreversible; recovery is refused")
     _checkpoint(manifest, journal, "recovering", states, boundaries)
@@ -1397,8 +1449,14 @@ def apply(
             _checkpoint(manifest, journal, "sealed", states, controller)
         except InjectedFailure:
             raise
-        except BaseException:
-            _recover_locked(manifest, journal, BoundaryController())
+        except BaseException as original:
+            try:
+                _recover_locked(manifest, journal, BoundaryController())
+            except AdoptionError:
+                # Preserve the originating fail-closed diagnosis.  Recovery is
+                # never allowed to overwrite an unknown live object merely to
+                # make an earlier operation look tidy.
+                raise original
             raise
         _cleanup_temps(manifest)
         return {

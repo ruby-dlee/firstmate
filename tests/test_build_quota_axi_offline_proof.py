@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -267,6 +270,152 @@ class QuotaOfflineProofTests(unittest.TestCase):
             source_members,
             quota_proof._package_members(package),
         )
+        controls = sorted(path.name for path in scratch.iterdir())
+        self.assertEqual(len(controls), 2)
+        self.assertTrue(any(name.endswith(".journal.json") for name in controls))
+        self.assertTrue(any(name.endswith(".lock") for name in controls))
+        self.assertEqual(quota_proof.build(spec_path), (package, proof))
+
+        build_id = hashlib.sha256(
+            b"bridge-quota-offline-build-v1\0"
+            + bytes.fromhex(quota_proof._sha(spec_path))
+        ).hexdigest()
+        held_lock = quota_proof._open_build_lock(
+            quota_proof._lock_path(scratch, build_id)
+        )
+        try:
+            concurrent = subprocess.run(
+                [sys.executable, str(SCRIPT), "--spec", str(spec_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            quota_proof.fcntl.flock(held_lock, quota_proof.fcntl.LOCK_UN)
+            os.close(held_lock)
+        self.assertNotEqual(concurrent.returncode, 0)
+        self.assertIn("already running", concurrent.stderr)
+
+        for phase in quota_proof.JOURNAL_PHASES:
+            with self.subTest(kill_after_phase=phase):
+                crash_root = self.root / f"crash-{phase}"
+                crash_root.mkdir()
+                crash_scratch = crash_root / "scratch"
+                crash_scratch.mkdir()
+                crash_spec = dict(spec)
+                crash_spec.update(
+                    {
+                        "package_tarball": str(crash_root / "quota-axi.tgz"),
+                        "proof": str(crash_root / "quota-build-proof.json"),
+                        "scratch_parent": str(crash_scratch),
+                    }
+                )
+                crash_spec_path = crash_root / "spec.json"
+                crash_spec_path.write_bytes(quota_proof._canonical(crash_spec))
+                injector = textwrap.dedent(
+                    f"""\
+                    import importlib.util, os, signal
+                    from pathlib import Path
+                    source = Path({str(SCRIPT)!r})
+                    spec = importlib.util.spec_from_file_location("quota_crash", source)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    original = module._replace_owned_json
+                    fired = False
+                    def replace(path, previous, value):
+                        global fired
+                        identity = original(path, previous, value)
+                        if not fired and value.get("phase") == {phase!r}:
+                            fired = True
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        return identity
+                    module._replace_owned_json = replace
+                    module.build(Path({str(crash_spec_path)!r}))
+                    """
+                )
+                killed = subprocess.run(
+                    [sys.executable, "-c", injector],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(killed.returncode, -signal.SIGKILL)
+                recovered = quota_proof.build(crash_spec_path)
+                self.assertEqual(
+                    recovered,
+                    (
+                        Path(crash_spec["package_tarball"]),
+                        Path(crash_spec["proof"]),
+                    ),
+                )
+                self.assertEqual(
+                    Path(crash_spec["package_tarball"]).read_bytes(),
+                    package.read_bytes(),
+                )
+                self.assertEqual(
+                    Path(crash_spec["proof"]).read_bytes(), proof.read_bytes()
+                )
+                self.assertFalse(
+                    any(
+                        path.name.endswith("-a") or path.name.endswith("-b")
+                        for path in crash_scratch.iterdir()
+                    )
+                )
+
+        forged_package = self.root / "forged-quota-axi.tgz"
+        forged_members = quota_proof._package_members(package)
+        forged_members["dist/bin/quota-axi.js"] = b"console.log('forged');\n"
+        with tarfile.open(forged_package, mode="w") as archive:
+            for relative, payload in sorted(forged_members.items()):
+                member = tarfile.TarInfo(f"package/{relative}")
+                member.size = len(payload)
+                member.mode = 0o644
+                member.mtime = 0
+                member.uid = member.gid = 0
+                member.uname = member.gname = ""
+                archive.addfile(member, io.BytesIO(payload))
+        forged_value = json.loads(proof.read_text(encoding="utf-8"))
+        forged_value["package_tarball_sha256"] = quota_proof._sha(forged_package)
+        forged_value["package_members"] = [
+            {
+                "path": relative,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+            for relative, payload in sorted(forged_members.items())
+        ]
+        forged_value["generated_members"] = [
+            record
+            for record in forged_value["package_members"]
+            if record["path"].startswith("dist/")
+        ]
+        forged_proof = self.root / "forged-quota-build-proof.json"
+        forged_proof.write_bytes(quota_proof._canonical(forged_value))
+        forged_role = sealed_builder.QuotaRole(
+            role="candidate",
+            release_path="quota/releases/candidate",
+            version="0.1.7",
+            source_repo=source,
+            source_commit=commit,
+            source_tree_sha256=source_tree,
+            package_tarball=forged_package,
+            package_sha256=quota_proof._sha(forged_package),
+            package_lock=lock,
+            package_lock_sha256=quota_proof._sha(lock),
+            build_proof=forged_proof,
+            build_proof_sha256=quota_proof._sha(forged_proof),
+            dependencies=(),
+        )
+        with self.assertRaisesRegex(
+            sealed_builder.BuildError, "independent Quota producer replay"
+        ):
+            sealed_builder._validate_quota_build_proof(
+                forged_role,
+                source_members,
+                quota_proof._package_members(forged_package),
+            )
 
         proof.write_bytes(proof.read_bytes() + b" ")
         with self.assertRaisesRegex(sealed_builder.BuildError, "manifest pin"):
@@ -275,7 +424,6 @@ class QuotaOfflineProofTests(unittest.TestCase):
                 source_members,
                 quota_proof._package_members(package),
             )
-        self.assertEqual(list(scratch.iterdir()), [])
 
     def test_output_writer_recovers_only_exact_partial_staging(self) -> None:
         output = self.root / "proof.json"

@@ -22,6 +22,7 @@ import csv
 import ctypes
 import dataclasses
 import errno as errno_module
+import fcntl
 import hashlib
 import importlib
 import importlib.util
@@ -2292,6 +2293,8 @@ def _validate_adoption_inputs(spec: PreparationSpec) -> None:
 
 def _validate_input_state(
     spec: PreparationSpec,
+    *,
+    allow_existing_output: bool = False,
 ) -> tuple[AgentFleetAPI, AgentFleetAPI]:
     _require_regular(spec.baseline_registry, "baseline registry", mode=0o600)
     if _sha256(spec.baseline_registry) != spec.baseline_registry_sha256:
@@ -2302,7 +2305,10 @@ def _validate_input_state(
     baseline_raw = _parse_registry_toml(spec.baseline_registry, "baseline registry")
     _validate_legacy_registry_shape(baseline_raw, spec)
     _require_directory(spec.trusted_project, "trusted Relvino project")
-    if spec.output_dir.exists() or os.path.lexists(spec.output_dir):
+    if (
+        not allow_existing_output
+        and (spec.output_dir.exists() or os.path.lexists(spec.output_dir))
+    ):
         raise PreparationError(f"output_dir must not already exist: {spec.output_dir}")
     _require_directory(spec.output_dir.parent, "output parent")
     _validate_adoption_inputs(spec)
@@ -2908,6 +2914,7 @@ def _validate_agent_runtime_record(
     executable: Path,
     python_binary: Path,
     python_version: str,
+    expected_python_sha256: str,
     version: str,
     contract: int,
     source_commit: str,
@@ -2983,7 +2990,11 @@ def _validate_agent_runtime_record(
         raise PreparationError(f"{label}.python must be an object")
     _require_exact_keys(python, {"path", "sha256", "version"}, set(), f"{label}.python")
     python_path = _relative_record_path(root, python["path"], f"{label}.python.path")
-    if python_path != python_binary or python["sha256"] != _sha256(python_path):
+    if (
+        python_path != python_binary
+        or python["sha256"] != _sha256(python_path)
+        or python["sha256"] != expected_python_sha256
+    ):
         raise PreparationError(f"{label}.python identity mismatch")
     if python["version"] != python_version:
         raise PreparationError(f"{label}.python version mismatch")
@@ -3272,6 +3283,7 @@ def _validate_quota_runtime_record(
     package_lock: Path,
     version: str,
     node_version: str,
+    expected_node_sha256: str,
     source_commit: str,
     driver: ModuleType,
     label: str,
@@ -3353,7 +3365,14 @@ def _validate_quota_runtime_record(
     )
     node_path = _relative_record_path(root, node["path"], f"{label}.node.path")
     expected_node = _record_proof(node_path, root)
-    if node_path != node_binary or any(node[key] != expected_node[key] for key in ("path", "sha256", "mode", "nlink")):
+    if (
+        node_path != node_binary
+        or any(
+            node[key] != expected_node[key]
+            for key in ("path", "sha256", "mode", "nlink")
+        )
+        or node["sha256"] != expected_node_sha256
+    ):
         raise PreparationError(f"{label}.node identity mismatch")
     if node["version"] != node_version or not isinstance(node["signature_state"], str):
         raise PreparationError(f"{label}.node version/signature-state mismatch")
@@ -3536,6 +3555,59 @@ def _runtime_transformations(root: Path) -> list[dict[str, str]]:
             }
         )
     return records
+
+
+def _validate_materialized_python_runtime(source_root: Path, sealed_root: Path) -> None:
+    """Bind the sealed regular-file closure to the retained lexical runtime tree."""
+
+    expected: dict[str, tuple[str, str | None]] = {}
+    starts = (source_root / "bin/python3.11", source_root / "lib")
+    observed: list[Path] = list(starts)
+    for start in starts:
+        if start.is_dir():
+            observed.extend(start.rglob("*"))
+    for path in sorted(
+        set(observed),
+        key=lambda item: item.relative_to(source_root).as_posix().encode("utf-8"),
+    ):
+        relative = path.relative_to(source_root).as_posix()
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            expected[relative] = ("directory", None)
+        elif stat.S_ISLNK(info.st_mode):
+            _, resolved = _runtime_internal_symlink(source_root, path)
+            expected[relative] = ("file", _sha256(resolved))
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            expected[relative] = ("file", _sha256(path))
+        else:
+            raise PreparationError(
+                f"retained Python runtime contains unsupported path: {path}"
+            )
+
+    actual: dict[str, tuple[str, str | None]] = {}
+    sealed_starts = (sealed_root / "bin/python3.11", sealed_root / "lib")
+    sealed_paths: list[Path] = list(sealed_starts)
+    for start in sealed_starts:
+        if start.is_dir():
+            sealed_paths.extend(start.rglob("*"))
+    for path in sorted(
+        set(sealed_paths),
+        key=lambda item: item.relative_to(sealed_root).as_posix().encode("utf-8"),
+    ):
+        relative = path.relative_to(sealed_root).as_posix()
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            actual[relative] = ("directory", None)
+        elif stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            actual[relative] = ("file", _sha256(path))
+        else:
+            raise PreparationError(
+                f"sealed Python runtime is not fully materialized: {path}"
+            )
+    if actual != expected:
+        raise PreparationError(
+            f"sealed Python runtime closure differs from retained runtime: {sealed_root}"
+        )
 
 
 def _build_input_file(
@@ -3827,7 +3899,9 @@ def _validate_sealed_runtime_manifest(
     _validate_agent_runtime_record(
         raw["agent_fleet_candidate"], manifest_root=manifest_root, release=af.release,
         candidate=True, executable=af.executable, python_binary=af.python_binary,
-        python_version=af.expected_python_version, version=af.expected_version,
+        python_version=af.expected_python_version,
+        expected_python_sha256=build_inputs["python_runtime"]["binary_sha256"],
+        version=af.expected_version,
         contract=af.expected_contract_version, source_commit=af.source_commit,
         driver=driver, label="agent_fleet_candidate",
     )
@@ -3836,6 +3910,7 @@ def _validate_sealed_runtime_manifest(
         candidate=False, executable=af.rollback_executable,
         python_binary=af.release.old_release / "bin/python3.11",
         python_version=af.rollback_python_version,
+        expected_python_sha256=build_inputs["python_runtime"]["binary_sha256"],
         version=af.rollback_version, contract=af.rollback_contract_version,
         source_commit=af.rollback_source_commit, driver=driver,
         label="agent_fleet_rollback",
@@ -3848,6 +3923,7 @@ def _validate_sealed_runtime_manifest(
         runtime_manifest=quota.runtime_manifest,
         package_lock=quota.package_lock,
         version=quota.expected_version, node_version=quota.node_version,
+        expected_node_sha256=build_inputs["node_runtime"]["sha256"],
         source_commit=quota.source_commit, driver=driver, label="quota_axi_candidate",
     )
     _validate_quota_runtime_record(
@@ -3859,6 +3935,7 @@ def _validate_sealed_runtime_manifest(
         runtime_manifest=quota.rollback_runtime_manifest,
         package_lock=quota.rollback_package_lock, version=quota.rollback_version,
         node_version=quota.rollback_node_version,
+        expected_node_sha256=build_inputs["node_runtime"]["sha256"],
         source_commit=quota.rollback_source_commit, driver=driver,
         label="quota_axi_rollback",
     )
@@ -3877,6 +3954,7 @@ def _validate_sealed_runtime_manifest(
             raise PreparationError(
                 f"{label} provenance does not bind the retained Python transformation proof"
             )
+        _validate_materialized_python_runtime(Path(python_inputs["root"]), root)
     xattrs = raw["xattr_policy"]
     if not isinstance(xattrs, dict):
         raise PreparationError("xattr_policy must be an object")
@@ -4663,9 +4741,145 @@ def _preparation_staging_marker(
     }
 
 
+def _preparation_control_paths(staging: Path) -> tuple[Path, Path]:
+    return (
+        staging.with_name(staging.name + ".journal.json"),
+        staging.with_name(staging.name + ".lock"),
+    )
+
+
+def _open_preparation_lock(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise PreparationError(f"preparation lock is not attributable: {path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PreparationError("this exact preparation is already running") from exc
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _preparation_journal_value(
+    staging: Path,
+    output_dir: Path,
+    expected_marker: Mapping[str, Any],
+    phase: str,
+    tree_sha256: str | None,
+) -> dict[str, Any]:
+    if phase not in {"building", "ready", "complete"}:
+        raise PreparationError(f"invalid preparation journal phase: {phase}")
+    if phase == "building" and tree_sha256 is not None:
+        raise PreparationError("building preparation journal cannot have a tree digest")
+    if phase != "building" and (
+        not isinstance(tree_sha256, str) or not SHA256.fullmatch(tree_sha256)
+    ):
+        raise PreparationError("ready preparation journal requires a tree digest")
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "staging_path": str(staging),
+        "output_dir": str(output_dir),
+        "marker": dict(expected_marker),
+        "tree_sha256": tree_sha256,
+    }
+
+
+def _write_preparation_journal(
+    path: Path,
+    value: Mapping[str, Any],
+    previous_sha256: str | None,
+) -> str:
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    temporary = path.with_name(f".{path.name}.bridge-write-{digest[:32]}")
+    if os.path.lexists(temporary):
+        info = os.lstat(temporary)
+        staged = temporary.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or len(staged) > len(payload)
+            or not payload.startswith(staged)
+        ):
+            raise PreparationError(
+                f"preparation journal staging is not attributable: {temporary}"
+            )
+        temporary.unlink()
+    if previous_sha256 is None:
+        if os.path.lexists(path):
+            raise PreparationError(f"preparation journal appeared unexpectedly: {path}")
+    elif not os.path.lexists(path) or _sha256(path) != previous_sha256:
+        raise PreparationError(f"preparation journal changed concurrently: {path}")
+    _write_bytes(temporary, payload, 0o600)
+    if previous_sha256 is None:
+        _rename_directory_no_replace(temporary, path)
+    else:
+        if _sha256(path) != previous_sha256:
+            raise PreparationError(
+                f"preparation journal changed before replacement: {path}"
+            )
+        os.replace(temporary, path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return digest
+
+
+def _load_preparation_journal(
+    path: Path,
+    staging: Path,
+    output_dir: Path,
+    expected_marker: Mapping[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    if not os.path.lexists(path):
+        return None
+    _require_regular(path, "preparation journal", mode=0o600)
+    value = _read_json(path, "preparation journal")
+    if not isinstance(value, dict):
+        raise PreparationError("preparation journal must be an object")
+    _require_exact_keys(
+        value,
+        {"schema_version", "phase", "staging_path", "output_dir", "marker", "tree_sha256"},
+        set(),
+        "preparation journal",
+    )
+    expected = _preparation_journal_value(
+        staging,
+        output_dir,
+        expected_marker,
+        value["phase"],
+        value["tree_sha256"],
+    )
+    if value != expected:
+        raise PreparationError("preparation journal belongs to another operation")
+    return value, _sha256(path)
+
+
 def _remove_preparation_staging(
     staging: Path,
     expected_marker: Mapping[str, Any],
+    *,
+    allow_incomplete_marker: bool = False,
 ) -> None:
     if not os.path.lexists(staging):
         return
@@ -4679,11 +4893,39 @@ def _remove_preparation_staging(
             f"preparation staging path is not attributable: {staging}"
         )
     marker_path = staging / ".bridge-preparation-staging.json"
-    observed = _read_json(marker_path, "preparation staging ownership marker")
-    if observed != expected_marker:
-        raise PreparationError(
-            f"preparation staging marker belongs to another operation: {staging}"
-        )
+    if not os.path.lexists(marker_path) and allow_incomplete_marker:
+        if any(staging.iterdir()):
+            raise PreparationError(
+                f"unmarked preparation staging is not empty: {staging}"
+            )
+    else:
+        marker_payload = (
+            json.dumps(expected_marker, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        try:
+            observed = _read_json(marker_path, "preparation staging ownership marker")
+        except PreparationError:
+            if not allow_incomplete_marker:
+                raise
+            info = os.lstat(marker_path)
+            partial = marker_path.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or any(child != marker_path for child in staging.iterdir())
+                or len(partial) > len(marker_payload)
+                or not marker_payload.startswith(partial)
+            ):
+                raise PreparationError(
+                    f"preparation staging marker is not attributable: {staging}"
+                )
+        else:
+            if observed != expected_marker:
+                raise PreparationError(
+                    f"preparation staging marker belongs to another operation: {staging}"
+                )
     shutil.rmtree(staging)
     parent_fd = os.open(
         staging.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -4694,7 +4936,7 @@ def _remove_preparation_staging(
         os.close(parent_fd)
 
 
-def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
+def _prepare_locked(spec_path: Path, driver_path: Path) -> dict[str, Any]:
     spec = load_spec(spec_path)
     driver = _load_driver(driver_path)
     try:
@@ -4702,8 +4944,6 @@ def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
         _validate_quota_release_tree(spec.quota, driver)
     except driver.CutoverError as exc:
         raise PreparationError(f"sealed runtime proof validation failed: {exc}") from exc
-    rollback_api, candidate_api = _validate_input_state(spec)
-
     staging = spec.output_dir.parent / (
         f".{spec.output_dir.name}.prepare-"
         f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
@@ -4711,7 +4951,82 @@ def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
     expected_staging_marker = _preparation_staging_marker(
         staging, spec, spec_path, driver_path
     )
-    _remove_preparation_staging(staging, expected_staging_marker)
+    journal_path, _ = _preparation_control_paths(staging)
+    loaded_journal = _load_preparation_journal(
+        journal_path, staging, spec.output_dir, expected_staging_marker
+    )
+    rollback_api, candidate_api = _validate_input_state(
+        spec, allow_existing_output=loaded_journal is not None
+    )
+    if loaded_journal is None:
+        if os.path.lexists(staging):
+            raise PreparationError(
+                "preparation staging exists without an ownership journal and "
+                f"belongs to another operation: {staging}"
+            )
+        journal = _preparation_journal_value(
+            staging, spec.output_dir, expected_staging_marker, "building", None
+        )
+        journal_sha256 = _write_preparation_journal(journal_path, journal, None)
+    else:
+        journal, journal_sha256 = loaded_journal
+        tree_sha256 = journal["tree_sha256"]
+        if journal["phase"] in {"ready", "complete"}:
+            if os.path.lexists(spec.output_dir):
+                observed = driver.compute_release_tree_sha256(
+                    spec.output_dir, "completed preparation bundle"
+                )
+                if observed != tree_sha256:
+                    raise PreparationError(
+                        "completed preparation output differs from its journal"
+                    )
+                if journal["phase"] != "complete":
+                    journal = _preparation_journal_value(
+                        staging,
+                        spec.output_dir,
+                        expected_staging_marker,
+                        "complete",
+                        tree_sha256,
+                    )
+                    journal_sha256 = _write_preparation_journal(
+                        journal_path, journal, journal_sha256
+                    )
+                return validate_bundle(spec.output_dir / "bundle.json", driver_path)
+            if journal["phase"] == "complete":
+                raise PreparationError(
+                    "completed preparation journal has no output directory"
+                )
+            if os.path.lexists(staging):
+                observed = driver.compute_release_tree_sha256(
+                    staging, "ready preparation staging"
+                )
+                if observed != tree_sha256:
+                    raise PreparationError(
+                        "ready preparation staging differs from its journal"
+                    )
+                _rename_directory_no_replace(staging, spec.output_dir)
+                journal = _preparation_journal_value(
+                    staging,
+                    spec.output_dir,
+                    expected_staging_marker,
+                    "complete",
+                    tree_sha256,
+                )
+                _write_preparation_journal(journal_path, journal, journal_sha256)
+                return validate_bundle(spec.output_dir / "bundle.json", driver_path)
+        if os.path.lexists(spec.output_dir):
+            raise PreparationError(
+                "preparation output exists before a complete tree was journaled"
+            )
+        _remove_preparation_staging(
+            staging, expected_staging_marker, allow_incomplete_marker=True
+        )
+        journal = _preparation_journal_value(
+            staging, spec.output_dir, expected_staging_marker, "building", None
+        )
+        journal_sha256 = _write_preparation_journal(
+            journal_path, journal, journal_sha256
+        )
     staging.mkdir(mode=0o700)
     _write_json(
         staging / ".bridge-preparation-staging.json",
@@ -4854,13 +5169,49 @@ def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
         worker_state_manifest,
         0o600,
     )
+    tree_sha256 = driver.compute_release_tree_sha256(
+        staging, "completed preparation staging"
+    )
+    journal = _preparation_journal_value(
+        staging,
+        spec.output_dir,
+        expected_staging_marker,
+        "ready",
+        tree_sha256,
+    )
+    journal_sha256 = _write_preparation_journal(
+        journal_path, journal, journal_sha256
+    )
     _rename_directory_no_replace(staging, spec.output_dir)
     parent_fd = os.open(spec.output_dir.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
+    journal = _preparation_journal_value(
+        staging,
+        spec.output_dir,
+        expected_staging_marker,
+        "complete",
+        tree_sha256,
+    )
+    _write_preparation_journal(journal_path, journal, journal_sha256)
     return validate_bundle(spec.output_dir / "bundle.json", driver_path)
+
+
+def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
+    spec = load_spec(spec_path)
+    staging = spec.output_dir.parent / (
+        f".{spec.output_dir.name}.prepare-"
+        f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+    )
+    _, lock_path = _preparation_control_paths(staging)
+    descriptor = _open_preparation_lock(lock_path)
+    try:
+        return _prepare_locked(spec_path, driver_path)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _spec_from_bundle(bundle_path: Path, bundle: dict[str, Any]) -> PreparationSpec:

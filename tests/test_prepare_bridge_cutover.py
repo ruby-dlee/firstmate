@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pwd
+import signal
 import stat
 import subprocess
 import sys
@@ -645,7 +646,13 @@ class CutoverPreparationFixture:
                         if (getenv(blocked[i]) != NULL) return 91;
                     }}
                     if (argc == 3 && strcmp(argv[2], "--version") == 0) {{
-                        puts("quota-axi {version}");
+                        /* One pinned Node runtime serves both sealed releases.
+                         * The real Node binary obtains the package version from
+                         * the invoked JS; this fixture derives the same answer
+                         * from the release-local entrypoint path. */
+                        puts(strstr(argv[1], "0.1.5-old") != NULL
+                                 ? "quota-axi 0.1.5"
+                                 : "quota-axi 0.1.7");
                         return 0;
                     }}
                     return 2;
@@ -858,6 +865,33 @@ class CutoverPreparationFixture:
         self.agent_build_manifest = self.root / "sealed-runtime-proof-manifest.json"
         builder_path = SCRIPT_DIR / "build_sealed_bridge_runtimes.py"
         bootstrap_path = SCRIPT_DIR / "sealed_agent_fleet_bootstrap.py"
+        # The production builder copies one exact pinned runtime into both role
+        # releases.  Keep the fixture faithful to that identity contract rather
+        # than compiling path-dependent Mach-O binaries independently.
+        (self.agent_old / "bin/python3.11").write_bytes(
+            (self.agent_new / "bin/python3.11").read_bytes()
+        )
+        (self.agent_old / "bin/python3.11").chmod(0o755)
+        for release in (self.agent_new, self.agent_old):
+            (release / "lib").mkdir(exist_ok=True)
+            (release / "lib/stdlib.py").write_text(
+                "# pinned fixture stdlib\n", encoding="utf-8"
+            )
+        (self.quota_old / "runtime/node").write_bytes(
+            (self.quota_new / "runtime/node").read_bytes()
+        )
+        (self.quota_old / "runtime/node").chmod(0o755)
+        rollback_quota_provenance = self.quota_old / "build/provenance.json"
+        rollback_quota_value = json.loads(
+            rollback_quota_provenance.read_text(encoding="utf-8")
+        )
+        rollback_quota_value["artifacts"]["node"]["sha256"] = prepare._sha256(
+            self.quota_old / "runtime/node"
+        )
+        rollback_quota_provenance.write_text(
+            json.dumps(rollback_quota_value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         pinned_python = self.root / "pinned-python"
         (pinned_python / "bin").mkdir(parents=True)
         (pinned_python / "lib").mkdir()
@@ -1777,6 +1811,14 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         marker = prepare._preparation_staging_marker(
             staging, spec, self.fixture.spec_path, DRIVER
         )
+        journal_path, _ = prepare._preparation_control_paths(staging)
+        prepare._write_preparation_journal(
+            journal_path,
+            prepare._preparation_journal_value(
+                staging, spec.output_dir, marker, "building", None
+            ),
+            None,
+        )
         staging.mkdir(mode=0o700)
         prepare._write_json(
             staging / ".bridge-preparation-staging.json", marker, 0o600
@@ -1785,6 +1827,48 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         result = self.fixture.prepare()
         self.assertTrue(result["valid"])
         self.assertFalse(staging.exists())
+
+    def test_prepare_recovers_sigkill_at_every_journal_phase(self) -> None:
+        for phase in ("building", "ready", "complete"):
+            with self.subTest(phase=phase):
+                fixture = CutoverPreparationFixture()
+                self.addCleanup(fixture.cleanup)
+                injector = textwrap.dedent(
+                    f"""\
+                    import os, signal, sys
+                    from pathlib import Path
+                    sys.path.insert(0, {str(SCRIPT_DIR)!r})
+                    import prepare_bridge_cutover as module
+                    original = module._write_preparation_journal
+                    fired = False
+                    def write(path, value, previous):
+                        global fired
+                        digest = original(path, value, previous)
+                        if not fired and value.get("phase") == {phase!r}:
+                            fired = True
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        return digest
+                    module._write_preparation_journal = write
+                    module.prepare(Path({str(fixture.spec_path)!r}), Path({str(DRIVER)!r}))
+                    """
+                )
+                killed = subprocess.run(
+                    [sys.executable, "-c", injector],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(killed.returncode, -signal.SIGKILL)
+                recovered = fixture.prepare()
+                self.assertTrue(recovered["valid"])
+                self.assertTrue(fixture.prepare()["valid"])
+                spec = prepare.load_spec(fixture.spec_path)
+                staging = spec.output_dir.parent / (
+                    f".{spec.output_dir.name}.prepare-"
+                    f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+                )
+                self.assertFalse(staging.exists())
 
     def test_prepare_refuses_foreign_deterministic_staging(self) -> None:
         spec = prepare.load_spec(self.fixture.spec_path)
@@ -2368,7 +2452,7 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
             self.fixture.bundle_dir / "bundle.json", DRIVER, self.fixture.scratch
         )
         self.assertTrue(result["rehearsed"])
-        self.assertEqual(result["adoption_forward_boundaries"], 44)
+        self.assertEqual(result["adoption_forward_boundaries"], 52)
         self.assertTrue(result["adoption_recovery_refused_after_seal"])
         self.assertGreaterEqual(result["forward_boundaries"], 90)
         self.assertGreaterEqual(result["rollback_boundaries"], 90)

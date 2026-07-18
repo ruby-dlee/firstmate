@@ -550,6 +550,23 @@ class BridgeSealedAdoptionTests(unittest.TestCase):
                 adoption.apply(manifest)
         self.assertEqual(fixture.registry.read_bytes(), racer)
 
+    def test_link_change_at_exchange_syscall_is_swapped_back_and_preserved(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        foreign_target = "releases/foreign-at-syscall"
+
+        class ChangeAtExchange(adoption.BoundaryController):
+            def hit(self, label: str) -> None:
+                super().hit(label)
+                if label == "immediately_before_exchange:forward:quota-current":
+                    temp = fixture.links[0].with_name(".foreign-link.tmp")
+                    os.symlink(foreign_target, temp)
+                    os.replace(temp, fixture.links[0])
+
+        with self.assertRaisesRegex(adoption.AdoptionError, "displaced live state"):
+            adoption.apply(fixture.load(), ChangeAtExchange())
+        self.assertEqual(os.readlink(fixture.links[0]), foreign_target)
+
     def test_state_directory_substitution_during_scan_is_refused(self) -> None:
         fixture = Fixture()
         self.addCleanup(fixture.close)
@@ -582,7 +599,7 @@ class BridgeSealedAdoptionTests(unittest.TestCase):
         recorder = adoption.BoundaryController()
         adoption.apply(discovery.load(), recorder)
         boundaries = tuple(dict.fromkeys(recorder.seen))
-        self.assertEqual(len(boundaries), 44)
+        self.assertEqual(len(boundaries), 52)
 
         for boundary in boundaries:
             with self.subTest(boundary=boundary):
@@ -616,7 +633,7 @@ class BridgeSealedAdoptionTests(unittest.TestCase):
         recorder = adoption.BoundaryController()
         adoption.recover(discovery.load(), recorder)
         boundaries = tuple(dict.fromkeys(recorder.seen))
-        self.assertEqual(len(boundaries), 28)
+        self.assertEqual(len(boundaries), 32)
 
         for boundary in boundaries:
             with self.subTest(boundary=boundary):

@@ -13,6 +13,7 @@ snapshot.  Reserve/Desktop homes are never statted, opened, or read.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -1178,12 +1179,14 @@ def _assert_worker_entry_attributed(
     snapshot: Mapping[str, Any],
     home_fd: int | None,
     relative: str,
+    observed_name: str | None = None,
 ) -> None:
     original = snapshot["workers"][worker.profile]["mutable"][relative]
     candidate = _candidate_state(manifest, worker, relative)
-    if _node_matches_at(home_fd, relative, original, exact_directory=True):
+    name = observed_name or relative
+    if _node_matches_at(home_fd, name, original, exact_directory=True):
         return
-    if _node_matches_at(home_fd, relative, candidate, exact_directory=True):
+    if _node_matches_at(home_fd, name, candidate, exact_directory=True):
         return
     raise WorkerStateError(
         f"managed state drift is not attributable for {worker.profile}:{relative}"
@@ -1220,6 +1223,18 @@ def _assert_identity_authority(
     if _identity_file_state(path) != expected:
         raise WorkerStateError(
             f"{provider} identity changed immediately before restore"
+        )
+
+
+def _assert_identity_authority_at(
+    parent_fd: int | None,
+    name: str,
+    expected: Mapping[str, Any],
+    provider: str,
+) -> None:
+    if not _node_matches_at(parent_fd, name, expected, exact_directory=True):
+        raise WorkerStateError(
+            f"{provider} identity displaced live state is not attributable"
         )
 
 
@@ -1467,6 +1482,66 @@ def _materialize_node_at(
     raise WorkerStateError("cannot materialize absent/unknown snapshot node")
 
 
+def _rename_at(
+    parent_fd: int,
+    source: str,
+    destination: str,
+    *,
+    exchange: bool,
+) -> None:
+    """Use a syscall-level exchange or no-replace rename within one bound dir."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        flag = 0x00000002 if exchange else 0x00000004
+        result = function(
+            parent_fd, source_bytes, parent_fd, destination_bytes, flag
+        )
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        flag = 0x2 if exchange else 0x1
+        result = function(
+            parent_fd, source_bytes, parent_fd, destination_bytes, flag
+        )
+    else:
+        raise WorkerStateError(
+            "atomic exchange/no-replace rename is unavailable on this platform"
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise WorkerStateError(
+            f"atomic {'exchange' if exchange else 'no-replace rename'} failed for "
+            f"{source} and {destination}: {os.strerror(error)}"
+        )
+
+
+def _lexists_at(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _restore_node_at(
     state: Mapping[str, Any],
     parent_fd: int | None,
@@ -1474,7 +1549,11 @@ def _restore_node_at(
     data_root: Path,
     temporary_tag: str,
     pre_replace: Callable[[], None] | None = None,
+    validate_displaced: Callable[[str], None] | None = None,
+    boundaries: BoundaryController | None = None,
+    exchange_label: str = "restore",
 ) -> None:
+    controller = boundaries or BoundaryController()
     node_type = state.get("type")
     if parent_fd is None:
         if node_type == "absent":
@@ -1483,28 +1562,84 @@ def _restore_node_at(
             return
         raise WorkerStateError("restore parent is absent for non-absent state")
     if node_type == "absent":
+        temporary = f".{name}.restore-{temporary_tag}"
+        if _lexists_at(parent_fd, temporary):
+            if not _node_matches_at(parent_fd, name, state, exact_directory=True):
+                raise WorkerStateError(
+                    f"ambiguous interrupted absent restore is preserved: {temporary}"
+                )
+            if validate_displaced is not None:
+                validate_displaced(temporary)
+            _remove_entry_at(parent_fd, temporary)
+            os.fsync(parent_fd)
+            return
+        if _node_matches_at(parent_fd, name, state, exact_directory=True):
+            return
         if pre_replace is not None:
             pre_replace()
-        _remove_entry_at(parent_fd, name)
+        controller.hit(f"immediately_before_exchange:{exchange_label}")
+        _rename_at(parent_fd, name, temporary, exchange=False)
+        controller.hit(f"after_exchange:{exchange_label}")
+        try:
+            if validate_displaced is not None:
+                validate_displaced(temporary)
+        except Exception:
+            try:
+                _rename_at(parent_fd, temporary, name, exchange=False)
+                os.fsync(parent_fd)
+            except WorkerStateError as restore_exc:
+                raise WorkerStateError(
+                    f"ambiguous displaced absent restore is preserved: {temporary}"
+                ) from restore_exc
+            raise
+        _remove_entry_at(parent_fd, temporary)
         os.fsync(parent_fd)
         return
     temporary = f".{name}.restore-{temporary_tag}"
-    _remove_entry_at(parent_fd, temporary)
     try:
-        _materialize_node_at(state, parent_fd, temporary, data_root)
+        if _lexists_at(parent_fd, temporary):
+            if _node_matches_at(parent_fd, name, state, exact_directory=True):
+                if validate_displaced is not None:
+                    validate_displaced(temporary)
+                _remove_entry_at(parent_fd, temporary)
+                os.fsync(parent_fd)
+                return
+            if not _node_matches_at(
+                parent_fd, temporary, state, exact_directory=True
+            ):
+                raise WorkerStateError(
+                    f"ambiguous interrupted restore is preserved: {temporary}"
+                )
+        else:
+            _materialize_node_at(state, parent_fd, temporary, data_root)
         if pre_replace is not None:
             pre_replace()
-        _remove_entry_at(parent_fd, name)
-        os.replace(
-            temporary,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        os.fsync(parent_fd)
-    except Exception:
+        controller.hit(f"immediately_before_exchange:{exchange_label}")
+        _rename_at(parent_fd, temporary, name, exchange=True)
+        controller.hit(f"after_exchange:{exchange_label}")
+        try:
+            if validate_displaced is not None:
+                validate_displaced(temporary)
+        except Exception:
+            try:
+                _rename_at(parent_fd, temporary, name, exchange=True)
+                _remove_entry_at(parent_fd, temporary)
+                os.fsync(parent_fd)
+            except WorkerStateError as restore_exc:
+                raise WorkerStateError(
+                    f"ambiguous displaced restore is preserved: {temporary}"
+                ) from restore_exc
+            raise
         _remove_entry_at(parent_fd, temporary)
         os.fsync(parent_fd)
+    except Exception:
+        if (
+            _lexists_at(parent_fd, temporary)
+            and _node_matches_at(parent_fd, temporary, state, exact_directory=True)
+            and not _node_matches_at(parent_fd, name, state, exact_directory=True)
+        ):
+            _remove_entry_at(parent_fd, temporary)
+            os.fsync(parent_fd)
         raise
 
 
@@ -1652,6 +1787,18 @@ def rollback(
                                 relative,
                             )
                         ),
+                        validate_displaced=lambda observed_name, worker=worker, relative=relative, home_fd=home_fd: (
+                            _assert_worker_entry_attributed(
+                                manifest,
+                                worker,
+                                snapshot,
+                                home_fd,
+                                relative,
+                                observed_name,
+                            )
+                        ),
+                        boundaries=boundaries,
+                        exchange_label=f"worker:{worker.profile}:{relative}",
                     )
                     if home_fd is not None:
                         _assert_bound_directory(
@@ -1690,6 +1837,16 @@ def rollback(
                                 provider,
                             )
                         ),
+                        validate_displaced=lambda observed_name, provider=provider, parent_fd=parent_fd: (
+                            _assert_identity_authority_at(
+                                parent_fd,
+                                observed_name,
+                                identity_authority[provider],
+                                provider,
+                            )
+                        ),
+                        boundaries=boundaries,
+                        exchange_label=f"identity:{provider}",
                     )
                     if parent_fd is not None:
                         _assert_bound_directory(

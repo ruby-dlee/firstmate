@@ -16,6 +16,7 @@ import base64
 import ctypes
 import csv
 import errno as errno_module
+import fcntl
 import hashlib
 import io
 import json
@@ -1255,6 +1256,175 @@ def _package_identity(
     return package
 
 
+def _quota_replay_lock(proof_sha256: str) -> int:
+    path = Path(tempfile.gettempdir()).resolve() / (
+        f".bridge-quota-consumer-{proof_sha256[:32]}.lock"
+    )
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise BuildError(f"Quota producer replay lock is not attributable: {path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BuildError(
+                "an independent Quota producer replay is already running"
+            ) from exc
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _write_private_replay_spec(path: Path, value: Mapping[str, Any]) -> None:
+    payload = (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0:
+                raise BuildError("short write while creating Quota replay spec")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _replay_quota_producer(
+    role: QuotaRole,
+    proof: Mapping[str, Any],
+    package_members: Mapping[str, bytes],
+) -> None:
+    """Independently rerun the hash-pinned offline producer and compare bytes."""
+
+    toolchain = proof["toolchain"]
+    helper = toolchain["helper"]
+    build_lock = proof["build_lock"]
+    lock_descriptor = _quota_replay_lock(role.build_proof_sha256)
+    temporary: Path | None = None
+    try:
+        temporary = Path(
+            tempfile.mkdtemp(prefix="bridge-quota-consumer-replay-")
+        ).resolve()
+        for name in ("outputs", "scratch", "home", "tmp"):
+            (temporary / name).mkdir(mode=0o700)
+        package_path = temporary / "outputs/quota-axi.tgz"
+        proof_path = temporary / "outputs/quota-build-proof.json"
+        spec_path = temporary / "replay-spec.json"
+        replay_spec = {
+            "schema_version": 1,
+            "role": role.role,
+            "version": role.version,
+            "source_repo": str(role.source_repo),
+            "source_commit": role.source_commit,
+            "source_tree_sha256": role.source_tree_sha256,
+            "git": toolchain["git"],
+            "node": toolchain["node"],
+            "npm": toolchain["npm"],
+            "npm_cache": {
+                "path": toolchain["npm_cache_path"],
+                "tree_sha256": toolchain["npm_cache_tree_sha256"],
+            },
+            "build_lock": {
+                "path": build_lock["path"],
+                "sha256": build_lock["sha256"],
+            },
+            "build_package_json": toolchain["build_package_json"],
+            "resolved_artifacts": toolchain["resolved_artifacts"],
+            "compiler": toolchain["compiler"],
+            "package_tarball": str(package_path),
+            "proof": str(proof_path),
+            "scratch_parent": str(temporary / "scratch"),
+        }
+        _write_private_replay_spec(spec_path, replay_spec)
+        interpreter = Path(os.path.realpath(sys.executable))
+        before_interpreter = os.stat(interpreter)
+        before_interpreter_digest = hashlib.sha256(interpreter.read_bytes()).hexdigest()
+        completed = subprocess.run(
+            [str(interpreter), str(helper["path"]), "--spec", str(spec_path)],
+            cwd=temporary,
+            env={
+                "HOME": str(temporary / "home"),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+                "TMPDIR": str(temporary / "tmp"),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        after_interpreter = os.stat(interpreter)
+        if (
+            completed.returncode != 0
+            or (before_interpreter.st_dev, before_interpreter.st_ino)
+            != (after_interpreter.st_dev, after_interpreter.st_ino)
+            or hashlib.sha256(interpreter.read_bytes()).hexdigest()
+            != before_interpreter_digest
+        ):
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise BuildError(
+                "independent Quota producer replay failed"
+                + (f": {detail}" if detail else "")
+            )
+        replay_package = _read_verified_bytes(
+            package_path, "independent Quota producer replay package"
+        )
+        retained_package = _read_verified_bytes(
+            role.package_tarball,
+            f"{role.role} retained Quota package",
+            role.package_sha256,
+        )
+        replay_proof = _read_verified_bytes(
+            proof_path, "independent Quota producer replay proof"
+        )
+        canonical_proof = (
+            json.dumps(proof, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        if (
+            replay_package != retained_package
+            or _safe_package_members(
+                package_path, "independent Quota producer replay package"
+            )
+            != package_members
+            or replay_proof != canonical_proof
+        ):
+            raise BuildError(
+                "independent Quota producer replay differs from retained package/proof"
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BuildError(f"independent Quota producer replay failed: {exc}") from exc
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+
 def _validate_quota_build_proof(
     role: QuotaRole,
     source: Mapping[str, tuple[str, bytes]],
@@ -1554,6 +1724,7 @@ def _validate_quota_build_proof(
             continue
         if source.get(path) != ("file", payload):
             raise BuildError(f"Quota packed source member differs from exact commit: {path}")
+    _replay_quota_producer(role, proof, package_members)
     return proof
 
 
@@ -1786,9 +1957,15 @@ def _json_changes(before: Any, after: Any, prefix: str = "$") -> list[dict[str, 
     return []
 
 
-def _copy_regular(source: Path, destination: Path) -> None:
+def _copy_regular(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str | None = None,
+    label: str = "copy source",
+) -> None:
     source_fd, source_info, source_digest = _open_verified_file(
-        source, "copy source"
+        source, label, expected_sha256
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1799,7 +1976,7 @@ def _copy_regular(source: Path, destination: Path) -> None:
                     break
                 writer.write(block)
             _revalidate_open_file(
-                source_fd, source_info, source, "copy source", source_digest
+                source_fd, source_info, source, label, source_digest
             )
             os.fchmod(writer.fileno(), 0o600)
             writer.flush()
@@ -1865,37 +2042,61 @@ def _copy_tree(
     destination: Path,
     *,
     canonical_runtime_root: Path | None = None,
+    expected_tree_sha256: str | None = None,
+    expected_tree_relatives: Sequence[str] | None = None,
+    pin_root: Path | None = None,
+    label: str = "copy source tree",
 ) -> None:
+    tree_root = pin_root or source
+    if (expected_tree_sha256 is None) != (expected_tree_relatives is None):
+        raise BuildError(f"{label} must bind both a tree digest and relative roots")
+    if expected_tree_sha256 is not None:
+        observed = _content_tree_sha256(
+            tree_root, expected_tree_relatives or (), label
+        )
+        if observed != expected_tree_sha256:
+            raise BuildError(f"{label} does not match its runtime tree pin")
     if destination.exists():
         raise BuildError(f"copy destination already exists: {destination}")
-    destination.mkdir(parents=True)
-    for directory, names, files in os.walk(source, topdown=True, followlinks=False):
-        names.sort()
-        files.sort()
-        base = Path(directory)
-        relative = base.relative_to(source)
-        target_base = destination / relative
-        for name in names:
-            item = base / name
-            info = os.lstat(item)
-            if not stat.S_ISDIR(info.st_mode):
-                raise BuildError(f"copy source tree contains a symlink or special path: {item}")
-            (target_base / name).mkdir()
-        for name in files:
-            item = base / name
-            if item.is_symlink():
-                if canonical_runtime_root is None:
-                    raise BuildError(
-                        f"copy source tree contains a symlink: {item}"
+    try:
+        destination.mkdir(parents=True)
+        for directory, names, files in os.walk(source, topdown=True, followlinks=False):
+            names.sort()
+            files.sort()
+            base = Path(directory)
+            relative = base.relative_to(source)
+            target_base = destination / relative
+            for name in names:
+                item = base / name
+                info = os.lstat(item)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise BuildError(f"copy source tree contains a symlink or special path: {item}")
+                (target_base / name).mkdir()
+            for name in files:
+                item = base / name
+                if item.is_symlink():
+                    if canonical_runtime_root is None:
+                        raise BuildError(
+                            f"copy source tree contains a symlink: {item}"
+                        )
+                    _, resolved = _validated_internal_runtime_symlink(
+                        canonical_runtime_root,
+                        item,
+                        "pinned Python runtime",
                     )
-                _, resolved = _validated_internal_runtime_symlink(
-                    canonical_runtime_root,
-                    item,
-                    "pinned Python runtime",
-                )
-                _copy_regular(resolved, target_base / name)
-            else:
-                _copy_regular(item, target_base / name)
+                    _copy_regular(resolved, target_base / name)
+                else:
+                    _copy_regular(item, target_base / name)
+        if expected_tree_sha256 is not None:
+            observed = _content_tree_sha256(
+                tree_root, expected_tree_relatives or (), label
+            )
+            if observed != expected_tree_sha256:
+                raise BuildError(f"{label} changed while its runtime tree was copied")
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
 
 
 def _extract_members(members: Mapping[str, bytes], destination: Path) -> None:
@@ -2605,11 +2806,20 @@ def _build_agent_release(
 ) -> None:
     root.mkdir(parents=True)
     (root / "bin").mkdir()
-    _copy_regular(manifest.python_runtime.root / "bin/python3.11", root / "bin/python3.11")
+    _copy_regular(
+        manifest.python_runtime.root / "bin/python3.11",
+        root / "bin/python3.11",
+        expected_sha256=manifest.python_runtime.binary_sha256,
+        label="pinned Python runtime binary",
+    )
     _copy_tree(
         manifest.python_runtime.root / "lib",
         root / "lib",
         canonical_runtime_root=manifest.python_runtime.root,
+        expected_tree_sha256=manifest.python_runtime.tree_sha256,
+        expected_tree_relatives=("bin/python3.11", "lib"),
+        pin_root=manifest.python_runtime.root,
+        label="pinned Python runtime tree",
     )
     _extract_members(wheel_members, root / "site-packages")
     build = root / "build"
@@ -2695,7 +2905,12 @@ def _build_quota_release(
     publication_id: str,
 ) -> None:
     root.mkdir(parents=True)
-    _copy_regular(manifest.node_runtime.binary, root / "runtime/node")
+    _copy_regular(
+        manifest.node_runtime.binary,
+        root / "runtime/node",
+        expected_sha256=manifest.node_runtime.sha256,
+        label="pinned Node runtime binary",
+    )
     _extract_members(package_members, root / "node_modules/quota-axi")
     for install_path, members in dependency_members.items():
         _extract_members(members, root / install_path)
@@ -3160,18 +3375,49 @@ def _publication_staging_marker(
     publication_id: str,
     final: Path,
     tree_sha256: str,
+    *,
+    allow_incomplete: bool = False,
 ) -> None:
-    marker = _exact_object(
-        _read_strict_json(staging / ".bridge-publication-staging.json", "publication staging marker"),
-        {"schema_version", "publication_id", "final_path", "tree_sha256"},
-        "publication staging marker",
-    )
     expected = {
         "schema_version": 1,
         "publication_id": publication_id,
         "final_path": str(final),
         "tree_sha256": tree_sha256,
     }
+    marker_path = staging / ".bridge-publication-staging.json"
+    if not os.path.lexists(marker_path) and allow_incomplete:
+        payload = (
+            json.dumps(expected, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        temporary = marker_path.with_name(
+            f".{marker_path.name}.bridge-write-{digest[:32]}"
+        )
+        names = {child.name for child in staging.iterdir()}
+        if names - {temporary.name}:
+            raise BuildError(
+                f"unmarked publication staging is not empty: {staging}"
+            )
+        if temporary.name in names:
+            info = os.lstat(temporary)
+            staged = temporary.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o400
+                or len(staged) > len(payload)
+                or not payload.startswith(staged)
+            ):
+                raise BuildError(
+                    f"publication marker staging is not attributable: {temporary}"
+                )
+        return
+    marker = _exact_object(
+        _read_strict_json(marker_path, "publication staging marker"),
+        {"schema_version", "publication_id", "final_path", "tree_sha256"},
+        "publication staging marker",
+    )
     if marker != expected:
         raise BuildError(f"publication staging marker is not attributable: {staging}")
 
@@ -3181,6 +3427,8 @@ def _remove_publication_staging(
     publication_id: str,
     final: Path,
     tree_sha256: str,
+    *,
+    allow_incomplete_marker: bool = False,
 ) -> None:
     try:
         info = os.lstat(staging)
@@ -3192,7 +3440,13 @@ def _remove_publication_staging(
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise BuildError(f"publication staging path is not attributable: {staging}")
-    _publication_staging_marker(staging, publication_id, final, tree_sha256)
+    _publication_staging_marker(
+        staging,
+        publication_id,
+        final,
+        tree_sha256,
+        allow_incomplete=allow_incomplete_marker,
+    )
     _remove_tree(staging)
     _fsync_directory(staging.parent)
 
@@ -3211,7 +3465,7 @@ def _publish_release(
         raise BuildError(f"publication staging path already exists: {staging}")
     staging.mkdir(mode=0o700)
     os.chmod(staging, 0o700)
-    _write_json(
+    _write_json_no_replace(
         staging / ".bridge-publication-staging.json",
         {
             "schema_version": 1,
@@ -3303,6 +3557,8 @@ def _remove_builder_workspace(
     publication_id: str,
     path: Path,
     build_index: int,
+    *,
+    allow_incomplete_marker: bool = False,
 ) -> None:
     try:
         info = os.lstat(path)
@@ -3314,12 +3570,39 @@ def _remove_builder_workspace(
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise BuildError(f"builder workspace is not attributable: {path}")
-    marker = _read_strict_json(
-        path / ".bridge-builder-workspace.json", "builder workspace marker"
-    )
     expected = _workspace_marker_value(
         manifest, publication_id, path, build_index
     )
+    marker_path = path / ".bridge-builder-workspace.json"
+    if not os.path.lexists(marker_path) and allow_incomplete_marker:
+        payload = (
+            json.dumps(expected, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        temporary = marker_path.with_name(
+            f".{marker_path.name}.bridge-write-{digest[:32]}"
+        )
+        names = {child.name for child in path.iterdir()}
+        if names - {temporary.name}:
+            raise BuildError(f"unmarked builder workspace is not empty: {path}")
+        if temporary.name in names:
+            info = os.lstat(temporary)
+            staged = temporary.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o400
+                or len(staged) > len(payload)
+                or not payload.startswith(staged)
+            ):
+                raise BuildError(
+                    f"builder workspace marker staging is not attributable: {path}"
+                )
+        _remove_tree(path)
+        _fsync_directory(path.parent)
+        return
+    marker = _read_strict_json(marker_path, "builder workspace marker")
     if marker != expected:
         raise BuildError(f"builder workspace belongs to another operation: {path}")
     _remove_tree(path)
@@ -3368,7 +3651,13 @@ def _recover_builder_workspaces(
     }:
         raise BuildError("builder workspace journal is not attributable")
     for index, path in enumerate(paths, start=1):
-        _remove_builder_workspace(manifest, publication_id, path, index)
+        _remove_builder_workspace(
+            manifest,
+            publication_id,
+            path,
+            index,
+            allow_incomplete_marker=True,
+        )
     _unlink_file_if_identity(journal_path, journal_identity)
 
 
@@ -3382,7 +3671,7 @@ def _create_builder_workspace(
         raise BuildError(f"builder workspace appeared before creation: {path}")
     path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
-    _write_json(
+    _write_json_no_replace(
         path / ".bridge-builder-workspace.json",
         _workspace_marker_value(manifest, publication_id, path, build_index),
         0o400,
@@ -3556,6 +3845,7 @@ def _recover_interrupted_publication(
             publication_id,
             Path(record["path"]),
             record["tree_sha256"],
+            allow_incomplete_marker=True,
         )
     plan_path = _front_door_plan_path(manifest)
     completed = _proof_matches_publication(manifest, driver, records)
@@ -3567,7 +3857,6 @@ def _recover_interrupted_publication(
         )
         if _read_strict_json(plan_path, "front-door plan") != expected_plan:
             raise BuildError("completed front-door plan does not match its releases")
-        _unlink_file_if_identity(journal_path, journal_identity)
         return True
     if plan_path.exists():
         expected_plan = _front_door_plan(
@@ -4019,7 +4308,7 @@ def _probe_declared_runtime_versions(
     return observed
 
 
-def build(manifest_path: Path) -> Path:
+def _build_locked(manifest_path: Path) -> Path:
     """Build, verify, and publish four previously absent immutable releases."""
     global _ACTIVE_MANIFEST
     manifest = load_manifest(manifest_path, allow_existing_outputs=True)
@@ -4293,7 +4582,6 @@ def build(manifest_path: Path) -> Path:
             proof_info.st_ino,
             _sha256(manifest.proof_manifest),
         )
-        _unlink_file_if_identity(journal_path, journal_identity)
         return manifest.proof_manifest
     except Exception:
         for path, identity in reversed(published):
@@ -4319,6 +4607,46 @@ def build(manifest_path: Path) -> Path:
             _unlink_file_if_identity(
                 workspace_journal_path, workspace_journal_identity
             )
+
+
+def _open_sealed_build_lock(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise BuildError(f"sealed-runtime build lock is not attributable: {path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BuildError("this exact sealed-runtime build is already running") from exc
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def build(manifest_path: Path) -> Path:
+    manifest = load_manifest(manifest_path, allow_existing_outputs=True)
+    lock_path = manifest.proof_manifest.with_name(
+        manifest.proof_manifest.stem + "-builder.lock"
+    )
+    descriptor = _open_sealed_build_lock(lock_path)
+    try:
+        return _build_locked(manifest_path)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

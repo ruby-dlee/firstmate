@@ -9,6 +9,7 @@ consumer/verifier of the resulting package and proof.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -32,6 +33,8 @@ COMMIT = __import__("re").compile(r"^[0-9a-f]{40}$")
 SRI = __import__("re").compile(r"^sha512-[A-Za-z0-9+/]+={0,2}$")
 VERSION = __import__("re").compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9._-]+)?$")
 MAX_SPEC = 1_000_000
+JOURNAL_SCHEMA = 1
+JOURNAL_PHASES = ("planned", "workspace", "package", "proof", "complete")
 
 
 def _canonical(value: Any) -> bytes:
@@ -445,6 +448,199 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _lock_path(scratch: Path, build_id: str) -> Path:
+    return scratch / f".quota-proof-{build_id[:32]}.lock"
+
+
+def _journal_path(scratch: Path, build_id: str) -> Path:
+    return scratch / f".quota-proof-{build_id[:32]}.journal.json"
+
+
+def _open_build_lock(path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ProofError(f"offline-build lock is not attributable: {path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ProofError("an exact-spec Quota offline build is already running") from exc
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _file_identity(path: Path) -> tuple[int, int, str]:
+    info = os.lstat(path)
+    return info.st_dev, info.st_ino, _sha(path)
+
+
+def _replace_owned_json(
+    path: Path,
+    previous: tuple[int, int, str] | None,
+    value: Mapping[str, Any],
+) -> tuple[int, int, str]:
+    payload = _canonical(value)
+    digest = _sha_bytes(payload)
+    staging = path.with_name(f".{path.name}.bridge-swap-{digest[:32]}")
+    if os.path.lexists(staging):
+        info = os.lstat(staging)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ProofError(f"journal staging path is not attributable: {staging}")
+        staged = _regular_bytes(staging, "journal staging")
+        if len(staged) > len(payload) or not payload.startswith(staged):
+            raise ProofError(f"journal staging payload is not attributable: {staging}")
+        staging.unlink()
+        _fsync_directory(staging.parent)
+    if previous is None:
+        if os.path.lexists(path):
+            raise ProofError(f"offline-build journal appeared unexpectedly: {path}")
+    else:
+        if not os.path.lexists(path) or _file_identity(path) != previous:
+            raise ProofError(f"offline-build journal changed concurrently: {path}")
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0:
+                raise ProofError("short write while updating offline-build journal")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if previous is not None and _file_identity(path) != previous:
+        raise ProofError(f"offline-build journal changed before replacement: {path}")
+    os.replace(staging, path)
+    _fsync_directory(path.parent)
+    return _file_identity(path)
+
+
+def _journal_value(
+    *,
+    spec_path: Path,
+    spec_sha256: str,
+    build_id: str,
+    phase: str,
+    workspaces: Sequence[Path],
+    package_path: Path,
+    proof_path: Path,
+    package_sha256: str | None = None,
+    proof_sha256: str | None = None,
+) -> dict[str, Any]:
+    if phase not in JOURNAL_PHASES:
+        raise ProofError(f"invalid offline-build journal phase: {phase}")
+    return {
+        "schema_version": JOURNAL_SCHEMA,
+        "spec_path": str(spec_path),
+        "spec_sha256": spec_sha256,
+        "build_id": build_id,
+        "phase": phase,
+        "workspaces": [str(path) for path in workspaces],
+        "package_path": str(package_path),
+        "proof_path": str(proof_path),
+        "package_sha256": package_sha256,
+        "proof_sha256": proof_sha256,
+    }
+
+
+def _read_owned_journal(path: Path, expected_base: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[int, int, str]]:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise ProofError(f"offline-build journal is not attributable: {path}")
+    value = _strict_json(path, "offline-build journal")
+    if set(value) != {
+        "schema_version", "spec_path", "spec_sha256", "build_id", "phase",
+        "workspaces", "package_path", "proof_path", "package_sha256", "proof_sha256",
+    }:
+        raise ProofError("offline-build journal fields are not exact")
+    for key, expected in expected_base.items():
+        if value.get(key) != expected:
+            raise ProofError("offline-build journal belongs to another build")
+    if value["schema_version"] != JOURNAL_SCHEMA or value["phase"] not in JOURNAL_PHASES:
+        raise ProofError("offline-build journal schema/phase is invalid")
+    for key in ("package_sha256", "proof_sha256"):
+        if value[key] is not None and (
+            not isinstance(value[key], str) or not SHA256.fullmatch(value[key])
+        ):
+            raise ProofError(f"offline-build journal {key} is invalid")
+    return value, (info.st_dev, info.st_ino, _sha(path))
+
+
+def _unlink_exact_output(path: Path, expected_sha256: str | None) -> None:
+    if not os.path.lexists(path):
+        return
+    if expected_sha256 is None:
+        raise ProofError(f"offline-build output exists before it was planned: {path}")
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or _sha(path) != expected_sha256
+    ):
+        raise ProofError(f"offline-build output is not attributable: {path}")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _recover_journal_state(
+    journal: Mapping[str, Any],
+    markers: Sequence[Mapping[str, Any]],
+) -> bool:
+    workspaces = [Path(value) for value in journal["workspaces"]]
+    for path, marker in zip(workspaces, markers, strict=True):
+        _recover_workspace(path, marker)
+    package = Path(journal["package_path"])
+    proof = Path(journal["proof_path"])
+    if journal["phase"] == "complete":
+        for path, digest in (
+            (package, journal["package_sha256"]),
+            (proof, journal["proof_sha256"]),
+        ):
+            if digest is None or not os.path.lexists(path):
+                raise ProofError("completed offline-build journal has missing output")
+            info = os.lstat(path)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or _sha(path) != digest
+            ):
+                raise ProofError("completed offline-build output drifted")
+        return True
+    _unlink_exact_output(proof, journal["proof_sha256"])
+    _unlink_exact_output(package, journal["package_sha256"])
+    return False
+
+
 def _workspace_marker(
     spec_path: Path,
     spec_sha256: str,
@@ -477,13 +673,57 @@ def _remove_workspace(path: Path, expected: Mapping[str, Any]) -> None:
     _fsync_directory(path.parent)
 
 
+def _recover_workspace(path: Path, expected: Mapping[str, Any]) -> None:
+    """Remove only a journal-planned workspace, including pre-marker crashes."""
+
+    if not os.path.lexists(path):
+        return
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise ProofError(f"offline-build workspace is not attributable: {path}")
+    marker = path / ".bridge-quota-build-workspace.json"
+    marker_payload = _canonical(expected)
+    marker_digest = _sha_bytes(marker_payload)
+    marker_staging = marker.with_name(
+        f".{marker.name}.bridge-write-{marker_digest[:32]}"
+    )
+    names = {child.name for child in path.iterdir()}
+    if marker.name in names:
+        if _strict_json(marker, "workspace marker") != expected:
+            raise ProofError(f"offline-build workspace belongs to another build: {path}")
+    else:
+        allowed = {marker_staging.name}
+        if names - allowed:
+            raise ProofError(
+                f"offline-build workspace has no ownership marker and is not empty: {path}"
+            )
+        if marker_staging.name in names:
+            staged = _regular_bytes(marker_staging, "workspace marker staging")
+            staged_info = os.lstat(marker_staging)
+            if (
+                staged_info.st_uid != os.getuid()
+                or staged_info.st_nlink != 1
+                or stat.S_IMODE(staged_info.st_mode) != 0o400
+                or len(staged) > len(marker_payload)
+                or not marker_payload.startswith(staged)
+            ):
+                raise ProofError(
+                    f"offline-build workspace marker staging is not attributable: {path}"
+                )
+    shutil.rmtree(path)
+    _fsync_directory(path.parent)
+
+
 def _create_workspace(path: Path, marker: Mapping[str, Any]) -> None:
     if path.exists() or path.is_symlink():
         raise ProofError(f"offline-build workspace already exists: {path}")
     path.mkdir(mode=0o700)
     marker_path = path / ".bridge-quota-build-workspace.json"
-    marker_path.write_bytes(_canonical(marker))
-    marker_path.chmod(0o400)
+    _publish_bytes_no_replace(marker_path, _canonical(marker), 0o400)
     _fsync_directory(path)
 
 
@@ -746,8 +986,6 @@ def build(spec_path: Path) -> tuple[Path, Path]:
     proof_path = _path(raw["proof"], "proof", absent=True)
     _safe_ancestry(package_path.parent, "package_tarball output")
     _safe_ancestry(proof_path.parent, "proof output")
-    if package_path.exists() or proof_path.exists():
-        raise ProofError("output package/proof must be absent")
     scratch = _path(raw["scratch_parent"], "scratch_parent")
     if not scratch.is_dir() or scratch.is_symlink():
         raise ProofError("scratch_parent must be a real directory")
@@ -764,14 +1002,72 @@ def build(spec_path: Path) -> tuple[Path, Path]:
         _workspace_marker(spec_path, spec_sha256, path, index)
         for index, path in enumerate(workspaces, start=1)
     )
-    for path, marker in zip(workspaces, markers, strict=True):
-        _remove_workspace(path, marker)
+    journal_path = _journal_path(scratch, build_id)
+    lock_descriptor = _open_build_lock(_lock_path(scratch, build_id))
+    expected_journal = {
+        "schema_version": JOURNAL_SCHEMA,
+        "spec_path": str(spec_path),
+        "spec_sha256": spec_sha256,
+        "build_id": build_id,
+        "workspaces": [str(path) for path in workspaces],
+        "package_path": str(package_path),
+        "proof_path": str(proof_path),
+    }
     created: list[tuple[Path, Mapping[str, Any]]] = []
-    published_package: tuple[int, int, str] | None = None
+    journal: dict[str, Any] | None = None
+    journal_identity: tuple[int, int, str] | None = None
     try:
+        if os.path.lexists(journal_path):
+            journal, journal_identity = _read_owned_journal(
+                journal_path, expected_journal
+            )
+            if _recover_journal_state(journal, markers):
+                return package_path, proof_path
+            journal = _journal_value(
+                spec_path=spec_path,
+                spec_sha256=spec_sha256,
+                build_id=build_id,
+                phase="planned",
+                workspaces=workspaces,
+                package_path=package_path,
+                proof_path=proof_path,
+            )
+            journal_identity = _replace_owned_json(
+                journal_path, journal_identity, journal
+            )
+        else:
+            if package_path.exists() or package_path.is_symlink() or proof_path.exists() or proof_path.is_symlink():
+                raise ProofError("output package/proof exists without an attributable journal")
+            for path in workspaces:
+                if os.path.lexists(path):
+                    raise ProofError(
+                        f"offline-build workspace exists without an ownership journal: {path}"
+                    )
+            journal = _journal_value(
+                spec_path=spec_path,
+                spec_sha256=spec_sha256,
+                build_id=build_id,
+                phase="planned",
+                workspaces=workspaces,
+                package_path=package_path,
+                proof_path=proof_path,
+            )
+            journal_identity = _replace_owned_json(journal_path, None, journal)
         for path, marker in zip(workspaces, markers, strict=True):
             _create_workspace(path, marker)
             created.append((path, marker))
+        journal = _journal_value(
+            spec_path=spec_path,
+            spec_sha256=spec_sha256,
+            build_id=build_id,
+            phase="workspace",
+            workspaces=workspaces,
+            package_path=package_path,
+            proof_path=proof_path,
+        )
+        journal_identity = _replace_owned_json(
+            journal_path, journal_identity, journal
+        )
         builds = []
         for path in workspaces:
             builds.append(
@@ -886,15 +1182,55 @@ def build(spec_path: Path) -> tuple[Path, Path]:
             "member_maps_match": True,
             "tar_digests_match": True,
         }
-        published_package = _publish_bytes_no_replace(package_path, first_tar.read_bytes())
-        _publish_bytes_no_replace(proof_path, _canonical(proof))
-    except Exception:
-        if published_package is not None:
-            _unlink_owned(package_path, published_package)
-        raise
-    finally:
+        package_payload = first_tar.read_bytes()
+        proof_payload = _canonical(proof)
+        package_digest = _sha_bytes(package_payload)
+        proof_digest = _sha_bytes(proof_payload)
+        journal = _journal_value(
+            spec_path=spec_path,
+            spec_sha256=spec_sha256,
+            build_id=build_id,
+            phase="package",
+            workspaces=workspaces,
+            package_path=package_path,
+            proof_path=proof_path,
+            package_sha256=package_digest,
+            proof_sha256=proof_digest,
+        )
+        journal_identity = _replace_owned_json(
+            journal_path, journal_identity, journal
+        )
+        _publish_bytes_no_replace(package_path, package_payload)
+        journal = {**journal, "phase": "proof"}
+        journal_identity = _replace_owned_json(
+            journal_path, journal_identity, journal
+        )
+        _publish_bytes_no_replace(proof_path, proof_payload)
+        journal = {**journal, "phase": "complete"}
+        journal_identity = _replace_owned_json(
+            journal_path, journal_identity, journal
+        )
         for path, marker in reversed(created):
             _remove_workspace(path, marker)
+        created.clear()
+    except Exception:
+        if journal is not None:
+            _recover_journal_state(journal, markers)
+            planned = _journal_value(
+                spec_path=spec_path,
+                spec_sha256=spec_sha256,
+                build_id=build_id,
+                phase="planned",
+                workspaces=workspaces,
+                package_path=package_path,
+                proof_path=proof_path,
+            )
+            if journal_identity is not None:
+                _replace_owned_json(journal_path, journal_identity, planned)
+        raise
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
     return package_path, proof_path
 
 

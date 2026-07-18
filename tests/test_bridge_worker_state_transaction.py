@@ -339,6 +339,28 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), '{"foreign":true}')
         self.assertEqual(list(target_worker.home.glob(".*.restore-*")), [])
 
+    def test_rollback_preserves_foreign_state_arriving_at_exchange_syscall(self) -> None:
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        target_worker = next(
+            value for value in self.manifest.workers if value.profile == "claude-1"
+        )
+        target = target_worker.home / ".claude.json"
+
+        class ChangeAtExchange(worker_state.BoundaryController):
+            def hit(self, label: str) -> None:
+                super().hit(label)
+                if label == "immediately_before_exchange:worker:claude-1:.claude.json":
+                    target.write_text('{"foreign-at-syscall":true}', encoding="utf-8")
+                    target.chmod(0o600)
+
+        with self.assertRaisesRegex(worker_state.WorkerStateError, "not attributable"):
+            worker_state.rollback(self.manifest, ChangeAtExchange())
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), '{"foreign-at-syscall":true}'
+        )
+        self.assertEqual(list(target_worker.home.glob(".*.restore-*")), [])
+
     def test_manifest_rejects_worker_overlap_with_candidate_release(self) -> None:
         raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         worker = next(value for value in raw["workers"] if value["profile"] == "claude-1")

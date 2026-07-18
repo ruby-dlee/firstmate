@@ -554,6 +554,34 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuildError, "proof fields are not exact"):
             builder._validate_quota_inputs(role, source)
 
+    def test_copy_regular_rebinds_the_expected_runtime_digest(self) -> None:
+        source = self.root / "runtime-source"
+        destination = self.root / "runtime-copy"
+        source.write_bytes(b"substituted-same-version-runtime")
+        with self.assertRaisesRegex(builder.BuildError, "runtime pin"):
+            builder._copy_regular(
+                source,
+                destination,
+                expected_sha256=hashlib.sha256(b"pinned-runtime").hexdigest(),
+                label="runtime pin",
+            )
+        self.assertFalse(destination.exists())
+
+    def test_copy_tree_rebinds_the_expected_runtime_tree(self) -> None:
+        source = self.root / "runtime-tree-source"
+        source.mkdir()
+        (source / "stdlib.py").write_bytes(b"substituted")
+        destination = self.root / "runtime-tree-copy"
+        with self.assertRaisesRegex(builder.BuildError, "runtime tree pin"):
+            builder._copy_tree(
+                source,
+                destination,
+                expected_tree_sha256="0" * 64,
+                expected_tree_relatives=(".",),
+                label="runtime tree pin",
+            )
+        self.assertFalse(destination.exists())
+
     def test_agent_wheel_rejects_recorded_importable_extra(self) -> None:
         package_files = {
             "agent_fleet/__init__.py": b"",
@@ -808,7 +836,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
                 staging,
                 "1" * 64,
             )
-        rename_index = events.index("rename")
+        rename_index = max(index for index, event in enumerate(events) if event == "rename")
         self.assertEqual(
             events[rename_index : rename_index + 3],
             ["rename", "release-fsync", "parent-fsync"],
@@ -910,6 +938,40 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         builder._recover_builder_workspaces(manifest, publication_id)
         self.assertFalse(journal_path.exists())
         self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_workspace_recovery_handles_sigkill_before_marker_publication(self) -> None:
+        manifest = builder.load_manifest(self.fixture.path)
+        publication_id = hashlib.sha256(
+            b"bridge-sealed-publication-v2\0"
+            + manifest.manifest_sha256.encode("ascii")
+        ).hexdigest()
+        paths = builder._workspace_paths(manifest, publication_id)
+        journal_path = builder._workspace_journal_path(manifest)
+        builder._write_json_no_replace(
+            journal_path,
+            {
+                "schema_version": 1,
+                "manifest_sha256": manifest.manifest_sha256,
+                "publication_id": publication_id,
+                "live_references_changed": False,
+                "workspaces": [str(path) for path in paths],
+            },
+            0o600,
+        )
+        paths[0].mkdir(mode=0o700)
+        builder._recover_builder_workspaces(manifest, publication_id)
+        self.assertFalse(journal_path.exists())
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_exact_build_lock_refuses_concurrent_consumer(self) -> None:
+        lock = self.root / "sealed-builder.lock"
+        descriptor = builder._open_sealed_build_lock(lock)
+        try:
+            with self.assertRaisesRegex(builder.BuildError, "already running"):
+                builder._open_sealed_build_lock(lock)
+        finally:
+            builder.fcntl.flock(descriptor, builder.fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def test_bootstrap_is_exact_consumer_contract(self) -> None:
         expected = (

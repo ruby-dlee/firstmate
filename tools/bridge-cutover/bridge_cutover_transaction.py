@@ -13,6 +13,8 @@ runtime symlinks it is intended to switch are themselves in transition.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -1084,6 +1086,108 @@ def _temp_path(path: Path, transaction_id: str, purpose: str) -> Path:
     return path.with_name(f".{path.name}.{transaction_id}.{purpose}.tmp")
 
 
+def _rename_exchange(source: Path, destination: Path) -> None:
+    """Atomically exchange two existing paths or fail closed.
+
+    A normal rename cannot implement compare-and-swap: a foreign object can
+    arrive after the final observation and be overwritten.  Exchange retains
+    the displaced live object at ``source`` so it can be authenticated before
+    anything is deleted.
+    """
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        function = libc.renamex_np
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(source_bytes, destination_bytes, 0x00000002)  # RENAME_SWAP
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(-100, source_bytes, -100, destination_bytes, 0x2)
+    else:
+        raise CutoverError("atomic path exchange is unavailable on this platform")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise CutoverError(
+            f"atomic path exchange failed for {source} and {destination}: "
+            f"{os.strerror(error)}"
+        )
+
+
+def _operation_path_matches(operation: Operation, path: Path, state: str) -> bool:
+    try:
+        if isinstance(operation, SymlinkOperation):
+            info = os.lstat(path)
+            target = operation.old_target if state == "old" else operation.new_target
+            return stat.S_ISLNK(info.st_mode) and os.readlink(path) == target
+        digest = operation.old_sha256 if state == "old" else operation.new_sha256
+        return (
+            _sha256_file(
+                path,
+                label=f"{operation.name} {state} exchange object",
+                expected_mode=operation.mode,
+            )
+            == digest
+        )
+    except (FileNotFoundError, CutoverError, OSError):
+        return False
+
+
+def _unlink_authenticated_operation_path(
+    operation: Operation, path: Path, state: str
+) -> None:
+    if not _operation_path_matches(operation, path, state):
+        raise CutoverError(
+            f"{operation.name} displaced live state is not exact {state} state"
+        )
+    os.unlink(path)
+
+
+def _recover_displaced_operation_temps(
+    manifest: Manifest, boundaries: BoundaryController
+) -> None:
+    """Finish only an exact exchange whose process died before displaced cleanup."""
+
+    for operation in manifest.operations:
+        for direction, staged, displaced in (
+            ("forward", "new", "old"),
+            ("rollback", "old", "new"),
+        ):
+            temp = _temp_path(operation.path, manifest.transaction_id, direction)
+            if not os.path.lexists(temp):
+                continue
+            if _operation_path_matches(operation, temp, staged):
+                # Prepared but not exchanged; the normal operation will reuse it.
+                continue
+            if not (
+                _operation_path_matches(operation, temp, displaced)
+                and _operation_path_matches(operation, operation.path, staged)
+            ):
+                requirement = (
+                    "an exact expected staged symlink"
+                    if isinstance(operation, SymlinkOperation)
+                    else "an exact staged regular file with exactly one hard link"
+                )
+                raise CutoverError(
+                    f"{operation.name} has an ambiguous displaced exchange artifact; "
+                    f"expected {requirement}: {temp}"
+                )
+            boundaries.hit(f"before_recover_displaced:{direction}:{operation.name}")
+            _unlink_authenticated_operation_path(operation, temp, displaced)
+            _fsync_directory(temp.parent)
+            boundaries.hit(f"after_recover_displaced:{direction}:{operation.name}")
+
+
 def _verify_temp_regular(
     path: Path, label: str, modes: int | tuple[int, ...] = 0o600
 ) -> None:
@@ -1742,7 +1846,22 @@ def _replace_symlink(
         raise CutoverError(
             f"{operation.name} changed immediately before replacement"
         )
-    os.replace(temp, operation.path)
+    boundaries.hit(f"immediately_before_exchange:{direction}:{operation.name}")
+    _rename_exchange(temp, operation.path)
+    boundaries.hit(f"after_exchange:{direction}:{operation.name}")
+    try:
+        _unlink_authenticated_operation_path(operation, temp, expected_current)
+    except CutoverError as exc:
+        try:
+            _rename_exchange(temp, operation.path)
+            _fsync_directory(operation.path.parent)
+        except CutoverError as restore_exc:
+            raise CutoverError(
+                f"{operation.name} displaced live state is ambiguous and could not be restored"
+            ) from restore_exc
+        raise CutoverError(
+            f"{operation.name} displaced live state changed at the exchange syscall"
+        ) from exc
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
     _fsync_directory(operation.path.parent)
@@ -1849,7 +1968,22 @@ def _replace_regular_file(
         raise CutoverError(
             f"{operation.name} changed immediately before replacement"
         )
-    os.replace(temp, operation.path)
+    boundaries.hit(f"immediately_before_exchange:{direction}:{operation.name}")
+    _rename_exchange(temp, operation.path)
+    boundaries.hit(f"after_exchange:{direction}:{operation.name}")
+    try:
+        _unlink_authenticated_operation_path(operation, temp, expected_current)
+    except CutoverError as exc:
+        try:
+            _rename_exchange(temp, operation.path)
+            _fsync_directory(operation.path.parent)
+        except CutoverError as restore_exc:
+            raise CutoverError(
+                f"{operation.name} displaced live state is ambiguous and could not be restored"
+            ) from restore_exc
+        raise CutoverError(
+            f"{operation.name} displaced live state changed at the exchange syscall"
+        ) from exc
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
     _fsync_directory(operation.path.parent)
@@ -1903,6 +2037,7 @@ def _execute_locked(
     if direction not in ("forward", "rollback"):
         raise ValueError("direction must be forward or rollback")
     boundary_controller = boundaries or BoundaryController()
+    _recover_displaced_operation_temps(manifest, boundary_controller)
     states, prefix_new, loaded_journal = _observe_load_and_seal(
         manifest, boundary_controller
     )

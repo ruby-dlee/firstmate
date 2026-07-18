@@ -632,7 +632,7 @@ class CutoverPreparationFixture:
                 #include <string.h>
                 int main(int argc, char **argv) {{
                     if (argc == 2 && strcmp(argv[1], "--version") == 0) {{
-                        puts("v22.4.1");
+                        puts("v20.19.0");
                         return 0;
                     }}
                     const char *blocked[] = {{
@@ -667,7 +667,7 @@ class CutoverPreparationFixture:
         wrapper_source = release / "build" / "quota-axi-launcher.c"
         wrapper_source.write_text(
             textwrap.dedent(
-                f"""\
+                f"""{''}\
                 #include <limits.h>
                 #include <stdio.h>
                 #include <stdlib.h>
@@ -797,6 +797,21 @@ class CutoverPreparationFixture:
             + "\n",
             encoding="utf-8",
         )
+        quota_build_proof = release / "build" / "quota-build-proof.json"
+        quota_build_proof.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "quota-axi-offline-deterministic-build",
+                    "role": "candidate" if version == "0.1.7" else "rollback",
+                    "version": version,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         (release / "build" / "provenance.json").write_text(
             json.dumps(
                 {
@@ -826,6 +841,10 @@ class CutoverPreparationFixture:
                             "path": str(runtime_manifest.relative_to(release)),
                             "sha256": prepare._sha256(runtime_manifest),
                         },
+                        "quota_build_proof": {
+                            "path": str(quota_build_proof.relative_to(release)),
+                            "sha256": prepare._sha256(quota_build_proof),
+                        },
                     },
                 },
                 indent=2,
@@ -837,6 +856,123 @@ class CutoverPreparationFixture:
     def _create_agent_build_manifests(self) -> None:
         driver = prepare._load_driver(DRIVER)
         self.agent_build_manifest = self.root / "sealed-runtime-proof-manifest.json"
+        builder_path = SCRIPT_DIR / "build_sealed_bridge_runtimes.py"
+        bootstrap_path = SCRIPT_DIR / "sealed_agent_fleet_bootstrap.py"
+        pinned_python = self.root / "pinned-python"
+        (pinned_python / "bin").mkdir(parents=True)
+        (pinned_python / "lib").mkdir()
+        (pinned_python / "bin/python3.11").write_bytes(
+            (self.agent_new / "bin/python3.11").read_bytes()
+        )
+        (pinned_python / "bin/python3.11").chmod(0o700)
+        (pinned_python / "lib/stdlib.py").write_text(
+            "# pinned fixture stdlib\n", encoding="utf-8"
+        )
+        python_tree_sha256 = prepare._runtime_source_tree_sha256(pinned_python)
+        python_transformations = prepare._runtime_transformations(pinned_python)
+        pinned_node = self.root / "pinned-node"
+        pinned_node.write_bytes((self.quota_new / "runtime/node").read_bytes())
+        pinned_node.chmod(0o700)
+        agent_source = self.root / "retained-agent-source"
+        quota_source = self.root / "retained-quota-source"
+        agent_source.mkdir(mode=0o700)
+        quota_source.mkdir(mode=0o700)
+        quota_packages: dict[str, Path] = {}
+        for role_name in ("candidate", "rollback"):
+            package = self.root / f"quota-{role_name}.tgz"
+            package.write_bytes(f"quota-{role_name}\n".encode("utf-8"))
+            quota_packages[role_name] = package
+        system_tools = {
+            name: {
+                "path": f"/usr/bin/{name}",
+                "sha256": prepare._sha256(
+                    Path(f"/usr/bin/{name}"), allow_root_hardlinks=True
+                ),
+            }
+            for name in ("clang", "codesign", "file", "git", "otool", "xattr")
+        }
+        driver_pin = {"path": str(DRIVER), "sha256": prepare._sha256(DRIVER)}
+        builder_input = {
+            "schema_version": 2,
+            "output_root": str(self.root),
+            "proof_manifest": str(self.agent_build_manifest),
+            "operator_front_door": str(self.operator_front_door),
+            "transaction_driver": driver_pin,
+            "tools": system_tools,
+            "python_runtime": {
+                "root": str(pinned_python),
+                "version": "3.11.14",
+                "binary_sha256": prepare._sha256(
+                    pinned_python / "bin/python3.11"
+                ),
+                "tree_sha256": python_tree_sha256,
+            },
+            "node_runtime": {
+                "binary": str(pinned_node),
+                "version": "20.19.0",
+                "sha256": prepare._sha256(pinned_node),
+            },
+            "agent_fleet": {
+                "candidate": {
+                    "role": "candidate",
+                    "release_path": str(self.agent_new.relative_to(self.root)),
+                    "version": "0.2.0",
+                    "contract_version": 2,
+                    "source_repo": str(agent_source),
+                    "source_commit": "a" * 40,
+                    "source_tree_sha256": "9" * 64,
+                    "source_subdirectory": ".",
+                    "wheel": str(self.agent_new / "build/source.whl"),
+                    "wheel_sha256": prepare._sha256(
+                        self.agent_new / "build/source.whl"
+                    ),
+                },
+                "rollback": {
+                    "role": "rollback",
+                    "release_path": str(self.agent_old.relative_to(self.root)),
+                    "version": "0.1.5",
+                    "contract_version": 1,
+                    "source_repo": str(agent_source),
+                    "source_commit": "b" * 40,
+                    "source_tree_sha256": "9" * 64,
+                    "source_subdirectory": ".",
+                    "wheel": str(self.agent_old / "build/source.whl"),
+                    "wheel_sha256": prepare._sha256(
+                        self.agent_old / "build/source.whl"
+                    ),
+                },
+            },
+            "quota_axi": {},
+        }
+        for role_name, release, version, commit, tree in (
+            ("candidate", self.quota_new, "0.1.7", "c" * 40, "e" * 64),
+            ("rollback", self.quota_old, "0.1.5", "d" * 40, "f" * 64),
+        ):
+            builder_input["quota_axi"][role_name] = {
+                "role": role_name,
+                "release_path": str(release.relative_to(self.root)),
+                "version": version,
+                "source_repo": str(quota_source),
+                "source_commit": commit,
+                "source_tree_sha256": tree,
+                "package_tarball": str(quota_packages[role_name]),
+                "package_sha256": prepare._sha256(quota_packages[role_name]),
+                "package_lock": str(release / "package-lock.json"),
+                "package_lock_sha256": prepare._sha256(
+                    release / "package-lock.json"
+                ),
+                "build_proof": str(release / "build/quota-build-proof.json"),
+                "build_proof_sha256": prepare._sha256(
+                    release / "build/quota-build-proof.json"
+                ),
+                "dependencies": [],
+            }
+        self.builder_input_manifest = self.root / "sealed-runtime-builder-input.json"
+        self.builder_input_manifest.write_text(
+            json.dumps(builder_input, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.builder_input_manifest.chmod(0o600)
 
         def generic_proof(root: Path, relative: str) -> dict[str, object]:
             value = driver.compute_release_proof(root, relative)
@@ -878,6 +1014,8 @@ class CutoverPreparationFixture:
                         "version": version,
                         "source_commit": commit,
                         "source_tree_sha256": "9" * 64,
+                        "python_runtime_source_tree_sha256": python_tree_sha256,
+                        "python_runtime_transformations": python_transformations,
                         "artifacts": {
                             "launcher": {
                                 "path": str(launcher.relative_to(root)),
@@ -979,8 +1117,6 @@ class CutoverPreparationFixture:
         ) -> dict[str, object]:
             launcher = root / "bin" / "quota-axi"
             source = root / "build" / "quota-axi-launcher.c"
-            node = root / "runtime" / "node"
-            entrypoint = root / "node_modules/quota-axi/dist/bin/quota-axi.js"
             lock = root / "package-lock.json"
             provenance = root / "build" / "provenance.json"
             runtime_manifest = root / "build" / "runtime-closure.json"
@@ -1029,7 +1165,7 @@ class CutoverPreparationFixture:
                 },
                 "node": {
                     **node_proof,
-                    "version": "22.4.1",
+                    "version": "20.19.0",
                     "signature_state": "contained-internal-unchanged",
                     "operational": False,
                 },
@@ -1108,12 +1244,85 @@ class CutoverPreparationFixture:
             "package-lock.json",
             "build/quota-axi-launcher.c",
             "build/provenance.json",
+            "build/quota-build-proof.json",
             "build/runtime-closure.json",
         ]
+        canonical_builder_input = (
+            json.dumps(
+                builder_input, indent=2, sort_keys=True, ensure_ascii=False
+            )
+            + "\n"
+        ).encode("utf-8")
+        build_inputs = {
+            "schema_version": 1,
+            "manifest_path": str(self.builder_input_manifest),
+            "manifest": builder_input,
+            "manifest_sha256": prepare._sha256(self.builder_input_manifest),
+            "manifest_canonical_sha256": hashlib.sha256(
+                canonical_builder_input
+            ).hexdigest(),
+            "builder": {
+                "path": str(builder_path),
+                "sha256": prepare._sha256(builder_path),
+            },
+            "bootstrap": {
+                "path": str(bootstrap_path),
+                "sha256": prepare._sha256(bootstrap_path),
+            },
+            "transaction_driver": driver_pin,
+            "tools": system_tools,
+            "python_runtime": {
+                "root": str(pinned_python),
+                "version": "3.11.14",
+                "binary_sha256": prepare._sha256(
+                    pinned_python / "bin/python3.11"
+                ),
+                "source_tree_sha256": python_tree_sha256,
+                "transformations": python_transformations,
+            },
+            "node_runtime": {
+                "path": str(pinned_node),
+                "version": "20.19.0",
+                "sha256": prepare._sha256(pinned_node),
+            },
+            "agent_fleet": {
+                role_name: {
+                    key: builder_input["agent_fleet"][role_name][key]
+                    for key in (
+                        "source_repo",
+                        "source_commit",
+                        "source_tree_sha256",
+                        "source_subdirectory",
+                        "wheel",
+                        "wheel_sha256",
+                    )
+                }
+                for role_name in ("candidate", "rollback")
+            },
+            "quota_axi": {
+                role_name: {
+                    key: builder_input["quota_axi"][role_name][key]
+                    for key in (
+                        "source_repo",
+                        "source_commit",
+                        "source_tree_sha256",
+                        "package_tarball",
+                        "package_sha256",
+                        "package_lock",
+                        "package_lock_sha256",
+                        "build_proof",
+                        "build_proof_sha256",
+                        "dependencies",
+                    )
+                }
+                for role_name in ("candidate", "rollback")
+            },
+        }
         self.agent_build_manifest.write_text(
             json.dumps(
                 {
                     "schema_version": 2,
+                    "build_inputs": build_inputs,
                     "agent_fleet_candidate": agent_record(
                         self.agent_new, "candidate", "0.2.0", 2, "a" * 40,
                         agent_candidate_proofs,
@@ -1140,6 +1349,16 @@ class CutoverPreparationFixture:
                         "tree_hashes_match": True,
                         "relocated_hashes_match": True,
                         "known_exclusions": [],
+                    },
+                    "runtime_versions": {
+                        "schema_version": 1,
+                        "closed_environment": True,
+                        "observed": {
+                            "agent_fleet_candidate": "Python 3.11.14",
+                            "agent_fleet_rollback": "Python 3.11.14",
+                            "quota_axi_candidate": "v20.19.0",
+                            "quota_axi_rollback": "v20.19.0",
+                        },
                     },
                 }
             ),
@@ -1231,6 +1450,7 @@ class CutoverPreparationFixture:
             "package-lock.json",
             "build/quota-axi-launcher.c",
             "build/provenance.json",
+            "build/quota-build-proof.json",
             "build/runtime-closure.json",
         ]
         return {
@@ -1331,7 +1551,7 @@ class CutoverPreparationFixture:
                 "runtime_manifest": str(
                     self.quota_new / "build" / "runtime-closure.json"
                 ),
-                "node_version": "22.4.1",
+                "node_version": "20.19.0",
                 "binary": str(self.quota_new / "bin" / "quota-axi"),
                 "package_json": str(
                     self.quota_new / "node_modules" / "quota-axi" / "package.json"
@@ -1363,7 +1583,7 @@ class CutoverPreparationFixture:
                     self.quota_old / "node_modules" / "quota-axi" / "package.json"
                 ),
                 "rollback_package_lock": str(self.quota_old / "package-lock.json"),
-                "rollback_node_version": "22.4.1",
+                "rollback_node_version": "20.19.0",
                 "rollback_version": "0.1.5",
                 "rollback_source_commit": "d" * 40,
                 "legacy_registry_binary": str(self.quota_initial_js),
@@ -1547,6 +1767,44 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         self.assertNotIn("claude-3", json.dumps(worker_manifest, sort_keys=True))
         self.assertNotIn("codex-5", json.dumps(worker_manifest, sort_keys=True))
         self.assertEqual(result["worker_state_phase"], "not-started")
+
+    def test_prepare_recovers_attributed_deterministic_staging(self) -> None:
+        spec = prepare.load_spec(self.fixture.spec_path)
+        staging = spec.output_dir.parent / (
+            f".{spec.output_dir.name}.prepare-"
+            f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+        )
+        marker = prepare._preparation_staging_marker(
+            staging, spec, self.fixture.spec_path, DRIVER
+        )
+        staging.mkdir(mode=0o700)
+        prepare._write_json(
+            staging / ".bridge-preparation-staging.json", marker, 0o600
+        )
+        (staging / "partial").write_bytes(b"interrupted")
+        result = self.fixture.prepare()
+        self.assertTrue(result["valid"])
+        self.assertFalse(staging.exists())
+
+    def test_prepare_refuses_foreign_deterministic_staging(self) -> None:
+        spec = prepare.load_spec(self.fixture.spec_path)
+        staging = spec.output_dir.parent / (
+            f".{spec.output_dir.name}.prepare-"
+            f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+        )
+        staging.mkdir(mode=0o700)
+        prepare._write_json(
+            staging / ".bridge-preparation-staging.json",
+            {"schema_version": 1, "foreign": True},
+            0o600,
+        )
+        sentinel = staging / "foreign-sentinel"
+        sentinel.write_bytes(b"preserve")
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "belongs to another operation"
+        ):
+            self.fixture.prepare()
+        self.assertEqual(sentinel.read_bytes(), b"preserve")
 
     def test_prepare_refuses_disqualified_quota_candidate(self) -> None:
         self.fixture.spec["quota"]["expected_version"] = "0.1.6"
@@ -1861,7 +2119,10 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         payload = json.loads(lock.read_text(encoding="utf-8"))
         payload["packages"][""]["dependencies"]["quota-axi"] = "^0.1.7"
         lock.write_text(json.dumps(payload), encoding="utf-8")
-        with self.assertRaisesRegex(prepare.PreparationError, "tree_sha256|exact version pin"):
+        with self.assertRaisesRegex(
+            prepare.PreparationError,
+            "retained quota_axi candidate package_lock digest changed|tree_sha256|exact version pin",
+        ):
             self.fixture.prepare()
 
     def test_prepare_refuses_nonexact_agent_fleet_launcher(self) -> None:

@@ -19,7 +19,9 @@ import argparse
 import base64
 import copy
 import csv
+import ctypes
 import dataclasses
+import errno as errno_module
 import hashlib
 import importlib
 import importlib.util
@@ -33,7 +35,6 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -359,6 +360,7 @@ def _require_regular(
     *,
     mode: int | None = None,
     executable: bool = False,
+    allow_root_hardlinks: bool = False,
 ) -> None:
     try:
         info = os.lstat(path)
@@ -366,7 +368,7 @@ def _require_regular(
         raise PreparationError(f"{label} does not exist: {path}") from exc
     if not stat.S_ISREG(info.st_mode):
         raise PreparationError(f"{label} must be a regular non-symlink file: {path}")
-    if info.st_nlink != 1:
+    if info.st_nlink != 1 and not (allow_root_hardlinks and info.st_uid == 0):
         raise PreparationError(f"{label} must have exactly one hard link: {path}")
     _canonical(path, label)
     observed_mode = stat.S_IMODE(info.st_mode)
@@ -395,8 +397,10 @@ def _require_within(path: Path, root: Path, label: str) -> str:
     return str(path.relative_to(root))
 
 
-def _sha256(path: Path) -> str:
-    _require_regular(path, "SHA-256 input")
+def _sha256(path: Path, *, allow_root_hardlinks: bool = False) -> str:
+    _require_regular(
+        path, "SHA-256 input", allow_root_hardlinks=allow_root_hardlinks
+    )
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -2048,6 +2052,7 @@ def _validate_quota_role(
         "runtime manifest": root / "build" / "runtime-closure.json",
         "package.json": root / "node_modules/quota-axi/package.json",
         "package-lock.json": root / "package-lock.json",
+        "Quota build proof": root / "build" / "quota-build-proof.json",
     }
     observed_paths = {
         "binary": binary,
@@ -2058,6 +2063,7 @@ def _validate_quota_role(
         "runtime manifest": runtime_manifest,
         "package.json": package_json,
         "package-lock.json": package_lock,
+        "Quota build proof": root / "build" / "quota-build-proof.json",
     }
     for name, expected in expected_paths.items():
         observed = observed_paths[name]
@@ -2082,6 +2088,10 @@ def _validate_quota_role(
     _require_regular(runtime_manifest, f"{label} runtime closure manifest")
     _require_regular(package_json, f"{label} package.json")
     _require_regular(package_lock, f"{label} package-lock.json")
+    _require_regular(
+        root / "build" / "quota-build-proof.json",
+        f"{label} Quota deterministic build proof",
+    )
 
     required_proofs = {
         str(path.relative_to(root))
@@ -2094,6 +2104,7 @@ def _validate_quota_role(
             runtime_manifest,
             package_json,
             package_lock,
+            root / "build" / "quota-build-proof.json",
         )
     }
     missing = required_proofs - set(proof_paths)
@@ -2821,18 +2832,23 @@ def _validate_provenance_record(
     payload = _read_json(path, f"{label} provenance")
     if not isinstance(payload, dict):
         raise PreparationError(f"{label}.provenance payload must be an object")
+    required_payload = {
+        "schema_version",
+        "role",
+        "version",
+        "source_commit",
+        "source_tree_sha256",
+        "artifacts",
+    }
+    if kind == "agent_fleet":
+        required_payload.update(
+            {
+                "python_runtime_source_tree_sha256",
+                "python_runtime_transformations",
+            }
+        )
     _require_exact_keys(
-        payload,
-        {
-            "schema_version",
-            "role",
-            "version",
-            "source_commit",
-            "source_tree_sha256",
-            "artifacts",
-        },
-        set(),
-        f"{label}.provenance payload",
+        payload, required_payload, set(), f"{label}.provenance payload"
     )
     if (
         payload["schema_version"] != 2
@@ -2843,6 +2859,15 @@ def _validate_provenance_record(
         or not SHA256.fullmatch(payload["source_tree_sha256"])
     ):
         raise PreparationError(f"{label}.provenance identity is not exact")
+    if kind == "agent_fleet":
+        if (
+            not isinstance(payload["python_runtime_source_tree_sha256"], str)
+            or not SHA256.fullmatch(payload["python_runtime_source_tree_sha256"])
+            or not isinstance(payload["python_runtime_transformations"], list)
+        ):
+            raise PreparationError(
+                f"{label}.provenance Python-runtime transformation proof is invalid"
+            )
     artifact_records = payload["artifacts"]
     if not isinstance(artifact_records, dict) or set(artifact_records) != set(artifacts):
         raise PreparationError(f"{label}.provenance artifact set is not exact")
@@ -3365,6 +3390,7 @@ def _validate_quota_runtime_record(
             "entrypoint": entrypoint,
             "package_lock": package_lock,
             "runtime_manifest": runtime_manifest,
+            "quota_build_proof": root / "build" / "quota-build-proof.json",
         },
         label,
     )
@@ -3444,6 +3470,334 @@ def _validate_closed_xattrs(roots: Sequence[Path]) -> None:
                 )
 
 
+def _runtime_internal_symlink(root: Path, path: Path) -> tuple[str, Path]:
+    target = os.readlink(path)
+    if not target or "\x00" in target or "$" in target or os.path.isabs(target):
+        raise PreparationError(
+            f"pinned Python runtime has unsafe symlink: {path} -> {target!r}"
+        )
+    lexical = Path(os.path.normpath(path.parent / target))
+    if not _is_relative_to(lexical, root):
+        raise PreparationError(f"pinned Python runtime symlink escapes: {path}")
+    resolved = Path(os.path.realpath(lexical))
+    if not _is_relative_to(resolved, root):
+        raise PreparationError(f"pinned Python runtime symlink resolves outside: {path}")
+    _require_regular(resolved, "pinned Python runtime symlink target")
+    return target, resolved
+
+
+def _runtime_source_tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256(b"bridge-runtime-source-v1\0")
+    observed = [root / "bin/python3.11", root / "lib"]
+    for start in tuple(observed):
+        if not start.exists() or start.is_symlink():
+            raise PreparationError(f"pinned Python runtime root is invalid: {start}")
+        if start.is_dir():
+            observed.extend(start.rglob("*"))
+    for path in sorted(
+        set(observed),
+        key=lambda item: item.relative_to(root).as_posix().encode("utf-8"),
+    ):
+        relative = path.relative_to(root).as_posix()
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            target, resolved = _runtime_internal_symlink(root, path)
+            kind = b"symlink"
+            value = hashlib.sha256(target.encode("utf-8")).digest()
+            value += bytes.fromhex(_sha256(resolved))
+        elif stat.S_ISDIR(info.st_mode):
+            kind, value = b"directory", b""
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            kind, value = b"file", bytes.fromhex(_sha256(path))
+        else:
+            raise PreparationError(
+                f"pinned Python runtime contains unsupported path: {path}"
+            )
+        digest.update(relative.encode("utf-8") + b"\0" + kind + b"\0" + value)
+    return digest.hexdigest()
+
+
+def _runtime_transformations(root: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for path in sorted(
+        (root / "lib").rglob("*"),
+        key=lambda item: item.relative_to(root).as_posix().encode("utf-8"),
+    ):
+        if not path.is_symlink():
+            continue
+        target, resolved = _runtime_internal_symlink(root, path)
+        records.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "target": target,
+                "resolved_path": resolved.relative_to(root).as_posix(),
+                "resolved_sha256": _sha256(resolved),
+                "transformation": "materialize-internal-regular-file",
+            }
+        )
+    return records
+
+
+def _build_input_file(
+    record: Any, label: str, *, allow_root_hardlinks: bool = False
+) -> Path:
+    if not isinstance(record, dict):
+        raise PreparationError(f"{label} must be an object")
+    _require_exact_keys(record, {"path", "sha256"}, set(), label)
+    path = _normalized_absolute(record["path"], f"{label}.path")
+    _require_regular(path, label, allow_root_hardlinks=allow_root_hardlinks)
+    if not isinstance(record["sha256"], str) or not SHA256.fullmatch(
+        record["sha256"]
+    ):
+        raise PreparationError(f"{label}.sha256 is invalid")
+    if _sha256(path, allow_root_hardlinks=allow_root_hardlinks) != record["sha256"]:
+        raise PreparationError(f"{label} digest changed")
+    return path
+
+
+def _validate_build_inputs(
+    value: Any,
+    proof_path: Path,
+) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise PreparationError("sealed runtime build_inputs must be an object")
+    _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "manifest_path",
+            "manifest",
+            "manifest_sha256",
+            "manifest_canonical_sha256",
+            "builder",
+            "bootstrap",
+            "transaction_driver",
+            "tools",
+            "python_runtime",
+            "node_runtime",
+            "agent_fleet",
+            "quota_axi",
+        },
+        set(),
+        "sealed runtime build_inputs",
+    )
+    if value["schema_version"] != 1 or not isinstance(value["manifest"], dict):
+        raise PreparationError("sealed runtime build_inputs schema is invalid")
+    manifest_path = _normalized_absolute(
+        value["manifest_path"], "build_inputs.manifest_path"
+    )
+    _require_regular(manifest_path, "retained sealed-runtime builder manifest")
+    raw_manifest = _read_json(manifest_path, "retained sealed-runtime builder manifest")
+    if raw_manifest != value["manifest"]:
+        raise PreparationError("retained builder manifest does not match build_inputs")
+    if (
+        value["manifest_sha256"] != _sha256(manifest_path)
+        or not isinstance(value["manifest_sha256"], str)
+        or not SHA256.fullmatch(value["manifest_sha256"])
+    ):
+        raise PreparationError("retained builder manifest digest is invalid")
+    canonical = (
+        json.dumps(raw_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    if value["manifest_canonical_sha256"] != hashlib.sha256(canonical).hexdigest():
+        raise PreparationError("retained builder manifest canonical digest is invalid")
+    if raw_manifest.get("proof_manifest") != str(proof_path):
+        raise PreparationError("retained builder manifest targets a different proof")
+
+    _build_input_file(value["builder"], "retained sealed-runtime builder")
+    _build_input_file(value["bootstrap"], "retained Agent Fleet bootstrap")
+    driver = _build_input_file(
+        value["transaction_driver"], "retained transaction driver"
+    )
+    if raw_manifest.get("transaction_driver") != value["transaction_driver"]:
+        raise PreparationError("retained transaction-driver binding differs from manifest")
+    if not isinstance(value["tools"], dict) or value["tools"] != raw_manifest.get("tools"):
+        raise PreparationError("retained tool bindings differ from builder manifest")
+    for name, record in value["tools"].items():
+        path = _build_input_file(
+            record,
+            f"retained build tool {name}",
+            allow_root_hardlinks=True,
+        )
+        if name in {"clang", "codesign", "file", "git", "otool", "xattr"}:
+            expected = Path(f"/usr/bin/{name}")
+            if path != expected or os.lstat(path).st_uid != 0:
+                raise PreparationError(f"retained build tool {name} is not immutable")
+    if driver != _normalized_absolute(
+        raw_manifest["transaction_driver"]["path"], "manifest transaction driver"
+    ):
+        raise PreparationError("retained transaction-driver path mismatch")
+
+    python = value["python_runtime"]
+    if not isinstance(python, dict):
+        raise PreparationError("build_inputs.python_runtime must be an object")
+    _require_exact_keys(
+        python,
+        {
+            "root",
+            "version",
+            "binary_sha256",
+            "source_tree_sha256",
+            "transformations",
+        },
+        set(),
+        "build_inputs.python_runtime",
+    )
+    raw_python = raw_manifest.get("python_runtime")
+    if not isinstance(raw_python, dict):
+        raise PreparationError("retained manifest Python runtime is invalid")
+    root = _normalized_absolute(python["root"], "build_inputs.python_runtime.root")
+    _require_directory(root, "retained Python runtime")
+    if (
+        python["version"] != raw_python.get("version")
+        or python["binary_sha256"] != raw_python.get("binary_sha256")
+        or python["source_tree_sha256"] != raw_python.get("tree_sha256")
+        or _sha256(root / "bin/python3.11") != python["binary_sha256"]
+        or _runtime_source_tree_sha256(root) != python["source_tree_sha256"]
+        or _runtime_transformations(root) != python["transformations"]
+    ):
+        raise PreparationError("retained Python runtime proof changed")
+
+    node = value["node_runtime"]
+    if not isinstance(node, dict):
+        raise PreparationError("build_inputs.node_runtime must be an object")
+    _require_exact_keys(node, {"path", "version", "sha256"}, set(), "node runtime")
+    node_path = _build_input_file(
+        {"path": node["path"], "sha256": node["sha256"]},
+        "retained Node runtime",
+    )
+    raw_node = raw_manifest.get("node_runtime")
+    if not isinstance(raw_node, dict) or raw_node != {
+        "binary": str(node_path),
+        "version": node["version"],
+        "sha256": node["sha256"],
+    }:
+        raise PreparationError("retained Node runtime differs from builder manifest")
+
+    for family, artifact_fields in (
+        ("agent_fleet", (("wheel", "wheel_sha256"),)),
+        (
+            "quota_axi",
+            (
+                ("package_tarball", "package_sha256"),
+                ("package_lock", "package_lock_sha256"),
+                ("build_proof", "build_proof_sha256"),
+            ),
+        ),
+    ):
+        records = value[family]
+        raw_records = raw_manifest.get(family)
+        if not isinstance(records, dict) or set(records) != {"candidate", "rollback"}:
+            raise PreparationError(f"build_inputs.{family} roles are not exact")
+        if not isinstance(raw_records, dict):
+            raise PreparationError(f"retained manifest {family} roles are invalid")
+        for role_name, record in records.items():
+            raw_role = raw_records.get(role_name)
+            if not isinstance(record, dict) or not isinstance(raw_role, dict):
+                raise PreparationError(f"build_inputs.{family}.{role_name} is invalid")
+            expected_record_keys = {
+                "source_repo",
+                "source_commit",
+                "source_tree_sha256",
+                *(
+                    {"source_subdirectory", "wheel", "wheel_sha256"}
+                    if family == "agent_fleet"
+                    else {
+                        "package_tarball",
+                        "package_sha256",
+                        "package_lock",
+                        "package_lock_sha256",
+                        "build_proof",
+                        "build_proof_sha256",
+                        "dependencies",
+                    }
+                ),
+            }
+            _require_exact_keys(
+                record,
+                expected_record_keys,
+                set(),
+                f"build_inputs.{family}.{role_name}",
+            )
+            for field in ("source_repo", "source_commit", "source_tree_sha256"):
+                if record.get(field) != raw_role.get(field):
+                    raise PreparationError(
+                        f"build_inputs.{family}.{role_name}.{field} differs from manifest"
+                    )
+            if family == "agent_fleet":
+                source_subdirectory = record.get("source_subdirectory")
+                if (
+                    source_subdirectory != raw_role.get("source_subdirectory")
+                    or not isinstance(source_subdirectory, str)
+                    or not source_subdirectory
+                ):
+                    raise PreparationError(
+                        f"build_inputs.{family}.{role_name}.source_subdirectory is invalid"
+                    )
+                if source_subdirectory != ".":
+                    _normalized_relative(
+                        source_subdirectory,
+                        f"build_inputs.{family}.{role_name}.source_subdirectory",
+                    )
+            if (
+                not isinstance(record["source_commit"], str)
+                or not GIT_COMMIT.fullmatch(record["source_commit"])
+                or not isinstance(record["source_tree_sha256"], str)
+                or not SHA256.fullmatch(record["source_tree_sha256"])
+            ):
+                raise PreparationError(
+                    f"build_inputs.{family}.{role_name} source identity is invalid"
+                )
+            source_repo = _normalized_absolute(
+                record.get("source_repo"),
+                f"build_inputs.{family}.{role_name}.source_repo",
+            )
+            _require_directory(
+                source_repo, f"retained {family} {role_name} source repository"
+            )
+            for path_field, sha_field in artifact_fields:
+                path = _build_input_file(
+                    {"path": record.get(path_field), "sha256": record.get(sha_field)},
+                    f"retained {family} {role_name} {path_field}",
+                )
+                if (
+                    raw_role.get(path_field) != str(path)
+                    or raw_role.get(sha_field) != record.get(sha_field)
+                ):
+                    raise PreparationError(
+                        f"retained {family} {role_name} {path_field} differs from manifest"
+                    )
+            if family == "quota_axi":
+                if record.get("dependencies") != raw_role.get("dependencies"):
+                    raise PreparationError(
+                        f"retained Quota {role_name} dependency closure differs"
+                    )
+                for dependency in record.get("dependencies", []):
+                    if not isinstance(dependency, dict):
+                        raise PreparationError("retained Quota dependency is invalid")
+                    _require_exact_keys(
+                        dependency,
+                        {
+                            "name",
+                            "version",
+                            "install_path",
+                            "tarball",
+                            "sha256",
+                            "integrity",
+                        },
+                        set(),
+                        "retained Quota dependency",
+                    )
+                    _build_input_file(
+                        {
+                            "path": dependency.get("tarball"),
+                            "sha256": dependency.get("sha256"),
+                        },
+                        f"retained Quota {role_name} dependency",
+                    )
+    return value
+
+
 def _validate_sealed_runtime_manifest(
     spec: PreparationSpec,
     driver: ModuleType,
@@ -3456,10 +3810,14 @@ def _validate_sealed_runtime_manifest(
     top_keys = {
         "schema_version", "agent_fleet_candidate", "agent_fleet_rollback",
         "quota_axi_candidate", "quota_axi_rollback", "xattr_policy", "nondeterminism",
+        "build_inputs", "runtime_versions",
     }
     _require_exact_keys(raw, top_keys, set(), "sealed runtime proof manifest")
     if raw["schema_version"] != 2:
         raise PreparationError("sealed runtime proof manifest schema must be 2")
+    build_inputs = _validate_build_inputs(
+        raw["build_inputs"], spec.agent_fleet.build_manifest
+    )
     # Role release paths are relative to the sealed-runtime root that owns the
     # source manifest.  A bundle carries a byte-for-byte proof copy elsewhere,
     # but relocation of that proof document must not retarget any runtime.
@@ -3504,6 +3862,21 @@ def _validate_sealed_runtime_manifest(
         source_commit=quota.rollback_source_commit, driver=driver,
         label="quota_axi_rollback",
     )
+    python_inputs = build_inputs["python_runtime"]
+    for root, label in (
+        (af.release.new_release, "agent_fleet_candidate"),
+        (af.release.old_release, "agent_fleet_rollback"),
+    ):
+        provenance = _read_json(root / "build/provenance.json", f"{label} provenance")
+        if (
+            provenance.get("python_runtime_source_tree_sha256")
+            != python_inputs["source_tree_sha256"]
+            or provenance.get("python_runtime_transformations")
+            != python_inputs["transformations"]
+        ):
+            raise PreparationError(
+                f"{label} provenance does not bind the retained Python transformation proof"
+            )
     xattrs = raw["xattr_policy"]
     if not isinstance(xattrs, dict):
         raise PreparationError("xattr_policy must be an object")
@@ -3542,6 +3915,27 @@ def _validate_sealed_runtime_manifest(
         or nondeterminism["known_exclusions"] != []
     ):
         raise PreparationError("sealed runtime builds are not deterministic and relocation-stable")
+    runtime_versions = raw["runtime_versions"]
+    if not isinstance(runtime_versions, dict):
+        raise PreparationError("runtime_versions must be an object")
+    _require_exact_keys(
+        runtime_versions,
+        {"schema_version", "closed_environment", "observed"},
+        set(),
+        "runtime_versions",
+    )
+    expected_versions = {
+        "agent_fleet_candidate": f"Python {af.expected_python_version}",
+        "agent_fleet_rollback": f"Python {af.rollback_python_version}",
+        "quota_axi_candidate": f"v{quota.node_version}",
+        "quota_axi_rollback": f"v{quota.rollback_node_version}",
+    }
+    if (
+        runtime_versions["schema_version"] != 1
+        or runtime_versions["closed_environment"] is not True
+        or runtime_versions["observed"] != expected_versions
+    ):
+        raise PreparationError("closed-environment runtime version proof is not exact")
     return raw
 
 
@@ -4216,6 +4610,90 @@ def _worker_state_manifest_dict(
     }
 
 
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        function = libc.renamex_np
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(source_bytes, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(-100, source_bytes, -100, destination_bytes, 1)
+    else:
+        raise PreparationError(
+            "this platform has no supported atomic no-replace rename primitive"
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in {errno_module.EEXIST, errno_module.ENOTEMPTY}:
+            raise PreparationError(
+                f"output_dir appeared during preparation; refusing overwrite: {destination}"
+            )
+        raise PreparationError(
+            f"atomic no-replace preparation publication failed: {source} -> "
+            f"{destination}: {os.strerror(error)}"
+        )
+
+
+def _preparation_staging_marker(
+    staging: Path,
+    spec: PreparationSpec,
+    spec_path: Path,
+    driver_path: Path,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "transaction_id": spec.transaction_id,
+        "output_dir": str(spec.output_dir),
+        "spec_path": str(spec_path),
+        "spec_sha256": _sha256(spec_path),
+        "driver_path": str(driver_path),
+        "driver_sha256": _sha256(driver_path),
+    }
+
+
+def _remove_preparation_staging(
+    staging: Path,
+    expected_marker: Mapping[str, Any],
+) -> None:
+    if not os.path.lexists(staging):
+        return
+    info = os.lstat(staging)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise PreparationError(
+            f"preparation staging path is not attributable: {staging}"
+        )
+    marker_path = staging / ".bridge-preparation-staging.json"
+    observed = _read_json(marker_path, "preparation staging ownership marker")
+    if observed != expected_marker:
+        raise PreparationError(
+            f"preparation staging marker belongs to another operation: {staging}"
+        )
+    shutil.rmtree(staging)
+    parent_fd = os.open(
+        staging.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
     spec = load_spec(spec_path)
     driver = _load_driver(driver_path)
@@ -4226,8 +4704,20 @@ def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
         raise PreparationError(f"sealed runtime proof validation failed: {exc}") from exc
     rollback_api, candidate_api = _validate_input_state(spec)
 
-    staging = spec.output_dir.parent / f".{spec.output_dir.name}.prepare-{uuid.uuid4().hex}"
+    staging = spec.output_dir.parent / (
+        f".{spec.output_dir.name}.prepare-"
+        f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+    )
+    expected_staging_marker = _preparation_staging_marker(
+        staging, spec, spec_path, driver_path
+    )
+    _remove_preparation_staging(staging, expected_staging_marker)
     staging.mkdir(mode=0o700)
+    _write_json(
+        staging / ".bridge-preparation-staging.json",
+        expected_staging_marker,
+        0o600,
+    )
     private = staging / "transaction"
     private.mkdir(mode=0o700)
     initial_staged = staging / "registry.initial.toml"
@@ -4364,7 +4854,7 @@ def prepare(spec_path: Path, driver_path: Path) -> dict[str, Any]:
         worker_state_manifest,
         0o600,
     )
-    os.replace(staging, spec.output_dir)
+    _rename_directory_no_replace(staging, spec.output_dir)
     parent_fd = os.open(spec.output_dir.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(parent_fd)

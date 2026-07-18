@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+"""Build Quota AXI twice from exact offline inputs and emit a sealed proof.
+
+This helper is deliberately separate from the sealed-runtime builder.  It is
+the producer of generated npm bytes; the runtime builder is an independent
+consumer/verifier of the resulting package and proof.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import posixpath
+import shutil
+import stat
+import subprocess
+import tarfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+class ProofError(RuntimeError):
+    pass
+
+
+SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
+COMMIT = __import__("re").compile(r"^[0-9a-f]{40}$")
+SRI = __import__("re").compile(r"^sha512-[A-Za-z0-9+/]+={0,2}$")
+VERSION = __import__("re").compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9._-]+)?$")
+MAX_SPEC = 1_000_000
+
+
+def _canonical(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+
+
+def _sha_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _safe_ancestry(path: Path, label: str, *, system_only: bool = False) -> None:
+    current = path
+    saw_private_user_directory = False
+    while True:
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise ProofError(f"{label} ancestry is missing: {current}") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise ProofError(f"{label} ancestry is not a real directory: {current}")
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid == os.getuid() and not system_only:
+            if mode & 0o022:
+                raise ProofError(
+                    f"{label} has group/world-writable user ancestry: {current}"
+                )
+            saw_private_user_directory = True
+        elif info.st_uid == 0:
+            if mode & 0o022:
+                sticky = bool(mode & stat.S_ISVTX)
+                if system_only or not sticky or not saw_private_user_directory:
+                    raise ProofError(f"{label} has unsafe root-owned ancestry: {current}")
+        else:
+            raise ProofError(
+                f"{label} ancestry is not owned by current uid or root: {current}"
+            )
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+def _regular_bytes(path: Path, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_nlink != 1 and before.st_uid != 0)
+            or before.st_uid not in {os.getuid(), 0}
+            or stat.S_IMODE(before.st_mode) & 0o022
+        ):
+            raise ProofError(f"not an owned, safe single-link regular file: {path}")
+        _safe_ancestry(path.parent, label, system_only=before.st_uid == 0)
+        payload = bytearray()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            payload.extend(block)
+        after = os.fstat(fd)
+        current = os.lstat(path)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if before_identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or before_identity != (
+            current.st_dev,
+            current.st_ino,
+            current.st_uid,
+            current.st_mode,
+            current.st_nlink,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        ):
+            raise ProofError(f"file changed while hashing: {path}")
+        return bytes(payload)
+    finally:
+        os.close(fd)
+
+
+def _sha(path: Path) -> str:
+    return _sha_bytes(_regular_bytes(path, "offline build input"))
+
+
+def _tree(root: Path) -> str:
+    if not root.is_dir() or root.is_symlink():
+        raise ProofError(f"tree root is not a real directory: {root}")
+    _safe_ancestry(root, "offline input tree")
+    digest = hashlib.sha256(b"bridge-offline-tree-v1\0")
+    for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix().encode()):
+        relative = path.relative_to(root).as_posix()
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            kind, payload = b"dir", b""
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            kind, payload = b"file", bytes.fromhex(_sha(path))
+        elif stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            if not target or "$" in target or os.path.isabs(target):
+                raise ProofError(f"tree symlink is unsafe: {path} -> {target!r}")
+            resolved = Path(os.path.realpath(path.parent / target))
+            try:
+                resolved.relative_to(root)
+            except ValueError as exc:
+                raise ProofError(f"tree symlink escapes: {path} -> {target}") from exc
+            resolved_info = os.lstat(resolved)
+            if not stat.S_ISREG(resolved_info.st_mode) or resolved_info.st_nlink != 1:
+                raise ProofError(f"tree symlink target is not a regular file: {path}")
+            kind, payload = b"symlink", hashlib.sha256(target.encode()).digest()
+        else:
+            raise ProofError(f"unsupported tree entry: {path}")
+        digest.update(relative.encode() + b"\0" + kind + b"\0" + payload)
+    return digest.hexdigest()
+
+
+def _strict_json(path: Path, label: str) -> dict[str, Any]:
+    payload = _regular_bytes(path, label)
+    if len(payload) > MAX_SPEC:
+        raise ProofError(f"{label} is too large")
+
+    def pairs(values: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in values:
+            if key in result:
+                raise ProofError(f"{label} repeats key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(payload, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProofError(f"{label} is invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ProofError(f"{label} must be an object")
+    return value
+
+
+def _exact(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ProofError(f"{label} keys are not exact")
+    return value
+
+
+def _path(value: Any, label: str, *, absent: bool = False) -> Path:
+    if not isinstance(value, str) or not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise ProofError(f"{label} must be an absolute normalized path")
+    result = Path(value)
+    anchor = result.parent if absent else result
+    if Path(os.path.realpath(anchor)) != anchor:
+        raise ProofError(f"{label} is noncanonical")
+    if not absent and not result.exists():
+        raise ProofError(f"{label} does not exist")
+    return result
+
+
+def _relative(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "$" in value:
+        raise ProofError(f"{label} must be a non-empty literal relative path")
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        raise ProofError(f"{label} must be normalized and relative")
+    if pure.as_posix() != value:
+        raise ProofError(f"{label} must use canonical POSIX separators")
+    return value
+
+
+def _pin(raw: Any, label: str, *, directory: bool = False) -> tuple[Path, str]:
+    value = _exact(raw, {"path", "sha256" if not directory else "tree_sha256"}, label)
+    path = _path(value["path"], f"{label}.path")
+    expected = value["tree_sha256" if directory else "sha256"]
+    if not isinstance(expected, str) or not SHA256.fullmatch(expected):
+        raise ProofError(f"{label} digest is invalid")
+    observed = _tree(path) if directory else _sha(path)
+    if observed != expected:
+        raise ProofError(f"{label} digest mismatch")
+    return path, expected
+
+
+def _archive_source(
+    git: Path, repo: Path, commit: str, destination: Path
+) -> dict[str, tuple[str, bytes]]:
+    environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": "/var/empty",
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    resolved = subprocess.run(
+        [str(git), "--no-replace-objects", "-C", str(repo), "rev-parse", f"{commit}^{{commit}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+    if resolved.returncode or resolved.stdout.strip() != commit:
+        raise ProofError("source commit is unavailable or ambiguous")
+    git_sha256 = _sha(git)
+    completed = subprocess.run(
+        [str(git), "--no-replace-objects", "-C", str(repo), "archive", "--format=tar", commit],
+        check=False,
+        capture_output=True,
+        env=environment,
+        timeout=60,
+    )
+    if completed.returncode:
+        raise ProofError(completed.stderr.decode(errors="replace"))
+    if _sha(git) != git_sha256:
+        raise ProofError("git identity changed during source archive")
+    members: dict[str, tuple[str, bytes]] = {}
+    symlinks: list[tuple[Path, str, str]] = []
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        for member in archive.getmembers():
+            pure = PurePosixPath(member.name)
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ProofError("source archive path escapes")
+            target = destination.joinpath(*pure.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            relative = pure.as_posix()
+            if relative in members:
+                raise ProofError(f"source archive repeats member: {relative}")
+            if member.isfile():
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ProofError("source archive member cannot be read")
+                payload = extracted.read()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+                members[relative] = ("file", payload)
+            elif member.issym():
+                link_target = member.linkname
+                if (
+                    not link_target
+                    or "$" in link_target
+                    or PurePosixPath(link_target).is_absolute()
+                ):
+                    raise ProofError(f"source archive symlink is unsafe: {member.name}")
+                resolved = posixpath.normpath(posixpath.join(pure.parent.as_posix(), link_target))
+                if resolved == ".." or resolved.startswith("../"):
+                    raise ProofError(f"source archive symlink escapes: {member.name}")
+                members[relative] = (
+                    "symlink",
+                    link_target.encode("utf-8"),
+                )
+                symlinks.append((target, link_target, resolved))
+            else:
+                raise ProofError(f"source archive contains non-file: {member.name}")
+    for target, link_target, resolved in symlinks:
+        if members.get(resolved, (None, b""))[0] != "file":
+            raise ProofError(f"source archive symlink does not resolve to a file: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link_target, target)
+    return members
+
+
+def _archive_digest(members: Mapping[str, tuple[str, bytes]]) -> str:
+    digest = hashlib.sha256(b"bridge-git-archive-v1\0")
+    for relative in sorted(members, key=lambda value: value.encode("utf-8")):
+        digest.update(relative.encode("utf-8"))
+        kind, payload = members[relative]
+        digest.update(b"\0" + kind.encode("ascii") + b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+    return digest.hexdigest()
+
+
+def _package_members(path: Path) -> dict[str, bytes]:
+    members: dict[str, bytes] = {}
+    with tarfile.open(path, mode="r:*") as archive:
+        for member in archive.getmembers():
+            pure = PurePosixPath(member.name)
+            if not pure.parts or pure.parts[0] != "package":
+                raise ProofError("packed member is outside package/")
+            if member.isdir():
+                continue
+            if not member.isfile() or len(pure.parts) == 1:
+                raise ProofError("packed member is linked or special")
+            relative = PurePosixPath(*pure.parts[1:]).as_posix()
+            if relative in members or ".." in PurePosixPath(relative).parts:
+                raise ProofError("packed member path is repeated or unsafe")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise ProofError("packed member cannot be read")
+            members[relative] = extracted.read()
+    return members
+
+
+def _json_changes(before: Any, after: Any, prefix: str = "$") -> list[dict[str, Any]]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes: list[dict[str, Any]] = []
+        for key in sorted(set(before) | set(after)):
+            child = f"{prefix}.{key}"
+            if key not in before:
+                changes.append({"path": child, "before": None, "after": after[key]})
+            elif key not in after:
+                changes.append({"path": child, "before": before[key], "after": None})
+            else:
+                changes.extend(_json_changes(before[key], after[key], child))
+        return changes
+    if before != after:
+        return [{"path": prefix, "before": before, "after": after}]
+    return []
+
+
+def _lock_proof(
+    lock: Mapping[str, Any],
+    resolved_artifacts: Mapping[Path, str],
+    lock_parent: Path,
+) -> dict[str, Any]:
+    if lock.get("lockfileVersion") != 3 or not isinstance(lock.get("packages"), dict):
+        raise ProofError("build lock must be package-lock v3")
+    packages = lock["packages"]
+    records: list[dict[str, str]] = []
+    for install_path in sorted(key for key in packages if key):
+        value = packages[install_path]
+        if not isinstance(value, dict):
+            raise ProofError(f"lock record is not an object: {install_path}")
+        version = value.get("version")
+        integrity = value.get("integrity")
+        resolved = value.get("resolved")
+        if (
+            not isinstance(version, str)
+            or not isinstance(integrity, str)
+            or not SRI.fullmatch(integrity)
+        ):
+            raise ProofError(f"lock record lacks exact version/SRI: {install_path}")
+        if not isinstance(resolved, str) or not resolved:
+            raise ProofError(f"lock record lacks exact resolved artifact: {install_path}")
+        if resolved.startswith("file:"):
+            raw_path = resolved.removeprefix("file:")
+            if not raw_path or "$" in raw_path or "\x00" in raw_path:
+                raise ProofError(f"lock file artifact path is unsafe: {install_path}")
+            unresolved = Path(raw_path)
+            if not unresolved.is_absolute():
+                unresolved = lock_parent / unresolved
+            resolved_path = Path(os.path.realpath(unresolved))
+            if not resolved_path.is_absolute() or resolved_path not in resolved_artifacts:
+                raise ProofError(f"lock file artifact is not an exact retained pin: {install_path}")
+        elif not resolved.startswith("https://registry.npmjs.org/"):
+            raise ProofError(f"lock record uses an unsupported resolved artifact: {install_path}")
+        records.append(
+            {
+                "install_path": install_path,
+                "version": version,
+                "integrity": integrity,
+                "resolved": resolved,
+            }
+        )
+    referenced_files = {
+        Path(
+            os.path.realpath(
+                Path(record["resolved"].removeprefix("file:"))
+                if Path(record["resolved"].removeprefix("file:")).is_absolute()
+                else lock_parent / Path(record["resolved"].removeprefix("file:"))
+            )
+        )
+        for record in records
+        if record["resolved"].startswith("file:")
+    }
+    if referenced_files != set(resolved_artifacts):
+        raise ProofError("resolved-artifact pins are not the exact lock file closure")
+    return {
+        "lockfile_version": 3,
+        "packages_sha256": _sha_bytes(_canonical(packages)),
+        "records": records,
+    }
+
+
+def _run(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: int = 300) -> str:
+    result = subprocess.run(
+        list(argv),
+        cwd=cwd,
+        env=dict(env),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode:
+        raise ProofError(
+            f"command failed {list(argv)!r}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _workspace_marker(
+    spec_path: Path,
+    spec_sha256: str,
+    path: Path,
+    build_index: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "spec_path": str(spec_path),
+        "spec_sha256": spec_sha256,
+        "path": str(path),
+        "build_index": build_index,
+    }
+
+
+def _remove_workspace(path: Path, expected: Mapping[str, Any]) -> None:
+    if not os.path.lexists(path):
+        return
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise ProofError(f"offline-build workspace is not attributable: {path}")
+    marker = _strict_json(path / ".bridge-quota-build-workspace.json", "workspace marker")
+    if marker != expected:
+        raise ProofError(f"offline-build workspace belongs to another build: {path}")
+    shutil.rmtree(path)
+    _fsync_directory(path.parent)
+
+
+def _create_workspace(path: Path, marker: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise ProofError(f"offline-build workspace already exists: {path}")
+    path.mkdir(mode=0o700)
+    marker_path = path / ".bridge-quota-build-workspace.json"
+    marker_path.write_bytes(_canonical(marker))
+    marker_path.chmod(0o400)
+    _fsync_directory(path)
+
+
+def _publish_bytes_no_replace(
+    path: Path, payload: bytes, mode: int = 0o600
+) -> tuple[int, int, str]:
+    if path.exists() or path.is_symlink():
+        raise ProofError(f"refusing to overwrite output: {path}")
+    digest = _sha_bytes(payload)
+    staging = path.with_name(f".{path.name}.bridge-write-{digest[:32]}")
+    if staging.exists() or staging.is_symlink():
+        info = os.lstat(staging)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != mode
+        ):
+            raise ProofError(f"output staging path is not attributable: {staging}")
+        staged = staging.read_bytes()
+        if len(staged) > len(payload) or not payload.startswith(staged):
+            raise ProofError(f"output staging payload is not attributable: {staging}")
+        staging.unlink()
+        _fsync_directory(staging.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(staging, flags, mode)
+    try:
+        os.fchmod(descriptor, mode)
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0:
+                raise ProofError(f"short write while publishing: {path}")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.link(staging, path, follow_symlinks=False)
+        _fsync_directory(path.parent)
+        staging.unlink()
+        _fsync_directory(path.parent)
+    except Exception:
+        if staging.exists() and _sha(staging) == digest:
+            staging.unlink()
+            _fsync_directory(staging.parent)
+        raise
+    info = os.lstat(path)
+    if info.st_nlink != 1 or _sha(path) != digest:
+        raise ProofError(f"published output identity is invalid: {path}")
+    return info.st_dev, info.st_ino, digest
+
+
+def _unlink_owned(path: Path, identity: tuple[int, int, str]) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (info.st_dev, info.st_ino, _sha(path)) != identity
+    ):
+        raise ProofError(f"refusing to remove output whose identity changed: {path}")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _one_build(
+    *,
+    base: Path,
+    git: Path,
+    repo: Path,
+    commit: str,
+    node: Path,
+    node_sha256: str,
+    node_version: str,
+    npm_root: Path,
+    npm_entry: str,
+    npm_version: str,
+    npm_cache: Path,
+    lock_path: Path,
+    build_package_json: Path,
+    compiler_relative: str,
+    compiler_sha256: str,
+    compiler_args: Sequence[str],
+) -> tuple[Path, dict[str, bytes], dict[str, tuple[str, bytes]]]:
+    source = base / "source"
+    source.mkdir()
+    source_members = _archive_source(git, repo, commit, source)
+    shutil.copy2(lock_path, source / "package-lock.json")
+    shutil.copy2(build_package_json, source / "package.json")
+    private_tools = base / "tools"
+    private_tools.mkdir()
+    shutil.copy2(node, private_tools / "node")
+    if _sha(private_tools / "node") != node_sha256:
+        raise ProofError("private Node copy differs from its pinned source")
+    shutil.copytree(npm_root, private_tools / "npm", symlinks=True)
+    if _tree(private_tools / "npm") != _tree(npm_root):
+        raise ProofError("private npm closure differs from its pinned source")
+    private_cache = base / "npm-cache"
+    shutil.copytree(npm_cache, private_cache, symlinks=True)
+    if _tree(private_cache) != _tree(npm_cache):
+        raise ProofError("private npm cache differs from its pinned source")
+    env = {
+        "HOME": str(base / "home"),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "SOURCE_DATE_EPOCH": "1580601600",
+        "TMPDIR": str(base / "tmp"),
+        "npm_config_audit": "false",
+        "npm_config_fund": "false",
+        "npm_config_offline": "true",
+        "npm_config_update_notifier": "false",
+    }
+    Path(env["HOME"]).mkdir()
+    Path(env["TMPDIR"]).mkdir()
+    npm = private_tools / "npm" / npm_entry
+    if _run([str(private_tools / "node"), "--version"], source, env) != f"v{node_version}":
+        raise ProofError("private Node empirical version differs from its pin")
+    if _run([str(private_tools / "node"), str(npm), "--version"], source, env) != npm_version:
+        raise ProofError("private npm empirical version differs from its pin")
+    _run(
+        [
+            str(private_tools / "node"),
+            str(npm),
+            "ci",
+            "--offline",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            str(private_cache),
+        ],
+        source,
+        env,
+        600,
+    )
+    compiler = source.joinpath(*PurePosixPath(compiler_relative).parts)
+    if _sha(compiler) != compiler_sha256:
+        raise ProofError("installed compiler digest differs from its pin")
+    _run([str(private_tools / "node"), str(compiler), *compiler_args], source, env, 600)
+    (source / "package.json").write_bytes(source_members["package.json"][1])
+    pack_dir = base / "pack"
+    pack_dir.mkdir()
+    output = _run(
+        [
+            str(private_tools / "node"),
+            str(npm),
+            "pack",
+            "--ignore-scripts",
+            "--json",
+            "--pack-destination",
+            str(pack_dir),
+        ],
+        source,
+        env,
+        300,
+    )
+    try:
+        packed = json.loads(output)
+        filename = packed[0]["filename"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise ProofError("npm pack did not return its exact JSON result") from exc
+    tarball = pack_dir / filename
+    return tarball, _package_members(tarball), source_members
+
+
+def build(spec_path: Path) -> tuple[Path, Path]:
+    spec_path = _path(str(spec_path), "Quota build spec")
+    raw = _strict_json(spec_path, "Quota build spec")
+    required = {
+        "schema_version",
+        "role",
+        "version",
+        "source_repo",
+        "source_commit",
+        "source_tree_sha256",
+        "git",
+        "node",
+        "npm",
+        "npm_cache",
+        "build_lock",
+        "build_package_json",
+        "resolved_artifacts",
+        "compiler",
+        "package_tarball",
+        "proof",
+        "scratch_parent",
+    }
+    _exact(raw, required, "Quota build spec")
+    if raw["schema_version"] != 1 or raw["role"] not in {"candidate", "rollback"}:
+        raise ProofError("Quota build spec schema/role is invalid")
+    if not isinstance(raw["version"], str) or not VERSION.fullmatch(raw["version"]):
+        raise ProofError("Quota build version is invalid")
+    commit = raw["source_commit"]
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        raise ProofError("source commit is not exact")
+    repo = _path(raw["source_repo"], "source_repo")
+    if not repo.is_dir() or repo.is_symlink():
+        raise ProofError("source_repo must be a real directory")
+    _safe_ancestry(repo, "source_repo")
+    if not isinstance(raw["source_tree_sha256"], str) or not SHA256.fullmatch(
+        raw["source_tree_sha256"]
+    ):
+        raise ProofError("source tree digest is invalid")
+    helper_path = Path(os.path.realpath(__file__))
+    helper_sha256 = _sha(helper_path)
+    git, git_sha256 = _pin(raw["git"], "git")
+    if git != Path("/usr/bin/git") or os.lstat(git).st_uid != 0:
+        raise ProofError("git must be the immutable root-owned /usr/bin/git")
+    node_raw = _exact(raw["node"], {"path", "sha256", "version"}, "node")
+    node = _path(node_raw["path"], "node.path")
+    if (
+        not isinstance(node_raw["sha256"], str)
+        or not SHA256.fullmatch(node_raw["sha256"])
+        or _sha(node) != node_raw["sha256"]
+        or not isinstance(node_raw["version"], str)
+        or not node_raw["version"].startswith("20.")
+    ):
+        raise ProofError("Node 20 identity is invalid")
+    npm_raw = _exact(raw["npm"], {"root", "tree_sha256", "entry", "version"}, "npm")
+    npm_root = _path(npm_raw["root"], "npm.root")
+    if _tree(npm_root) != npm_raw["tree_sha256"]:
+        raise ProofError("npm closure tree mismatch")
+    npm_entry = _relative(npm_raw["entry"], "npm.entry")
+    if not isinstance(npm_raw["version"], str) or not VERSION.fullmatch(npm_raw["version"]):
+        raise ProofError("npm version is invalid")
+    npm_entry_path = npm_root.joinpath(*PurePosixPath(npm_entry).parts)
+    if not npm_entry_path.is_file():
+        raise ProofError("npm entry is missing")
+    npm_cache, npm_cache_tree = _pin(raw["npm_cache"], "npm_cache", directory=True)
+    lock_path, lock_sha = _pin(raw["build_lock"], "build_lock")
+    lock = _strict_json(lock_path, "build lock")
+    build_package_path, build_package_sha = _pin(raw["build_package_json"], "build_package_json")
+    build_package = _strict_json(build_package_path, "build package.json")
+    if build_package.get("name") != "quota-axi" or build_package.get("version") != raw["version"]:
+        raise ProofError("build package.json identity differs from the source role")
+    if not isinstance(raw["resolved_artifacts"], list):
+        raise ProofError("resolved_artifacts must be a path-sorted array")
+    resolved_artifacts: dict[Path, str] = {}
+    previous = ""
+    for index, artifact_raw in enumerate(raw["resolved_artifacts"]):
+        artifact, digest = _pin(artifact_raw, f"resolved_artifacts[{index}]")
+        if str(artifact) <= previous or artifact in resolved_artifacts:
+            raise ProofError("resolved_artifacts must be unique and path-sorted")
+        previous = str(artifact)
+        resolved_artifacts[artifact] = digest
+    lock_proof = _lock_proof(lock, resolved_artifacts, lock_path.parent)
+    compiler = _exact(raw["compiler"], {"relative_path", "sha256", "args"}, "compiler")
+    compiler["relative_path"] = _relative(compiler["relative_path"], "compiler.relative_path")
+    if not isinstance(compiler["sha256"], str) or not SHA256.fullmatch(compiler["sha256"]):
+        raise ProofError("compiler digest is invalid")
+    if not isinstance(compiler["args"], list) or not all(
+        isinstance(v, str) for v in compiler["args"]
+    ):
+        raise ProofError("compiler args must be exact strings")
+    package_path = _path(raw["package_tarball"], "package_tarball", absent=True)
+    proof_path = _path(raw["proof"], "proof", absent=True)
+    _safe_ancestry(package_path.parent, "package_tarball output")
+    _safe_ancestry(proof_path.parent, "proof output")
+    if package_path.exists() or proof_path.exists():
+        raise ProofError("output package/proof must be absent")
+    scratch = _path(raw["scratch_parent"], "scratch_parent")
+    if not scratch.is_dir() or scratch.is_symlink():
+        raise ProofError("scratch_parent must be a real directory")
+    _safe_ancestry(scratch, "scratch_parent")
+    spec_sha256 = _sha(spec_path)
+    build_id = hashlib.sha256(
+        b"bridge-quota-offline-build-v1\0" + bytes.fromhex(spec_sha256)
+    ).hexdigest()
+    workspaces = (
+        scratch / f".quota-proof-{build_id[:32]}-a",
+        scratch / f".quota-proof-{build_id[:32]}-b",
+    )
+    markers = tuple(
+        _workspace_marker(spec_path, spec_sha256, path, index)
+        for index, path in enumerate(workspaces, start=1)
+    )
+    for path, marker in zip(workspaces, markers, strict=True):
+        _remove_workspace(path, marker)
+    created: list[tuple[Path, Mapping[str, Any]]] = []
+    published_package: tuple[int, int, str] | None = None
+    try:
+        for path, marker in zip(workspaces, markers, strict=True):
+            _create_workspace(path, marker)
+            created.append((path, marker))
+        builds = []
+        for path in workspaces:
+            builds.append(
+                _one_build(
+                    base=path,
+                    git=git,
+                    repo=repo,
+                    commit=commit,
+                    node=node,
+                    node_sha256=node_raw["sha256"],
+                    node_version=node_raw["version"],
+                    npm_root=npm_root,
+                    npm_entry=npm_entry,
+                    npm_version=npm_raw["version"],
+                    npm_cache=npm_cache,
+                    lock_path=lock_path,
+                    build_package_json=build_package_path,
+                    compiler_relative=compiler["relative_path"],
+                    compiler_sha256=compiler["sha256"],
+                    compiler_args=compiler["args"],
+                )
+            )
+        first_tar, first_members, source_members = builds[0]
+        second_tar, second_members, second_source_members = builds[1]
+        if (
+            source_members != second_source_members
+            or first_members != second_members
+            or _sha(first_tar) != _sha(second_tar)
+        ):
+            raise ProofError("two offline Quota builds are not byte-for-byte deterministic")
+        if _archive_digest(source_members) != raw["source_tree_sha256"]:
+            raise ProofError("exact source archive tree digest differs from its pin")
+        if (
+            _sha(helper_path) != helper_sha256
+            or _sha(git) != git_sha256
+            or _sha(node) != node_raw["sha256"]
+            or _tree(npm_root) != npm_raw["tree_sha256"]
+            or _tree(npm_cache) != npm_cache_tree
+            or _sha(lock_path) != lock_sha
+            or _sha(build_package_path) != build_package_sha
+            or any(_sha(path) != digest for path, digest in resolved_artifacts.items())
+        ):
+            raise ProofError("a pinned offline build input changed while it was consumed")
+        source_package = json.loads(source_members["package.json"][1])
+        packed_package = json.loads(first_members["package.json"])
+        if (
+            packed_package.get("name") != "quota-axi"
+            or packed_package.get("version") != raw["version"]
+        ):
+            raise ProofError("packed Quota identity is wrong")
+        generated = []
+        for relative, payload in sorted(first_members.items()):
+            source_payload = source_members.get(relative)
+            if source_payload == ("file", payload):
+                continue
+            if relative == "package.json":
+                continue
+            if not relative.startswith("dist/"):
+                raise ProofError(f"non-source package member is outside dist/: {relative}")
+            generated.append(
+                {"path": relative, "sha256": _sha_bytes(payload), "size": len(payload)}
+            )
+        proof = {
+            "schema_version": 1,
+            "kind": "quota-axi-offline-deterministic-build",
+            "role": raw["role"],
+            "version": raw["version"],
+            "source": {
+                "repo": str(repo),
+                "commit": commit,
+                "tree_sha256": raw["source_tree_sha256"],
+                "package_json_sha256": _sha_bytes(source_members["package.json"][1]),
+            },
+            "toolchain": {
+                "helper": {
+                    "path": str(helper_path),
+                    "sha256": helper_sha256,
+                },
+                "git": raw["git"],
+                "node": node_raw,
+                "npm": npm_raw,
+                "npm_cache_path": str(npm_cache),
+                "npm_cache_tree_sha256": npm_cache_tree,
+                "build_package_json": {
+                    "path": str(build_package_path),
+                    "sha256": build_package_sha,
+                },
+                "resolved_artifacts": [
+                    {"path": str(path), "sha256": digest}
+                    for path, digest in resolved_artifacts.items()
+                ],
+                "compiler": compiler,
+            },
+            "build_lock": {"path": str(lock_path), "sha256": lock_sha, **lock_proof},
+            "build_package_json_normalization": {
+                "source_sha256": _sha_bytes(source_members["package.json"][1]),
+                "build_sha256": build_package_sha,
+                "changes": _json_changes(source_package, build_package),
+            },
+            "npm_package_json_normalization": {
+                "source_sha256": _sha_bytes(source_members["package.json"][1]),
+                "packed_sha256": _sha_bytes(first_members["package.json"]),
+                "changes": _json_changes(source_package, packed_package),
+            },
+            "generated_members": generated,
+            "package_members": [
+                {"path": path, "sha256": _sha_bytes(payload), "size": len(payload)}
+                for path, payload in sorted(first_members.items())
+            ],
+            "package_tarball_sha256": _sha(first_tar),
+            "builds": 2,
+            "member_maps_match": True,
+            "tar_digests_match": True,
+        }
+        published_package = _publish_bytes_no_replace(package_path, first_tar.read_bytes())
+        _publish_bytes_no_replace(proof_path, _canonical(proof))
+    except Exception:
+        if published_package is not None:
+            _unlink_owned(package_path, published_package)
+        raise
+    finally:
+        for path, marker in reversed(created):
+            _remove_workspace(path, marker)
+    return package_path, proof_path
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spec", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        package, proof = build(args.spec)
+    except (ProofError, OSError, subprocess.TimeoutExpired) as exc:
+        parser.error(str(exc))
+    print(json.dumps({"package": str(package), "proof": str(proof)}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

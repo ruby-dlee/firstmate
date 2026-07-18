@@ -58,6 +58,7 @@ class ManifestFixture:
         self.wheels: dict[str, Path] = {}
         self.packages: dict[str, Path] = {}
         self.locks: dict[str, Path] = {}
+        self.build_proofs: dict[str, Path] = {}
         for role in ("candidate", "rollback"):
             wheel = temporary / f"{role}.whl"
             wheel.write_bytes(role.encode())
@@ -68,6 +69,9 @@ class ManifestFixture:
             lock = temporary / f"{role}-package-lock.json"
             lock.write_text("{}\n", encoding="utf-8")
             self.locks[role] = lock
+            build_proof = temporary / f"{role}-build-proof.json"
+            build_proof.write_text("{}\n", encoding="utf-8")
+            self.build_proofs[role] = build_proof
         tool_pin = {"path": str(self.tool), "sha256": sha(self.tool)}
         self.value = {
             "schema_version": 2,
@@ -76,8 +80,11 @@ class ManifestFixture:
             "operator_front_door": str(self.front_parent / "agent-fleet"),
             "transaction_driver": dict(tool_pin),
             "tools": {
-                name: dict(tool_pin)
-                for name in ("clang", "codesign", "file", "git", "otool", "xattr")
+                name: {
+                    "path": str(builder.SYSTEM_TOOL_PATHS[name]),
+                    "sha256": sha(builder.SYSTEM_TOOL_PATHS[name]),
+                }
+                for name in builder.SYSTEM_TOOL_PATHS
             },
             "python_runtime": {
                 "root": str(self.python),
@@ -113,6 +120,7 @@ class ManifestFixture:
             "source_repo": str(self.agent_source),
             "source_commit": ("a" if role == "candidate" else "b") * 40,
             "source_tree_sha256": ("1" if role == "candidate" else "2") * 64,
+            "source_subdirectory": ".",
             "wheel": str(self.wheels[role]),
             "wheel_sha256": sha(self.wheels[role]),
         }
@@ -129,6 +137,8 @@ class ManifestFixture:
             "package_sha256": sha(self.packages[role]),
             "package_lock": str(self.locks[role]),
             "package_lock_sha256": sha(self.locks[role]),
+            "build_proof": str(self.build_proofs[role]),
+            "build_proof_sha256": sha(self.build_proofs[role]),
             "dependencies": [],
         }
 
@@ -214,6 +224,12 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuildError, "contract_version must be 2"):
             builder.load_manifest(self.fixture.path)
 
+    def test_manifest_rejects_agent_source_subdirectory_escape(self) -> None:
+        self.fixture.value["agent_fleet"]["candidate"]["source_subdirectory"] = "../tools"
+        self.fixture.write()
+        with self.assertRaisesRegex(builder.BuildError, "source_subdirectory"):
+            builder.load_manifest(self.fixture.path)
+
     def test_manifest_rejects_existing_release(self) -> None:
         path = self.fixture.output / "agent/releases/0.2.0-candidate"
         path.mkdir()
@@ -241,6 +257,9 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
                 "install_path": "node_modules/z",
                 "tarball": str(dependency),
                 "sha256": sha(dependency),
+                "integrity": "sha512-" + base64.b64encode(
+                    hashlib.sha512(dependency.read_bytes()).digest()
+                ).decode("ascii"),
             },
             {
                 "name": "a",
@@ -248,6 +267,9 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
                 "install_path": "node_modules/a",
                 "tarball": str(dependency),
                 "sha256": sha(dependency),
+                "integrity": "sha512-" + base64.b64encode(
+                    hashlib.sha512(dependency.read_bytes()).digest()
+                ).decode("ascii"),
             },
         ]
         self.fixture.write()
@@ -414,6 +436,55 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
                 with self.assertRaises(builder.BuildError):
                     builder._safe_package_members(package, name)
 
+    def test_internal_python_symlink_is_bound_and_materialized(self) -> None:
+        alias = self.fixture.python / "lib/alias.py"
+        os.symlink("stdlib.py", alias)
+        digest = builder._content_tree_sha256(
+            self.fixture.python,
+            ("bin/python3.11", "lib"),
+            "symlinked Python fixture",
+        )
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            builder._python_runtime_transformations(self.fixture.python),
+            [
+                {
+                    "path": "lib/alias.py",
+                    "target": "stdlib.py",
+                    "resolved_path": "lib/stdlib.py",
+                    "resolved_sha256": sha(
+                        self.fixture.python / "lib/stdlib.py"
+                    ),
+                    "transformation": "materialize-internal-regular-file",
+                }
+            ],
+        )
+        copied = self.root / "copied-lib"
+        builder._copy_tree(
+            self.fixture.python / "lib",
+            copied,
+            canonical_runtime_root=self.fixture.python,
+        )
+        self.assertFalse((copied / "alias.py").is_symlink())
+        self.assertEqual(
+            (copied / "alias.py").read_bytes(),
+            (copied / "stdlib.py").read_bytes(),
+        )
+
+    def test_python_symlink_escape_is_rejected(self) -> None:
+        outside = self.root / "outside-runtime.py"
+        outside.write_bytes(b"outside")
+        os.symlink(
+            "../../outside-runtime.py",
+            self.fixture.python / "lib/escape.py",
+        )
+        with self.assertRaisesRegex(builder.BuildError, "(escapes|outside)"):
+            builder._content_tree_sha256(
+                self.fixture.python,
+                ("bin/python3.11", "lib"),
+                "escaping Python fixture",
+            )
+
     def test_package_identity_rejects_install_scripts(self) -> None:
         members = {
             "package.json": json.dumps(
@@ -427,7 +498,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuildError, "install-time"):
             builder._package_identity(members, "quota-axi", "0.1.7", "package")
 
-    def test_quota_package_rejects_recorded_extra_absent_from_commit(self) -> None:
+    def test_quota_package_requires_complete_proof_for_generated_extra(self) -> None:
         package_json = (
             json.dumps(
                 {
@@ -472,13 +543,15 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
             sha(package_path),
             lock_path,
             sha(lock_path),
+            self.fixture.build_proofs["candidate"],
+            sha(self.fixture.build_proofs["candidate"]),
             (),
         )
         source = {
             "package.json": ("file", package_json),
             "dist/bin/quota-axi.js": ("file", entrypoint),
         }
-        with self.assertRaisesRegex(builder.BuildError, "absent or differs"):
+        with self.assertRaisesRegex(builder.BuildError, "proof fields are not exact"):
             builder._validate_quota_inputs(role, source)
 
     def test_agent_wheel_rejects_recorded_importable_extra(self) -> None:
@@ -523,6 +596,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
             self.fixture.agent_source,
             "a" * 40,
             "1" * 64,
+            ".",
             wheel,
             sha(wheel),
         )
@@ -530,6 +604,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
             f"src/{relative}": ("file", content)
             for relative, content in package_files.items()
         }
+        source["pyproject.toml"] = ("file", b"[project]\nname='agent-fleet'\n")
         with self.assertRaisesRegex(builder.BuildError, "non-source"):
             builder._wheel_members(role, source)
 
@@ -605,6 +680,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
             self.fixture.agent_source,
             "a" * 40,
             "1" * 64,
+            ".",
             self.fixture.wheels["candidate"],
             sha(self.fixture.wheels["candidate"]),
         )
@@ -661,6 +737,22 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         )
         self.assertEqual(stat.S_IMODE(os.lstat(proof).st_mode), 0o444)
 
+    def test_atomic_file_writer_recovers_exact_partial_staging(self) -> None:
+        proof = self.root / "proof.json"
+        value = {"complete": True}
+        payload = (
+            json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        staging = proof.with_name(
+            f".{proof.name}.bridge-write-{digest[:32]}"
+        )
+        staging.write_bytes(payload[:9])
+        staging.chmod(0o444)
+        builder._write_json_no_replace(proof, value, 0o444)
+        self.assertEqual(proof.read_bytes(), payload)
+        self.assertFalse(staging.exists())
+
     def test_atomic_file_writer_fsyncs_parent_after_file_is_final(self) -> None:
         proof = self.root / "proof.json"
         observed: list[str] = []
@@ -704,9 +796,22 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         with mock.patch.object(builder, "_rename_no_replace", side_effect=rename), mock.patch.object(
             builder, "_fsync_directory", side_effect=fsync
         ):
-            builder._publish_release(manifest, source, destination)
+            publication_id = "f" * 64
+            staging = destination.with_name(
+                f".{destination.name}.bridge-sealed-{publication_id[:32]}"
+            )
+            builder._publish_release(
+                manifest,
+                source,
+                destination,
+                publication_id,
+                staging,
+                "1" * 64,
+            )
+        rename_index = events.index("rename")
         self.assertEqual(
-            events[-3:], ["rename", "release-fsync", "parent-fsync"]
+            events[rename_index : rename_index + 3],
+            ["rename", "release-fsync", "parent-fsync"],
         )
 
     def test_interrupted_publication_journal_recovers_without_live_reference(self) -> None:
@@ -747,19 +852,64 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         journal_path = builder._publication_journal_path(manifest)
         builder._write_json(
             journal_path,
-            {
+            journal := {
                 "schema_version": 1,
                 "manifest_sha256": sha(manifest.path),
                 "publication_id": publication_id,
                 "live_references_changed": False,
-                "releases": builder._publication_records(manifest, trees),
+                "releases": builder._publication_records(
+                    manifest, trees, publication_id
+                ),
             },
             0o600,
         )
+        staging = Path(journal["releases"][0]["staging_path"])
+        staging.mkdir(mode=0o700)
+        builder._write_json(
+            staging / ".bridge-publication-staging.json",
+            {
+                "schema_version": 1,
+                "publication_id": publication_id,
+                "final_path": journal["releases"][0]["path"],
+                "tree_sha256": journal["releases"][0]["tree_sha256"],
+            },
+            0o400,
+        )
+        (staging / "release").mkdir()
+        (staging / "release/partial").write_bytes(b"partial")
         self.assertFalse(builder._recover_interrupted_publication(manifest, Driver))
         self.assertFalse(interrupted.exists())
+        self.assertFalse(staging.exists())
         self.assertFalse(journal_path.exists())
         self.assertFalse(manifest.operator_front_door.exists())
+
+    def test_interrupted_builder_workspaces_are_recovered_from_journal(self) -> None:
+        manifest = builder.load_manifest(self.fixture.path)
+        publication_id = hashlib.sha256(
+            b"bridge-sealed-publication-v2\0"
+            + manifest.manifest_sha256.encode("ascii")
+        ).hexdigest()
+        paths = builder._workspace_paths(manifest, publication_id)
+        journal_path = builder._workspace_journal_path(manifest)
+        builder._write_json(
+            journal_path,
+            {
+                "schema_version": 1,
+                "manifest_sha256": manifest.manifest_sha256,
+                "publication_id": publication_id,
+                "live_references_changed": False,
+                "workspaces": [str(path) for path in paths],
+            },
+            0o600,
+        )
+        for index, path in enumerate(paths, start=1):
+            builder._create_builder_workspace(
+                manifest, publication_id, path, index
+            )
+            (path / "interrupted-payload").write_bytes(b"partial")
+        builder._recover_builder_workspaces(manifest, publication_id)
+        self.assertFalse(journal_path.exists())
+        self.assertTrue(all(not path.exists() for path in paths))
 
     def test_bootstrap_is_exact_consumer_contract(self) -> None:
         expected = (

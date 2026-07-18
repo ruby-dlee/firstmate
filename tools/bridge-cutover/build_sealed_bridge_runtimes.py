@@ -21,7 +21,6 @@ import io
 import json
 import os
 import re
-import secrets
 import shutil
 import stat
 import subprocess
@@ -125,6 +124,14 @@ ROLE_REQUIREMENTS = {
         "rollback": ("0.1.5", None),
     },
 }
+SYSTEM_TOOL_PATHS = {
+    "clang": Path("/usr/bin/clang"),
+    "codesign": Path("/usr/bin/codesign"),
+    "file": Path("/usr/bin/file"),
+    "git": Path("/usr/bin/git"),
+    "otool": Path("/usr/bin/otool"),
+    "xattr": Path("/usr/bin/xattr"),
+}
 
 
 class BuildError(RuntimeError):
@@ -161,6 +168,7 @@ class AgentRole:
     source_repo: Path
     source_commit: str
     source_tree_sha256: str
+    source_subdirectory: str
     wheel: Path
     wheel_sha256: str
 
@@ -172,6 +180,7 @@ class Dependency:
     install_path: str
     tarball: Path
     sha256: str
+    integrity: str
 
 
 @dataclass(frozen=True)
@@ -186,6 +195,8 @@ class QuotaRole:
     package_sha256: str
     package_lock: Path
     package_lock_sha256: str
+    build_proof: Path
+    build_proof_sha256: str
     dependencies: tuple[Dependency, ...]
 
 
@@ -202,6 +213,7 @@ class BuildManifest:
     node_runtime: NodeRuntime
     agent_roles: Mapping[str, AgentRole]
     quota_roles: Mapping[str, QuotaRole]
+    raw: Mapping[str, Any]
 
 
 def _sha256_fd(fd: int) -> str:
@@ -247,12 +259,15 @@ def _open_verified_file(
         mode = stat.S_IMODE(before.st_mode)
         if (
             not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
+            or (
+                before.st_nlink != 1
+                and not (before.st_uid == 0 and allow_root_owner)
+            )
             or before.st_uid not in allowed_uids
             or mode & 0o022
         ):
             raise BuildError(
-                f"{label} must be an owned, single-link, safe regular file: {path}"
+                f"{label} must be an owned, safely linked regular file: {path}"
             )
         if executable and not mode & 0o100:
             raise BuildError(f"{label} is not owner-executable: {path}")
@@ -584,6 +599,7 @@ def _parse_agent_role(value: Any, expected_role: str, label: str) -> AgentRole:
             "source_repo",
             "source_commit",
             "source_tree_sha256",
+            "source_subdirectory",
             "wheel",
             "wheel_sha256",
         },
@@ -601,6 +617,11 @@ def _parse_agent_role(value: Any, expected_role: str, label: str) -> AgentRole:
         raise BuildError(f"{label}.source_repo must be a directory")
     _require_safe_ancestry(source_repo, f"{label}.source_repo")
     wheel = _absolute(raw["wheel"], f"{label}.wheel")
+    source_subdirectory = raw["source_subdirectory"]
+    if source_subdirectory != ".":
+        source_subdirectory = _relative(
+            source_subdirectory, f"{label}.source_subdirectory"
+        )
     role = AgentRole(
         role=expected_role,
         release_path=_relative(raw["release_path"], f"{label}.release_path"),
@@ -611,6 +632,7 @@ def _parse_agent_role(value: Any, expected_role: str, label: str) -> AgentRole:
         source_tree_sha256=_sha_value(
             raw["source_tree_sha256"], f"{label}.source_tree_sha256"
         ),
+        source_subdirectory=source_subdirectory,
         wheel=wheel,
         wheel_sha256=_sha_value(raw["wheel_sha256"], f"{label}.wheel_sha256"),
     )
@@ -621,7 +643,7 @@ def _parse_agent_role(value: Any, expected_role: str, label: str) -> AgentRole:
 def _parse_dependency(value: Any, label: str) -> Dependency:
     raw = _exact_object(
         value,
-        {"name", "version", "install_path", "tarball", "sha256"},
+        {"name", "version", "install_path", "tarball", "sha256", "integrity"},
         label,
     )
     name = raw["name"]
@@ -637,7 +659,13 @@ def _parse_dependency(value: Any, label: str) -> Dependency:
         install_path=install_path,
         tarball=tarball,
         sha256=_sha_value(raw["sha256"], f"{label}.sha256"),
+        integrity=raw["integrity"],
     )
+    if (
+        not isinstance(dependency.integrity, str)
+        or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", dependency.integrity)
+    ):
+        raise BuildError(f"{label}.integrity must be an exact sha512 npm SRI")
     _require_regular(tarball, f"{label} tarball", dependency.sha256)
     return dependency
 
@@ -656,6 +684,8 @@ def _parse_quota_role(value: Any, expected_role: str, label: str) -> QuotaRole:
             "package_sha256",
             "package_lock",
             "package_lock_sha256",
+            "build_proof",
+            "build_proof_sha256",
             "dependencies",
         },
         label,
@@ -679,6 +709,7 @@ def _parse_quota_role(value: Any, expected_role: str, label: str) -> QuotaRole:
     _require_safe_ancestry(source_repo, f"{label}.source_repo")
     package_tarball = _absolute(raw["package_tarball"], f"{label}.package_tarball")
     package_lock = _absolute(raw["package_lock"], f"{label}.package_lock")
+    build_proof = _absolute(raw["build_proof"], f"{label}.build_proof")
     role = QuotaRole(
         role=expected_role,
         release_path=_relative(raw["release_path"], f"{label}.release_path"),
@@ -694,10 +725,15 @@ def _parse_quota_role(value: Any, expected_role: str, label: str) -> QuotaRole:
         package_lock_sha256=_sha_value(
             raw["package_lock_sha256"], f"{label}.package_lock_sha256"
         ),
+        build_proof=build_proof,
+        build_proof_sha256=_sha_value(
+            raw["build_proof_sha256"], f"{label}.build_proof_sha256"
+        ),
         dependencies=dependencies,
     )
     _require_regular(package_tarball, f"{label} package tarball", role.package_sha256)
     _require_regular(package_lock, f"{label} package lock", role.package_lock_sha256)
+    _require_regular(build_proof, f"{label} build proof", role.build_proof_sha256)
     return role
 
 
@@ -758,6 +794,14 @@ def load_manifest(path: Path, *, allow_existing_outputs: bool = False) -> BuildM
         name: _parse_tool(value, f"tools.{name}", system_tool=True)
         for name, value in tools_raw.items()
     }
+    for name, pin in tools.items():
+        if pin.path != SYSTEM_TOOL_PATHS[name]:
+            raise BuildError(
+                f"tools.{name}.path must be the immutable system path "
+                f"{SYSTEM_TOOL_PATHS[name]}"
+            )
+        if os.lstat(pin.path).st_uid != 0:
+            raise BuildError(f"tools.{name} must be root-owned")
     transaction_driver = _parse_tool(
         raw["transaction_driver"], "transaction_driver", system_tool=False
     )
@@ -779,6 +823,8 @@ def load_manifest(path: Path, *, allow_existing_outputs: bool = False) -> BuildM
         ),
         tree_sha256=_sha_value(python_raw["tree_sha256"], "python_runtime.tree_sha256"),
     )
+    if not python_runtime.version.startswith("3.11."):
+        raise BuildError("python_runtime.version must be exact Python 3.11")
     _require_regular(
         python_root / "bin/python3.11",
         "pinned Python binary",
@@ -799,6 +845,8 @@ def load_manifest(path: Path, *, allow_existing_outputs: bool = False) -> BuildM
         version=_version(node_raw["version"], "node_runtime.version"),
         sha256=_sha_value(node_raw["sha256"], "node_runtime.sha256"),
     )
+    if not node_runtime.version.startswith("20."):
+        raise BuildError("node_runtime.version must be exact Node 20")
     _require_regular(node_binary, "pinned Node binary", node_runtime.sha256, executable=True)
 
     agents_raw = _exact_object(
@@ -839,6 +887,7 @@ def load_manifest(path: Path, *, allow_existing_outputs: bool = False) -> BuildM
         node_runtime=node_runtime,
         agent_roles=agent_roles,
         quota_roles=quota_roles,
+        raw=raw,
     )
 
 
@@ -1096,11 +1145,25 @@ def _wheel_members(role: AgentRole, source: Mapping[str, tuple[str, bytes]]) -> 
             raise BuildError(f"Agent Fleet wheel RECORD hash is invalid: {relative}") from exc
         if expected != hashlib.sha256(payload).digest():
             raise BuildError(f"Agent Fleet wheel RECORD hash failed: {relative}")
+    source_prefix = (
+        "src/"
+        if role.source_subdirectory == "."
+        else f"{role.source_subdirectory}/src/"
+    )
     source_package = {
-        path.removeprefix("src/"): payload
+        path.removeprefix(source_prefix): payload
         for path, (kind, payload) in source.items()
-        if kind == "file" and path.startswith("src/agent_fleet/")
+        if kind == "file" and path.startswith(f"{source_prefix}agent_fleet/")
     }
+    package_manifest = (
+        "pyproject.toml"
+        if role.source_subdirectory == "."
+        else f"{role.source_subdirectory}/pyproject.toml"
+    )
+    if source.get(package_manifest, (None, b""))[0] != "file" or not source_package:
+        raise BuildError(
+            f"{role.role} Agent Fleet source_subdirectory does not bind a package"
+        )
     installed_package = {
         path: payload
         for path, payload in members.items()
@@ -1192,6 +1255,308 @@ def _package_identity(
     return package
 
 
+def _validate_quota_build_proof(
+    role: QuotaRole,
+    source: Mapping[str, tuple[str, bytes]],
+    package_members: Mapping[str, bytes],
+) -> dict[str, Any]:
+    proof = _parse_strict_json_payload(
+        _read_verified_bytes(
+            role.build_proof,
+            f"{role.role} Quota build proof",
+            role.build_proof_sha256,
+        ),
+        f"{role.role} Quota build proof",
+    )
+    _exact_object(
+        proof,
+        {
+            "schema_version", "kind", "role", "version", "source", "toolchain",
+            "build_lock", "build_package_json_normalization",
+            "npm_package_json_normalization", "generated_members", "package_members",
+            "package_tarball_sha256", "builds", "member_maps_match",
+            "tar_digests_match",
+        },
+        f"{role.role} Quota build proof",
+    )
+    if (
+        proof["schema_version"] != 1
+        or proof["kind"] != "quota-axi-offline-deterministic-build"
+        or proof["role"] != role.role
+        or proof["version"] != role.version
+        or proof["package_tarball_sha256"] != role.package_sha256
+        or proof["builds"] != 2
+        or proof["member_maps_match"] is not True
+        or proof["tar_digests_match"] is not True
+    ):
+        raise BuildError(f"{role.role} Quota build proof identity is invalid")
+    source_record = _exact_object(
+        proof["source"],
+        {"repo", "commit", "tree_sha256", "package_json_sha256"},
+        f"{role.role} Quota proof source",
+    )
+    source_package = source.get("package.json")
+    if (
+        source_record["repo"] != str(role.source_repo)
+        or source_record["commit"] != role.source_commit
+        or source_record["tree_sha256"] != role.source_tree_sha256
+        or source_package is None
+        or source_package[0] != "file"
+        or source_record["package_json_sha256"]
+        != hashlib.sha256(source_package[1]).hexdigest()
+    ):
+        raise BuildError(f"{role.role} Quota build proof source binding failed")
+
+    toolchain = _exact_object(
+        proof["toolchain"],
+        {
+            "helper", "git", "node", "npm", "npm_cache_path",
+            "npm_cache_tree_sha256", "build_package_json",
+            "resolved_artifacts", "compiler",
+        },
+        f"{role.role} Quota proof toolchain",
+    )
+    for name in ("helper", "git"):
+        record = _exact_object(
+            toolchain[name], {"path", "sha256"}, f"Quota proof {name}"
+        )
+        path = _absolute(record["path"], f"Quota proof {name}.path")
+        _require_regular(
+            path,
+            f"Quota proof {name}",
+            _sha_value(record["sha256"], f"Quota proof {name}.sha256"),
+            executable=name == "git",
+            allow_root_owner=name == "git",
+        )
+    if toolchain["git"]["path"] != "/usr/bin/git" or os.lstat("/usr/bin/git").st_uid != 0:
+        raise BuildError("Quota build proof git is not immutable /usr/bin/git")
+    node = _exact_object(
+        toolchain["node"], {"path", "sha256", "version"}, "Quota proof node"
+    )
+    node_path = _absolute(node["path"], "Quota proof node.path")
+    _require_regular(node_path, "Quota proof node", node["sha256"], executable=True)
+    if not str(node["version"]).startswith("20."):
+        raise BuildError("Quota proof did not use Node 20")
+    npm = _exact_object(
+        toolchain["npm"], {"root", "tree_sha256", "entry", "version"}, "Quota proof npm"
+    )
+    npm_root = _absolute(npm["root"], "Quota proof npm.root")
+    npm_entry = _relative(npm["entry"], "Quota proof npm.entry")
+    if (
+        not npm_root.is_dir()
+        or _offline_tree_sha256(npm_root, "Quota proof npm")
+        != npm["tree_sha256"]
+        or not (npm_root / npm_entry).is_file()
+        or not isinstance(npm["version"], str)
+        or not VERSION.fullmatch(npm["version"])
+    ):
+        raise BuildError("Quota proof npm closure changed")
+    cache = _absolute(toolchain["npm_cache_path"], "Quota proof npm cache")
+    if not cache.is_dir() or _offline_tree_sha256(cache, "Quota proof npm cache") != toolchain["npm_cache_tree_sha256"]:
+        raise BuildError("Quota proof npm cache closure changed")
+    build_package_record = _exact_object(
+        toolchain["build_package_json"],
+        {"path", "sha256"},
+        "Quota proof build package.json",
+    )
+    build_package_path = _absolute(
+        build_package_record["path"], "Quota proof build package.json.path"
+    )
+    build_package_payload = _read_verified_bytes(
+        build_package_path,
+        "Quota proof build package.json",
+        _sha_value(
+            build_package_record["sha256"],
+            "Quota proof build package.json.sha256",
+        ),
+    )
+    try:
+        build_package_json = json.loads(
+            build_package_payload, object_pairs_hook=_strict_pairs
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BuildError("Quota proof build package.json is invalid") from exc
+    if (
+        not isinstance(build_package_json, dict)
+        or build_package_json.get("name") != "quota-axi"
+        or build_package_json.get("version") != role.version
+    ):
+        raise BuildError("Quota proof build package.json identity is invalid")
+    if not isinstance(toolchain["resolved_artifacts"], list):
+        raise BuildError("Quota proof resolved artifacts must be an array")
+    resolved_artifacts: dict[Path, str] = {}
+    previous_artifact = ""
+    for index, raw_artifact in enumerate(toolchain["resolved_artifacts"]):
+        artifact = _exact_object(
+            raw_artifact,
+            {"path", "sha256"},
+            f"Quota proof resolved artifact {index}",
+        )
+        artifact_path = _absolute(
+            artifact["path"], f"Quota proof resolved artifact {index}.path"
+        )
+        artifact_sha256 = _sha_value(
+            artifact["sha256"],
+            f"Quota proof resolved artifact {index}.sha256",
+        )
+        if str(artifact_path) <= previous_artifact or artifact_path in resolved_artifacts:
+            raise BuildError("Quota proof resolved artifacts are not unique/path-sorted")
+        _require_regular(
+            artifact_path,
+            f"Quota proof resolved artifact {index}",
+            artifact_sha256,
+        )
+        previous_artifact = str(artifact_path)
+        resolved_artifacts[artifact_path] = artifact_sha256
+    compiler = _exact_object(
+        toolchain["compiler"], {"relative_path", "sha256", "args"}, "Quota proof compiler"
+    )
+    if (
+        _relative(
+            compiler["relative_path"], "Quota proof compiler.relative_path"
+        )
+        != compiler["relative_path"]
+        or not SHA256.fullmatch(compiler["sha256"])
+        or not isinstance(compiler["args"], list)
+        or not all(isinstance(value, str) for value in compiler["args"])
+    ):
+        raise BuildError("Quota proof compiler contract is invalid")
+
+    build_lock = _exact_object(
+        proof["build_lock"],
+        {"path", "sha256", "lockfile_version", "packages_sha256", "records"},
+        "Quota proof build lock",
+    )
+    lock_path = _absolute(build_lock["path"], "Quota proof build lock.path")
+    lock_payload = _read_verified_bytes(
+        lock_path, "Quota proof build lock", build_lock["sha256"]
+    )
+    try:
+        lock = json.loads(lock_payload, object_pairs_hook=_strict_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BuildError("Quota proof build lock is invalid") from exc
+    packages = lock.get("packages") if isinstance(lock, dict) else None
+    if (
+        build_lock["lockfile_version"] != 3
+        or lock.get("lockfileVersion") != 3
+        or not isinstance(packages, dict)
+        or hashlib.sha256(
+            (
+                json.dumps(
+                    packages, indent=2, sort_keys=True, ensure_ascii=False
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        != build_lock["packages_sha256"]
+    ):
+        raise BuildError("Quota proof build-lock graph digest failed")
+    expected_records = []
+    referenced_artifacts: set[Path] = set()
+    for install_path in sorted(path for path in packages if path):
+        record = packages[install_path]
+        if not isinstance(record, dict):
+            raise BuildError("Quota proof build-lock record is invalid")
+        version = record.get("version")
+        integrity = record.get("integrity")
+        resolved = record.get("resolved")
+        if not isinstance(integrity, str) or not re.fullmatch(
+            r"sha512-[A-Za-z0-9+/]+={0,2}", integrity
+        ):
+            raise BuildError("Quota proof build-lock record lacks exact SRI")
+        if (
+            not isinstance(version, str)
+            or not VERSION.fullmatch(version)
+            or not isinstance(resolved, str)
+            or not resolved
+        ):
+            raise BuildError(
+                "Quota proof build-lock record lacks an exact version/resolved artifact"
+            )
+        if resolved.startswith("file:"):
+            raw_resolved_path = resolved.removeprefix("file:")
+            if (
+                not raw_resolved_path
+                or "$" in raw_resolved_path
+                or "\x00" in raw_resolved_path
+            ):
+                raise BuildError("Quota proof build-lock file artifact is unsafe")
+            unresolved_path = Path(raw_resolved_path)
+            if not unresolved_path.is_absolute():
+                unresolved_path = lock_path.parent / unresolved_path
+            resolved_path = Path(os.path.realpath(unresolved_path))
+            if resolved_path not in resolved_artifacts:
+                raise BuildError(
+                    "Quota proof build-lock file artifact is not retained and pinned"
+                )
+            referenced_artifacts.add(resolved_path)
+        elif not resolved.startswith("https://registry.npmjs.org/"):
+            raise BuildError(
+                "Quota proof build-lock resolved artifact scheme is unsupported"
+            )
+        expected_records.append(
+            {
+                "install_path": install_path,
+                "version": version,
+                "integrity": integrity,
+                "resolved": resolved,
+            }
+        )
+    if build_lock["records"] != expected_records:
+        raise BuildError("Quota proof build-lock graph/SRI records differ")
+    if referenced_artifacts != set(resolved_artifacts):
+        raise BuildError("Quota proof resolved-artifact closure differs from its lock")
+
+    member_records = [
+        {"path": path, "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+        for path, payload in sorted(package_members.items())
+    ]
+    if proof["package_members"] != member_records:
+        raise BuildError("Quota build proof package-member inventory differs")
+    normalization = _exact_object(
+        proof["npm_package_json_normalization"],
+        {"source_sha256", "packed_sha256", "changes"},
+        "Quota npm package.json normalization",
+    )
+    try:
+        source_json = json.loads(source_package[1])
+        packed_json = json.loads(package_members["package.json"])
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BuildError("Quota package.json normalization is unreadable") from exc
+    if normalization != {
+        "source_sha256": hashlib.sha256(source_package[1]).hexdigest(),
+        "packed_sha256": hashlib.sha256(package_members["package.json"]).hexdigest(),
+        "changes": _json_changes(source_json, packed_json),
+    }:
+        raise BuildError("Quota npm package.json normalization proof differs")
+    build_normalization = _exact_object(
+        proof["build_package_json_normalization"],
+        {"source_sha256", "build_sha256", "changes"},
+        "Quota build package.json normalization",
+    )
+    if build_normalization != {
+        "source_sha256": hashlib.sha256(source_package[1]).hexdigest(),
+        "build_sha256": hashlib.sha256(build_package_payload).hexdigest(),
+        "changes": _json_changes(source_json, build_package_json),
+    }:
+        raise BuildError("Quota build package.json normalization proof differs")
+    generated = [
+        {"path": path, "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+        for path, payload in sorted(package_members.items())
+        if path != "package.json" and source.get(path) != ("file", payload)
+    ]
+    if proof["generated_members"] != generated or any(
+        not record["path"].startswith("dist/") for record in generated
+    ):
+        raise BuildError("Quota generated-member proof is not the exact dist closure")
+    for path, payload in package_members.items():
+        if path == "package.json" or path.startswith("dist/"):
+            continue
+        if source.get(path) != ("file", payload):
+            raise BuildError(f"Quota packed source member differs from exact commit: {path}")
+    return proof
+
+
 def _validate_quota_inputs(
     role: QuotaRole,
     source: Mapping[str, tuple[str, bytes]],
@@ -1224,12 +1589,7 @@ def _validate_quota_inputs(
         raise BuildError("Quota AXI source package.json is invalid") from exc
     if source_identity.get("name") != "quota-axi" or source_identity.get("version") != role.version:
         raise BuildError(f"{role.role} Quota AXI source identity does not match its package")
-    for relative, payload in package_members.items():
-        source_member = source.get(relative)
-        if source_member != ("file", payload):
-            raise BuildError(
-                f"{role.role} Quota AXI package member is absent or differs from exact source: {relative}"
-            )
+    _validate_quota_build_proof(role, source, package_members)
 
     dependency_members: dict[str, dict[str, bytes]] = {}
     for dependency in role.dependencies:
@@ -1265,6 +1625,11 @@ def _validate_quota_inputs(
         raise BuildError(f"{role.role} Quota AXI lock package closure is not exact")
     if packages["node_modules/quota-axi"].get("version") != role.version:
         raise BuildError(f"{role.role} Quota AXI lock does not pin quota-axi")
+    package_integrity = "sha512-" + base64.b64encode(
+        hashlib.sha512(_read_verified_bytes(role.package_tarball, "Quota package SRI")).digest()
+    ).decode("ascii")
+    if packages["node_modules/quota-axi"].get("integrity") != package_integrity:
+        raise BuildError(f"{role.role} Quota AXI lock package SRI does not match")
     root = packages.get("")
     root_dependencies = root.get("dependencies") if isinstance(root, dict) else None
     if not isinstance(root_dependencies, dict) or root_dependencies.get("quota-axi") != role.version:
@@ -1275,6 +1640,19 @@ def _validate_quota_inputs(
             raise BuildError(
                 f"{role.role} Quota AXI lock does not pin {dependency.install_path}"
             )
+        payload = _read_verified_bytes(
+            dependency.tarball, f"{role.role} dependency SRI", dependency.sha256
+        )
+        observed_integrity = "sha512-" + base64.b64encode(
+            hashlib.sha512(payload).digest()
+        ).decode("ascii")
+        if (
+            dependency.integrity != observed_integrity
+            or record.get("integrity") != dependency.integrity
+        ):
+            raise BuildError(
+                f"{role.role} Quota AXI lock SRI does not bind {dependency.install_path}"
+            )
     return package_members, dependency_members, lock_bytes
 
 
@@ -1284,7 +1662,7 @@ def _content_tree_sha256(root: Path, relatives: Sequence[str], label: str) -> st
     for relative in relatives:
         path = root / relative
         if not path.exists() or path.is_symlink():
-            raise BuildError(f"{label} path is missing or symlinked: {path}")
+            raise BuildError(f"{label} root path is missing or symlinked: {path}")
         observed.append(path)
         if path.is_dir():
             observed.extend(path.rglob("*"))
@@ -1295,8 +1673,12 @@ def _content_tree_sha256(root: Path, relatives: Sequence[str], label: str) -> st
         relative = path.relative_to(root).as_posix()
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
-            raise BuildError(f"{label} contains a symlink: {path}")
-        if stat.S_ISDIR(info.st_mode):
+            target, resolved = _validated_internal_runtime_symlink(root, path, label)
+            kind = b"symlink"
+            value = hashlib.sha256(target.encode("utf-8")).digest()
+            # Bind both the lexical link and the exact canonicalized payload.
+            value += bytes.fromhex(_sha256(resolved))
+        elif stat.S_ISDIR(info.st_mode):
             kind = b"directory"
             value = b""
         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
@@ -1306,6 +1688,102 @@ def _content_tree_sha256(root: Path, relatives: Sequence[str], label: str) -> st
             raise BuildError(f"{label} contains an unsupported path: {path}")
         digest.update(relative.encode("utf-8") + b"\0" + kind + b"\0" + value)
     return digest.hexdigest()
+
+
+def _validated_internal_runtime_symlink(
+    root: Path, path: Path, label: str
+) -> tuple[str, Path]:
+    target = os.readlink(path)
+    if (
+        not target
+        or "\x00" in target
+        or "$" in target
+        or os.path.isabs(target)
+    ):
+        raise BuildError(f"{label} has an unsafe runtime symlink: {path} -> {target!r}")
+    lexical = Path(os.path.normpath(path.parent / target))
+    try:
+        lexical.relative_to(root)
+    except ValueError as exc:
+        raise BuildError(
+            f"{label} runtime symlink escapes its root: {path} -> {target!r}"
+        ) from exc
+    resolved = Path(os.path.realpath(lexical))
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise BuildError(
+            f"{label} runtime symlink resolves outside its root: {path} -> {target!r}"
+        ) from exc
+    _require_regular(resolved, f"{label} runtime symlink target")
+    return target, resolved
+
+
+def _python_runtime_transformations(root: Path) -> list[dict[str, str]]:
+    transformations: list[dict[str, str]] = []
+    for path in sorted(
+        (root / "lib").rglob("*"),
+        key=lambda item: item.relative_to(root).as_posix().encode("utf-8"),
+    ):
+        if not path.is_symlink():
+            continue
+        target, resolved = _validated_internal_runtime_symlink(
+            root, path, "pinned Python runtime"
+        )
+        transformations.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "target": target,
+                "resolved_path": resolved.relative_to(root).as_posix(),
+                "resolved_sha256": _sha256(resolved),
+                "transformation": "materialize-internal-regular-file",
+            }
+        )
+    return transformations
+
+
+def _offline_tree_sha256(root: Path, label: str) -> str:
+    digest = hashlib.sha256(b"bridge-offline-tree-v1\0")
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda item: item.relative_to(root).as_posix().encode("utf-8"),
+    ):
+        relative = path.relative_to(root).as_posix()
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            kind, payload = b"dir", b""
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            kind, payload = b"file", bytes.fromhex(_sha256(path))
+        elif stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            resolved = Path(os.path.realpath(path.parent / target))
+            try:
+                resolved.relative_to(root)
+            except ValueError as exc:
+                raise BuildError(f"{label} symlink escapes: {path}") from exc
+            kind = b"symlink"
+            payload = hashlib.sha256(target.encode("utf-8")).digest()
+        else:
+            raise BuildError(f"{label} contains unsupported path: {path}")
+        digest.update(relative.encode("utf-8") + b"\0" + kind + b"\0" + payload)
+    return digest.hexdigest()
+
+
+def _json_changes(before: Any, after: Any, prefix: str = "$") -> list[dict[str, Any]]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes: list[dict[str, Any]] = []
+        for key in sorted(set(before) | set(after)):
+            child = f"{prefix}.{key}"
+            if key not in before:
+                changes.append({"path": child, "before": None, "after": after[key]})
+            elif key not in after:
+                changes.append({"path": child, "before": before[key], "after": None})
+            else:
+                changes.extend(_json_changes(before[key], after[key], child))
+        return changes
+    if before != after:
+        return [{"path": prefix, "before": before, "after": after}]
+    return []
 
 
 def _copy_regular(source: Path, destination: Path) -> None:
@@ -1382,7 +1860,12 @@ def _fsync_sealed_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def _copy_tree(
+    source: Path,
+    destination: Path,
+    *,
+    canonical_runtime_root: Path | None = None,
+) -> None:
     if destination.exists():
         raise BuildError(f"copy destination already exists: {destination}")
     destination.mkdir(parents=True)
@@ -1400,7 +1883,19 @@ def _copy_tree(source: Path, destination: Path) -> None:
             (target_base / name).mkdir()
         for name in files:
             item = base / name
-            _copy_regular(item, target_base / name)
+            if item.is_symlink():
+                if canonical_runtime_root is None:
+                    raise BuildError(
+                        f"copy source tree contains a symlink: {item}"
+                    )
+                _, resolved = _validated_internal_runtime_symlink(
+                    canonical_runtime_root,
+                    item,
+                    "pinned Python runtime",
+                )
+                _copy_regular(resolved, target_base / name)
+            else:
+                _copy_regular(item, target_base / name)
 
 
 def _extract_members(members: Mapping[str, bytes], destination: Path) -> None:
@@ -2111,7 +2606,11 @@ def _build_agent_release(
     root.mkdir(parents=True)
     (root / "bin").mkdir()
     _copy_regular(manifest.python_runtime.root / "bin/python3.11", root / "bin/python3.11")
-    _copy_tree(manifest.python_runtime.root / "lib", root / "lib")
+    _copy_tree(
+        manifest.python_runtime.root / "lib",
+        root / "lib",
+        canonical_runtime_root=manifest.python_runtime.root,
+    )
     _extract_members(wheel_members, root / "site-packages")
     build = root / "build"
     build.mkdir()
@@ -2164,6 +2663,10 @@ def _build_agent_release(
         "version": role.version,
         "source_commit": role.source_commit,
         "source_tree_sha256": role.source_tree_sha256,
+        "python_runtime_source_tree_sha256": manifest.python_runtime.tree_sha256,
+        "python_runtime_transformations": _python_runtime_transformations(
+            manifest.python_runtime.root
+        ),
         "artifacts": {
             "launcher": _artifact(launcher, root),
             "python": _artifact(root / "bin/python3.11", root),
@@ -2199,6 +2702,7 @@ def _build_quota_release(
     _write_bytes(root / "package-lock.json", lock_bytes)
     build = root / "build"
     build.mkdir()
+    _copy_regular(role.build_proof, build / "quota-build-proof.json")
     executables = {"runtime/node"}
     _set_preclosure_modes(root, executables)
     protected = ("runtime", "node_modules", "package-lock.json")
@@ -2235,6 +2739,9 @@ def _build_quota_release(
             ),
             "package_lock": _artifact(root / "package-lock.json", root),
             "runtime_manifest": _artifact(closure_path, root),
+            "quota_build_proof": _artifact(
+                build / "quota-build-proof.json", root
+            ),
         },
     }
     _write_json(build / "provenance.json", provenance)
@@ -2581,30 +3088,139 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
 def _write_json_no_replace(path: Path, value: Any, mode: int) -> None:
     if path.exists() or path.is_symlink():
         raise BuildError(f"refusing to overwrite build artifact: {path}")
-    staging = Path(
-        os.path.realpath(
-            tempfile.mkdtemp(prefix=f".{path.name}.bridge-write-", dir=path.parent)
-        )
+    payload = (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    staging = path.with_name(
+        f".{path.name}.bridge-write-{payload_sha256[:32]}"
     )
-    os.chmod(staging, 0o700)
-    temporary = staging / "payload"
     try:
-        _write_json(temporary, value, mode)
-        _rename_no_replace(temporary, path)
-        _fsync_directory(path.parent)
+        staging_info = os.lstat(staging)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            not stat.S_ISREG(staging_info.st_mode)
+            or staging_info.st_uid != os.getuid()
+            or staging_info.st_nlink != 1
+            or stat.S_IMODE(staging_info.st_mode) != mode
+        ):
+            raise BuildError(
+                f"deterministic JSON staging path is not attributable: {staging}"
+            )
+        staged = staging.read_bytes()
+        if len(staged) > len(payload) or not payload.startswith(staged):
+            raise BuildError(
+                f"deterministic JSON staging payload is not attributable: {staging}"
+            )
+        staging.unlink()
+        _fsync_directory(staging.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(staging, flags, mode)
+    try:
+        os.fchmod(descriptor, mode)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise BuildError(f"short write while staging JSON artifact: {staging}")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
     finally:
-        _remove_tree(staging)
+        os.close(descriptor)
+    try:
+        _rename_no_replace(staging, path)
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            staged_info = os.lstat(staging)
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                not stat.S_ISREG(staged_info.st_mode)
+                or staged_info.st_uid != os.getuid()
+                or staged_info.st_nlink != 1
+                or stat.S_IMODE(staged_info.st_mode) != mode
+                or staging.read_bytes() != payload
+            ):
+                raise BuildError(
+                    f"refusing cleanup of unattributed JSON staging path: {staging}"
+                )
+            staging.unlink()
+            _fsync_directory(staging.parent)
+        raise
 
 
-def _publish_release(manifest: BuildManifest, source: Path, final: Path) -> tuple[int, int]:
+def _publication_staging_marker(
+    staging: Path,
+    publication_id: str,
+    final: Path,
+    tree_sha256: str,
+) -> None:
+    marker = _exact_object(
+        _read_strict_json(staging / ".bridge-publication-staging.json", "publication staging marker"),
+        {"schema_version", "publication_id", "final_path", "tree_sha256"},
+        "publication staging marker",
+    )
+    expected = {
+        "schema_version": 1,
+        "publication_id": publication_id,
+        "final_path": str(final),
+        "tree_sha256": tree_sha256,
+    }
+    if marker != expected:
+        raise BuildError(f"publication staging marker is not attributable: {staging}")
+
+
+def _remove_publication_staging(
+    staging: Path,
+    publication_id: str,
+    final: Path,
+    tree_sha256: str,
+) -> None:
+    try:
+        info = os.lstat(staging)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise BuildError(f"publication staging path is not attributable: {staging}")
+    _publication_staging_marker(staging, publication_id, final, tree_sha256)
+    _remove_tree(staging)
+    _fsync_directory(staging.parent)
+
+
+def _publish_release(
+    manifest: BuildManifest,
+    source: Path,
+    final: Path,
+    publication_id: str,
+    staging: Path,
+    tree_sha256: str,
+) -> tuple[int, int]:
     if final.exists() or final.is_symlink():
         raise BuildError(f"final release appeared during build; refusing overwrite: {final}")
-    staging = Path(
-        os.path.realpath(
-            tempfile.mkdtemp(prefix=f".{final.name}.bridge-sealed-", dir=final.parent)
-        )
-    )
+    if staging.exists() or staging.is_symlink():
+        raise BuildError(f"publication staging path already exists: {staging}")
+    staging.mkdir(mode=0o700)
     os.chmod(staging, 0o700)
+    _write_json(
+        staging / ".bridge-publication-staging.json",
+        {
+            "schema_version": 1,
+            "publication_id": publication_id,
+            "final_path": str(final),
+            "tree_sha256": tree_sha256,
+        },
+        0o400,
+    )
     candidate = staging / "release"
     try:
         _copy_sealed(manifest, source, candidate)
@@ -2616,7 +3232,9 @@ def _publish_release(manifest: BuildManifest, source: Path, final: Path) -> tupl
         info = os.lstat(final)
         return info.st_dev, info.st_ino
     finally:
-        _remove_tree(staging)
+        _remove_publication_staging(
+            staging, publication_id, final, tree_sha256
+        )
 
 
 def _remove_tree_if_identity(path: Path, identity: tuple[int, int]) -> None:
@@ -2652,6 +3270,126 @@ def _publication_journal_path(manifest: BuildManifest) -> Path:
     )
 
 
+def _workspace_journal_path(manifest: BuildManifest) -> Path:
+    return manifest.proof_manifest.with_name(
+        manifest.proof_manifest.stem + "-workspace-journal.json"
+    )
+
+
+def _workspace_paths(
+    manifest: BuildManifest, publication_id: str
+) -> tuple[Path, Path]:
+    prefix = f".{manifest.proof_manifest.stem}.bridge-build-{publication_id[:32]}"
+    return (
+        manifest.proof_manifest.parent / f"{prefix}-a",
+        manifest.proof_manifest.parent / f"{prefix}-b",
+    )
+
+
+def _workspace_marker_value(
+    manifest: BuildManifest, publication_id: str, path: Path, build_index: int
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "manifest_sha256": manifest.manifest_sha256,
+        "publication_id": publication_id,
+        "path": str(path),
+        "build_index": build_index,
+    }
+
+
+def _remove_builder_workspace(
+    manifest: BuildManifest,
+    publication_id: str,
+    path: Path,
+    build_index: int,
+) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise BuildError(f"builder workspace is not attributable: {path}")
+    marker = _read_strict_json(
+        path / ".bridge-builder-workspace.json", "builder workspace marker"
+    )
+    expected = _workspace_marker_value(
+        manifest, publication_id, path, build_index
+    )
+    if marker != expected:
+        raise BuildError(f"builder workspace belongs to another operation: {path}")
+    _remove_tree(path)
+    _fsync_directory(path.parent)
+
+
+def _recover_builder_workspaces(
+    manifest: BuildManifest, publication_id: str
+) -> None:
+    journal_path = _workspace_journal_path(manifest)
+    paths = _workspace_paths(manifest, publication_id)
+    if not journal_path.exists() and not journal_path.is_symlink():
+        for path in paths:
+            if path.exists() or path.is_symlink():
+                raise BuildError(
+                    f"builder workspace exists without an ownership journal: {path}"
+                )
+        return
+    _require_regular(journal_path, "builder workspace journal")
+    if stat.S_IMODE(os.lstat(journal_path).st_mode) != 0o600:
+        raise BuildError("builder workspace journal mode must be 0600")
+    journal_info = os.lstat(journal_path)
+    journal_identity = (
+        journal_info.st_dev,
+        journal_info.st_ino,
+        _sha256(journal_path),
+    )
+    journal = _exact_object(
+        _read_strict_json(journal_path, "builder workspace journal"),
+        {
+            "schema_version",
+            "manifest_sha256",
+            "publication_id",
+            "live_references_changed",
+            "workspaces",
+        },
+        "builder workspace journal",
+    )
+    expected_workspaces = [str(path) for path in paths]
+    if journal != {
+        "schema_version": 1,
+        "manifest_sha256": manifest.manifest_sha256,
+        "publication_id": publication_id,
+        "live_references_changed": False,
+        "workspaces": expected_workspaces,
+    }:
+        raise BuildError("builder workspace journal is not attributable")
+    for index, path in enumerate(paths, start=1):
+        _remove_builder_workspace(manifest, publication_id, path, index)
+    _unlink_file_if_identity(journal_path, journal_identity)
+
+
+def _create_builder_workspace(
+    manifest: BuildManifest,
+    publication_id: str,
+    path: Path,
+    build_index: int,
+) -> None:
+    if path.exists() or path.is_symlink():
+        raise BuildError(f"builder workspace appeared before creation: {path}")
+    path.mkdir(mode=0o700)
+    os.chmod(path, 0o700)
+    _write_json(
+        path / ".bridge-builder-workspace.json",
+        _workspace_marker_value(manifest, publication_id, path, build_index),
+        0o400,
+    )
+    _fsync_directory(path)
+
+
 def _front_door_plan_path(manifest: BuildManifest) -> Path:
     return manifest.proof_manifest.with_name(
         manifest.proof_manifest.stem + "-front-door.json"
@@ -2659,7 +3397,7 @@ def _front_door_plan_path(manifest: BuildManifest) -> Path:
 
 
 def _publication_records(
-    manifest: BuildManifest, trees: Mapping[str, str]
+    manifest: BuildManifest, trees: Mapping[str, str], publication_id: str
 ) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     for key in (
@@ -2674,11 +3412,16 @@ def _publication_records(
             if family == "agent_fleet"
             else manifest.quota_roles[role_name]
         )
+        final = manifest.output_root / role.release_path
+        staging = final.with_name(
+            f".{final.name}.bridge-sealed-{publication_id[:32]}"
+        )
         records.append(
             {
                 "key": key,
-                "path": str(manifest.output_root / role.release_path),
+                "path": str(final),
                 "relative_path": role.release_path,
+                "staging_path": str(staging),
                 "tree_sha256": trees[key],
             }
         )
@@ -2722,24 +3465,37 @@ def _validate_publication_journal(
     releases = journal["releases"]
     if not isinstance(releases, list) or len(releases) != 4:
         raise BuildError("publication journal must bind exactly four releases")
-    expected_paths = {
-        str(manifest.output_root / role.release_path): role.release_path
-        for role in (*manifest.agent_roles.values(), *manifest.quota_roles.values())
-    }
+    expected_paths: dict[str, tuple[str, str]] = {}
+    for family, roles in (
+        ("agent_fleet", manifest.agent_roles),
+        ("quota_axi", manifest.quota_roles),
+    ):
+        for role_name, role in roles.items():
+            expected_paths[str(manifest.output_root / role.release_path)] = (
+                role.release_path,
+                f"{family}_{role_name}",
+            )
     observed_paths: set[str] = set()
     records: list[Mapping[str, str]] = []
     for index, value in enumerate(releases):
         record = _exact_object(
             value,
-            {"key", "path", "relative_path", "tree_sha256"},
+            {"key", "path", "relative_path", "staging_path", "tree_sha256"},
             f"publication journal release[{index}]",
         )
         if (
             not isinstance(record["key"], str)
             or record["path"] not in expected_paths
-            or record["relative_path"] != expected_paths.get(record["path"])
+            or record["relative_path"] != expected_paths[record["path"]][0]
+            or record["key"] != expected_paths[record["path"]][1]
             or not isinstance(record["tree_sha256"], str)
             or not SHA256.fullmatch(record["tree_sha256"])
+            or record["staging_path"]
+            != str(
+                Path(record["path"]).with_name(
+                    f".{Path(record['path']).name}.bridge-sealed-{publication_id[:32]}"
+                )
+            )
             or record["path"] in observed_paths
         ):
             raise BuildError("publication journal release binding is invalid")
@@ -2794,6 +3550,13 @@ def _recover_interrupted_publication(
     publication_id, records = _validate_publication_journal(
         manifest, _read_strict_json(journal_path, "publication journal")
     )
+    for record in records:
+        _remove_publication_staging(
+            Path(record["staging_path"]),
+            publication_id,
+            Path(record["path"]),
+            record["tree_sha256"],
+        )
     plan_path = _front_door_plan_path(manifest)
     completed = _proof_matches_publication(manifest, driver, records)
     if completed:
@@ -2895,6 +3658,7 @@ def _quota_proof_paths() -> list[str]:
             "package-lock.json",
             "build/quota-axi-launcher.c",
             "build/provenance.json",
+            "build/quota-build-proof.json",
             "build/runtime-closure.json",
         },
         key=lambda item: item.encode("utf-8"),
@@ -2917,6 +3681,90 @@ def _signature_record(manifest: BuildManifest, path: Path) -> dict[str, Any]:
         "hardened_runtime": True,
         "verify_strict": True,
         "details_sha256": _signature_details(manifest, path),
+    }
+
+
+def _build_inputs_record(manifest: BuildManifest) -> dict[str, Any]:
+    canonical_manifest = (
+        json.dumps(
+            manifest.raw,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    builder_path = Path(os.path.realpath(__file__))
+    bootstrap_path = builder_path.with_name("sealed_agent_fleet_bootstrap.py")
+    return {
+        "schema_version": 1,
+        "manifest_path": str(manifest.path),
+        "manifest": dict(manifest.raw),
+        "manifest_sha256": manifest.manifest_sha256,
+        "manifest_canonical_sha256": hashlib.sha256(canonical_manifest).hexdigest(),
+        "builder": {"path": str(builder_path), "sha256": _sha256(builder_path)},
+        "bootstrap": {
+            "path": str(bootstrap_path),
+            "sha256": _sha256(bootstrap_path),
+        },
+        "transaction_driver": {
+            "path": str(manifest.transaction_driver.path),
+            "sha256": manifest.transaction_driver.sha256,
+        },
+        "tools": {
+            name: {"path": str(pin.path), "sha256": pin.sha256}
+            for name, pin in sorted(manifest.tools.items())
+        },
+        "python_runtime": {
+            "root": str(manifest.python_runtime.root),
+            "version": manifest.python_runtime.version,
+            "binary_sha256": manifest.python_runtime.binary_sha256,
+            "source_tree_sha256": manifest.python_runtime.tree_sha256,
+            "transformations": _python_runtime_transformations(
+                manifest.python_runtime.root
+            ),
+        },
+        "node_runtime": {
+            "path": str(manifest.node_runtime.binary),
+            "version": manifest.node_runtime.version,
+            "sha256": manifest.node_runtime.sha256,
+        },
+        "agent_fleet": {
+            role_name: {
+                "source_repo": str(role.source_repo),
+                "source_commit": role.source_commit,
+                "source_tree_sha256": role.source_tree_sha256,
+                "source_subdirectory": role.source_subdirectory,
+                "wheel": str(role.wheel),
+                "wheel_sha256": role.wheel_sha256,
+            }
+            for role_name, role in manifest.agent_roles.items()
+        },
+        "quota_axi": {
+            role_name: {
+                "source_repo": str(role.source_repo),
+                "source_commit": role.source_commit,
+                "source_tree_sha256": role.source_tree_sha256,
+                "package_tarball": str(role.package_tarball),
+                "package_sha256": role.package_sha256,
+                "package_lock": str(role.package_lock),
+                "package_lock_sha256": role.package_lock_sha256,
+                "build_proof": str(role.build_proof),
+                "build_proof_sha256": role.build_proof_sha256,
+                "dependencies": [
+                    {
+                        "name": item.name,
+                        "version": item.version,
+                        "install_path": item.install_path,
+                        "tarball": str(item.tarball),
+                        "sha256": item.sha256,
+                        "integrity": item.integrity,
+                    }
+                    for item in role.dependencies
+                ],
+            }
+            for role_name, role in manifest.quota_roles.items()
+        },
     }
 
 
@@ -3131,6 +3979,46 @@ def _probe_front_door(manifest: BuildManifest, source: Path, expected: AgentRole
         _remove_tree(temporary)
 
 
+def _probe_declared_runtime_versions(
+    manifest: BuildManifest, roots: Mapping[str, Path]
+) -> dict[str, str]:
+    env = {
+        "HOME": "/var/empty",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+    }
+    observed: dict[str, str] = {}
+    for key in ("agent_fleet_candidate", "agent_fleet_rollback"):
+        result = _run(
+            [str(roots[key] / "bin/python3.11"), "--version"],
+            env=env,
+            timeout=30,
+        )
+        value = (result.stdout + result.stderr).strip()
+        expected = f"Python {manifest.python_runtime.version}"
+        if value != expected:
+            raise BuildError(
+                f"{key} runtime version is {value!r}; expected {expected!r}"
+            )
+        observed[key] = value
+    for key in ("quota_axi_candidate", "quota_axi_rollback"):
+        result = _run(
+            [str(roots[key] / "runtime/node"), "--version"],
+            env=env,
+            timeout=30,
+        )
+        value = (result.stdout + result.stderr).strip()
+        expected = f"v{manifest.node_runtime.version}"
+        if value != expected:
+            raise BuildError(
+                f"{key} runtime version is {value!r}; expected {expected!r}"
+            )
+        observed[key] = value
+    return observed
+
+
 def build(manifest_path: Path) -> Path:
     """Build, verify, and publish four previously absent immutable releases."""
     global _ACTIVE_MANIFEST
@@ -3141,7 +4029,12 @@ def build(manifest_path: Path) -> Path:
         "builder manifest",
         manifest.manifest_sha256,
     )
+    publication_id = hashlib.sha256(
+        b"bridge-sealed-publication-v2\0"
+        + manifest.manifest_sha256.encode("ascii")
+    ).hexdigest()
     driver = _load_transaction_driver(manifest.transaction_driver)
+    _recover_builder_workspaces(manifest, publication_id)
     if _recover_interrupted_publication(manifest, driver):
         return manifest.proof_manifest
     for role in (*manifest.agent_roles.values(), *manifest.quota_roles.values()):
@@ -3187,12 +4080,15 @@ def build(manifest_path: Path) -> Path:
         )
         quota_inputs[role_name] = _validate_quota_inputs(role, source)
 
-    publication_id = secrets.token_hex(32)
-    first_base = Path(os.path.realpath(tempfile.mkdtemp(prefix="bridge-runtime-build-a-")))
-    second_base = Path(os.path.realpath(tempfile.mkdtemp(prefix="bridge-runtime-build-b-")))
+    first_base, second_base = _workspace_paths(manifest, publication_id)
     published: list[tuple[Path, tuple[int, int]]] = []
     plan_path = _front_door_plan_path(manifest)
     journal_path = _publication_journal_path(manifest)
+    workspace_journal_path = _workspace_journal_path(manifest)
+    plan_identity: tuple[int, int, str] | None = None
+    proof_identity: tuple[int, int, str] | None = None
+    workspace_journal_identity: tuple[int, int, str] | None = None
+    owned_workspaces: list[tuple[Path, int]] = []
     try:
         if journal_path.exists() or journal_path.is_symlink():
             raise BuildError(
@@ -3200,6 +4096,36 @@ def build(manifest_path: Path) -> Path:
             )
         if plan_path.exists() or plan_path.is_symlink():
             raise BuildError(f"front-door plan already exists; refusing overwrite: {plan_path}")
+        if workspace_journal_path.exists() or workspace_journal_path.is_symlink():
+            raise BuildError(
+                f"workspace journal appeared after recovery: {workspace_journal_path}"
+            )
+        for workspace in (first_base, second_base):
+            if workspace.exists() or workspace.is_symlink():
+                raise BuildError(
+                    f"builder workspace appeared after recovery: {workspace}"
+                )
+        _write_json_no_replace(
+            workspace_journal_path,
+            {
+                "schema_version": 1,
+                "manifest_sha256": manifest.manifest_sha256,
+                "publication_id": publication_id,
+                "live_references_changed": False,
+                "workspaces": [str(first_base), str(second_base)],
+            },
+            0o600,
+        )
+        workspace_journal_info = os.lstat(workspace_journal_path)
+        workspace_journal_identity = (
+            workspace_journal_info.st_dev,
+            workspace_journal_info.st_ino,
+            _sha256(workspace_journal_path),
+        )
+        _create_builder_workspace(manifest, publication_id, first_base, 1)
+        owned_workspaces.append((first_base, 1))
+        _create_builder_workspace(manifest, publication_id, second_base, 2)
+        owned_workspaces.append((second_base, 2))
         first = _build_once(
             manifest,
             first_base,
@@ -3220,6 +4146,14 @@ def build(manifest_path: Path) -> Path:
             raise BuildError(
                 f"deterministic rebuild tree digests differ: {first['trees']!r} != {second['trees']!r}"
             )
+        first_runtime_versions = _probe_declared_runtime_versions(
+            manifest, first["roots"]
+        )
+        second_runtime_versions = _probe_declared_runtime_versions(
+            manifest, second["roots"]
+        )
+        if first_runtime_versions != second_runtime_versions:
+            raise BuildError("runtime-version probes differ across deterministic builds")
         probes: dict[str, Mapping[str, Any]] = {}
         for role_name, role in manifest.agent_roles.items():
             key = f"agent_fleet_{role_name}"
@@ -3250,7 +4184,9 @@ def build(manifest_path: Path) -> Path:
             "manifest_sha256": manifest.manifest_sha256,
             "publication_id": publication_id,
             "live_references_changed": False,
-            "releases": _publication_records(manifest, first["trees"]),
+            "releases": _publication_records(
+                manifest, first["trees"], publication_id
+            ),
         }
         _write_json_no_replace(journal_path, journal, 0o600)
         journal_info = os.lstat(journal_path)
@@ -3266,7 +4202,17 @@ def build(manifest_path: Path) -> Path:
             else:
                 role = manifest.quota_roles[key.removeprefix("quota_axi_")]
             final = manifest.output_root / role.release_path
-            identity = _publish_release(manifest, source, final)
+            staging = final.with_name(
+                f".{final.name}.bridge-sealed-{publication_id[:32]}"
+            )
+            identity = _publish_release(
+                manifest,
+                source,
+                final,
+                publication_id,
+                staging,
+                first["trees"][key],
+            )
             published.append((final, identity))
             if _tree_sha256(driver, final, f"published {key}") != first["trees"][key]:
                 raise BuildError(f"published {key} tree digest differs")
@@ -3286,6 +4232,7 @@ def build(manifest_path: Path) -> Path:
 
         proof: dict[str, Any] = {
             "schema_version": 2,
+            "build_inputs": _build_inputs_record(manifest),
             "agent_fleet_candidate": _agent_record(
                 manifest,
                 driver,
@@ -3329,33 +4276,49 @@ def build(manifest_path: Path) -> Path:
                 "relocated_hashes_match": True,
                 "known_exclusions": [],
             },
+            "runtime_versions": {
+                "schema_version": 1,
+                "closed_environment": True,
+                "observed": first_runtime_versions,
+            },
         }
         plan = _front_door_plan(manifest, agent_candidate, agent_rollback)
         _write_json_no_replace(plan_path, plan, 0o444)
         plan_info = os.lstat(plan_path)
         plan_identity = (plan_info.st_dev, plan_info.st_ino, _sha256(plan_path))
         _write_json_no_replace(manifest.proof_manifest, proof, 0o444)
+        proof_info = os.lstat(manifest.proof_manifest)
+        proof_identity = (
+            proof_info.st_dev,
+            proof_info.st_ino,
+            _sha256(manifest.proof_manifest),
+        )
         _unlink_file_if_identity(journal_path, journal_identity)
         return manifest.proof_manifest
     except Exception:
         for path, identity in reversed(published):
             _remove_tree_if_identity(path, identity)
-        if plan_path.exists():
-            if "plan_identity" not in locals():
+        if plan_path.exists() or plan_path.is_symlink():
+            if plan_identity is None:
                 raise BuildError(f"front-door plan appeared without owned identity: {plan_path}")
             _unlink_file_if_identity(plan_path, plan_identity)
-        if manifest.proof_manifest.exists():
-            proof_info = os.lstat(manifest.proof_manifest)
-            proof_identity = (
-                proof_info.st_dev,
-                proof_info.st_ino,
-                _sha256(manifest.proof_manifest),
-            )
+        if manifest.proof_manifest.exists() or manifest.proof_manifest.is_symlink():
+            if proof_identity is None:
+                raise BuildError(
+                    "proof manifest appeared without owned identity; refusing cleanup: "
+                    f"{manifest.proof_manifest}"
+                )
             _unlink_file_if_identity(manifest.proof_manifest, proof_identity)
         raise
     finally:
-        _remove_tree(first_base)
-        _remove_tree(second_base)
+        for path, build_index in reversed(owned_workspaces):
+            _remove_builder_workspace(
+                manifest, publication_id, path, build_index
+            )
+        if workspace_journal_identity is not None:
+            _unlink_file_if_identity(
+                workspace_journal_path, workspace_journal_identity
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

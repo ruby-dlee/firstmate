@@ -6,7 +6,6 @@ import io
 import json
 import os
 import shutil
-import stat
 import sys
 import unittest
 from pathlib import Path
@@ -265,7 +264,7 @@ class WorkerStateTransactionTests(unittest.TestCase):
         settings.write_text('{"before":true}', encoding="utf-8")
         settings.chmod(0o600)
         worker_state.begin(self.manifest)
-        settings.write_text('{"after":true}', encoding="utf-8")
+        self._materialize_provisioned_workers()
         original = worker_state._materialize_node_at
         raised = False
 
@@ -284,6 +283,61 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertEqual(list(target_worker.home.glob(".*.restore-*")), [])
         worker_state.rollback(self.manifest)
         self.assertEqual(settings.read_text(encoding="utf-8"), '{"before":true}')
+
+    def test_rollback_refuses_and_preserves_unattributed_managed_drift(self) -> None:
+        target_worker = next(
+            value for value in self.manifest.workers if value.profile == "claude-1"
+        )
+        target_worker.home.mkdir(parents=True, mode=0o700)
+        settings = target_worker.home / "settings.json"
+        settings.write_text('{"before":true}', encoding="utf-8")
+        settings.chmod(0o600)
+        worker_state.begin(self.manifest)
+        settings.write_text('{"foreign":true}', encoding="utf-8")
+        settings.chmod(0o600)
+        with self.assertRaisesRegex(
+            worker_state.WorkerStateError, "managed state drift is not attributable"
+        ):
+            worker_state.rollback(self.manifest)
+        self.assertEqual(settings.read_text(encoding="utf-8"), '{"foreign":true}')
+
+    def test_rollback_rechecks_attribution_immediately_before_replace(self) -> None:
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        target_worker = next(
+            value for value in self.manifest.workers if value.profile == "claude-1"
+        )
+        target = target_worker.home / ".claude.json"
+        original_assert = worker_state._assert_worker_entry_attributed
+        calls = 0
+
+        def race_on_second_check(
+            manifest: worker_state.Manifest,
+            worker: worker_state.Worker,
+            snapshot: object,
+            home_fd: int | None,
+            relative: str,
+        ) -> None:
+            nonlocal calls
+            if worker.profile == "claude-1" and relative == ".claude.json":
+                calls += 1
+                if calls == 2:
+                    target.write_text('{"foreign":true}', encoding="utf-8")
+                    target.chmod(0o600)
+            original_assert(manifest, worker, snapshot, home_fd, relative)
+
+        with mock.patch.object(
+            worker_state,
+            "_assert_worker_entry_attributed",
+            side_effect=race_on_second_check,
+        ):
+            with self.assertRaisesRegex(
+                worker_state.WorkerStateError,
+                "managed state drift is not attributable",
+            ):
+                worker_state.rollback(self.manifest)
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"foreign":true}')
+        self.assertEqual(list(target_worker.home.glob(".*.restore-*")), [])
 
     def test_manifest_rejects_worker_overlap_with_candidate_release(self) -> None:
         raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))

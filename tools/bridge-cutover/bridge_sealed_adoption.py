@@ -1164,7 +1164,13 @@ def _replace_front_door(
         ):
             raise AdoptionError("staged Agent Fleet front-door rollback changed")
     else:
-        _require_regular(temp, "staged adoption front door", operation.mode)
+        if (
+            _sha256(temp, "staged adoption front door", operation.mode)
+            != operation.sealed_sha256
+        ):
+            raise AdoptionError(
+                "staged adoption front-door hash changed immediately before replacement"
+            )
     if _observe_operation(operation) != expected_state:
         raise AdoptionError("live Agent Fleet front door changed before replacement")
     os.replace(temp, operation.path)
@@ -1225,8 +1231,16 @@ def _replace_registry(
     if _observe_operation(operation) != expected_state:
         raise AdoptionError("live adoption registry changed during preparation")
     _validate_quiet_point(manifest)
+    for sealed in manifest.link_operations:
+        _validate_sealed_operation(sealed)
     boundaries.hit(f"before_replace:{direction}:{operation.name}")
-    _require_regular(temp, "staged adoption registry", operation.mode)
+    if (
+        _sha256(temp, "staged adoption registry", operation.mode)
+        != expected_hash
+    ):
+        raise AdoptionError(
+            "staged adoption registry hash changed immediately before replacement"
+        )
     if _observe_operation(operation) != expected_state:
         raise AdoptionError("live adoption registry changed before replacement")
     os.replace(temp, operation.path)

@@ -5,7 +5,9 @@ This driver never enrolls an account, starts a provider, opens a browser,
 reads Keychain values, or touches reserve/Desktop homes.  It snapshots only
 the explicit managed state for the six Fleet workers plus the two atomic
 non-secret provider identity bundles.  Credential files are immutable guards:
-their bytes are hashed in memory but are never copied into the snapshot.
+only the six declared ``.credentials.json``/``auth.json`` paths are opened and
+read, their bytes are hashed in memory, and they are never copied into the
+snapshot.  Reserve/Desktop homes are never statted, opened, or read.
 """
 
 from __future__ import annotations
@@ -21,13 +23,11 @@ import pwd
 import shutil
 import stat
 import sys
-import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -241,7 +241,20 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _write_atomic(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    tag = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    temporary = path.parent / f".{path.name}.bridge-write-{tag}"
+    if os.path.lexists(temporary):
+        partial, info = _read_stable_file(temporary, "interrupted atomic write")
+        if (
+            info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != mode
+            or not payload.startswith(partial)
+        ):
+            raise WorkerStateError(
+                f"interrupted atomic write is not attributable: {temporary}"
+            )
+        temporary.unlink()
+        _fsync_directory(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(temporary, flags, mode)
     try:
@@ -600,7 +613,7 @@ def _snapshot_node(path: Path, data_root: Path, key: str, counter: list[int]) ->
         raise WorkerStateError("managed state exceeds the snapshot entry limit")
     if stat.S_ISREG(info.st_mode):
         payload, stable = _read_stable_file(path, "managed worker state")
-        data_name = f"{key}-{uuid.uuid4().hex}.bin"
+        data_name = f"{key}-{_hash_bytes(payload)[:24]}.bin"
         data_path = data_root / data_name
         _write_atomic(data_path, payload, 0o600)
         return {
@@ -837,8 +850,11 @@ def _write_journal(manifest: Manifest, value: Mapping[str, Any]) -> None:
 
 
 def _event(value: dict[str, Any], name: str) -> None:
+    # Deterministic history makes an interrupted journal temp byte-for-byte
+    # attributable on restart. Wall-clock timestamps belong in operator logs,
+    # not in the recovery authority.
     value["history"].append(
-        {"event": name, "at": datetime.now(UTC).isoformat()}
+        {"event": name, "sequence": len(value["history"]) + 1}
     )
 
 
@@ -876,9 +892,39 @@ def begin(
             _event(recovered, "orphan-snapshot-recovered")
             _write_journal(manifest, recovered)
             return plan(manifest)
-        staging = manifest.snapshot_parent / f".{manifest.transaction_id}.snapshot-{uuid.uuid4().hex}"
+        staging = manifest.snapshot_parent / f".{manifest.transaction_id}.snapshot-staging"
+        marker = staging / ".bridge-worker-snapshot.json"
+        marker_payload = _canonical_bytes(
+            {
+                "schema_version": 1,
+                "manifest_fingerprint": manifest.fingerprint,
+                "transaction_id": manifest.transaction_id,
+            }
+        )
+        if os.path.lexists(staging):
+            _private_directory(staging, "interrupted worker-state snapshot staging")
+            names = set(os.listdir(staging))
+            marker_tag = hashlib.sha256(str(marker).encode("utf-8")).hexdigest()[:16]
+            marker_temp = f".{marker.name}.bridge-write-{marker_tag}"
+            if marker.name not in names:
+                if names - {marker_temp}:
+                    raise WorkerStateError(
+                        "interrupted worker-state staging has no ownership marker"
+                    )
+                _write_atomic(marker, marker_payload, 0o600)
+            observed_marker, _ = _read_stable_file(
+                marker, "worker-state staging ownership marker"
+            )
+            if observed_marker != marker_payload:
+                raise WorkerStateError(
+                    "interrupted worker-state staging belongs to another manifest"
+                )
+            shutil.rmtree(staging)
+            _fsync_directory(manifest.snapshot_parent)
         staging.mkdir(mode=0o700)
         try:
+            _write_atomic(marker, marker_payload, 0o600)
+            _fsync_directory(staging)
             snapshot = _snapshot_manifest(manifest, staging)
             snapshot_path = staging / "snapshot.json"
             _write_atomic(snapshot_path, _canonical_bytes(snapshot), 0o600)
@@ -973,6 +1019,208 @@ def _guards_unchanged(
             raise WorkerStateError(
                 f"credential guard changed for {worker.profile}; refusing state mutation"
             )
+
+
+def _read_regular_at(parent_fd: int, name: str, label: str) -> dict[str, Any]:
+    """Return a stable fd-relative regular-file identity without following links."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise WorkerStateError(f"cannot bind {label}: {exc}") from exc
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or before.st_size > MAX_FILE_BYTES
+        ):
+            raise WorkerStateError(f"{label} is not an owned single-link regular file")
+        payload = bytearray()
+        remaining = before.st_size
+        while remaining:
+            block = os.read(fd, min(1024 * 1024, remaining))
+            if not block:
+                raise WorkerStateError(f"{label} changed while being read")
+            payload.extend(block)
+            remaining -= len(block)
+        if os.read(fd, 1):
+            raise WorkerStateError(f"{label} grew while being read")
+        after = os.fstat(fd)
+        leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _file_identity(after) != _file_identity(before) or _file_identity(leaf) != _file_identity(before):
+            raise WorkerStateError(f"{label} changed while being read")
+        return {
+            "type": "file",
+            "mode": f"{stat.S_IMODE(after.st_mode):04o}",
+            "sha256": _hash_bytes(bytes(payload)),
+            "size": len(payload),
+        }
+    finally:
+        os.close(fd)
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _node_matches_at(
+    parent_fd: int | None,
+    name: str,
+    expected: Mapping[str, Any],
+    *,
+    exact_directory: bool,
+) -> bool:
+    """Compare one node fd-relatively; directory comparisons never follow links."""
+
+    expected_type = expected.get("type")
+    if parent_fd is None:
+        return expected_type == "absent"
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return expected_type == "absent"
+    if expected_type == "absent":
+        return False
+    if expected_type == "file":
+        try:
+            observed = _read_regular_at(parent_fd, name, f"managed state {name}")
+        except WorkerStateError:
+            return False
+        return (
+            observed["mode"] == expected.get("mode")
+            and observed["sha256"] == expected.get("sha256")
+            and (
+                "size" not in expected
+                or observed["size"] == expected.get("size")
+            )
+        )
+    if expected_type == "symlink":
+        if not stat.S_ISLNK(before.st_mode):
+            return False
+        try:
+            target = os.readlink(name, dir_fd=parent_fd)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return (
+            _file_identity(after) == _file_identity(before)
+            and target == expected.get("target")
+        )
+    if expected_type != "dir" or not stat.S_ISDIR(before.st_mode):
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(child_fd)
+        leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _file_identity(opened) != _file_identity(before)
+            or _file_identity(leaf) != _file_identity(before)
+            or f"{stat.S_IMODE(opened.st_mode):04o}" != expected.get("mode")
+        ):
+            return False
+        if not exact_directory:
+            return True
+        entries = expected.get("entries", {})
+        if not isinstance(entries, dict):
+            return False
+        names = set(os.listdir(child_fd))
+        if names != set(entries):
+            return False
+        return all(
+            _node_matches_at(
+                child_fd,
+                child,
+                entries[child],
+                exact_directory=True,
+            )
+            for child in names
+        )
+    finally:
+        os.close(child_fd)
+
+
+def _candidate_state(manifest: Manifest, worker: Worker, relative: str) -> dict[str, Any]:
+    entries = {
+        entry["relative_path"]: entry
+        for entry in manifest.sealed_plans[worker.profile]["plan"]["entries"]
+    }
+    value = entries.get(relative)
+    if value is None:
+        return {"type": "absent"}
+    state = dict(value)
+    state.pop("relative_path", None)
+    if state.get("type") == "dir":
+        # Every managed planned directory other than the home root is an exact
+        # empty directory. Unknown descendants are not attributable provisioning.
+        state["entries"] = {}
+    return state
+
+
+def _assert_worker_entry_attributed(
+    manifest: Manifest,
+    worker: Worker,
+    snapshot: Mapping[str, Any],
+    home_fd: int | None,
+    relative: str,
+) -> None:
+    original = snapshot["workers"][worker.profile]["mutable"][relative]
+    candidate = _candidate_state(manifest, worker, relative)
+    if _node_matches_at(home_fd, relative, original, exact_directory=True):
+        return
+    if _node_matches_at(home_fd, relative, candidate, exact_directory=True):
+        return
+    raise WorkerStateError(
+        f"managed state drift is not attributable for {worker.profile}:{relative}"
+    )
+
+
+def _identity_file_state(path: Path) -> dict[str, Any]:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"type": "absent"}
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise WorkerStateError(f"identity bundle has an unsupported live type: {path}")
+    payload, stable = _read_stable_file(path, "identity bundle CAS")
+    return {
+        "type": "file",
+        "mode": f"{stat.S_IMODE(stable.st_mode):04o}",
+        "sha256": _hash_bytes(payload),
+        "size": len(payload),
+    }
+
+
+def _identity_matches_snapshot(current: Mapping[str, Any], original: Mapping[str, Any]) -> bool:
+    if current.get("type") != original.get("type"):
+        return False
+    if current.get("type") == "absent":
+        return True
+    return all(current.get(key) == original.get(key) for key in ("mode", "sha256", "size"))
+
+
+def _assert_identity_authority(
+    path: Path, expected: Mapping[str, Any], provider: str
+) -> None:
+    if _identity_file_state(path) != expected:
+        raise WorkerStateError(
+            f"{provider} identity changed immediately before restore"
+        )
 
 
 def _candidate_api(manifest: Manifest) -> tuple[ModuleType, Any]:
@@ -1225,13 +1473,18 @@ def _restore_node_at(
     name: str,
     data_root: Path,
     temporary_tag: str,
+    pre_replace: Callable[[], None] | None = None,
 ) -> None:
     node_type = state.get("type")
     if parent_fd is None:
         if node_type == "absent":
+            if pre_replace is not None:
+                pre_replace()
             return
         raise WorkerStateError("restore parent is absent for non-absent state")
     if node_type == "absent":
+        if pre_replace is not None:
+            pre_replace()
         _remove_entry_at(parent_fd, name)
         os.fsync(parent_fd)
         return
@@ -1239,6 +1492,8 @@ def _restore_node_at(
     _remove_entry_at(parent_fd, temporary)
     try:
         _materialize_node_at(state, parent_fd, temporary, data_root)
+        if pre_replace is not None:
+            pre_replace()
         _remove_entry_at(parent_fd, name)
         os.replace(
             temporary,
@@ -1322,6 +1577,44 @@ def rollback(
                     observed_guard = None
                 if observed_guard != guard["identity"]:
                     drifted.add(worker.profile)
+            # Refuse all unattributed managed-state drift before changing any
+            # worker path. A partially completed prior rollback is accepted
+            # because restored nodes exactly match the sealed snapshot.
+            for worker in manifest.workers:
+                for relative in MUTABLE_PATHS[worker.provider]:
+                    _assert_worker_entry_attributed(
+                        manifest,
+                        worker,
+                        snapshot,
+                        home_fds[worker.profile],
+                        relative,
+                    )
+
+            identity_authority: dict[str, dict[str, Any]] = {}
+            identity_api: tuple[Any, Any] | None = None
+            for provider in ("claude", "codex"):
+                path = manifest.identity_bundles[provider]
+                current = _identity_file_state(path)
+                original = snapshot["identity_bundles"][provider]["state"]
+                if not _identity_matches_snapshot(current, original):
+                    if identity_api is None:
+                        identity_api = _candidate_api(manifest)
+                    api, registry = identity_api
+                    if api.identity is None:
+                        raise WorkerStateError("candidate identity API is absent")
+                    result = api.identity.verify_identity_bundle(
+                        registry, provider, compare_live_external=False
+                    )
+                    if result != {
+                        "provider": provider,
+                        "status": "verified",
+                        "reason": None,
+                    }:
+                        raise WorkerStateError(
+                            f"live {provider} identity drift is not attributable"
+                        )
+                    current = _identity_file_state(path)
+                identity_authority[provider] = current
             journal["credential_drift"] = sorted(drifted)
             if drifted:
                 _event(journal, "credential-drift-preserved")
@@ -1350,6 +1643,15 @@ def rollback(
                         relative,
                         data_root,
                         temporary_tag,
+                        pre_replace=lambda worker=worker, relative=relative, home_fd=home_fd: (
+                            _assert_worker_entry_attributed(
+                                manifest,
+                                worker,
+                                snapshot,
+                                home_fd,
+                                relative,
+                            )
+                        ),
                     )
                     if home_fd is not None:
                         _assert_bound_directory(
@@ -1381,6 +1683,13 @@ def rollback(
                         identity_path.name,
                         data_root,
                         temporary_tag,
+                        pre_replace=lambda provider=provider, identity_path=identity_path: (
+                            _assert_identity_authority(
+                                identity_path,
+                                identity_authority[provider],
+                                provider,
+                            )
+                        ),
                     )
                     if parent_fd is not None:
                         _assert_bound_directory(

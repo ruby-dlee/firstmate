@@ -1731,6 +1731,17 @@ def _replace_symlink(
         )
     boundaries.hit(f"before_replace:{direction}:{operation.name}")
     _validate_quiet_point(manifest)
+    # The quiet-point proof is intentionally comprehensive and therefore not
+    # instantaneous.  Treat it as a race boundary: every object that grants
+    # replacement authority must be reproved after it returns and immediately
+    # before the atomic rename.
+    _revalidate_manifest_ancestry(manifest)
+    _validate_all_release_bindings(manifest)
+    _verify_temp_symlink(temp, target, f"{operation.name} temporary link")
+    if _observe_operation(operation) != expected_current:
+        raise CutoverError(
+            f"{operation.name} changed immediately before replacement"
+        )
     os.replace(temp, operation.path)
     boundaries.hit(f"after_replace:{direction}:{operation.name}")
     boundaries.hit(f"before_fsync:{direction}-dir:{operation.name}")
@@ -1821,7 +1832,19 @@ def _replace_regular_file(
         )
     boundaries.hit(f"before_replace:{direction}:{operation.name}")
     _validate_quiet_point(manifest)
-    _require_regular(temp, f"{operation.name} staged regular file", operation.mode)
+    _revalidate_manifest_ancestry(manifest)
+    _validate_all_release_bindings(manifest)
+    if (
+        _sha256_file(
+            temp,
+            label=f"{operation.name} staged regular file",
+            expected_mode=operation.mode,
+        )
+        != expected_hash
+    ):
+        raise CutoverError(
+            f"{operation.name} staged regular-file hash changed immediately before replacement"
+        )
     if _observe_operation(operation) != expected_current:
         raise CutoverError(
             f"{operation.name} changed immediately before replacement"

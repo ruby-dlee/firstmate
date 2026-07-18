@@ -5,6 +5,8 @@ command -v python3.11 >/dev/null
 export PYTHONDONTWRITEBYTECODE=1
 
 exec python3.11 -m unittest -v \
+  tests.test_build_quota_axi_offline_proof \
+  tests.test_build_quota_axi_offline_real_inputs \
   tests.test_build_sealed_bridge_runtimes \
   tests.test_bridge_cutover_transaction \
   tests.test_bridge_sealed_adoption \

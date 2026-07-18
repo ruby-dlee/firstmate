@@ -984,6 +984,66 @@ class BridgeCutoverTransactionTests(unittest.TestCase):
         self.assertEqual(os.readlink(fixture.link_paths[1]), str(fixture.releases / "agent-fleet-old"))
         self.assertEqual(fixture.registry.read_bytes(), fixture.old_source.read_bytes())
 
+    def test_symlink_change_after_quiet_point_is_not_overwritten(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        unknown = fixture.releases / "unknown-post-quiet"
+        unknown.mkdir()
+        manifest = fixture.load()
+        operation = manifest.operations[0]
+        temporary = cutover._temp_path(
+            operation.path, manifest.transaction_id, "forward"
+        )
+        original_quiet = cutover._validate_quiet_point
+        changed = False
+
+        def quiet_then_change(value: cutover.Manifest) -> None:
+            nonlocal changed
+            original_quiet(value)
+            if os.path.lexists(temporary) and not changed:
+                changed = True
+                atomic_link(fixture.link_paths[0], unknown)
+
+        with mock.patch.object(
+            cutover, "_validate_quiet_point", side_effect=quiet_then_change
+        ):
+            with self.assertRaisesRegex(
+                cutover.CutoverError,
+                "(unknown target|immediately before replacement)",
+            ):
+                cutover.execute(manifest, "forward")
+        self.assertEqual(os.readlink(fixture.link_paths[0]), str(unknown))
+
+    def test_regular_file_change_after_quiet_point_is_not_overwritten(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        racer = b'version = 1\nmode = "racer"\n'
+        manifest = fixture.load()
+        operation = manifest.operations[-1]
+        temporary = cutover._temp_path(
+            operation.path, manifest.transaction_id, "forward"
+        )
+        original_quiet = cutover._validate_quiet_point
+        changed = False
+
+        def quiet_then_change(value: cutover.Manifest) -> None:
+            nonlocal changed
+            original_quiet(value)
+            if os.path.lexists(temporary) and not changed:
+                changed = True
+                fixture.registry.write_bytes(racer)
+                fixture.registry.chmod(0o600)
+
+        with mock.patch.object(
+            cutover, "_validate_quiet_point", side_effect=quiet_then_change
+        ):
+            with self.assertRaisesRegex(
+                cutover.CutoverError,
+                "(unknown (content|SHA-256)|immediately before replacement)",
+            ):
+                cutover.execute(manifest, "forward")
+        self.assertEqual(fixture.registry.read_bytes(), racer)
+
     def test_activity_appearing_between_operations_stops_cutover_and_recovery(self) -> None:
         fixture = Fixture(relative_targets=True)
         self.addCleanup(fixture.close)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -492,6 +491,64 @@ class BridgeSealedAdoptionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(adoption.AdoptionError, "path changed while reading"):
                 adoption.plan(manifest)
+
+    def test_front_door_change_after_quiet_point_is_not_overwritten(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        manifest = fixture.load()
+        operation = manifest.front_door_operation
+        temporary = transaction._temp_path(
+            operation.path, manifest.transaction_id, "forward"
+        )
+        original_quiet = adoption._validate_quiet_point
+        changed = False
+
+        def quiet_then_change(value: adoption.Manifest) -> None:
+            nonlocal changed
+            original_quiet(value)
+            if os.path.lexists(temporary) and not changed:
+                changed = True
+                racer = fixture.front_door.with_name(".agent-fleet.racer")
+                os.symlink("foreign-front-door", racer)
+                os.replace(racer, fixture.front_door)
+
+        with mock.patch.object(
+            adoption, "_validate_quiet_point", side_effect=quiet_then_change
+        ):
+            with self.assertRaisesRegex(
+                adoption.AdoptionError, "unknown|changed before replacement"
+            ):
+                adoption.apply(manifest)
+        self.assertEqual(os.readlink(fixture.front_door), "foreign-front-door")
+
+    def test_registry_change_after_quiet_point_is_not_overwritten(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        manifest = fixture.load()
+        operation = manifest.registry_operation
+        temporary = transaction._temp_path(
+            operation.path, manifest.transaction_id, "forward"
+        )
+        original_quiet = adoption._validate_quiet_point
+        changed = False
+        racer = b'version = 1\nmode = "racer"\n'
+
+        def quiet_then_change(value: adoption.Manifest) -> None:
+            nonlocal changed
+            original_quiet(value)
+            if os.path.lexists(temporary) and not changed:
+                changed = True
+                fixture.registry.write_bytes(racer)
+                fixture.registry.chmod(0o600)
+
+        with mock.patch.object(
+            adoption, "_validate_quiet_point", side_effect=quiet_then_change
+        ):
+            with self.assertRaisesRegex(
+                adoption.AdoptionError, "unknown|changed before replacement"
+            ):
+                adoption.apply(manifest)
+        self.assertEqual(fixture.registry.read_bytes(), racer)
 
     def test_state_directory_substitution_during_scan_is_refused(self) -> None:
         fixture = Fixture()

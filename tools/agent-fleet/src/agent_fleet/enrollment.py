@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import shutil
 import stat
@@ -15,7 +14,7 @@ from .models import Profile, Registry
 from .paths import ensure_private_dir
 from .provision import provision_profile
 from .quota import QuotaCacheSnapshot, restore_quota_cache
-from .util import atomic_write_json
+from .util import atomic_write_json, read_private_json
 
 CODEX_AUTH_FILE = "auth.json"
 
@@ -103,11 +102,9 @@ def _snapshot_from_payload(value: Any) -> QuotaCacheSnapshot:
 
 def _read_journal(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = read_private_json(path, label="Codex auth transaction journal")
     except FileNotFoundError as exc:
         raise ValueError(f"Codex auth transaction journal is missing: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Codex auth transaction journal is invalid: {path}") from exc
     if not isinstance(value, dict) or value.get("schema") != 1:
         raise ValueError(f"Codex auth transaction journal is invalid: {path}")
     return value
@@ -190,7 +187,10 @@ def create_codex_login_stage(registry: Registry, profile: Profile) -> Profile:
     )
     stage.chmod(0o700)
     config = stage / "config.toml"
-    config.write_text('cli_auth_credentials_store = "file"\n', encoding="utf-8")
+    config.write_text(
+        'cli_auth_credentials_store = "file"\n\n[features]\nhooks = true\n',
+        encoding="utf-8",
+    )
     config.chmod(0o600)
     return replace(profile, home=stage, enabled=False)
 

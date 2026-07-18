@@ -7,8 +7,8 @@ from typing import Any
 SUPPORTED_PROVIDERS = ("claude", "codex")
 PROFILE_SAFETY_POLICIES = ("worker", "manual_only", "desktop_shared")
 SHARED_WORKFLOW_ENTRIES = {
-    "claude": frozenset({"CLAUDE.md", "skills", "plugins"}),
-    "codex": frozenset({"AGENTS.md", "skills", "plugins", "rules"}),
+    "claude": frozenset({"CLAUDE.md", "skills"}),
+    "codex": frozenset({"AGENTS.md", "skills", "rules"}),
 }
 
 
@@ -54,6 +54,10 @@ class Settings:
     state_dir: Path
     share_dir: Path
     quota_binary: Path
+    quota_node_binary: Path
+    quota_binary_sha256: str = ""
+    quota_node_sha256: str = ""
+    quota_release_tree_sha256: str = ""
     quota_stale_seconds: int = 300
     quota_verification_grace_seconds: int = 86400
     lease_grace_seconds: int = 30
@@ -67,6 +71,7 @@ class Registry:
     settings: Settings
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     profiles: dict[str, Profile] = field(default_factory=dict)
+    config_path: Path | None = None
 
     def require_profile(self, profile_id: str) -> Profile:
         try:

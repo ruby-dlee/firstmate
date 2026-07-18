@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
@@ -13,11 +12,28 @@ from . import __version__
 from .models import SHARED_WORKFLOW_ENTRIES, Profile, ProviderConfig, Registry
 from .paths import ensure_private_dir
 from .projects import TrustedProject, registered_trusted_projects, resolve_trusted_project
-from .providers import session_hook_command
-from .util import atomic_write_json
+from .providers import (
+    agent_fleet_entrypoint_path,
+    credential_storage_ready,
+    session_hook_command,
+)
+from .util import atomic_write_bytes, atomic_write_json, read_private_bytes, read_private_json
 
-HOOK_MARKER = " hook session-start"
-CODEX_HOOK_MARKER_FILE = ".agent-fleet-hooks.json"
+HOOK_MARKERS = (" hook session-start", " hook turn-end")
+HOOK_MARKER_FILE = ".agent-fleet-hooks.json"
+PROVIDER_BINARY_MARKER_FILE = ".agent-fleet-provider-binary.json"
+PROJECT_CONTROL_FILES = {
+    "claude": (
+        Path(".claude/settings.json"),
+        Path(".claude/settings.local.json"),
+        Path(".mcp.json"),
+    ),
+    "codex": (
+        Path(".codex/config.toml"),
+        Path(".codex/hooks.json"),
+        Path(".mcp.json"),
+    ),
+}
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -33,83 +49,209 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 
 def _read_owned_json_object(path: Path) -> dict[str, Any]:
-    if not path.exists() and not path.is_symlink():
-        return {}
     try:
-        current = path.lstat()
+        value = read_private_json(path, label="managed JSON")
     except FileNotFoundError:
         return {}
-    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-        raise ValueError(f"managed JSON must be a current-user regular file: {path}")
-    if stat.S_IMODE(current.st_mode) & 0o077:
-        raise ValueError(f"managed JSON must not grant group/world access: {path}")
-    return _read_json_object(path)
+    if not isinstance(value, dict):
+        raise ValueError(f"refusing to modify non-object JSON: {path}")
+    return value
 
 
-def _merge_source_hooks(payload: dict[str, Any], source: Path | None) -> None:
-    if source is None or not source.exists():
-        return
-    source_payload = _read_json_object(source)
-    source_hooks = source_payload.get("hooks", {})
-    if not isinstance(source_hooks, dict):
-        raise ValueError(f"hooks must be an object: {source}")
-    destination = payload.setdefault("hooks", {})
-    if not isinstance(destination, dict):
-        raise ValueError("destination hooks must be an object")
-    for event, groups in source_hooks.items():
-        if not isinstance(groups, list):
-            raise ValueError(f"hooks.{event} must be an array: {source}")
-        target_groups = destination.setdefault(event, [])
-        if not isinstance(target_groups, list):
-            raise ValueError(f"destination hooks.{event} must be an array")
-        existing = {json.dumps(group, sort_keys=True) for group in target_groups}
-        for group in groups:
-            encoded = json.dumps(group, sort_keys=True)
-            if encoded not in existing:
-                target_groups.append(group)
-                existing.add(encoded)
+def _assert_safe_file_ancestry(path: Path, description: str) -> None:
+    current = path.absolute().parent
+    while True:
+        metadata = current.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{description} has symlinked or non-directory ancestry: {path}")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022 and not (mode & stat.S_ISVTX and metadata.st_uid == 0):
+            raise ValueError(f"{description} has group/world-writable ancestry: {path}")
+        if current == current.parent:
+            return
+        current = current.parent
 
 
-def _install_session_hook(path: Path, source: Path | None) -> None:
-    payload = _read_json_object(path)
-    _merge_source_hooks(payload, source)
-    hooks = payload.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        raise ValueError(f"hooks must be an object: {path}")
-    groups = hooks.setdefault("SessionStart", [])
-    if not isinstance(groups, list):
-        raise ValueError(f"hooks.SessionStart must be an array: {path}")
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for hook in group.get("hooks", []):
-            if isinstance(hook, dict) and HOOK_MARKER in str(hook.get("command", "")):
-                atomic_write_json(path, payload)
-                return
-    groups.append(
-        {
-            "matcher": "startup|resume|clear|compact",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": session_hook_command(),
-                    "statusMessage": "Recording Agent Fleet session identity",
-                }
-            ],
-        }
-    )
-    atomic_write_json(path, payload)
+def _opened_regular_identity(
+    path: Path,
+    description: str,
+    *,
+    require_owner: bool,
+    require_executable: bool,
+    allow_symlink: bool,
+) -> dict[str, Any]:
+    configured = path.absolute()
+    _assert_safe_file_ancestry(configured, description)
+    try:
+        configured_metadata = configured.lstat()
+    except OSError as exc:
+        raise ValueError(f"{description} is not an existing safe file: {path}") from exc
+    if not allow_symlink and not stat.S_ISREG(configured_metadata.st_mode):
+        raise ValueError(f"{description} must be a current-user regular file: {path}")
+    try:
+        resolved = configured.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{description} is not an existing safe file: {path}") from exc
+    _assert_safe_file_ancestry(resolved, description)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise ValueError(f"{description} is not an openable regular file: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = resolved.lstat()
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or identity != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError(f"{description} must resolve to one stable regular file: {path}")
+        if require_owner and opened.st_uid != os.getuid():
+            raise ValueError(f"{description} must be a current-user regular file: {path}")
+        if stat.S_IMODE(opened.st_mode) & 0o022:
+            raise ValueError(f"{description} must not be group/world writable: {path}")
+        if require_executable and not os.access(resolved, os.X_OK):
+            raise ValueError(f"{description} must be executable: {path}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after_open = os.fstat(descriptor)
+        after_path = resolved.lstat()
+        if (
+            (after_open.st_dev, after_open.st_ino) != identity
+            or (after_path.st_dev, after_path.st_ino) != identity
+            or after_open.st_size != opened.st_size
+            or after_open.st_mtime_ns != opened.st_mtime_ns
+            or after_open.st_ctime_ns != opened.st_ctime_ns
+            or configured.resolve(strict=True) != resolved
+        ):
+            raise ValueError(f"{description} changed while it was being verified: {path}")
+    finally:
+        os.close(descriptor)
+    return {
+        "configured_path": str(path),
+        "resolved_path": str(resolved),
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+        "uid": opened.st_uid,
+        "size": opened.st_size,
+        "mode": stat.S_IMODE(opened.st_mode),
+        "nlink": opened.st_nlink,
+        "modified_ns": opened.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _source_hash(source: Path | None) -> str | None:
     if source is None:
         return None
     if not source.exists() and not source.is_symlink():
-        return None
-    current = source.lstat()
-    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-        raise ValueError(f"hook source must be a current-user regular file: {source}")
-    return hashlib.sha256(source.read_bytes()).hexdigest()
+        raise ValueError(f"configured hook source is missing: {source}")
+    return str(
+        _opened_regular_identity(
+            source,
+            "hook source",
+            require_owner=True,
+            require_executable=False,
+            allow_symlink=False,
+        )["sha256"]
+    )
+
+
+def _provider_binary_identity(provider: ProviderConfig) -> dict[str, Any]:
+    identity = _opened_regular_identity(
+        provider.binary,
+        f"{provider.name} provider binary",
+        require_owner=False,
+        require_executable=True,
+        allow_symlink=False,
+    )
+    if identity["uid"] not in {0, os.getuid()}:
+        raise ValueError(f"{provider.name} provider binary must be owned by current user or root")
+    return identity
+
+
+def _agent_fleet_entrypoint_identity() -> dict[str, Any]:
+    identity = _opened_regular_identity(
+        agent_fleet_entrypoint_path(),
+        "Agent Fleet SessionStart entrypoint",
+        require_owner=False,
+        require_executable=True,
+        allow_symlink=False,
+    )
+    if identity["uid"] not in {0, os.getuid()}:
+        raise ValueError(
+            "Agent Fleet SessionStart entrypoint must be owned by current user or root"
+        )
+    return identity
+
+
+def _verified_session_hook(registry: Registry) -> tuple[str, dict[str, Any]]:
+    identity = _agent_fleet_entrypoint_identity()
+    if registry.config_path is None:
+        raise ValueError("loaded registry path is unavailable for managed hooks")
+    command = session_hook_command(
+        registry.config_path,
+        Path(str(identity["resolved_path"])),
+    )
+    return command, identity
+
+
+def verified_agent_fleet_hook_entrypoint() -> Path:
+    """Return the freshly verified release-local hook entrypoint."""
+
+    return Path(str(_agent_fleet_entrypoint_identity()["resolved_path"]))
+
+
+def verified_configured_provider_binary(registry: Registry, provider_name: str) -> Path:
+    """Verify a configured non-symlink binary before intentional bootstrap use."""
+
+    identity = _provider_binary_identity(registry.require_provider(provider_name))
+    return Path(str(identity["resolved_path"]))
+
+
+def verified_provider_binary(registry: Registry, profile: Profile) -> Path:
+    """Return the freshly marker-verified regular executable for one profile."""
+
+    provider = registry.require_provider(profile.provider)
+    marker = _read_owned_json_object(profile.home / PROVIDER_BINARY_MARKER_FILE)
+    expected = _provider_binary_identity(provider)
+    if marker != {
+        "schema": 1,
+        "profile": profile.id,
+        "provider": profile.provider,
+        "binary": expected,
+    }:
+        raise ValueError(f"managed provider binary changed since provisioning: {profile.id}")
+    return Path(str(expected["resolved_path"]))
+
+
+def provider_binary_ready(registry: Registry, profile: Profile) -> bool:
+    try:
+        verified_provider_binary(registry, profile)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _project_control_file(project: TrustedProject, provider: str) -> Path | None:
+    for relative in PROJECT_CONTROL_FILES[provider]:
+        candidate = project.active_root / relative
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return None
+
+
+def _assert_project_controls_absent(project: TrustedProject, provider: str) -> None:
+    control_file = _project_control_file(project, provider)
+    if control_file is not None:
+        raise ValueError(
+            f"managed {provider.title()} launch refuses project control file: {control_file}"
+        )
 
 
 def _hook_payload_hash(payload: dict[str, Any]) -> str:
@@ -130,136 +272,270 @@ def _agent_fleet_session_group(command: str) -> dict[str, Any]:
     }
 
 
-def _codex_hook_payload(source: Path | None, command: str) -> dict[str, Any]:
-    source_payload = _read_json_object(source) if source is not None and source.exists() else {}
-    source_hooks = source_payload.get("hooks", {})
-    if not isinstance(source_hooks, dict):
-        raise ValueError(f"hooks must be an object: {source}")
-    hooks = copy.deepcopy(source_hooks)
-    for event, groups in list(hooks.items()):
-        if not isinstance(groups, list):
-            raise ValueError(f"hooks.{event} must be an array: {source}")
-        canonical_groups: list[Any] = []
-        for group in groups:
-            if not isinstance(group, dict):
-                raise ValueError(f"hooks.{event} entries must be objects: {source}")
-            entries = group.get("hooks", [])
-            if not isinstance(entries, list):
-                raise ValueError(f"hooks.{event} hook entries must be an array: {source}")
-            canonical_entries = [
-                entry
-                for entry in entries
-                if not (isinstance(entry, dict) and HOOK_MARKER in str(entry.get("command", "")))
-            ]
-            if canonical_entries:
-                group["hooks"] = canonical_entries
-                canonical_groups.append(group)
-        hooks[event] = canonical_groups
+def _agent_fleet_turn_end_group(command: str) -> dict[str, Any]:
+    return {
+        "matcher": "",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "statusMessage": "Recording FirstMate turn boundary",
+            }
+        ],
+    }
+
+
+def _declared_source_hooks(source: Path | None) -> dict[str, Any]:
+    if source is not None:
+        raise ValueError(
+            "managed worker hooks must be release-owned; provider hooks_source must be absent"
+        )
+    return {}
+
+
+def _managed_hooks(
+    source: Path | None,
+    session_command: str,
+    turn_end_command: str | None,
+) -> dict[str, Any]:
+    hooks = _declared_source_hooks(source)
     groups = hooks.setdefault("SessionStart", [])
-    groups.append(_agent_fleet_session_group(command))
-    return {"hooks": hooks}
+    groups.append(_agent_fleet_session_group(session_command))
+    if turn_end_command is not None:
+        hooks.setdefault("Stop", []).append(_agent_fleet_turn_end_group(turn_end_command))
+    return hooks
 
 
-def _install_codex_hooks(profile: Profile, provider: ProviderConfig) -> None:
-    command = session_hook_command()
+def _codex_hook_payload(source: Path | None, command: str) -> dict[str, Any]:
+    return {"hooks": _managed_hooks(source, command, None)}
+
+
+def _claude_hook_payload(
+    existing: dict[str, Any],
+    source: Path | None,
+    session_command: str,
+    turn_end_command: str,
+) -> dict[str, Any]:
+    return {"hooks": _managed_hooks(source, session_command, turn_end_command)}
+
+
+def _hook_marker_payload(
+    profile: Profile,
+    provider: ProviderConfig,
+    source_hash: str | None,
+    session_command: str,
+    turn_end_command: str | None,
+    agent_fleet_binary: dict[str, Any],
+    hooks: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": 2,
+        "agent_fleet_version": __version__,
+        "agent_fleet_binary": agent_fleet_binary,
+        "profile": profile.id,
+        "provider": profile.provider,
+        "source": str(provider.hooks_source) if provider.hooks_source is not None else None,
+        "source_hash": source_hash,
+        "session_command": session_command,
+        "turn_end_command": turn_end_command,
+        "hooks_hash": _hook_payload_hash(hooks),
+    }
+
+
+def _hook_marker_matches(
+    marker: dict[str, Any],
+    profile: Profile,
+    provider: ProviderConfig,
+    source_hash: str | None,
+    session_command: str,
+    turn_end_command: str | None,
+    agent_fleet_binary: dict[str, Any],
+) -> bool:
+    return (
+        set(marker)
+        == {
+            "schema",
+            "agent_fleet_version",
+            "agent_fleet_binary",
+            "profile",
+            "provider",
+            "source",
+            "source_hash",
+            "session_command",
+            "turn_end_command",
+            "hooks_hash",
+        }
+        and marker.get("schema") == 2
+        and marker.get("agent_fleet_version") == __version__
+        and marker.get("agent_fleet_binary") == agent_fleet_binary
+        and marker.get("profile") == profile.id
+        and marker.get("provider") == profile.provider
+        and marker.get("source")
+        == (str(provider.hooks_source) if provider.hooks_source is not None else None)
+        and marker.get("source_hash") == source_hash
+        and marker.get("session_command") == session_command
+        and marker.get("turn_end_command") == turn_end_command
+    )
+
+
+def _install_claude_hooks(
+    registry: Registry, profile: Profile, provider: ProviderConfig
+) -> None:
+    session_command, agent_fleet_binary = _verified_session_hook(registry)
+    turn_end_command = session_command.replace(" hook session-start", " hook turn-end")
     source_hash = _source_hash(provider.hooks_source)
-    payload = _codex_hook_payload(provider.hooks_source, command)
+    path = profile.home / "settings.json"
+    existing = _read_owned_json_object(path)
+    payload = _claude_hook_payload(
+        existing,
+        provider.hooks_source,
+        session_command,
+        turn_end_command,
+    )
+    if source_hash != _source_hash(provider.hooks_source):
+        raise ValueError("Claude hook source changed during provisioning")
+    atomic_write_json(path, payload)
+    atomic_write_json(
+        profile.home / HOOK_MARKER_FILE,
+        _hook_marker_payload(
+            profile,
+            provider,
+            source_hash,
+            session_command,
+            turn_end_command,
+            agent_fleet_binary,
+            payload["hooks"],
+        ),
+    )
+
+
+def _install_codex_hooks(
+    registry: Registry, profile: Profile, provider: ProviderConfig
+) -> None:
+    session_command, agent_fleet_binary = _verified_session_hook(registry)
+    source_hash = _source_hash(provider.hooks_source)
+    payload = _codex_hook_payload(provider.hooks_source, session_command)
     if source_hash != _source_hash(provider.hooks_source):
         raise ValueError("Codex hook source changed during provisioning")
     path = profile.home / "hooks.json"
     atomic_write_json(path, payload)
     atomic_write_json(
-        profile.home / CODEX_HOOK_MARKER_FILE,
-        {
-            "schema": 1,
-            "agent_fleet_version": __version__,
-            "profile": profile.id,
-            "provider": profile.provider,
-            "source": str(provider.hooks_source) if provider.hooks_source is not None else None,
-            "source_hash": source_hash,
-            "session_command": command,
-            "hooks_hash": _hook_payload_hash(payload),
-        },
+        profile.home / HOOK_MARKER_FILE,
+        _hook_marker_payload(
+            profile,
+            provider,
+            source_hash,
+            session_command,
+            None,
+            agent_fleet_binary,
+            payload["hooks"],
+        ),
+    )
+
+
+def claude_hooks_ready(registry: Registry, profile: Profile) -> bool:
+    provider = registry.require_provider(profile.provider)
+    try:
+        expected_command, agent_fleet_binary = _verified_session_hook(registry)
+        turn_end_command = expected_command.replace(" hook session-start", " hook turn-end")
+        source_hash = _source_hash(provider.hooks_source)
+        marker = _read_owned_json_object(profile.home / HOOK_MARKER_FILE)
+        if not _hook_marker_matches(
+            marker,
+            profile,
+            provider,
+            source_hash,
+            expected_command,
+            turn_end_command,
+            agent_fleet_binary,
+        ):
+            return False
+        payload = _read_owned_json_object(profile.home / "settings.json")
+        expected = _claude_hook_payload(
+            payload,
+            provider.hooks_source,
+            expected_command,
+            turn_end_command,
+        )
+    except (OSError, ValueError):
+        return False
+    expected_hooks = expected.get("hooks")
+    actual_hooks = payload.get("hooks")
+    expected_hash = _hook_payload_hash(expected_hooks)
+    return (
+        payload == expected
+        and actual_hooks == expected_hooks
+        and marker.get("hooks_hash") == expected_hash
+        and _hook_payload_hash(actual_hooks) == expected_hash
     )
 
 
 def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
     provider = registry.require_provider(profile.provider)
     try:
-        expected_command = session_hook_command()
-        marker = _read_owned_json_object(profile.home / CODEX_HOOK_MARKER_FILE)
-        if (
-            set(marker)
-            != {
-                "schema",
-                "agent_fleet_version",
-                "profile",
-                "provider",
-                "source",
-                "source_hash",
-                "session_command",
-                "hooks_hash",
-            }
-            or marker.get("schema") != 1
-            or marker.get("agent_fleet_version") != __version__
-            or marker.get("profile") != profile.id
-            or marker.get("provider") != "codex"
-            or marker.get("source")
-            != (str(provider.hooks_source) if provider.hooks_source is not None else None)
-            or marker.get("source_hash") != _source_hash(provider.hooks_source)
-            or marker.get("session_command") != expected_command
+        expected_command, agent_fleet_binary = _verified_session_hook(registry)
+        source_hash = _source_hash(provider.hooks_source)
+        marker = _read_owned_json_object(profile.home / HOOK_MARKER_FILE)
+        if not _hook_marker_matches(
+            marker,
+            profile,
+            provider,
+            source_hash,
+            expected_command,
+            None,
+            agent_fleet_binary,
         ):
             return False
         payload = _read_owned_json_object(profile.home / "hooks.json")
         expected = _codex_hook_payload(provider.hooks_source, expected_command)
     except (OSError, ValueError):
         return False
-    expected_hash = _hook_payload_hash(expected)
+    expected_hash = _hook_payload_hash(expected["hooks"])
     return (
         payload == expected
         and marker.get("hooks_hash") == expected_hash
-        and _hook_payload_hash(payload) == expected_hash
+        and _hook_payload_hash(payload["hooks"]) == expected_hash
     )
 
 
-def _merge_claude_project_trust(profile: Profile, roots: set[Path]) -> None:
+def closed_claude_state_payload(registry: Registry) -> dict[str, Any]:
+    roots = sorted(
+        {
+            str(root)
+            for project in registered_trusted_projects(registry, "claude")
+            for root in {project.active_root, project.canonical_root}
+        }
+    )
+    return {
+        "hasCompletedOnboarding": True,
+        "projects": {
+            root: {
+                "hasCompletedProjectOnboarding": True,
+                "hasTrustDialogAccepted": True,
+            }
+            for root in roots
+        },
+    }
+
+
+def _install_closed_claude_state(registry: Registry, profile: Profile) -> None:
     path = profile.home / ".claude.json"
-    payload = _read_owned_json_object(path)
-    projects = payload.setdefault("projects", {})
-    if not isinstance(projects, dict):
-        raise ValueError(f"Claude projects state must be an object: {path}")
-    changed = payload.get("hasCompletedOnboarding") is not True
-    payload["hasCompletedOnboarding"] = True
-    for root in roots:
-        key = str(root)
-        existing = projects.setdefault(key, {})
-        if not isinstance(existing, dict):
-            raise ValueError(f"Claude project state must be an object: {key}")
-        if existing.get("hasTrustDialogAccepted") is not True:
-            changed = True
-            existing["hasTrustDialogAccepted"] = True
-        if existing.get("hasCompletedProjectOnboarding") is not True:
-            changed = True
-            existing["hasCompletedProjectOnboarding"] = True
-    if changed:
-        atomic_write_json(path, payload)
+    if path.exists() or path.is_symlink():
+        _read_owned_json_object(path)
+    atomic_write_json(path, closed_claude_state_payload(registry))
 
 
-def claude_project_ready(profile: Profile, project: TrustedProject) -> bool:
+def claude_project_ready(
+    registry: Registry, profile: Profile, project: TrustedProject
+) -> bool:
     try:
         payload = _read_owned_json_object(profile.home / ".claude.json")
     except ValueError:
         return False
-    projects = payload.get("projects")
-    return (
-        payload.get("hasCompletedOnboarding") is True
-        and isinstance(projects, dict)
-        and all(
-            isinstance(projects.get(str(root)), dict)
-            and projects[str(root)].get("hasTrustDialogAccepted") is True
-            and projects[str(root)].get("hasCompletedProjectOnboarding") is True
-            for root in {project.active_root, project.canonical_root}
-        )
+    expected = closed_claude_state_payload(registry)
+    return payload == expected and all(
+        str(root) in expected["projects"]
+        for root in {project.active_root, project.canonical_root}
     )
 
 
@@ -270,20 +546,23 @@ def prepare_profile_launch(
 ) -> TrustedProject:
     if not profile_is_provisioned(profile):
         raise ValueError(f"profile is not provisioned: {profile.id}")
+    if not credential_storage_ready(profile):
+        raise ValueError(f"managed credential storage is not ready for {profile.id}")
+    if not _profile_plugins_absent(profile):
+        raise ValueError(f"managed plugin path is forbidden for {profile.id}")
+    if not provider_binary_ready(registry, profile):
+        raise ValueError(f"managed provider binary changed since provisioning: {profile.id}")
     project = resolve_trusted_project(registry, profile.provider, workspace)
+    _assert_project_controls_absent(project, profile.provider)
     if profile.provider == "claude":
-        _merge_claude_project_trust(profile, {project.active_root, project.canonical_root})
-        if not claude_project_ready(profile, project):
+        if not claude_project_ready(registry, profile, project):
             raise ValueError(f"Claude project trust bootstrap failed for {profile.id}")
         hook_health = profile_hook_health(registry, profile)
         if not (
-            hook_health["agent_fleet_session_hook"] and hook_health["inherited_workflow_hooks"]
+            hook_health["agent_fleet_session_hook"] and hook_health["release_owned_hooks"]
         ):
             raise ValueError(f"managed Claude hook set is not ready for {profile.id}")
     else:
-        project_hook = project.active_root / ".codex" / "hooks.json"
-        if project_hook.exists() or project_hook.is_symlink():
-            raise ValueError(f"managed Codex launch refuses project hooks: {project_hook}")
         if not _codex_config_ready(profile.home):
             raise ValueError(f"managed Codex config is not ready for {profile.id}")
         if not codex_hooks_ready(registry, profile):
@@ -296,9 +575,17 @@ def profile_selection_ready(
     profile: Profile,
     workspace: Path,
 ) -> bool:
+    if (
+        not credential_storage_ready(profile)
+        or not provider_binary_ready(registry, profile)
+        or not _profile_plugins_absent(profile)
+    ):
+        return False
     try:
         project = resolve_trusted_project(registry, profile.provider, workspace)
     except ValueError:
+        return False
+    if _project_control_file(project, profile.provider) is not None:
         return False
     if profile.provider == "claude":
         canonical = TrustedProject(
@@ -308,16 +595,11 @@ def profile_selection_ready(
         )
         hook_health = profile_hook_health(registry, profile)
         return (
-            claude_project_ready(profile, canonical)
+            claude_project_ready(registry, profile, canonical)
             and hook_health["agent_fleet_session_hook"]
-            and hook_health["inherited_workflow_hooks"]
+            and hook_health["release_owned_hooks"]
         )
-    project_hook = project.active_root / ".codex" / "hooks.json"
-    return (
-        not (project_hook.exists() or project_hook.is_symlink())
-        and _codex_config_ready(profile.home)
-        and codex_hooks_ready(registry, profile)
-    )
+    return _codex_config_ready(profile.home) and codex_hooks_ready(registry, profile)
 
 
 def profile_launch_ready(
@@ -325,89 +607,74 @@ def profile_launch_ready(
     profile: Profile,
     workspace: Path,
 ) -> bool:
+    if (
+        not credential_storage_ready(profile)
+        or not provider_binary_ready(registry, profile)
+        or not _profile_plugins_absent(profile)
+    ):
+        return False
     try:
         project = resolve_trusted_project(registry, profile.provider, workspace)
     except ValueError:
         return False
+    if _project_control_file(project, profile.provider) is not None:
+        return False
     if profile.provider == "claude":
         hook_health = profile_hook_health(registry, profile)
         return (
-            claude_project_ready(profile, project)
+            claude_project_ready(registry, profile, project)
             and hook_health["agent_fleet_session_hook"]
-            and hook_health["inherited_workflow_hooks"]
+            and hook_health["release_owned_hooks"]
         )
-    project_hook = project.active_root / ".codex" / "hooks.json"
-    return (
-        not (project_hook.exists() or project_hook.is_symlink())
-        and _codex_config_ready(profile.home)
-        and codex_hooks_ready(registry, profile)
-    )
+    return _codex_config_ready(profile.home) and codex_hooks_ready(registry, profile)
+
+
+CODEX_MANAGED_CONFIG = {"cli_auth_credentials_store": "file", "features": {"hooks": True}}
+CODEX_MANAGED_CONFIG_TEXT = 'cli_auth_credentials_store = "file"\n\n[features]\nhooks = true\n'
+
+
+def _read_closed_codex_config(path: Path) -> dict[str, Any]:
+    raw = _read_owned_codex_config(path)
+    if raw != CODEX_MANAGED_CONFIG:
+        raise ValueError(f"managed Codex config contains unsupported launch controls: {path}")
+    return raw
+
+
+def _read_owned_codex_config(path: Path) -> dict[str, Any]:
+    try:
+        raw = tomllib.loads(read_private_bytes(path, label="managed Codex config").decode())
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid Codex config encoding: {path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid Codex config: {path}: {exc}") from exc
+    return raw
+
+
+def _assert_existing_profile_config_closed(profile: Profile) -> None:
+    if profile.provider == "claude":
+        path = profile.home / "settings.json"
+        if path.exists() or path.is_symlink():
+            _read_owned_json_object(path)
+        return
+    path = profile.home / "config.toml"
+    if path.exists() or path.is_symlink():
+        _read_owned_codex_config(path)
 
 
 def _ensure_codex_config(home: Path) -> None:
     path = home / "config.toml"
-    if not path.exists() and not path.is_symlink():
-        path.write_text(
-            'cli_auth_credentials_store = "file"\n\n[features]\nhooks = true\n',
-            encoding="utf-8",
-        )
-        path.chmod(0o600)
-        return
-    current = path.lstat()
-    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-        raise ValueError(f"managed Codex config must be a current-user regular file: {path}")
-    try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"invalid Codex config: {path}: {exc}") from exc
-    store = raw.get("cli_auth_credentials_store")
-    if store != "file":
-        raise ValueError(
-            f'managed Codex profile requires cli_auth_credentials_store="file": {path}'
-        )
-    features = raw.get("features", {})
-    if not isinstance(features, dict) or features.get("hooks") is not True:
-        raise ValueError(f"managed Codex profile requires [features] hooks=true: {path}")
-    if any(
-        features.get(name) is not None and features.get(name) is not False
-        for name in ("plugins", "plugin_sharing")
-    ):
-        raise ValueError(f"managed Codex profile cannot enable plugins: {path}")
-    if any(raw.get(name) for name in ("plugins", "plugin_sharing")):
-        raise ValueError(f"managed Codex profile cannot configure plugins: {path}")
-    projects = raw.get("projects", {})
-    if not isinstance(projects, dict) or projects:
-        raise ValueError(f"managed Codex profile cannot persist project trust: {path}")
-    path.chmod(0o600)
+    if path.exists() or path.is_symlink():
+        _read_owned_codex_config(path)
+    atomic_write_bytes(path, CODEX_MANAGED_CONFIG_TEXT.encode("utf-8"))
 
 
 def _codex_config_ready(home: Path) -> bool:
     path = home / "config.toml"
     try:
-        current = path.lstat()
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or current.st_uid != os.getuid()
-            or stat.S_IMODE(current.st_mode) & 0o077
-        ):
-            return False
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
+        _read_closed_codex_config(path)
+    except (OSError, ValueError):
         return False
-    features = raw.get("features", {})
-    projects = raw.get("projects", {})
-    return (
-        raw.get("cli_auth_credentials_store") == "file"
-        and isinstance(features, dict)
-        and features.get("hooks") is True
-        and all(
-            features.get(name) is None or features.get(name) is False
-            for name in ("plugins", "plugin_sharing")
-        )
-        and not any(raw.get(name) for name in ("plugins", "plugin_sharing"))
-        and isinstance(projects, dict)
-        and not projects
-    )
+    return True
 
 
 def _share_workflow_entries(profile: Profile, provider: ProviderConfig) -> list[str]:
@@ -467,31 +734,241 @@ def _share_workflow_entries(profile: Profile, provider: ProviderConfig) -> list[
     return shared
 
 
-def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
+def _remove_exact_legacy_plugin_link(profile: Profile, provider: ProviderConfig) -> None:
+    destination = profile.home / "plugins"
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        return
+    expected = provider.base_home / "plugins" if provider.base_home is not None else None
+    if (
+        expected is None
+        or not stat.S_ISLNK(metadata.st_mode)
+        or os.readlink(destination) != str(expected)
+    ):
+        raise ValueError(f"unexpected managed plugin path must be removed manually: {destination}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(profile.home, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = profile.home.lstat()
+        link = os.stat("plugins", dir_fd=descriptor, follow_symlinks=False)
+        if (
+            (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or (link.st_dev, link.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or not stat.S_ISLNK(link.st_mode)
+            or os.readlink("plugins", dir_fd=descriptor) != str(expected)
+        ):
+            raise ValueError(f"managed plugin link changed during cleanup: {destination}")
+        os.unlink("plugins", dir_fd=descriptor)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _profile_plugins_absent(profile: Profile) -> bool:
+    try:
+        profile.home.joinpath("plugins").lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _planned_file(relative_path: str, payload: bytes) -> dict[str, Any]:
+    return {
+        "relative_path": relative_path,
+        "type": "file",
+        "mode": "0600",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def provision_plan(registry: Registry, profile_id: str) -> dict[str, Any]:
+    """Return the canonical, non-mutating managed filesystem plan for one worker."""
+
+    profile = registry.require_profile(profile_id)
+    if profile.safety_policy != "worker":
+        raise ValueError("external reserve profiles must never be planned or inspected")
     provider = registry.require_provider(profile.provider)
+    if provider.hooks_source is not None:
+        raise ValueError("managed worker hooks must be release-owned")
+    binary_identity = _provider_binary_identity(provider)
+    session_command, agent_fleet_binary = _verified_session_hook(registry)
+    turn_end_command = (
+        session_command.replace(" hook session-start", " hook turn-end")
+        if profile.provider == "claude"
+        else None
+    )
+    hook_payload = (
+        _claude_hook_payload({}, None, session_command, str(turn_end_command))
+        if profile.provider == "claude"
+        else _codex_hook_payload(None, session_command)
+    )
+    payloads: dict[str, bytes] = {
+        HOOK_MARKER_FILE: _canonical_json_bytes(
+            _hook_marker_payload(
+                profile,
+                provider,
+                None,
+                session_command,
+                turn_end_command,
+                agent_fleet_binary,
+                hook_payload["hooks"],
+            )
+        ),
+        PROVIDER_BINARY_MARKER_FILE: _canonical_json_bytes(
+            {
+                "schema": 1,
+                "profile": profile.id,
+                "provider": profile.provider,
+                "binary": binary_identity,
+            }
+        ),
+        ".agent-fleet-profile.json": _canonical_json_bytes(
+            {
+                "schema": 2,
+                "agent_fleet_version": __version__,
+                "profile": profile.id,
+                "provider": profile.provider,
+            }
+        ),
+    }
+    if profile.provider == "claude":
+        payloads["settings.json"] = _canonical_json_bytes(hook_payload)
+        payloads[".claude.json"] = _canonical_json_bytes(
+            closed_claude_state_payload(registry)
+        )
+    else:
+        payloads["hooks.json"] = _canonical_json_bytes(hook_payload)
+        payloads["config.toml"] = CODEX_MANAGED_CONFIG_TEXT.encode()
+    entries: list[dict[str, Any]] = [
+        {"relative_path": ".", "type": "dir", "mode": "0700"},
+        {"relative_path": "hooks", "type": "dir", "mode": "0700"},
+        *(_planned_file(path, payload) for path, payload in payloads.items()),
+    ]
+    if provider.base_home is not None:
+        for entry in provider.shared_entries:
+            source = provider.base_home / entry
+            if source.exists():
+                entries.append(
+                    {
+                        "relative_path": entry,
+                        "type": "symlink",
+                        "target": str(source),
+                    }
+                )
+    entries.sort(key=lambda item: str(item["relative_path"]))
+    return {
+        "schema": 1,
+        "profile": profile.id,
+        "provider": profile.provider,
+        "home": str(profile.home),
+        "safety_policy": profile.safety_policy,
+        "entries": entries,
+    }
+
+
+def verify_provisioned_profile(registry: Registry, profile_id: str) -> dict[str, Any]:
+    """Verify only release-managed paths; never read credentials or reserve homes."""
+
+    plan = provision_plan(registry, profile_id)
+    profile = registry.require_profile(profile_id)
+    actual_entries: list[dict[str, Any]] = []
+    mismatches: list[dict[str, str]] = []
+    for expected in plan["entries"]:
+        relative = str(expected["relative_path"])
+        path = profile.home if relative == "." else profile.home / relative
+        try:
+            metadata = path.lstat()
+        except OSError:
+            mismatches.append({"relative_path": relative, "reason": "missing"})
+            continue
+        if expected["type"] == "dir":
+            actual = {
+                "relative_path": relative,
+                "type": "dir" if stat.S_ISDIR(metadata.st_mode) else "other",
+                "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            }
+        elif expected["type"] == "symlink":
+            actual = {
+                "relative_path": relative,
+                "type": "symlink" if stat.S_ISLNK(metadata.st_mode) else "other",
+                "target": os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None,
+            }
+        else:
+            try:
+                payload = read_private_bytes(path, label="managed provisioned file")
+            except (OSError, ValueError):
+                actual = {"relative_path": relative, "type": "other"}
+            else:
+                actual = {
+                    "relative_path": relative,
+                    "type": "file",
+                    "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+        actual_entries.append(actual)
+        if actual != expected:
+            mismatches.append({"relative_path": relative, "reason": "content_or_type"})
+    if not _profile_plugins_absent(profile):
+        mismatches.append({"relative_path": "plugins", "reason": "forbidden"})
+    canonical_plan = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "schema": 1,
+        "profile": profile.id,
+        "provider": profile.provider,
+        "status": "verified" if not mismatches else "mismatch",
+        "plan_sha256": hashlib.sha256(canonical_plan).hexdigest(),
+        "actual_entries": actual_entries,
+        "mismatches": mismatches,
+    }
+
+
+def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
+    if profile.safety_policy != "worker":
+        raise ValueError(
+            f"profile {profile.id} is external {profile.safety_policy} capacity "
+            "and must not be provisioned"
+        )
+    provider = registry.require_provider(profile.provider)
+    binary_identity = _provider_binary_identity(provider)
     trusted_projects = registered_trusted_projects(registry, profile.provider)
     if not trusted_projects:
         raise ValueError(f"register at least one trusted project for {profile.provider}")
-    if profile.provider == "codex":
-        _source_hash(provider.hooks_source)
+    _assert_existing_profile_config_closed(profile)
+    if provider.hooks_source is not None:
+        raise ValueError(
+            "managed worker hooks must be release-owned; provider hooks_source must be absent"
+        )
     if profile.home.is_symlink():
         raise ValueError(f"managed profile home cannot be a symlink: {profile.home}")
     ensure_private_dir(profile.home)
     current = profile.home.lstat()
     if not stat.S_ISDIR(current.st_mode) or current.st_uid != os.getuid():
         raise ValueError(f"managed profile home must be a current-user directory: {profile.home}")
+    _remove_exact_legacy_plugin_link(profile, provider)
     shared = _share_workflow_entries(profile, provider)
     if profile.provider == "claude":
         ensure_private_dir(profile.home / "hooks")
-        _install_session_hook(profile.home / "settings.json", provider.hooks_source)
-        _merge_claude_project_trust(
-            profile,
-            {project.canonical_root for project in trusted_projects},
-        )
+        _install_claude_hooks(registry, profile, provider)
+        _install_closed_claude_state(registry, profile)
     elif profile.provider == "codex":
         ensure_private_dir(profile.home / "hooks")
         _ensure_codex_config(profile.home)
-        _install_codex_hooks(profile, provider)
+        _install_codex_hooks(registry, profile, provider)
+    atomic_write_json(
+        profile.home / PROVIDER_BINARY_MARKER_FILE,
+        {
+            "schema": 1,
+            "profile": profile.id,
+            "provider": profile.provider,
+            "binary": binary_identity,
+        },
+    )
     marker = profile.home / ".agent-fleet-profile.json"
     atomic_write_json(
         marker,
@@ -509,6 +986,7 @@ def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
         "home": str(profile.home),
         "provisioned": True,
         "shared_entries": shared,
+        "provider_binary": binary_identity,
     }
 
 
@@ -517,15 +995,8 @@ def profile_is_provisioned(profile: Profile) -> bool:
     if not profile.home.is_dir():
         return False
     try:
-        current = marker.lstat()
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or current.st_uid != os.getuid()
-            or stat.S_IMODE(current.st_mode) != 0o600
-        ):
-            return False
-        raw = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = read_private_json(marker, label="profile marker")
+    except (OSError, ValueError):
         return False
     return raw == {
         "schema": 2,
@@ -543,7 +1014,7 @@ def profile_hook_health(registry: Registry, profile: Profile) -> dict[str, bool]
         return {
             "agent_fleet_session_hook": False,
             "herdr_session_hook": False,
-            "inherited_workflow_hooks": False,
+            "release_owned_hooks": False,
         }
     hooks = payload.get("hooks", {})
     commands: list[str] = []
@@ -561,40 +1032,17 @@ def profile_hook_health(registry: Registry, profile: Profile) -> dict[str, bool]
                     str(entry.get("command", "")) for entry in entries if isinstance(entry, dict)
                 )
 
-    source_ok = True
-    source = registry.require_provider(profile.provider).hooks_source
-    if source is not None and source.exists():
-        try:
-            source_payload = _read_json_object(source)
-        except ValueError:
-            source_ok = False
-        else:
-            source_hooks = source_payload.get("hooks", {})
-            if not isinstance(source_hooks, dict) or not isinstance(hooks, dict):
-                source_ok = False
-            else:
-                for event, groups in source_hooks.items():
-                    destination_groups = hooks.get(event, [])
-                    if not isinstance(groups, list) or not isinstance(destination_groups, list):
-                        source_ok = False
-                        break
-                    destination = {
-                        json.dumps(group, sort_keys=True) for group in destination_groups
-                    }
-                    if any(
-                        json.dumps(group, sort_keys=True) not in destination for group in groups
-                    ):
-                        source_ok = False
-                        break
-    if profile.provider == "codex":
-        source_ok = codex_hooks_ready(registry, profile)
+    closed_hooks = (
+        claude_hooks_ready(registry, profile)
+        if profile.provider == "claude"
+        else codex_hooks_ready(registry, profile)
+    )
     health = {
-        "agent_fleet_session_hook": any(HOOK_MARKER in command for command in commands),
+        "agent_fleet_session_hook": closed_hooks,
         "herdr_session_hook": any("herdr-agent-state" in command for command in commands),
-        "inherited_workflow_hooks": source_ok,
+        "release_owned_hooks": closed_hooks,
     }
-    if profile.provider == "codex":
-        health["closed_profile_hooks"] = codex_hooks_ready(registry, profile)
+    health["closed_profile_hooks"] = closed_hooks
     return health
 
 

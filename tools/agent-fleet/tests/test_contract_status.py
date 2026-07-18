@@ -12,9 +12,14 @@ from pathlib import Path
 from agent_fleet import __version__
 from agent_fleet.config import load_registry, save_registry
 from agent_fleet.doctor import run_doctor
+from agent_fleet.identity import adopt_provider_identity_bundle, identity_bundle_path
 from agent_fleet.providers import identity_fingerprint
 from agent_fleet.provision import provision_profile
-from agent_fleet.quota import quota_path
+from agent_fleet.quota import (
+    inspect_credential_source_contract,
+    quota_path,
+    read_quota,
+)
 from agent_fleet.util import atomic_write_json, utc_now
 
 
@@ -47,7 +52,9 @@ def test_contract_and_version_do_not_require_registry(tmp_path: Path) -> None:
             check=True,
         )
         payload = json.loads(result.stdout)
-        assert payload["contract_version"] == 1
+        assert payload["contract_version"] == 2
+        if command == "contract":
+            assert "workspace" in payload["selection_fields"]
 
 
 def test_runtime_version_matches_package_metadata() -> None:
@@ -112,15 +119,16 @@ def test_pool_status_reports_provider_level_fallback(
         env=env,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
     )
+    assert result.returncode == 0, result.stderr
     provider = json.loads(result.stdout)["providers"][0]
     assert provider["available"] is True
     assert provider["selection_mode"] == "verified-fallback"
     assert provider["degraded"] is True
 
 
-def test_enroll_uses_codex_device_auth_then_verifies_while_disabled(
+def test_enroll_is_a_verified_noop_without_invoking_codex_login(
     fleet: tuple[object, Path], tmp_path: Path
 ) -> None:
     _, config = fleet
@@ -134,8 +142,10 @@ import os
 import sys
 if sys.argv[1:] == ["login", "--device-auth"]:
     home = os.environ["CODEX_HOME"]
-    with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as handle:
-        json.dump({"tokens": "fake-test-only"}, handle)
+    credential = os.path.join(home, "auth.json")
+    with open(credential, "w", encoding="utf-8") as handle:
+        json.dump({"tokens": {"access_token": "fake-test-only"}}, handle)
+    os.chmod(credential, 0o600)
 with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 """,
@@ -146,6 +156,25 @@ with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as handle:
     providers["codex"] = replace(providers["codex"], binary=binary)
     registry = replace(registry, providers=providers)
     save_registry(registry, config)
+    registry = load_registry(config)
+    workers = [
+        profile
+        for profile in registry.profiles.values()
+        if profile.provider == "codex" and profile.safety_policy == "worker"
+    ]
+    for profile in workers:
+        provision_profile(registry, profile)
+    adopt_provider_identity_bundle(
+        registry,
+        "codex",
+        {
+            profile.id: (
+                read_quota(registry, profile.id),
+                inspect_credential_source_contract(registry, profile),
+            )
+            for profile in workers
+        },
+    )
 
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
@@ -168,16 +197,129 @@ with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as handle:
         env=env,
         text=True,
         capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    payload = json.loads(result.stdout)
+    assert not log.exists()
+    assert payload["credential_verified"] is True
+    assert payload["no_op"] is True
+    assert payload["provider_login_invoked"] is False
+    assert payload["enabled"] is False
+    assert load_registry(config).require_profile("codex-1").enabled is False
+
+
+def test_enroll_missing_credentials_refuses_before_provider_or_browser(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    marker = tmp_path / "provider-login-ran"
+    binary = tmp_path / "codex-provider"
+    binary.write_text(
+        f"#!/bin/sh\nprintf ran > {str(marker)!r}\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    providers = dict(registry.providers)
+    providers["codex"] = replace(providers["codex"], binary=binary)
+    registry = replace(registry, providers=providers)
+    save_registry(registry, config)
+    profile = registry.require_profile("codex-1")
+    provision_profile(registry, profile)
+    (profile.home / "auth.json").unlink()
+    project_root = Path(__file__).parents[1]
+    environment = {**os.environ, "PYTHONPATH": str(project_root / "src")}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--format",
+            "json",
+            "--config",
+            str(config),
+            "profile",
+            "enroll",
+            "codex-1",
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "requires future transactional maintenance tooling" in json.loads(
+        result.stdout
+    )["error"]
+    assert not marker.exists()
+
+
+def test_enroll_existing_unpinned_identity_directs_batch_adoption(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    identity_bundle_path(registry, "codex").unlink()
+    project_root = Path(__file__).parents[1]
+    environment = {**os.environ, "PYTHONPATH": str(project_root / "src")}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--format",
+            "json",
+            "--config",
+            str(config),
+            "profile",
+            "enroll",
+            "codex-1",
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "profile identity adopt codex-1" in json.loads(result.stdout)["error"]
+
+
+def test_enroll_help_exposes_no_interactive_or_replacement_flags(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    project_root = Path(__file__).parents[1]
+    environment = {**os.environ, "PYTHONPATH": str(project_root / "src")}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--config",
+            str(config),
+            "profile",
+            "enroll",
+            "--help",
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
         check=True,
     )
 
-    payload = json.loads(result.stdout)
-    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert calls[0] == ["login", "--device-auth"]
-    assert ["login", "status"] in calls
-    assert payload["credential_verified"] is True
-    assert payload["enabled"] is False
-    assert load_registry(config).require_profile("codex-1").enabled is False
+    assert "--browser-login" not in result.stdout
+    assert "--access-token" not in result.stdout
+    assert "--replace" not in result.stdout
 
 
 def test_verify_keeps_a_remotely_rejected_profile_disabled(
@@ -206,7 +348,7 @@ def test_verify_keeps_a_remotely_rejected_profile_disabled(
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
-    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
         str(fixtures), encoding="utf-8"
     )
     result = subprocess.run(
@@ -235,7 +377,68 @@ def test_verify_keeps_a_remotely_rejected_profile_disabled(
     assert load_registry(config).require_profile("codex-1").enabled is False
 
 
-def test_claude_enrollment_discards_prelogin_identity_proof(
+def test_enable_requires_fresh_proof_for_every_enabled_provider_worker(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profiles = dict(registry.profiles)
+    profiles["codex-2"] = replace(profiles["codex-2"], enabled=True)
+    registry = replace(registry, profiles=profiles)
+    save_registry(registry, config)
+    provision_profile(registry, registry.require_profile("codex-1"))
+    provision_profile(registry, registry.require_profile("codex-2"))
+    fixtures = tmp_path / "enable-proof-fixtures"
+    fixtures.mkdir()
+    (fixtures / "codex-2.json").write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "provider": "codex",
+                        "state": {"status": "auth_required", "reason": "logged_out"},
+                        "windows": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
+        str(fixtures),
+        encoding="utf-8",
+    )
+    project_root = Path(__file__).parents[1]
+    environment = {**os.environ, "PYTHONPATH": str(project_root / "src")}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--format",
+            "json",
+            "--config",
+            str(config),
+            "profile",
+            "enable",
+            "codex-1",
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "provider enable proof set is incomplete" in json.loads(result.stdout)["error"]
+    observed = load_registry(config)
+    assert observed.require_profile("codex-1").enabled is False
+    assert observed.require_profile("codex-2").enabled is True
+
+
+def test_claude_enrollment_refuses_remote_failure_without_mutating_prior_proof(
     fleet: tuple[object, Path], tmp_path: Path
 ) -> None:
     _, config = fleet
@@ -269,7 +472,7 @@ def test_claude_enrollment_discards_prelogin_identity_proof(
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
-    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
         str(fixtures), encoding="utf-8"
     )
     result = subprocess.run(
@@ -290,15 +493,15 @@ def test_claude_enrollment_discards_prelogin_identity_proof(
         text=True,
         capture_output=True,
         timeout=20,
-        check=True,
+        check=False,
     )
 
     payload = json.loads(result.stdout)
     stored = json.loads(quota_path(registry, "claude-1").read_text(encoding="utf-8"))
-    assert payload["verification_pending"] is True
-    assert payload["credential_verified"] is False
-    assert stored.get("identity_fingerprint") is None
-    assert stored["reason"] == "keychain_access_required"
+    assert result.returncode == 2
+    assert payload["ok"] is False
+    assert "no provider/browser login was invoked" in payload["error"]
+    assert stored == old_quota
 
 
 def test_toon_preflight_precedes_registry_mutation(tmp_path: Path) -> None:

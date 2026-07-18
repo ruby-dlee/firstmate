@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import stat
 import subprocess
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from .config import verified_quota_runtime
 from .locks import DirectoryLock
 from .models import Profile, Registry
-from .paths import ensure_private_dir
-from .providers import auth_probe, identity_fingerprint, provider_environment
-from .util import atomic_write_bytes, atomic_write_json, utc_now
+from .paths import current_user_home, ensure_private_dir
+from .providers import credential_file_state, identity_fingerprint, provider_environment
+from .provision import (
+    profile_is_provisioned,
+    verified_configured_provider_binary,
+    verified_provider_binary,
+)
+from .util import (
+    atomic_write_bytes,
+    atomic_write_json,
+    read_private_bytes,
+    read_private_json,
+    unlink_private_file,
+    utc_now,
+)
 
 PRIMARY_WINDOWS = {"five_hour", "seven_day", "weekly", "week"}
 AUTH_FAILURE_RE = re.compile(r"sign[- ]?in|required|reauth|token.*(?:revoked|invalid)", re.I)
@@ -24,6 +37,35 @@ HARD_BLOCKED_STATUSES = {"auth_required", "rate_limited", "error"}
 FALLBACK_STATUSES = {"fresh", "stale", "unavailable"}
 KNOWN_STATUSES = HARD_BLOCKED_STATUSES | FALLBACK_STATUSES
 SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+
+
+def _quota_runtime_environment(
+    profile: Profile, *, default_provider_home: bool = False
+) -> dict[str, str]:
+    """Return the provider environment without ambient Node/npm injection hooks."""
+    env = provider_environment(profile, default_provider_home=default_provider_home)
+    for name in tuple(env):
+        normalized = name.lower()
+        if (
+            name.startswith(("NODE_", "DYLD_", "LD_", "PYTHON"))
+            or normalized.startswith("npm_config_")
+            or name
+            in {
+                "BASH_ENV",
+                "ENV",
+                "SHELLOPTS",
+                "BASHOPTS",
+                "PERL5OPT",
+                "PERLLIB",
+                "RUBYOPT",
+                "RUBYLIB",
+                "ELECTRON_RUN_AS_NODE",
+                "INIT_CWD",
+            }
+        ):
+            env.pop(name, None)
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    return env
 
 
 @dataclass(frozen=True)
@@ -40,15 +82,13 @@ def quota_path(registry: Registry, profile_id: str) -> Path:
 def snapshot_quota_cache(registry: Registry, profile_id: str) -> QuotaCacheSnapshot:
     path = quota_path(registry, profile_id)
     try:
-        current = path.lstat()
+        payload = read_private_bytes(path, label="quota cache")
     except FileNotFoundError:
         return QuotaCacheSnapshot(False)
-    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-        raise ValueError(f"quota cache must be a current-user regular file: {path}")
     return QuotaCacheSnapshot(
         True,
-        path.read_bytes(),
-        stat.S_IMODE(current.st_mode),
+        payload,
+        0o600,
     )
 
 
@@ -61,13 +101,7 @@ def restore_quota_cache(
     if snapshot.existed:
         atomic_write_bytes(path, snapshot.payload, mode=snapshot.mode)
         return
-    try:
-        current = path.lstat()
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
-        raise ValueError(f"refusing to remove unexpected quota cache path: {path}")
-    path.unlink()
+    unlink_private_file(path, label="quota cache")
 
 
 def discard_quota_cache(registry: Registry, profile_id: str) -> None:
@@ -164,6 +198,43 @@ def _identity_fingerprint(profile: Profile, provider: dict[str, Any]) -> str | N
     return identity_fingerprint(profile.provider, identifier)
 
 
+def _claude_credential_state(provider: dict[str, Any]) -> str:
+    attempts = provider.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return "indeterminate"
+    relevant: dict[str, list[dict[str, Any]]] = {"oauth-file": [], "keychain": []}
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            return "indeterminate"
+        source = attempt.get("source")
+        status = attempt.get("status")
+        error = attempt.get("error")
+        if attempt.get("credentialPresent") is True:
+            return "present"
+        if source == "oauth" and status in {"success", "failed"}:
+            return "present"
+        if source in relevant:
+            relevant[source].append(attempt)
+        elif source not in {"cache"}:
+            return "indeterminate"
+        if not isinstance(source, str) or not isinstance(status, str):
+            return "indeterminate"
+        if error is not None and not isinstance(error, str):
+            return "indeterminate"
+    if all(
+        entries
+        and all(
+            entry.get("status") == "skipped"
+            and entry.get("error") == "credentials_missing"
+            and entry.get("credentialPresent") is not True
+            for entry in entries
+        )
+        for entries in relevant.values()
+    ):
+        return "absent"
+    return "indeterminate"
+
+
 def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("profile") == profile.id and raw.get("schema") == 1:
         status = _safe_token(raw.get("status"), "unavailable")
@@ -179,6 +250,9 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         if status == "fresh" and verified_at is None:
             status = "error"
+        credential_state = _safe_token(raw.get("credential_state"), "indeterminate")
+        if credential_state not in {"present", "absent", "indeterminate"}:
+            credential_state = "indeterminate"
         return {
             "schema": 1,
             "profile": profile.id,
@@ -195,6 +269,7 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
             "verified_at": verified_at,
             "identity_fingerprint": fingerprint,
             "identity_source": "quota-account" if fingerprint else None,
+            "credential_state": "present" if fingerprint else credential_state,
             "refreshed_at": now,
         }
 
@@ -257,6 +332,11 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
             status = "error"
             derived_reason = "missing_remote_verification_timestamp"
     identity_fingerprint = _identity_fingerprint(profile, provider)
+    credential_state = (
+        _claude_credential_state(provider) if profile.provider == "claude" else "indeterminate"
+    )
+    if identity_fingerprint is not None:
+        credential_state = "present"
     return {
         "schema": 1,
         "profile": profile.id,
@@ -269,6 +349,7 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
         "verified_at": verified_at,
         "identity_fingerprint": identity_fingerprint,
         "identity_source": "quota-account" if identity_fingerprint else None,
+        "credential_state": credential_state,
         "refreshed_at": utc_now(),
     }
 
@@ -279,26 +360,56 @@ def _load_raw_quota(
     *,
     timeout: int = 30,
     allow_keychain_prompt: bool = False,
+    default_provider_home: bool = False,
 ) -> dict[str, Any]:
-    binary = registry.settings.quota_binary
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise ValueError(f"configured quota-axi candidate is not executable: {binary}")
-    cache = profile.home / ".agent-fleet-quota-cache"
+    _node_binary, quota_binary = verified_quota_runtime(registry.settings)
+    base_anchor = (
+        profile.id == f"{profile.provider}-base-anchor"
+        and profile.safety_policy == "desktop_shared"
+    )
+    if not base_anchor:
+        credential_state, credential_reason = credential_file_state(profile)
+        if credential_state == "indeterminate" or (
+            profile.provider == "codex" and credential_state != "present"
+        ):
+            raise ValueError(
+                f"unsafe or unavailable {profile.provider} credential storage for {profile.id}: "
+                f"{credential_reason or credential_state}"
+            )
+    cache = (
+        registry.settings.state_dir / "identity-anchor-cache" / profile.provider
+        if base_anchor
+        else profile.home / ".agent-fleet-quota-cache"
+    )
     ensure_private_dir(cache)
-    env = provider_environment(profile)
+    env = _quota_runtime_environment(profile, default_provider_home=default_provider_home)
     env.pop("AGENT_FLEET_QUOTA_FIXTURE_DIR", None)
     env.pop("AGENT_FLEET_TEST_QUOTA_FIXTURE_DIR", None)
     env["XDG_CACHE_HOME"] = str(cache)
+    if profile_is_provisioned(profile):
+        provider_binary = verified_provider_binary(registry, profile)
+    elif base_anchor:
+        provider_binary = verified_configured_provider_binary(registry, profile.provider)
+    else:
+        raise ValueError(f"quota probe requires a provisioned profile: {profile.id}")
     if profile.provider == "codex":
-        env["QUOTA_AXI_CODEX_BINARY"] = str(registry.require_provider("codex").binary)
+        env["QUOTA_AXI_CODEX_BINARY"] = str(
+            cache / "codex-cli-fallback-disabled" if base_anchor else provider_binary
+        )
     try:
-        argv = [str(binary), "--provider", profile.provider, "--json", "--full"]
+        argv = [
+            str(quota_binary),
+            "--provider",
+            profile.provider,
+            "--json",
+            "--full",
+        ]
         if allow_keychain_prompt and profile.provider == "claude":
             argv.append("--allow-keychain-prompt")
         result = subprocess.run(
             argv,
             env=env,
-            cwd=profile.home,
+            cwd=(profile.home if profile.home.exists() or not base_anchor else current_user_home()),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -335,28 +446,149 @@ def probe_quota(
     *,
     timeout: int = 30,
     allow_keychain_prompt: bool = False,
+    default_provider_home: bool = False,
 ) -> dict[str, Any]:
     raw = _load_raw_quota(
         registry,
         profile,
         timeout=timeout,
         allow_keychain_prompt=allow_keychain_prompt,
+        default_provider_home=default_provider_home,
     )
-    normalized = _normalize(profile, raw)
+    return _normalize(profile, raw)
+
+
+def _claude_scoped_keychain_service(profile: Profile) -> str:
+    stable_home = unicodedata.normalize("NFC", str(profile.home))
+    suffix = sha256(stable_home.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{suffix}"
+
+
+def inspect_credential_source_contract(
+    registry: Registry,
+    profile: Profile,
+    *,
+    timeout: int = 30,
+    allow_keychain_prompt: bool = False,
+    allow_absent: bool = False,
+) -> dict[str, Any]:
+    """Prove the non-secret credential source set used by one managed worker.
+
+    This invokes only the sealed Quota AXI auth inspector. It never falls back
+    to the Desktop/default home and never accepts Claude's unsuffixed Keychain
+    service for a routed profile.
+    """
+
+    if profile.safety_policy != "worker":
+        raise ValueError("external reserve profiles must not be remotely inspected")
+    _node_binary, quota_binary = verified_quota_runtime(registry.settings)
+    if not profile_is_provisioned(profile):
+        raise ValueError(f"credential inspection requires a provisioned profile: {profile.id}")
+    cache = profile.home / ".agent-fleet-quota-cache"
+    ensure_private_dir(cache)
+    env = _quota_runtime_environment(profile)
+    env.pop("AGENT_FLEET_QUOTA_FIXTURE_DIR", None)
+    env.pop("AGENT_FLEET_TEST_QUOTA_FIXTURE_DIR", None)
+    env["XDG_CACHE_HOME"] = str(cache)
+    if profile.provider == "codex":
+        env["QUOTA_AXI_CODEX_BINARY"] = str(verified_provider_binary(registry, profile))
+    argv = [str(quota_binary), "auth", "--provider", profile.provider, "--json"]
+    if allow_keychain_prompt and profile.provider == "claude":
+        argv.append("--allow-keychain-prompt")
+    try:
+        result = subprocess.run(
+            argv,
+            env=env,
+            cwd=profile.home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"credential source inspection timed out for {profile.id}") from exc
+    try:
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Quota AXI emitted invalid auth JSON for {profile.id}") from exc
+    if result.returncode != 0 or not isinstance(raw, dict):
+        raise ValueError(f"credential source inspection failed for {profile.id}")
+    reports = raw.get("auth")
+    if not isinstance(reports, list) or len(reports) != 1:
+        raise ValueError(f"credential source inspection was incomplete for {profile.id}")
+    report = reports[0]
+    if not isinstance(report, dict) or report.get("provider") != profile.provider:
+        raise ValueError(f"credential source inspection provider mismatch for {profile.id}")
+    raw_sources = report.get("sources")
+    if not isinstance(raw_sources, list):
+        raise ValueError(f"credential source inspection has no sources for {profile.id}")
+    sources: dict[str, dict[str, Any]] = {}
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            raise ValueError(f"credential source inspection is malformed for {profile.id}")
+        source = item.get("source")
+        status = item.get("status")
+        if (
+            not isinstance(source, str)
+            or source in sources
+            or status not in {"available", "missing", "invalid", "expired", "skipped"}
+        ):
+            raise ValueError(f"credential source inspection is ambiguous for {profile.id}")
+        sources[source] = item
     if profile.provider == "claude":
-        probe = auth_probe(registry, profile)
-        fingerprint = probe.get("identity_fingerprint")
-        existing = normalized.get("identity_fingerprint")
-        if fingerprint and existing and fingerprint != existing:
-            normalized["status"] = "error"
-            normalized["reason"] = "identity_source_mismatch"
-            normalized["verified_at"] = None
-            normalized["identity_fingerprint"] = None
-            normalized["identity_source"] = None
-        elif fingerprint:
-            normalized["identity_fingerprint"] = fingerprint
-            normalized["identity_source"] = probe.get("identity_source")
-    return normalized
+        if set(sources) != {"oauth-file", "keychain"}:
+            raise ValueError(f"Claude credential source set is incomplete for {profile.id}")
+        expected_file = str(profile.home / ".credentials.json")
+        file_source = sources["oauth-file"]
+        keychain_source = sources["keychain"]
+        if file_source.get("path") != expected_file or keychain_source.get("path") is not None:
+            raise ValueError(f"Claude credential source scope mismatch for {profile.id}")
+        available = [
+            source
+            for source in (file_source, keychain_source)
+            if source.get("status") == "available"
+        ]
+        if not available and all(
+            source.get("status") == "missing" for source in (file_source, keychain_source)
+        ):
+            if allow_absent:
+                return {"kind": "absent"}
+            raise ValueError(f"Claude credentials are absent for {profile.id}")
+        if len(available) != 1:
+            raise ValueError(
+                f"Claude worker {profile.id} requires exactly one authoritative credential source"
+            )
+        unavailable = keychain_source if available[0] is file_source else file_source
+        if unavailable.get("status") != "missing":
+            raise ValueError(
+                f"Claude worker {profile.id} has an ambiguous or unreadable credential source"
+            )
+        if available[0] is file_source:
+            return {"kind": "oauth-file", "path": expected_file}
+        return {
+            "kind": "keychain",
+            "service": _claude_scoped_keychain_service(profile),
+            "config_home": str(profile.home),
+        }
+    if set(sources) != {"auth-json", "cli-rpc"}:
+        raise ValueError(f"Codex credential source set is incomplete for {profile.id}")
+    auth_json = sources["auth-json"]
+    expected_file = str(profile.home / "auth.json")
+    if auth_json.get("path") != expected_file:
+        raise ValueError(f"Codex auth.json scope mismatch for {profile.id}")
+    if auth_json.get("status") == "missing" and allow_absent:
+        return {"kind": "absent"}
+    if auth_json.get("status") != "available":
+        raise ValueError(f"Codex auth.json is unavailable for {profile.id}")
+    cli_rpc = sources["cli-rpc"]
+    expected_binary = str(verified_provider_binary(registry, profile))
+    if cli_rpc.get("status") != "available" or cli_rpc.get("path") != expected_binary:
+        raise ValueError(f"Codex CLI-RPC control path mismatch for {profile.id}")
+    return {
+        "kind": "auth-json",
+        "path": expected_file,
+        "cli_rpc_path": expected_binary,
+    }
 
 
 def store_quota(
@@ -368,30 +600,6 @@ def store_quota(
     normalized["profile"] = profile.id
     normalized["provider"] = profile.provider
     path = quota_path(registry, profile.id)
-    try:
-        previous = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        previous = {}
-    if isinstance(previous, dict):
-        if not normalized.get("verified_at") and _parse_time(previous.get("verified_at")):
-            normalized["verified_at"] = previous["verified_at"]
-        fingerprint = normalized.get("identity_fingerprint")
-        fingerprint_is_verified = (
-            normalized.get("status") == "fresh"
-            and normalized.get("verified_at") is not None
-            and normalized.get("headroom_percent") is not None
-            and isinstance(fingerprint, str)
-            and len(fingerprint) == 64
-        )
-        previous_fingerprint = previous.get("identity_fingerprint")
-        if (
-            not fingerprint_is_verified
-            and isinstance(previous_fingerprint, str)
-            and len(previous_fingerprint) == 64
-            and _parse_time(previous.get("verified_at")) is not None
-        ):
-            normalized["identity_fingerprint"] = previous_fingerprint
-            normalized["identity_source"] = "previous-verified-quota-account"
     atomic_write_json(path, normalized)
     return normalized
 
@@ -415,13 +623,26 @@ def refresh_quota(
 def read_quota(registry: Registry, profile_id: str) -> dict[str, Any]:
     path = quota_path(registry, profile_id)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        value = read_private_json(path, label="quota cache")
+    except FileNotFoundError:
         return {
             "schema": 1,
             "profile": profile_id,
             "status": "unavailable",
             "reason": "no_cache",
+            "headroom_percent": None,
+            "windows": [],
+            "refreshed_at": None,
+            "verified_at": None,
+            "verified_recent": False,
+            "fresh": False,
+        }
+    except ValueError:
+        return {
+            "schema": 1,
+            "profile": profile_id,
+            "status": "error",
+            "reason": "unsafe_or_corrupt_cache",
             "headroom_percent": None,
             "windows": [],
             "refreshed_at": None,

@@ -7,6 +7,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from .config import verified_quota_binary, verified_quota_node_binary, verified_quota_runtime
 from .models import Registry
 from .projects import registered_trusted_projects
 from .providers import auth_status
@@ -15,6 +16,8 @@ from .provision import (
     profile_is_provisioned,
     profile_selection_ready,
     profile_shared_assets_healthy,
+    provider_binary_ready,
+    verified_provider_binary,
 )
 from .quota import has_remote_identity_proof, read_quota
 
@@ -43,6 +46,19 @@ def run_doctor(
     project: Path | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    try:
+        quota_binary = verified_quota_binary(registry.settings)
+    except (OSError, ValueError):
+        quota_binary = None
+    try:
+        quota_node_binary = verified_quota_node_binary(registry.settings)
+    except (OSError, ValueError):
+        quota_node_binary = None
+    try:
+        verified_quota_runtime(registry.settings)
+        quota_release_tree_ready = True
+    except (OSError, ValueError):
+        quota_release_tree_ready = False
 
     def add(name: str, ok: bool, detail: str, *, required: bool = True) -> None:
         checks.append({"name": name, "ok": ok, "required": required, "detail": detail})
@@ -55,9 +71,18 @@ def run_doctor(
     add("toon", shutil.which("toon") is not None, "TOON encoder on PATH")
     add(
         "quota-axi",
-        registry.settings.quota_binary.is_file()
-        and os.access(registry.settings.quota_binary, os.X_OK),
-        f"pinned quota reader: {registry.settings.quota_binary}",
+        quota_binary is not None,
+        f"hash-pinned hardened quota wrapper: {registry.settings.quota_binary}",
+    )
+    add(
+        "quota-axi-node",
+        quota_node_binary is not None,
+        f"contained hash-pinned Node runtime: {registry.settings.quota_node_binary}",
+    )
+    add(
+        "quota-axi-release-tree",
+        quota_release_tree_ready,
+        "complete hash-pinned Quota release import closure",
     )
     for provider, config in registry.providers.items():
         binary_ok = config.binary.is_file() and os.access(config.binary, os.X_OK)
@@ -78,13 +103,33 @@ def run_doctor(
             ",".join(str(path) for path in config.trusted_projects) or "none",
         )
     for profile in sorted(registry.profiles.values(), key=lambda item: item.id):
+        if profile.safety_policy != "worker":
+            add(
+                f"profile:{profile.id}:external-reserve",
+                not profile.enabled,
+                "intentionally disabled, unprovisioned, and never routed",
+            )
+            continue
         provisioned = profile_is_provisioned(profile)
         add(
             f"profile:{profile.id}:provisioned",
             provisioned or not profile.enabled,
             "provisioned" if provisioned else "not provisioned (allowed while disabled)",
         )
-        status = auth_status(registry, profile) if provisioned else "not-provisioned"
+        binary_ready = provisioned and provider_binary_ready(registry, profile)
+        if provisioned:
+            add(
+                f"profile:{profile.id}:provider-binary",
+                binary_ready,
+                "pinned" if binary_ready else "changed since provisioning",
+            )
+        status = (
+            auth_status(profile, binary=verified_provider_binary(registry, profile))
+            if provisioned and binary_ready
+            else "provider-binary-drift"
+            if provisioned
+            else "not-provisioned"
+        )
         add(
             f"profile:{profile.id}:auth",
             status == "authenticated" or not profile.enabled,
@@ -139,6 +184,8 @@ def run_doctor(
         )
     if project is not None:
         for profile in sorted(registry.profiles.values(), key=lambda item: item.id):
+            if profile.safety_policy != "worker":
+                continue
             ready = profile_is_provisioned(profile) and profile_selection_ready(
                 registry, profile, project
             )

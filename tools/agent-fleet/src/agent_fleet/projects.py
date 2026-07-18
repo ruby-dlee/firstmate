@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import Registry
+from .paths import current_user_home, expand_lexical_path
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class TrustedProject:
 
 
 def lexical_path(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(path)))))
+    return expand_lexical_path(path)
 
 
 def _owned_directory(path: Path, label: str) -> None:
@@ -58,7 +59,7 @@ def canonical_git_project(path: Path) -> tuple[Path, Path]:
         raise ValueError(f"Git worktree root must not be symlinked: {root}")
     _owned_directory(root, "Git worktree root")
     _owned_directory(common_dir, "Git common directory")
-    if root == Path(root.anchor) or root == Path.home().resolve():
+    if root == Path(root.anchor) or root == current_user_home():
         raise ValueError(f"trusted project root is too broad: {root}")
     try:
         expanded.relative_to(root)

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
+import math
 import time
 from pathlib import Path
 from typing import Any
 
 from .models import Registry
-from .util import atomic_write_json, utc_now, validate_id
+from .util import atomic_write_json, read_private_json, unlink_private_file, utc_now, validate_id
 
 
 def cooldown_path(registry: Registry, profile_id: str) -> Path:
@@ -16,13 +16,28 @@ def cooldown_path(registry: Registry, profile_id: str) -> Path:
 def read_cooldown(registry: Registry, profile_id: str) -> dict[str, Any] | None:
     path = cooldown_path(registry, profile_id)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        value = read_private_json(path, label="cooldown state")
+    except FileNotFoundError:
         return None
-    if not isinstance(value, dict) or value.get("profile") != profile_id:
-        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "profile", "reason", "created_at", "expires_unix"}
+        or value.get("schema") != 1
+        or value.get("profile") != profile_id
+        or not isinstance(value.get("reason"), str)
+        or not value["reason"]
+        or not isinstance(value.get("created_at"), str)
+        or not value["created_at"]
+    ):
+        raise ValueError(f"corrupt cooldown state: {path}")
     expires = value.get("expires_unix")
-    if not isinstance(expires, (int, float)) or float(expires) <= time.time():
+    if (
+        not isinstance(expires, (int, float))
+        or isinstance(expires, bool)
+        or not math.isfinite(float(expires))
+    ):
+        raise ValueError(f"corrupt cooldown state: {path}")
+    if float(expires) <= time.time():
         return None
     return value
 
@@ -52,6 +67,5 @@ def set_cooldown(
 
 def clear_cooldown(registry: Registry, profile_id: str) -> dict[str, Any]:
     path = cooldown_path(registry, profile_id)
-    existed = path.exists()
-    path.unlink(missing_ok=True)
+    existed = unlink_private_file(path, label="cooldown state")
     return {"profile": profile_id, "cooldown_cleared": existed}

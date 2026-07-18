@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from agent_fleet import enrollment, leases, locks
+import agent_fleet.cli as cli_module
+import agent_fleet.scheduler as scheduler_module
+from agent_fleet import enrollment, identity, leases, locks, util
 from agent_fleet.config import load_registry, save_registry
+from agent_fleet.cooldowns import cooldown_path
 from agent_fleet.enrollment import (
     activate_codex_promotion,
     create_codex_login_stage,
@@ -22,13 +27,69 @@ from agent_fleet.enrollment import (
     recover_pending_codex_transaction,
     rollback_codex_promotion,
 )
-from agent_fleet.leases import bind_lease, new_lease
-from agent_fleet.locks import provider_enrollment_lock
-from agent_fleet.providers import provider_environment
+from agent_fleet.identity import (
+    adopt_provider_identity_bundle,
+    identity_bundle_path,
+    refresh_provider_identity_anchors,
+)
+from agent_fleet.leases import active_leases, bind_lease, lease_path, new_lease, release_lease
+from agent_fleet.locks import DirectoryLock, provider_enrollment_lock
+from agent_fleet.paths import current_user_home, ensure_private_dir
+from agent_fleet.providers import (
+    CONTROL_PATH,
+    auth_probe,
+    identity_fingerprint,
+    provider_environment,
+)
 from agent_fleet.provision import provision_profile
-from agent_fleet.quota import quota_path, snapshot_quota_cache
+from agent_fleet.quota import (
+    inspect_credential_source_contract,
+    quota_path,
+    read_quota,
+    snapshot_quota_cache,
+)
 from agent_fleet.scheduler import select_and_acquire
 from agent_fleet.util import atomic_write_json
+
+
+def _directory_lock_process(
+    path: str,
+    hook_phase: str | None,
+    ready: multiprocessing.synchronize.Event,
+    proceed: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    outcomes: multiprocessing.queues.Queue,
+) -> None:
+    def hook(phase: str, _path: Path) -> None:
+        if phase != hook_phase:
+            return
+        ready.set()
+        if not proceed.wait(timeout=10):
+            raise RuntimeError(f"timed out at lock test hook {phase}")
+
+    lock = DirectoryLock(
+        Path(path),
+        stale_seconds=0,
+        timeout=8,
+        test_hook=hook,
+    )
+    try:
+        lock.acquire()
+        outcomes.put(("entered", os.getpid()))
+        if not release.wait(timeout=10):
+            raise RuntimeError("timed out waiting to release test lock")
+        lock.release()
+        outcomes.put(("released", os.getpid()))
+    except BaseException as exc:
+        outcomes.put(("error", os.getpid(), type(exc).__name__, str(exc)))
+
+
+def _state_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
 
 
 def _enable_and_provision(registry, config: Path, profile_id: str):
@@ -221,6 +282,51 @@ def test_provider_maintenance_marker_blocks_new_lease(
         )
 
 
+def test_provider_maintenance_rejects_stale_registry_before_recovery(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    stale = load_registry(config)
+    profiles = dict(stale.profiles)
+    profiles["codex-1"] = replace(profiles["codex-1"], reserve_percent=42)
+    save_registry(replace(stale, profiles=profiles), config)
+    recovered: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "recover_pending_codex_transactions",
+        lambda *_args, **_kwargs: recovered.append("recovery"),
+    )
+
+    with (
+        pytest.raises(ValueError, match="registry changed before provider maintenance"),
+        cli_module._provider_maintenance(stale, config, {"codex"}),
+    ):
+        pass
+
+    assert recovered == []
+
+
+def test_enrollment_rejects_stale_registry_before_auth_recovery(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    stale = load_registry(config)
+    profile = stale.require_profile("codex-1")
+    profiles = dict(stale.profiles)
+    profiles[profile.id] = replace(profile, reserve_percent=41)
+    save_registry(replace(stale, profiles=profiles), config)
+    recovered: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "recover_pending_codex_transactions",
+        lambda *_args, **_kwargs: recovered.append("recovery"),
+    )
+    with pytest.raises(ValueError, match="registry changed before provider enrollment"):
+        cli_module._run_profile_enrollment(stale, profile, config)
+
+    assert recovered == []
+
+
 def test_profile_add_obeys_provider_maintenance_lock(
     fleet: tuple[object, Path],
 ) -> None:
@@ -261,6 +367,31 @@ def test_profile_add_obeys_provider_maintenance_lock(
     assert "claude-4" not in load_registry(config).profiles
 
 
+def test_dry_run_selection_never_enters_mutating_state_lock(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "claude-1")
+    state_before = _state_snapshot(registry.settings.state_dir)
+
+    def refuse_state_lock(*_args, **_kwargs):
+        raise AssertionError("dry-run selection entered the mutating state lock")
+
+    monkeypatch.setattr(scheduler_module, "state_lock", refuse_state_lock)
+    selected = select_and_acquire(
+        registry,
+        task="read-only-observe",
+        pool="claude-crew",
+        profile_id="claude-1",
+        dry_run=True,
+        workspace=Path.cwd(),
+    )
+
+    assert selected["dry_run"] is True
+    assert selected["workspace"] == str(Path.cwd())
+    assert _state_snapshot(registry.settings.state_dir) == state_before
+
+
 def test_lease_creation_and_binding_require_process_start_tokens(
     fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -268,13 +399,113 @@ def test_lease_creation_and_binding_require_process_start_tokens(
     registry = load_registry(config)
     monkeypatch.setattr(leases, "process_start_token", lambda _pid: None)
     with pytest.raises(ValueError, match="verified process start token"):
-        new_lease("no-start-token", "codex-1", "codex-crew", pid=os.getpid())
+        new_lease(
+            "no-start-token",
+            "codex-1",
+            "codex-crew",
+            provider="codex",
+            workspace=Path.cwd(),
+            pid=os.getpid(),
+        )
     with pytest.raises(ValueError, match="verified process start token"):
         bind_lease(
             registry,
-            new_lease("reserved", "codex-1", "codex-crew", pid=None),
+            new_lease(
+                "reserved",
+                "codex-1",
+                "codex-crew",
+                provider="codex",
+                workspace=Path.cwd(),
+                pid=None,
+            ),
             os.getpid(),
         )
+
+
+def test_corrupt_lease_state_never_routes_prunes_or_releases(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "claude-1")
+    corrupt = lease_path(registry, "corrupt-owner")
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.parent.chmod(0o700)
+    corrupt.write_bytes(b'{"schema":2,"task":')
+    corrupt.chmod(0o600)
+    original = corrupt.read_bytes()
+
+    with pytest.raises(ValueError, match="corrupt worker lease"):
+        active_leases(registry, prune=True)
+    assert corrupt.read_bytes() == original
+    with pytest.raises(ValueError, match="corrupt worker lease"):
+        select_and_acquire(
+            registry,
+            task="must-not-route",
+            pool="claude-crew",
+            profile_id="claude-1",
+            workspace=Path.cwd(),
+        )
+    with pytest.raises(ValueError, match="corrupt worker lease"):
+        release_lease(registry, "corrupt-owner", force=True)
+    assert corrupt.read_bytes() == original
+
+    corrupt.unlink()
+    wrong = corrupt.parent / "wrong-filename.json"
+    atomic_write_json(
+        wrong,
+        new_lease(
+            "right-task",
+            "claude-1",
+            "claude-crew",
+            provider="claude",
+            workspace=Path.cwd(),
+            pid=None,
+        ),
+    )
+    wrong_bytes = wrong.read_bytes()
+    with pytest.raises(ValueError, match="filename does not match"):
+        active_leases(registry, prune=True)
+    assert wrong.read_bytes() == wrong_bytes
+
+    wrong.unlink()
+    malformed_time = new_lease(
+        "bad-time",
+        "claude-1",
+        "claude-crew",
+        provider="claude",
+        workspace=Path.cwd(),
+        pid=None,
+    )
+    malformed_time["created_at"] = "yesterday"
+    timed = lease_path(registry, "bad-time")
+    atomic_write_json(timed, malformed_time)
+    timed_bytes = timed.read_bytes()
+    with pytest.raises(ValueError, match="corrupt worker lease"):
+        active_leases(registry, prune=True)
+    assert timed.read_bytes() == timed_bytes
+
+
+def test_corrupt_cooldown_state_blocks_selection_without_rewrite(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "codex-1")
+    path = cooldown_path(registry, "codex-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    path.write_bytes(b'{"schema":1,"profile":"someone-else"}')
+    path.chmod(0o600)
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="corrupt cooldown state"):
+        select_and_acquire(
+            registry,
+            task="cooldown-corrupt",
+            pool="codex-crew",
+            profile_id="codex-1",
+            workspace=Path.cwd(),
+        )
+    assert path.read_bytes() == original
 
 
 def test_lock_creation_requires_process_start_token(
@@ -289,6 +520,223 @@ def test_lock_creation_requires_process_start_token(
             "codex",
             registry.settings.lock_stale_seconds,
         )
+
+
+def test_ensure_private_dir_rejects_symlink_non_directory_and_unsafe_mode(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="unsafe private directory"):
+        ensure_private_dir(link)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+    regular = tmp_path / "regular"
+    regular.write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsafe private directory"):
+        ensure_private_dir(regular)
+
+    public = tmp_path / "public"
+    public.mkdir(mode=0o755)
+    public.chmod(0o755)
+    with pytest.raises(ValueError, match="mode 0700"):
+        ensure_private_dir(public)
+    assert stat.S_IMODE(public.stat().st_mode) == 0o755
+
+
+def test_ensure_private_dir_rejects_wrong_owner_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "private"
+    target.mkdir(mode=0o700)
+    before = target.stat()
+    monkeypatch.setattr(os, "getuid", lambda: before.st_uid + 1)
+    with pytest.raises(ValueError, match="current-user owned"):
+        ensure_private_dir(target)
+    after = target.stat()
+    assert (after.st_uid, stat.S_IMODE(after.st_mode)) == (
+        before.st_uid,
+        stat.S_IMODE(before.st_mode),
+    )
+
+
+def test_directory_lock_post_mkdir_race_never_overlaps_owners(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "locks" / "post-mkdir.lock"
+    path.parent.mkdir(mode=0o700)
+    ready_a = context.Event()
+    go_a = context.Event()
+    release_a = context.Event()
+    ready_b = context.Event()
+    go_b = context.Event()
+    go_b.set()
+    release_b = context.Event()
+    outcomes = context.Queue()
+    first = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), "post-mkdir", ready_a, go_a, release_a, outcomes),
+    )
+    second = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), None, ready_b, go_b, release_b, outcomes),
+    )
+    first.start()
+    assert ready_a.wait(timeout=10)
+    second.start()
+    kind, second_pid = outcomes.get(timeout=10)[:2]
+    assert kind == "entered"
+    assert second_pid == second.pid
+
+    go_a.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
+    first_outcome = outcomes.get(timeout=10)
+    assert first_outcome[0] == "error"
+    assert first_outcome[1] == first.pid
+
+    release_b.set()
+    second.join(timeout=10)
+    assert not second.is_alive()
+    assert outcomes.get(timeout=10) == ("released", second.pid)
+    assert not path.exists()
+
+
+def test_directory_lock_rechecks_quarantined_owner_after_rename(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "locks" / "post-rename.lock"
+    path.parent.mkdir(mode=0o700)
+    ready_a = context.Event()
+    go_a = context.Event()
+    release_a = context.Event()
+    ready_b = context.Event()
+    go_b = context.Event()
+    release_b = context.Event()
+    outcomes = context.Queue()
+    first = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), "post-mkdir", ready_a, go_a, release_a, outcomes),
+    )
+    second = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), "post-reclaim-rename", ready_b, go_b, release_b, outcomes),
+    )
+    first.start()
+    assert ready_a.wait(timeout=10)
+    second.start()
+    assert ready_b.wait(timeout=10)
+
+    go_a.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
+    first_outcome = outcomes.get(timeout=10)
+    assert first_outcome[0] == "error"
+    assert first_outcome[1] == first.pid
+
+    go_b.set()
+    entered = outcomes.get(timeout=10)
+    assert entered == ("entered", second.pid)
+    release_b.set()
+    second.join(timeout=10)
+    assert not second.is_alive()
+    assert outcomes.get(timeout=10) == ("released", second.pid)
+    assert not path.exists()
+
+
+def test_directory_lock_failed_creator_removes_its_exact_live_quarantine(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "locks" / "three-contender.lock"
+    path.parent.mkdir(mode=0o700)
+    ready_a, go_a, release_a = context.Event(), context.Event(), context.Event()
+    ready_b, go_b, release_b = context.Event(), context.Event(), context.Event()
+    ready_c, go_c, release_c = context.Event(), context.Event(), context.Event()
+    outcomes = context.Queue()
+    first = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), "post-mkdir", ready_a, go_a, release_a, outcomes),
+    )
+    reclaimer = context.Process(
+        target=_directory_lock_process,
+        args=(
+            str(path),
+            "post-reclaim-rename",
+            ready_b,
+            go_b,
+            release_b,
+            outcomes,
+        ),
+    )
+    successor = context.Process(
+        target=_directory_lock_process,
+        args=(str(path), "pre-mkdir", ready_c, go_c, release_c, outcomes),
+    )
+
+    first.start()
+    assert ready_a.wait(timeout=10)
+    successor.start()
+    assert ready_c.wait(timeout=10)
+    reclaimer.start()
+    assert ready_b.wait(timeout=10)
+
+    go_c.set()
+    assert outcomes.get(timeout=10) == ("entered", successor.pid)
+    go_a.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
+    failed = outcomes.get(timeout=10)
+    assert failed[0] == "error"
+    assert failed[1] == first.pid
+    assert not list(path.parent.glob(f".{path.name}.stale.*"))
+
+    go_b.set()
+    release_c.set()
+    successor.join(timeout=10)
+    assert not successor.is_alive()
+    assert outcomes.get(timeout=10) == ("released", successor.pid)
+    assert outcomes.get(timeout=10) == ("entered", reclaimer.pid)
+    release_b.set()
+    reclaimer.join(timeout=10)
+    assert not reclaimer.is_alive()
+    assert outcomes.get(timeout=10) == ("released", reclaimer.pid)
+    assert not path.exists()
+    assert not list(path.parent.glob(f".{path.name}.*"))
+
+
+def test_indeterminate_process_probe_never_prunes_lease_or_reclaims_lock(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    lease = new_lease(
+        "indeterminate-owner",
+        "codex-1",
+        "codex-crew",
+        provider="codex",
+        workspace=Path.cwd(),
+        pid=os.getpid(),
+    )
+    leases.write_lease(registry, lease)
+    path = lease_path(registry, "indeterminate-owner")
+    before = path.read_bytes()
+    lock_path = tmp_path / "locks" / "indeterminate.lock"
+    owner = DirectoryLock(lock_path, stale_seconds=0)
+    contender = DirectoryLock(lock_path, stale_seconds=0, timeout=0)
+    owner.acquire()
+
+    def failed_ps(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 2, "", "transient ps failure")
+
+    monkeypatch.setattr(util.subprocess, "run", failed_ps)
+
+    assert active_leases(registry, prune=True) == [lease]
+    assert path.read_bytes() == before
+    with pytest.raises(TimeoutError):
+        contender.acquire()
+    assert lock_path.exists()
+    owner.release()
 
 
 @pytest.mark.parametrize("profile_id", ["claude-1", "codex-1"])
@@ -368,7 +816,301 @@ def test_claude_desktop_switch_is_seen_on_the_next_selection(
         )
 
 
-def test_missing_configured_desktop_anchor_fails_closed(
+def test_bundle_adoption_rejects_final_external_identity_race(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    workers = [
+        profile
+        for profile in registry.profiles.values()
+        if profile.provider == "claude" and profile.safety_policy == "worker"
+    ]
+    proofs = {
+        profile.id: (
+            read_quota(registry, profile.id),
+            inspect_credential_source_contract(registry, profile),
+        )
+        for profile in workers
+    }
+    worker_fingerprint = proofs[workers[0].id][0]["identity_fingerprint"]
+    bundle_path = identity_bundle_path(registry, "claude")
+    before = bundle_path.read_bytes()
+    real_refresh = identity.refresh_provider_identity_anchors
+
+    def switch_base_during_final_refresh(*args, **kwargs):
+        result = real_refresh(*args, **kwargs)
+        raced_base = {**result["base"], "identity_fingerprint": worker_fingerprint}
+        atomic_write_json(
+            registry.settings.state_dir / "identity-anchors" / "claude-base.json",
+            raced_base,
+        )
+        return {**result, "base": raced_base}
+
+    monkeypatch.setattr(
+        identity,
+        "refresh_provider_identity_anchors",
+        switch_base_during_final_refresh,
+    )
+
+    with pytest.raises(ValueError, match="conflicts with final base identity"):
+        adopt_provider_identity_bundle(registry, "claude", proofs)
+
+    assert bundle_path.read_bytes() == before
+
+
+def test_claude_default_anchor_environment_is_distinct_from_worker_home(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    worker = registry.require_profile("claude-1")
+    base = replace(worker, id="claude-base-anchor", home=current_user_home() / ".claude")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/ambient-claude")
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/ambient-storage")
+
+    base_environment = provider_environment(base, default_provider_home=True)
+    worker_environment = provider_environment(worker)
+
+    assert "CLAUDE_CONFIG_DIR" not in base_environment
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in base_environment
+    assert worker_environment["CLAUDE_CONFIG_DIR"] == str(worker.home)
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in worker_environment
+
+
+def test_hostile_home_cannot_change_default_claude_base_semantics_or_read_it(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    canonical_base = current_user_home() / ".claude"
+    hostile_home = tmp_path / "hostile-home"
+    hostile_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(hostile_home))
+    provider = registry.require_provider("claude")
+    providers = dict(registry.providers)
+    providers["claude"] = replace(provider, base_home=canonical_base)
+    registry = replace(registry, providers=providers)
+    observed: dict[str, object] = {}
+
+    def no_live_credential_read(profile):
+        observed["credential_home"] = profile.home
+        return "absent", None
+
+    def fake_probe(_registry, profile, **kwargs):
+        observed["quota_home"] = profile.home
+        observed["default_provider_home"] = kwargs["default_provider_home"]
+        return {
+            "status": "auth_required",
+            "reason": "credentials_missing",
+            "credential_state": "absent",
+            "identity_fingerprint": None,
+        }
+
+    monkeypatch.setattr(identity, "credential_file_state", no_live_credential_read)
+    monkeypatch.setattr(identity, "probe_quota", fake_probe)
+
+    result = refresh_provider_identity_anchors(registry, "claude")["base"]
+
+    assert result["status"] == "absent"
+    assert observed == {
+        "credential_home": canonical_base,
+        "quota_home": canonical_base,
+        "default_provider_home": True,
+    }
+    assert hostile_home not in canonical_base.parents
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "codex"])
+def test_base_identity_probe_writes_cache_only_under_fleet_state(
+    fleet: tuple[object, Path], provider_name: str
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    base_home = registry.require_provider(provider_name).base_home
+    assert base_home is not None
+    before = _state_snapshot(base_home)
+
+    refresh_provider_identity_anchors(registry, provider_name)
+
+    assert _state_snapshot(base_home) == before
+    assert (registry.settings.state_dir / "identity-anchor-cache" / provider_name).is_dir()
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "codex"])
+def test_base_credential_probe_accepts_current_user_0755_provider_home(
+    fleet: tuple[object, Path], provider_name: str
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    base_home = registry.require_provider(provider_name).base_home
+    assert base_home is not None
+    base_home.chmod(0o755)
+
+    result = refresh_provider_identity_anchors(registry, provider_name)["base"]
+
+    assert result["status"] == "present"
+    assert result["identity_fingerprint"] is not None
+    assert stat.S_IMODE(base_home.stat().st_mode) == 0o755
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "codex"])
+@pytest.mark.parametrize("mode", [0o775, 0o777])
+def test_base_credential_probe_rejects_writable_provider_home(
+    fleet: tuple[object, Path], provider_name: str, mode: int
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    base_home = registry.require_provider(provider_name).base_home
+    assert base_home is not None
+    base_home.chmod(mode)
+
+    result = refresh_provider_identity_anchors(registry, provider_name)["base"]
+
+    assert result["status"] == "indeterminate"
+    assert result["identity_fingerprint"] is None
+    assert stat.S_IMODE(base_home.stat().st_mode) == mode
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "codex"])
+def test_base_credential_probe_rejects_symlinked_provider_home(
+    fleet: tuple[object, Path], tmp_path: Path, provider_name: str
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    provider = registry.require_provider(provider_name)
+    assert provider.base_home is not None
+    linked = tmp_path / f"linked-{provider_name}-base"
+    linked.symlink_to(provider.base_home, target_is_directory=True)
+    providers = dict(registry.providers)
+    providers[provider_name] = replace(provider, base_home=linked)
+    registry = replace(registry, providers=providers)
+
+    result = refresh_provider_identity_anchors(registry, provider_name)["base"]
+
+    assert result["status"] == "indeterminate"
+    assert result["identity_fingerprint"] is None
+
+
+def test_codex_base_switch_is_seen_on_next_selection(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "codex-1")
+    fixtures = tmp_path / "quota-fixtures"
+    fixtures.mkdir()
+
+    def write_base(account_id: str) -> None:
+        (fixtures / "codex-base-anchor.json").write_text(
+            json.dumps(
+                {
+                    "providers": [
+                        {
+                            "provider": "codex",
+                            "account": {"accountId": account_id},
+                            "state": {
+                                "status": "fresh",
+                                "refreshedAt": datetime.now(UTC).isoformat(),
+                            },
+                            "windows": [
+                                {
+                                    "id": "five_hour",
+                                    "kind": "session",
+                                    "percentRemaining": 80,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_base("codex-base-anchor-account")
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
+    selected = select_and_acquire(
+        registry,
+        task="before-codex-base-switch",
+        pool="codex-crew",
+        profile_id="codex-1",
+        workspace=Path.cwd(),
+    )
+    assert selected["profile"] == "codex-1"
+    release_lease(registry, "before-codex-base-switch")
+    write_base("codex-1-account")
+
+    with pytest.raises(ValueError, match="duplicate_provider_identity"):
+        select_and_acquire(
+            registry,
+            task="after-codex-base-switch",
+            pool="codex-crew",
+            profile_id="codex-1",
+            workspace=Path.cwd(),
+        )
+
+
+def test_claude_base_switch_is_seen_on_next_selection(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "claude-1")
+    fixtures = tmp_path / "claude-base-quota-fixtures"
+    fixtures.mkdir()
+
+    def write_base(account_id: str) -> None:
+        (fixtures / "claude-base-anchor.json").write_text(
+            json.dumps(
+                {
+                    "providers": [
+                        {
+                            "provider": "claude",
+                            "account": {"accountId": account_id},
+                            "state": {
+                                "status": "fresh",
+                                "refreshedAt": datetime.now(UTC).isoformat(),
+                            },
+                            "windows": [
+                                {
+                                    "id": "five_hour",
+                                    "kind": "session",
+                                    "percentRemaining": 80,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_base("claude-base-anchor-account")
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
+    selected = select_and_acquire(
+        registry,
+        task="before-claude-base-switch",
+        pool="claude-crew",
+        profile_id="claude-1",
+        workspace=Path.cwd(),
+    )
+    assert selected["profile"] == "claude-1"
+    release_lease(registry, "before-claude-base-switch")
+    write_base("claude-1-account")
+
+    with pytest.raises(ValueError, match="duplicate_provider_identity"):
+        select_and_acquire(
+            registry,
+            task="after-claude-base-switch",
+            pool="claude-crew",
+            profile_id="claude-1",
+            workspace=Path.cwd(),
+        )
+
+
+def test_missing_configured_desktop_identity_is_proven_absent(
     fleet: tuple[object, Path],
 ) -> None:
     _, config = fleet
@@ -376,12 +1118,202 @@ def test_missing_configured_desktop_anchor_fails_closed(
     desktop_file = registry.require_provider("claude").desktop_identity_file
     assert desktop_file is not None
     desktop_file.unlink()
+    selected = select_and_acquire(
+        registry,
+        task="missing-desktop-anchor",
+        pool="claude-crew",
+        profile_id="claude-1",
+        dry_run=True,
+        workspace=Path.cwd(),
+    )
+    assert selected["profile"] == "claude-1"
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected"),
+    [
+        (
+            [
+                {
+                    "source": "oauth-file",
+                    "status": "skipped",
+                    "error": "credentials_missing",
+                },
+                {
+                    "source": "keychain",
+                    "status": "skipped",
+                    "error": "credentials_missing",
+                },
+            ],
+            "absent",
+        ),
+        (
+            [
+                {
+                    "source": "oauth-file",
+                    "status": "skipped",
+                    "error": "credentials_missing",
+                },
+                {
+                    "source": "keychain",
+                    "status": "skipped",
+                    "error": "keychain_prompt_required",
+                    "credentialPresent": True,
+                },
+            ],
+            "indeterminate",
+        ),
+        (
+            [
+                {
+                    "source": "oauth-file",
+                    "status": "skipped",
+                    "error": "credentials_missing",
+                },
+                {
+                    "source": "keychain",
+                    "status": "skipped",
+                    "error": "keychain_presence_check_failed",
+                },
+            ],
+            "indeterminate",
+        ),
+        ([{"source": "keychain"}], "indeterminate"),
+    ],
+)
+def test_claude_base_attempts_distinguish_absent_from_indeterminate(
+    fleet: tuple[object, Path],
+    tmp_path: Path,
+    attempts: list[dict[str, object]],
+    expected: str,
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "claude-1")
+    base_home = registry.require_provider("claude").base_home
+    assert base_home is not None
+    (base_home / ".credentials.json").unlink()
+    fixtures = tmp_path / "base-attempt-fixtures"
+    fixtures.mkdir()
+    (fixtures / "claude-base-anchor.json").write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "provider": "claude",
+                        "state": {
+                            "status": "auth_required",
+                            "reason": "keychain_access_required",
+                        },
+                        "attempts": attempts,
+                        "windows": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
+
+    result = refresh_provider_identity_anchors(registry, "claude")["base"]
+    assert result["status"] == expected
+    if expected == "absent":
+        selected = select_and_acquire(
+            registry,
+            task="proven-default-claude-absence",
+            pool="claude-crew",
+            profile_id="claude-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+        assert selected["profile"] == "claude-1"
+    else:
+        with pytest.raises(ValueError, match="duplicate_provider_identity"):
+            select_and_acquire(
+                registry,
+                task="indeterminate-default-claude-identity",
+                pool="claude-crew",
+                profile_id="claude-1",
+                dry_run=True,
+                workspace=Path.cwd(),
+            )
+
+
+def test_base_refresh_uses_realistic_timeout_and_slow_success(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    observed: list[int] = []
+
+    def slow_success(_registry, profile, *, timeout, **_kwargs):
+        observed.append(timeout)
+        return {
+            "status": "fresh",
+            "verified_at": datetime.now(UTC).isoformat(),
+            "headroom_percent": 80,
+            "windows": [{"id": "five_hour", "remaining_percent": 80}],
+            "identity_fingerprint": identity_fingerprint(profile.provider, "slow-base-account"),
+        }
+
+    monkeypatch.setattr(identity, "probe_quota", slow_success)
+    identity.refresh_provider_identity_anchors_if_due(registry, "claude")
+    assert observed == [30]
+
+
+def test_base_refresh_timeout_is_indeterminate_and_fail_closed(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "codex-1")
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("simulated base probe timeout")
+
+    monkeypatch.setattr(identity, "probe_quota", timeout)
+    identity.refresh_provider_identity_anchors_if_due(registry, "codex")
     with pytest.raises(ValueError, match="duplicate_provider_identity"):
         select_and_acquire(
             registry,
-            task="missing-desktop-anchor",
-            pool="claude-crew",
-            profile_id="claude-1",
+            task="base-timeout-fails-closed",
+            pool="codex-crew",
+            profile_id="codex-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "codex"])
+@pytest.mark.parametrize("mutation", ["mode", "hardlink", "symlink"])
+def test_worker_credential_storage_tampering_blocks_selection(
+    fleet: tuple[object, Path],
+    tmp_path: Path,
+    provider_name: str,
+    mutation: str,
+) -> None:
+    _, config = fleet
+    profile_id = f"{provider_name}-1"
+    registry = _enable_and_provision(load_registry(config), config, profile_id)
+    profile = registry.require_profile(profile_id)
+    credential = profile.home / (".credentials.json" if provider_name == "claude" else "auth.json")
+    if mutation == "mode":
+        credential.chmod(0o644)
+    elif mutation == "hardlink":
+        os.link(credential, tmp_path / f"{provider_name}-credential-alias")
+    else:
+        target = tmp_path / f"{provider_name}-credential-target"
+        target.write_bytes(credential.read_bytes())
+        target.chmod(0o600)
+        credential.unlink()
+        credential.symlink_to(target)
+
+    with pytest.raises(ValueError, match="profile is not ready"):
+        select_and_acquire(
+            registry,
+            task=f"{provider_name}-{mutation}-credential",
+            pool=f"{provider_name}-crew",
+            profile_id=profile_id,
             dry_run=True,
             workspace=Path.cwd(),
         )
@@ -421,11 +1353,65 @@ def test_claude_worker_environment_blocks_login_logout_and_scrubs_ambient(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "poison")
     monkeypatch.setenv("CODEX_HOME", "/tmp/poison")
     monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", "/tmp/poison")
-    environment = provider_environment(profile, "managed-task")
+    monkeypatch.setenv("AGENT_FLEET_ROGUE", "poison")
+    monkeypatch.setenv("QUOTA_AXI_FAKE", "poison")
+    environment = provider_environment(
+        profile,
+        "managed-task",
+        Path.cwd(),
+        "claude-crew",
+        operation="worker",
+    )
     assert environment["CLAUDE_CONFIG_DIR"] == str(profile.home)
+    assert environment["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] == "false"
     assert environment["DISABLE_LOGIN_COMMAND"] == "1"
     assert environment["DISABLE_LOGOUT_COMMAND"] == "1"
+    assert environment["AGENT_FLEET_WORKSPACE"] == str(Path.cwd())
+    assert environment["AGENT_FLEET_POOL"] == "claude-crew"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert "CODEX_HOME" not in environment
     assert "AGENT_FLEET_QUOTA_FIXTURE_DIR" not in environment
+    assert "AGENT_FLEET_ROGUE" not in environment
+    assert "QUOTA_AXI_FAKE" not in environment
+
+
+def test_control_auth_probe_uses_closed_environment(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    profile = load_registry(config).require_profile("codex-1")
+    captured = tmp_path / "auth-environment.json"
+    binary = tmp_path / "codex-auth-probe"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+Path(os.environ["CAPTURE_AUTH_ENV"]).write_text(json.dumps(dict(os.environ)))
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("CAPTURE_AUTH_ENV", str(captured))
+    monkeypatch.setenv("AGENT_FLEET_ROGUE", "poison")
+    monkeypatch.setenv("QUOTA_AXI_FAKE", "poison")
+    monkeypatch.setenv("BROWSER", "poison")
+    monkeypatch.setenv("GIT_ASKPASS", "poison")
+    monkeypatch.setenv("HTTP_PROXY", "http://poison.invalid")
+
+    result = auth_probe(profile, binary=binary)
+
+    environment = json.loads(captured.read_text(encoding="utf-8"))
+    assert result["status"] == "authenticated"
+    assert environment["PATH"] == CONTROL_PATH
+    assert {
+        name for name in environment if name.startswith("AGENT_FLEET_")
+    } == {"AGENT_FLEET_PROFILE", "AGENT_FLEET_PROVIDER"}
+    assert not {
+        "AGENT_FLEET_ROGUE",
+        "QUOTA_AXI_FAKE",
+        "BROWSER",
+        "GIT_ASKPASS",
+        "HTTP_PROXY",
+    } & set(environment)

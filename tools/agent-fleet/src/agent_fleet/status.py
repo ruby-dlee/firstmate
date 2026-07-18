@@ -8,17 +8,35 @@ from .identity import identity_conflict, refresh_provider_identity_anchors_if_du
 from .leases import active_leases
 from .models import SUPPORTED_PROVIDERS, Registry
 from .providers import auth_status
-from .provision import profile_is_provisioned
+from .provision import profile_is_provisioned, verified_provider_binary
 from .quota import quota_routeability, read_quota, refresh_due_quotas
 
 
 def profile_status(registry: Registry, profile_id: str) -> dict[str, Any]:
     profile = registry.require_profile(profile_id)
+    if profile.safety_policy != "worker":
+        return {
+            **profile.public_dict(),
+            "provisioned": False,
+            "auth_status": "external-reserve",
+            "active_leases": 0,
+            "cooldown": None,
+            "quota": {},
+            "routeability": {
+                "eligible": False,
+                "mode": "blocked",
+                "reason": "external_reserve_never_routed",
+            },
+        }
     if profile.safety_policy == "worker":
         refresh_provider_identity_anchors_if_due(registry, profile.provider)
     leases = active_leases(registry)
     provisioned = profile_is_provisioned(profile)
-    authentication = auth_status(registry, profile) if provisioned else "not-provisioned"
+    authentication = (
+        auth_status(profile, binary=verified_provider_binary(registry, profile))
+        if provisioned
+        else "not-provisioned"
+    )
     quota = read_quota(registry, profile.id)
     routeability = quota_routeability(
         registry,
@@ -67,8 +85,34 @@ def pool_status(
         for profile in registry.profiles.values():
             if profile.provider != provider_name or pool not in profile.pools:
                 continue
+            if profile.safety_policy != "worker":
+                profiles.append(
+                    {
+                        "profile": profile.id,
+                        "enabled": False,
+                        "provisioned": False,
+                        "auth_status": "external-reserve",
+                        "active_leases": 0,
+                        "max_concurrent": profile.max_concurrent,
+                        "quota_fresh": False,
+                        "headroom_percent": None,
+                        "cooldown": None,
+                        "routeability": {
+                            "eligible": False,
+                            "mode": "blocked",
+                            "reason": "external_reserve_never_routed",
+                        },
+                        "eligible": False,
+                        "adjusted_headroom": None,
+                    }
+                )
+                continue
             provisioned = profile_is_provisioned(profile)
-            authentication = auth_status(registry, profile) if provisioned else "not-provisioned"
+            authentication = (
+                auth_status(profile, binary=verified_provider_binary(registry, profile))
+                if provisioned
+                else "not-provisioned"
+            )
             quota = read_quota(registry, profile.id)
             fresh = quota.get("fresh") is True
             headroom = quota.get("headroom_percent") if fresh else None

@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +14,12 @@ from pathlib import Path
 import pytest
 
 import agent_fleet.scheduler as scheduler_module
-from agent_fleet.config import load_registry, save_registry
+from agent_fleet.config import (
+    load_registry,
+    quota_binary_digest,
+    quota_release_tree_digest,
+    save_registry,
+)
 from agent_fleet.cooldowns import set_cooldown
 from agent_fleet.leases import active_leases, release_lease
 from agent_fleet.provision import provision_profile
@@ -71,8 +77,53 @@ def _quota_fixture(path: Path, provider: str, remaining: int) -> None:
 
 
 def _use_quota_fixtures(registry, fixtures: Path) -> None:
-    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+    (registry.settings.state_dir / "test-quota-fixture-dir").write_text(
         str(fixtures), encoding="utf-8"
+    )
+
+
+def _sealed_quota_runtime(
+    root: Path,
+    quota_source: str,
+    *,
+    node_source: str | None = None,
+) -> tuple[Path, Path, str]:
+    quota_entrypoint = root / "node_modules" / "quota-axi" / "dist" / "bin" / "quota-axi.js"
+    quota_entrypoint.parent.mkdir(parents=True)
+    quota_entrypoint.write_text(quota_source, encoding="utf-8")
+    quota_entrypoint.chmod(0o444)
+    dependency = root / "node_modules" / "quota-axi" / "dist" / "src" / "quota.js"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("export const sealedTestDependency = true;\n", encoding="utf-8")
+    dependency.chmod(0o644)
+    node_binary = root / "runtime" / "node"
+    node_binary.parent.mkdir(parents=True)
+    node_binary.write_text(
+        node_source or f'#!/bin/sh\nexec {str(sys.executable)!r} "$@"\n',
+        encoding="utf-8",
+    )
+    node_binary.chmod(0o755)
+    quota_binary = root / "bin" / "quota-axi"
+    quota_binary.parent.mkdir()
+    quota_binary.write_text(
+        f'#!/bin/sh\nexec {str(sys.executable)!r} {str(quota_entrypoint)!r} "$@"\n',
+        encoding="utf-8",
+    )
+    quota_binary.chmod(0o755)
+    return node_binary, quota_binary, quota_release_tree_digest(quota_binary, node_binary)
+
+
+def _with_quota_runtime(registry, node: Path, quota: Path, tree_digest: str):
+    return replace(
+        registry,
+        settings=replace(
+            registry.settings,
+            quota_binary=quota,
+            quota_binary_sha256=quota_binary_digest(quota),
+            quota_node_binary=node,
+            quota_node_sha256=quota_binary_digest(node),
+            quota_release_tree_sha256=tree_digest,
+        ),
     )
 
 
@@ -156,7 +207,10 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
             "pool": "codex-crew",
             "profile": "codex-1",
             "provider": "codex",
+            "workspace": str(Path.cwd()),
+            "turn_end": str(tmp_path / "resumed-task.turn-ended"),
             "session_id": "sticky-session",
+            "updated_at": datetime.now(UTC).isoformat(),
         },
     )
     project_root = Path(__file__).parents[1]
@@ -183,8 +237,9 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
         text=True,
         capture_output=True,
         timeout=20,
-        check=True,
+        check=False,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
     selected = json.loads(result.stdout)
     assert selected["profile"] == "codex-1"
     assert selected["decision_reason"] == "sticky-resume"
@@ -294,8 +349,8 @@ def test_nonzero_quota_exit_preserves_structured_provider_status(
 ) -> None:
     _, config = fleet
     registry = load_registry(config)
-    binary = tmp_path / "quota-axi"
-    binary.write_text(
+    node, binary, tree_digest = _sealed_quota_runtime(
+        tmp_path / "custom-quota-release",
         """#!/usr/bin/env python3
 import json
 import sys
@@ -309,13 +364,8 @@ print(json.dumps({
 }))
 sys.exit(1)
 """,
-        encoding="utf-8",
     )
-    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
-    registry = replace(
-        registry,
-        settings=replace(registry.settings, quota_binary=binary),
-    )
+    registry = _with_quota_runtime(registry, node, binary, tree_digest)
 
     quota = refresh_quota(registry, registry.require_profile("claude-1"))
     assert quota["status"] == "auth_required"
@@ -462,8 +512,8 @@ def test_interactive_claude_verification_explicitly_allows_keychain_prompt(
     _, config = fleet
     registry = load_registry(config)
     argv_log = tmp_path / "argv.json"
-    binary = tmp_path / "quota-axi"
-    binary.write_text(
+    node, binary, tree_digest = _sealed_quota_runtime(
+        tmp_path / "custom-quota-release",
         """#!/usr/bin/env python3
 import json
 import os
@@ -487,13 +537,8 @@ print(json.dumps({
     }]
 }))
 """,
-        encoding="utf-8",
     )
-    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
-    registry = replace(
-        registry,
-        settings=replace(registry.settings, quota_binary=binary),
-    )
+    registry = _with_quota_runtime(registry, node, binary, tree_digest)
     monkeypatch.setenv("ARGV_LOG", str(argv_log))
 
     refresh_quota(
@@ -524,6 +569,82 @@ def test_production_quota_probe_ignores_legacy_fixture_environment(
     assert quota["identity_fingerprint"] is not None
 
 
+def test_quota_probe_scrubs_ambient_node_and_npm_injection(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    sentinel = tmp_path / "node-options-executed"
+    node_source = f"""#!{sys.executable}
+import os
+from pathlib import Path
+import sys
+
+if os.environ.get("PATH") != "/usr/bin:/bin:/usr/sbin:/sbin" or any(
+    name.startswith("NODE_")
+    or name.startswith("DYLD_")
+    or name.startswith("LD_")
+    or name.startswith("PYTHON")
+    or name.lower().startswith("npm_config_")
+    or (name.startswith("AGENT_FLEET_") and name not in {{
+        "AGENT_FLEET_PROFILE", "AGENT_FLEET_PROVIDER"
+    }})
+    or name.startswith("QUOTA_AXI_") and name != "QUOTA_AXI_CODEX_BINARY"
+    or name in {{
+        "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PERL5OPT", "PERLLIB",
+        "RUBYOPT", "RUBYLIB", "ELECTRON_RUN_AS_NODE", "INIT_CWD", "BROWSER",
+        "GIT_ASKPASS", "HTTP_PROXY",
+    }}
+    for name in os.environ
+):
+    Path({str(sentinel)!r}).write_text("ambient runtime injection survived", encoding="utf-8")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+    release_root = registry.settings.quota_binary.parent.parent
+    original_quota = (
+        release_root / "node_modules" / "quota-axi" / "dist" / "bin" / "quota-axi.js"
+    ).read_text(encoding="utf-8")
+    node, quota, tree_digest = _sealed_quota_runtime(
+        tmp_path / "custom-quota-release",
+        original_quota,
+        node_source=node_source,
+    )
+    registry = _with_quota_runtime(registry, node, quota, tree_digest)
+    preload = tmp_path / "evil.js"
+    preload.write_text(
+        f"require('fs').writeFileSync({str(sentinel)!r}, 'executed');\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NODE_OPTIONS", f"--require={preload}")
+    monkeypatch.setenv("NODE_PATH", str(tmp_path / "modules"))
+    monkeypatch.setenv("NPM_CONFIG_USERCONFIG", str(tmp_path / "npmrc"))
+    monkeypatch.setenv("npm_config_cache", str(tmp_path / "npm-cache"))
+    monkeypatch.setenv("INIT_CWD", str(tmp_path))
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(tmp_path / "evil.dylib"))
+    monkeypatch.setenv("BASH_ENV", str(tmp_path / "bash-env"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "python"))
+    monkeypatch.setenv("AGENT_FLEET_ROGUE", "poison")
+    monkeypatch.setenv("AGENT_FLEET_STATE_DIR", str(tmp_path / "poison-state"))
+    monkeypatch.setenv("QUOTA_AXI_FAKE", "poison")
+    monkeypatch.setenv("BROWSER", "poison")
+    monkeypatch.setenv("GIT_ASKPASS", "poison")
+    monkeypatch.setenv("HTTP_PROXY", "http://poison.invalid")
+    hostile_bin = tmp_path / "hostile-bin"
+    hostile_bin.mkdir()
+    fake_security = hostile_bin / "security"
+    fake_security.write_text(
+        f"#!/bin/sh\nprintf ran > {str(sentinel)!r}\n",
+        encoding="utf-8",
+    )
+    fake_security.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{hostile_bin}:{os.environ.get('PATH', '')}")
+
+    quota = refresh_quota(registry, registry.require_profile("codex-1"))
+
+    assert quota["status"] == "fresh"
+    assert not sentinel.exists()
+
+
 @pytest.mark.parametrize("mutation", ["disable", "remove", "revoke-project"])
 def test_registry_change_during_selection_cannot_commit_a_stale_lease(
     fleet: tuple[object, Path],
@@ -536,10 +657,10 @@ def test_registry_change_during_selection_cannot_commit_a_stale_lease(
     proceed = threading.Event()
     original_auth_status = scheduler_module.auth_status
 
-    def blocked_auth_status(current_registry, profile):
+    def blocked_auth_status(profile, *, binary):
         entered.set()
         assert proceed.wait(timeout=10)
-        return original_auth_status(current_registry, profile)
+        return original_auth_status(profile, binary=binary)
 
     monkeypatch.setattr(scheduler_module, "auth_status", blocked_auth_status)
     outcome: dict[str, object] = {}
@@ -579,6 +700,104 @@ def test_registry_change_during_selection_cannot_commit_a_stale_lease(
 
     assert not worker.is_alive()
     assert outcome == {"error": "registry changed during selection; retry the lease request"}
+    assert active_leases(registry) == []
+
+
+def test_registry_change_before_provider_lock_aborts_before_refresh(
+    fleet: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["codex-1"])
+    entered = threading.Event()
+    proceed = threading.Event()
+    events: list[str] = []
+    original_load_registry = scheduler_module.load_registry
+
+    @contextmanager
+    def delayed_provider_lock(*_args, **_kwargs):
+        entered.set()
+        assert proceed.wait(timeout=10)
+        yield
+
+    def recorded_load_registry(path: Path):
+        events.append("load")
+        return original_load_registry(path)
+
+    def unexpected(name: str, result=None):
+        def record(*_args, **_kwargs):
+            events.append(name)
+            return result
+
+        return record
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "provider_selection_refresh_lock",
+        delayed_provider_lock,
+    )
+    monkeypatch.setattr(scheduler_module, "load_registry", recorded_load_registry)
+    monkeypatch.setattr(
+        scheduler_module,
+        "resolve_trusted_project",
+        unexpected("trusted-project"),
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "profile_selection_ready",
+        unexpected("readiness", True),
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "recover_pending_codex_transactions",
+        unexpected("recovery"),
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "refresh_provider_identity_anchors_if_due",
+        unexpected("identity"),
+    )
+    monkeypatch.setattr(scheduler_module, "probe_quota", unexpected("quota"))
+    monkeypatch.setattr(scheduler_module, "auth_status", unexpected("auth", "authenticated"))
+    before_state = {
+        path.relative_to(registry.settings.state_dir): path.read_bytes()
+        for path in registry.settings.state_dir.rglob("*")
+        if path.is_file()
+    }
+    outcome: dict[str, object] = {}
+
+    def select() -> None:
+        try:
+            outcome["result"] = select_and_acquire(
+                registry,
+                task="pre-lock-registry-race",
+                pool="codex-crew",
+                profile_id="codex-1",
+                workspace=Path.cwd(),
+                config_path=config,
+            )
+        except ValueError as exc:
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=select)
+    worker.start()
+    assert entered.wait(timeout=10)
+    changed = load_registry(config)
+    profiles = dict(changed.profiles)
+    profiles["codex-1"] = replace(profiles["codex-1"], enabled=False)
+    save_registry(replace(changed, profiles=profiles), config)
+    proceed.set()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert outcome == {"error": "registry changed before provider refresh; retry the lease request"}
+    assert events == ["load"]
+    after_state = {
+        path.relative_to(registry.settings.state_dir): path.read_bytes()
+        for path in registry.settings.state_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after_state == before_state
     assert active_leases(registry) == []
 
 

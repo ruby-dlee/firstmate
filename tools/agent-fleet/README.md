@@ -55,8 +55,9 @@ task-to-provider-session mappings and resumes through the original profile.
 agent-fleet init --claude 1 --codex 1
 agent-fleet project register --provider claude /absolute/path/to/project
 agent-fleet project register --provider codex /absolute/path/to/project
-agent-fleet profile enroll claude-1
-agent-fleet profile enroll codex-1
+agent-fleet profile provision --all
+agent-fleet profile identity adopt claude-1 --allow-keychain-prompt
+agent-fleet profile identity adopt codex-1
 ```
 
 Before `init`, set `AGENT_FLEET_CLAUDE_BIN`, `AGENT_FLEET_CODEX_BIN`, or `AGENT_FLEET_QUOTA_BIN` when the executable defaults in "State" do not match the local installation.
@@ -66,12 +67,12 @@ Register every Git project that may host a managed worker before enrollment and 
 Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
 Broad, symlinked, unrelated, and unregistered working directories fail closed before a provider process or lease starts.
 
-`profile enroll` is the login transaction: the profile must already be disabled
-and every same-provider Fleet lease must be drained.
-It provisions the isolated home and hooks, runs provider login, and attempts live remote verification and duplicate-identity checks.
-Claude enrollment reports a separate verification step when Keychain access has not yet been granted.
-The profile stays disabled after both success and failure.
-Enable it only in a separate command after reviewing verification:
+The sealed cutover release never starts provider login or a browser. Credentials
+must already exist in each isolated worker home. `profile identity adopt` is a
+browser-free, provider-batch operation: every same-provider worker must be
+disabled, drained, provisioned, freshly source-attested, remotely verified, and
+identity-distinct before one atomic provider bundle is written. Enable remains
+a separate phase:
 
 ```sh
 agent-fleet profile verify claude-1 --allow-keychain-prompt
@@ -80,26 +81,21 @@ agent-fleet profile enable claude-1
 agent-fleet profile enable codex-1
 ```
 
-Codex enrollment uses device authorization by default and a fresh staging home,
-so a cancelled or failed attempt cannot revoke the target profile's installed
-credential. Complete the device page in a fresh private/Guest browser context,
-close that entire context after success, and never select **Log out**. Login is
-not idempotent at the provider: raw Codex login/logout can revoke a refresh
-session. Agent Fleet therefore refuses enrollment while any same-provider Fleet
-lease is active, verifies the staged identity, atomically promotes it, and keeps
-a durable recovery journal until commit. Do not reauthenticate a Codex Desktop
-account while it has live tasks.
+`profile enroll` and its `profile login` alias have a deliberately narrow
+three-state contract:
 
-For ChatGPT Business or Enterprise accounts that support Codex access tokens,
-the browser-independent form is:
+- An already pinned credential with the exact same live identity and source is
+  a verified no-op; no provider login is invoked.
+- A fresh existing credential that is not yet durably pinned directs the
+  operator to the provider-batch `profile identity adopt` command.
+- Missing, remotely unverifiable, or identity-replacing credentials are refused
+  before any provider/browser login. They require future transactional
+  maintenance tooling.
 
-```sh
-printenv CODEX_ACCESS_TOKEN | agent-fleet profile enroll codex-1 --access-token
-```
-
-The token is consumed directly by Codex from stdin; Agent Fleet never reads or
-logs it. Profiles are disabled by default, and login remains the only interactive
-step for browser/device authorization.
+Do not run raw provider login/logout, relogin the Desktop apps, or treat login as
+idempotent. Those actions can rotate or revoke sessions shared by other
+processes. The versioned follow-up for safe generational enrollment is tracked
+in [FOLLOWUPS.md](FOLLOWUPS.md).
 
 Add or remove profiles at any time; the registry has no fixed account count:
 
@@ -135,10 +131,11 @@ agent-fleet --format json lease choose \
 agent-fleet exec \
   --task fm:crew:example --pool codex-crew --provider codex \
   --workspace /absolute/path/to/task-worktree -- \
-  --full-auto
+  --dangerously-bypass-approvals-and-sandbox "$(cat brief.md)"
 
 agent-fleet resume --task fm:crew:example \
-  --workspace /absolute/path/to/task-worktree -- --full-auto
+  --workspace /absolute/path/to/task-worktree -- \
+  --dangerously-bypass-approvals-and-sandbox
 agent-fleet --format json session status --task fm:crew:example
 agent-fleet --format json lease recover --task fm:crew:example \
   --workspace /absolute/path/to/task-worktree
@@ -157,10 +154,22 @@ lease and lock requires a verified process-start token; missing tokens fail
 closed. Selection, execution, and recovery require the intended task worktree
 explicitly and never infer the orchestrator's working directory. A live task
 can never be rebound to a different process.
-Raw provider auth and resume subcommands are refused by `exec` so credential maintenance and sticky session recovery cannot bypass their dedicated paths.
+Provider arguments use a strict operation-aware positive grammar matching FirstMate's Claude and Codex launch templates.
+`exec` requires the provider autonomy flag, accepts only FirstMate's optional model, effort, and Codex turn-end notification fields, and requires exactly one prompt.
+Agent Fleet reconstructs the provider argv from the parsed fields and inserts a provider-level `--` before that prompt, so prompt text that resembles a command remains prompt text.
+`resume` accepts the same safe option family but no caller prompt, session id, alternate command, attached flag form, or arbitrary provider config.
 
-Claude provisioning atomically preserves opaque profile state while setting completed onboarding and project trust for every canonical registered project; a linked worktree receives its matching active-root trust only immediately before execution.
-Codex launches require an exact current-version profile hook set derived from the declared hook source plus Agent Fleet SessionStart, reject project hooks, disable `plugins` and `plugin_sharing`, and apply trust only to the validated active root.
+Claude provisioning writes a closed `settings.json` and a closed `.claude.json` containing only onboarding plus registered-project trust state; it strips opaque oauth, refresh, MCP, plugin, and unrelated project keys rather than preserving unknown state.
+Credential identity remains solely in the source-attested `.credentials.json` or exact path-scoped Keychain service, never in `.claude.json`.
+Static fixtures prove this closed rewrite and idempotence. The first real Claude canary is still a mandatory rollback boundary: an auth/onboarding prompt or any mutation of the closed state aborts activation, disables routing, and must not be "fixed" by widening the schema ad hoc.
+Readiness derives the command and source hash independently, so stale, duplicate, spoofed, co-tampered, unsafe, or source-drifted hook files fail closed.
+Provisioning also sets completed onboarding and project trust for every canonical registered project; a linked worktree receives its matching active-root trust only immediately before execution.
+Codex launches require an exact current-version profile hook set derived from the declared hook source plus Agent Fleet SessionStart, disable `plugins` and `plugin_sharing`, and apply trust only to the validated active root.
+Every provisioned profile requires a directly configured non-symlink provider executable and records its opened regular-file identity, size, mode, modification time, and SHA-256 digest.
+Selection, doctor, and the final managed/login/resume argv build recompute that authoritative opened-object identity and refuse path replacement or in-place binary drift until locked reprovisioning updates the marker.
+Provider-reported version text is diagnostic only and is deliberately not an integrity authority.
+The only pre-provision provider execution is the declared base-home identity anchor probe, which reopens and verifies the exact configured non-symlink regular executable immediately before Quota AXI or auth uses it.
+Managed launches refuse active-root provider control files, including Claude project settings, Codex project config or hooks, and `.mcp.json`, while continuing to allow instruction files such as `CLAUDE.md` and `AGENTS.md`.
 
 Task resume is fail-closed: it requires the recorded provider session and
 reuses that session's exact profile. The new-task quota reserve does not block
@@ -178,10 +187,15 @@ view.
 
 ## Selection policy
 
-`quota refresh` invokes `quota-axi` inside each profile environment and stores normalized routing evidence rather than provider payloads, including status and reason, timestamps, aggregate headroom, percentage windows, and an opaque provider-identity fingerprint when available.
-Before every selection, old quota evidence is refreshed automatically.
-`auth_required`, `rate_limited`, provider errors, duplicate identities, missing remote verification, and expired verification are hard blocks.
-A cached response whose live probe says sign-in is required is also a hard block; cached percentages can never hide revoked credentials.
+`quota refresh` invokes `quota-axi` inside each profile environment and stores
+only normalized status, an opaque provider-identity fingerprint when available,
+and percentage windows. Every real selection obtains a same-attempt
+source-before/quota/source-after proof for every enabled worker of each scoped
+provider, including workers outside the requested pool. Cached quota is never
+identity authority. `auth_required`, `rate_limited`, provider errors, duplicate
+identities, missing remote verification, and expired verification are hard
+blocks. A cached response whose live probe says sign-in is required is also a
+hard block; cached percentages can never hide revoked credentials.
 
 When fresh quota exists, Agent Fleet selects the highest safe headroom after
 reserve and active-lease penalties. A transient stale/unavailable response may
@@ -198,7 +212,9 @@ agent-fleet doctor --workspace ~/firstmate --project /absolute/path/to/task-work
 ```
 
 `profile verify --all` remotely rechecks every profile while all profiles remain
-disabled. Enable each verified worker explicitly afterward; verification and
+disabled. Enable each verified worker explicitly afterward; each enable again
+requires fresh same-attempt proof for the target and every already-enabled
+same-provider worker before its single registry mutation. Verification and
 routing activation are deliberately separate phases. On macOS,
 `--allow-keychain-prompt` is the explicit one-time Claude Keychain grant; choose
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
@@ -216,10 +232,11 @@ Homes and state are mode 0700; registry, lease, quota, and session files are mod
 Before every provider subprocess, Agent Fleet scrubs ambient `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, and `CODEX_*` variables, then sets the managed profile-home and task/workspace variables it owns.
 
 The provider registry can declare a base home, hook source, trusted Git projects, and allowlisted shared entries.
-Initial profiles share only account-neutral workflow assets:
+Initial profiles may share only explicitly allowlisted account-neutral workflow
+assets. Managed plugin directories are forbidden:
 
-- Claude: `CLAUDE.md`, skills, plugins, and hook definitions.
-- Codex: `AGENTS.md`, skills, plugins, rules, and hook definitions.
+- Claude: declared instruction/skill assets and closed hook definitions.
+- Codex: declared instruction/skill/rule assets and closed hook definitions.
 
 Auth files, sessions, histories, logs, caches, databases, and provider state are
 never shared.
@@ -232,10 +249,20 @@ Defaults:
 - Profile homes: paths recorded in the registry, under `~/.local/share/agent-fleet/accounts/<provider>/` by default
 - Leases, normalized quota, and session mappings:
   `~/.local/state/agent-fleet`
-- Claude Code binary: `~/.local/bin/claude`
-- Codex CLI binary: `~/.local/libexec/agent-fleet/runtime/codex`
-- Profile-aware quota reader:
-  `~/.local/libexec/agent-fleet/quota-axi/current/bin/quota-axi`
+- Neutral provider runtimes: `~/.local/libexec/agent-fleet/runtime`
+- Hash-pinned profile-aware quota reader: the exact regular `node_modules/quota-axi/dist/bin/quota-axi.js` file inside one immutable release.
+- Hash-pinned Quota interpreter: an exact regular standalone Node executable stored inside that same immutable release and invoked directly before the verified JavaScript path.
+
+The current release layout stores those files at `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d/node_modules/quota-axi/dist/bin/quota-axi.js` and `~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d/runtime/node`.
+
+`agent-fleet init` may resolve a caller-supplied convenience symlink once, but the generated registry stores only the two resolved non-symlink release paths and their SHA-256 digests.
+
+Legacy registries without the hashes migrate only when their configured Quota path is already an exact regular file and the exact Node runtime is available at the release path or through `AGENT_FLEET_QUOTA_NODE_BIN`.
+
+Moving `current`, npm `.bin`, and shebang/PATH execution are rejected.
+
+Runtime drift blocks selection and quota refresh, and Doctor reports the failed pin; inventory and worker-disable operations remain available so an operator can fail safe without executing Quota.
+Registry loading, doctor, and every quota probe refuse a moved symlink, replaced release, or digest drift.
 
 `AGENT_FLEET_CONFIG`, `AGENT_FLEET_STATE_DIR`, and `AGENT_FLEET_SHARE_DIR` redirect the registry, state, and share/profile-home defaults.
 The init-time executable overrides documented under "Initial setup" set the three generated binary paths; afterward, the registry owns those values.

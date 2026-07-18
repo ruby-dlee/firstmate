@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import socket
@@ -23,9 +24,11 @@ from .audit import append_audit
 from .config import load_registry
 from .enrollment import recover_pending_codex_transactions
 from .identity import (
-    adopt_provider_identity_bundle,
+    build_provider_identity_bundle,
+    identity_binding_conflict,
     identity_bundle_path,
     identity_conflict,
+    install_provider_identity_bundle,
     read_identity_binding,
     refresh_provider_identity_anchors,
 )
@@ -42,6 +45,7 @@ from .quota import (
     store_quota,
 )
 from .sessions import get_session, session_path
+from .transaction_fence import pending_credential_recovery_journals
 from .util import (
     atomic_write_bytes,
     atomic_write_json,
@@ -49,6 +53,7 @@ from .util import (
     process_start_token,
     read_private_bytes,
     read_private_json,
+    utc_now,
 )
 
 RECOVERY_SCHEMA = 1
@@ -56,6 +61,9 @@ INITIALIZATION_CONTRACT_VERSION = 1
 RECOVERY_MARKER = ".agent-fleet-recovery-stage.json"
 CODEX_AUTH = "auth.json"
 CLAUDE_AUTH = ".credentials.json"
+CLAUDE_KEYCHAIN_SERVICE = re.compile(
+    r"(?:Claude Code-credentials-[0-9a-f]{8}|Claude Code-agent-fleet-backup-[0-9a-f]{32})"
+)
 
 
 class KeychainControl(Protocol):
@@ -110,7 +118,7 @@ class SecurityKeychain:
         expected_account: str,
     ) -> list[str]:
         if (
-            not service.startswith("Claude Code-")
+            CLAUDE_KEYCHAIN_SERVICE.fullmatch(service) is None
             or not account
             or account != expected_account
         ):
@@ -215,12 +223,17 @@ class SecurityKeychain:
 class RecoveryHooks:
     """Narrow seams used by tests; production defaults remain the sealed controls."""
 
-    login: Callable[[list[str], dict[str, str], Path, Callable[[int, str], None]], int]
+    login: Callable[[list[str], dict[str, str], Path, Callable[[int, str, int], None]], int]
     inspect_source: Callable[[Registry, Profile, bool], dict[str, Any]]
     prove: Callable[[Registry, Profile, bool], tuple[dict[str, Any], dict[str, Any]]]
     refresh_anchors: Callable[[Registry, str, bool], None]
-    adopt_bundle: Callable[
-        [Registry, str, dict[str, tuple[dict[str, Any], dict[str, Any]]], bool],
+    install_bundle: Callable[
+        [
+            Registry,
+            str,
+            dict[str, Any],
+            Callable[[], None] | None,
+        ],
         dict[str, Any],
     ]
     keychain: KeychainControl
@@ -230,7 +243,7 @@ def _system_login(
     argv: list[str],
     environment: dict[str, str],
     cwd: Path,
-    record_child: Callable[[int, str], None],
+    record_child: Callable[[int, str, int], None],
 ) -> int:
     """Fork a gated child so its durable PID record precedes provider exec."""
 
@@ -239,6 +252,7 @@ def _system_login(
     if pid == 0:  # pragma: no cover - integration-only child
         try:
             os.close(write_fd)
+            os.setsid()
             os.umask(0o077)
             if os.read(read_fd, 1) != b"1":
                 os._exit(126)
@@ -254,7 +268,7 @@ def _system_login(
             os.kill(pid, signal.SIGTERM)
             os.waitpid(pid, 0)
             raise ValueError("could not establish provider login process identity")
-        record_child(pid, start)
+        record_child(pid, start, pid)
         os.write(write_fd, b"1")
     except BaseException:
         with suppress(ProcessLookupError):
@@ -264,6 +278,8 @@ def _system_login(
     finally:
         os.close(write_fd)
     _, status = os.waitpid(pid, 0)
+    if _process_group_state(pid) != "dead":
+        raise ValueError("provider login descendants remain live or indeterminate")
     return os.waitstatus_to_exitcode(status)
 
 
@@ -307,17 +323,17 @@ def _refresh(registry: Registry, provider: str, prompt: bool) -> None:
     )
 
 
-def _adopt(
+def _install_bundle(
     registry: Registry,
     provider: str,
-    proofs: dict[str, tuple[dict[str, Any], dict[str, Any]]],
-    prompt: bool,
+    payload: dict[str, Any],
+    before_install: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    return adopt_provider_identity_bundle(
+    return install_provider_identity_bundle(
         registry,
         provider,
-        proofs,
-        allow_keychain_prompt=prompt,
+        payload,
+        before_install=before_install,
     )
 
 
@@ -327,7 +343,7 @@ def default_recovery_hooks() -> RecoveryHooks:
         inspect_source=_inspect_source,
         prove=_prove,
         refresh_anchors=_refresh,
-        adopt_bundle=_adopt,
+        install_bundle=_install_bundle,
         keychain=SecurityKeychain(),
     )
 
@@ -455,6 +471,40 @@ def _same_stat(path: Path, encoded: object, *, ctime: bool = True) -> bool:
         return False
     fields = set(observed) if ctime else set(observed) - {"ctime_ns"}
     return all(encoded.get(field) == observed[field] for field in fields)
+
+
+def _file_generation(path: Path, label: str) -> dict[str, Any]:
+    before = _private_file(path, label)
+    payload = read_private_bytes(path, label=label)
+    after = _private_file(path, label)
+    if _stat_payload(before) != _stat_payload(after):
+        raise ValueError(f"{label} changed while its generation was read")
+    return {
+        "stat": _stat_payload(after),
+        "sha256": sha256(payload).hexdigest(),
+    }
+
+
+def _same_file_generation(path: Path, encoded: object) -> bool:
+    if not isinstance(encoded, dict):
+        return False
+    expected_stat = encoded.get("stat")
+    expected_digest = encoded.get("sha256")
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        return False
+    try:
+        observed = _file_generation(path, "credential transaction generation")
+    except (FileNotFoundError, ValueError):
+        return False
+    if observed["sha256"] != expected_digest or not isinstance(expected_stat, dict):
+        return False
+    fields = set(observed["stat"]) - {"ctime_ns"}
+    return all(expected_stat.get(field) == observed["stat"][field] for field in fields)
+
+
+def _json_payload_sha256(payload: dict[str, Any]) -> str:
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    return sha256(encoded).hexdigest()
 
 
 def _same_directory_identity(path: Path, encoded: object) -> bool:
@@ -622,6 +672,16 @@ def _transactional_keychain(
     return control
 
 
+def _process_group_state(pgid: int) -> str:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "indeterminate"
+    return "live"
+
+
 def _ensure_keychain_operation_quiescent(
     journal_path: Path,
     journal: dict[str, Any],
@@ -637,14 +697,7 @@ def _ensure_keychain_operation_quiescent(
     if not isinstance(pid, int) or not isinstance(start, str) or pgid != pid:
         raise ValueError("credential recovery journal has invalid Keychain helper identity")
     helper_state = process_identity_state(pid, start)
-    try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        group_state = "dead"
-    except PermissionError:
-        group_state = "indeterminate"
-    else:
-        group_state = "live"
+    group_state = _process_group_state(pid)
     if helper_state != "dead" or group_state != "dead":
         raise ValueError("scoped Claude Keychain operation is still live or indeterminate")
     journal.pop("keychain_operation", None)
@@ -653,6 +706,31 @@ def _ensure_keychain_operation_quiescent(
         journal,
         "keychain-operation-quiesced",
     )
+
+
+def _ensure_login_operation_quiescent(
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    pid = journal.get("login_pid")
+    start = journal.get("login_start")
+    pgid = journal.get("login_pgid")
+    present = (pid is not None, start is not None, pgid is not None)
+    if present == (False, False, False):
+        return
+    if (
+        present != (True, True, True)
+        or not isinstance(pid, int)
+        or not isinstance(start, str)
+        or pgid != pid
+    ):
+        raise ValueError("credential recovery journal has invalid provider login ownership")
+    if process_identity_state(pid, start) != "dead" or _process_group_state(pgid) != "dead":
+        raise ValueError("provider login process group is still live or indeterminate")
+    journal.pop("login_pid", None)
+    journal.pop("login_start", None)
+    journal.pop("login_pgid", None)
+    _write_recovery_journal(journal_path, journal, "provider-login-quiesced")
 
 
 def _read_journal(registry: Registry, profile: Profile) -> tuple[Path, dict[str, Any]] | None:
@@ -990,6 +1068,75 @@ def _keychain_account() -> str:
     return account
 
 
+def _validated_keychain_scope(
+    target: Profile,
+    paths: dict[str, Path],
+    journal: dict[str, Any],
+) -> dict[str, str]:
+    if target.provider != "claude":
+        raise ValueError("Keychain scope requires a Claude worker")
+    nonce = journal.get("nonce")
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise ValueError("credential recovery journal has invalid Keychain nonce")
+    scope = {
+        "account": _keychain_account(),
+        "staged": _claude_service(paths["stage"]),
+        "stable": _claude_service(target.home),
+        "backup": f"Claude Code-agent-fleet-backup-{nonce}",
+    }
+    expected_fields = {
+        "keychain_account": scope["account"],
+        "staged_service": scope["staged"],
+        "stable_service": scope["stable"],
+        "backup_service": scope["backup"],
+    }
+    if any(journal.get(field) != value for field, value in expected_fields.items()):
+        raise ValueError("credential recovery journal Keychain scope is not derived exactly")
+    if len({scope["staged"], scope["stable"], scope["backup"]}) != 3:
+        raise ValueError("credential recovery Keychain services are not distinct")
+    return scope
+
+
+def _scoped_keychain_exists(
+    hooks: RecoveryHooks,
+    target: Profile,
+    paths: dict[str, Path],
+    journal: dict[str, Any],
+    role: str,
+) -> bool:
+    scope = _validated_keychain_scope(target, paths, journal)
+    return hooks.keychain.exists(scope[role], scope["account"])
+
+
+def _scoped_keychain_copy(
+    hooks: RecoveryHooks,
+    target: Profile,
+    paths: dict[str, Path],
+    journal: dict[str, Any],
+    source_role: str,
+    destination_role: str,
+) -> None:
+    scope = _validated_keychain_scope(target, paths, journal)
+    hooks.keychain.copy(
+        scope[source_role],
+        scope[destination_role],
+        scope["account"],
+    )
+
+
+def _scoped_keychain_delete(
+    hooks: RecoveryHooks,
+    target: Profile,
+    paths: dict[str, Path],
+    journal: dict[str, Any],
+    role: str,
+    *,
+    missing_ok: bool,
+) -> None:
+    scope = _validated_keychain_scope(target, paths, journal)
+    hooks.keychain.delete(scope[role], scope["account"], missing_ok=missing_ok)
+
+
 def _login_environment(profile: Profile) -> dict[str, str]:
     account = _keychain_account()
     environment = {
@@ -1036,9 +1183,11 @@ def _snapshot_bundle(registry: Registry, paths: dict[str, Path], journal: dict[s
     bundle = identity_bundle_path(registry, str(journal["provider"]))
     journal["bundle_existed"] = bundle.exists()
     if bundle.exists() or bundle.is_symlink():
-        _private_file(bundle, "provider identity bundle")
+        journal["bundle_original_generation"] = _file_generation(
+            bundle,
+            "provider identity bundle",
+        )
         _copy_private_file(bundle, paths["bundle_backup"])
-        journal["bundle_original_stat"] = _stat_payload(bundle.lstat())
 
 
 def _provisional_path(registry: Registry, provider: str) -> Path:
@@ -1292,10 +1441,65 @@ def _snapshot_provisional(
     journal["provisional_existed"] = existed
     journal["provisional_guard_existed"] = guard_existed
     if existed:
-        _private_file(path, "provider provisional identity batch")
+        journal["provisional_original_generation"] = _file_generation(
+            path,
+            "provider provisional identity batch",
+        )
         _copy_private_file(path, paths["provisional_backup"])
-        _private_file(guard, "provider initialization locator")
+        journal["provisional_guard_original_generation"] = _file_generation(
+            guard,
+            "provider initialization locator",
+        )
         _copy_private_file(guard, paths["provisional_guard_backup"])
+
+
+def _snapshot_state(
+    target: Path,
+    *,
+    existed: bool,
+    key: str,
+    label: str,
+    journal: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    if not (target.exists() or target.is_symlink()):
+        if not existed:
+            return "original-absent", None
+        if journal.get(f"{key}_forward_absent") is True:
+            return "forward-absent", None
+        return "unknown-absent", None
+    observed = _file_generation(target, label)
+    for state, field in (
+        ("original", f"{key}_original_generation"),
+        ("forward", f"{key}_forward_generation"),
+        ("prepared-restore", f"{key}_restore_prepared_generation"),
+        ("restored", f"{key}_restored_generation"),
+    ):
+        if _same_file_generation(target, journal.get(field)):
+            return state, observed
+    planned_digest = journal.get(f"{key}_forward_sha256")
+    if isinstance(planned_digest, str) and observed["sha256"] == planned_digest:
+        return "forward-planned", observed
+    return "unknown", observed
+
+
+def _require_snapshot_original(
+    target: Path,
+    *,
+    existed: bool,
+    key: str,
+    label: str,
+    journal: dict[str, Any],
+) -> None:
+    state, _generation = _snapshot_state(
+        target,
+        existed=existed,
+        key=key,
+        label=label,
+        journal=journal,
+    )
+    expected = "original" if existed else "original-absent"
+    if state != expected:
+        raise ValueError(f"{label} changed before transaction installation")
 
 
 def _restore_snapshot_file(
@@ -1312,24 +1516,41 @@ def _restore_snapshot_file(
     """Restore one private snapshot through a restart-idempotent generation."""
 
     complete_key = f"{key}_restore_complete"
-    restored_key = f"{key}_restored_stat"
-    prepared_key = f"{key}_restore_prepared_stat"
+    restored_key = f"{key}_restored_generation"
+    prepared_key = f"{key}_restore_prepared_generation"
     if journal.get(complete_key) is True:
         if existed:
-            if not _same_stat(target, journal.get(restored_key), ctime=False):
+            if not _same_file_generation(target, journal.get(restored_key)):
                 raise ValueError(f"{label} changed after rollback completed")
         elif target.exists() or target.is_symlink():
             raise ValueError(f"{label} appeared after rollback completed")
         return
 
+    state, observed = _snapshot_state(
+        target,
+        existed=existed,
+        key=key,
+        label=label,
+        journal=journal,
+    )
     if not existed:
-        if target.exists() or target.is_symlink():
-            _private_file(target, f"transaction-created {label}")
+        if state not in {"original-absent", "forward", "forward-planned"}:
+            raise ValueError(f"{label} has an unknown generation during rollback")
+        if state != "original-absent":
             _write_recovery_journal(
                 journal_path,
                 journal,
                 f"{key}-restore-delete-authorized",
             )
+            current_state, current_observed = _snapshot_state(
+                target,
+                existed=existed,
+                key=key,
+                label=label,
+                journal=journal,
+            )
+            if current_state != state or current_observed != observed:
+                raise ValueError(f"{label} changed immediately before rollback removal")
             target.unlink()
             _fsync(target.parent)
         else:
@@ -1338,13 +1559,16 @@ def _restore_snapshot_file(
         _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
         return
 
+    if state in {"original", "restored"}:
+        journal[restored_key] = _file_generation(target, f"restored {label}")
+        journal[complete_key] = True
+        _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+        return
+    if state not in {"forward", "forward-planned", "forward-absent", "prepared-restore"}:
+        raise ValueError(f"{label} has an unknown generation during rollback")
+
     prepared = journal.get(prepared_key)
-    target_is_prepared = prepared is not None and _same_stat(
-        target,
-        prepared,
-        ctime=False,
-    )
-    if target_is_prepared:
+    if state == "prepared-restore":
         if temporary.exists() or temporary.is_symlink():
             raise ValueError(f"{label} rollback generation exists at two paths")
         _fsync(target.parent)
@@ -1359,10 +1583,17 @@ def _restore_snapshot_file(
                 journal,
                 f"{key}-restore-copy-running",
             )
-            _private_file(backup, f"{label} backup")
+            backup_generation = _file_generation(backup, f"{label} backup")
+            original_generation = journal.get(f"{key}_original_generation")
+            if (
+                not isinstance(original_generation, dict)
+                or backup_generation["sha256"] != original_generation.get("sha256")
+            ):
+                raise ValueError(f"{label} backup is not the snapshotted generation")
             _copy_private_file(backup, temporary)
-            prepared = _stat_payload(
-                _private_file(temporary, f"prepared {label} rollback generation")
+            prepared = _file_generation(
+                temporary,
+                f"prepared {label} rollback generation",
             )
             journal[prepared_key] = prepared
             _write_recovery_journal(
@@ -1370,7 +1601,7 @@ def _restore_snapshot_file(
                 journal,
                 f"{key}-restore-prepared",
             )
-        elif not _same_stat(temporary, prepared, ctime=False):
+        elif not _same_file_generation(temporary, prepared):
             raise ValueError(f"prepared {label} rollback generation changed")
 
         _write_recovery_journal(
@@ -1378,10 +1609,19 @@ def _restore_snapshot_file(
             journal,
             f"{key}-restore-replace-authorized",
         )
+        current_state, current_observed = _snapshot_state(
+            target,
+            existed=existed,
+            key=key,
+            label=label,
+            journal=journal,
+        )
+        if current_state != state or current_observed != observed:
+            raise ValueError(f"{label} changed immediately before rollback replacement")
         os.replace(temporary, target)
         _fsync(target.parent)
 
-    journal[restored_key] = _stat_payload(_private_file(target, f"restored {label}"))
+    journal[restored_key] = _file_generation(target, f"restored {label}")
     journal[complete_key] = True
     _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
 
@@ -1646,9 +1886,12 @@ def _install_codex(
         _private_file(temporary, "prepared Codex auth")
     )
     _write_journal(journal_path, journal, "credential-prepared")
-    current = _stat_payload(_private_file(stable, "stable Codex auth")) if original else None
-    if current != journal["original_credential_stat"]:
-        raise ValueError("stable Codex auth changed during recovery")
+    if original is not None:
+        current = _stat_payload(_private_file(stable, "stable Codex auth"))
+        if current != journal["original_credential_stat"]:
+            raise ValueError("stable Codex auth changed during recovery")
+    elif stable.exists() or stable.is_symlink():
+        raise ValueError("stable Codex auth appeared during recovery")
     os.replace(temporary, stable)
     _fsync(target.home)
     journal["installed_credential_stat"] = _stat_payload(
@@ -1686,6 +1929,12 @@ def _install_claude(
         _copy_private_file(staged, temporary)
         journal["prepared_credential_stat"] = _stat_payload(temporary.lstat())
         _write_journal(journal_path, journal, "credential-prepared")
+        if original is not None:
+            current = _stat_payload(_private_file(stable, "stable Claude auth"))
+            if current != journal["original_credential_stat"]:
+                raise ValueError("stable Claude auth changed during recovery")
+        elif stable.exists() or stable.is_symlink():
+            raise ValueError("stable Claude auth appeared during recovery")
         os.replace(temporary, stable)
         _fsync(target.home)
         journal["installed_credential_stat"] = _stat_payload(stable.lstat())
@@ -1693,16 +1942,17 @@ def _install_claude(
         return
     if source.get("kind") != "keychain":
         raise ValueError("staged Claude login has no single scoped credential source")
-    account = _keychain_account()
-    staged_service = _claude_service(stage.home)
-    stable_service = _claude_service(target.home)
+    scope = _validated_keychain_scope(target, paths, journal)
+    account = scope["account"]
+    staged_service = scope["staged"]
+    stable_service = scope["stable"]
     if (
         source.get("service") != staged_service
         or source.get("config_home") != str(stage.home)
         or source.get("account") != account
     ):
         raise ValueError("staged Claude Keychain credential is scoped to another home")
-    backup_service = f"Claude Code-agent-fleet-backup-{journal['nonce']}"
+    backup_service = scope["backup"]
     stable_source = _normalize_source_contract(
         hooks,
         target,
@@ -1732,9 +1982,9 @@ def _install_claude(
     if stable_file_stat is not None:
         _copy_private_file(stable_file, paths["claude_file_backup"])
     if stable_keychain:
-        if not hooks.keychain.exists(stable_service, account):
+        if not _scoped_keychain_exists(hooks, target, paths, journal, "stable"):
             raise ValueError("stable scoped Claude Keychain item disappeared")
-        hooks.keychain.copy(stable_service, backup_service, account)
+        _scoped_keychain_copy(hooks, target, paths, journal, "stable", "backup")
     _record_stage_manifest(stage.home, journal)
     _write_journal(journal_path, journal, "credential-backup-ready")
     if stable_file_stat is not None:
@@ -1745,8 +1995,8 @@ def _install_claude(
         stable_file.unlink()
         _fsync(target.home)
     _write_journal(journal_path, journal, "credential-prepared")
-    hooks.keychain.copy(staged_service, stable_service, account)
-    if not hooks.keychain.exists(stable_service, account):
+    _scoped_keychain_copy(hooks, target, paths, journal, "staged", "stable")
+    if not _scoped_keychain_exists(hooks, target, paths, journal, "stable"):
         raise ValueError("promoted scoped Claude Keychain item is unavailable")
     _write_journal(journal_path, journal, "credential-installed")
 
@@ -1856,9 +2106,7 @@ def _rollback_local_credential(
             journal,
         )
     elif kind == "claude-keychain":
-        account = str(journal.get("keychain_account", ""))
-        stable_service = str(journal.get("stable_service", ""))
-        backup_service = str(journal.get("backup_service", ""))
+        _validated_keychain_scope(target, paths, journal)
         phase = journal.get("phase")
         backup_ready = phase not in {
             "credential-backup-running",
@@ -1867,16 +2115,48 @@ def _rollback_local_credential(
             _write_recovery_journal(journal_path, journal, "rollback-keychain-running")
             if journal.get("stable_keychain_existed") is True:
                 if backup_ready:
-                    if not hooks.keychain.exists(backup_service, account):
+                    if not _scoped_keychain_exists(
+                        hooks,
+                        target,
+                        paths,
+                        journal,
+                        "backup",
+                    ):
                         raise ValueError("Claude Keychain rollback generation is unavailable")
-                    hooks.keychain.copy(backup_service, stable_service, account)
-                    if not hooks.keychain.exists(stable_service, account):
+                    _scoped_keychain_copy(
+                        hooks,
+                        target,
+                        paths,
+                        journal,
+                        "backup",
+                        "stable",
+                    )
+                    if not _scoped_keychain_exists(
+                        hooks,
+                        target,
+                        paths,
+                        journal,
+                        "stable",
+                    ):
                         raise ValueError("restored scoped Claude Keychain item is unavailable")
-                elif not hooks.keychain.exists(stable_service, account):
+                elif not _scoped_keychain_exists(
+                    hooks,
+                    target,
+                    paths,
+                    journal,
+                    "stable",
+                ):
                     raise ValueError("original scoped Claude Keychain item changed during backup")
             elif backup_ready:
-                hooks.keychain.delete(stable_service, account, missing_ok=True)
-            elif hooks.keychain.exists(stable_service, account):
+                _scoped_keychain_delete(
+                    hooks,
+                    target,
+                    paths,
+                    journal,
+                    "stable",
+                    missing_ok=True,
+                )
+            elif _scoped_keychain_exists(hooks, target, paths, journal, "stable"):
                 raise ValueError("stable scoped Claude Keychain item appeared during backup")
             journal["keychain_rollback_complete"] = True
             _write_recovery_journal(journal_path, journal, "rollback-keychain-complete")
@@ -1914,6 +2194,8 @@ def _clean_exact_temporaries(paths: dict[str, Path]) -> None:
 
 def _cleanup_keychain(
     hooks: RecoveryHooks,
+    target: Profile,
+    paths: dict[str, Path],
     journal_path: Path,
     journal: dict[str, Any],
     *,
@@ -1923,18 +2205,23 @@ def _cleanup_keychain(
         return
     if journal.get("keychain_cleanup_complete") is True:
         return
-    account = str(journal.get("keychain_account", ""))
+    _validated_keychain_scope(target, paths, journal)
     staged_service = journal.get("staged_service")
     if journal.get("staged_keychain_cleanup_complete") is not True:
         if isinstance(staged_service, str):
-            if account != _keychain_account():
-                raise ValueError("Claude Keychain cleanup account changed")
             _write_recovery_journal(
                 journal_path,
                 journal,
                 "keychain-staged-cleanup-authorized",
             )
-            hooks.keychain.delete(staged_service, account, missing_ok=True)
+            _scoped_keychain_delete(
+                hooks,
+                target,
+                paths,
+                journal,
+                "staged",
+                missing_ok=True,
+            )
         journal["staged_keychain_cleanup_complete"] = True
         _write_recovery_journal(
             journal_path,
@@ -1947,14 +2234,19 @@ def _cleanup_keychain(
         if not committed and journal.get("local_credential_rollback_complete") is not True:
             raise ValueError("refusing to delete Claude rollback backup before durable rollback")
         if isinstance(backup_service, str):
-            if account != _keychain_account():
-                raise ValueError("Claude Keychain cleanup account changed")
             _write_recovery_journal(
                 journal_path,
                 journal,
                 "keychain-backup-cleanup-authorized",
             )
-            hooks.keychain.delete(backup_service, account, missing_ok=True)
+            _scoped_keychain_delete(
+                hooks,
+                target,
+                paths,
+                journal,
+                "backup",
+                missing_ok=True,
+            )
         journal["backup_keychain_cleanup_complete"] = True
         _write_recovery_journal(
             journal_path,
@@ -1971,16 +2263,28 @@ def recover_pending_profile_recoveries(
     *,
     hooks: RecoveryHooks | None = None,
     allow_current_owner: bool = False,
+    retain_committed_receipts: bool = False,
 ) -> list[dict[str, Any]]:
     """Recover only worker transactions while the caller owns the provider lock."""
 
     controls = hooks or default_recovery_hooks()
     recovered: list[dict[str, Any]] = []
-    # This worker-only filter happens before journal-path derivation (R2/R5).
-    for target in _workers(registry, provider):
-        pending = _read_journal(registry, target)
-        if pending is None:
+    for discovered_path, discovered in pending_credential_recovery_journals(registry):
+        if discovered.get("provider") != provider:
             continue
+        profile_id = str(discovered.get("profile", ""))
+        target = registry.profiles.get(profile_id)
+        if (
+            target is None
+            or target.provider != provider
+            or target.safety_policy != "worker"
+        ):
+            raise ValueError(
+                "pending credential recovery journal is hidden by profile topology drift"
+            )
+        pending = _read_journal(registry, target)
+        if pending is None or pending[0] != discovered_path or pending[1] != discovered:
+            raise ValueError("pending credential recovery journal changed during discovery")
         journal_path, journal = pending
         paths = _validate_paths(registry, target, journal)
         owner_host = journal.get("owner_host")
@@ -1994,14 +2298,7 @@ def recover_pending_profile_recoveries(
         current_owner = owner_pid == os.getpid() and owner_start == process_start_token(os.getpid())
         if owner_state != "dead" and not (allow_current_owner and current_owner):
             raise ValueError("credential recovery transaction still has a live/unknown owner")
-        child_pid = journal.get("login_pid")
-        child_start = journal.get("login_start")
-        if (
-            isinstance(child_pid, int)
-            and isinstance(child_start, str)
-            and process_identity_state(child_pid, child_start) != "dead"
-        ):
-            raise ValueError("provider login process is still live or indeterminate")
+        _ensure_login_operation_quiescent(journal_path, journal)
         _ensure_keychain_operation_quiescent(journal_path, journal)
         transaction_controls = replace(
             controls,
@@ -2034,6 +2331,8 @@ def recover_pending_profile_recoveries(
         _clean_exact_temporaries(paths)
         _cleanup_keychain(
             transaction_controls,
+            target,
+            paths,
             journal_path,
             journal,
             committed=committed,
@@ -2045,16 +2344,143 @@ def recover_pending_profile_recoveries(
             journal,
             "transaction-cleanup-complete",
         )
-        journal_path.unlink()
-        _fsync(journal_path.parent)
-        recovered.append(
-            {
-                "profile": target.id,
-                "committed": committed,
-                "provider_side_revocation_possible": bool(journal.get("login_started")),
-            }
-        )
+        retained = committed and retain_committed_receipts
+        if not retained:
+            journal_path.unlink()
+            _fsync(journal_path.parent)
+        record = {
+            "profile": target.id,
+            "committed": committed,
+            "provider_side_revocation_possible": bool(journal.get("login_started")),
+        }
+        if retained:
+            record.update(
+                {
+                    "workflow": journal.get("workflow"),
+                    "receipt_retained": True,
+                }
+            )
+        recovered.append(record)
     return recovered
+
+
+def _verify_committed_receipt(
+    registry: Registry,
+    receipt: dict[str, Any],
+    hooks: RecoveryHooks,
+    allow_keychain_prompt: bool,
+) -> dict[str, Any]:
+    profile_id = str(receipt["profile"])
+    workflow = str(receipt["workflow"])
+    target = registry.require_profile(profile_id)
+    if target.safety_policy != "worker":
+        raise ValueError("committed credential receipt is hidden by profile policy drift")
+    hooks.refresh_anchors(registry, target.provider, allow_keychain_prompt)
+    proofs: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    blockers: dict[str, str] = {}
+    fingerprints: dict[str, str] = {}
+    for worker in _workers(registry, target.provider):
+        try:
+            proof, raw_source = hooks.prove(registry, worker, allow_keychain_prompt)
+            source = _normalize_source_contract(hooks, worker, raw_source)
+            fingerprint = _identity_fingerprint(proof, worker)
+            if fingerprint in fingerprints:
+                raise ValueError("duplicate_worker_identity")
+            fingerprints[fingerprint] = worker.id
+            proofs[worker.id] = proof, source
+        except (OSError, TimeoutError, ValueError) as exc:
+            blockers[worker.id] = type(exc).__name__
+
+    pending_initialization: list[str] = []
+    provisional_workers: list[str] = []
+    bundle = _bundle_present(registry, target.provider)
+    provisional = _read_provisional_batch(registry, target.provider)
+    if bundle:
+        if provisional is not None:
+            raise ValueError("committed credential receipt has conflicting identity metadata")
+        for worker_id, (proof, source) in proofs.items():
+            worker = registry.require_profile(worker_id)
+            conflict = identity_binding_conflict(registry, worker, proof, source)
+            if conflict is not None:
+                blockers[worker_id] = conflict
+    elif workflow == "initialize" and provisional is not None:
+        records = provisional["workers"]
+        provisional_workers = sorted(records)
+        pending_initialization = sorted(
+            set(provisional["expected_workers"]) - set(records)
+        )
+        if profile_id not in records:
+            raise ValueError(
+                "committed initialization receipt is absent from its provisional batch"
+            )
+        for worker_id, record in records.items():
+            if worker_id not in proofs:
+                blockers[worker_id] = "fresh_proof_unavailable"
+                continue
+            worker = registry.require_profile(worker_id)
+            observed = _provisional_record(
+                hooks,
+                worker,
+                proofs[worker_id][0],
+                proofs[worker_id][1],
+                str(record["transaction_generation"]),
+            )
+            if observed != record:
+                blockers[worker_id] = "provisional_identity_drift"
+    else:
+        raise ValueError("committed credential receipt has no matching identity generation")
+
+    for worker_id, (proof, _source) in proofs.items():
+        if worker_id not in blockers:
+            store_quota(registry, registry.require_profile(worker_id), proof)
+    ready = (
+        bundle
+        and not blockers
+        and len(proofs) == len(_workers(registry, target.provider))
+    )
+    return {
+        "profile": profile_id,
+        "provider": target.provider,
+        "credential_recovered": workflow == "recover",
+        "credential_initialized": workflow == "initialize",
+        "workflow": f"{workflow}-login",
+        "provider_ready": ready,
+        "blocked_profiles": sorted(blockers),
+        "pending_initialization": pending_initialization,
+        "provisional_workers": provisional_workers,
+        "enabled": False,
+        "provider_login_invoked": False,
+        "browser_mode": False,
+        "replayed_committed_transaction": True,
+        "provider_side_revocation_possible": bool(
+            receipt.get("provider_side_revocation_possible")
+        ),
+        "provider_side_revocation_locally_reversible": False,
+        "next_step": (
+            "run the existing explicit profile enable gate for each worker"
+            if ready
+            else "review this committed replay receipt before any new explicit login"
+        ),
+    }
+
+
+def _consume_committed_receipt(
+    registry: Registry,
+    profile: Profile,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    observed = _read_journal(registry, profile)
+    if observed is None or observed[0] != journal_path or observed[1] != journal:
+        raise ValueError("committed credential replay receipt changed during verification")
+    if (
+        journal.get("phase") != "committed"
+        or journal.get("transaction_cleanup_complete") is not True
+        or journal.get("keychain_operation") is not None
+    ):
+        raise ValueError("committed credential replay receipt is not terminal")
+    journal_path.unlink()
+    _fsync(journal_path.parent)
 
 
 def _profile_login_transaction(
@@ -2100,7 +2526,46 @@ def _profile_login_transaction(
         try:
             current, target = _recheck(registry, config_path, profile_id, "start")
             recover_pending_codex_transactions(current, target.provider)
-            prior = recover_pending_profile_recoveries(current, target.provider, hooks=controls)
+            prior = recover_pending_profile_recoveries(
+                current,
+                target.provider,
+                hooks=controls,
+                retain_committed_receipts=True,
+            )
+            committed_prior = [record for record in prior if record.get("committed") is True]
+            if committed_prior:
+                if len(committed_prior) != 1:
+                    raise ValueError("multiple committed credential replay receipts require review")
+                receipt = committed_prior[0]
+                receipt_profile = current.require_profile(str(receipt["profile"]))
+                pending_receipt = _read_journal(current, receipt_profile)
+                if pending_receipt is None:
+                    raise ValueError("committed credential replay receipt disappeared")
+                receipt_path, receipt_journal = pending_receipt
+                receipt_controls = replace(
+                    controls,
+                    keychain=_transactional_keychain(
+                        controls.keychain,
+                        receipt_path,
+                        receipt_journal,
+                    ),
+                )
+                result = _verify_committed_receipt(
+                    current,
+                    receipt,
+                    receipt_controls,
+                    allow_keychain_prompt,
+                )
+                result["recovered_prior_transactions"] = prior
+                result["requested_profile"] = profile_id
+                result["requested_workflow"] = f"{workflow}-login"
+                _consume_committed_receipt(
+                    current,
+                    receipt_profile,
+                    receipt_path,
+                    receipt_journal,
+                )
+                return result
             current, target = _recheck(current, config_path, profile_id, "intent")
             observed_batch = _assert_workflow_state(current, target.provider, workflow)
             persisted_batch = observed_batch
@@ -2227,12 +2692,15 @@ def _profile_login_transaction(
                 browser_login=browser_login,
             )
 
-            def child_started(pid: int, start: str) -> None:
+            def child_started(pid: int, start: str, pgid: int) -> None:
+                if pgid != pid:
+                    raise ValueError("provider login must own a detached process group")
                 journal.update(
                     {
                         "login_started": True,
                         "login_pid": pid,
                         "login_start": start,
+                        "login_pgid": pgid,
                     }
                 )
                 _write_journal(journal_path, journal, "login-running")
@@ -2240,6 +2708,7 @@ def _profile_login_transaction(
             status = controls.login(argv, _login_environment(stage), stage.home, child_started)
             journal.pop("login_pid", None)
             journal.pop("login_start", None)
+            journal.pop("login_pgid", None)
             _write_journal(journal_path, journal, "login-finished")
             if status != 0:
                 raise ValueError("provider login did not complete successfully")
@@ -2403,13 +2872,47 @@ def _profile_login_transaction(
                 journal["provisional_snapshot_ready"] = True
                 _record_stage_manifest(stage.home, journal)
                 _write_journal(journal_path, journal, "provisional-backup-ready")
-                atomic_write_json(
-                    _provisional_path(current, target.provider),
+                provisional_path = _provisional_path(current, target.provider)
+                provisional_guard = _provisional_guard_path(current, target.provider)
+                guard_payload = _provisional_guard_payload(
+                    current,
+                    target.provider,
                     updated_batch,
                 )
-                atomic_write_json(
-                    _provisional_guard_path(current, target.provider),
-                    _provisional_guard_payload(current, target.provider, updated_batch),
+                journal["provisional_forward_sha256"] = _json_payload_sha256(
+                    updated_batch
+                )
+                journal["provisional_guard_forward_sha256"] = _json_payload_sha256(
+                    guard_payload
+                )
+                _write_journal(
+                    journal_path,
+                    journal,
+                    "provisional-install-authorized",
+                )
+                _require_snapshot_original(
+                    provisional_path,
+                    existed=bool(journal["provisional_existed"]),
+                    key="provisional",
+                    label="provider provisional identity batch",
+                    journal=journal,
+                )
+                atomic_write_json(provisional_path, updated_batch)
+                journal["provisional_forward_generation"] = _file_generation(
+                    provisional_path,
+                    "transaction-installed provider provisional identity batch",
+                )
+                _require_snapshot_original(
+                    provisional_guard,
+                    existed=bool(journal["provisional_guard_existed"]),
+                    key="provisional_guard",
+                    label="provider initialization locator",
+                    journal=journal,
+                )
+                atomic_write_json(provisional_guard, guard_payload)
+                journal["provisional_guard_forward_generation"] = _file_generation(
+                    provisional_guard,
+                    "transaction-installed provider initialization locator",
                 )
                 persisted_batch = updated_batch
                 _write_journal(journal_path, journal, "provisional-installed")
@@ -2420,16 +2923,43 @@ def _profile_login_transaction(
                 journal["bundle_snapshot_ready"] = True
                 _record_stage_manifest(stage.home, journal)
                 _write_journal(journal_path, journal, "bundle-backup-ready")
-                controls.adopt_bundle(
+                adopted_at = utc_now()
+                planned_bundle = build_provider_identity_bundle(
                     current,
                     target.provider,
                     proofs,
-                    allow_keychain_prompt,
+                    allow_keychain_prompt=allow_keychain_prompt,
+                    adopted_at=adopted_at,
+                )
+                journal["bundle_forward_sha256"] = _json_payload_sha256(planned_bundle)
+                _write_journal(journal_path, journal, "bundle-install-authorized")
+                bundle_path = identity_bundle_path(current, target.provider)
+
+                def require_bundle_snapshot_original() -> None:
+                    _require_snapshot_original(
+                        bundle_path,
+                        existed=bool(journal["bundle_existed"]),
+                        key="bundle",
+                        label="provider identity bundle",
+                        journal=journal,
+                    )
+
+                installed_bundle = controls.install_bundle(
+                    current,
+                    target.provider,
+                    planned_bundle,
+                    require_bundle_snapshot_original,
+                )
+                if installed_bundle != planned_bundle:
+                    raise ValueError(
+                        "provider identity bundle installation changed from its authorized plan"
+                    )
+                journal["bundle_forward_generation"] = _file_generation(
+                    bundle_path,
+                    "transaction-installed provider identity bundle",
                 )
                 _write_journal(journal_path, journal, "binding-installed")
                 if workflow == "initialize":
-                    provisional_path = _provisional_path(current, target.provider)
-                    provisional_guard = _provisional_guard_path(current, target.provider)
                     _private_file(
                         provisional_path,
                         "completed provider provisional identity batch",
@@ -2438,8 +2968,37 @@ def _profile_login_transaction(
                         provisional_guard,
                         "completed provider initialization locator",
                     )
+                    journal["provisional_forward_absent"] = True
+                    journal["provisional_guard_forward_absent"] = True
+                    _write_journal(
+                        journal_path,
+                        journal,
+                        "provisional-remove-authorized",
+                    )
+                    provisional_state, _ = _snapshot_state(
+                        provisional_path,
+                        existed=bool(journal["provisional_existed"]),
+                        key="provisional",
+                        label="provider provisional identity batch",
+                        journal=journal,
+                    )
+                    if provisional_state != "forward":
+                        raise ValueError(
+                            "provider provisional identity batch changed before removal"
+                        )
                     provisional_path.unlink()
                     _fsync(provisional_path.parent)
+                    guard_state, _ = _snapshot_state(
+                        provisional_guard,
+                        existed=bool(journal["provisional_guard_existed"]),
+                        key="provisional_guard",
+                        label="provider initialization locator",
+                        journal=journal,
+                    )
+                    if guard_state != "forward":
+                        raise ValueError(
+                            "provider initialization locator changed before removal"
+                        )
                     provisional_guard.unlink()
                     _fsync(provisional_guard.parent)
                     persisted_batch = None
@@ -2460,6 +3019,8 @@ def _profile_login_transaction(
             _clean_exact_temporaries(paths)
             _cleanup_keychain(
                 controls,
+                target,
+                paths,
                 journal_path,
                 journal,
                 committed=True,
@@ -2535,6 +3096,7 @@ def _profile_login_transaction(
                     initial.provider,
                     hooks=controls,
                     allow_current_owner=True,
+                    retain_committed_receipts=True,
                 )
             except BaseException:
                 rollback_complete = False

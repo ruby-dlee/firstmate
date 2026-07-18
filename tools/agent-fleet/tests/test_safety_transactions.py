@@ -17,8 +17,13 @@ import agent_fleet.cli as cli_module
 import agent_fleet.quota as quota_module
 import agent_fleet.scheduler as scheduler_module
 from agent_fleet import enrollment, identity, leases, locks, util
-from agent_fleet.config import load_registry, save_registry
-from agent_fleet.cooldowns import cooldown_path
+from agent_fleet.config import (
+    load_registry,
+    save_registry,
+    set_profile_enabled,
+    set_profile_safety_policy,
+)
+from agent_fleet.cooldowns import clear_cooldown, cooldown_path, set_cooldown
 from agent_fleet.enrollment import (
     activate_codex_promotion,
     create_codex_login_stage,
@@ -51,6 +56,7 @@ from agent_fleet.quota import (
     read_quota,
     snapshot_quota_cache,
 )
+from agent_fleet.recovery import recover_pending_profile_recoveries
 from agent_fleet.scheduler import select_and_acquire
 from agent_fleet.util import atomic_write_json
 
@@ -175,6 +181,27 @@ def _enable_and_provision(registry, config: Path, profile_id: str):
     registry = load_registry(config)
     provision_profile(registry, registry.require_profile(profile_id))
     return registry
+
+
+def _write_pending_credential_journal(
+    registry,
+    provider: str,
+    profile_id: str,
+) -> Path:
+    root = registry.settings.state_dir / "transactions" / "credential-recovery"
+    ensure_private_dir(root)
+    path = root / f"{provider}-{profile_id}.json"
+    atomic_write_json(
+        path,
+        {
+            "schema": 1,
+            "kind": "credential-recovery",
+            "provider": provider,
+            "profile": profile_id,
+            "journal": str(path),
+        },
+    )
+    return path
 
 
 def _prepared_codex_transaction(registry):
@@ -461,6 +488,73 @@ def test_dry_run_selection_never_enters_mutating_state_lock(
     assert selected["dry_run"] is True
     assert selected["workspace"] == str(Path.cwd())
     assert _state_snapshot(registry.settings.state_dir) == state_before
+
+
+def test_pending_credential_journal_fences_control_plane_after_policy_drift(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    journal_path = _write_pending_credential_journal(registry, "codex", "codex-1")
+
+    with pytest.raises(ValueError, match="blocks profile selection"):
+        select_and_acquire(
+            registry,
+            task="pending-credential-dry-run",
+            pool="codex-crew",
+            profile_id="codex-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+    with pytest.raises(ValueError, match="blocks profile enablement change"):
+        set_profile_enabled(registry, "codex-1", True)
+    with pytest.raises(ValueError, match="blocks profile safety-policy change"):
+        set_profile_safety_policy(registry, "codex-1", "manual_only")
+    with pytest.raises(ValueError, match="blocks routing cooldown mutation"):
+        set_cooldown(registry, "codex-1", seconds=60, reason="test fence")
+    with pytest.raises(ValueError, match="blocks routing cooldown mutation"):
+        clear_cooldown(registry, "codex-1")
+    with pytest.raises(ValueError, match="blocks registry mutation"):
+        cli_module._mutate(registry, lambda current: current, config)
+    with (
+        pytest.raises(ValueError, match="blocks provider maintenance"),
+        cli_module._provider_maintenance(registry, config, {"codex"}),
+    ):
+        pass
+    with pytest.raises(ValueError, match="blocks provider enrollment"):
+        cli_module._run_profile_enrollment(
+            registry,
+            registry.require_profile("codex-1"),
+            config,
+        )
+
+    profiles = dict(registry.profiles)
+    profiles["codex-1"] = replace(
+        profiles["codex-1"],
+        enabled=False,
+        pools=("codex-manual",),
+        safety_policy="manual_only",
+    )
+    save_registry(replace(registry, profiles=profiles), config)
+    drifted = load_registry(config)
+    with pytest.raises(ValueError, match="blocks profile selection"):
+        select_and_acquire(
+            drifted,
+            task="policy-hidden-pending-credential",
+            pool="codex-crew",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+    with (
+        provider_enrollment_lock(
+            drifted.settings.state_dir,
+            "codex",
+            drifted.settings.lock_stale_seconds,
+        ),
+        pytest.raises(ValueError, match="hidden by profile topology drift"),
+    ):
+        recover_pending_profile_recoveries(drifted, "codex")
+    assert journal_path.exists()
 
 
 def test_lease_creation_and_binding_require_process_start_tokens(

@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from .models import Registry
-from .util import atomic_write_json, read_private_json, unlink_private_file, utc_now, validate_id
+from .transaction_fence import assert_no_pending_credential_recovery
+from .util import (
+    atomic_write_json,
+    read_private_json,
+    unlink_private_file,
+    utc_now,
+    validate_id,
+)
 
 
 def cooldown_path(registry: Registry, profile_id: str) -> Path:
@@ -50,6 +57,12 @@ def set_cooldown(
     reason: str,
 ) -> dict[str, Any]:
     validate_id(profile_id, "profile id")
+    profile = registry.require_profile(profile_id)
+    assert_no_pending_credential_recovery(
+        registry,
+        {profile.provider},
+        operation="routing cooldown mutation",
+    )
     if seconds < 1 or seconds > 86_400:
         raise ValueError("cooldown seconds must be between 1 and 86400")
     if not reason or len(reason) > 128 or any(ord(char) < 32 for char in reason):
@@ -66,6 +79,12 @@ def set_cooldown(
 
 
 def clear_cooldown(registry: Registry, profile_id: str) -> dict[str, Any]:
+    profile = registry.require_profile(profile_id)
+    assert_no_pending_credential_recovery(
+        registry,
+        {profile.provider},
+        operation="routing cooldown mutation",
+    )
     path = cooldown_path(registry, profile_id)
     existed = unlink_private_file(path, label="cooldown state")
     return {"profile": profile_id, "cooldown_cleared": existed}

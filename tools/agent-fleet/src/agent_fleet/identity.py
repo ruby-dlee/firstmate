@@ -960,12 +960,13 @@ def _external_observation(registry: Registry, provider: str) -> dict[str, Any]:
     return _external_observation_from_snapshots(registry, provider, snapshots)
 
 
-def adopt_provider_identity_bundle(
+def build_provider_identity_bundle(
     registry: Registry,
     provider: str,
     proofs: dict[str, tuple[dict[str, Any], dict[str, Any]]],
     *,
     allow_keychain_prompt: bool = False,
+    adopted_at: str | None = None,
 ) -> dict[str, Any]:
     workers = sorted(
         (
@@ -1021,8 +1022,85 @@ def adopt_provider_identity_bundle(
         "provider": provider,
         "external": external,
         "workers": bindings,
-        "adopted_at": utc_now(),
+        "adopted_at": adopted_at or utc_now(),
     }
+    return payload
+
+
+def adopt_provider_identity_bundle(
+    registry: Registry,
+    provider: str,
+    proofs: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    allow_keychain_prompt: bool = False,
+    adopted_at: str | None = None,
+    before_install: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    payload = build_provider_identity_bundle(
+        registry,
+        provider,
+        proofs,
+        allow_keychain_prompt=allow_keychain_prompt,
+        adopted_at=adopted_at,
+    )
+    return install_provider_identity_bundle(
+        registry,
+        provider,
+        payload,
+        before_install=before_install,
+    )
+
+
+def install_provider_identity_bundle(
+    registry: Registry,
+    provider: str,
+    payload: dict[str, Any],
+    *,
+    before_install: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    workers = {
+        profile.id: profile
+        for profile in registry.profiles.values()
+        if profile.provider == provider and profile.safety_policy == "worker"
+    }
+    if (
+        set(payload) != {"schema", "provider", "external", "workers", "adopted_at"}
+        or payload.get("schema") != 1
+        or payload.get("provider") != provider
+        or not isinstance(payload.get("external"), dict)
+        or not isinstance(payload.get("workers"), dict)
+        or set(payload["workers"]) != set(workers)
+        or not isinstance(payload.get("adopted_at"), str)
+        or not payload["adopted_at"]
+    ):
+        raise ValueError("prepared provider identity bundle is invalid or drifted")
+    fingerprints: set[str] = set()
+    for profile_id, profile in workers.items():
+        binding = payload["workers"].get(profile_id)
+        if (
+            not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "profile",
+                "provider",
+                "stable_home",
+                "remote_fingerprint",
+                "credential_source_contract",
+            }
+            or binding.get("profile") != profile_id
+            or binding.get("provider") != provider
+            or binding.get("stable_home") != _stable_profile_home(profile)
+            or not isinstance(binding.get("remote_fingerprint"), str)
+            or len(binding["remote_fingerprint"]) != 64
+            or binding["remote_fingerprint"] in fingerprints
+            or not isinstance(binding.get("credential_source_contract"), dict)
+        ):
+            raise ValueError("prepared provider identity binding is invalid or drifted")
+        fingerprints.add(binding["remote_fingerprint"])
+    if payload["external"] != _external_observation(registry, provider):
+        raise ValueError("prepared provider external identity observation drifted")
+    if before_install is not None:
+        before_install()
     atomic_write_json(identity_bundle_path(registry, provider), payload)
     return payload
 

@@ -143,6 +143,8 @@ Its only external-identity access is the existing read-only fingerprint anchor c
 It is not initial enrollment and it cannot replace a worker with a different account.
 Before any provider action it requires an existing identity binding, every same-provider worker disabled, zero same-provider worker leases, zero continuable same-provider session mappings, the exact registry unchanged, and the target provisioned against its sealed provider binary.
 The provider maintenance lock stays held through staged login, local promotion, whole-provider verification, commit, and cleanup.
+The provider login itself is launched in a detached session and process group; its PID, process-start token, and PGID are journaled before exec is released.
+Restart recovery refuses while either that exact authority process or any member of its process group remains live or indeterminate.
 
 Codex defaults to its device flow and never uses the base/Desktop home:
 
@@ -174,9 +176,14 @@ Recovery never auto-enables routing.
 
 The transaction can restore the previous local file or exact scoped-Keychain generation after an error or process crash.
 Rollback generations, Keychain cleanup, metadata restoration, and staged-home quarantine are separately journaled so another process crash during recovery resumes the same exact generation without discarding the rollback source or orphaning credential-bearing state.
+Bundle, provisional-manifest, and locator rollback accept only the exact snapshotted generation or the exact transaction-planned generation, with a final compare immediately before every replace or removal; unknown drift is preserved and refused.
 It cannot undo provider-side token family rotation or revocation caused by the provider login itself.
 On any such failure, keep the provider disabled, preserve unaffected worker credentials, and complete worker-set recovery before the enable gate.
 Never use provider logout as cleanup.
+
+Pending credential journals are discovered directly from the private transaction root rather than from the current worker list.
+They fence routing selection (including dry-run choice), enablement, policy changes, cooldown changes, enrollment, and provider maintenance even if registry policy drift would otherwise hide the worker.
+If a process died after the transaction was durably committed, repeating the explicit command performs fresh whole-provider verification and returns the committed result without invoking provider login or rotating another token.
 
 Fresh quota proofs are cached only after the credential and identity-binding transaction is durably committed.
 Any pre-commit error or crash restores the previous credential generation without changing quota cache bytes; blocked or unproved workers are never written as successful cache entries.

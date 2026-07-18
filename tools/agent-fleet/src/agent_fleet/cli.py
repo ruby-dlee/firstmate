@@ -84,6 +84,7 @@ from .sessions import (
     validate_turn_end_path,
 )
 from .status import pool_status, profile_status
+from .transaction_fence import assert_no_pending_credential_recovery
 from .util import validate_id
 
 
@@ -341,6 +342,10 @@ def _mutate(registry: Registry, operation: Callable[[Registry], Registry], path:
         current = load_registry(path)
         if current != registry:
             raise ValueError("registry changed before mutation; retry the command")
+        assert_no_pending_credential_recovery(
+            current,
+            operation="registry mutation",
+        )
         updated = operation(current)
         save_registry(updated, path)
         return updated
@@ -378,6 +383,11 @@ def _provider_maintenance(
                 for profile_id in require_disabled:
                     if current.require_profile(profile_id).enabled:
                         raise ValueError(f"disable {profile_id} before provider maintenance")
+                assert_no_pending_credential_recovery(
+                    current,
+                    providers,
+                    operation="provider maintenance",
+                )
             for provider in sorted(providers):
                 recover_pending_codex_transactions(current, provider)
             yield current
@@ -670,6 +680,11 @@ def _run_profile_enrollment(
                         f"refusing {profile.provider} login while any same-provider "
                         "Fleet lease is active"
                     )
+                assert_no_pending_credential_recovery(
+                    current,
+                    {profile.provider},
+                    operation="provider enrollment",
+                )
             recover_pending_codex_transactions(current, profile.provider)
             registry = current
             expected_registry = current
@@ -1205,6 +1220,11 @@ def _run(args: argparse.Namespace) -> Any | None:
             profile = registry.require_profile(args.profile_id)
             if profile.safety_policy != "worker":
                 raise ValueError("external reserve profiles do not have routing cooldown state")
+            assert_no_pending_credential_recovery(
+                registry,
+                {profile.provider},
+                operation="routing cooldown mutation",
+            )
             with state_lock(
                 registry.settings.state_dir,
                 registry.settings.lock_stale_seconds,

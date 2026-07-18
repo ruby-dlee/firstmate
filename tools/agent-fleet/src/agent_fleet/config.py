@@ -27,6 +27,7 @@ from .paths import (
     expand_lexical_path,
     expand_path,
 )
+from .transaction_fence import assert_no_pending_credential_recovery
 from .util import read_private_bytes, validate_id
 
 DEFAULT_QUOTA_RELEASE = "~/.local/libexec/agent-fleet/quota-axi/releases/0.1.6-da603d0d"
@@ -718,6 +719,11 @@ def _validate_profile_invariants(registry: Registry) -> None:
 
 def set_profile_enabled(registry: Registry, profile_id: str, enabled: bool) -> Registry:
     profile = registry.require_profile(profile_id)
+    assert_no_pending_credential_recovery(
+        registry,
+        {profile.provider},
+        operation="profile enablement change",
+    )
     if enabled and profile.safety_policy != "worker":
         raise ValueError(
             f"{profile.safety_policy} profile {profile.id} cannot be enabled for routing"
@@ -734,6 +740,11 @@ def set_profile_safety_policy(
         choices = ", ".join(PROFILE_SAFETY_POLICIES)
         raise ValueError(f"safety policy must be one of {choices}")
     profile = registry.require_profile(profile_id)
+    assert_no_pending_credential_recovery(
+        registry,
+        {profile.provider},
+        operation="profile safety-policy change",
+    )
     if profile.safety_policy != "worker" and safety_policy != profile.safety_policy:
         raise ValueError(
             f"{profile.safety_policy} classification is terminal for {profile.id}; "

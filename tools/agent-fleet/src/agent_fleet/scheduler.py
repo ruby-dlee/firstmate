@@ -35,6 +35,7 @@ from .quota import (
     store_quota,
 )
 from .routeability import source_attested_live_proofs
+from .transaction_fence import assert_no_pending_credential_recovery
 from .util import atomic_write_json, read_private_json, task_key
 
 
@@ -138,6 +139,10 @@ def _select_and_acquire(
     workspace: Path,
     config_path: Path | None = None,
 ) -> dict[str, Any]:
+    assert_no_pending_credential_recovery(
+        registry,
+        operation="profile selection",
+    )
     if profile_id is not None:
         requested = registry.require_profile(profile_id)
         if requested.safety_policy != "worker":

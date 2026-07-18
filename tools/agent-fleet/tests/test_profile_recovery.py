@@ -5,7 +5,9 @@ import json
 import os
 import pwd
 import signal
+import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -16,8 +18,8 @@ import pytest
 from agent_fleet import recovery
 from agent_fleet.config import load_registry, save_registry
 from agent_fleet.identity import (
-    adopt_provider_identity_bundle,
     identity_bundle_path,
+    install_provider_identity_bundle,
     read_identity_binding,
     refresh_provider_identity_anchors,
 )
@@ -129,6 +131,7 @@ class FakeRecovery:
         self.stable_fingerprint_override: dict[str, str] = {}
         self.proof_exception: str | None = None
         self.claude_file_login = False
+        self.proof_calls: list[str] = []
 
     def inspect(self, _registry: Registry, profile: Profile, _prompt: bool) -> dict[str, Any]:
         if profile.provider == "codex":
@@ -170,7 +173,7 @@ class FakeRecovery:
         self.login_calls.append((list(argv), dict(environment), cwd))
         start = process_start_token(os.getpid())
         assert start is not None
-        child_started(os.getpid(), start)
+        child_started(os.getpid(), start, os.getpid())
         if self.fail_login:
             return 9
         if environment.get("AGENT_FLEET_PROVIDER") == "codex":
@@ -198,6 +201,7 @@ class FakeRecovery:
         profile: Profile,
         prompt: bool,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self.proof_calls.append(profile.id)
         if self.proof_exception is not None:
             raise ValueError(self.proof_exception)
         if profile.id in self.fail_stable and "credential-recovery" not in str(profile.home):
@@ -230,17 +234,17 @@ class FakeRecovery:
         return None
 
     @staticmethod
-    def adopt(
+    def install_bundle(
         registry: Registry,
         provider: str,
-        proofs: dict[str, tuple[dict[str, Any], dict[str, Any]]],
-        prompt: bool,
+        payload: dict[str, Any],
+        before_install: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        return adopt_provider_identity_bundle(
+        return install_provider_identity_bundle(
             registry,
             provider,
-            proofs,
-            allow_keychain_prompt=prompt,
+            payload,
+            before_install=before_install,
         )
 
     def hooks(self) -> RecoveryHooks:
@@ -249,7 +253,7 @@ class FakeRecovery:
             inspect_source=self.inspect,
             prove=self.prove,
             refresh_anchors=self.refresh,
-            adopt_bundle=self.adopt,
+            install_bundle=self.install_bundle,
             keychain=self.keychain,
         )
 
@@ -331,6 +335,7 @@ DURABLE_RECOVERY_PHASES = [
     "credential-installed",
     "bundle-backup-running",
     "bundle-backup-ready",
+    "bundle-install-authorized",
     "binding-installed",
     "committed",
 ]
@@ -346,6 +351,28 @@ PRE_LOGIN_PHASES = {
     "stage-cache-ready",
     "stage-ready",
 }
+
+
+def _crash_transaction_at_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    transaction: Callable[[], object],
+    phase_to_crash: str,
+) -> None:
+    real_write = recovery._write_journal
+
+    def crash_after_phase(path: Path, journal: dict[str, Any], phase: str) -> None:
+        real_write(path, journal, phase)
+        if phase == phase_to_crash:
+            os._exit(91)
+
+    monkeypatch.setattr(recovery, "_write_journal", crash_after_phase)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional crash child
+        transaction()
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    monkeypatch.setattr(recovery, "_write_journal", real_write)
+    assert os.waitstatus_to_exitcode(status) == 91
 
 
 def test_codex_recovery_is_staged_device_login_and_leaves_routing_disabled(
@@ -1117,6 +1144,99 @@ def test_quota_cache_commit_contains_only_final_successful_worker_proofs(
     assert cached["verified_at"] == "2026-07-18T00:00:00+00:00"
 
 
+def test_committed_transaction_rerun_fresh_verifies_without_provider_login(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    forward = FakeRecovery(registry)
+    _crash_transaction_at_phase(
+        monkeypatch,
+        lambda: recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=forward.hooks(),
+        ),
+        "committed",
+    )
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    replay = FakeRecovery(reloaded)
+    result = recover_profile_login(
+        reloaded,
+        "codex-1",
+        config,
+        hooks=replay.hooks(),
+    )
+
+    assert replay.login_calls == []
+    assert replay.proof_calls == [
+        worker.id for worker in recovery._workers(reloaded, "codex")
+    ]
+    assert result["provider_login_invoked"] is False
+    assert result["replayed_committed_transaction"] is True
+    assert result["provider_ready"] is True
+    assert not list(
+        (reloaded.settings.state_dir / "transactions" / "credential-recovery").glob(
+            "*.json"
+        )
+    )
+
+
+def test_committed_replay_crash_retries_without_provider_login(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    _crash_transaction_at_phase(
+        monkeypatch,
+        lambda: recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=FakeRecovery(registry).hooks(),
+        ),
+        "committed",
+    )
+    _expire_abandoned_provider_lock(registry, "codex")
+    real_consume = recovery._consume_committed_receipt
+
+    def crash_before_receipt_consumption(*_args, **_kwargs) -> None:
+        os._exit(92)
+
+    monkeypatch.setattr(
+        recovery,
+        "_consume_committed_receipt",
+        crash_before_receipt_consumption,
+    )
+    replay_registry = load_registry(config)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional replay crash child
+        recover_profile_login(
+            replay_registry,
+            "codex-1",
+            config,
+            hooks=FakeRecovery(replay_registry).hooks(),
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 92
+    monkeypatch.setattr(recovery, "_consume_committed_receipt", real_consume)
+    _expire_abandoned_provider_lock(replay_registry, "codex")
+
+    final_registry = load_registry(config)
+    final_replay = FakeRecovery(final_registry)
+    result = recover_profile_login(
+        final_registry,
+        "codex-1",
+        config,
+        hooks=final_replay.hooks(),
+    )
+    assert final_replay.login_calls == []
+    assert result["replayed_committed_transaction"] is True
+    assert result["provider_login_invoked"] is False
+
+
 @pytest.mark.parametrize("crash_phase", DURABLE_RECOVERY_PHASES)
 def test_codex_sigkill_boundary_restart_is_locally_atomic(
     fleet: tuple[Registry, Path],
@@ -1610,6 +1730,214 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
 
 
 @pytest.mark.parametrize(
+    ("component", "snapshot_existed"),
+    [
+        ("bundle", True),
+        ("bundle", False),
+        ("provisional", True),
+        ("provisional", False),
+        ("provisional_guard", True),
+        ("provisional_guard", False),
+    ],
+)
+def test_metadata_rollback_rejects_unknown_generation_without_overwrite(
+    fleet: tuple[Registry, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+    snapshot_existed: bool,
+) -> None:
+    registry, config = _loaded(fleet)
+    provider = "codex"
+    if component == "bundle" and snapshot_existed:
+        target_id = "codex-1"
+        fake = FakeRecovery(registry)
+
+        def transaction() -> object:
+            return recover_profile_login(
+                registry,
+                target_id,
+                config,
+                hooks=fake.hooks(),
+            )
+
+        crash_phase = "binding-installed"
+        target = identity_bundle_path(registry, provider)
+    else:
+        registry, fake, first_id, second_id, _reserve = _two_worker_initialization_topology(
+            registry,
+            config,
+            provider,
+        )
+        fake.fail_stable.add(second_id)
+        if snapshot_existed or component == "bundle":
+            initialize_profile_login(registry, first_id, config, hooks=fake.hooks())
+            fake.fail_stable.clear()
+            target_id = second_id
+        else:
+            target_id = first_id
+
+        def transaction() -> object:
+            return initialize_profile_login(
+                registry,
+                target_id,
+                config,
+                hooks=fake.hooks(),
+            )
+
+        crash_phase = "binding-installed" if component == "bundle" else "provisional-installed"
+        target = {
+            "bundle": identity_bundle_path(registry, provider),
+            "provisional": recovery._provisional_path(registry, provider),
+            "provisional_guard": recovery._provisional_guard_path(registry, provider),
+        }[component]
+
+    _crash_transaction_at_phase(monkeypatch, transaction, crash_phase)
+    journal_path = next(
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
+            "*.json"
+        )
+    )
+    journal = read_private_json(journal_path, label="test credential recovery journal")
+    assert journal[f"{component}_existed"] is snapshot_existed
+    if component == "bundle":
+        unknown = read_private_json(target, label="test transaction-installed bundle")
+        unknown["external"] = {"provider": provider, "outside_transaction": True}
+    else:
+        unknown = {
+            "schema": 1,
+            "owner": "outside-transaction",
+            "component": component,
+        }
+    atomic_write_json(target, unknown)
+    unknown_bytes = target.read_bytes()
+    _expire_abandoned_provider_lock(registry, provider)
+
+    reloaded = load_registry(config)
+    with (
+        provider_enrollment_lock(
+            reloaded.settings.state_dir,
+            provider,
+            reloaded.settings.lock_stale_seconds,
+        ),
+        pytest.raises(ValueError, match="unknown generation"),
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            provider,
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+
+    assert target.read_bytes() == unknown_bytes
+    assert journal_path.exists()
+
+
+@pytest.mark.parametrize("snapshot_existed", [True, False])
+def test_metadata_rollback_immediate_cas_rejects_pre_replace_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_existed: bool,
+) -> None:
+    root = tmp_path / "metadata-cas"
+    root.mkdir(mode=0o700)
+    target = root / "target.json"
+    backup = root / "backup.json"
+    temporary = root / "restore.json"
+    journal_path = root / "journal.json"
+    original = {"schema": 1, "generation": "original"}
+    forward = {"schema": 1, "generation": "forward"}
+    unknown = {"schema": 1, "generation": "outside-transaction"}
+    if snapshot_existed:
+        atomic_write_json(target, original)
+        original_generation = recovery._file_generation(target, "test original metadata")
+        atomic_write_json(backup, original)
+    else:
+        original_generation = None
+    atomic_write_json(target, forward)
+    journal: dict[str, Any] = {
+        "bundle_original_generation": original_generation,
+        "bundle_forward_generation": recovery._file_generation(
+            target,
+            "test forward metadata",
+        ),
+    }
+    atomic_write_json(journal_path, journal)
+    real_write = recovery._write_recovery_journal
+    expected_phase = (
+        "bundle-restore-replace-authorized"
+        if snapshot_existed
+        else "bundle-restore-delete-authorized"
+    )
+
+    def inject_unknown_generation(
+        path: Path,
+        payload: dict[str, Any],
+        phase: str,
+    ) -> None:
+        real_write(path, payload, phase)
+        if phase == expected_phase:
+            atomic_write_json(target, unknown)
+
+    monkeypatch.setattr(
+        recovery,
+        "_write_recovery_journal",
+        inject_unknown_generation,
+    )
+    with pytest.raises(ValueError, match="changed immediately before rollback"):
+        recovery._restore_snapshot_file(
+            target=target,
+            backup=backup,
+            temporary=temporary,
+            existed=snapshot_existed,
+            key="bundle",
+            label="test provider identity bundle",
+            journal_path=journal_path,
+            journal=journal,
+        )
+
+    assert read_private_json(target, label="test raced metadata") == unknown
+
+
+def test_bundle_install_cas_runs_inside_atomic_writer_and_preserves_race(
+    fleet: tuple[Registry, Path],
+) -> None:
+    registry, config = _loaded(fleet)
+    fake = FakeRecovery(registry)
+    hooks = fake.hooks()
+    bundle = identity_bundle_path(registry, "codex")
+    unknown = {"schema": 1, "owner": "outside-transaction"}
+    rejected: list[str] = []
+
+    def racing_install(
+        current: Registry,
+        provider: str,
+        payload: dict[str, Any],
+        before_install: Callable[[], None] | None,
+    ) -> dict[str, Any]:
+        atomic_write_json(bundle, unknown)
+        try:
+            return hooks.install_bundle(
+                current,
+                provider,
+                payload,
+                before_install,
+            )
+        except ValueError as exc:
+            rejected.append(str(exc))
+            raise
+
+    with pytest.raises(ValueError, match="local_rollback=incomplete_fail_closed"):
+        recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=replace(hooks, install_bundle=racing_install),
+        )
+
+    assert rejected == ["provider identity bundle changed before transaction installation"]
+    assert read_private_json(bundle, label="test raced identity bundle") == unknown
+
+
+@pytest.mark.parametrize(
     "cleanup_crash",
     [
         "stage-quarantine-authorized",
@@ -1915,6 +2243,95 @@ def test_recovery_refuses_live_keychain_helper_then_converges_after_it_exits(
     assert not journal_path.exists()
 
 
+def test_provider_login_detached_group_fences_live_descendant_until_exit(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "provider-login-tree.py"
+    ownership = tmp_path / "provider-login-ownership.json"
+    descendant_started = tmp_path / "provider-login-descendant"
+    release = tmp_path / "provider-login-release"
+    script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import pathlib",
+                "import sys",
+                "import time",
+                "started = pathlib.Path(sys.argv[1])",
+                "release = pathlib.Path(sys.argv[2])",
+                "child = os.fork()",
+                "if child == 0:",
+                "    started.write_text(str(os.getpid()), encoding='utf-8')",
+                "    while not release.exists():",
+                "        time.sleep(0.01)",
+                "    os._exit(0)",
+                "while not release.exists():",
+                "    time.sleep(0.01)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    owner = os.fork()
+    if owner == 0:  # pragma: no cover - production-shaped login owner
+        def record_child(pid: int, start: str, pgid: int) -> None:
+            atomic_write_json(
+                ownership,
+                {"login_pid": pid, "login_start": start, "login_pgid": pgid},
+            )
+
+        try:
+            recovery._system_login(
+                [
+                    sys.executable,
+                    str(script),
+                    str(descendant_started),
+                    str(release),
+                ],
+                dict(os.environ),
+                tmp_path,
+                record_child,
+            )
+        except ValueError:
+            os._exit(93)
+        os._exit(0)
+
+    deadline = time.monotonic() + 10
+    while (
+        (not ownership.exists() or not descendant_started.exists())
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert ownership.exists()
+    assert descendant_started.exists()
+    journal = read_private_json(ownership, label="test provider login ownership")
+    leader = int(journal["login_pid"])
+    pgid = int(journal["login_pgid"])
+    assert pgid == leader
+    journal_path = tmp_path / "provider-login-recovery.json"
+    atomic_write_json(journal_path, journal)
+
+    with pytest.raises(ValueError, match="process group is still live"):
+        recovery._ensure_login_operation_quiescent(journal_path, journal)
+    os.kill(leader, signal.SIGKILL)
+    _, status = os.waitpid(owner, 0)
+    assert os.waitstatus_to_exitcode(status) == 93
+    with pytest.raises(ValueError, match="process group is still live"):
+        recovery._ensure_login_operation_quiescent(journal_path, journal)
+
+    atomic_write_bytes(release, b"release")
+    deadline = time.monotonic() + 10
+    while recovery._process_group_state(pgid) != "dead" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if recovery._process_group_state(pgid) != "dead":
+        os.killpg(pgid, signal.SIGKILL)
+    assert recovery._process_group_state(pgid) == "dead"
+    recovery._ensure_login_operation_quiescent(journal_path, journal)
+    assert "login_pid" not in journal
+    assert "login_start" not in journal
+    assert "login_pgid" not in journal
+
+
 def test_uncommitted_recovery_restart_after_stage_removal_needs_no_deleted_backup(
     fleet: tuple[Registry, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -2123,6 +2540,206 @@ def test_initialize_crash_between_bundle_adoption_and_provisional_removal_rolls_
     assert _old_auth(reloaded, second_id) == second_before
 
 
+@pytest.mark.parametrize("written_component", ["provisional", "provisional_guard"])
+def test_initialize_crash_after_planned_metadata_write_rolls_back(
+    fleet: tuple[Registry, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    written_component: str,
+) -> None:
+    registry, config = _loaded(fleet)
+    registry, fake, first_id, second_id, _reserve = _two_worker_initialization_topology(
+        registry,
+        config,
+        "codex",
+    )
+    fake.fail_stable.add(second_id)
+    initialize_profile_login(registry, first_id, config, hooks=fake.hooks())
+    fake.fail_stable.clear()
+    provisional = recovery._provisional_path(registry, "codex")
+    guard = recovery._provisional_guard_path(registry, "codex")
+    original_provisional = provisional.read_bytes()
+    original_guard = guard.read_bytes()
+    second_before = _old_auth(registry, second_id)
+    crash_target = provisional if written_component == "provisional" else guard
+    real_atomic_write = recovery.atomic_write_json
+
+    def crash_after_atomic_write(path: Path, payload: dict[str, Any]) -> None:
+        real_atomic_write(path, payload)
+        if path == crash_target:
+            os._exit(94)
+
+    monkeypatch.setattr(recovery, "atomic_write_json", crash_after_atomic_write)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional planned-generation crash
+        initialize_profile_login(registry, second_id, config, hooks=fake.hooks())
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 94
+    monkeypatch.setattr(recovery, "atomic_write_json", real_atomic_write)
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert not identity_bundle_path(reloaded, "codex").exists()
+    assert provisional.read_bytes() == original_provisional
+    assert guard.read_bytes() == original_guard
+    assert _old_auth(reloaded, second_id) == second_before
+
+
+def test_initialize_crash_after_planned_bundle_write_rolls_back(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    registry, fake, first_id, second_id, _reserve = _two_worker_initialization_topology(
+        registry,
+        config,
+        "codex",
+    )
+    fake.fail_stable.add(second_id)
+    initialize_profile_login(registry, first_id, config, hooks=fake.hooks())
+    fake.fail_stable.clear()
+    provisional = recovery._provisional_path(registry, "codex")
+    guard = recovery._provisional_guard_path(registry, "codex")
+    original_provisional = provisional.read_bytes()
+    original_guard = guard.read_bytes()
+    second_before = _old_auth(registry, second_id)
+    hooks = fake.hooks()
+
+    def crash_after_bundle_write(
+        current: Registry,
+        provider: str,
+        payload: dict[str, Any],
+        before_install: Callable[[], None] | None,
+    ) -> dict[str, Any]:
+        hooks.install_bundle(
+            current,
+            provider,
+            payload,
+            before_install,
+        )
+        os._exit(95)
+
+    crashing_hooks = replace(hooks, install_bundle=crash_after_bundle_write)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional planned-generation crash
+        initialize_profile_login(registry, second_id, config, hooks=crashing_hooks)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 95
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert not identity_bundle_path(reloaded, "codex").exists()
+    assert provisional.read_bytes() == original_provisional
+    assert guard.read_bytes() == original_guard
+    assert _old_auth(reloaded, second_id) == second_before
+
+
+def test_initialize_crash_between_provisional_deletes_rolls_back(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    registry, fake, first_id, second_id, _reserve = _two_worker_initialization_topology(
+        registry,
+        config,
+        "codex",
+    )
+    fake.fail_stable.add(second_id)
+    initialize_profile_login(registry, first_id, config, hooks=fake.hooks())
+    fake.fail_stable.clear()
+    provisional = recovery._provisional_path(registry, "codex")
+    guard = recovery._provisional_guard_path(registry, "codex")
+    original_provisional = provisional.read_bytes()
+    original_guard = guard.read_bytes()
+    second_before = _old_auth(registry, second_id)
+    real_unlink = Path.unlink
+
+    def crash_after_provisional_delete(path: Path, *args, **kwargs) -> None:
+        real_unlink(path, *args, **kwargs)
+        if path == provisional:
+            os._exit(96)
+
+    monkeypatch.setattr(Path, "unlink", crash_after_provisional_delete)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional metadata-removal crash
+        initialize_profile_login(registry, second_id, config, hooks=fake.hooks())
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 96
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert not identity_bundle_path(reloaded, "codex").exists()
+    assert provisional.read_bytes() == original_provisional
+    assert guard.read_bytes() == original_guard
+    assert _old_auth(reloaded, second_id) == second_before
+
+
+def test_non_macos_claude_file_install_refuses_pre_replace_generation_race(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, config = _loaded(fleet)
+    target = registry.require_profile("claude-1")
+    stable = target.home / ".credentials.json"
+    unknown = {"claudeAiOauth": {"accessToken": "outside-transaction"}}
+    fake = FakeRecovery(registry)
+    fake.claude_file_login = True
+    monkeypatch.setattr(recovery.sys, "platform", "linux")
+    real_write = recovery._write_journal
+
+    def race_after_prepare(path: Path, journal: dict[str, Any], phase: str) -> None:
+        real_write(path, journal, phase)
+        if phase == "credential-prepared":
+            atomic_write_json(stable, unknown)
+
+    monkeypatch.setattr(recovery, "_write_journal", race_after_prepare)
+    with pytest.raises(ValueError, match="local_rollback=incomplete_fail_closed"):
+        recover_profile_login(
+            registry,
+            "claude-1",
+            config,
+            browser_login=True,
+            hooks=fake.hooks(),
+        )
+
+    assert read_private_json(stable, label="test raced Claude credential") == unknown
+    assert list(
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
+            "*.json"
+        )
+    )
+
+
 def _prepare_claude_origin(
     registry: Registry,
     keychain: FileKeychain,
@@ -2159,6 +2776,75 @@ def _recover_crashed_claude(
             "claude",
             hooks=controls.hooks(),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt_value"),
+    [
+        ("keychain_account", "wrong-account"),
+        ("staged_service", "Claude Code"),
+        ("stable_service", "Claude Code-credentials"),
+        ("backup_service", "Claude Code-agent-fleet-backup"),
+    ],
+)
+def test_corrupt_claude_keychain_scope_journal_performs_no_keychain_operation(
+    fleet: tuple[Registry, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    corrupt_value: str,
+) -> None:
+    registry, config = _loaded(fleet)
+    keychain = FileKeychain(tmp_path / "scope-keychain")
+    _prepare_claude_origin(registry, keychain, "keychain")
+    forward = FakeRecovery(registry)
+    forward.keychain = keychain  # type: ignore[assignment]
+    _crash_transaction_at_phase(
+        monkeypatch,
+        lambda: recover_profile_login(
+            registry,
+            "claude-1",
+            config,
+            browser_login=True,
+            allow_keychain_prompt=True,
+            hooks=forward.hooks(),
+        ),
+        "credential-installed",
+    )
+    journal_path = next(
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
+            "*.json"
+        )
+    )
+    journal = read_private_json(journal_path, label="test Claude recovery journal")
+    journal[field] = corrupt_value
+    atomic_write_json(journal_path, journal)
+    keychain_before = {
+        path.name: path.read_bytes() for path in sorted(keychain.root.iterdir())
+    }
+    _expire_abandoned_provider_lock(registry, "claude")
+
+    reloaded = load_registry(config)
+    controls = FakeRecovery(reloaded)
+    controls.keychain = keychain  # type: ignore[assignment]
+    with (
+        provider_enrollment_lock(
+            reloaded.settings.state_dir,
+            "claude",
+            reloaded.settings.lock_stale_seconds,
+        ),
+        pytest.raises(ValueError, match="Keychain scope is not derived exactly"),
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "claude",
+            hooks=controls.hooks(),
+        )
+
+    assert {
+        path.name: path.read_bytes() for path in sorted(keychain.root.iterdir())
+    } == keychain_before
+    assert journal_path.exists()
 
 
 @pytest.mark.parametrize("crash_phase", DURABLE_RECOVERY_PHASES)
@@ -2393,6 +3079,27 @@ def test_security_keychain_exists_and_delete_ignore_hostile_environment(
     assert len(calls) == 2
     assert all(environment == expected_environment for _argv, environment, _cwd in calls)
     assert all(cwd == tmp_path for _argv, _environment, cwd in calls)
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        "Claude Code",
+        "Claude Code-credentials",
+        "Claude Code-credentials-default",
+        "Claude Code-credentials-1111111g",
+        "Claude Code-agent-fleet-backup",
+        "Claude Code-agent-fleet-backup-11111111",
+        "Claude Code-unrelated-11111111",
+    ],
+)
+def test_security_keychain_rejects_default_or_non_derived_service(
+    monkeypatch: pytest.MonkeyPatch,
+    service: str,
+) -> None:
+    monkeypatch.setattr(recovery, "_keychain_account", lambda: "fixture-user")
+    with pytest.raises(ValueError, match="unscoped Claude Keychain operation"):
+        SecurityKeychain().exists(service, "fixture-user")
 
 
 def test_security_keychain_rejects_untrusted_binary(tmp_path: Path) -> None:

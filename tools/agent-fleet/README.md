@@ -164,6 +164,8 @@ On macOS, Claude promotes only the staged home's uniquely suffixed `Claude Code-
 The unsuffixed/default Claude service, base homes, Desktop homes, browser sessions, and logout commands are never staging or promotion targets and are never changed or invoked by recovery.
 They are observed only through the existing read-only identity-anchor path needed for collision rejection.
 Keychain secret bytes travel only over an OS pipe and never enter argv, environment, journals, audit output, or command results.
+Every macOS Keychain operation uses the verified root-owned, executable, non-group/world-writable `/usr/bin/security` binary under a passwd-derived home and username plus a fixed system path and locale.
+During a transaction, each operation runs behind a detached gated helper whose PID, process-start token, and process group are durable before the helper is released; restart recovery refuses while that helper or group remains live or indeterminate.
 
 After local promotion, recovery freshly proves every same-provider worker in the same maintenance attempt.
 If all workers are valid and identity-distinct, the existing provider identity bundle is rebuilt under the same adoption semantics and the result points to the normal explicit enable gate.
@@ -171,6 +173,7 @@ If a peer worker is ejected or indeterminate, the repaired target remains disabl
 Recovery never auto-enables routing.
 
 The transaction can restore the previous local file or exact scoped-Keychain generation after an error or process crash.
+Rollback generations, Keychain cleanup, metadata restoration, and staged-home quarantine are separately journaled so another process crash during recovery resumes the same exact generation without discarding the rollback source or orphaning credential-bearing state.
 It cannot undo provider-side token family rotation or revocation caused by the provider login itself.
 On any such failure, keep the provider disabled, preserve unaffected worker credentials, and complete worker-set recovery before the enable gate.
 Never use provider logout as cleanup.

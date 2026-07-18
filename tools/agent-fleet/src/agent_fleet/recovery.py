@@ -32,7 +32,7 @@ from .identity import (
 from .leases import active_leases
 from .locks import provider_enrollment_lock, state_lock
 from .models import Profile, Registry
-from .paths import ensure_private_dir, open_private_dir
+from .paths import current_user_home, ensure_private_dir, open_private_dir
 from .providers import CONTROL_PATH, login_argv
 from .provision import PROVIDER_BINARY_MARKER_FILE, profile_is_provisioned, verified_provider_binary
 from .quota import (
@@ -71,14 +71,64 @@ class SecurityKeychain:
 
     binary = Path("/usr/bin/security")
 
-    def _prefix(self, operation: str, service: str, account: str) -> list[str]:
-        if not service.startswith("Claude Code-") or not account:
+    def _verified_binary(self) -> Path:
+        try:
+            metadata = self.binary.lstat()
+        except OSError as exc:
+            raise ValueError("macOS Keychain control is unavailable") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not os.access(self.binary, os.X_OK)
+        ):
+            raise ValueError("macOS Keychain control is unsafe")
+        return self.binary
+
+    def _execution_context(self) -> tuple[Path, str, Path, dict[str, str]]:
+        binary = self._verified_binary()
+        account = _keychain_account()
+        home = current_user_home()
+        environment = {
+            "HOME": str(home),
+            "USER": account,
+            "LOGNAME": account,
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+        }
+        return binary, account, home, environment
+
+    @staticmethod
+    def _prefix(
+        binary: Path,
+        operation: str,
+        service: str,
+        account: str,
+        expected_account: str,
+    ) -> list[str]:
+        if (
+            not service.startswith("Claude Code-")
+            or not account
+            or account != expected_account
+        ):
             raise ValueError("refusing an unscoped Claude Keychain operation")
-        return [str(self.binary), operation, "-s", service, "-a", account]
+        return [str(binary), operation, "-s", service, "-a", account]
 
     def exists(self, service: str, account: str) -> bool:
+        binary, expected_account, home, environment = self._execution_context()
         result = subprocess.run(
-            self._prefix("find-generic-password", service, account),
+            self._prefix(
+                binary,
+                "find-generic-password",
+                service,
+                account,
+                expected_account,
+            ),
+            env=environment,
+            cwd=home,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -91,8 +141,20 @@ class SecurityKeychain:
     def copy(self, source: str, destination: str, account: str) -> None:
         # `security -w` writes the secret only to the pipe. The destination
         # command receives it through stdin because -w is its final option.
+        binary, expected_account, home, environment = self._execution_context()
         reader = subprocess.Popen(
-            [*self._prefix("find-generic-password", source, account), "-w"],
+            [
+                *self._prefix(
+                    binary,
+                    "find-generic-password",
+                    source,
+                    account,
+                    expected_account,
+                ),
+                "-w",
+            ],
+            env=environment,
+            cwd=home,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -101,10 +163,18 @@ class SecurityKeychain:
         try:
             writer = subprocess.Popen(
                 [
-                    *self._prefix("add-generic-password", destination, account),
+                    *self._prefix(
+                        binary,
+                        "add-generic-password",
+                        destination,
+                        account,
+                        expected_account,
+                    ),
                     "-U",
                     "-w",
                 ],
+                env=environment,
+                cwd=home,
                 stdin=reader.stdout,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -121,8 +191,17 @@ class SecurityKeychain:
             raise ValueError("scoped Claude Keychain copy failed")
 
     def delete(self, service: str, account: str, *, missing_ok: bool = False) -> None:
+        binary, expected_account, home, environment = self._execution_context()
         result = subprocess.run(
-            self._prefix("delete-generic-password", service, account),
+            self._prefix(
+                binary,
+                "delete-generic-password",
+                service,
+                account,
+                expected_account,
+            ),
+            env=environment,
+            cwd=home,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -410,6 +489,172 @@ def _write_journal(path: Path, journal: dict[str, Any], phase: str) -> None:
     atomic_write_json(path, journal)
 
 
+def _write_recovery_journal(
+    path: Path,
+    journal: dict[str, Any],
+    recovery_phase: str,
+) -> None:
+    """Durably advance cleanup without destroying the forward transaction phase."""
+
+    journal["recovery_phase"] = recovery_phase
+    atomic_write_json(path, journal)
+
+
+class _JournaledKeychain:
+    """Run macOS Keychain operations behind a durably tracked gated helper."""
+
+    def __init__(
+        self,
+        delegate: SecurityKeychain,
+        journal_path: Path,
+        journal: dict[str, Any],
+    ) -> None:
+        self.delegate = delegate
+        self.journal_path = journal_path
+        self.journal = journal
+
+    def _run(
+        self,
+        operation: str,
+        source: str,
+        account: str,
+        *,
+        destination: str | None = None,
+        missing_ok: bool = False,
+    ) -> bool:
+        gate_read, gate_write = os.pipe()
+        result_read, result_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - exercised through kill/restart tests
+            try:
+                os.close(gate_write)
+                os.close(result_read)
+                os.setsid()
+                if os.read(gate_read, 1) != b"1":
+                    os._exit(126)
+                os.close(gate_read)
+                if operation == "exists":
+                    observed = self.delegate.exists(source, account)
+                    os.write(result_write, b"1" if observed else b"0")
+                elif operation == "copy" and destination is not None:
+                    self.delegate.copy(source, destination, account)
+                    os.write(result_write, b"1")
+                elif operation == "delete":
+                    self.delegate.delete(source, account, missing_ok=missing_ok)
+                    os.write(result_write, b"1")
+                else:
+                    os._exit(64)
+                os.close(result_write)
+                os._exit(0)
+            except BaseException:
+                os._exit(70)
+
+        os.close(gate_read)
+        os.close(result_write)
+        gate_open = True
+        try:
+            start = process_start_token(pid)
+            if start is None:
+                raise ValueError("could not establish Keychain helper process identity")
+            sequence = int(self.journal.get("keychain_operation_sequence", 0)) + 1
+            self.journal["keychain_operation_sequence"] = sequence
+            self.journal["keychain_operation"] = {
+                "pid": pid,
+                "start": start,
+                "pgid": pid,
+                "operation": operation,
+                "sequence": sequence,
+            }
+            _write_recovery_journal(
+                self.journal_path,
+                self.journal,
+                "keychain-operation-gated",
+            )
+            os.write(gate_write, b"1")
+            os.close(gate_write)
+            gate_open = False
+            result = bytearray()
+            while chunk := os.read(result_read, 64):
+                result.extend(chunk)
+            _, status = os.waitpid(pid, 0)
+            self.journal.pop("keychain_operation", None)
+            _write_recovery_journal(
+                self.journal_path,
+                self.journal,
+                "keychain-operation-finished",
+            )
+            if os.waitstatus_to_exitcode(status) != 0:
+                raise ValueError("scoped Claude Keychain helper failed")
+            return bytes(result) == b"1"
+        except BaseException:
+            if gate_open:
+                os.close(gate_write)
+                gate_open = False
+                with suppress(ChildProcessError):
+                    os.waitpid(pid, 0)
+            raise
+        finally:
+            if gate_open:
+                os.close(gate_write)
+            os.close(result_read)
+
+    def exists(self, service: str, account: str) -> bool:
+        return self._run("exists", service, account)
+
+    def copy(self, source: str, destination: str, account: str) -> None:
+        if not self._run("copy", source, account, destination=destination):
+            raise ValueError("scoped Claude Keychain copy returned no completion proof")
+
+    def delete(self, service: str, account: str, *, missing_ok: bool = False) -> None:
+        if not self._run("delete", service, account, missing_ok=missing_ok):
+            raise ValueError("scoped Claude Keychain deletion returned no completion proof")
+
+
+def _transactional_keychain(
+    control: KeychainControl,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> KeychainControl:
+    if isinstance(control, _JournaledKeychain):
+        control = control.delegate
+    if isinstance(control, SecurityKeychain):
+        return _JournaledKeychain(control, journal_path, journal)
+    return control
+
+
+def _ensure_keychain_operation_quiescent(
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    operation = journal.get("keychain_operation")
+    if operation is None:
+        return
+    if not isinstance(operation, dict):
+        raise ValueError("credential recovery journal has invalid Keychain operation state")
+    pid = operation.get("pid")
+    start = operation.get("start")
+    pgid = operation.get("pgid")
+    if not isinstance(pid, int) or not isinstance(start, str) or pgid != pid:
+        raise ValueError("credential recovery journal has invalid Keychain helper identity")
+    helper_state = process_identity_state(pid, start)
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        group_state = "dead"
+    except PermissionError:
+        group_state = "indeterminate"
+    else:
+        group_state = "live"
+    if helper_state != "dead" or group_state != "dead":
+        raise ValueError("scoped Claude Keychain operation is still live or indeterminate")
+    journal.pop("keychain_operation", None)
+    _write_recovery_journal(
+        journal_path,
+        journal,
+        "keychain-operation-quiesced",
+    )
+
+
 def _read_journal(registry: Registry, profile: Profile) -> tuple[Path, dict[str, Any]] | None:
     path = _journal_path_for_worker(registry, profile)
     try:
@@ -437,6 +682,7 @@ def _transaction_paths(
     stage = _stage_root(registry, profile.provider) / f".{profile.id}.login-{nonce}"
     return {
         "stage": str(stage),
+        "quarantine": str(stage.with_name(f".{stage.name}.cleanup-{nonce}")),
         "codex_backup": str(stage / ".stable-auth.backup"),
         "claude_file_backup": str(stage / ".stable-claude-auth.backup"),
         "bundle_backup": str(stage / ".identity-bundle.backup"),
@@ -444,6 +690,21 @@ def _transaction_paths(
         "provisional_guard_backup": str(stage / ".provisional-guard.backup"),
         "install_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.new"),
         "rollback_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.rollback"),
+        "bundle_restore_temp": str(
+            identity_bundle_path(registry, profile.provider).with_name(
+                f".{identity_bundle_path(registry, profile.provider).name}.rollback-{nonce}"
+            )
+        ),
+        "provisional_restore_temp": str(
+            _provisional_path(registry, profile.provider).with_name(
+                f".{_provisional_path(registry, profile.provider).name}.rollback-{nonce}"
+            )
+        ),
+        "provisional_guard_restore_temp": str(
+            _provisional_guard_path(registry, profile.provider).with_name(
+                f".{_provisional_guard_path(registry, profile.provider).name}.rollback-{nonce}"
+            )
+        ),
     }
 
 
@@ -515,10 +776,17 @@ def _prepare_stage(
     paths = _validate_paths(registry, profile, journal)
     stage = paths["stage"]
     ensure_private_dir(stage.parent)
+    if stage.exists() or stage.is_symlink():
+        raise ValueError("credential recovery stage already exists before construction")
+    _write_journal(journal_path, journal, "stage-create-authorized")
     stage.mkdir(mode=0o700)
     stage.chmod(0o700)
+    journal["stage_stat"] = _stat_payload(_private_directory(stage, "recovery stage"))
+    _write_journal(journal_path, journal, "stage-created")
     marker = stage / RECOVERY_MARKER
     atomic_write_json(marker, _stage_marker_payload(profile, str(journal["nonce"])))
+    journal["marker_stat"] = _stat_payload(_private_file(marker, "recovery stage marker"))
+    _write_journal(journal_path, journal, "stage-marker-ready")
     # These two non-secret markers let the sealed Quota runtime inspect and
     # prove the staged credential. Worker hooks, shared workflow links, project
     # trust, plugins, and provider history are deliberately absent.
@@ -531,19 +799,21 @@ def _prepare_stage(
             "provider": profile.provider,
         }, indent=2, sort_keys=True) + "\n").encode(),
     )
+    _write_journal(journal_path, journal, "stage-profile-ready")
     stable_binary_marker = profile.home / PROVIDER_BINARY_MARKER_FILE
     atomic_write_bytes(
         stage / PROVIDER_BINARY_MARKER_FILE,
         read_private_bytes(stable_binary_marker, label="managed provider binary marker"),
     )
+    _write_journal(journal_path, journal, "stage-binary-ready")
     if profile.provider == "codex":
         atomic_write_bytes(
             stage / "config.toml",
             b'cli_auth_credentials_store = "file"\n\n[features]\nhooks = false\n',
         )
+    _write_journal(journal_path, journal, "stage-config-ready")
     ensure_private_dir(stage / ".cache")
-    journal["stage_stat"] = _stat_payload(_private_directory(stage, "recovery stage"))
-    journal["marker_stat"] = _stat_payload(_private_file(marker, "recovery stage marker"))
+    _write_journal(journal_path, journal, "stage-cache-ready")
     _record_stage_manifest(stage, journal)
     _write_journal(journal_path, journal, "stage-ready")
     return replace(profile, home=stage, enabled=False)
@@ -615,19 +885,94 @@ def _record_stage_manifest(stage: Path, journal: dict[str, Any]) -> None:
     journal["stage_manifest"] = _stage_manifest(stage)
 
 
-def _remove_stage(profile: Profile, stage: Path, journal: dict[str, Any]) -> None:
-    _validate_stage(profile, stage, journal)
-    quarantine = stage.with_name(f".{stage.name}.cleanup-{journal['nonce']}")
-    if quarantine.exists() or quarantine.is_symlink():
-        raise ValueError("credential recovery cleanup quarantine already exists")
-    identity = (stage.lstat().st_dev, stage.lstat().st_ino)
-    os.replace(stage, quarantine)
-    moved = quarantine.lstat()
-    if (moved.st_dev, moved.st_ino) != identity:
-        raise ValueError("credential recovery stage changed during quarantine")
-    _validate_stage(profile, quarantine, journal)
-    shutil.rmtree(quarantine)
-    _fsync(quarantine.parent)
+def _validate_partial_stage_tree(stage: Path, expected: object | None) -> os.stat_result:
+    metadata = _private_directory(stage, "credential recovery cleanup tree")
+    if expected is not None and not all(
+        isinstance(expected, dict) and expected.get(field) == _stat_payload(metadata)[field]
+        for field in ("dev", "ino", "uid", "mode")
+    ):
+        raise ValueError("credential recovery cleanup tree identity changed")
+    for root, directories, files in os.walk(stage, followlinks=False):
+        root_path = Path(root)
+        for name in [*directories, *files]:
+            path = root_path / name
+            item = path.lstat()
+            if item.st_uid != os.getuid() or stat.S_IMODE(item.st_mode) & 0o077:
+                raise ValueError(f"unsafe entry in partial credential recovery stage: {path}")
+            if stat.S_ISDIR(item.st_mode):
+                continue
+            if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
+                raise ValueError(f"unsafe partial credential recovery stage entry: {path}")
+    return metadata
+
+
+def _remove_stage(
+    profile: Profile,
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    """Quarantine and remove a full or partially constructed stage idempotently."""
+
+    if journal.get("stage_cleanup_complete") is True:
+        return
+    stage = paths["stage"]
+    quarantine = paths["quarantine"]
+    stage_exists = stage.exists() or stage.is_symlink()
+    quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+    if stage_exists and quarantine_exists:
+        raise ValueError("credential recovery stage and quarantine both exist")
+    if not stage_exists and not quarantine_exists:
+        if stage.parent.exists() or stage.parent.is_symlink():
+            _fsync(stage.parent)
+        journal["stage_cleanup_complete"] = True
+        _write_recovery_journal(journal_path, journal, "stage-removed")
+        return
+
+    expected = journal.get("stage_cleanup_stat") or journal.get("stage_stat")
+    if stage_exists:
+        if expected is None:
+            # The only unbound crash window is immediately after mkdir and
+            # before the stage-created journal. No writer was yet authorized.
+            metadata = _validate_partial_stage_tree(stage, None)
+            if any(stage.iterdir()):
+                raise ValueError("unbound credential recovery stage is not empty")
+            expected = _stat_payload(metadata)
+            journal["stage_cleanup_stat"] = expected
+            _write_recovery_journal(journal_path, journal, "stage-cleanup-bound")
+        else:
+            _validate_partial_stage_tree(stage, expected)
+        if journal.get("stage_manifest") is not None:
+            _validate_stage(profile, stage, journal)
+        journal["stage_cleanup_stat"] = expected
+        _write_recovery_journal(journal_path, journal, "stage-quarantine-authorized")
+        os.replace(stage, quarantine)
+        _fsync(quarantine.parent)
+        moved = _validate_partial_stage_tree(quarantine, expected)
+        journal["quarantine_stat"] = _stat_payload(moved)
+        _write_recovery_journal(journal_path, journal, "stage-quarantined")
+        quarantine_exists = True
+
+    if quarantine_exists:
+        _fsync(quarantine.parent)
+        expected = journal.get("stage_cleanup_stat") or journal.get("stage_stat")
+        removal_started = journal.get("stage_removal_started") is True
+        moved = _validate_partial_stage_tree(quarantine, expected)
+        if journal.get("quarantine_stat") is None:
+            journal["quarantine_stat"] = _stat_payload(moved)
+            _write_recovery_journal(journal_path, journal, "stage-quarantined")
+        if journal.get("stage_manifest") is not None and not removal_started:
+            _validate_stage(profile, quarantine, journal)
+        journal["stage_removal_started"] = True
+        _write_recovery_journal(
+            journal_path,
+            journal,
+            "stage-quarantine-remove-authorized",
+        )
+        shutil.rmtree(quarantine)
+        _fsync(quarantine.parent)
+    journal["stage_cleanup_complete"] = True
+    _write_recovery_journal(journal_path, journal, "stage-removed")
 
 
 def _claude_service(home: Path) -> str:
@@ -953,59 +1298,149 @@ def _snapshot_provisional(
         _copy_private_file(guard, paths["provisional_guard_backup"])
 
 
+def _restore_snapshot_file(
+    *,
+    target: Path,
+    backup: Path,
+    temporary: Path,
+    existed: bool,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    """Restore one private snapshot through a restart-idempotent generation."""
+
+    complete_key = f"{key}_restore_complete"
+    restored_key = f"{key}_restored_stat"
+    prepared_key = f"{key}_restore_prepared_stat"
+    if journal.get(complete_key) is True:
+        if existed:
+            if not _same_stat(target, journal.get(restored_key), ctime=False):
+                raise ValueError(f"{label} changed after rollback completed")
+        elif target.exists() or target.is_symlink():
+            raise ValueError(f"{label} appeared after rollback completed")
+        return
+
+    if not existed:
+        if target.exists() or target.is_symlink():
+            _private_file(target, f"transaction-created {label}")
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                f"{key}-restore-delete-authorized",
+            )
+            target.unlink()
+            _fsync(target.parent)
+        else:
+            _fsync(target.parent)
+        journal[complete_key] = True
+        _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+        return
+
+    prepared = journal.get(prepared_key)
+    target_is_prepared = prepared is not None and _same_stat(
+        target,
+        prepared,
+        ctime=False,
+    )
+    if target_is_prepared:
+        if temporary.exists() or temporary.is_symlink():
+            raise ValueError(f"{label} rollback generation exists at two paths")
+        _fsync(target.parent)
+    else:
+        if prepared is None:
+            if temporary.exists() or temporary.is_symlink():
+                _private_file(temporary, f"partial {label} rollback temporary")
+                temporary.unlink()
+                _fsync(temporary.parent)
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                f"{key}-restore-copy-running",
+            )
+            _private_file(backup, f"{label} backup")
+            _copy_private_file(backup, temporary)
+            prepared = _stat_payload(
+                _private_file(temporary, f"prepared {label} rollback generation")
+            )
+            journal[prepared_key] = prepared
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                f"{key}-restore-prepared",
+            )
+        elif not _same_stat(temporary, prepared, ctime=False):
+            raise ValueError(f"prepared {label} rollback generation changed")
+
+        _write_recovery_journal(
+            journal_path,
+            journal,
+            f"{key}-restore-replace-authorized",
+        )
+        os.replace(temporary, target)
+        _fsync(target.parent)
+
+    journal[restored_key] = _stat_payload(_private_file(target, f"restored {label}"))
+    journal[complete_key] = True
+    _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+
+
 def _restore_provisional(
     registry: Registry,
     provider: str,
     paths: dict[str, Path],
+    journal_path: Path,
     journal: dict[str, Any],
 ) -> None:
     path = _provisional_path(registry, provider)
     guard = _provisional_guard_path(registry, provider)
-    if journal.get("provisional_existed") is True:
-        backup = paths["provisional_backup"]
-        _private_file(backup, "provider provisional identity backup")
-        temporary = path.with_name(f".{path.name}.rollback-{journal['nonce']}")
-        if temporary.exists() or temporary.is_symlink():
-            raise ValueError("provisional identity rollback temporary already exists")
-        _copy_private_file(backup, temporary)
-        os.replace(temporary, path)
-        _fsync(path.parent)
-    elif journal.get("provisional_existed") is False and (path.exists() or path.is_symlink()):
-        _private_file(path, "transaction-created provisional identity batch")
-        path.unlink()
-        _fsync(path.parent)
-    if journal.get("provisional_guard_existed") is True:
-        backup = paths["provisional_guard_backup"]
-        _private_file(backup, "provider initialization locator backup")
-        temporary = guard.with_name(f".{guard.name}.rollback-{journal['nonce']}")
-        if temporary.exists() or temporary.is_symlink():
-            raise ValueError("initialization locator rollback temporary already exists")
-        _copy_private_file(backup, temporary)
-        os.replace(temporary, guard)
-        _fsync(guard.parent)
-    elif journal.get("provisional_guard_existed") is False and (
-        guard.exists() or guard.is_symlink()
-    ):
-        _private_file(guard, "transaction-created provider initialization locator")
-        guard.unlink()
-        _fsync(guard.parent)
+    provisional_existed = journal.get("provisional_existed")
+    guard_existed = journal.get("provisional_guard_existed")
+    if not isinstance(provisional_existed, bool) or not isinstance(guard_existed, bool):
+        raise ValueError("provider provisional snapshot state is incomplete")
+    _restore_snapshot_file(
+        target=path,
+        backup=paths["provisional_backup"],
+        temporary=paths["provisional_restore_temp"],
+        existed=provisional_existed,
+        key="provisional",
+        label="provider provisional identity batch",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    _restore_snapshot_file(
+        target=guard,
+        backup=paths["provisional_guard_backup"],
+        temporary=paths["provisional_guard_restore_temp"],
+        existed=guard_existed,
+        key="provisional_guard",
+        label="provider initialization locator",
+        journal_path=journal_path,
+        journal=journal,
+    )
 
 
-def _restore_bundle(registry: Registry, paths: dict[str, Path], journal: dict[str, Any]) -> None:
+def _restore_bundle(
+    registry: Registry,
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
     bundle = identity_bundle_path(registry, str(journal["provider"]))
-    if journal.get("bundle_existed") is True:
-        backup = paths["bundle_backup"]
-        _private_file(backup, "provider identity bundle backup")
-        temporary = bundle.with_name(f".{bundle.name}.rollback-{journal['nonce']}")
-        if temporary.exists() or temporary.is_symlink():
-            raise ValueError("identity bundle rollback temporary already exists")
-        _copy_private_file(backup, temporary)
-        os.replace(temporary, bundle)
-        _fsync(bundle.parent)
-    elif journal.get("bundle_existed") is False and (bundle.exists() or bundle.is_symlink()):
-        _private_file(bundle, "transaction-created provider identity bundle")
-        bundle.unlink()
-        _fsync(bundle.parent)
+    bundle_existed = journal.get("bundle_existed")
+    if not isinstance(bundle_existed, bool):
+        raise ValueError("provider identity bundle snapshot state is incomplete")
+    _restore_snapshot_file(
+        target=bundle,
+        backup=paths["bundle_backup"],
+        temporary=paths["bundle_restore_temp"],
+        existed=bundle_existed,
+        key="bundle",
+        label="provider identity bundle",
+        journal_path=journal_path,
+        journal=journal,
+    )
 
 
 def _identity_fingerprint(proof: dict[str, Any], profile: Profile) -> str:
@@ -1321,47 +1756,103 @@ def _rollback_file_credential(
     stable_name: str,
     backup: Path,
     paths: dict[str, Path],
+    journal_path: Path,
     journal: dict[str, Any],
+    *,
+    allow_absent_forward: bool = False,
 ) -> None:
     stable = target.home / stable_name
     original = journal.get("original_credential_stat")
     installed = journal.get("installed_credential_stat") or journal.get(
         "prepared_credential_stat"
     )
-    current_original = _same_stat(stable, original) if original is not None else not stable.exists()
-    current_installed = _same_stat(stable, installed, ctime=False) if installed else False
-    if current_original:
-        return
-    if not current_installed:
-        raise ValueError("stable credential changed outside the recovery transaction")
+    restored = journal.get("rollback_file_installed_stat")
     if original is None:
+        if not (stable.exists() or stable.is_symlink()):
+            _fsync(target.home)
+            return
+        if not (installed and _same_stat(stable, installed, ctime=False)):
+            raise ValueError("stable credential changed outside the recovery transaction")
+        _write_recovery_journal(journal_path, journal, "rollback-file-delete-authorized")
         stable.unlink()
-    else:
-        _private_file(backup, "credential recovery backup")
-        rollback = paths["rollback_temp"]
+        _fsync(target.home)
+        journal["rollback_file_deleted"] = True
+        _write_recovery_journal(journal_path, journal, "rollback-file-installed")
+        return
+    if _same_stat(stable, original):
+        return
+    if restored is not None and _same_stat(stable, restored, ctime=False):
+        return
+
+    rollback = paths["rollback_temp"]
+    prepared = journal.get("rollback_file_prepared_stat")
+    if prepared is not None and _same_stat(stable, prepared, ctime=False):
         if rollback.exists() or rollback.is_symlink():
-            _private_file(rollback, "credential rollback temporary")
+            raise ValueError("rollback generation exists at both stable and temporary paths")
+        _fsync(target.home)
+        journal["rollback_file_installed_stat"] = _stat_payload(
+            _private_file(stable, "restored credential generation")
+        )
+        _write_recovery_journal(journal_path, journal, "rollback-file-installed")
+        return
+
+    current_forward = bool(installed and _same_stat(stable, installed, ctime=False))
+    if not current_forward and not (
+        allow_absent_forward and not (stable.exists() or stable.is_symlink())
+    ):
+        raise ValueError("stable credential changed outside the recovery transaction")
+
+    if prepared is None:
+        if rollback.exists() or rollback.is_symlink():
+            _private_file(rollback, "partial credential rollback temporary")
             rollback.unlink()
+            _fsync(rollback.parent)
+        _write_recovery_journal(journal_path, journal, "rollback-file-copy-running")
+        _private_file(backup, "credential recovery backup")
         _copy_private_file(backup, rollback)
-        os.replace(rollback, stable)
+        journal["rollback_file_prepared_stat"] = _stat_payload(
+            _private_file(rollback, "prepared credential rollback generation")
+        )
+        _write_recovery_journal(journal_path, journal, "rollback-file-prepared")
+    else:
+        if not _same_stat(rollback, prepared, ctime=False):
+            raise ValueError("prepared credential rollback generation changed")
+
+    _write_recovery_journal(journal_path, journal, "rollback-file-replace-authorized")
+    os.replace(rollback, stable)
     _fsync(target.home)
+    journal["rollback_file_installed_stat"] = _stat_payload(
+        _private_file(stable, "restored credential generation")
+    )
+    _write_recovery_journal(journal_path, journal, "rollback-file-installed")
 
 
 def _rollback_local_credential(
     hooks: RecoveryHooks,
     target: Profile,
     paths: dict[str, Path],
+    journal_path: Path,
     journal: dict[str, Any],
 ) -> None:
+    if journal.get("local_credential_rollback_complete") is True:
+        return
     kind = journal.get("credential_kind")
     if kind == "codex-file":
-        _rollback_file_credential(target, CODEX_AUTH, paths["codex_backup"], paths, journal)
+        _rollback_file_credential(
+            target,
+            CODEX_AUTH,
+            paths["codex_backup"],
+            paths,
+            journal_path,
+            journal,
+        )
     elif kind == "claude-file":
         _rollback_file_credential(
             target,
             CLAUDE_AUTH,
             paths["claude_file_backup"],
             paths,
+            journal_path,
             journal,
         )
     elif kind == "claude-keychain":
@@ -1372,32 +1863,48 @@ def _rollback_local_credential(
         backup_ready = phase not in {
             "credential-backup-running",
         }
-        if journal.get("stable_keychain_existed") is True:
-            if backup_ready:
-                if not hooks.keychain.exists(backup_service, account):
-                    raise ValueError("Claude Keychain rollback generation is unavailable")
-                hooks.keychain.copy(backup_service, stable_service, account)
-            elif not hooks.keychain.exists(stable_service, account):
-                raise ValueError("original scoped Claude Keychain item changed during backup")
-        elif backup_ready:
-            hooks.keychain.delete(stable_service, account, missing_ok=True)
-        elif hooks.keychain.exists(stable_service, account):
-            raise ValueError("stable scoped Claude Keychain item appeared during backup")
+        if journal.get("keychain_rollback_complete") is not True:
+            _write_recovery_journal(journal_path, journal, "rollback-keychain-running")
+            if journal.get("stable_keychain_existed") is True:
+                if backup_ready:
+                    if not hooks.keychain.exists(backup_service, account):
+                        raise ValueError("Claude Keychain rollback generation is unavailable")
+                    hooks.keychain.copy(backup_service, stable_service, account)
+                    if not hooks.keychain.exists(stable_service, account):
+                        raise ValueError("restored scoped Claude Keychain item is unavailable")
+                elif not hooks.keychain.exists(stable_service, account):
+                    raise ValueError("original scoped Claude Keychain item changed during backup")
+            elif backup_ready:
+                hooks.keychain.delete(stable_service, account, missing_ok=True)
+            elif hooks.keychain.exists(stable_service, account):
+                raise ValueError("stable scoped Claude Keychain item appeared during backup")
+            journal["keychain_rollback_complete"] = True
+            _write_recovery_journal(journal_path, journal, "rollback-keychain-complete")
         original = journal.get("original_credential_stat")
-        stable_file = target.home / CLAUDE_AUTH
-        if original is not None and not _same_stat(stable_file, original):
-            if stable_file.exists() or stable_file.is_symlink():
-                raise ValueError("stable Claude auth file changed outside recovery")
-            rollback = paths["rollback_temp"]
-            _copy_private_file(paths["claude_file_backup"], rollback)
-            os.replace(rollback, stable_file)
-            _fsync(target.home)
-        elif original is None and (stable_file.exists() or stable_file.is_symlink()):
+        if original is not None:
+            _rollback_file_credential(
+                target,
+                CLAUDE_AUTH,
+                paths["claude_file_backup"],
+                paths,
+                journal_path,
+                journal,
+                allow_absent_forward=True,
+            )
+        elif (target.home / CLAUDE_AUTH).exists() or (target.home / CLAUDE_AUTH).is_symlink():
             raise ValueError("unexpected stable Claude auth file appeared during recovery")
+    journal["local_credential_rollback_complete"] = True
+    _write_recovery_journal(journal_path, journal, "rollback-credential-complete")
 
 
 def _clean_exact_temporaries(paths: dict[str, Path]) -> None:
-    for name in ("install_temp", "rollback_temp"):
+    for name in (
+        "install_temp",
+        "rollback_temp",
+        "bundle_restore_temp",
+        "provisional_restore_temp",
+        "provisional_guard_restore_temp",
+    ):
         path = paths[name]
         if path.exists() or path.is_symlink():
             _private_file(path, "credential recovery temporary")
@@ -1405,14 +1912,57 @@ def _clean_exact_temporaries(paths: dict[str, Path]) -> None:
             _fsync(path.parent)
 
 
-def _cleanup_keychain(hooks: RecoveryHooks, journal: dict[str, Any]) -> None:
+def _cleanup_keychain(
+    hooks: RecoveryHooks,
+    journal_path: Path,
+    journal: dict[str, Any],
+    *,
+    committed: bool,
+) -> None:
     if journal.get("provider") != "claude":
         return
+    if journal.get("keychain_cleanup_complete") is True:
+        return
     account = str(journal.get("keychain_account", ""))
-    for field in ("staged_service", "backup_service"):
-        service = journal.get(field)
-        if isinstance(service, str):
-            hooks.keychain.delete(service, account, missing_ok=True)
+    staged_service = journal.get("staged_service")
+    if journal.get("staged_keychain_cleanup_complete") is not True:
+        if isinstance(staged_service, str):
+            if account != _keychain_account():
+                raise ValueError("Claude Keychain cleanup account changed")
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                "keychain-staged-cleanup-authorized",
+            )
+            hooks.keychain.delete(staged_service, account, missing_ok=True)
+        journal["staged_keychain_cleanup_complete"] = True
+        _write_recovery_journal(
+            journal_path,
+            journal,
+            "keychain-staged-cleanup-complete",
+        )
+
+    backup_service = journal.get("backup_service")
+    if journal.get("backup_keychain_cleanup_complete") is not True:
+        if not committed and journal.get("local_credential_rollback_complete") is not True:
+            raise ValueError("refusing to delete Claude rollback backup before durable rollback")
+        if isinstance(backup_service, str):
+            if account != _keychain_account():
+                raise ValueError("Claude Keychain cleanup account changed")
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                "keychain-backup-cleanup-authorized",
+            )
+            hooks.keychain.delete(backup_service, account, missing_ok=True)
+        journal["backup_keychain_cleanup_complete"] = True
+        _write_recovery_journal(
+            journal_path,
+            journal,
+            "keychain-backup-cleanup-complete",
+        )
+    journal["keychain_cleanup_complete"] = True
+    _write_recovery_journal(journal_path, journal, "keychain-cleanup-complete")
 
 
 def recover_pending_profile_recoveries(
@@ -1452,19 +2002,49 @@ def recover_pending_profile_recoveries(
             and process_identity_state(child_pid, child_start) != "dead"
         ):
             raise ValueError("provider login process is still live or indeterminate")
+        _ensure_keychain_operation_quiescent(journal_path, journal)
+        transaction_controls = replace(
+            controls,
+            keychain=_transactional_keychain(
+                controls.keychain,
+                journal_path,
+                journal,
+            ),
+        )
         phase = journal.get("phase")
         committed = phase == "committed"
         if not committed:
-            _rollback_local_credential(controls, target, paths, journal)
+            _rollback_local_credential(
+                transaction_controls,
+                target,
+                paths,
+                journal_path,
+                journal,
+            )
             if journal.get("bundle_snapshot_ready") is True:
-                _restore_bundle(registry, paths, journal)
+                _restore_bundle(registry, paths, journal_path, journal)
             if journal.get("provisional_snapshot_ready") is True:
-                _restore_provisional(registry, target.provider, paths, journal)
+                _restore_provisional(
+                    registry,
+                    target.provider,
+                    paths,
+                    journal_path,
+                    journal,
+                )
         _clean_exact_temporaries(paths)
-        _cleanup_keychain(controls, journal)
-        stage = paths["stage"]
-        if stage.exists() or stage.is_symlink():
-            _remove_stage(target, stage, journal)
+        _cleanup_keychain(
+            transaction_controls,
+            journal_path,
+            journal,
+            committed=committed,
+        )
+        _remove_stage(target, paths, journal_path, journal)
+        journal["transaction_cleanup_complete"] = True
+        _write_recovery_journal(
+            journal_path,
+            journal,
+            "transaction-cleanup-complete",
+        )
         journal_path.unlink()
         _fsync(journal_path.parent)
         recovered.append(
@@ -1544,6 +2124,8 @@ def _profile_login_transaction(
                     f"worker {target.id} is already recorded in the provisional identity batch; "
                     "initialize a pending worker instead: " + ", ".join(pending)
                 )
+            _preflight_stable_credential(target)
+            controls.inspect_source(current, target, allow_keychain_prompt)
 
             def checked(
                 expected: Registry,
@@ -1574,20 +2156,6 @@ def _profile_login_transaction(
                     )
                 return checked_registry, checked_target
 
-            if workflow == "initialize":
-                assert working_batch is not None
-                # Reprove every durable peer before invoking another provider
-                # login. Tamper, drift, or ejection must not consume/revoke a
-                # second worker credential before the batch fails closed.
-                _initialization_peer_proofs(
-                    current,
-                    target,
-                    working_batch,
-                    controls,
-                    allow_keychain_prompt,
-                )
-            _preflight_stable_credential(target)
-            controls.inspect_source(current, target, allow_keychain_prompt)
             journal_path = _journal_path_for_worker(current, target)
             ensure_private_dir(journal_path.parent)
             if journal_path.exists() or journal_path.is_symlink():
@@ -1625,6 +2193,26 @@ def _profile_login_transaction(
             # Durable ownership and artifact paths precede stage creation and
             # therefore every possible credential-bearing provider write.
             _write_journal(journal_path, journal, "intent")
+            controls = replace(
+                controls,
+                keychain=_transactional_keychain(
+                    controls.keychain,
+                    journal_path,
+                    journal,
+                ),
+            )
+            if workflow == "initialize":
+                assert working_batch is not None
+                # Reprove every durable peer before invoking another provider
+                # login. Tamper, drift, or ejection must not consume/revoke a
+                # second worker credential before the batch fails closed.
+                _initialization_peer_proofs(
+                    current,
+                    target,
+                    working_batch,
+                    controls,
+                    allow_keychain_prompt,
+                )
             stage = _prepare_stage(current, target, journal_path, journal)
             if boundary_hook:
                 boundary_hook("stage-ready")
@@ -1870,8 +2458,19 @@ def _profile_login_transaction(
             )
             failure_stage = "transaction_cleanup"
             _clean_exact_temporaries(paths)
-            _cleanup_keychain(controls, journal)
-            _remove_stage(target, paths["stage"], journal)
+            _cleanup_keychain(
+                controls,
+                journal_path,
+                journal,
+                committed=True,
+            )
+            _remove_stage(target, paths, journal_path, journal)
+            journal["transaction_cleanup_complete"] = True
+            _write_recovery_journal(
+                journal_path,
+                journal,
+                "transaction-cleanup-complete",
+            )
             journal_path.unlink()
             _fsync(journal_path.parent)
             append_audit(

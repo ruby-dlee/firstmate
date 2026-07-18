@@ -905,28 +905,25 @@ def _publish_bytes_no_replace(
     descriptor = os.open(staging, flags, mode)
     identity: tuple[int, int, str] | None = None
     try:
-        try:
-            os.fchmod(descriptor, mode)
-            staged_info = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(staged_info.st_mode)
-                or staged_info.st_uid != os.getuid()
-                or staged_info.st_nlink != 1
-                or stat.S_IMODE(staged_info.st_mode) != mode
-            ):
-                raise ProofError(f"new output staging inode is unsafe: {staging}")
-            identity = (staged_info.st_dev, staged_info.st_ino, digest)
-            if before_publish is not None:
-                before_publish(identity)
-            remaining = memoryview(payload)
-            while remaining:
-                count = os.write(descriptor, remaining)
-                if count <= 0:
-                    raise ProofError(f"short write while publishing: {path}")
-                remaining = remaining[count:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        os.fchmod(descriptor, mode)
+        staged_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(staged_info.st_mode)
+            or staged_info.st_uid != os.getuid()
+            or staged_info.st_nlink != 1
+            or stat.S_IMODE(staged_info.st_mode) != mode
+        ):
+            raise ProofError(f"new output staging inode is unsafe: {staging}")
+        identity = (staged_info.st_dev, staged_info.st_ino, digest)
+        if before_publish is not None:
+            before_publish(identity)
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0:
+                raise ProofError(f"short write while publishing: {path}")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
         staged_info, staged_digest = _output_generation_identity(staging, mode=mode)
         if (
             identity is None
@@ -954,6 +951,10 @@ def _publish_bytes_no_replace(
             staging.unlink()
             _fsync_directory(staging.parent)
         raise
+    finally:
+        # Keep the owned inode live until publication or exception cleanup finishes
+        # so a racing replacement cannot recycle its journaled identity.
+        os.close(descriptor)
     assert identity is not None
     info = os.lstat(path)
     if info.st_nlink != 1 or _sha(path) != digest:

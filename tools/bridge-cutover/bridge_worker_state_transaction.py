@@ -780,7 +780,12 @@ def _snapshot_manifest(manifest: Manifest, staging: Path) -> dict[str, Any]:
     }
 
 
-def _validate_identity_journal_state(value: Any, label: str) -> dict[str, Any]:
+def _validate_identity_journal_state(
+    value: Any,
+    label: str,
+    *,
+    restore: bool = False,
+) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("type") not in {"absent", "file"}:
         raise WorkerStateError(f"{label} is invalid")
     if value["type"] == "absent":
@@ -789,7 +794,7 @@ def _validate_identity_journal_state(value: Any, label: str) -> dict[str, Any]:
         return value
     _exact_keys(
         value,
-        {"type", "mode", "sha256", "size"},
+        {"type", "mode", "sha256", "size", *({"data"} if restore else set())},
         set(),
         label,
     )
@@ -803,6 +808,8 @@ def _validate_identity_journal_state(value: Any, label: str) -> dict[str, Any]:
         or value["size"] < 0
     ):
         raise WorkerStateError(f"{label} file fields are invalid")
+    if restore:
+        _relative(value["data"], f"{label}.data")
     return value
 
 
@@ -904,6 +911,7 @@ def _journal(manifest: Manifest) -> dict[str, Any] | None:
         _validate_identity_journal_state(
             identity_restore["restore_state"],
             "worker-state identity restore state",
+            restore=True,
         )
     if (
         not isinstance(value["credential_drift"], list)

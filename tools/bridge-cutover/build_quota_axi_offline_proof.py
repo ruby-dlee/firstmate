@@ -704,27 +704,29 @@ def _cleanup_output_generation(
     if completed and existing != [path]:
         raise ProofError("completed offline-build output generation is incomplete")
     if value["dev"] is None:
-        if path in existing:
-            raise ProofError("offline-build output appeared before inode ownership was journaled")
-        for candidate in existing:
-            info = os.lstat(candidate)
-            if (
-                candidate != staging
-                or not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_size > value["size"]
-            ):
-                raise ProofError(f"offline-build output staging is not attributable: {candidate}")
-            candidate.unlink()
-            _fsync_directory(candidate.parent)
+        if existing:
+            raise ProofError(
+                "offline-build output exists without journaled inode ownership: "
+                f"{existing[0]}"
+            )
         return
     for candidate in existing:
         info, observed_digest = _output_generation_identity(candidate)
         if (
             (info.st_dev, info.st_ino) != (value["dev"], value["ino"])
-            or observed_digest != value["sha256"]
+            or info.st_size > value["size"]
+            or (
+                candidate == path
+                and (
+                    info.st_size != value["size"]
+                    or observed_digest != value["sha256"]
+                )
+            )
+            or (
+                candidate == staging
+                and info.st_size == value["size"]
+                and observed_digest != value["sha256"]
+            )
         ):
             raise ProofError(f"offline-build output generation changed: {candidate}")
     if completed:
@@ -732,11 +734,20 @@ def _cleanup_output_generation(
             raise ProofError("completed offline-build output has unexpected hard links")
         return
     for candidate in existing:
+        current = os.lstat(candidate)
+        if (current.st_dev, current.st_ino) != (value["dev"], value["ino"]):
+            raise ProofError(
+                f"offline-build output generation changed before cleanup: {candidate}"
+            )
         candidate.unlink()
         _fsync_directory(candidate.parent)
 
 
-def _output_generation_identity(path: Path) -> tuple[os.stat_result, str]:
+def _output_generation_identity(
+    path: Path,
+    *,
+    mode: int = 0o600,
+) -> tuple[os.stat_result, str]:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
@@ -744,7 +755,7 @@ def _output_generation_identity(path: Path) -> tuple[os.stat_result, str]:
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.getuid()
             or before.st_nlink not in {1, 2}
-            or stat.S_IMODE(before.st_mode) != 0o600
+            or stat.S_IMODE(before.st_mode) != mode
         ):
             raise ProofError(f"offline-build output generation is unsafe: {path}")
         payload = bytearray()
@@ -886,49 +897,64 @@ def _publish_bytes_no_replace(
     staging = staging_path or path.with_name(
         f".{path.name}.bridge-write-{digest[:32]}"
     )
-    if staging.exists() or staging.is_symlink():
-        info = os.lstat(staging)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != mode
-        ):
-            raise ProofError(f"output staging path is not attributable: {staging}")
-        staged = staging.read_bytes()
-        if len(staged) > len(payload) or not payload.startswith(staged):
-            raise ProofError(f"output staging payload is not attributable: {staging}")
-        staging.unlink()
-        _fsync_directory(staging.parent)
+    if os.path.lexists(staging):
+        raise ProofError(
+            f"output staging exists without journaled inode ownership: {staging}"
+        )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(staging, flags, mode)
+    identity: tuple[int, int, str] | None = None
     try:
-        os.fchmod(descriptor, mode)
-        remaining = memoryview(payload)
-        while remaining:
-            count = os.write(descriptor, remaining)
-            if count <= 0:
-                raise ProofError(f"short write while publishing: {path}")
-            remaining = remaining[count:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    staged_info = os.lstat(staging)
-    identity = (staged_info.st_dev, staged_info.st_ino, digest)
-    if before_publish is not None:
-        before_publish(identity)
-    try:
+        try:
+            os.fchmod(descriptor, mode)
+            staged_info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(staged_info.st_mode)
+                or staged_info.st_uid != os.getuid()
+                or staged_info.st_nlink != 1
+                or stat.S_IMODE(staged_info.st_mode) != mode
+            ):
+                raise ProofError(f"new output staging inode is unsafe: {staging}")
+            identity = (staged_info.st_dev, staged_info.st_ino, digest)
+            if before_publish is not None:
+                before_publish(identity)
+            remaining = memoryview(payload)
+            while remaining:
+                count = os.write(descriptor, remaining)
+                if count <= 0:
+                    raise ProofError(f"short write while publishing: {path}")
+                remaining = remaining[count:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        staged_info, staged_digest = _output_generation_identity(staging, mode=mode)
+        if (
+            identity is None
+            or (staged_info.st_dev, staged_info.st_ino) != identity[:2]
+            or staged_info.st_size != len(payload)
+            or staged_digest != digest
+        ):
+            raise ProofError(f"output generation changed before publication: {staging}")
         os.link(staging, path, follow_symlinks=False)
         _fsync_directory(path.parent)
         staging.unlink()
         _fsync_directory(path.parent)
-    except Exception:
-        if staging.exists():
-            _, staged_digest = _output_generation_identity(staging)
-            if staged_digest == digest:
-                staging.unlink()
-                _fsync_directory(staging.parent)
+    except Exception as exc:
+        if identity is not None and os.path.lexists(staging):
+            current, _ = _output_generation_identity(staging, mode=mode)
+            if (current.st_dev, current.st_ino) != identity[:2]:
+                raise ProofError(
+                    f"output generation changed during publication: {staging}"
+                ) from exc
+            current = os.lstat(staging)
+            if (current.st_dev, current.st_ino) != identity[:2]:
+                raise ProofError(
+                    f"output generation changed before exception cleanup: {staging}"
+                ) from exc
+            staging.unlink()
+            _fsync_directory(staging.parent)
         raise
+    assert identity is not None
     info = os.lstat(path)
     if info.st_nlink != 1 or _sha(path) != digest:
         raise ProofError(f"published output identity is invalid: {path}")

@@ -559,16 +559,24 @@ class QuotaOfflineProofTests(unittest.TestCase):
                 quota_proof._package_members(package),
             )
 
-    def test_output_writer_recovers_only_exact_partial_staging(self) -> None:
+    def test_output_writer_requires_journaled_inode_for_cleanup(self) -> None:
         output = self.root / "proof.json"
         payload = b"deterministic-proof\n"
         digest = hashlib.sha256(payload).hexdigest()
         staging = output.with_name(f".{output.name}.bridge-write-{digest[:32]}")
         staging.write_bytes(payload[:7])
         staging.chmod(0o600)
-        quota_proof._publish_bytes_no_replace(output, payload)
-        self.assertEqual(output.read_bytes(), payload)
-        self.assertFalse(staging.exists())
+        unjournaled_identity = os.lstat(staging)
+        with self.assertRaisesRegex(
+            quota_proof.ProofError, "without journaled inode ownership"
+        ):
+            quota_proof._publish_bytes_no_replace(output, payload)
+        self.assertFalse(output.exists())
+        self.assertEqual(staging.read_bytes(), payload[:7])
+        self.assertEqual(
+            (os.lstat(staging).st_dev, os.lstat(staging).st_ino),
+            (unjournaled_identity.st_dev, unjournaled_identity.st_ino),
+        )
 
         foreign_output = self.root / "foreign.json"
         foreign_staging = foreign_output.with_name(
@@ -576,9 +584,45 @@ class QuotaOfflineProofTests(unittest.TestCase):
         )
         foreign_staging.write_bytes(b"foreign")
         foreign_staging.chmod(0o600)
-        with self.assertRaisesRegex(quota_proof.ProofError, "not attributable"):
+        with self.assertRaisesRegex(
+            quota_proof.ProofError, "without journaled inode ownership"
+        ):
             quota_proof._publish_bytes_no_replace(foreign_output, payload)
         self.assertEqual(foreign_staging.read_bytes(), b"foreign")
+
+        exception_output = self.root / "exception.json"
+        exception_staging = exception_output.with_name(
+            f".{exception_output.name}.bridge-write-{digest[:32]}"
+        )
+        foreign_identity: list[tuple[int, int]] = []
+
+        def substitute_staging_inode(
+            source: str | os.PathLike[str],
+            destination: str | os.PathLike[str],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            source_path = Path(source)
+            source_path.unlink()
+            source_path.write_bytes(payload)
+            source_path.chmod(0o600)
+            info = os.lstat(source_path)
+            foreign_identity.append((info.st_dev, info.st_ino))
+            raise OSError("injected link failure after staging substitution")
+
+        with mock.patch.object(
+            quota_proof.os, "link", side_effect=substitute_staging_inode
+        ):
+            with self.assertRaisesRegex(
+                quota_proof.ProofError, "output generation changed"
+            ):
+                quota_proof._publish_bytes_no_replace(exception_output, payload)
+        self.assertFalse(exception_output.exists())
+        self.assertEqual(exception_staging.read_bytes(), payload)
+        self.assertEqual(
+            (os.lstat(exception_staging).st_dev, os.lstat(exception_staging).st_ino),
+            foreign_identity[0],
+        )
 
 
 if __name__ == "__main__":

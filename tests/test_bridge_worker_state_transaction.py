@@ -181,6 +181,74 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(identity))
         self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
 
+    def test_file_identity_rollback_resumes_sigkill_and_preserves_foreign_state(self) -> None:
+        identity = self.manifest.identity_bundles["claude"]
+        original = b'{"original-file-identity":true}'
+        identity.write_bytes(original)
+        identity.chmod(0o600)
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        self._write_identity_bundles()
+        injector = textwrap.dedent(
+            f"""\
+            import os, signal, sys
+            from pathlib import Path
+            sys.path.insert(0, {str(SCRIPT_DIR)!r})
+            import bridge_worker_state_transaction as module
+            class KillAfterIdentityExchange(module.BoundaryController):
+                def hit(self, label):
+                    super().hit(label)
+                    if label == "after_exchange:identity:claude":
+                        os.kill(os.getpid(), signal.SIGKILL)
+            manifest = module.load_manifest(Path({str(self.manifest_path)!r}))
+            module.rollback(manifest, KillAfterIdentityExchange())
+            """
+        )
+        killed = subprocess.run(
+            [sys.executable, "-c", injector],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(killed.returncode, -signal.SIGKILL)
+        journal = json.loads(
+            self.manifest.journal_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(journal["identity_restore"]["phase"], "exchanged")
+        self.assertEqual(journal["identity_restore"]["restore_state"]["type"], "file")
+        self.assertIn("data", journal["identity_restore"]["restore_state"])
+        temporary = list(identity.parent.glob(f".{identity.name}.restore-*"))
+        self.assertEqual(len(temporary), 1)
+        self.assertEqual(identity.read_bytes(), original)
+
+        foreign = b'{"foreign-after-file-exchange":true}'
+        identity.unlink()
+        identity.write_bytes(foreign)
+        identity.chmod(0o600)
+        foreign_identity = os.lstat(identity)
+        with self.assertRaisesRegex(
+            worker_state.WorkerStateError, "ambiguous interrupted restore"
+        ):
+            worker_state.rollback(self.manifest)
+        self.assertEqual(identity.read_bytes(), foreign)
+        self.assertEqual(
+            (os.lstat(identity).st_dev, os.lstat(identity).st_ino),
+            (foreign_identity.st_dev, foreign_identity.st_ino),
+        )
+        self.assertEqual(
+            list(identity.parent.glob(f".{identity.name}.restore-*")), temporary
+        )
+
+        identity.unlink()
+        identity.write_bytes(original)
+        identity.chmod(0o600)
+        result = worker_state.rollback(self.manifest)
+        self.assertEqual(result["phase"], "rolled_back")
+        self.assertEqual(identity.read_bytes(), original)
+        self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
+
     def test_credential_guard_blocks_verification_and_secret_is_not_snapshotted(self) -> None:
         target_worker = next(
             value for value in self.manifest.workers if value.profile == "codex-1"

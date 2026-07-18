@@ -4383,11 +4383,12 @@ SH
 }
 
 test_account_locks_never_reclaim_on_indeterminate_process_probe() {
-  local case_dir state fake_ps kind acquire held owner_pid inode_before inode_after owner_before owner_after status
+  local case_dir state fake_ps ps_env_log kind acquire held owner_pid inode_before inode_after owner_before owner_after status
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/account-lock-indeterminate-ps"
   state="$case_dir/state"
   fake_ps="$case_dir/ps"
+  ps_env_log="$case_dir/ps-env"
   mkdir -p "$state"
   cat > "$fake_ps" <<'SH'
 #!/usr/bin/env bash
@@ -4398,6 +4399,8 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ "$target" = "${FM_TEST_ACCOUNT_PS_TARGET:?}" ]; then
+  printf '%s|%s|%s|%s\n' "${LD_PRELOAD:-}" "${DYLD_INSERT_LIBRARIES:-}" \
+    "${BASH_ENV:-}" "${PYTHONPATH:-}" >> "${FM_TEST_ACCOUNT_PS_ENV_LOG:?}"
   printf 'transient ps failure\n' >&2
   exit 42
 fi
@@ -4418,9 +4421,12 @@ SH
     owner_before=$(cat "$held")
     if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
       FM_TEST_ACCOUNT_PS_BIN="$fake_ps" FM_TEST_ACCOUNT_PS_TARGET="$owner_pid" \
+      FM_TEST_ACCOUNT_PS_ENV_LOG="$ps_env_log" \
       FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 \
       FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=1 \
       bash -c '
+        export LD_PRELOAD=/hostile-loader DYLD_INSERT_LIBRARIES=/hostile-dyld
+        export BASH_ENV=/hostile-bash-env PYTHONPATH=/hostile-python
         . "$1"
         if [ "$2" = meta ]; then
           fm_account_meta_lock_acquire "$3" "indeterminate-$2"
@@ -4439,6 +4445,9 @@ SH
       || fail "$kind lock identity changed after an indeterminate process probe"
     fm_account_meta_lock_release "$held" || fail "could not release preserved $kind lock"
   done
+  [ -s "$ps_env_log" ] || fail "the pinned ps fixture was never invoked"
+  [ "$(sort -u "$ps_env_log")" = '|||' ] \
+    || fail "process probes inherited loader or language startup injection: $(cat "$ps_env_log")"
   pass "metadata and lifecycle locks preserve live owners when pinned ps is indeterminate"
 }
 
@@ -4854,7 +4863,7 @@ SH
 }
 
 test_production_routing_ignores_ambient_mode_and_forbids_binary_override() {
-  local dir mode marker status
+  local dir mode marker fake_ps ps_probe selected_ps status
   dir="$TMP_ROOT/production-routing-authority"
   mkdir -p "$dir/config"
   printf 'enforce\n' > "$dir/config/account-routing-mode"
@@ -4883,6 +4892,17 @@ SH
   fi
   [ "$status" -ne 0 ] || fail "production accepted an Agent Fleet executable override"
   [ ! -e "$marker" ] || fail "forbidden production Agent Fleet override executed"
+  fake_ps="$dir/fake-ps"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_ps"
+  chmod 755 "$fake_ps"
+  ps_probe='. "$1"; fm_account_ps_bin'
+  selected_ps=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_TEST_ACCOUNT_PS_BIN="$fake_ps" bash -c \
+    "$ps_probe" _ "$ROOT/bin/fm-account-routing-lib.sh") \
+    || fail "production could not select its fixed ps binary"
+  [ "$selected_ps" != "$fake_ps" ] \
+    || fail "production accepted the test ps hook without the exact test-lab opt-in"
   pass "production routing config is authoritative and executable overrides are forbidden"
 }
 

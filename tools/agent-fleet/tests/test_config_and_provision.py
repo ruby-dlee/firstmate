@@ -99,10 +99,10 @@ def test_initial_registry_resolves_quota_current_to_hash_pinned_release(
     )
 
 
-def test_legacy_exact_quota_runtime_migrates_once_but_symlinks_refuse(
-    fleet: tuple[object, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_registry_without_immutable_quota_provenance_is_rejected(
+    fleet: tuple[object, Path], tmp_path: Path
 ) -> None:
-    registry, path = fleet
+    _, path = fleet
     original = path.read_text(encoding="utf-8")
     legacy_text = (
         "\n".join(
@@ -119,43 +119,48 @@ def test_legacy_exact_quota_runtime_migrates_once_but_symlinks_refuse(
         )
         + "\n"
     )
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_NODE_BIN", str(registry.settings.quota_node_binary))
     legacy = tmp_path / "legacy" / "accounts.toml"
     legacy.parent.mkdir(mode=0o700)
     legacy.write_text(legacy_text, encoding="utf-8")
     legacy.chmod(0o600)
 
-    migrated = load_registry(legacy)
-    assert migrated.settings.quota_binary_sha256 == quota_binary_digest(
-        migrated.settings.quota_binary
-    )
-    assert migrated.settings.quota_node_sha256 == quota_binary_digest(
-        migrated.settings.quota_node_binary
-    )
-    save_registry(migrated, legacy)
-    assert load_registry(legacy).settings == migrated.settings
-
-    quota_alias = tmp_path / "quota-current"
-    quota_alias.symlink_to(registry.settings.quota_binary)
-    binary_line = next(
-        line for line in legacy_text.splitlines() if line.startswith("quota_binary =")
-    )
-    legacy.write_text(
-        legacy_text.replace(binary_line, f"quota_binary = {json.dumps(str(quota_alias))}"),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="non-symlink release file"):
+    with pytest.raises(ValueError, match="required for immutable Quota provenance"):
         load_registry(legacy)
 
-    node_alias = tmp_path / "node-current"
-    node_alias.symlink_to(registry.settings.quota_node_binary)
-    node_line = f"quota_node_binary = {json.dumps(str(node_alias))}\n"
-    legacy.write_text(
-        legacy_text.replace("quota_stale_seconds =", node_line + "quota_stale_seconds ="),
-        encoding="utf-8",
+
+def test_external_reserve_home_is_loaded_without_resolution(
+    fleet: tuple[object, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, path = fleet
+    reserve_home = tmp_path / "unprobed-reserve-home"
+    text = path.read_text(encoding="utf-8")
+    marker = '[profiles."claude-3"]'
+    before, section = text.split(marker, 1)
+    next_marker = section.find("\n[profiles.")
+    profile_section = section if next_marker < 0 else section[:next_marker]
+    remainder = "" if next_marker < 0 else section[next_marker:]
+    home_line = next(
+        line for line in profile_section.splitlines() if line.startswith("home =")
     )
-    with pytest.raises(ValueError, match="non-symlink release file"):
-        load_registry(legacy)
+    profile_section = profile_section.replace(
+        home_line, f"home = {json.dumps(str(reserve_home))}", 1
+    )
+    profile_section = profile_section.replace(
+        'pools = ["claude-crew", "claude-manual"]',
+        'pools = ["claude-manual"]',
+        1,
+    ).replace('safety_policy = "worker"', 'safety_policy = "desktop_shared"', 1)
+    path.write_text(before + marker + profile_section + remainder, encoding="utf-8")
+    original_resolve = Path.resolve
+
+    def guarded_resolve(candidate: Path, *args: object, **kwargs: object) -> Path:
+        if candidate == reserve_home:
+            raise AssertionError("reserve home was resolved")
+        return original_resolve(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", guarded_resolve)
+    registry = load_registry(path)
+    assert registry.require_profile("claude-3").home == reserve_home
 
 
 def test_registry_rejects_quota_symlink_and_hash_drift(

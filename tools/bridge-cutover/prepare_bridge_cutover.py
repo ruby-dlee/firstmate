@@ -1512,6 +1512,36 @@ def _validate_legacy_registry_shape(
             raise PreparationError(
                 f"legacy baseline safety_policy mismatch for {profile_id}"
             )
+    worker_homes = {
+        profile_id: _normalized_absolute(
+            raw["profiles"][profile_id]["home"],
+            f"legacy baseline profile {profile_id}.home",
+        )
+        for profile_id in WORKER_PROFILES
+    }
+    identity_state = _normalized_absolute(
+        settings["state_dir"], "legacy baseline identity state directory"
+    )
+    snapshot_parent = spec.worker_state.snapshot_parent
+    for reserve_id in RESERVE_PROFILES:
+        reserve_home = _normalized_absolute(
+            raw["profiles"][reserve_id]["home"],
+            f"legacy baseline profile {reserve_id}.home",
+        )
+        protected = {
+            **worker_homes,
+            "identity-state": identity_state,
+            "worker-snapshot-parent": snapshot_parent,
+        }
+        for protected_id, protected_path in protected.items():
+            if (
+                reserve_home == protected_path
+                or _is_relative_to(reserve_home, protected_path)
+                or _is_relative_to(protected_path, reserve_home)
+            ):
+                raise PreparationError(
+                    f"reserve profile {reserve_id} home overlaps {protected_id}"
+                )
 
 
 def _validate_release_spec(

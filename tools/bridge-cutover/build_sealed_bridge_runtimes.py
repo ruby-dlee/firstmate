@@ -3491,13 +3491,20 @@ def _publish_release(
         )
 
 
-def _remove_tree_if_identity(path: Path, identity: tuple[int, int]) -> None:
+def _remove_tree_if_identity(
+    path: Path,
+    identity: tuple[int, int],
+    driver: ModuleType,
+    tree_sha256: str,
+) -> None:
     try:
         info = os.lstat(path)
     except FileNotFoundError:
         return
     if (info.st_dev, info.st_ino) != identity or not stat.S_ISDIR(info.st_mode):
         raise BuildError(f"refusing cleanup after published release identity changed: {path}")
+    if _tree_sha256(driver, path, "failed published release cleanup") != tree_sha256:
+        raise BuildError(f"refusing cleanup after published release tree changed: {path}")
     _remove_tree(path)
     _fsync_directory(path.parent)
 
@@ -3821,6 +3828,90 @@ def _proof_matches_publication(
     return True
 
 
+def _publication_current_links(
+    manifest: BuildManifest,
+    records: Sequence[Mapping[str, str]],
+) -> tuple[Path, ...]:
+    links: dict[str, Path] = {}
+    for record in records:
+        family = record["key"].split("_", 2)[0]
+        if record["key"].startswith("agent_fleet_"):
+            family = "agent_fleet"
+        elif record["key"].startswith("quota_axi_"):
+            family = "quota_axi"
+        relative = Path(record["relative_path"])
+        if len(relative.parts) < 3 or relative.parent.name != "releases":
+            raise BuildError("publication release path has no attributable current link")
+        current = manifest.output_root / relative.parent.parent / "current"
+        previous = links.setdefault(family, current)
+        if previous != current:
+            raise BuildError("publication roles do not share one current link per family")
+    return tuple(links.values())
+
+
+def _path_targets_release(path: Path, roots: Sequence[Path]) -> bool:
+    lexical = Path(os.path.normpath(path))
+    return any(lexical == root or root in lexical.parents for root in roots)
+
+
+def _assert_no_live_publication_references(
+    manifest: BuildManifest,
+    records: Sequence[Mapping[str, str]],
+) -> None:
+    roots = tuple(Path(record["path"]) for record in records)
+    for current in _publication_current_links(manifest, records):
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISLNK(info.st_mode):
+            raise BuildError(
+                f"cannot prove interrupted release is unreferenced by current path: {current}"
+            )
+        payload = os.readlink(current)
+        target = Path(
+            os.path.normpath(payload if os.path.isabs(payload) else current.parent / payload)
+        )
+        effective = Path(os.path.realpath(current))
+        if _path_targets_release(target, roots) or _path_targets_release(effective, roots):
+            raise BuildError(
+                f"interrupted release is referenced by live current path: {current}"
+            )
+    front = manifest.operator_front_door
+    try:
+        front_info = os.lstat(front)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(front_info.st_mode):
+        payload = os.readlink(front)
+        target = Path(
+            os.path.normpath(payload if os.path.isabs(payload) else front.parent / payload)
+        )
+        effective = Path(os.path.realpath(front))
+        if _path_targets_release(target, roots) or _path_targets_release(effective, roots):
+            raise BuildError(
+                f"interrupted release is referenced by live operator front door: {front}"
+            )
+        return
+    if not stat.S_ISREG(front_info.st_mode):
+        raise BuildError(
+            f"cannot prove interrupted release is unreferenced by operator front door: {front}"
+        )
+    front_sha256 = _sha256(front)
+    known_payloads = []
+    for root in roots:
+        payload = root / "operator/agent-fleet"
+        if payload.exists():
+            known_payloads.append(_sha256(payload))
+    if front_sha256 in known_payloads:
+        raise BuildError(
+            f"interrupted release is referenced by live operator front door: {front}"
+        )
+    raise BuildError(
+        f"cannot prove interrupted release is unreferenced by operator front door: {front}"
+    )
+
+
 def _recover_interrupted_publication(
     manifest: BuildManifest, driver: ModuleType
 ) -> bool:
@@ -3857,7 +3948,9 @@ def _recover_interrupted_publication(
         )
         if _read_strict_json(plan_path, "front-door plan") != expected_plan:
             raise BuildError("completed front-door plan does not match its releases")
+        _unlink_file_if_identity(journal_path, journal_identity)
         return True
+    _assert_no_live_publication_references(manifest, records)
     if plan_path.exists():
         expected_plan = _front_door_plan(
             manifest,
@@ -4370,14 +4463,16 @@ def _build_locked(manifest_path: Path) -> Path:
         quota_inputs[role_name] = _validate_quota_inputs(role, source)
 
     first_base, second_base = _workspace_paths(manifest, publication_id)
-    published: list[tuple[Path, tuple[int, int]]] = []
+    published: list[tuple[Path, tuple[int, int], str]] = []
     plan_path = _front_door_plan_path(manifest)
     journal_path = _publication_journal_path(manifest)
     workspace_journal_path = _workspace_journal_path(manifest)
     plan_identity: tuple[int, int, str] | None = None
     proof_identity: tuple[int, int, str] | None = None
+    journal_identity: tuple[int, int, str] | None = None
     workspace_journal_identity: tuple[int, int, str] | None = None
     owned_workspaces: list[tuple[Path, int]] = []
+    completed_proof: Path | None = None
     try:
         if journal_path.exists() or journal_path.is_symlink():
             raise BuildError(
@@ -4502,7 +4597,7 @@ def _build_locked(manifest_path: Path) -> Path:
                 staging,
                 first["trees"][key],
             )
-            published.append((final, identity))
+            published.append((final, identity, first["trees"][key]))
             if _tree_sha256(driver, final, f"published {key}") != first["trees"][key]:
                 raise BuildError(f"published {key} tree digest differs")
 
@@ -4582,10 +4677,10 @@ def _build_locked(manifest_path: Path) -> Path:
             proof_info.st_ino,
             _sha256(manifest.proof_manifest),
         )
-        return manifest.proof_manifest
+        completed_proof = manifest.proof_manifest
     except Exception:
-        for path, identity in reversed(published):
-            _remove_tree_if_identity(path, identity)
+        for path, identity, tree_sha256 in reversed(published):
+            _remove_tree_if_identity(path, identity, driver, tree_sha256)
         if plan_path.exists() or plan_path.is_symlink():
             if plan_identity is None:
                 raise BuildError(f"front-door plan appeared without owned identity: {plan_path}")
@@ -4607,6 +4702,10 @@ def _build_locked(manifest_path: Path) -> Path:
             _unlink_file_if_identity(
                 workspace_journal_path, workspace_journal_identity
             )
+    if completed_proof is None or journal_identity is None:
+        raise BuildError("completed publication lost its journal identity")
+    _unlink_file_if_identity(journal_path, journal_identity)
+    return completed_proof
 
 
 def _open_sealed_build_lock(path: Path) -> int:

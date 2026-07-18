@@ -1952,6 +1952,51 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
             result = self.fixture.prepare()
         self.assertTrue(result["valid"])
 
+    def test_prepare_lexically_isolates_reserve_homes_from_worker_state(self) -> None:
+        original = self.fixture.baseline.read_text(encoding="utf-8")
+        worker_home = self.fixture.root / "fleet-share/accounts/claude/claude-1"
+        state_dir = self.fixture.root / "fleet-state"
+        cases = (
+            ("claude-3", worker_home, "claude-1"),
+            ("codex-5", state_dir / "reserve", "identity-state"),
+            (
+                "claude-3",
+                self.fixture.snapshot_parent / "reserve",
+                "worker-snapshot-parent",
+            ),
+        )
+        for profile_id, hostile_home, protected_id in cases:
+            with self.subTest(profile=profile_id, protected=protected_id):
+                marker = f'[profiles."{profile_id}"]'
+                before, section = original.split(marker, 1)
+                next_marker = section.find("\n[profiles.")
+                profile_section = section if next_marker < 0 else section[:next_marker]
+                remainder = "" if next_marker < 0 else section[next_marker:]
+                home_line = next(
+                    line
+                    for line in profile_section.splitlines()
+                    if line.startswith("home =")
+                )
+                profile_section = profile_section.replace(
+                    home_line,
+                    f"home = {json.dumps(str(hostile_home))}",
+                    1,
+                )
+                tampered = before + marker + profile_section + remainder
+                self.fixture.baseline.write_text(tampered, encoding="utf-8")
+                self.fixture.baseline.chmod(0o600)
+                self.fixture.live.write_bytes(self.fixture.baseline.read_bytes())
+                self.fixture.live.chmod(0o600)
+                self.fixture.spec["baseline_registry_sha256"] = prepare._sha256(
+                    self.fixture.baseline
+                )
+                self.fixture.write_spec()
+                with self.assertRaisesRegex(
+                    prepare.PreparationError,
+                    f"reserve profile {profile_id} home overlaps {protected_id}",
+                ):
+                    self.fixture.prepare()
+
     def test_prepare_refuses_shell_variable_in_shared_entry(self) -> None:
         text = self.fixture.baseline.read_text(encoding="utf-8").replace(
             'shared_entries = ["CLAUDE.md", "plugins"]',

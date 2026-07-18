@@ -911,6 +911,122 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         self.assertFalse(journal_path.exists())
         self.assertFalse(manifest.operator_front_door.exists())
 
+    def test_completed_publication_recovery_retires_ownership_journal(self) -> None:
+        manifest = builder.load_manifest(self.fixture.path)
+        publication_id = "d" * 64
+        trees = {
+            "agent_fleet_candidate": "0" * 64,
+            "agent_fleet_rollback": "1" * 64,
+            "quota_axi_candidate": "2" * 64,
+            "quota_axi_rollback": "3" * 64,
+        }
+        journal_path = builder._publication_journal_path(manifest)
+        builder._write_json(
+            journal_path,
+            {
+                "schema_version": 1,
+                "manifest_sha256": sha(manifest.path),
+                "publication_id": publication_id,
+                "live_references_changed": False,
+                "releases": builder._publication_records(
+                    manifest, trees, publication_id
+                ),
+            },
+            0o600,
+        )
+        plan_path = builder._front_door_plan_path(manifest)
+        expected_plan = {"schema_version": 1, "completed": True}
+        builder._write_json(plan_path, expected_plan, 0o444)
+        with mock.patch.object(
+            builder, "_proof_matches_publication", return_value=True
+        ), mock.patch.object(builder, "_front_door_plan", return_value=expected_plan):
+            self.assertTrue(builder._recover_interrupted_publication(manifest, object()))
+        self.assertFalse(journal_path.exists())
+
+    def test_interrupted_publication_preserves_live_current_release(self) -> None:
+        manifest = builder.load_manifest(self.fixture.path)
+        publication_id = "c" * 64
+        role = manifest.agent_roles["candidate"]
+        interrupted = manifest.output_root / role.release_path
+        (interrupted / "build").mkdir(parents=True)
+        builder._write_json(
+            interrupted / "build/bridge-publication.json",
+            {"schema_version": 1, "publication_id": publication_id},
+            0o444,
+        )
+        (interrupted / "payload").write_bytes(b"sealed")
+        (interrupted / "payload").chmod(0o444)
+
+        class Driver:
+            @staticmethod
+            def compute_release_tree_sha256(root: Path, _label: str) -> str:
+                digest = hashlib.sha256(b"test-publication-tree-v1\0")
+                for path in [root, *sorted(root.rglob("*"))]:
+                    info = os.lstat(path)
+                    digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+                    digest.update(stat.S_IMODE(info.st_mode).to_bytes(4, "big"))
+                    if path.is_file():
+                        digest.update(path.read_bytes())
+                return digest.hexdigest()
+
+        interrupted.chmod(0o555)
+        expected_tree = Driver.compute_release_tree_sha256(interrupted, "expected")
+        interrupted.chmod(0o700)
+        trees = {
+            "agent_fleet_candidate": expected_tree,
+            "agent_fleet_rollback": "1" * 64,
+            "quota_axi_candidate": "2" * 64,
+            "quota_axi_rollback": "3" * 64,
+        }
+        journal_path = builder._publication_journal_path(manifest)
+        builder._write_json(
+            journal_path,
+            {
+                "schema_version": 1,
+                "manifest_sha256": sha(manifest.path),
+                "publication_id": publication_id,
+                "live_references_changed": False,
+                "releases": builder._publication_records(
+                    manifest, trees, publication_id
+                ),
+            },
+            0o600,
+        )
+        current = interrupted.parent.parent / "current"
+        current.symlink_to(interrupted.relative_to(current.parent))
+        with self.assertRaisesRegex(builder.BuildError, "referenced by live current"):
+            builder._recover_interrupted_publication(manifest, Driver)
+        self.assertTrue(interrupted.exists())
+        self.assertTrue(journal_path.exists())
+
+    def test_failed_publication_cleanup_preserves_tree_digest_drift(self) -> None:
+        published = self.root / "published-drift"
+        published.mkdir(mode=0o700)
+        payload = published / "payload"
+        payload.write_bytes(b"sealed")
+        payload.chmod(0o444)
+        published.chmod(0o555)
+
+        class Driver:
+            @staticmethod
+            def compute_release_tree_sha256(root: Path, _label: str) -> str:
+                digest = hashlib.sha256()
+                for path in [root, *sorted(root.rglob("*"))]:
+                    digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+                    if path.is_file():
+                        digest.update(path.read_bytes())
+                return digest.hexdigest()
+
+        identity = (published.stat().st_dev, published.stat().st_ino)
+        expected = Driver.compute_release_tree_sha256(published, "expected")
+        published.chmod(0o700)
+        payload.chmod(0o644)
+        payload.write_bytes(b"foreign")
+        with self.assertRaisesRegex(builder.BuildError, "release tree changed"):
+            builder._remove_tree_if_identity(published, identity, Driver, expected)
+        self.assertTrue(published.exists())
+        self.assertEqual(payload.read_bytes(), b"foreign")
+
     def test_interrupted_builder_workspaces_are_recovered_from_journal(self) -> None:
         manifest = builder.load_manifest(self.fixture.path)
         publication_id = hashlib.sha256(

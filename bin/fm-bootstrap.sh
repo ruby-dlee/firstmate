@@ -368,7 +368,9 @@ secondmate_liveness_sweep() {
         if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)
         else
-          resume_args+=(--no-account-routing)
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision"
+          continue
         fi
         if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
           "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
@@ -387,7 +389,9 @@ secondmate_liveness_sweep() {
           if [ -n "$retry_profile" ]; then
             retry_args+=(--resume-account)
           else
-            retry_args+=(--no-account-routing)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: restored unmanaged generation requires an explicit operator --no-account-routing decision"
+            continue
           fi
           if [ -n "$retry_profile" ] \
             && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then

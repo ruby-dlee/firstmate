@@ -329,11 +329,19 @@ def _profile_from_toml(profile_id: str, raw: dict[str, Any], share_dir: Path) ->
     provider = str(raw.get("provider", ""))
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(f"profile {profile_id}: unsupported provider: {provider}")
+    safety_policy = raw.get("safety_policy", "worker")
+    if safety_policy not in PROFILE_SAFETY_POLICIES:
+        choices = ", ".join(PROFILE_SAFETY_POLICIES)
+        raise ValueError(f"profile {profile_id}: safety_policy must be one of {choices}")
     home_raw = raw.get("home")
     if not isinstance(home_raw, str) or not home_raw:
         home = share_dir / "accounts" / provider / profile_id
     else:
-        home = expand_path(home_raw)
+        home = (
+            expand_path(home_raw)
+            if safety_policy == "worker"
+            else expand_lexical_path(home_raw)
+        )
     pools_raw = raw.get("pools", [])
     if not isinstance(pools_raw, list) or not pools_raw:
         raise ValueError(f"profile {profile_id}: pools must be a non-empty array")
@@ -341,10 +349,6 @@ def _profile_from_toml(profile_id: str, raw: dict[str, Any], share_dir: Path) ->
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError(f"profile {profile_id}: enabled must be boolean")
-    safety_policy = raw.get("safety_policy", "worker")
-    if safety_policy not in PROFILE_SAFETY_POLICIES:
-        choices = ", ".join(PROFILE_SAFETY_POLICIES)
-        raise ValueError(f"profile {profile_id}: safety_policy must be one of {choices}")
     if safety_policy != "worker":
         pools = tuple(pool for pool in pools if pool != f"{provider}-crew")
         if not pools:
@@ -400,39 +404,32 @@ def load_registry(path: Path | None = None) -> Registry:
     )
     quota_binary_sha256 = settings_raw.get("quota_binary_sha256")
     if quota_binary_sha256 is None:
-        quota_binary, quota_binary_sha256 = _opened_executable_identity(
-            quota_binary,
-            "legacy configured quota-axi binary",
-            resolve_configured_symlink=False,
+        raise ValueError(
+            "settings.quota_binary_sha256 is required for immutable Quota provenance"
         )
-    elif not _valid_sha256(quota_binary_sha256):
+    if not _valid_sha256(quota_binary_sha256):
         raise ValueError("settings.quota_binary_sha256 must be a lowercase SHA-256 digest")
     quota_node_raw = settings_raw.get("quota_node_binary")
     quota_node_sha256 = settings_raw.get("quota_node_sha256")
     if quota_node_raw is None:
-        if quota_node_sha256 is not None:
-            raise ValueError("settings.quota_node_binary is required with quota_node_sha256")
-        quota_node_binary, quota_node_sha256 = _opened_executable_identity(
-            _initial_quota_node_candidate(),
-            "legacy quota-axi Node runtime",
-            resolve_configured_symlink=True,
+        raise ValueError(
+            "settings.quota_node_binary is required for immutable Quota provenance"
         )
-    else:
-        if not isinstance(quota_node_raw, str) or not quota_node_raw:
-            raise ValueError("settings.quota_node_binary must be a non-empty path string")
-        quota_node_binary = expand_lexical_path(quota_node_raw)
-        if quota_node_sha256 is None:
-            quota_node_binary, quota_node_sha256 = _opened_executable_identity(
-                quota_node_binary,
-                "legacy quota-axi Node runtime",
-                resolve_configured_symlink=False,
-            )
-        elif not _valid_sha256(quota_node_sha256):
-            raise ValueError("settings.quota_node_sha256 must be a lowercase SHA-256 digest")
+    if not isinstance(quota_node_raw, str) or not quota_node_raw:
+        raise ValueError("settings.quota_node_binary must be a non-empty path string")
+    quota_node_binary = expand_lexical_path(quota_node_raw)
+    if quota_node_sha256 is None:
+        raise ValueError(
+            "settings.quota_node_sha256 is required for immutable Quota provenance"
+        )
+    if not _valid_sha256(quota_node_sha256):
+        raise ValueError("settings.quota_node_sha256 must be a lowercase SHA-256 digest")
     quota_release_tree_sha256 = settings_raw.get("quota_release_tree_sha256")
     if quota_release_tree_sha256 is None:
-        quota_release_tree_sha256 = quota_release_tree_digest(quota_binary, quota_node_binary)
-    elif not _valid_sha256(quota_release_tree_sha256):
+        raise ValueError(
+            "settings.quota_release_tree_sha256 is required for immutable Quota provenance"
+        )
+    if not _valid_sha256(quota_release_tree_sha256):
         raise ValueError("settings.quota_release_tree_sha256 must be a lowercase SHA-256 digest")
     settings = Settings(
         state_dir=state_dir,
@@ -662,6 +659,12 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
+def _profile_home_for_overlap(profile: Profile) -> Path:
+    if profile.safety_policy == "worker":
+        return profile.home.resolve()
+    return Path(os.path.normpath(str(profile.home)))
+
+
 def _validate_profile_invariants(registry: Registry) -> None:
     if not _valid_sha256(registry.settings.quota_binary_sha256):
         raise ValueError("settings.quota_binary_sha256 must be a lowercase SHA-256 digest")
@@ -692,7 +695,7 @@ def _validate_profile_invariants(registry: Registry) -> None:
                     f"profile {profile.id}: {profile.safety_policy} profiles "
                     "cannot join a worker crew pool"
                 )
-        home = profile.home.resolve()
+        home = _profile_home_for_overlap(profile)
         state_dir = registry.settings.state_dir.resolve()
         share_dir = registry.settings.share_dir.resolve()
         if _paths_overlap(home, state_dir):
@@ -713,7 +716,10 @@ def _validate_profile_invariants(registry: Registry) -> None:
             )
     for index, profile in enumerate(profiles):
         for other in profiles[index + 1 :]:
-            if _paths_overlap(profile.home.resolve(), other.home.resolve()):
+            if _paths_overlap(
+                _profile_home_for_overlap(profile),
+                _profile_home_for_overlap(other),
+            ):
                 raise ValueError(f"profile homes must not overlap: {profile.id}, {other.id}")
 
 

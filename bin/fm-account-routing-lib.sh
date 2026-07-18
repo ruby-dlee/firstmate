@@ -591,7 +591,8 @@ fm_account_task_key() {  # <home> <task> <attempt>
 }
 
 fm_account_ps_bin() {
-  if [ "${FM_ACCOUNT_TEST_HOOKS:-}" = firstmate-account-tests-v1 ] \
+  if fm_account_test_lab_enabled \
+    && [ "${FM_ACCOUNT_TEST_HOOKS:-}" = firstmate-account-tests-v1 ] \
     && [ -n "${FM_TEST_ACCOUNT_PS_BIN:-}" ]; then
     [ -x "$FM_TEST_ACCOUNT_PS_BIN" ] || return 1
     printf '%s\n' "$FM_TEST_ACCOUNT_PS_BIN"
@@ -607,7 +608,7 @@ fm_account_ps_bin() {
 fm_account_process_start_time() {  # <pid>
   local out ps_bin
   ps_bin=$(fm_account_ps_bin) || return 1
-  out=$(LC_ALL=C "$ps_bin" -o lstart= -p "$1" 2>/dev/null) || return 1
+  out=$(LC_ALL=C fm_account_system_exec "$ps_bin" -o lstart= -p "$1" 2>/dev/null) || return 1
   [ -n "$FM_ACCOUNT_SYSTEM_SED_BIN" ] || return 1
   out=$(printf '%s\n' "$out" | fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SED_BIN" 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$out" ] || return 1
@@ -641,7 +642,7 @@ fm_account_lock_owner_state() {  # <lock-path>
   FM_ACCOUNT_LOCK_OWNER_PID=$pid
   FM_ACCOUNT_LOCK_OWNER_START=$recorded
   ps_bin=$(fm_account_ps_bin) || return 2
-  if probe=$(LC_ALL=C "$ps_bin" -o lstart= -p "$pid" 2>&1); then
+  if probe=$(LC_ALL=C fm_account_system_exec "$ps_bin" -o lstart= -p "$pid" 2>&1); then
     probe_status=0
   else
     probe_status=$?

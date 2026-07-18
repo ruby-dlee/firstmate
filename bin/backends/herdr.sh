@@ -536,7 +536,8 @@ fm_backend_herdr_worker_path() {  # [candidate-path]
 }
 
 fm_backend_herdr_test_hooks_enabled() {
-  [ "${FM_BACKEND_HERDR_TEST_HOOKS:-}" = firstmate-herdr-tests-v1 ]
+  fm_backend_herdr_test_lab_enabled \
+    && [ "${FM_BACKEND_HERDR_TEST_HOOKS:-}" = firstmate-herdr-tests-v1 ]
 }
 
 fm_backend_herdr_ps_bin() {

@@ -228,12 +228,13 @@ case "${1:-}" in
     for a in "$@"; do
       case "$a" in
         *pane_current_command*)
-          [ -z "${FM_TEST_PROBE_LOG:-}" ] || printf 'probe\n' >> "$FM_TEST_PROBE_LOG"
           if [ -n "${FM_TEST_PANE_CMD_FILE:-}" ]; then
-            cat "$FM_TEST_PANE_CMD_FILE"
+            pane_command=$(cat "$FM_TEST_PANE_CMD_FILE")
           else
-            printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"
+            pane_command=${FM_TEST_PANE_CMD:-zsh}
           fi
+          [ -z "${FM_TEST_PROBE_LOG:-}" ] || printf 'probe\n' >> "$FM_TEST_PROBE_LOG"
+          printf '%s\n' "$pane_command"
           exit 0
           ;;
       esac
@@ -333,7 +334,7 @@ run_bootstrap() {  # <fakebin> <home> <pane-cmd> <call-log> [extra env...] -> st
     env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
 }
 
-test_sweep_respawns_confirmed_dead_secondmate() {
+test_sweep_defers_confirmed_dead_unmanaged_secondmate() {
   local w fb tmuxfb log out
   w=$(new_world sweep-dead)
   add_sm_home "$w" sm1 firstmate:fm-sm1
@@ -342,13 +343,13 @@ test_sweep_respawns_confirmed_dead_secondmate() {
 
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
 
-  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
-    "a bare-shell (dead) secondmate should be reported as respawned"
+  assert_contains "$out" "respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision" \
+    "a bare-shell unmanaged secondmate did not fail closed"
   assert_contains "$(cat "$log")" "kill-window -t firstmate:fm-sm1" \
-    "the stale endpoint must be killed before respawn (tmux refuses a same-named window over a live one)"
-  assert_contains "$(cat "$log")" "new-window" \
-    "a confirmed-dead secondmate should actually be relaunched"
-  pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
+    "the stale endpoint must be killed before deferring recovery"
+  assert_not_contains "$(cat "$log")" "new-window" \
+    "a confirmed-dead unmanaged secondmate was automatically relaunched"
+  pass "sweep: a confirmed-dead unmanaged secondmate requires operator routing authority"
 }
 
 test_sweep_rechecks_liveness_after_lifecycle_lock() {
@@ -398,7 +399,7 @@ test_sweep_rechecks_liveness_after_lifecycle_lock() {
   pass "sweep: lifecycle lock recheck prevents stale endpoint termination"
 }
 
-test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
+test_unmanaged_respawn_requires_explicit_operator_bypass() {
   local w fb tmuxfb log out
   w=$(new_world sweep-unmanaged-routing)
   add_sm_home "$w" sm1 firstmate:fm-sm1
@@ -409,11 +410,11 @@ test_unmanaged_respawn_does_not_migrate_into_current_account_policy() {
 
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
 
-  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
-    "an unmanaged secondmate should retain legacy recovery after routing is enabled"
-  assert_contains "$(cat "$log")" "new-window" \
-    "the unmanaged secondmate was not relaunched under its original policy"
-  pass "unmanaged secondmate recovery explicitly stays outside newly enabled account routing"
+  assert_contains "$out" "respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision" \
+    "automatic recovery did not fail closed for an unmanaged secondmate"
+  assert_not_contains "$(cat "$log")" "new-window" \
+    "automatic recovery relaunched an unmanaged secondmate with the provider default identity"
+  pass "unmanaged secondmate recovery requires an explicit operator bypass"
 }
 
 test_pending_rollback_recovery_bypasses_session_gate_and_retries() {
@@ -467,25 +468,27 @@ SH
     out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
       FM_ROOT_OVERRIDE="$fake_root" FM_ROLLBACK_CALL_LOG="$log" FM_TEST_REAL_ROOT="$ROOT")
 
-    assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: rollback reconciled and respawned" \
-      "$variant rollback recovery did not converge in the liveness sweep"
-    assert_contains "$(cat "$log")" "fresh-lock" \
-      "$variant rollback recovery reused the child-released lifecycle lock instead of acquiring a fresh one"
     grep -q '^spawn sm1 --secondmate --resume-account$' "$log" \
       || fail "$variant rollback recovery did not enter rollback-first resume: $(cat "$log")"
     if [ "$variant" = profile ]; then
+      assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: rollback reconciled and respawned" \
+        "$variant rollback recovery did not converge in the liveness sweep"
+      assert_contains "$(cat "$log")" "fresh-lock" \
+        "$variant rollback recovery reused the child-released lifecycle lock instead of acquiring a fresh one"
       [ "$(grep -c '^spawn sm1 --secondmate --resume-account$' "$log")" -eq 2 ] \
         || fail "profile rollback recovery did not retry the restored managed generation"
       [ "$(grep -c '^session-sync ' "$log")" -eq 1 ] \
         || fail "profile rollback recovery did not redo session sync exactly once under its fresh lock"
     else
+      assert_contains "$out" "rollback reconciled; respawn deferred: restored unmanaged generation requires an explicit operator --no-account-routing decision" \
+        "profileless rollback recovery did not fail closed after restoring unmanaged metadata"
       assert_not_contains "$(cat "$log")" "session-sync" \
         "profileless rollback recovery unexpectedly ran managed session synchronization"
-      assert_contains "$(cat "$log")" "spawn sm1 --secondmate --no-account-routing" \
-        "profileless rollback recovery did not retry its restored unmanaged generation"
+      assert_not_contains "$(cat "$log")" "spawn sm1 --secondmate --no-account-routing" \
+        "profileless rollback recovery automatically used the provider default identity"
     fi
   done
-  pass "pending secondmate rollback recovery bypasses pre-bind gating and converges"
+  pass "pending rollback recovery resumes only restored managed generations"
 }
 
 test_sweep_parent_skips_release_after_spawn_handoff() {
@@ -600,8 +603,12 @@ case "$*" in
     ;;
   *' session status '*)
     updated=2026-07-13T00:00:00Z
-    [ ! -f "${FM_MANAGED_SESSION_REFRESHED:-/nonexistent}" ] || updated=2026-07-13T00:00:01Z
-    printf '{"schema":1,"task":"%s","profile":"%s","provider":"claude","pool":"%s","workspace":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$pool" "$workspace" "$task" "$updated"
+    event_seq=1
+    if [ -f "${FM_MANAGED_SESSION_REFRESHED:-/nonexistent}" ]; then
+      updated=2026-07-13T00:00:01Z
+      event_seq=2
+    fi
+    printf '{"schema":2,"task":"%s","profile":"%s","provider":"claude","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$task" "$profile" "$pool" "$workspace" "$task" "$event_seq" "$updated"
     ;;
   *' lease release '*) printf '{"ok":true}\n' ;;
   *) exit 64 ;;
@@ -684,10 +691,12 @@ test_sweep_converges_no_retouch_once_alive() {
   fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
   log="$w/calls.log"; : > "$log"
 
-  # Round 1: dead -> respawned (kill + new-window logged).
+  # Round 1: a dead unmanaged generation is killed and deferred.
   out1=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
-  assert_contains "$out1" "SECONDMATE_LIVENESS: secondmate sm1: respawned" "round 1 should respawn the dead secondmate"
-  [ -s "$log" ] || fail "round 1 should have logged the kill+respawn window operations"
+  assert_contains "$out1" "respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision" \
+    "round 1 should defer the dead unmanaged secondmate"
+  assert_not_contains "$(cat "$log")" "new-window" \
+    "round 1 automatically relaunched the unmanaged generation"
 
   # Round 2: the (now-respawned) secondmate is genuinely alive - a second
   # sweep must converge to a pure no-op, not respawn again.
@@ -695,7 +704,7 @@ test_sweep_converges_no_retouch_once_alive() {
   out2=$(run_bootstrap "$tmuxfb:$fb" "$w/home" claude "$log")
   assert_contains "$out2" "SECONDMATE_LIVENESS: secondmate sm1: already-live" "round 2 should see the now-live secondmate and stop touching it"
   [ ! -s "$log" ] || fail "round 2 must not re-kill or re-respawn an already-live secondmate: $(cat "$log")"
-  pass "sweep: idempotent by construction - a live secondmate is never re-touched on a later run"
+  pass "sweep: a later live secondmate is never re-touched after deferred recovery"
 }
 
 test_sweep_skipped_under_detect_only() {
@@ -735,9 +744,9 @@ test_sweep_noop_with_no_secondmate_meta() {
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
-  test_sweep_respawns_confirmed_dead_secondmate
+  test_sweep_defers_confirmed_dead_unmanaged_secondmate
   test_sweep_rechecks_liveness_after_lifecycle_lock
-  test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+  test_unmanaged_respawn_requires_explicit_operator_bypass
   test_pending_rollback_recovery_bypasses_session_gate_and_retries
   test_enforced_recovery_sweep_installs_meta_with_inherited_lock
   exit 0
@@ -754,9 +763,9 @@ test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
 test_herdr_agent_alive_preserves_identity_state
 test_agent_alive_dispatcher_routes_and_falls_back
-test_sweep_respawns_confirmed_dead_secondmate
+test_sweep_defers_confirmed_dead_unmanaged_secondmate
 test_sweep_rechecks_liveness_after_lifecycle_lock
-test_unmanaged_respawn_does_not_migrate_into_current_account_policy
+test_unmanaged_respawn_requires_explicit_operator_bypass
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
 test_sweep_parent_skips_release_after_spawn_handoff
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock

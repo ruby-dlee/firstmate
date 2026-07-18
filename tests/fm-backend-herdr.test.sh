@@ -1937,7 +1937,7 @@ SH
 }
 
 test_server_test_hooks_are_inert_without_explicit_opt_in() {
-  local dir lock_root ready release kill_marker
+  local dir lock_root ready release kill_marker hook_probe
   dir="$TMP_ROOT/server-hooks-inert"
   lock_root="$dir/locks"
   ready="$dir/candidate-ready"
@@ -1964,6 +1964,13 @@ test_server_test_hooks_are_inert_without_explicit_opt_in() {
     ' "$ROOT" || fail "inherited test-hook variables affected production lock acquisition"
   [ ! -e "$ready" ] && [ ! -e "$kill_marker" ] \
     || fail "a Herdr test hook ran without the validated test-only opt-in"
+  hook_probe='. "$1"; fm_backend_herdr_test_hooks_enabled'
+  if env -u FM_BACKEND_HERDR_TEST_LAB \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    bash -c "$hook_probe" \
+      _ "$ROOT/bin/backends/herdr.sh"; then
+    fail "the Herdr test-hook opt-in worked without the exact test-lab opt-in"
+  fi
   assert_no_server_transients "$lock_root" "inert test-hook check"
   pass "Herdr launch-lock fault hooks are inert unless the validated test-only opt-in is present"
 }

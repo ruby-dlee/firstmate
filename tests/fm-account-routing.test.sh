@@ -1028,7 +1028,10 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
   out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
-  cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "failed managed respawn did not restore the original unmanaged metadata"
+  if ! cmp -s "$HOME_DIR/state/$id.meta" "$expected"; then
+    diff -u "$expected" "$HOME_DIR/state/$id.meta" >&2 || true
+    fail "failed managed respawn did not restore the original unmanaged metadata"
+  fi
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
       || fail "failed managed respawn did not restore prior $artifact state"

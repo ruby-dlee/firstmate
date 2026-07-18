@@ -706,9 +706,12 @@ SH
   pass "managed artifact recovery deletes only proven generations and quarantines last-check substitutions without data loss"
 }
 
+# Literal programs are intentionally passed to isolated Bash subprocesses.
+# shellcheck disable=SC2016
 test_managed_artifact_recovers_every_published_pair_crash_boundary() {
   local dir lock_root source ps_fake helper helper_candidate helper_marker recovered
   local config config_candidate config_marker helper_quarantine_marker helper_quarantine
+  local helper_mkdir_marker helper_mkdir_quarantine config_mkdir_marker config_mkdir_quarantine
   local empty_marker config_empty_quarantine foreign foreign_candidate helper_before
   local substitution_config substitution_candidate substitution_marker substitution_ready substitution_proceed
   local substitution_original substitution_expected recovery_pid recovery_status artifact
@@ -760,6 +763,7 @@ SH
       FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" \
       FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" \
       FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" \
       FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
       FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
       FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" \
@@ -791,6 +795,20 @@ SH
     fail "killed helper publisher did not leave one exact two-link inode"
   fi
   touch -t 202001010000 "$helper_candidate"
+  helper_mkdir_marker="$dir/helper-quarantine-created"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$helper_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$helper_mkdir_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "managed helper recovery survived its post-quarantine-mkdir SIGKILL fixture"
+  fi
+  [ -e "$helper_mkdir_marker" ] || fail "managed helper never reached its post-quarantine-mkdir kill boundary"
+  helper_mkdir_quarantine=$(first_candidate_quarantine "$helper") \
+    || fail "managed helper mkdir crash left no attributed quarantine"
+  if [ ! -e "$helper_candidate" ] || [ -e "$helper_mkdir_quarantine/artifact" ]; then
+    fail "managed helper mkdir crash did not retain the public pair and exact empty quarantine"
+  fi
+  touch -t 202001010000 "$helper_mkdir_quarantine"
   recovered=$(artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin') \
     || fail "managed helper did not recover its killed post-link publisher"
   if [ ! -e "$recovered" ] \
@@ -819,6 +837,21 @@ SH
     fail "killed config publisher did not leave one exact two-link inode"
   fi
   touch -t 202001010000 "$config_candidate"
+  config_mkdir_marker="$dir/config-quarantine-created"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$config_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$config_mkdir_marker" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+    ' "$helper" >/dev/null 2>&1; then
+    fail "managed config recovery survived its post-quarantine-mkdir SIGKILL fixture"
+  fi
+  [ -e "$config_mkdir_marker" ] || fail "managed config never reached its post-quarantine-mkdir kill boundary"
+  config_mkdir_quarantine=$(first_candidate_quarantine "$config") \
+    || fail "managed config mkdir crash left no attributed quarantine"
+  if [ ! -e "$config_candidate" ] || [ -e "$config_mkdir_quarantine/artifact" ]; then
+    fail "managed config mkdir crash did not retain the public pair and exact empty quarantine"
+  fi
+  touch -t 202001010000 "$config_mkdir_quarantine"
   recovered=$(artifact_bash '
     . "$0/bin/backends/herdr.sh"
     fm_backend_herdr_managed_config_ensure fm-config-link "$1"
@@ -979,6 +1012,182 @@ SH
     fail "published-pair substitution refusal deleted or changed a target generation"
   fi
   pass "managed helper/config publication recovers every two-link cleanup crash boundary and refuses foreign/substituted pairs"
+}
+
+# Literal programs are intentionally passed to isolated Bash subprocesses.
+# shellcheck disable=SC2016
+test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases() {
+  local dir lock_root ps_fake lock candidate quarantine marker phase hook_mkdir hook_moved hook_unlinked
+  local original occupied_candidate occupied_quarantine substituted_candidate substituted_quarantine
+  local substitution_lock occupied_lock
+  dir="$TMP_ROOT/herdr-attributed-cleanup-phases"
+  lock_root="$dir/locks"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  lock_root=$(cd "$lock_root" && pwd -P) || fail "could not resolve attributed-cleanup lock root"
+  lock="$lock_root/lifecycle.lock"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+[ "$pid" != 999999 ] || exit 1
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+
+  first_attributed_quarantine() {
+    local found
+    for found in "$1".quarantine.*; do
+      [ -d "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  cleanup_bash() {
+    local program=$1
+    shift
+    PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" \
+      FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
+      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+  }
+  write_dead_candidate() {
+    printf '999999\nMon Jan  1 00:00:00 2024\n%s\n' "${1##*.candidate.}" > "$1"
+    chmod 600 "$1"
+    touch -t 202001010000 "$1"
+  }
+
+  # Lifecycle lock candidates can be nlink=1 when publication never happened.
+  # Crash each phase of their attributed deletion and require convergence.
+  for phase in mkdir moved unlinked; do
+    candidate="$lock.candidate.999999-nlink1-$phase"
+    marker="$dir/nlink1-$phase"
+    write_dead_candidate "$candidate"
+    hook_mkdir=
+    hook_moved=
+    hook_unlinked=
+    case "$phase" in
+      mkdir) hook_mkdir=$marker ;;
+      moved) hook_moved=$marker ;;
+      unlinked) hook_unlinked=$marker ;;
+    esac
+    if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$candidate" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$hook_mkdir" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$hook_moved" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$hook_unlinked" cleanup_bash '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_server_lock_recover_candidates "$1"
+      ' "$lock" >/dev/null 2>&1; then
+      fail "nlink1 lifecycle candidate survived its $phase cleanup SIGKILL fixture"
+    fi
+    [ -e "$marker" ] || fail "nlink1 lifecycle candidate never reached its $phase crash boundary"
+    quarantine=$(first_attributed_quarantine "$candidate") \
+      || fail "nlink1 $phase crash left no attributed quarantine"
+    touch -t 202001010000 "$quarantine"
+    [ ! -e "$quarantine/artifact" ] || touch -t 202001010000 "$quarantine/artifact"
+    [ ! -e "$candidate" ] || touch -t 202001010000 "$candidate"
+    cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+      "$lock" >/dev/null 2>&1 || fail "nlink1 lifecycle candidate did not recover its $phase crash"
+    if [ -e "$candidate" ] || [ -e "$quarantine" ]; then
+      fail "nlink1 lifecycle candidate left residue after $phase recovery"
+    fi
+  done
+
+  # Exact release of the owned lifecycle lock uses the same primitive. Build
+  # the record inside the killed process so release ownership is authentic.
+  for phase in mkdir moved unlinked; do
+    marker="$dir/release-$phase"
+    hook_mkdir=
+    hook_moved=
+    hook_unlinked=
+    case "$phase" in
+      mkdir) hook_mkdir=$marker ;;
+      moved) hook_moved=$marker ;;
+      unlinked) hook_unlinked=$marker ;;
+    esac
+    if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$lock" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$hook_mkdir" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$hook_moved" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$hook_unlinked" cleanup_bash '
+        . "$0/bin/backends/herdr.sh"
+        pid=${BASHPID:-$$}
+        start=$(fm_backend_herdr_process_start "$pid") || exit 2
+        token="release-$1"
+        (umask 077; printf "%s\n%s\n%s\n" "$pid" "$start" "$token" > "$2") || exit 3
+        chmod 600 "$2" || exit 4
+        inode=$(fm_backend_herdr_path_inode "$2") || exit 5
+        fm_backend_herdr_server_lock_release "$2" "$token" "$inode"
+      ' "$phase" "$lock" >/dev/null 2>&1; then
+      fail "exact lock release survived its $phase cleanup SIGKILL fixture"
+    fi
+    [ -e "$marker" ] || fail "exact lock release never reached its $phase crash boundary"
+    quarantine=$(first_attributed_quarantine "$lock") \
+      || fail "exact lock $phase crash left no attributed quarantine"
+    touch -t 202001010000 "$quarantine"
+    [ ! -e "$quarantine/artifact" ] || touch -t 202001010000 "$quarantine/artifact"
+    [ ! -e "$lock" ] || touch -t 202001010000 "$lock"
+    cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_quarantines "$1"' \
+      "$lock" >/dev/null 2>&1 || fail "exact lock release did not recover its $phase crash"
+    if [ -e "$lock" ] || [ -e "$quarantine" ]; then
+      fail "exact lock release left residue after $phase recovery"
+    fi
+  done
+
+  # A foreign replacement at the empty-quarantine boundary is preserved, as
+  # is an occupied private quarantine; neither can be guessed away.
+  substitution_lock="$lock_root/substitution.lock"
+  substituted_candidate="$substitution_lock.candidate.999999-substituted"
+  write_dead_candidate "$substituted_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$substituted_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$dir/substituted-mkdir" cleanup_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_recover_candidates "$1"
+    ' "$substitution_lock" >/dev/null 2>&1; then
+    fail "substitution fixture survived its quarantine-mkdir SIGKILL"
+  fi
+  substituted_quarantine=$(first_attributed_quarantine "$substituted_candidate") \
+    || fail "substitution fixture left no empty quarantine"
+  original="$substituted_candidate.original"
+  mv "$substituted_candidate" "$original"
+  write_dead_candidate "$substituted_candidate"
+  touch -t 202001010000 "$substituted_quarantine"
+  if cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+    "$substitution_lock" >/dev/null 2>&1; then
+    fail "attributed recovery accepted a foreign substituted lifecycle candidate"
+  fi
+  if [ ! -e "$original" ] || [ ! -e "$substituted_candidate" ] || [ ! -e "$substituted_quarantine" ]; then
+    fail "substituted lifecycle candidate refusal lost a generation"
+  fi
+
+  occupied_lock="$lock_root/occupied.lock"
+  occupied_candidate="$occupied_lock.candidate.999999-occupied"
+  write_dead_candidate "$occupied_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$occupied_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$dir/occupied-mkdir" cleanup_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_recover_candidates "$1"
+    ' "$occupied_lock" >/dev/null 2>&1; then
+    fail "occupied fixture survived its quarantine-mkdir SIGKILL"
+  fi
+  occupied_quarantine=$(first_attributed_quarantine "$occupied_candidate") \
+    || fail "occupied fixture left no empty quarantine"
+  printf 'foreign quarantine content\n' > "$occupied_quarantine/foreign"
+  touch -t 202001010000 "$occupied_candidate" "$occupied_quarantine"
+  if cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+    "$occupied_lock" >/dev/null 2>&1; then
+    fail "attributed recovery accepted an occupied lifecycle quarantine"
+  fi
+  if [ ! -e "$occupied_candidate" ] || [ ! -e "$occupied_quarantine/foreign" ]; then
+    fail "occupied lifecycle quarantine refusal lost foreign state"
+  fi
+  pass "attributed cleanup recovers every nlink1 candidate and exact-lock phase while preserving foreign/occupied states"
 }
 
 test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
@@ -3818,11 +4027,13 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
   test_managed_shell_certificate_rejects_release_and_artifact_drift
   test_managed_artifact_candidate_recovery_is_guarded
   test_managed_artifact_recovers_every_published_pair_crash_boundary
+  test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = published-pair ]; then
   test_managed_artifact_recovers_every_published_pair_crash_boundary
+  test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
   exit 0
 fi
 
@@ -3847,6 +4058,7 @@ test_managed_shell_and_server_certificate_close_startup_before_bash
 test_managed_shell_certificate_rejects_release_and_artifact_drift
 test_managed_artifact_candidate_recovery_is_guarded
 test_managed_artifact_recovers_every_published_pair_crash_boundary
+test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
 test_server_ensure_converges_only_adapter_owned_exact_empty_drift
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker

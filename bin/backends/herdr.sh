@@ -795,62 +795,148 @@ fm_backend_herdr_artifact_has_quarantine() {  # <target>
   return 1
 }
 
+# Read one quarantine through its directory descriptor, accepting only an
+# owner-private 0700 directory whose exact contents are empty or `artifact`.
+fm_backend_herdr_artifact_quarantine_snapshot() {  # <quarantine>
+  local quarantine=$1
+  case "$quarantine" in *$'\n'*) return 1 ;; esac
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -e '
+    my ($path) = @ARGV;
+    opendir my $dir, $path or die "opendir: $!";
+    my @before = stat($dir);
+    @before && -d $dir or die "not directory";
+    ($before[2] & 07777) == 0700 or die "mode";
+    $before[4] == $< or die "owner";
+    my @names = sort grep { $_ ne "." && $_ ne ".." } readdir $dir;
+    my @after = stat($dir);
+    for my $index (0, 1, 2, 3, 4, 9) {
+      $before[$index] == $after[$index] or die "directory changed";
+    }
+    my @path_after = lstat($path);
+    @path_after
+      && $path_after[0] == $after[0]
+      && $path_after[1] == $after[1]
+      && ($path_after[2] & 07777) == 0700
+      && $path_after[4] == $<
+      or die "path replaced";
+    closedir $dir or die "closedir: $!";
+    my $contents = !@names ? "empty"
+      : @names == 1 && $names[0] eq "artifact" ? "artifact"
+      : "occupied";
+    print "$after[0]:$after[1]\n$contents\n";
+  ' "$quarantine" 2>/dev/null
+}
+
+# Resume any finite phase of one already-authorized attributed deletion. The
+# caller owns the safety proof for <path>; this primitive descriptor-proves the
+# private quarantine and never deletes a moved generation until its inode is
+# exactly the attributed inode. Ambiguous or occupied generations are kept.
+fm_backend_herdr_artifact_resume_attributed() {  # <path> <expected-dev:ino>
+  local path=$1 expected_inode=$2 quarantine quarantine_key snapshot quarantine_inode contents
+  local moved_inode after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$expected_inode" in ''|*[!0-9:]*|:*|*:) return 1 ;; esac
+  quarantine_key=${expected_inode/:/_}
+  quarantine="$path.quarantine.$quarantine_key"
+  snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+  case "$snapshot" in *$'\n'*) ;; *) return 1 ;; esac
+  quarantine_inode=${snapshot%%$'\n'*}
+  contents=${snapshot#*$'\n'}
+  case "$contents" in
+    empty)
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        [ "$(fm_backend_herdr_path_inode "$path" 2>/dev/null)" = "$expected_inode" ] \
+          || return 1
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        [ "$after" = "$snapshot" ] || return 1
+        if fm_backend_herdr_test_hooks_enabled \
+          && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_READY:-}" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED:-}" ]; then
+          : > "$FM_TEST_HERDR_ARTIFACT_REMOVE_READY"
+          while [ ! -e "$FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED" ]; do
+            fm_backend_herdr_control_exec sleep 0.01
+          done
+        fi
+        fm_backend_herdr_control_exec mv "$path" "$quarantine/artifact" 2>/dev/null \
+          || return 1
+        moved_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null) \
+          || return 1
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        if [ "$moved_inode" != "$expected_inode" ] \
+          || [ "${after%%$'\n'*}" != "$quarantine_inode" ] \
+          || [ "${after#*$'\n'}" != artifact ]; then
+          echo "error: preserved ambiguous Herdr artifact generation at $quarantine/artifact" >&2
+          return 1
+        fi
+        contents=artifact
+      else
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        [ "$after" = "$snapshot" ] || return 1
+      fi
+      ;;
+    artifact)
+      [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+      moved_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null) \
+        || return 1
+      [ "$moved_inode" = "$expected_inode" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$contents" = artifact ]; then
+    after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+    [ "${after%%$'\n'*}" = "$quarantine_inode" ] \
+      && [ "${after#*$'\n'}" = artifact ] \
+      && [ "$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null)" = "$expected_inode" ] \
+      || return 1
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" ]; then
+      : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE"
+      kill -KILL "${BASHPID:-$$}"
+    fi
+    fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" ]; then
+      : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK"
+      kill -KILL "${BASHPID:-$$}"
+    fi
+  fi
+  after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+  [ "${after%%$'\n'*}" = "$quarantine_inode" ] \
+    && [ "${after#*$'\n'}" = empty ] || return 1
+  fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
+}
+
 # Move the pathname generation into a private, deterministic device/inode-keyed
-# quarantine before any deletion. The private directory makes the rename
-# no-replace. A replacement in the final check-to-mutation window is moved but
-# never deleted: the inode mismatch leaves the quarantine intact for explicit
-# inspection/recovery and fails the caller closed.
+# quarantine before deletion. Every later phase is resumable by the state
+# machine above.
 fm_backend_herdr_artifact_remove_attributed() {  # <path> <expected-dev:ino>
-  local path=$1 expected_inode=$2 quarantine quarantine_key quarantine_inode moved_inode PATH=$FM_BACKEND_HERDR_CONTROL_PATH
-  case "$expected_inode" in ''|*[!0-9:]*) return 1 ;; esac
+  local path=$1 expected_inode=$2 quarantine quarantine_key PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$expected_inode" in ''|*[!0-9:]*|:*|*:) return 1 ;; esac
   quarantine_key=${expected_inode/:/_}
   fm_backend_herdr_artifact_has_quarantine "$path" && return 1
   quarantine="$path.quarantine.$quarantine_key"
   (umask 077 && fm_backend_herdr_control_exec mkdir "$quarantine") 2>/dev/null || return 1
   fm_backend_herdr_control_exec chmod 700 "$quarantine" 2>/dev/null || return 1
-  quarantine_inode=$(fm_backend_herdr_path_inode "$quarantine") || return 1
+  fm_backend_herdr_artifact_quarantine_snapshot "$quarantine" >/dev/null || return 1
   if fm_backend_herdr_test_hooks_enabled \
     && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
-    && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_READY:-}" ] \
-    && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED:-}" ]; then
-    : > "$FM_TEST_HERDR_ARTIFACT_REMOVE_READY"
-    while [ ! -e "$FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED" ]; do
-      fm_backend_herdr_control_exec sleep 0.01
-    done
-  fi
-  if ! fm_backend_herdr_control_exec mv "$path" "$quarantine/artifact" 2>/dev/null; then
-    [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$quarantine_inode" ] \
-      && fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || true
-    return 1
-  fi
-  moved_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null) || return 1
-  if [ "$moved_inode" != "$expected_inode" ] \
-    || [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" != "$quarantine_inode" ]; then
-    echo "error: preserved ambiguous Herdr artifact generation at $quarantine/artifact" >&2
-    return 1
-  fi
-  if fm_backend_herdr_test_hooks_enabled \
-    && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
-    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" ]; then
-    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE"
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR"
     kill -KILL "${BASHPID:-$$}"
   fi
-  fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
-  if fm_backend_herdr_test_hooks_enabled \
-    && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
-    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" ]; then
-    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK"
-    kill -KILL "${BASHPID:-$$}"
-  fi
-  fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
+  fm_backend_herdr_artifact_resume_attributed "$path" "$expected_inode"
 }
 
-# Recover either crash boundary after an attributed published candidate was
-# moved into its private quarantine: artifact still linked to <target>, or the
-# artifact already unlinked with only the empty owned quarantine remaining.
+# Recover every attributed candidate cleanup phase: empty quarantine before
+# move, quarantined artifact before unlink, and empty quarantine before rmdir.
+# Both ordinary nlink=1 candidates and published target/candidate nlink=2 pairs
+# use the same state machine and retain their stale/dead PID authorization.
 fm_backend_herdr_artifact_recover_candidate_quarantines() {  # <target> <mode>
-  local target=$1 mode=$2 quarantine candidate pid key expected_inode quarantine_inode contents
-  local identity_before identity_after artifact_inode target_after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  local target=$1 mode=$2 quarantine candidate pid key expected_inode snapshot contents artifact_path
+  local links identity_before identity_after artifact_inode target_after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
   for quarantine in "$target".candidate.*.quarantine.*; do
     [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
     candidate=${quarantine%.quarantine.*}
@@ -861,58 +947,57 @@ fm_backend_herdr_artifact_recover_candidate_quarantines() {  # <target> <mode>
     expected_inode=${key/_/:}
     fm_backend_herdr_server_lock_is_stale_age "$quarantine" || continue
     fm_backend_herdr_process_absent "$pid" || continue
-    [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
-    [ -d "$quarantine" ] && [ ! -L "$quarantine" ] && [ -O "$quarantine" ] \
-      && [ "$(fm_backend_herdr_path_mode "$quarantine")" = 700 ] || return 1
-    quarantine_inode=$(fm_backend_herdr_path_inode "$quarantine") || return 1
-    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
-    contents=$(fm_backend_herdr_control_perl -e '
-      opendir my $dir, $ARGV[0] or die $!;
-      my @names = sort grep { $_ ne "." && $_ ne ".." } readdir $dir;
-      closedir $dir or die $!;
-      if (!@names) { print "empty"; exit 0; }
-      if (@names == 1 && $names[0] eq "artifact") { print "artifact"; exit 0; }
-      exit 1;
-    ' "$quarantine" 2>/dev/null) || return 1
+    snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+    contents=${snapshot#*$'\n'}
     case "$contents" in
+      empty)
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+          identity_before=
+          links=0
+        else
+          artifact_path=$candidate
+          links=$(fm_backend_herdr_path_nlink "$artifact_path" 2>/dev/null) || return 1
+        fi
+        ;;
       artifact)
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+        artifact_path="$quarantine/artifact"
+        links=$(fm_backend_herdr_path_nlink "$artifact_path" 2>/dev/null) || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    case "$links" in
+      0) ;;
+      1)
+        identity_before=$(fm_backend_herdr_file_identity "$artifact_path" "$mode" owner 2>/dev/null) \
+          || return 1
+        artifact_inode=$(fm_backend_herdr_path_inode "$artifact_path") || return 1
+        [ "$artifact_inode" = "$expected_inode" ] || return 1
+        identity_after=$(fm_backend_herdr_file_identity "$artifact_path" "$mode" owner 2>/dev/null) \
+          || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        ;;
+      2)
         identity_before=$(fm_backend_herdr_hardlink_pair_identity \
-          "$quarantine/artifact" "$target" "$mode") || return 1
-        artifact_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact") || return 1
+          "$artifact_path" "$target" "$mode") || return 1
+        artifact_inode=$(fm_backend_herdr_path_inode "$artifact_path") || return 1
         [ "$artifact_inode" = "$expected_inode" ] || return 1
         identity_after=$(fm_backend_herdr_hardlink_pair_identity \
-          "$quarantine/artifact" "$target" "$mode") || return 1
-        [ "$identity_after" = "$identity_before" ] || return 1
-        [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$quarantine_inode" ] \
-          || return 1
-        fm_backend_herdr_process_absent "$pid" || return 1
-        fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
-        fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
-        target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
-          || return 1
-        [ "$target_after" = "$identity_after" ] || return 1
-        ;;
-      empty)
-        identity_before=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
-          || return 1
-        [ "$(fm_backend_herdr_path_inode "$target" 2>/dev/null)" = "$expected_inode" ] \
-          || return 1
-        identity_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
-          || return 1
+          "$artifact_path" "$target" "$mode") || return 1
         [ "$identity_after" = "$identity_before" ] || return 1
         ;;
       *) return 1 ;;
     esac
-    [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$quarantine_inode" ] \
+    [ "$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine")" = "$snapshot" ] \
       || return 1
-    contents=$(fm_backend_herdr_control_perl -e '
-      opendir my $dir, $ARGV[0] or die $!;
-      my @names = grep { $_ ne "." && $_ ne ".." } readdir $dir;
-      closedir $dir or die $!;
-      print @names ? "occupied" : "empty";
-    ' "$quarantine" 2>/dev/null) || return 1
-    [ "$contents" = empty ] || return 1
-    fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
+    fm_backend_herdr_process_absent "$pid" || return 1
+    fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+    fm_backend_herdr_artifact_resume_attributed "$candidate" "$expected_inode" || return 1
+    if [ "$links" -eq 2 ]; then
+      target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
+        || return 1
+      [ "$target_after" = "$identity_after" ] || return 1
+    fi
   done
 }
 
@@ -992,11 +1077,11 @@ fm_backend_herdr_managed_shell_bin() {
     # Copy through O_NOFOLLOW descriptors, publish with a no-overwrite hard
     # link, and verify both the source snapshot and installed digest. A racing
     # installer may win the link; both converge on the same content address.
-    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
     if fm_backend_herdr_test_hooks_enabled \
       && [ -n "${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" ]; then
       kill_after_link=$FM_TEST_HERDR_KILL_AFTER_HELPER_LINK
     fi
+    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
     publication=$(fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -MIO::Handle -e '
       my ($source, $target, $expected_digest, $kill_after_link) = @ARGV;
       my $nofollow = eval { O_NOFOLLOW() };
@@ -1116,11 +1201,11 @@ fm_backend_herdr_managed_config_ensure() {  # <session> [managed-shell]; prints 
     printf '%s\n' "$path"
     return 0
   fi
-  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
   if fm_backend_herdr_test_hooks_enabled \
     && [ -n "${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" ]; then
     kill_after_link=$FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK
   fi
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
   publication=$(fm_backend_herdr_control_perl -MFcntl=:DEFAULT -MIO::Handle -e '
     my ($path, $payload, $kill_after_link) = @ARGV;
     my $candidate = "$path.candidate.$$";
@@ -1368,6 +1453,62 @@ fm_backend_herdr_server_lock_remove_exact() {  # <path> <inode>
   fm_backend_herdr_artifact_remove_attributed "$1" "$2"
 }
 
+# Resume an interrupted attributed deletion of a lifecycle lock, lock
+# candidate, or stale-lock quarantine. Authorization mirrors ordinary stale
+# lock recovery: a present generation must be proven dead/reused or malformed
+# and stale twice; a post-unlink empty quarantine can only be removed after its
+# own private descriptor identity and stale age are repeated.
+fm_backend_herdr_server_lock_recover_attributed() {  # <path> <quarantine>
+  local path=$1 quarantine=$2 key expected_inode quarantine_snapshot contents artifact
+  local artifact_inode state snapshot current_state PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$quarantine" in "$path".quarantine.*) ;; *) return 1 ;; esac
+  key=${quarantine##*.quarantine.}
+  case "$key" in ''|*[!0-9_]*|_*|*_|*_*_*) return 1 ;; esac
+  expected_inode=${key/_/:}
+  quarantine_snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") \
+    || return 1
+  contents=${quarantine_snapshot#*$'\n'}
+  fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+  case "$contents" in
+    empty)
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        artifact=
+      else
+        artifact=$path
+      fi
+      ;;
+    artifact)
+      [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+      artifact="$quarantine/artifact"
+      ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$artifact" ]; then
+    artifact_inode=$(fm_backend_herdr_path_inode "$artifact" 2>/dev/null) || return 1
+    [ "$artifact_inode" = "$expected_inode" ] || return 1
+    if fm_backend_herdr_server_lock_owner_state "$artifact"; then state=0; else state=$?; fi
+    snapshot=$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT
+    case "$state" in
+      1|3) fm_backend_herdr_server_lock_is_stale_age "$artifact" || return 1 ;;
+      *) return 1 ;;
+    esac
+    [ "$(fm_backend_herdr_path_inode "$artifact" 2>/dev/null)" = "$artifact_inode" ] \
+      || return 1
+    if [ "$state" -eq 1 ]; then
+      if fm_backend_herdr_server_lock_owner_state "$artifact"; then current_state=0; else current_state=$?; fi
+      [ "$current_state" -eq 1 ] \
+        && [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+    else
+      fm_backend_herdr_server_lock_owner_read "$artifact" && return 1
+      fm_backend_herdr_server_lock_is_stale_age "$artifact" || return 1
+    fi
+  fi
+  [ "$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine")" = "$quarantine_snapshot" ] \
+    || return 1
+  fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+  fm_backend_herdr_artifact_resume_attributed "$path" "$expected_inode"
+}
+
 fm_backend_herdr_server_lock_cleanup_initialization() {  # <lock> <inode> <token>
   local lock=$1 expected_inode=$2 token=$3
   [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
@@ -1459,9 +1600,15 @@ fm_backend_herdr_server_lock_remove_quarantine() {  # <quarantine>
 }
 
 fm_backend_herdr_server_lock_recover_candidates() {  # <lock>
-  local lock=$1 candidate inode state snapshot current_state
+  local lock=$1 candidate quarantine inode state snapshot current_state
+  for quarantine in "$lock".candidate.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    candidate=${quarantine%.quarantine.*}
+    fm_backend_herdr_server_lock_recover_attributed "$candidate" "$quarantine" || return 1
+  done
   for candidate in "$lock".candidate.*; do
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    case "$candidate" in *.quarantine.*) continue ;; esac
     [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -O "$candidate" ] || return 1
     inode=$(fm_backend_herdr_path_inode "$candidate") || return 1
     if fm_backend_herdr_server_lock_owner_state "$candidate"; then state=0; else state=$?; fi
@@ -1567,9 +1714,19 @@ fm_backend_herdr_server_lock_recover_quarantine() {  # <quarantine> <lock>
 }
 
 fm_backend_herdr_server_lock_recover_quarantines() {  # <lock>
-  local lock=$1 quarantine
+  local lock=$1 quarantine attributed
+  for quarantine in "$lock".quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    fm_backend_herdr_server_lock_recover_attributed "$lock" "$quarantine" || return 1
+  done
+  for quarantine in "$lock".stale.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    attributed=${quarantine%.quarantine.*}
+    fm_backend_herdr_server_lock_recover_attributed "$attributed" "$quarantine" || return 1
+  done
   for quarantine in "$lock".stale.*; do
     [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    case "$quarantine" in *.quarantine.*) continue ;; esac
     fm_backend_herdr_server_lock_recover_quarantine "$quarantine" "$lock" || return 1
   done
   fm_backend_herdr_server_lock_has_quarantine "$lock" && return 1

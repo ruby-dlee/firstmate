@@ -68,6 +68,12 @@ The generated registry pins the resolved executable paths.
 Register every Git project that may host a managed worker before enrollment and launch.
 Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
 Broad, symlinked, unrelated, and unregistered working directories fail closed before a provider process or lease starts.
+Provider-owned project control files (`.mcp.json` for Claude and
+`.codex/config.toml` for Codex) are rejected during preparation and rechecked
+immediately before the final enter/exec boundary. A same-uid process can still
+create one after that last portable filesystem check and before the provider
+opens the project; eliminating that residual race requires the provider to
+disable project-local controls itself.
 
 The sealed cutover release never starts provider login or a browser. Credentials
 must already exist in each isolated worker home. `profile identity adopt` is a
@@ -228,6 +234,18 @@ routing activation are deliberately separate phases. On macOS,
 `--allow-keychain-prompt` is the explicit one-time Claude Keychain grant; choose
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
 never requests Keychain access and fails closed when verification is unavailable.
+The grant is bound to the canonical unsuffixed `Claude Code-credentials`
+service, the passwd-derived Keychain account, bounded non-secret live item
+metadata, and the exact hash-pinned Quota wrapper, Node runtime, and release
+tree. Ordinary selection invokes `/usr/bin/security` with the exact service and
+account, closed stdin, a closed environment, and no `-g`/`-w`; only an unchanged
+`0600` single-link `granted\n` marker plus a matching Fleet contract is copied
+into the disposable identity shadow. The normalized Quota release then uses
+that same exact service/account for its value read. A missing, linked, malformed,
+replaced, or stale marker/item/runtime blocks before Quota or a browser can run.
+Because Keychain ACL approval is enforced by macOS, unattended reads still rely
+on the operator's prior **Always Allow** choice; timeouts, denial, or the
+unavoidable same-uid replacement race fail closed and never authorize routing.
 
 `doctor` verifies private profile homes, fresh remote identity proof for enabled workers, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
 Non-worker reserve profiles are never provisioned, remotely probed, or routed; their status is the zero-touch `external-reserve` classification with no quota payload.
@@ -235,9 +253,15 @@ Non-worker reserve profiles are never provisioned, remotely probed, or routed; t
 
 ## Isolation and shared workflow assets
 
-Claude profiles set `CLAUDE_CONFIG_DIR`; Codex profiles set `CODEX_HOME` and `CODEX_SQLITE_HOME` and force file-backed credentials inside that home.
-Homes and state are mode 0700; registry, lease, quota, and session files are mode 0600.
-Before every provider subprocess, Agent Fleet scrubs ambient `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, and `CODEX_*` variables, then sets the managed profile-home and task/workspace variables it owns.
+Claude profiles set `CLAUDE_CONFIG_DIR`; Codex profiles set `CODEX_HOME` and
+`CODEX_SQLITE_HOME` and force file-backed credentials inside that home. Homes
+and state are mode 0700; registry, lease, quota, and session files are mode
+0600. Before every provider subprocess, Agent Fleet scrubs ambient
+`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, and `CODEX_*` variables, then sets only
+the managed profile-home and task/workspace variables it owns. Every provider
+control and worker environment also pins `USER` and `LOGNAME` to the current
+passwd identity; Claude's profile-scoped Keychain account therefore cannot be
+redirected by an ambient shell or Desktop-app login identity.
 
 The provider registry can declare a base home, hook source, trusted Git projects, and allowlisted shared entries.
 Initial profiles may share only explicitly allowlisted account-neutral workflow
@@ -248,6 +272,24 @@ assets. Managed plugin directories are forbidden:
 
 Auth files, sessions, histories, logs, caches, databases, and provider state are
 never shared.
+
+File-backed worker credentials are snapshot-attested before and after each live
+identity proof, including owner, mode, link count, inode metadata, ctime/mtime,
+size, and content digest.  The default/Desktop identity proof never runs a
+provider against the real default home: Agent Fleet copies one verified
+credential snapshot into a private, crash-recoverable shadow and proves it
+there.  Owner journals are durably published before credential bytes; startup
+recovers only dead, inode-pinned shadows and preserves live, foreign, linked,
+or otherwise ambiguous entries for inspection.
+
+The remaining boundary is the Unix same-uid threat model.  A hostile process
+already running as the Fleet owner can still race a user-owned credential path
+after its final attestation and before the provider opens it; portable process
+launch has no `fexecve` equivalent for an arbitrary provider data file.  Normal
+Desktop activity is outside each worker's private `0700` home and cannot cause
+that race.  Any observed replacement, ambiguous source set, duplicate identity,
+or failed post-proof attestation is fail-closed, and the cutover audit requires
+the identity-shadow directory to be empty after verification.
 
 ## State
 

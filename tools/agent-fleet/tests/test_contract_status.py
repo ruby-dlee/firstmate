@@ -9,6 +9,9 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+import agent_fleet.output as output_module
 from agent_fleet import __version__
 from agent_fleet.config import load_registry, save_registry
 from agent_fleet.doctor import run_doctor
@@ -115,6 +118,24 @@ def test_enroll_is_a_verified_noop_without_invoking_codex_login(
 import json
 import os
 import sys
+if "app-server" in sys.argv:
+    for line in sys.stdin:
+        message = json.loads(line)
+        if message.get("method") == "initialize":
+            print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        elif message.get("method") == "account/read":
+            print(json.dumps({
+                "id": message["id"],
+                "result": {
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "codex-base-anchor@example.invalid",
+                        "planType": "test",
+                    },
+                    "requiresOpenaiAuth": True,
+                },
+            }), flush=True)
+    raise SystemExit
 if sys.argv[1:] == ["login", "--device-auth"]:
     home = os.environ["CODEX_HOME"]
     credential = os.path.join(home, "auth.json")
@@ -485,6 +506,11 @@ def test_toon_preflight_precedes_registry_mutation(tmp_path: Path) -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
     env["PATH"] = str(tmp_path)
+    marker = tmp_path / "ambient-toon-ran"
+    shadow = tmp_path / "toon"
+    shadow.write_text(f"#!/bin/sh\n/usr/bin/touch '{marker}'\n/bin/cat\n", encoding="utf-8")
+    shadow.chmod(0o755)
+    env["AGENT_FLEET_TOON_BIN"] = str(tmp_path / "missing-pinned-toon")
     result = subprocess.run(
         [
             sys.executable,
@@ -504,8 +530,27 @@ def test_toon_preflight_precedes_registry_mutation(tmp_path: Path) -> None:
         check=False,
     )
     assert result.returncode == 2
-    assert "TOON output requested" in result.stderr
+    assert "no safely pinned encoder" in result.stderr
     assert not config.exists()
+    assert not marker.exists()
+
+
+def test_toon_emit_rejects_pinned_target_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoder = tmp_path / "toon"
+    encoder.write_text("#!/bin/sh\n/bin/cat\n", encoding="utf-8")
+    encoder.chmod(0o755)
+    monkeypatch.setenv("AGENT_FLEET_TOON_BIN", str(encoder))
+    monkeypatch.setattr(output_module, "_PINNED_TOON_COMMAND", None)
+
+    output_module.preflight("toon")
+    encoder.unlink()
+    encoder.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    encoder.chmod(0o755)
+
+    with pytest.raises(ValueError, match="changed after preflight"):
+        output_module.emit({"safe": True}, "toon")
 
 
 def test_doctor_splits_supervision_workspace_from_provider_project_and_reserves(

@@ -40,9 +40,13 @@ from .models import PROFILE_SAFETY_POLICIES, SUPPORTED_PROVIDERS, Profile, Regis
 from .output import emit, preflight
 from .paths import default_config_path, expand_path
 from .projects import (
+    TrustedProject,
+    assert_project_controls_absent,
+    enter_trusted_project,
     lexical_path,
     register_trusted_project,
     remove_trusted_project,
+    revalidate_trusted_project,
 )
 from .providers import (
     WorkerArguments,
@@ -80,6 +84,32 @@ from .sessions import (
 )
 from .status import pool_status, profile_status
 from .util import validate_id
+
+
+def _exec_managed_provider(
+    project: TrustedProject,
+    profile: Profile,
+    argv: list[str],
+    task: str,
+    workspace: Path,
+    pool: str,
+    turn_end: Path,
+) -> None:
+    """Build the worker environment, then make the final project-control check."""
+
+    environment = provider_environment(
+        profile,
+        task,
+        workspace,
+        pool,
+        turn_end,
+        operation="worker",
+    )
+    # Environment construction is deliberately inside this helper: a future
+    # provider adapter must not gain a mutation window after the last control-
+    # file check and before exec.
+    assert_project_controls_absent(project, profile.provider)
+    os.execvpe(argv[0], argv, environment)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -906,9 +936,10 @@ def _run(args: argparse.Namespace) -> Any | None:
             return updated.require_profile(profile_id).public_dict()
         if args.profile_command == "remove":
             profile = registry.require_profile(args.profile_id)
-            if profile.safety_policy == "desktop_shared":
+            if profile.safety_policy != "worker":
                 raise ValueError(
-                    f"desktop_shared profile {profile.id} cannot be removed by the live CLI"
+                    f"{profile.safety_policy} profile {profile.id} cannot be removed by the "
+                    "live CLI; use an offline reviewed registry migration"
                 )
             with _provider_maintenance(
                 registry,
@@ -1158,11 +1189,11 @@ def _run(args: argparse.Namespace) -> Any | None:
         profile = registry.require_profile(args.profile_id)
         if args.profile_command == "policy":
             if (
-                profile.safety_policy == "desktop_shared"
-                and args.safety_policy != "desktop_shared"
+                profile.safety_policy != "worker"
+                and args.safety_policy != profile.safety_policy
             ):
                 raise ValueError(
-                    f"desktop_shared classification is terminal for {profile.id}; "
+                    f"{profile.safety_policy} classification is terminal for {profile.id}; "
                     "use an offline reviewed registry migration"
                 )
             with _provider_maintenance(
@@ -1369,18 +1400,16 @@ def _run(args: argparse.Namespace) -> Any | None:
             binary=verified_provider_binary(registry, profile),
             hook_entrypoint=hook_entrypoint,
         )
-        os.chdir(project.active_root)
-        os.execvpe(
-            argv[0],
+        revalidate_trusted_project(registry, profile.provider, workspace, project)
+        enter_trusted_project(project)
+        _exec_managed_provider(
+            project,
+            profile,
             argv,
-            provider_environment(
-                profile,
-                task,
-                workspace,
-                pool,
-                turn_end,
-                operation="worker",
-            ),
+            task,
+            workspace,
+            pool,
+            turn_end,
         )
 
     if args.command == "resume":
@@ -1439,18 +1468,16 @@ def _run(args: argparse.Namespace) -> Any | None:
             binary=verified_provider_binary(registry, profile),
             hook_entrypoint=hook_entrypoint,
         )
-        os.chdir(project.active_root)
-        os.execvpe(
-            argv[0],
+        revalidate_trusted_project(registry, profile.provider, workspace, project)
+        enter_trusted_project(project)
+        _exec_managed_provider(
+            project,
+            profile,
             argv,
-            provider_environment(
-                profile,
-                task,
-                workspace,
-                pool,
-                turn_end,
-                operation="worker",
-            ),
+            task,
+            workspace,
+            pool,
+            turn_end,
         )
 
     if args.command == "session":

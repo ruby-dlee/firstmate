@@ -34,6 +34,24 @@ def _fake_provider(path: Path) -> None:
 import json
 import os
 import sys
+if "app-server" in sys.argv:
+    for line in sys.stdin:
+        message = json.loads(line)
+        if message.get("method") == "initialize":
+            print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        elif message.get("method") == "account/read":
+            print(json.dumps({
+                "id": message["id"],
+                "result": {
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "codex-base-anchor@example.invalid",
+                        "planType": "test",
+                    },
+                    "requiresOpenaiAuth": True,
+                },
+            }), flush=True)
+    raise SystemExit
 print(json.dumps({
     "argv": sys.argv[1:],
     "profile": os.environ.get("AGENT_FLEET_PROFILE"),

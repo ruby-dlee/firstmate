@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import stat
 from pathlib import Path
 from typing import Any
 
 from .config import verified_quota_binary, verified_quota_node_binary, verified_quota_runtime
 from .models import Registry
+from .output import _resolve_toon_command
 from .projects import registered_trusted_projects
 from .providers import auth_status
 from .provision import (
@@ -68,7 +68,15 @@ def run_doctor(
         _mode(config_path) == "0o600",
         f"{config_path} mode={_mode(config_path)} expected=0o600",
     )
-    add("toon", shutil.which("toon") is not None, "TOON encoder on PATH")
+    try:
+        toon_command = _resolve_toon_command()
+    except ValueError:
+        toon_command = ()
+    add(
+        "toon",
+        bool(toon_command),
+        "safely pinned TOON encoder" if toon_command else "no safely pinned TOON encoder",
+    )
     add(
         "quota-axi",
         quota_binary is not None,

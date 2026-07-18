@@ -113,9 +113,11 @@ fm_refuse_if_gate_agent() {
     echo "error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)" >&2
     exit "$FM_GATE_REFUSE_EXIT"
   fi
-  local caller checkout common common_raw
+  local caller checkout common common_raw source_dir
   caller=$(pwd -P 2>/dev/null || true)
-  checkout=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
+  source_dir=${BASH_SOURCE[0]%/*}
+  [ "$source_dir" != "${BASH_SOURCE[0]}" ] || source_dir=.
+  checkout=$(cd "$source_dir/.." 2>/dev/null && pwd -P || true)
   for checkout in "$caller" "$checkout"; do
     [ -n "$checkout" ] || continue
     common_raw=$(git -C "$checkout" rev-parse --git-common-dir 2>/dev/null || true)

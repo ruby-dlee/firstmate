@@ -7,6 +7,25 @@ from contextlib import suppress
 from pathlib import Path
 
 
+def current_user_name() -> str:
+    """Return the canonical passwd name, never caller-controlled USER/LOGNAME."""
+
+    try:
+        record = pwd.getpwuid(os.getuid())
+    except (KeyError, OSError) as exc:
+        raise ValueError("cannot resolve the current user's passwd identity") from exc
+    configured = record.pw_name
+    if (
+        record.pw_uid != os.getuid()
+        or not configured
+        or "\x00" in configured
+        or "=" in configured
+        or any(ord(character) < 32 or ord(character) == 127 for character in configured)
+    ):
+        raise ValueError("current user's passwd identity is invalid")
+    return configured
+
+
 def current_user_home() -> Path:
     """Return the canonical passwd home, never the caller-controlled HOME."""
 

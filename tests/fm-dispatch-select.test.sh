@@ -265,10 +265,12 @@ test_invalid_pool_status_timeout_is_rejected() {
 }
 
 test_dispatch_ignores_hostile_path_jq_and_dirname() {
-  local fakebin jq_marker dirname_marker spec out
+  local fakebin jq_marker dirname_marker cat_marker awk_marker spec out stdin_out
   fakebin=$(fm_fakebin "$TMP_ROOT/hostile-path-tools")
   jq_marker="$TMP_ROOT/hostile-path-tools/jq-called"
   dirname_marker="$TMP_ROOT/hostile-path-tools/dirname-called"
+  cat_marker="$TMP_ROOT/hostile-path-tools/cat-called"
+  awk_marker="$TMP_ROOT/hostile-path-tools/awk-called"
   cat > "$fakebin/jq" <<SH
 #!/bin/sh
 printf called > '$jq_marker'
@@ -279,17 +281,32 @@ SH
 printf called > '$dirname_marker'
 printf '%s\n' /forged
 SH
-  chmod +x "$fakebin/jq" "$fakebin/dirname"
+  cat > "$fakebin/cat" <<SH
+#!/bin/sh
+printf called > '$cat_marker'
+printf '%s\n' '{"harness":"forged"}'
+SH
+  cat > "$fakebin/awk" <<SH
+#!/bin/sh
+printf called > '$awk_marker'
+printf '%s\n' 'forged help'
+SH
+  chmod +x "$fakebin/jq" "$fakebin/dirname" "$fakebin/cat" "$fakebin/awk"
   spec='{"harness":"claude","model":"sonnet"}'
 
   out=$(CDPATH='' builtin cd -- "$ROOT/bin" && \
     PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh "$spec")
+  stdin_out=$(printf '%s\n' "$spec" | (CDPATH='' builtin cd -- "$ROOT/bin" && \
+    PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh))
 
   [ "$out" = '{"harness":"claude","model":"sonnet"}' ] \
     || fail "hostile PATH forged dispatch selection: $out"
+  [ "$stdin_out" = "$out" ] || fail "hostile PATH forged stdin dispatch selection: $stdin_out"
   [ ! -e "$jq_marker" ] || fail "dispatch executed hostile PATH jq"
   [ ! -e "$dirname_marker" ] || fail "dispatch executed hostile PATH dirname"
-  pass "dispatch pins jq and resolves its source directory without ambient PATH tools"
+  [ ! -e "$cat_marker" ] || fail "dispatch executed hostile PATH cat"
+  [ ! -e "$awk_marker" ] || fail "dispatch executed hostile PATH awk"
+  pass "dispatch pins its parser and input tools without ambient PATH resolution"
 }
 
 test_account_pool_summary_owns_provider_quota_choice() {

@@ -3,6 +3,7 @@
 # A fake Agent Fleet and fake tmux capture every command; no profile home,
 # credential, real endpoint, global config, or live worker is touched.
 set -u
+export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -197,6 +198,7 @@ task=
 pool=
 profile=${FM_FAKE_AF_PROFILE:-claude-2}
 provider=${FM_FAKE_AF_PROVIDER:-claude}
+workspace=
 prev=
 for arg in "$@"; do
   case "$prev" in
@@ -204,13 +206,14 @@ for arg in "$@"; do
     --pool) pool=$arg ;;
     --profile) profile=$arg ;;
     --provider) provider=$arg ;;
+    --workspace) workspace=$arg ;;
   esac
   prev=$arg
 done
 case "$*" in
   '--format json contract')
     [ -z "${FM_FAKE_AF_CONTRACT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_CONTRACT_SLEEP"
-    printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-1}"
+    printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-2}"
     ;;
   *" choose "*|*" lease choose "*|*" lease acquire "*|*" lease recover "*)
     if [ -n "${FM_FAKE_AF_REQUIRE_PRELEASE_META:-}" ]; then
@@ -243,7 +246,8 @@ case "$*" in
         [ -z "${FM_FAKE_AF_SELECT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SELECT_SLEEP"
         ;;
     esac
-    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$provider"
+    [ -z "${FM_FAKE_AF_SELECTION_WORKSPACE:-}" ] || workspace=$FM_FAKE_AF_SELECTION_WORKSPACE
+    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"%s","workspace":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$provider" "$workspace"
     ;;
   *" session status "*)
     [ "${FM_FAKE_AF_SESSION_MISSING:-0}" != 1 ] || exit 1
@@ -284,7 +288,16 @@ case "$*" in
       fi
       updated_at=$(cat "$FM_FAKE_AF_WALLCLOCK_TIMESTAMP_FILE")
     fi
-    printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$task" "$updated_at"
+    workspace=${FM_FAKE_AF_WORKSPACE:-}
+    if [ -z "$workspace" ] && [ -n "${FM_STATE_OVERRIDE:-}" ]; then
+      for candidate in "$FM_STATE_OVERRIDE"/*.meta; do
+        [ -f "$candidate" ] || continue
+        [ "$(sed -n 's/^account_task=//p' "$candidate" | tail -1)" = "$task" ] || continue
+        workspace=$(sed -n 's/^worktree=//p' "$candidate" | tail -1)
+        break
+      done
+    fi
+    printf '{"schema":1,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$updated_at"
     ;;
   *" lease release "*)
     [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
@@ -666,7 +679,7 @@ test_observe_is_dry_run_only() {
 }
 
 test_enforce_pool_wraps_backend_and_records_real_session() {
-  local id rec out status launch meta account_task account_attempt
+  local id rec out status launch meta account_task account_attempt af_bin
   id=account-enforce-z3
   rec=$(make_case enforce claude "$id")
   read_case "$rec"
@@ -675,9 +688,11 @@ test_enforce_pool_wraps_backend_and_records_real_session() {
   expect_code 0 "$status" "explicit pool spawn should enforce routing"
   account_task=$(meta_account_task "$id")
   account_attempt=$(sed -n 's/^account_attempt=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  af_bin="$(cd "$FAKEBIN_DIR" && pwd -P)/agent-fleet"
   assert_grep "lease choose --pool claude-crew --task $account_task --provider claude" "$AF_LOG" "enforce did not atomically choose a namespaced lease"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "'$FAKEBIN_DIR/agent-fleet' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' --workspace '$WT_DIR' -- --dangerously-skip-permissions" "enforce did not build the task-worktree-bound Agent Fleet wrapper"
+  assert_contains "$launch" "'$af_bin' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' --workspace '$WT_DIR'" "enforce did not build the task-worktree-bound Agent Fleet wrapper"
+  assert_contains "$launch" "-- --dangerously-skip-permissions" "enforce did not preserve provider arguments after the Agent Fleet wrapper"
   meta="$HOME_DIR/state/$id.meta"
   grep -q '^account_pool=' "$meta" || fail "meta missing account pool; contents: $(tr '\n' '|' < "$meta")"
   assert_grep 'account_pool=claude-crew' "$meta" "meta missing account pool"
@@ -780,8 +795,11 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   assert_grep "lease recover --task $account_task" "$AF_LOG" "resume used new-task selection instead of sticky recovery reservation"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "resume ran the new-task quota path"
   launch=$(cat "$LAUNCH_LOG" "$NATIVE_LAUNCH_LOG")
-  assert_contains "$launch" "--format json resume --task '$account_task' --workspace '$WT_DIR' -- \"\$@\"" "resume did not use Agent Fleet's fail-closed task and worktree mapping"
+  assert_contains "$launch" "--format json resume --task '$account_task' --workspace '$WT_DIR'" "resume did not use Agent Fleet's fail-closed task and worktree mapping"
+  assert_contains "$launch" "-- \"\$@\"" "resume did not preserve provider arguments after the Agent Fleet wrapper"
   assert_contains "$launch" "account-native-launch' --dangerously-skip-permissions" "resume did not pass provider arguments through its launch gate"
+  assert_contains "$launch" "#!$ROOT/bin/fm-herdr-worker-shell" "native resume did not scrub inherited startup state before Bash"
+  assert_not_contains "$launch" '#!/bin/bash' "native resume reintroduced an unsanitized Bash shebang"
   assert_not_contains "$launch" 'cat ' "resume started a fresh prompted conversation"
   [ "$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)" = "$before_session" ] || fail "resume changed provider session identity"
   assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover recovery silently activated the report gate"
@@ -1070,6 +1088,35 @@ test_session_sync_bounds_agent_fleet_queries() {
   assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "timed-out session query retained the metadata lock"
   [ -n "$out" ] || true
   pass "session synchronization bounds every Agent Fleet query"
+}
+
+test_session_sync_rejects_workspace_mismatch_without_metadata_change() {
+  local id rec meta_tmp expected out status
+  id=account-sync-workspace-z9e
+  rec=$(make_case sync-workspace claude "$id")
+  read_case "$rec"
+  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "workspace mismatch precondition spawn failed"
+  meta_tmp="$HOME_DIR/state/.$id.meta.test"
+  grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  expected="$CASE_DIR/meta-before-workspace-mismatch"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
+    FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_WORKSPACE="$CASE_DIR/wrong-worktree" \
+    PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] || fail "session sync accepted a mismatched Agent Fleet workspace"
+  assert_contains "$out" "session workspace mismatch" \
+    "session sync did not report the mismatched workspace"
+  cmp -s "$HOME_DIR/state/$id.meta" "$expected" \
+    || fail "session workspace mismatch changed task metadata"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+    "session workspace mismatch published a provider session id"
+  pass "session synchronization validates the exact worktree before metadata commit"
 }
 
 test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
@@ -1374,6 +1421,18 @@ test_recovered_reservations_are_owned_only_after_validated_recovery() {
   assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" "mismatched recovery changed durable session metadata"
 
   clear_case_logs
+  out=$(FM_FAKE_AF_SELECTION_WORKSPACE="$CASE_DIR/wrong-recovery-workspace" \
+    run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "cross-workspace recovery response unexpectedly succeeded"
+  assert_grep "lease release --task $account_task --force" "$AF_LOG" \
+    "cross-workspace recovery did not release its exact cleanup-owned reservation"
+  assert_not_grep "session remove --task $account_task" "$AF_LOG" \
+    "cross-workspace recovery removed durable session state"
+  assert_grep "provider_session_id=$session" "$HOME_DIR/state/$id.meta" \
+    "cross-workspace recovery changed durable session metadata"
+
+  clear_case_logs
   lineage="$HOME_DIR/data/$id/account-attempts.md"
   rm -f "$lineage"
   mkdir "$lineage"
@@ -1444,6 +1503,27 @@ test_native_resume_separates_whole_second_sessionstart_evidence() {
   [ "$status" -eq 0 ] || fail "whole-second SessionStart evidence was rejected after the launch gate: $out"
   assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" "whole-second native resume lost its provider session binding"
   pass "native resume separates whole-second SessionStart evidence across its launch gate"
+}
+
+test_native_resume_accepts_agent_fleet_utc_offset_timestamps() {
+  local id rec out status before after
+  id=account-resume-offset-z9f
+  rec=$(make_case resume-offset claude "$id")
+  read_case "$rec"
+  before=2026-07-13T00:00:00.100000+00:00
+  after=2026-07-13T00:00:00.200000+00:00
+  FM_FAKE_AF_UPDATED_AT_BEFORE="$before" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
+    || fail "Agent Fleet timestamp resume precondition spawn failed"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+
+  if out=$(FM_FAKE_AF_UPDATED_AT_BEFORE="$before" FM_FAKE_AF_UPDATED_AT_AFTER="$after" \
+    run_spawn "$id" --resume-account); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] \
+    || fail "real Agent Fleet +00:00 SessionStart timestamp was rejected: $out"
+  assert_regex '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+    "Agent Fleet timestamp resume lost its provider session binding"
+  pass "native resume accepts and orders Agent Fleet's RFC3339 +00:00 timestamps"
 }
 
 test_native_resume_uses_private_launch_directory_and_cleans_it() {
@@ -1725,6 +1805,8 @@ test_unused_secondmate_pool_never_blocks_unmanaged_spawn() {
   status=$?
   [ "$status" -eq 0 ] || fail "malformed unused secondmate pool blocked explicit opt-out: $out"
   [ ! -s "$AF_LOG" ] || fail "opted-out malformed pool invoked Agent Fleet"
+  assert_contains "$out" 'WARNING: emergency --no-account-routing bypass is active' "emergency bypass was not surfaced"
+  assert_grep 'account_routing_emergency_bypass=1' "$HOME_DIR/state/$id.meta" "emergency bypass was not audited in task metadata"
   pass "unused secondmate pool policy is not parsed by unmanaged spawns"
 }
 
@@ -2728,6 +2810,7 @@ SH
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_AF_POOL=claude-crew FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_PROVIDER=claude \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_TEST_ACCOUNT_MV_BIN="$failbin/mv" \
     PATH="$failbin:$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --require 2>&1)
   status=$?
   set -e
@@ -4264,6 +4347,66 @@ SH
   pass "metadata locks reclaim abandoned directories without deleting new owners"
 }
 
+test_account_locks_never_reclaim_on_indeterminate_process_probe() {
+  local case_dir state fake_ps kind acquire held owner_pid inode_before inode_after owner_before owner_after status
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/account-lock-indeterminate-ps"
+  state="$case_dir/state"
+  fake_ps="$case_dir/ps"
+  mkdir -p "$state"
+  cat > "$fake_ps" <<'SH'
+#!/usr/bin/env bash
+original=("$@")
+target=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -p ]; then target=${2:-}; break; fi
+  shift
+done
+if [ "$target" = "${FM_TEST_ACCOUNT_PS_TARGET:?}" ]; then
+  printf 'transient ps failure\n' >&2
+  exit 42
+fi
+exec /bin/ps "${original[@]}"
+SH
+  chmod +x "$fake_ps"
+
+  for kind in meta lifecycle; do
+    if [ "$kind" = meta ]; then
+      acquire=fm_account_meta_lock_acquire
+    else
+      acquire=fm_account_lifecycle_lock_acquire
+    fi
+    held=$($acquire "$state" "indeterminate-$kind") \
+      || fail "could not acquire $kind lock fixture"
+    owner_pid=$(sed -n '1p' "$held")
+    inode_before=$(fm_account_path_inode "$held")
+    owner_before=$(cat "$held")
+    if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+      FM_TEST_ACCOUNT_PS_BIN="$fake_ps" FM_TEST_ACCOUNT_PS_TARGET="$owner_pid" \
+      FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 \
+      FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=1 \
+      bash -c '
+        . "$1"
+        if [ "$2" = meta ]; then
+          fm_account_meta_lock_acquire "$3" "indeterminate-$2"
+        else
+          fm_account_lifecycle_lock_acquire "$3" "indeterminate-$2"
+        fi
+      ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$kind" "$state" >/dev/null 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    [ "$status" -ne 0 ] || fail "$kind lock was stolen after an indeterminate process probe"
+    inode_after=$(fm_account_path_inode "$held")
+    owner_after=$(cat "$held")
+    [ "$inode_after" = "$inode_before" ] && [ "$owner_after" = "$owner_before" ] \
+      || fail "$kind lock identity changed after an indeterminate process probe"
+    fm_account_meta_lock_release "$held" || fail "could not release preserved $kind lock"
+  done
+  pass "metadata and lifecycle locks preserve live owners when pinned ps is indeterminate"
+}
+
 test_ownerless_lock_marker_rejects_symlink_clobber() {
   local case_dir state lock marker outside out status
   case_dir="$TMP_ROOT/account-ownerless-marker"
@@ -4349,8 +4492,12 @@ case "${1:-}" in
 esac
 SH
   chmod +x "$fakebin/uname" "$fakebin/stat"
-  output=$(PATH="$fakebin:$PATH" bash -c '. "$1"; printf "%s:%s\n" "$(fm_account_path_mtime "$2")" "$(fm_account_path_inode "$2")"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$file") || fail "Linux account stat helpers failed"
+  output=$(bash -c '
+    . "$1"
+    FM_ACCOUNT_SYSTEM_UNAME_BIN=$2/uname
+    FM_ACCOUNT_SYSTEM_STAT_BIN=$2/stat
+    printf "%s:%s\n" "$(fm_account_path_mtime "$3")" "$(fm_account_path_inode "$3")"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$fakebin" "$file") || fail "Linux account stat helpers failed"
   [ "$output" = '12345:67890' ] || fail "Linux account stat helpers accepted filesystem-stat output: $output"
   pass "account metadata stat helpers select GNU stat without probing BSD filesystem stat"
 }
@@ -4371,6 +4518,7 @@ test_stale_reclaim_guard_is_owned_before_lock_removal() {
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" || fail "stale reclaim guard was observed but not acquired"
 
   printf '999999\nstale-owner\n' > "$lock"
+  touch -t 200001010000 "$lock"
   set +e
   output=$(LOCK="$lock" bash -c '
     . "$1"
@@ -4502,17 +4650,359 @@ test_agent_fleet_contract_is_validated_before_routing() {
   id=account-contract-z26
   rec=$(make_case contract claude "$id")
   read_case "$rec"
-  if out=$(FM_FAKE_AF_CONTRACT_VERSION=2 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  if out=$(FM_FAKE_AF_CONTRACT_VERSION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "incompatible Agent Fleet contract unexpectedly enforced routing"
   assert_not_grep 'lease (choose|acquire)' "$AF_LOG" "incompatible Agent Fleet contract mutated a lease"
-  assert_contains "$out" "unsupported Agent Fleet contract version 2" "contract mismatch was not actionable"
+  assert_contains "$out" "unsupported Agent Fleet contract version 1" "contract mismatch was not actionable"
 
   clear_case_logs
-  if out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_CONTRACT_VERSION=2 run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
+  if out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_CONTRACT_VERSION=1 run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
   [ "$status" -eq 0 ] || fail "observe mode should degrade on an incompatible Agent Fleet contract"
   assert_not_grep ' choose ' "$AF_LOG" "incompatible observe contract still queried selection"
   assert_contains "$out" "observe contract unavailable" "observe contract fallback was not surfaced"
-  pass "Agent Fleet contract v1 is required before observation or enforcement"
+  pass "Agent Fleet contract v2 is required before observation or enforcement"
+}
+
+test_agent_fleet_entrypoint_is_physically_pinned_per_operation() {
+  local dir releases releases_physical current pathbin log out unsafe shadow_status release
+  dir="$TMP_ROOT/agent-fleet-physical-pin"
+  releases="$dir/releases"
+  current="$dir/current"
+  pathbin="$dir/bin"
+  log="$dir/invocations"
+  mkdir -p "$releases/r1" "$releases/r2" "$pathbin"
+  releases_physical=$(cd "$releases" && pwd -P)
+  : > "$log"
+  for release in r1 r2; do
+    cat > "$releases/$release/agent-fleet" <<SH
+#!/usr/bin/env bash
+printf '$release:%s\n' "\$*" >> '$log'
+case "\$*" in
+  '--format json contract') printf '{"contract_version":2}\n' ;;
+  *' lease release '*) printf '{"ok":true}\n' ;;
+  *) exit 64 ;;
+esac
+SH
+    chmod 755 "$releases/$release/agent-fleet"
+  done
+  ln -s "$releases/r1" "$current"
+  ln -s "$current/agent-fleet" "$pathbin/agent-fleet"
+
+  out=$(PATH="$pathbin:/usr/bin:/bin" FM_TEST_PIN_CURRENT="$current" \
+    FM_TEST_PIN_RELEASE_TWO="$releases/r2" bash -c '
+      . "$1"
+      fm_account_pin_fleet_bin || exit 1
+      pinned=$FM_ACCOUNT_FLEET_PINNED_BIN
+      rm "$FM_TEST_PIN_CURRENT"
+      ln -s "$FM_TEST_PIN_RELEASE_TWO" "$FM_TEST_PIN_CURRENT"
+      command=$(fm_account_exec_command claude-1 claude-crew task "$PWD" "$PWD/end") || exit 1
+      fm_account_release task --force >/dev/null || exit 1
+      printf "%s\n%s\n" "$pinned" "$command"
+    ' _ "$ROOT/bin/fm-account-routing-lib.sh") \
+    || fail "physical Agent Fleet pin fixture failed"
+  assert_contains "$out" "$releases_physical/r1/agent-fleet" "operation did not pin the physical release-one entrypoint"
+  assert_not_contains "$out" "$releases_physical/r2/agent-fleet" "current switch changed the operation's pinned entrypoint"
+  assert_grep 'r1:' "$log" "pinned release one was never executed"
+  assert_not_grep 'r2:' "$log" "current switch executed release two inside the existing operation"
+
+  unsafe="$dir/unsafe"
+  mkdir -p "$unsafe"
+  cat > "$unsafe/agent-fleet" <<SH
+#!/usr/bin/env bash
+printf 'unsafe-ran\n' >> '$log'
+SH
+  chmod 777 "$unsafe/agent-fleet"
+  if PATH="$unsafe:$pathbin:/usr/bin:/bin" bash -c \
+    '. "$1"; fm_account_pin_fleet_bin' _ "$ROOT/bin/fm-account-routing-lib.sh" >/dev/null 2>&1; then
+    shadow_status=0
+  else
+    shadow_status=$?
+  fi
+  [ "$shadow_status" -ne 0 ] || fail "writable PATH shadow was accepted as Agent Fleet"
+  assert_not_grep 'unsafe-ran' "$log" "writable PATH shadow executed during validation"
+
+  if FM_AGENT_FLEET_BIN="$unsafe/agent-fleet" bash -c \
+    '. "$1"; fm_account_pin_fleet_bin' _ "$ROOT/bin/fm-account-routing-lib.sh" >/dev/null 2>&1; then
+    shadow_status=0
+  else
+    shadow_status=$?
+  fi
+  [ "$shadow_status" -ne 0 ] || fail "writable FM_AGENT_FLEET_BIN override was accepted"
+  assert_not_grep 'unsafe-ran' "$log" "writable override executed during validation"
+
+  out=$(FM_AGENT_FLEET_BIN="$pathbin/agent-fleet" bash -c \
+    '. "$1"; fm_account_fleet_bin' _ "$ROOT/bin/fm-account-routing-lib.sh") \
+    || fail "safe override did not resolve to its physical release"
+  [ "$out" = "$releases_physical/r2/agent-fleet" ] \
+    || fail "safe override did not return the canonical physical path: $out"
+
+  ln "$releases/r2/agent-fleet" "$dir/agent-fleet-hardlink"
+  if FM_AGENT_FLEET_BIN="$pathbin/agent-fleet" bash -c \
+    '. "$1"; fm_account_fleet_bin' _ "$ROOT/bin/fm-account-routing-lib.sh" >/dev/null 2>&1; then
+    shadow_status=0
+  else
+    shadow_status=$?
+  fi
+  [ "$shadow_status" -ne 0 ] || fail "hardlinked Agent Fleet entrypoint was accepted"
+  pass "Agent Fleet resolves one safe physical release per operation and rejects PATH shadows"
+}
+
+
+test_agent_fleet_validation_ignores_ambient_system_tool_shadows() {
+  local dir fakebin safe log out tool perl_lib perl_marker lock_state stale_lock loader_env bash_env
+  dir="$TMP_ROOT/agent-fleet-system-tool-pin"
+  fakebin="$dir/fakebin"
+  safe="$dir/release/agent-fleet"
+  log="$dir/ambient-tools-ran"
+  perl_lib="$dir/perl-lib"
+  perl_marker="$dir/perl-injection-ran"
+  loader_env="$dir/loader-env"
+  bash_env="$dir/hostile-bash-env"
+  mkdir -p "$fakebin" "${safe%/*}" "$perl_lib"
+  cat > "$safe" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod 755 "$safe"
+  : > "$log"
+  for tool in perl uname stat id jq dirname rm mv ln mkdir rmdir mktemp sleep cp sed date env basename cat awk; do
+    cat > "$fakebin/$tool" <<SH
+#!/bin/sh
+printf '%s\n' '$tool' >> '$log'
+exit 97
+SH
+    chmod 755 "$fakebin/$tool"
+  done
+  lock_state="$dir/lock-state"
+  stale_lock="$lock_state/.account-meta-hostile-tools.lock"
+  mkdir -p "$stale_lock"
+  printf '999999\nMon Jan  1 00:00:00 2001\n' > "$stale_lock/owner"
+  cat > "$perl_lib/BridgeFleetEvil.pm" <<'PERL'
+package BridgeFleetEvil;
+BEGIN {
+  open my $fh, '>', $ENV{FM_PERL_INJECTION_MARKER} or die $!;
+  print {$fh} "ambient Perl injection executed\n";
+  close $fh;
+}
+1;
+PERL
+  cat > "$bash_env" <<SH
+printf 'BASH_ENV injection executed\n' > '$perl_marker'
+SH
+  out=$(PATH="$fakebin" PERL5OPT=-MBridgeFleetEvil PERL5LIB="$perl_lib" \
+    PERLLIB="$perl_lib" FM_PERL_INJECTION_MARKER="$perl_marker" /bin/bash -c \
+    '. "$1"
+     export LD_PRELOAD=/tmp/hostile.so DYLD_INSERT_LIBRARIES=/tmp/hostile.dylib
+     export NODE_OPTIONS="--require /tmp/hostile-node.js" PYTHONPATH=/tmp/hostile-python
+     export BASH_ENV="$6" FM_LOADER_ENV_LOG="$7"
+     binary=$(fm_account_fleet_bin "$2") || exit 1
+     selected=$(fm_account_json_field "$3" "$4" selection) || exit 1
+     lock=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 fm_account_meta_lock_acquire "$5" hostile-tools) || exit 1
+     fm_account_meta_lock_release "$lock" || exit 1
+     fm_account_system_exec /bin/bash -c '\''printf "%s|%s|%s|%s|%s\n" "${LD_PRELOAD-}" "${DYLD_INSERT_LIBRARIES-}" "${NODE_OPTIONS-}" "${PYTHONPATH-}" "${BASH_ENV-}" > "$FM_LOADER_ENV_LOG"'\'' || exit 1
+     printf "%s\n%s\n" "$binary" "$selected"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$safe" '{"profile":"claude-1"}' \
+    '.profile | select(type == "string" and length > 0)' "$lock_state" "$bash_env" "$loader_env") \
+    || fail "fixed-tool Agent Fleet validation failed under hostile PATH"
+  [ "${out%%$'\n'*}" = "$(cd "${safe%/*}" && pwd -P)/${safe##*/}" ] \
+    || fail "fixed-tool validation returned the wrong physical entrypoint: $out"
+  [ "${out##*$'\n'}" = claude-1 ] \
+    || fail "hostile jq forged an Agent Fleet selection field: $out"
+  PATH="$fakebin:/usr/bin:/bin" "$SESSION_SYNC" --help >/dev/null \
+    || fail "session-sync could not self-locate under hostile PATH"
+  [ ! -s "$log" ] || fail "Agent Fleet validation executed ambient system-tool shadows: $(cat "$log")"
+  [ ! -e "$perl_marker" ] || fail "Agent Fleet validation honored ambient PERL5OPT/PERLLIB injection"
+  [ "$(cat "$loader_env")" = '||||' ] \
+    || fail "fixed system control inherited loader/runtime injection: $(cat "$loader_env")"
+  [ ! -e "$stale_lock" ] || fail "hostile-path lock lifecycle did not reclaim and release its stale generation"
+  pass "Agent Fleet validation and lock recovery pin system tools and scrub Perl injection"
+}
+
+test_production_routing_ignores_ambient_mode_and_forbids_binary_override() {
+  local dir mode marker status
+  dir="$TMP_ROOT/production-routing-authority"
+  mkdir -p "$dir/config"
+  printf 'enforce\n' > "$dir/config/account-routing-mode"
+  # Arguments are intentionally expanded by bash -c.
+  # shellcheck disable=SC2016
+  mode=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB FM_ACCOUNT_ROUTING=off bash -c '
+    . "$1"
+    fm_account_resolve_mode "$2" 0 0
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$dir/config") \
+    || fail "production routing mode could not be resolved"
+  [ "$mode" = enforce ] || fail "ambient FM_ACCOUNT_ROUTING bypassed authoritative config: $mode"
+
+  marker="$dir/override-ran"
+  cat > "$dir/agent-fleet" <<SH
+#!/usr/bin/env bash
+touch '$marker'
+SH
+  chmod 755 "$dir/agent-fleet"
+  # $1 is intentionally expanded by bash -c.
+  # shellcheck disable=SC2016
+  if env -u FM_ACCOUNT_ROUTING_TEST_LAB FM_AGENT_FLEET_BIN="$dir/agent-fleet" bash -c \
+    '. "$1"; fm_account_fleet_bin' _ "$ROOT/bin/fm-account-routing-lib.sh" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "production accepted an Agent Fleet executable override"
+  [ ! -e "$marker" ] || fail "forbidden production Agent Fleet override executed"
+  pass "production routing config is authoritative and executable overrides are forbidden"
+}
+
+test_production_fleet_environment_is_closed_before_control_and_worker_exec() {
+  local dir fake log marker bash_env prefix_log out canonical identity expected_prefix separator
+  dir="$TMP_ROOT/production-fleet-environment"
+  fake="$dir/fake-agent-fleet"
+  log="$dir/invocations"
+  marker="$dir/startup-injection-ran"
+  bash_env="$dir/hostile-bash-env"
+  prefix_log="$dir/worker-prefix"
+  mkdir -p "$dir"
+  cat > "$fake" <<PERL
+#!/usr/bin/perl
+use strict;
+use warnings;
+open my \$fh, '>>', '$log' or die \$!;
+my @blocked = sort grep {
+  /^(?:AGENT_FLEET_|QUOTA_AXI_|XDG_|BASH_FUNC_)/
+    || /^(?:LD_|DYLD_|PERL|PYTHON|RUBY|NODE_)/
+    || /^(?:BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|BASH_XTRACEFD|KSHENV|ZDOTDIR|GCONV_PATH)\$/
+} keys %ENV;
+print {\$fh} "argv=", join("\x1f", @ARGV), "\n";
+print {\$fh} "blocked=", join(",", @blocked), "\n";
+print {\$fh} "identity=", join("|", map { \$ENV{\$_} // "" } qw(HOME USER LOGNAME)), "\n";
+print {\$fh} "path=", (\$ENV{PATH} // ""), "\n";
+print {\$fh} "locale=", (\$ENV{LC_ALL} // ""), "|", (\$ENV{LANG} // ""), "\n";
+print {\$fh} "sentinel=", (\$ENV{FM_WORKER_SENTINEL} // ""), "\n";
+close \$fh;
+print "{\"contract_version\":2,\"ok\":true}\n";
+PERL
+  chmod 755 "$fake"
+  cat > "$bash_env" <<SH
+/usr/bin/touch '$marker'
+SH
+
+  # shellcheck disable=SC2016  # Dollar expressions belong to the nested shell.
+  out=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB /bin/bash --noprofile --norc -c '
+    . "$1"
+    export AGENT_FLEET_CONFIG=/tmp/hostile-config
+    export AGENT_FLEET_STATE_DIR=/tmp/hostile-state
+    export AGENT_FLEET_FUTURE_REDIRECT=/tmp/hostile-future
+    export QUOTA_AXI_CACHE_DIR=/tmp/hostile-quota
+    export QUOTA_AXI_FUTURE_REDIRECT=/tmp/hostile-quota-future
+    export XDG_CONFIG_HOME=/tmp/hostile-xdg
+    export BASH_ENV="$4"
+    export FM_WORKER_SENTINEL=preserved
+    fm_account_run_control "$2" --format json contract >/dev/null || exit 1
+    fm_account_run_selection "$2" --format json choose --pool claude-crew --task probe --provider claude --workspace "$PWD" --dry-run >/dev/null || exit 1
+    fm_account_reconcile_lease_mutation "$2" probe "$PWD" probe >/dev/null || exit 1
+    prefix=$(fm_account_fleet_worker_prefix "$2") || exit 1
+    printf "%s\n" "$prefix" > "$5"
+    export SHELLOPTS BASHOPTS PS4
+    hostile_exported_function() { /usr/bin/touch "$3"; }
+    export -f hostile_exported_function
+    eval "$prefix --format json contract" >/dev/null || exit 1
+    "$FM_ACCOUNT_SYSTEM_ENV_BIN" \
+      SHELLOPTS=xtrace "PS4=\$(/usr/bin/touch '\''$3'\'')" \
+      "BASH_FUNC_hostile_direct%%=() { /usr/bin/touch '\''$3'\''; }" \
+      AGENT_FLEET_CONFIG=/tmp/direct-hostile-config \
+      QUOTA_AXI_CACHE_DIR=/tmp/direct-hostile-quota \
+      XDG_CONFIG_HOME=/tmp/direct-hostile-xdg \
+      FM_WORKER_SENTINEL=preserved \
+      LD_PRELOAD= LD_LIBRARY_PATH= LD_AUDIT= LD_DEBUG= \
+      DYLD_INSERT_LIBRARIES= DYLD_LIBRARY_PATH= DYLD_FRAMEWORK_PATH= \
+      DYLD_FALLBACK_LIBRARY_PATH= DYLD_FALLBACK_FRAMEWORK_PATH= \
+      PERL5OPT= PERL5LIB= PERLLIB= NODE_OPTIONS= NODE_PATH= \
+      PYTHONHOME= PYTHONPATH= RUBYOPT= RUBYLIB= BASH_ENV= ENV= GCONV_PATH= \
+      "$FM_ACCOUNT_SYSTEM_PERL_BIN" -e "$FM_ACCOUNT_WORKER_PERL_PROGRAM" \
+      "$FM_ACCOUNT_PASSWD_HOME" "$FM_ACCOUNT_PASSWD_NAME" \
+      "$FM_ACCOUNT_CANONICAL_CONFIG" "$2" --format json contract >/dev/null || exit 1
+    printf "%s\n%s|%s|%s\n" "$FM_ACCOUNT_CANONICAL_CONFIG" \
+      "$FM_ACCOUNT_PASSWD_HOME" "$FM_ACCOUNT_PASSWD_NAME" "$FM_ACCOUNT_PASSWD_NAME"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$fake" "$marker" "$bash_env" "$prefix_log") \
+    || fail "production Fleet launcher did not close hostile authority environment"
+
+  canonical=${out%%$'\n'*}
+  identity=${out##*$'\n'}
+  separator=$(printf '\037')
+  expected_prefix="argv=--config${separator}${canonical}${separator}"
+  [ "$(grep -Fc "$expected_prefix" "$log")" -eq 5 ] \
+    || fail "not every Fleet path pinned the canonical config before its command: $(cat "$log")"
+  [ "$(grep -c '^blocked=$' "$log")" -eq 5 ] \
+    || fail "Fleet child inherited a hostile authority/startup variable: $(cat "$log")"
+  [ "$(grep -Fc "identity=$identity" "$log")" -eq 5 ] \
+    || fail "Fleet child did not use the passwd identity: $(cat "$log")"
+  [ "$(grep -c '^path=/usr/bin:/bin:/usr/sbin:/sbin$' "$log")" -eq 3 ] \
+    || fail "Fleet control paths did not use the closed system PATH: $(cat "$log")"
+  [ "$(grep -c '^locale=C|C$' "$log")" -eq 3 ] \
+    || fail "Fleet control paths did not use the closed locale: $(cat "$log")"
+  [ "$(grep -c '^sentinel=$' "$log")" -eq 3 ] \
+    || fail "closed Fleet control unexpectedly retained worker environment"
+  [ "$(grep -c '^sentinel=preserved$' "$log")" -eq 2 ] \
+    || fail "worker Fleet launcher discarded intentional non-routing environment"
+  assert_not_contains "$(cat "$prefix_log")" "/bash" \
+    "worker Fleet launcher reintroduced a shell before environment scrubbing"
+  assert_contains "$(cat "$prefix_log")" "/perl" \
+    "worker Fleet launcher did not use the fixed pre-shell scrubber"
+  [ ! -e "$marker" ] \
+    || fail "hostile shell startup or exported-function injection executed before Fleet"
+  pass "production Fleet control, selection, recovery, and workers close authority environment before startup"
+}
+
+test_production_enforce_refuses_hostile_uncertified_parent_shell() {
+  local id rec marker hook fake_ps trace out status startup_out
+  id=uncertified-hostile-shell
+  rec=$(make_case uncertified-hostile-shell claude "$id")
+  read_case "$rec"
+  marker="$CASE_DIR/hostile-parent-ps4-ran"
+  hook="$CASE_DIR/hostile-parent-bash-env"
+  fake_ps="$CASE_DIR/hostile-parent-ps"
+  trace="$CASE_DIR/hostile-parent-trace"
+  # shellcheck disable=SC2016  # The variable expands when Bash sources the hook.
+  printf '%s\n' ': > "$FM_HOSTILE_PARENT_MARKER"' > "$hook"
+  cat > "$fake_ps" <<'SH'
+#!/bin/sh
+printf '%s\n' 'Fri Jul 18 08:00:00 2026'
+SH
+  chmod +x "$fake_ps"
+
+  # shellcheck disable=SC2016  # Dollar expressions belong to the nested shell.
+  if startup_out=$(/usr/bin/env SHELLOPTS=xtrace \
+    PS4=HOSTILE_PARENT_XTRACE: BASH_ENV="$hook" \
+    FM_HOSTILE_PARENT_MARKER="$marker" \
+    /bin/bash --noprofile --norc -c '
+      exec 2>"$9"
+      exec /usr/bin/env -u FM_ACCOUNT_ROUTING_TEST_LAB \
+        FM_ROOT_OVERRIDE= FM_HOME="$1" \
+        FM_STATE_OVERRIDE="$1/state" FM_DATA_OVERRIDE="$1/data" \
+        FM_PROJECTS_OVERRIDE="$1/projects" FM_CONFIG_OVERRIDE="$1/config" \
+        FM_SPAWN_NO_GUARD=1 FM_FAKE_TMUX_LOG="$4" \
+        FM_FAKE_ENDPOINT_FILE="$5" FM_FAKE_TMUX_LABEL_FILE="$6" \
+        FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+        FM_TEST_ACCOUNT_PS_BIN="${10}" \
+        TMUX=fake,1,0 PATH="$3:$PATH" \
+        "$7" "$8" "$2" --backend tmux --account-pool claude-crew
+    ' _ "$HOME_DIR" "$PROJ_DIR" "$FAKEBIN_DIR" "$TMUX_LOG" \
+      "$CASE_DIR/endpoint-live" "$CASE_DIR/tmux-label" "$SPAWN" "$id" \
+      "$trace" "$fake_ps" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  out="$startup_out$(cat "$trace")"
+
+  [ "$status" -ne 0 ] || fail "hostile uncertified tmux parent reached enforced routing"
+  [ -e "$marker" ] || fail "hostile parent-shell fixture never executed its inherited startup hook"
+  assert_contains "$out" "HOSTILE_PARENT_XTRACE:set -eu" \
+    "hostile parent-shell fixture never imported SHELLOPTS=xtrace/PS4 into fm-spawn"
+  assert_contains "$out" "requires backend=herdr with a process-bound closed-shell certificate" \
+    "uncertified hostile parent-shell refusal was not actionable"
+  [ ! -s "$AF_LOG" ] || fail "uncertified hostile parent shell reached Agent Fleet: $(cat "$AF_LOG")"
+  [ ! -s "$TMUX_LOG" ] || fail "uncertified hostile parent shell created a tmux endpoint"
+  assert_absent "$HOME_DIR/state/$id.meta" "uncertified hostile parent shell persisted managed metadata"
+  pass "production enforce refuses a genuinely hostile parent shell before Fleet, lease, or endpoint mutation"
 }
 
 test_agent_fleet_lifecycle_calls_are_bounded() {
@@ -4536,6 +5026,93 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   [ "$elapsed" -lt 5 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
   assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease release discarded retry metadata"
   pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
+}
+
+# Test doubles and environment values below are consumed indirectly by the
+# sourced routing functions.
+# shellcheck disable=SC2034,SC2329
+test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible() {
+  local out invalid log workspace
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  fm_account_run_bounded() {
+    printf '%s:%s\n' "$1" "$2"
+  }
+
+  unset FM_ACCOUNT_CONTROL_TIMEOUT FM_ACCOUNT_SELECTION_TIMEOUT
+  out=$(fm_account_run_control ordinary; fm_account_run_selection selection)
+  [ "$out" = $'10:ordinary\n120:selection' ] \
+    || fail "default account timeouts were not ordinary=10s selection=120s: $out"
+
+  FM_ACCOUNT_CONTROL_TIMEOUT=17
+  unset FM_ACCOUNT_SELECTION_TIMEOUT
+  out=$(fm_account_run_control ordinary; fm_account_run_selection selection)
+  [ "$out" = $'17:ordinary\n17:selection' ] \
+    || fail "legacy FM_ACCOUNT_CONTROL_TIMEOUT no longer overrides selection: $out"
+
+  FM_ACCOUNT_SELECTION_TIMEOUT=43
+  out=$(fm_account_run_control ordinary; fm_account_run_selection selection)
+  [ "$out" = $'17:ordinary\n43:selection' ] \
+    || fail "selection-specific timeout did not leave ordinary control unchanged: $out"
+
+  invalid="$TMP_ROOT/selection-timeout-invalid"
+  if FM_ACCOUNT_SELECTION_TIMEOUT=invalid fm_account_selection_timeout > /dev/null 2> "$invalid"; then
+    fail "invalid FM_ACCOUNT_SELECTION_TIMEOUT was accepted"
+  fi
+  assert_contains "$(cat "$invalid")" "FM_ACCOUNT_SELECTION_TIMEOUT must be a positive integer" \
+    "invalid selection timeout diagnostic did not name its variable"
+
+  log="$TMP_ROOT/selection-timeout.calls"
+  workspace="$TMP_ROOT/selection-timeout-workspace"
+  mkdir -p "$workspace"
+  : > "$log"
+  FM_ACCOUNT_CONTROL_TIMEOUT=
+  FM_ACCOUNT_SELECTION_TIMEOUT=37
+  fm_account_fleet_bin() { printf '%s\n' fake-agent-fleet; }
+  fm_account_validate_contract() { return 0; }
+  fm_account_run_bounded() {
+    local seconds=$1 task=task pool=pool profile=claude-1 provider=claude workspace='' argument
+    shift
+    printf '%s|%s\n' "$seconds" "$*" >> "$log"
+    while [ "$#" -gt 0 ]; do
+      argument=$1
+      shift
+      case "$argument" in
+        --task) task=$1; shift ;;
+        --pool) pool=$1; shift ;;
+        --profile) profile=$1; shift ;;
+        --provider) provider=$1; shift ;;
+        --workspace) workspace=$1; shift ;;
+      esac
+    done
+    printf '{"task":"%s","pool":"%s","profile":"%s","provider":"%s","workspace":"%s"}\n' \
+      "$task" "$pool" "$profile" "$provider" "$workspace"
+  }
+
+  fm_account_select observe claude pool '' choose-task "$workspace" >/dev/null \
+    || fail "observe selection timeout probe failed"
+  fm_account_select enforce claude explicit claude-1 acquire-task "$workspace" >/dev/null \
+    || fail "explicit acquire timeout probe failed"
+  fm_account_select enforce claude pool '' dynamic-task "$workspace" >/dev/null \
+    || fail "dynamic choose timeout probe failed"
+  fm_account_recover recover-task claude-1 pool claude "$workspace" >/dev/null \
+    || fail "sticky recover timeout probe failed"
+  fm_account_reconcile_lease_mutation fake-agent-fleet reconcile-task "$workspace" reconcile \
+    >/dev/null || fail "reconciliation timeout probe failed"
+  fm_account_release release-task --force >/dev/null \
+    || fail "ordinary release timeout probe failed"
+
+  assert_regex '^37\|fake-agent-fleet --format json choose ' "$log" \
+    "observe choose did not use the selection timeout"
+  assert_regex '^37\|fake-agent-fleet --format json lease acquire ' "$log" \
+    "explicit acquire did not use the selection timeout"
+  assert_regex '^37\|fake-agent-fleet --format json lease choose ' "$log" \
+    "lease choose did not use the selection timeout"
+  [ "$(grep -Ec '^37\|fake-agent-fleet --format json lease recover ' "$log")" -eq 2 ] \
+    || fail "recover and reconciliation did not both use the selection timeout"
+  assert_regex '^10\|fake-agent-fleet --format json lease release ' "$log" \
+    "ordinary release no longer uses the 10-second control default"
+  pass "Agent Fleet selection gets 120s by default with scoped and legacy overrides"
 }
 
 test_unsuccessful_lease_mutations_always_reconcile() {
@@ -4600,9 +5177,9 @@ test_lease_signal_handoff_publishes_cleanup_ownership() {
     . "$1"
     fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
     fm_account_validate_contract() { return 0; }
-    fm_account_run_control() {
+    fm_account_run_selection() {
       kill -TERM "$$"
-      printf "%s\n" "{\"task\":\"task-signal\",\"pool\":\"pool-signal\",\"profile\":\"profile-signal\",\"provider\":\"claude\"}"
+      printf "%s\n" "{\"task\":\"task-signal\",\"pool\":\"pool-signal\",\"profile\":\"profile-signal\",\"provider\":\"claude\",\"workspace\":\"${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}\"}"
     }
     trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
     fm_account_select enforce claude pool-signal "" task-signal "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"
@@ -4625,9 +5202,9 @@ test_recovery_signal_handoff_publishes_cleanup_ownership() {
     . "$1"
     fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
     fm_account_validate_contract() { return 0; }
-    fm_account_run_control() {
+    fm_account_run_selection() {
       kill -TERM "$$"
-      printf "%s\n" "{\"task\":\"task-recover\",\"pool\":\"pool-recover\",\"profile\":\"profile-recover\",\"provider\":\"claude\"}"
+      printf "%s\n" "{\"task\":\"task-recover\",\"pool\":\"pool-recover\",\"profile\":\"profile-recover\",\"provider\":\"claude\",\"workspace\":\"${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}\"}"
     }
     trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
     fm_account_recover task-recover profile-recover pool-recover claude "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"
@@ -4642,7 +5219,7 @@ test_recovery_signal_handoff_publishes_cleanup_ownership() {
     . "$1"
     fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
     fm_account_validate_contract() { return 0; }
-    fm_account_run_control() { printf "%s\n" "not-json"; }
+    fm_account_run_selection() { printf "%s\n" "not-json"; }
     if fm_account_recover task-recover profile-recover pool-recover claude "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"; then rc=0; else rc=$?; fi
     printf "%s:%s\n" "$rc" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh"
@@ -4780,6 +5357,11 @@ run_isolated_test() {
   [ "$status" -eq 0 ] || exit "$status"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = stale-reclaim-generation ]; then
+  run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = continuation-status-timeout ]; then
   run_isolated_test test_continuation_bounds_no_mistakes_status_snapshot
   exit 0
@@ -4800,6 +5382,7 @@ if [ "${FM_TEST_FOCUSED:-}" = tail-safety ]; then
   run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
   run_isolated_test test_agent_fleet_contract_is_validated_before_routing
   run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
+  run_isolated_test test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible
   run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
   run_isolated_test test_unsuccessful_recovery_mutation_is_retried
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
@@ -5050,12 +5633,46 @@ if [ "${FM_TEST_FOCUSED:-}" = errexit-preserve ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = session-workspace ]; then
+  run_isolated_test test_session_sync_rejects_workspace_mismatch_without_metadata_change
+  run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-locks ]; then
+  run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+  run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = signal-handoff ]; then
+  run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_recovery_signal_handoff_publishes_cleanup_ownership
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = gate-e-workspace ]; then
   run_isolated_test test_observe_is_dry_run_only
   run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
   run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
   run_isolated_test test_recovery_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_session_sync_rejects_workspace_mismatch_without_metadata_change
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = production-routing-authority ]; then
+  run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn
+  run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation
+  run_isolated_test test_agent_fleet_validation_ignores_ambient_system_tool_shadows
+  run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
+  run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = production-fleet-environment ]; then
+  run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
+  run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
   exit 0
 fi
 
@@ -5079,6 +5696,7 @@ run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
 run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
 run_isolated_test test_preinstall_managed_failure_restores_artifact_snapshot
 run_isolated_test test_session_sync_bounds_agent_fleet_queries
+run_isolated_test test_session_sync_rejects_workspace_mismatch_without_metadata_change
 run_isolated_test test_session_sync_all_bounds_each_task_and_reaches_later_mappings
 run_isolated_test test_session_sync_removes_reaped_workers_from_cleanup_state
 run_isolated_test test_session_sync_releases_metadata_lock_during_provider_query
@@ -5088,6 +5706,7 @@ run_isolated_test test_recovered_reservations_are_owned_only_after_validated_rec
 run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
 run_isolated_test test_native_resume_rejects_prelaunch_sessionstart_evidence
 run_isolated_test test_native_resume_separates_whole_second_sessionstart_evidence
+run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
 run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
 run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
 run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
@@ -5151,6 +5770,7 @@ run_isolated_test test_continuation_rejects_load_bearing_source_replacement_duri
 run_isolated_test test_continuation_rejects_task_source_ancestor_swap
 run_isolated_test test_continuation_rejects_metadata_ancestor_swap
 run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
@@ -5158,7 +5778,13 @@ run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
 run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
 run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
 run_isolated_test test_agent_fleet_contract_is_validated_before_routing
+run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation
+run_isolated_test test_agent_fleet_validation_ignores_ambient_system_tool_shadows
+run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
+run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
+run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
 run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
+run_isolated_test test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible
 run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
 run_isolated_test test_unsuccessful_recovery_mutation_is_retried
 run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership

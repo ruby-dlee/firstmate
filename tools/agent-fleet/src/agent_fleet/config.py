@@ -586,8 +586,6 @@ def initial_registry(claude_count: int, codex_count: int) -> Registry:
             profile_id = f"{provider}-{index}"
             safety_policy = "worker"
             pools = [f"{provider}-crew", f"{provider}-manual"]
-            if provider == "claude":
-                pools.append("claude-captain")
             profiles[profile_id] = Profile(
                 id=profile_id,
                 provider=provider,
@@ -649,9 +647,10 @@ def with_provider(registry: Registry, provider: ProviderConfig) -> Registry:
 
 def without_profile(registry: Registry, profile_id: str) -> Registry:
     profile = registry.require_profile(profile_id)
-    if profile.safety_policy == "desktop_shared":
+    if profile.safety_policy != "worker":
         raise ValueError(
-            f"desktop_shared profile {profile_id} cannot be removed by the live registry API"
+            f"{profile.safety_policy} profile {profile_id} cannot be removed by the live "
+            "registry API; use an offline reviewed registry migration"
         )
     profiles = dict(registry.profiles)
     del profiles[profile_id]
@@ -735,9 +734,9 @@ def set_profile_safety_policy(
         choices = ", ".join(PROFILE_SAFETY_POLICIES)
         raise ValueError(f"safety policy must be one of {choices}")
     profile = registry.require_profile(profile_id)
-    if profile.safety_policy == "desktop_shared" and safety_policy != "desktop_shared":
+    if profile.safety_policy != "worker" and safety_policy != profile.safety_policy:
         raise ValueError(
-            f"desktop_shared classification is terminal for {profile.id}; "
+            f"{profile.safety_policy} classification is terminal for {profile.id}; "
             "use an offline reviewed registry migration"
         )
     pools = profile.pools

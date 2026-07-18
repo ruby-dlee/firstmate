@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_fleet.cli as cli_module
 import agent_fleet.providers as providers_module
 import agent_fleet.provision as provision_module
 import agent_fleet.routeability as routeability_module
@@ -17,9 +18,11 @@ from agent_fleet.config import load_registry
 from agent_fleet.doctor import run_doctor
 from agent_fleet.leases import active_leases
 from agent_fleet.projects import (
+    enter_trusted_project,
     register_trusted_project,
     remove_trusted_project,
     resolve_trusted_project,
+    revalidate_trusted_project,
 )
 from agent_fleet.providers import (
     managed_argv,
@@ -115,6 +118,68 @@ def test_linked_worktree_matches_registered_git_common_dir(
 
     assert project.active_root == linked
     assert project.canonical_root == registered
+
+
+def test_trusted_project_validation_ignores_ambient_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    marker = tmp_path / "ambient-git-ran"
+    fake_git = shadow / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\ntouch '{marker}'\nprintf '%s\\n' \"$PWD\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    non_repository = tmp_path / "not-a-repository"
+    non_repository.mkdir()
+    monkeypatch.setenv("PATH", str(shadow))
+
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(non_repository)
+
+    assert not marker.exists()
+
+
+def test_trusted_project_rejects_writable_root_and_ancestry(tmp_path: Path) -> None:
+    for name, writable_target in (("root", "root"), ("ancestor", "ancestor"), ("git", "git")):
+        ancestor = tmp_path / name / "ancestor"
+        repository = ancestor / "repository"
+        repository.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        if writable_target == "root":
+            repository.chmod(0o775)
+        elif writable_target == "ancestor":
+            ancestor.chmod(0o777)
+        else:
+            (repository / ".git").chmod(0o775)
+
+        with pytest.raises(ValueError, match="writable"):
+            register_trusted_project(repository)
+
+
+def test_trusted_project_revalidation_rejects_root_replacement(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    registry, _ = fleet
+    repository = tmp_path / "replaceable-project"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    providers = dict(registry.providers)
+    providers["codex"] = replace(providers["codex"], trusted_projects=(repository,))
+    registry = replace(registry, providers=providers)
+    project = resolve_trusted_project(registry, "codex", repository)
+
+    original = repository.with_name("replaceable-project-original")
+    repository.rename(original)
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+
+    with pytest.raises(ValueError, match="changed before provider launch"):
+        revalidate_trusted_project(registry, "codex", repository, project)
+    with pytest.raises(ValueError, match="changed before provider launch"):
+        enter_trusted_project(project)
 
 
 def test_provision_is_idempotent_and_bootstraps_only_canonical_claude_projects(
@@ -588,6 +653,69 @@ def test_selection_rejects_project_control_files_before_state_changes(
     assert provider_calls == []
     assert active_leases(registry, prune=False) == []
     assert _file_snapshot(registry.settings.state_dir) == state_before
+
+
+@pytest.mark.parametrize(
+    ("provider", "relative"),
+    [("claude", ".mcp.json"), ("codex", ".codex/config.toml")],
+)
+def test_launch_revalidation_rejects_late_project_control_injection(
+    fleet: tuple[object, Path], provider: str, relative: str
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profile = registry.require_profile(f"{provider}-1")
+    project = prepare_profile_launch(registry, profile, Path.cwd())
+    control = Path.cwd() / relative
+    control.parent.mkdir(parents=True, exist_ok=True)
+    control.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refuses project control file"):
+        revalidate_trusted_project(registry, provider, Path.cwd(), project)
+
+
+@pytest.mark.parametrize(
+    ("provider", "relative"),
+    [("claude", ".mcp.json"), ("codex", ".codex/config.toml")],
+)
+def test_final_exec_gate_rejects_control_created_by_environment_builder(
+    fleet: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    relative: str,
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profile = registry.require_profile(f"{provider}-1")
+    project = prepare_profile_launch(registry, profile, Path.cwd())
+    control = project.active_root / relative
+    exec_calls: list[tuple[object, ...]] = []
+
+    def inject_control(*_args: object, **_kwargs: object) -> dict[str, str]:
+        control.parent.mkdir(parents=True, exist_ok=True)
+        control.write_text("{}\n", encoding="utf-8")
+        return {"PATH": os.environ.get("PATH", "")}
+
+    monkeypatch.setattr(cli_module, "provider_environment", inject_control)
+    monkeypatch.setattr(
+        cli_module.os,
+        "execvpe",
+        lambda *args: exec_calls.append(args),
+    )
+
+    with pytest.raises(ValueError, match="refuses project control file"):
+        cli_module._exec_managed_provider(
+            project,
+            profile,
+            ["/bin/false"],
+            f"{provider}-final-gate",
+            project.active_root,
+            f"{provider}-crew",
+            tmp_path / f"{provider}.turn-ended",
+        )
+
+    assert exec_calls == []
 
 
 @pytest.mark.parametrize(

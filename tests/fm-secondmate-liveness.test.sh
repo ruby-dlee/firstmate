@@ -327,6 +327,7 @@ add_sm_home() {
 run_bootstrap() {  # <fakebin> <home> <pane-cmd> <call-log> [extra env...] -> stdout
   local fb=$1 home=$2 cmd=$3 log=$4; shift 4
   PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_TEST_PANE_CMD="$cmd" FM_TMUX_CALL_LOG="$log" \
     FM_TEST_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
@@ -536,14 +537,15 @@ SH
 }
 
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
-  local w fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
+  local w workspace fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
   w=$(new_world sweep-enforced-inherited-lock)
   add_sm_home "$w" sm1 firstmate:fm-sm1 claude
+  workspace=$(cd "$w/sm1" && pwd -P)
   meta="$w/home/state/sm1.meta"
   account_task=fm-test-sm1-a1234
   cat >> "$meta" <<EOF
-worktree=$w/sm1
-project=$w/sm1
+worktree=$workspace
+project=$workspace
 mode=secondmate
 yolo=off
 tasktmp=/tmp/fm-sm1
@@ -585,20 +587,21 @@ set -u
 task=
 pool=claude-crew
 profile=claude-2
+workspace=${FM_MANAGED_WORKSPACE:-}
 prev=
 for arg in "$@"; do
-  case "$prev" in --task) task=$arg ;; --pool) pool=$arg ;; --profile) profile=$arg ;; esac
+  case "$prev" in --task) task=$arg ;; --pool) pool=$arg ;; --profile) profile=$arg ;; --workspace) workspace=$arg ;; esac
   prev=$arg
 done
 case "$*" in
-  '--format json contract') printf '{"contract_version":1}\n' ;;
+  '--format json contract') printf '{"contract_version":2}\n' ;;
   *' lease recover '*)
-    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"claude","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile"
+    printf '{"schema":1,"task":"%s","pool":"%s","profile":"%s","provider":"claude","workspace":"%s","decision_reason":"fake","quota_fresh":true,"headroom_percent":5,"active_lease_count":0,"degraded":false}\n' "$task" "$pool" "$profile" "$workspace"
     ;;
   *' session status '*)
     updated=2026-07-13T00:00:00Z
     [ ! -f "${FM_MANAGED_SESSION_REFRESHED:-/nonexistent}" ] || updated=2026-07-13T00:00:01Z
-    printf '{"schema":1,"task":"%s","profile":"%s","provider":"claude","pool":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$pool" "$task" "$updated"
+    printf '{"schema":1,"task":"%s","profile":"%s","provider":"claude","pool":"%s","workspace":"%s","session_id":"sess-%s","updated_at":"%s"}\n' "$task" "$profile" "$pool" "$workspace" "$task" "$updated"
     ;;
   *' lease release '*) printf '{"ok":true}\n' ;;
   *) exit 64 ;;
@@ -613,6 +616,7 @@ SH
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
     FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
     FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
+    FM_MANAGED_WORKSPACE="$workspace" \
     FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \
     FM_MANAGED_SPAWN_OUT="$w/spawn.out")
 

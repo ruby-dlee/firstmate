@@ -67,6 +67,8 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 FM_DISPATCH_JQ_BIN=$FM_ACCOUNT_SYSTEM_JQ_BIN
+FM_DISPATCH_AWK_BIN=$FM_ACCOUNT_SYSTEM_AWK_BIN
+FM_DISPATCH_CAT_BIN=$FM_ACCOUNT_SYSTEM_CAT_BIN
 
 STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
 SELECT_OVERRIDE=
@@ -74,7 +76,7 @@ QUOTA_JSON_FILE=
 ARGS=()
 
 usage() {
-  awk '
+  "$FM_DISPATCH_AWK_BIN" '
     NR == 1 { next }
     /^#/ { sub(/^# ?/, ""); print; next }
     { exit }
@@ -141,11 +143,13 @@ done
 
 [ "${#ARGS[@]}" -le 1 ] || { echo "error: expected at most one JSON argument" >&2; exit 2; }
 [ -x "$FM_DISPATCH_JQ_BIN" ] || { echo "error: fixed system jq is required" >&2; exit 2; }
+[ -x "$FM_DISPATCH_AWK_BIN" ] || { echo "error: fixed system awk is required" >&2; exit 2; }
+[ -x "$FM_DISPATCH_CAT_BIN" ] || { echo "error: fixed system cat is required" >&2; exit 2; }
 
 if [ "${#ARGS[@]}" -eq 1 ]; then
   SPEC_JSON=${ARGS[0]}
 else
-  SPEC_JSON=$(cat)
+  SPEC_JSON=$("$FM_DISPATCH_CAT_BIN")
 fi
 
 profiles_json=$(printf '%s\n' "$SPEC_JSON" | "$FM_DISPATCH_JQ_BIN" -ec '
@@ -233,7 +237,7 @@ if [ "$pooled_count" -gt 0 ]; then
   fi
   summaries='[]'
   while IFS=$(printf '\t') read -r index harness pool; do
-    if ! pool_json=$(fm_account_run_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
+    if ! pool_json=$(fm_account_run_fleet_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
       log "agent-fleet pool status failed for $pool/$harness; using first profile"
       first_profile
       exit 0
@@ -314,7 +318,7 @@ if [ "$pooled_count" -gt 0 ]; then
 fi
 
 if [ -n "$QUOTA_JSON_FILE" ]; then
-  if ! quota_json=$(cat "$QUOTA_JSON_FILE" 2>/dev/null); then
+  if ! quota_json=$("$FM_DISPATCH_CAT_BIN" "$QUOTA_JSON_FILE" 2>/dev/null); then
     log "cannot read quota JSON; using first profile"
     first_profile
     exit 0

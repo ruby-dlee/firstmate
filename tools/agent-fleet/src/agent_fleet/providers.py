@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import stat
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -12,8 +11,9 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
+from .executables import CONTROL_PATH, validated_safe_directory
 from .models import Profile, Registry
-from .paths import current_user_home
+from .paths import current_user_home, current_user_name
 from .util import read_owned_private_json
 
 
@@ -78,9 +78,6 @@ INJECTION_ENV_EXACT = frozenset(
     }
 )
 
-CONTROL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-
-
 def scrub_injection_environment(environment: dict[str, str]) -> dict[str, str]:
     cleaned = dict(environment)
     for name in tuple(cleaned):
@@ -105,15 +102,8 @@ def validated_worker_path(value: str | None = None) -> str:
         if not raw or not path.is_absolute():
             continue
         try:
-            resolved = path.resolve(strict=True)
-            metadata = resolved.stat()
-        except OSError:
-            continue
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid not in {0, os.getuid()}
-            or stat.S_IMODE(metadata.st_mode) & stat.S_IWOTH
-        ):
+            resolved = validated_safe_directory(path, label="worker PATH directory")
+        except ValueError:
             continue
         physical = str(resolved)
         if physical not in seen:
@@ -186,6 +176,9 @@ def provider_environment(
         if name.startswith(("AGENT_FLEET_", "QUOTA_AXI_", "XDG_")):
             env.pop(name, None)
     env["HOME"] = str(current_user_home())
+    passwd_name = current_user_name()
+    env["USER"] = passwd_name
+    env["LOGNAME"] = passwd_name
     for name in tuple(env):
         if name.startswith(("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_")):
             env.pop(name, None)

@@ -619,11 +619,7 @@ account_routing_preflight() {
     fi
   fi
   [ "$needs_agent_fleet" = 1 ] || return 0
-  if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
-    [ -x "$FM_AGENT_FLEET_BIN" ] || missing_tool_diagnostic agent-fleet
-  else
-    command -v agent-fleet >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
-  fi
+  fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
   if ! command -v jq >/dev/null 2>&1; then
     echo "MISSING: jq (install: $(install_cmd jq))"
     BOOTSTRAP_JQ_REPORTED=1

@@ -166,14 +166,16 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 ## Agent Fleet account routing
 
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
-Agent Fleet's public, provider-neutral source and installation instructions live under [`tools/agent-fleet`](../tools/agent-fleet/README.md); install an immutable release tag and ensure `agent-fleet` is on `PATH` before enabling routing.
+Agent Fleet's public, provider-neutral source and installation instructions live under [`tools/agent-fleet`](../tools/agent-fleet/README.md); the sealed cutover installs a regular native front door at the current passwd user's `~/.local/bin/agent-fleet` before enabling routing.
 Account routing is default-off, so an unchanged installation makes no Agent Fleet calls, does not wrap the provider launch, and adds no managed account-routing fields to task metadata.
 Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
-The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.
+The production mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, emergency `--no-account-routing` disables it for that spawn, the single value in local `config/account-routing-mode`, then `off`.
+The emergency bypass is printed loudly and persisted as `account_routing_emergency_bypass=1` in task metadata.
+Ambient `FM_ACCOUNT_ROUTING=off` cannot override the authoritative config.
 The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
 `observe` asks Agent Fleet for a read-only, non-leasing dry-run decision against the explicit task worktree, reports the non-secret pool/provider/profile choice, does not wrap the provider launch, and writes no managed account-routing fields even when Agent Fleet is unavailable.
-`enforce` prepares the isolated runtime endpoint and worktree first, passes that exact worktree to selection, recovery, execution, and resume, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
+`enforce` is a certified-Herdr-only production path. It rejects tmux, zellij, cmux, and Orca before Fleet selection, lease acquisition, worktree creation, or endpoint creation because those backends cannot prove that the pane shell was sanitized before startup. On Herdr it prepares the isolated runtime endpoint and worktree, passes that exact worktree to selection, recovery, execution, and resume, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
 Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
 `--account-profile <profile>` pins one dynamic profile, using the supplied `--account-pool` when present and the reserved `explicit` pool otherwise.
 Firstmate's direct spawn flags and `config/secondmate-account-pool` accept non-secret pool and profile aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
@@ -189,11 +191,14 @@ If predecessor lease or session cleanup fails after that binding, the replacemen
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
 Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
 Teardown kills the recorded endpoint and releases the Agent Fleet lease and session mapping only after the backend confirms absence; a live or unknown endpoint state retains metadata and storage for retry.
-Agent Fleet routing supports the tmux, Herdr, zellij, and cmux session backends; enforced Orca launches are rejected before lease, worktree, endpoint, or metadata mutation because managed Orca recovery is not implemented.
+Off and observe mode support the tmux, Herdr, zellij, and cmux session backends. Production enforce mode supports only a Herdr server carrying Firstmate's live process-bound closed-shell certificate and exact managed terminal configuration. A manually started, restored, or pre-upgrade Herdr server is not certified and routed spawn refuses it; stop that server only after proving the session idle, then let Firstmate launch it on the next spawn. Test labs retain fake backends behind their explicit opt-in so backend-neutral routing behavior remains covered without weakening production.
 `config/secondmate-account-pool` optionally selects the primary's dynamic pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
 An explicit per-spawn account pool or profile overrides that secondmate pool, and an explicit profile without a pool uses only the reserved `explicit` pool.
 `config/account-routing-mode` is inherited, so a secondmate can apply the same off/observe/enforce policy to its own crewmates while resolving its own pools from dispatch profiles or the standard provider defaults.
-`FM_AGENT_FLEET_BIN` is a test/lab override for the CLI path; normal operation resolves `agent-fleet` from `PATH`.
+Production does not resolve Agent Fleet from ambient `PATH` and never executes `FM_AGENT_FLEET_BIN` or `FM_DISPATCH_AGENT_FLEET` overrides.
+Spawn/control operations fail closed on such an override. Quota-balanced dispatch remains advisory: it surfaces the refusal and falls back to the first ordered candidate, preserving that candidate's `account_pool`; the later spawn still enforces that pool through the fixed production front door, so this fallback cannot become a default-account launch.
+It verifies the fixed passwd-home `~/.local/bin/agent-fleet` as a physical current-user/root-owned non-writable regular executable with safe ancestry and reuses that exact path for selection, execution, recovery, and cleanup.
+Environment mode and executable overrides exist only behind the unmistakable `FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1` test/lab opt-in.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -370,9 +375,11 @@ FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
 FM_BACKEND=             # optional runtime backend override; tmux/herdr/zellij/cmux support new ship/scout spawns, Orca is legacy-recovery-only, and codex-app is not accepted
-FM_ACCOUNT_ROUTING=off  # optional Agent Fleet mode override: off, observe, or enforce; explicit per-spawn account flags still take precedence
-FM_AGENT_FLEET_BIN=agent-fleet  # test/lab override for the Agent Fleet executable; normal operation resolves agent-fleet from PATH
-FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per Agent Fleet control-plane command
+FM_ACCOUNT_ROUTING=off  # test/lab-only mode override; production config/account-routing-mode is authoritative
+FM_AGENT_FLEET_BIN=agent-fleet  # test/lab-only Agent Fleet executable override
+FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1  # unmistakable opt-in required for either override; never set in production
+FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per ordinary Agent Fleet control-plane command; an explicit value also remains the legacy selection override when the next variable is unset
+FM_ACCOUNT_SELECTION_TIMEOUT=120  # seconds allowed per choose/acquire/recover command; unset falls back to an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
 FM_ACCOUNT_SESSION_WAIT_SECONDS=10  # seconds a managed spawn waits for its required SessionStart mapping
 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5  # seconds allowed per Agent Fleet session-status query
 FM_ACCOUNT_SESSION_SYNC_INTERVAL=60  # watcher cadence for reconciling missing managed provider-session mappings

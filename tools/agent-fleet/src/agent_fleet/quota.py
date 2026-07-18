@@ -14,7 +14,7 @@ from typing import Any
 from .config import verified_quota_runtime
 from .locks import DirectoryLock
 from .models import Profile, Registry
-from .paths import current_user_home, ensure_private_dir
+from .paths import current_user_home, current_user_name, ensure_private_dir
 from .providers import credential_file_state, identity_fingerprint, provider_environment
 from .provision import (
     profile_is_provisioned,
@@ -191,7 +191,12 @@ def _identity_fingerprint(profile: Profile, provider: dict[str, Any]) -> str | N
     account = provider.get("account")
     if not isinstance(account, dict):
         return None
-    identifier = account.get("accountId") or account.get("account_id")
+    email = account.get("email")
+    identifier = (
+        email.strip().casefold()
+        if profile.provider == "codex" and isinstance(email, str) and email.strip()
+        else account.get("accountId") or account.get("account_id")
+    )
     if not isinstance(identifier, str) or not identifier:
         return None
     return identity_fingerprint(profile.provider, identifier)
@@ -234,6 +239,19 @@ def _claude_credential_state(provider: dict[str, Any]) -> str:
     return "indeterminate"
 
 
+def _claude_keychain_account(provider: dict[str, Any]) -> str | None:
+    attempts = provider.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    accounts = [
+        attempt.get("account")
+        for attempt in attempts
+        if isinstance(attempt, dict) and attempt.get("source") == "keychain"
+    ]
+    expected = current_user_name()
+    return expected if accounts == [expected] else None
+
+
 def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("profile") == profile.id and raw.get("schema") == 1:
         status = _safe_token(raw.get("status"), "unavailable")
@@ -252,7 +270,7 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
         credential_state = _safe_token(raw.get("credential_state"), "indeterminate")
         if credential_state not in {"present", "absent", "indeterminate"}:
             credential_state = "indeterminate"
-        return {
+        normalized = {
             "schema": 1,
             "profile": profile.id,
             "provider": profile.provider,
@@ -271,6 +289,12 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
             "credential_state": "present" if fingerprint else credential_state,
             "refreshed_at": now,
         }
+        if profile.provider == "claude":
+            account = raw.get("credential_keychain_account")
+            normalized["credential_keychain_account"] = (
+                current_user_name() if account == current_user_name() else None
+            )
+        return normalized
 
     providers = raw.get("providers", [])
     if not isinstance(providers, list):
@@ -336,7 +360,7 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
     )
     if identity_fingerprint is not None:
         credential_state = "present"
-    return {
+    normalized = {
         "schema": 1,
         "profile": profile.id,
         "provider": profile.provider,
@@ -351,6 +375,9 @@ def _normalize(profile: Profile, raw: dict[str, Any]) -> dict[str, Any]:
         "credential_state": credential_state,
         "refreshed_at": utc_now(),
     }
+    if profile.provider == "claude":
+        normalized["credential_keychain_account"] = _claude_keychain_account(provider)
+    return normalized
 
 
 def _load_raw_quota(
@@ -375,8 +402,13 @@ def _load_raw_quota(
                 f"unsafe or unavailable {profile.provider} credential storage for {profile.id}: "
                 f"{credential_reason or credential_state}"
             )
+    isolation_root = (
+        profile.home
+        if profile.provider == "codex"
+        else profile.home.parent
+    )
     cache = (
-        registry.settings.state_dir / "identity-anchor-cache" / profile.provider
+        isolation_root / ".cache"
         if base_anchor
         else profile.home / ".agent-fleet-quota-cache"
     )
@@ -385,16 +417,26 @@ def _load_raw_quota(
     env.pop("AGENT_FLEET_QUOTA_FIXTURE_DIR", None)
     env.pop("AGENT_FLEET_TEST_QUOTA_FIXTURE_DIR", None)
     env["XDG_CACHE_HOME"] = str(cache)
-    if profile_is_provisioned(profile):
-        provider_binary = verified_provider_binary(registry, profile)
-    elif base_anchor:
-        provider_binary = verified_configured_provider_binary(registry, profile.provider)
-    else:
+    if base_anchor:
+        env["HOME"] = str(isolation_root)
+        for variable, name in (
+            ("XDG_CONFIG_HOME", ".config"),
+            ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_STATE_HOME", ".local/state"),
+        ):
+            location = isolation_root / name
+            ensure_private_dir(location)
+            env[variable] = str(location)
+    provisioned = profile_is_provisioned(profile)
+    if not provisioned and not base_anchor:
         raise ValueError(f"quota probe requires a provisioned profile: {profile.id}")
     if profile.provider == "codex":
-        env["QUOTA_AXI_CODEX_BINARY"] = str(
-            cache / "codex-cli-fallback-disabled" if base_anchor else provider_binary
+        provider_binary = (
+            verified_provider_binary(registry, profile)
+            if provisioned
+            else verified_configured_provider_binary(registry, profile.provider)
         )
+        env["QUOTA_AXI_CODEX_BINARY"] = str(provider_binary)
     try:
         argv = [
             str(quota_binary),
@@ -540,7 +582,12 @@ def inspect_credential_source_contract(
         expected_file = str(profile.home / ".credentials.json")
         file_source = sources["oauth-file"]
         keychain_source = sources["keychain"]
-        if file_source.get("path") != expected_file or keychain_source.get("path") is not None:
+        expected_account = current_user_name()
+        if (
+            file_source.get("path") != expected_file
+            or keychain_source.get("path") is not None
+            or keychain_source.get("account") != expected_account
+        ):
             raise ValueError(f"Claude credential source scope mismatch for {profile.id}")
         available = [
             source
@@ -567,6 +614,7 @@ def inspect_credential_source_contract(
         return {
             "kind": "keychain",
             "service": _claude_scoped_keychain_service(profile),
+            "account": expected_account,
             "config_home": str(profile.home),
         }
     if set(sources) != {"auth-json", "cli-rpc"}:

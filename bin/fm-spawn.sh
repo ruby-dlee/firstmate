@@ -1165,6 +1165,9 @@ if [ "$KIND" = secondmate ]; then
   ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 1
 fi
 ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "$NO_ACCOUNT_ROUTING") || exit 1
+if [ "$NO_ACCOUNT_ROUTING" = 1 ]; then
+  echo "WARNING: emergency --no-account-routing bypass is active for ${POS[0]:-unknown}; this spawn will use the provider's default identity and will be recorded in task metadata" >&2
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
     ACCOUNT_POOL=$SM_ACCOUNT_POOL
@@ -1203,6 +1206,11 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$RAW_LAUNCH" = 1 ]; then
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = orca ]; then
   echo "error: enforced Agent Fleet routing does not support backend=orca" >&2
+  exit 1
+fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && ! fm_account_test_lab_enabled \
+  && [ "$BACKEND" != herdr ]; then
+  echo "error: enforced Agent Fleet routing requires backend=herdr with a process-bound closed-shell certificate; backend=$BACKEND cannot prove that its pane shell was sanitized before startup" >&2
   exit 1
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$RESUME_ACCOUNT" != 1 ]; then
@@ -1724,6 +1732,11 @@ case "$BACKEND" in
     HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
     HERDR_SES=${CONTAINER%%:*}
     HERDR_WORKSPACE_ID=${CONTAINER#*:}
+    if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && ! fm_account_test_lab_enabled \
+      && ! fm_backend_herdr_server_closed_shell_environment_ready "$HERDR_SES"; then
+      echo "error: refusing enforced Agent Fleet routing because Herdr session '$HERDR_SES' was not launched by this adapter's closed environment; stop that idle server and let Firstmate restart it" >&2
+      exit 1
+    fi
     HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_CWD" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
     read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
@@ -1889,11 +1902,13 @@ exclude_path() {
 if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
-      mkdir -p "$WT/.claude"
-      cat > "$WT/.claude/settings.local.json" <<EOF
+      if [ "$ACCOUNT_EFFECTIVE_MODE" != enforce ]; then
+        mkdir -p "$WT/.claude"
+        cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
-      exclude_path '.claude/settings.local.json'
+        exclude_path '.claude/settings.local.json'
+      fi
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
@@ -2069,6 +2084,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
       RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
@@ -2186,15 +2202,28 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     ACCOUNT_NATIVE_LAUNCH_SCRIPT="$ACCOUNT_NATIVE_LAUNCH_DIR/account-native-launch"
     ACCOUNT_NATIVE_LAUNCH_READY="$ACCOUNT_NATIVE_LAUNCH_DIR/ready"
     ACCOUNT_NATIVE_LAUNCH_GO="$ACCOUNT_NATIVE_LAUNCH_DIR/go"
-    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK" "$WT") || exit 1
+    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK" "$WT" "$TURNEND") || exit 1
+    if [ "$BACKEND" = herdr ]; then
+      native_shell=$(fm_backend_herdr_managed_shell_bin) || {
+        echo "error: managed Herdr worker shell is unavailable for native resume" >&2
+        exit 1
+      }
+    else
+      # Non-Herdr enforced recovery is reachable only in the explicit test lab.
+      native_shell="$FM_ROOT/bin/fm-herdr-worker-shell"
+      [ -f "$native_shell" ] && [ ! -L "$native_shell" ] && [ -x "$native_shell" ] || {
+        echo "error: closed worker shell is unavailable for native resume" >&2
+        exit 1
+      }
+    fi
     native_ready_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_READY")
     native_go_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_GO")
     if ! ( set -C; cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
-#!/usr/bin/env bash
+#!$native_shell
 set -euC
 : > $native_ready_q
-while [ ! -f $native_go_q ]; do sleep 0.05; done
-rm -f $native_ready_q $native_go_q
+while [ ! -f $native_go_q ]; do /bin/sleep 0.05; done
+/bin/rm -f $native_ready_q $native_go_q
 exec $resume_command "\$@"
 EOF
     ); then
@@ -2204,7 +2233,7 @@ EOF
     chmod +x "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
     AGENT_COMMAND=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_SCRIPT")
   else
-    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK" "$WT") || exit 1
+    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK" "$WT" "$TURNEND") || exit 1
   fi
 fi
 LAUNCH=${LAUNCH//__AGENT__/$AGENT_COMMAND}

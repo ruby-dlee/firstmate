@@ -65,7 +65,11 @@ if "auth" in sys.argv:
                 "path": credential,
                 "status": "available" if os.path.exists(credential) else "missing",
             },
-            {"source": "keychain", "status": "missing"},
+            {
+                "source": "keychain",
+                "status": "missing",
+                "account": os.environ["USER"],
+            },
         ]
     else:
         credential = os.path.join(os.environ["CODEX_HOME"], "auth.json")

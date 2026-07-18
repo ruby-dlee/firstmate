@@ -21,6 +21,7 @@ from agent_fleet.config import (
     set_profile_safety_policy,
     verified_quota_binary,
     verified_quota_runtime,
+    without_profile,
 )
 from agent_fleet.doctor import run_doctor
 from agent_fleet.provision import (
@@ -347,6 +348,13 @@ def test_bridge_topology_keeps_desktop_and_manual_reserves_out_of_routing(
     assert {
         profile.id for profile in registry.profiles.values() if profile.safety_policy == "worker"
     } == {"claude-1", "claude-2", "codex-1", "codex-2", "codex-3", "codex-4"}
+    for profile_id in ("claude-1", "claude-2"):
+        assert registry.require_profile(profile_id).pools == ("claude-crew", "claude-manual")
+    for profile_id in ("codex-1", "codex-2", "codex-3", "codex-4"):
+        assert registry.require_profile(profile_id).pools == ("codex-crew", "codex-manual")
+    assert all(
+        "claude-captain" not in profile.pools for profile in registry.profiles.values()
+    )
     for profile_id in ("claude-3", "codex-5"):
         profile = registry.require_profile(profile_id)
         assert profile.safety_policy == "desktop_shared"
@@ -373,6 +381,25 @@ def test_bridge_topology_keeps_desktop_and_manual_reserves_out_of_routing(
             dry_run=True,
             workspace=Path.cwd(),
         )
+
+
+def test_every_external_reserve_classification_is_terminal(
+    fleet: tuple[object, Path],
+) -> None:
+    registry, _ = fleet
+    registry = set_profile_safety_policy(registry, "claude-2", "manual_only")
+    assert (
+        set_profile_safety_policy(registry, "claude-2", "manual_only")
+        .require_profile("claude-2")
+        .safety_policy
+        == "manual_only"
+    )
+
+    for replacement in ("worker", "desktop_shared"):
+        with pytest.raises(ValueError, match="manual_only classification is terminal"):
+            set_profile_safety_policy(registry, "claude-2", replacement)
+    with pytest.raises(ValueError, match="offline reviewed registry migration"):
+        without_profile(registry, "claude-2")
 
 
 def test_save_registry_preserves_existing_parent_mode(

@@ -5,13 +5,20 @@ import json
 import os
 import stat
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .models import SHARED_WORKFLOW_ENTRIES, Profile, ProviderConfig, Registry
 from .paths import ensure_private_dir
-from .projects import TrustedProject, registered_trusted_projects, resolve_trusted_project
+from .projects import (
+    TrustedProject,
+    assert_project_controls_absent,
+    project_control_file,
+    registered_trusted_projects,
+    resolve_trusted_project,
+)
 from .providers import (
     agent_fleet_entrypoint_path,
     credential_storage_ready,
@@ -22,19 +29,6 @@ from .util import atomic_write_bytes, atomic_write_json, read_private_bytes, rea
 HOOK_MARKERS = (" hook session-start", " hook turn-end")
 HOOK_MARKER_FILE = ".agent-fleet-hooks.json"
 PROVIDER_BINARY_MARKER_FILE = ".agent-fleet-provider-binary.json"
-PROJECT_CONTROL_FILES = {
-    "claude": (
-        Path(".claude/settings.json"),
-        Path(".claude/settings.local.json"),
-        Path(".mcp.json"),
-    ),
-    "codex": (
-        Path(".codex/config.toml"),
-        Path(".codex/hooks.json"),
-        Path(".mcp.json"),
-    ),
-}
-
 
 def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -236,22 +230,6 @@ def provider_binary_ready(registry: Registry, profile: Profile) -> bool:
     except (OSError, ValueError):
         return False
     return True
-
-
-def _project_control_file(project: TrustedProject, provider: str) -> Path | None:
-    for relative in PROJECT_CONTROL_FILES[provider]:
-        candidate = project.active_root / relative
-        if candidate.exists() or candidate.is_symlink():
-            return candidate
-    return None
-
-
-def _assert_project_controls_absent(project: TrustedProject, provider: str) -> None:
-    control_file = _project_control_file(project, provider)
-    if control_file is not None:
-        raise ValueError(
-            f"managed {provider.title()} launch refuses project control file: {control_file}"
-        )
 
 
 def _hook_payload_hash(payload: dict[str, Any]) -> str:
@@ -553,7 +531,7 @@ def prepare_profile_launch(
     if not provider_binary_ready(registry, profile):
         raise ValueError(f"managed provider binary changed since provisioning: {profile.id}")
     project = resolve_trusted_project(registry, profile.provider, workspace)
-    _assert_project_controls_absent(project, profile.provider)
+    assert_project_controls_absent(project, profile.provider)
     if profile.provider == "claude":
         if not claude_project_ready(registry, profile, project):
             raise ValueError(f"Claude project trust bootstrap failed for {profile.id}")
@@ -585,13 +563,13 @@ def profile_selection_ready(
         project = resolve_trusted_project(registry, profile.provider, workspace)
     except ValueError:
         return False
-    if _project_control_file(project, profile.provider) is not None:
+    if project_control_file(project, profile.provider) is not None:
         return False
     if profile.provider == "claude":
-        canonical = TrustedProject(
-            project.canonical_root,
-            project.canonical_root,
-            project.common_dir,
+        canonical = replace(
+            project,
+            active_root=project.canonical_root,
+            active_identity=project.canonical_identity,
         )
         hook_health = profile_hook_health(registry, profile)
         return (
@@ -617,7 +595,7 @@ def profile_launch_ready(
         project = resolve_trusted_project(registry, profile.provider, workspace)
     except ValueError:
         return False
-    if _project_control_file(project, profile.provider) is not None:
+    if project_control_file(project, profile.provider) is not None:
         return False
     if profile.provider == "claude":
         hook_health = profile_hook_health(registry, profile)

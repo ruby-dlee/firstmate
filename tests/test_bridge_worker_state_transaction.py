@@ -88,6 +88,50 @@ class WorkerStateTransactionTests(unittest.TestCase):
             )
             path.chmod(0o600)
 
+    def _kill_file_identity_after_displaced_cleanup(self) -> tuple[Path, bytes]:
+        identity = self.manifest.identity_bundles["claude"]
+        original = b'{"original-file-identity":true}'
+        identity.write_bytes(original)
+        identity.chmod(0o600)
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        self._write_identity_bundles()
+        injector = textwrap.dedent(
+            f"""\
+            import os, signal, sys
+            from pathlib import Path
+            sys.path.insert(0, {str(SCRIPT_DIR)!r})
+            import bridge_worker_state_transaction as module
+            identity = Path({str(identity)!r})
+            original_remove = module._remove_entry_at
+            def remove_then_kill(parent_fd, name):
+                original_remove(parent_fd, name)
+                if name.startswith(f".{{identity.name}}.restore-"):
+                    os.fsync(parent_fd)
+                    os.kill(os.getpid(), signal.SIGKILL)
+            module._remove_entry_at = remove_then_kill
+            manifest = module.load_manifest(Path({str(self.manifest_path)!r}))
+            module.rollback(manifest)
+            """
+        )
+        killed = subprocess.run(
+            [sys.executable, "-c", injector],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(killed.returncode, -signal.SIGKILL)
+        journal = json.loads(
+            self.manifest.journal_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(journal["identity_restore"]["provider"], "claude")
+        self.assertEqual(journal["identity_restore"]["phase"], "exchanged")
+        self.assertEqual(identity.read_bytes(), original)
+        self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
+        return identity, original
+
     def test_snapshot_verify_and_finalize_exact_six_workers(self) -> None:
         started = worker_state.begin(self.manifest)
         self.assertEqual(started["phase"], "snapshotted")
@@ -248,6 +292,39 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertEqual(result["phase"], "rolled_back")
         self.assertEqual(identity.read_bytes(), original)
         self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
+
+    def test_file_identity_rollback_resumes_sigkill_after_displaced_cleanup(self) -> None:
+        identity, original = self._kill_file_identity_after_displaced_cleanup()
+        result = worker_state.rollback(self.manifest)
+        self.assertEqual(result["phase"], "rolled_back")
+        self.assertEqual(identity.read_bytes(), original)
+        self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
+
+    def test_file_identity_post_cleanup_crash_preserves_foreign_state(self) -> None:
+        identity, original = self._kill_file_identity_after_displaced_cleanup()
+        foreign = b'{"foreign-after-displaced-cleanup":true}'
+        identity.unlink()
+        identity.write_bytes(foreign)
+        identity.chmod(0o600)
+        foreign_identity = os.lstat(identity)
+        with self.assertRaisesRegex(
+            worker_state.WorkerStateError,
+            "interrupted file identity restore live state is not exact",
+        ):
+            worker_state.rollback(self.manifest)
+        self.assertEqual(identity.read_bytes(), foreign)
+        self.assertEqual(
+            (os.lstat(identity).st_dev, os.lstat(identity).st_ino),
+            (foreign_identity.st_dev, foreign_identity.st_ino),
+        )
+        self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
+
+        identity.unlink()
+        identity.write_bytes(original)
+        identity.chmod(0o600)
+        result = worker_state.rollback(self.manifest)
+        self.assertEqual(result["phase"], "rolled_back")
+        self.assertEqual(identity.read_bytes(), original)
 
     def test_credential_guard_blocks_verification_and_secret_is_not_snapshotted(self) -> None:
         target_worker = next(

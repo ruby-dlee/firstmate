@@ -1559,6 +1559,16 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
         os.unlink(name, dir_fd=parent_fd)
 
 
+def _snapshot_file_payload(
+    state: Mapping[str, Any], data_root: Path
+) -> bytes:
+    source = data_root / _relative(state.get("data"), "snapshot data path")
+    payload, _ = _read_stable_file(source, "snapshot data")
+    if len(payload) != state.get("size") or _hash_bytes(payload) != state.get("sha256"):
+        raise WorkerStateError("snapshot data digest/size mismatch")
+    return payload
+
+
 def _materialize_node_at(
     state: Mapping[str, Any],
     parent_fd: int,
@@ -1567,10 +1577,7 @@ def _materialize_node_at(
 ) -> None:
     node_type = state.get("type")
     if node_type == "file":
-        source = data_root / _relative(state.get("data"), "snapshot data path")
-        payload, _ = _read_stable_file(source, "snapshot data")
-        if len(payload) != state.get("size") or _hash_bytes(payload) != state.get("sha256"):
-            raise WorkerStateError("snapshot data digest/size mismatch")
+        payload = _snapshot_file_payload(state, data_root)
         mode = int(state["mode"], 8)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(name, flags, mode, dir_fd=parent_fd)
@@ -1994,56 +2001,97 @@ def rollback(
                     restore_state = active["restore_state"]
                     authority = active["authority"]
                     parent_fd = _open_identity_parent(identity_path, restore_state)
+                    restore_already_complete = False
                     try:
                         temporary_tag = hashlib.sha256(
                             f"{manifest.transaction_id}:{key}".encode()
                         ).hexdigest()[:16]
-
-                        def record_exchange_phase(
-                            phase: str,
-                            *,
-                            provider: str = provider,
-                        ) -> None:
-                            current_restore = journal["identity_restore"]
-                            if (
-                                current_restore is None
-                                or current_restore["provider"] != provider
-                            ):
+                        temporary = (
+                            f".{identity_path.name}.restore-{temporary_tag}"
+                        )
+                        if (
+                            active["phase"] == "exchanged"
+                            and restore_state.get("type") == "file"
+                            and parent_fd is not None
+                            and not _lexists_at(parent_fd, temporary)
+                        ):
+                            _snapshot_file_payload(restore_state, data_root)
+                            _assert_bound_directory(
+                                parent_fd,
+                                identity_path.parent,
+                                f"identity bundle parent {provider}",
+                            )
+                            if not _node_matches_at(
+                                parent_fd,
+                                identity_path.name,
+                                restore_state,
+                                exact_directory=True,
+                            ) or _lexists_at(parent_fd, temporary):
                                 raise WorkerStateError(
-                                    "identity restore generation disappeared during exchange"
+                                    "interrupted file identity restore live state is not exact; "
+                                    "foreign state is preserved"
                                 )
-                            current_restore["phase"] = phase
+                            _assert_bound_directory(
+                                parent_fd,
+                                identity_path.parent,
+                                f"identity bundle parent {provider}",
+                            )
+                            journal["identity_restore"] = None
+                            if restore_state == desired_state and key not in completed:
+                                journal["restore_completed"].append(key)
+                                completed.add(key)
                             _event(
                                 journal,
-                                f"identity-restore-{phase}:{provider}",
+                                f"identity-restore-cleanup-observed:{provider}",
                             )
                             _write_journal(manifest, journal)
+                            restore_already_complete = True
+                        else:
+                            def record_exchange_phase(
+                                phase: str,
+                                *,
+                                provider: str = provider,
+                            ) -> None:
+                                current_restore = journal["identity_restore"]
+                                if (
+                                    current_restore is None
+                                    or current_restore["provider"] != provider
+                                ):
+                                    raise WorkerStateError(
+                                        "identity restore generation disappeared during exchange"
+                                    )
+                                current_restore["phase"] = phase
+                                _event(
+                                    journal,
+                                    f"identity-restore-{phase}:{provider}",
+                                )
+                                _write_journal(manifest, journal)
 
-                        _restore_node_at(
-                            restore_state,
-                            parent_fd,
-                            identity_path.name,
-                            data_root,
-                            temporary_tag,
-                            pre_replace=lambda provider=provider, identity_path=identity_path, authority=authority: (
-                                _assert_identity_authority(
-                                    identity_path,
-                                    authority,
-                                    provider,
-                                )
-                            ),
-                            validate_displaced=lambda observed_name, provider=provider, parent_fd=parent_fd, authority=authority: (
-                                _assert_identity_authority_at(
-                                    parent_fd,
-                                    observed_name,
-                                    authority,
-                                    provider,
-                                )
-                            ),
-                            boundaries=boundaries,
-                            exchange_label=f"identity:{provider}",
-                            exchange_phase=record_exchange_phase,
-                        )
+                            _restore_node_at(
+                                restore_state,
+                                parent_fd,
+                                identity_path.name,
+                                data_root,
+                                temporary_tag,
+                                pre_replace=lambda provider=provider, identity_path=identity_path, authority=authority: (
+                                    _assert_identity_authority(
+                                        identity_path,
+                                        authority,
+                                        provider,
+                                    )
+                                ),
+                                validate_displaced=lambda observed_name, provider=provider, parent_fd=parent_fd, authority=authority: (
+                                    _assert_identity_authority_at(
+                                        parent_fd,
+                                        observed_name,
+                                        authority,
+                                        provider,
+                                    )
+                                ),
+                                boundaries=boundaries,
+                                exchange_label=f"identity:{provider}",
+                                exchange_phase=record_exchange_phase,
+                            )
                         if parent_fd is not None:
                             _assert_bound_directory(
                                 parent_fd,
@@ -2053,6 +2101,13 @@ def rollback(
                     finally:
                         if parent_fd is not None:
                             os.close(parent_fd)
+                    if restore_already_complete:
+                        if restore_state != desired_state:
+                            identity_authority[provider] = _identity_generation(
+                                identity_path
+                            )
+                            continue
+                        break
                     boundaries.hit(f"restore:{key}")
                     journal["identity_restore"] = None
                     if restore_state != desired_state:

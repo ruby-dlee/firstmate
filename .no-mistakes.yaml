@@ -19,9 +19,10 @@ disable_project_settings: true
 # The shell definition stays single-owned, so local and CI cannot diverge
 # (parity asserted by tests/fm-lint.test.sh).
 # The test command mirrors the source checks in .github/workflows/ci.yml:
-# iterate every tests/*.test.sh, then run Agent Fleet's locked pytest and
-# compileall checks, and fail if any check exits non-zero. The e2e tests need
-# tmux on PATH, which the firstmate environment provides.
+# iterate every tests/*.test.sh, including the Python 3.11 Bridge cutover runner,
+# then run Agent Fleet's locked pytest and compileall checks, and fail if any
+# check exits non-zero. The e2e tests need tmux on PATH, which the firstmate
+# environment provides.
 commands:
   lint: 'bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check .'
   test: 'command -v tmux >/dev/null || { echo "tmux is required for e2e tests" >&2; exit 1; }; tmux -V; rc=0; for t in tests/*.test.sh; do echo "== $t =="; bash "$t" || rc=1; done; uv run --directory tools/agent-fleet --locked pytest || rc=1; uv run --directory tools/agent-fleet --locked python -m compileall -q src || rc=1; exit "$rc"'

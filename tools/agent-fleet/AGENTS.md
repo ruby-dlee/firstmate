@@ -9,9 +9,4 @@
 - JSON is the shell integration contract. TOON is the default agent-facing structured output.
 - Tests must use temporary homes and fake provider/quota binaries. They must not touch real provider homes.
 
-Run before commit:
-
-```sh
-uv run pytest
-uv run python -m compileall -q src
-```
+Run the locked verification in [RELEASING.md](RELEASING.md) before committing.

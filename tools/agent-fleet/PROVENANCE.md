@@ -3,12 +3,9 @@
 Agent Fleet was developed as a provider-neutral local component before its source was imported into the public Firstmate repository.
 The initial imported tree was the exact tracked tree from standalone commit `863188085af088371cf1e2b29e800f1ff1533e27`.
 No provider credentials, Fleet state, build outputs, caches, or virtual environments were imported.
-Version 0.2.0 adds the post-import safety work in this repository: remote
-identity-set verification, Desktop/base identity anchors, provider maintenance
-serialization, staged and journaled Codex enrollment, fail-closed process
-ownership, and login/logout isolation. After this import,
-`tools/agent-fleet` in `ruby-dlee/firstmate` is the canonical source and
-standalone release boundary.
+Version 0.2.0 adds the post-import safety work in this repository.
+That work covers remote identity-set verification, Desktop/base identity anchors, provider maintenance serialization, staged and journaled Codex enrollment, fail-closed process ownership, worker auth/resume isolation, ambient provider-variable scrubbing, registered Git workspace confinement, closed Codex hook sets, and constrained worker configuration.
+After this import, `tools/agent-fleet` in `ruby-dlee/firstmate` is the canonical source and independently versioned release boundary.
 
 The original standalone history was authored by Dongkeun Lee:
 

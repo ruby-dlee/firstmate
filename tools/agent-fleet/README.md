@@ -1,9 +1,7 @@
 # Agent Fleet
 
-Agent Fleet is a machine-global account routing layer for local Claude Code and
-Codex CLI agents. It gives an orchestrator a dynamic pool of named account
-profiles without making the orchestrator, tmux, or Herdr responsible for
-credentials.
+Agent Fleet is a machine-global account routing layer for local Claude Code and Codex CLI agents.
+It gives an orchestrator a dynamic pool of named account profiles without making the orchestrator or session backend responsible for credentials.
 
 The profile registry contains policy and opaque labels only. Provider logins
 remain in private per-profile homes owned by the provider CLI.
@@ -39,7 +37,7 @@ The launch stack is deliberately split:
 
 1. Firstmate (or another client) chooses the task, provider, and account pool.
 2. Agent Fleet atomically selects and leases one concrete profile.
-3. tmux or Herdr hosts the process.
+3. The session backend hosts the process.
 4. Claude Code or Codex CLI reads credentials from that profile's isolated home.
 
 Herdr native restore must remain disabled for multi-account panes. A bare
@@ -227,7 +225,7 @@ never shared.
 Defaults:
 
 - Registry: `~/.config/agent-fleet/accounts.toml`
-- Profile homes: `~/.local/share/agent-fleet/accounts/<provider>/<index>`
+- Profile homes: paths recorded in the registry, under `~/.local/share/agent-fleet/accounts/<provider>/` by default
 - Leases, normalized quota, and session mappings:
   `~/.local/state/agent-fleet`
 - Neutral provider runtimes: `~/.local/libexec/agent-fleet/runtime`

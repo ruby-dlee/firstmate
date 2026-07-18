@@ -54,7 +54,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 
 ## Development
 
-Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/` - ship through the `no-mistakes` pipeline on a feature branch and require an explicit merge approval.
+Changes to the shared tracked material listed under "Repo conventions" ship through the `no-mistakes` pipeline on a feature branch and require an explicit merge approval.
 Before making any such change, load the agent-only `firstmate-coding-guidelines` skill (`.agents/skills/firstmate-coding-guidelines/SKILL.md`).
 It has the knowledge-placement rules that keep `AGENTS.md` from regrowing after each diet pass.
 There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task's repo is firstmate itself, so firstmate adds this skill's load line to firstmate-repo briefs by hand.
@@ -62,7 +62,7 @@ A crewmate picking up such a brief should load the skill even if the brief preda
 When supervising live crewmates, keep firstmate's own long validation or build commands in the background so watcher wakes can still be handled.
 Crewmate validation follows the installed no-mistakes version's SKILL.md and live `axi` help instead of duplicating gate mechanics in firstmate docs.
 Firstmate's wrapper still matters: `ask-user` findings route to the captain through firstmate, and crewmates avoid `--yes` because it silently resolves captain-owned decisions without escalation.
-Local `.no-mistakes/` state and test evidence stay out of this repo; `.no-mistakes.yaml` keeps evidence in a temp directory and pins the gate's lint and test commands to the same `bin/fm-lint.sh` and bash behavior suite as CI, so the pre-push gate runs the exact checks CI enforces.
+Local `.no-mistakes/` state and test evidence stay out of this repo; `.no-mistakes.yaml` keeps evidence in a temp directory and pins the gate's shell and Agent Fleet source checks to their matching CI commands.
 That is firstmate-specific; do not commit `.no-mistakes/evidence/` here even when another no-mistakes-managed target project keeps committed PR evidence.
 
 Check and test the toolbelt before pushing:
@@ -77,17 +77,7 @@ tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVE
 ```
 
 Agent Fleet is independently packaged under `tools/agent-fleet` and requires Python 3.11 or newer plus `uv`.
-Run its locked checks from that directory before pushing:
-
-```sh
-uv sync --locked
-uv run --locked ruff check .
-uv run --locked pytest
-uv run --locked python -m compileall -q src
-uv build --out-dir dist
-```
-
-The complete versioning, tagging, and clean-install verification procedure lives in [`tools/agent-fleet/RELEASING.md`](tools/agent-fleet/RELEASING.md).
+Run the complete locked verification in [`tools/agent-fleet/RELEASING.md`](tools/agent-fleet/RELEASING.md) before pushing; that document also owns versioning, tagging, and clean-install verification.
 
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
 Tests that need a real optional backend, an explicit opt-in, or an ambient toolchain capability (real herdr/zellij/cmux smoke tests, the live Pi regression, the Pi TypeScript-extension checks when node cannot import `.ts` modules directly) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.

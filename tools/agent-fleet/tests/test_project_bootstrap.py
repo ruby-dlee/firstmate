@@ -11,6 +11,7 @@ import pytest
 
 import agent_fleet.providers as providers_module
 import agent_fleet.provision as provision_module
+import agent_fleet.routeability as routeability_module
 import agent_fleet.scheduler as scheduler_module
 from agent_fleet.config import load_registry
 from agent_fleet.doctor import run_doctor
@@ -565,7 +566,7 @@ def test_selection_rejects_project_control_files_before_state_changes(
         lambda *_args, **_kwargs: provider_calls.append("quota"),
     )
     monkeypatch.setattr(
-        scheduler_module,
+        routeability_module,
         "inspect_credential_source_contract",
         lambda *_args, **_kwargs: provider_calls.append("credential-source"),
     )
@@ -683,7 +684,7 @@ def test_provider_binary_drift_stops_before_provider_or_state_changes(
         lambda *_args, **_kwargs: provider_calls.append("quota"),
     )
     monkeypatch.setattr(
-        scheduler_module,
+        routeability_module,
         "inspect_credential_source_contract",
         lambda *_args, **_kwargs: provider_calls.append("credential-source"),
     )

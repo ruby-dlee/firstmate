@@ -20,6 +20,7 @@ from agent_fleet.quota import (
     quota_path,
     read_quota,
 )
+from agent_fleet.status import pool_status
 from agent_fleet.util import atomic_write_json, utc_now
 
 
@@ -63,19 +64,15 @@ def test_runtime_version_matches_package_metadata() -> None:
     assert __version__ == metadata["project"]["version"]
 
 
-def test_pool_status_reports_provider_level_fallback(
-    fleet: tuple[object, Path], tmp_path: Path
+def test_pool_status_uses_live_proof_instead_of_stale_cache(
+    fleet: tuple[object, Path],
 ) -> None:
     _, config = fleet
     registry = load_registry(config)
-    binary = tmp_path / "auth-ok"
-    _auth_ok_binary(binary)
-    providers = dict(registry.providers)
-    providers["codex"] = replace(providers["codex"], binary=binary)
     profiles = dict(registry.profiles)
     for profile_id in ("codex-1", "codex-2"):
         profiles[profile_id] = replace(profiles[profile_id], enabled=True)
-    registry = replace(registry, providers=providers, profiles=profiles)
+    registry = replace(registry, profiles=profiles)
     save_registry(registry, config)
     registry = load_registry(config)
     for profile_id in ("codex-1", "codex-2"):
@@ -96,36 +93,14 @@ def test_pool_status_reports_provider_level_fallback(
             },
         )
 
-    project_root = Path(__file__).parents[1]
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(project_root / "src")
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_fleet",
-            "--format",
-            "json",
-            "--config",
-            str(config),
-            "pool",
-            "status",
-            "--pool",
-            "codex-crew",
-            "--provider",
-            "codex",
-        ],
-        cwd=Path.cwd(),
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    provider = json.loads(result.stdout)["providers"][0]
+    provider = pool_status(
+        registry,
+        pool="codex-crew",
+        provider="codex",
+    )["providers"][0]
     assert provider["available"] is True
-    assert provider["selection_mode"] == "verified-fallback"
-    assert provider["degraded"] is True
+    assert provider["selection_mode"] == "quota"
+    assert provider["degraded"] is False
 
 
 def test_enroll_is_a_verified_noop_without_invoking_codex_login(

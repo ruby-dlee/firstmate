@@ -4,12 +4,135 @@ from collections import Counter
 from typing import Any
 
 from .cooldowns import read_cooldown
-from .identity import identity_conflict, refresh_provider_identity_anchors_if_due
+from .identity import (
+    identity_binding_conflict,
+    identity_conflict,
+    probe_provider_external_observation,
+    verify_identity_bundle,
+)
 from .leases import active_leases
-from .models import SUPPORTED_PROVIDERS, Registry
-from .providers import auth_status
-from .provision import profile_is_provisioned, verified_provider_binary
-from .quota import quota_routeability, read_quota, refresh_due_quotas
+from .locks import provider_selection_refresh_lock
+from .models import SUPPORTED_PROVIDERS, Profile, Registry
+from .provision import profile_is_provisioned
+from .quota import quota_routeability, read_quota
+from .routeability import source_attested_live_proofs
+
+
+def _public_routeability(
+    registry: Registry,
+    profile: Profile,
+    authentication: str,
+    proof: dict[str, Any] | None,
+    live_failure: str | None,
+    provider_failures: dict[str, str],
+    observed_external: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    quota = proof["quota"] if proof is not None else read_quota(registry, profile.id)
+    routeability = quota_routeability(
+        registry,
+        profile,
+        quota=quota,
+        authentication=authentication,
+    )
+    binding_conflict = (
+        identity_binding_conflict(
+            registry,
+            profile,
+            quota,
+            proof["source_contract"],
+            observed_external=observed_external,
+        )
+        if proof is not None
+        else None
+    )
+    conflict = (
+        identity_conflict(
+            registry,
+            profile,
+            quota,
+            observed_external=observed_external,
+        )
+        if proof is not None
+        else None
+    )
+    if live_failure is not None:
+        routeability = {
+            "eligible": False,
+            "mode": "blocked",
+            "reason": f"fresh_live_identity_proof_required:{live_failure}",
+        }
+    elif provider_failures:
+        failed_profile = sorted(provider_failures)[0]
+        routeability = {
+            "eligible": False,
+            "mode": "blocked",
+            "reason": (
+                "provider_identity_proof_incomplete:"
+                f"{failed_profile}:{provider_failures[failed_profile]}"
+            ),
+        }
+    elif binding_conflict is not None or conflict is not None:
+        routeability = {
+            "eligible": False,
+            "mode": "blocked",
+            "reason": binding_conflict or conflict,
+        }
+    return quota, routeability, binding_conflict
+
+
+def _provider_live_snapshot(
+    registry: Registry,
+    provider_name: str,
+    provider_scope: list[Profile],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, str],
+    dict[str, str],
+    dict[str, Any] | None,
+]:
+    proof_scope = [profile for profile in provider_scope if profile_is_provisioned(profile)]
+    failures = {
+        profile.id: "profile_unprovisioned"
+        for profile in provider_scope
+        if not profile_is_provisioned(profile)
+    }
+    if not proof_scope:
+        return {}, failures, {}, None
+    with provider_selection_refresh_lock(
+        registry.settings.state_dir,
+        provider_name,
+        registry.settings.lock_stale_seconds,
+    ):
+        proofs, live_failures = source_attested_live_proofs(registry, proof_scope)
+        failures.update(live_failures)
+        authentications = {
+            profile_id: "authenticated" for profile_id in proofs
+        }
+        try:
+            observed_external = probe_provider_external_observation(
+                registry,
+                provider_name,
+            )
+        except (OSError, TimeoutError, ValueError) as exc:
+            observed_external = None
+            if isinstance(exc, TimeoutError):
+                reason = "external_identity_timeout"
+            elif isinstance(exc, OSError):
+                reason = "external_identity_unavailable"
+            else:
+                reason = "external_identity_indeterminate"
+            failures[f"{provider_name}-external"] = reason
+        else:
+            bundle = verify_identity_bundle(
+                registry,
+                provider_name,
+                observed_external=observed_external,
+            )
+            if bundle["status"] != "verified":
+                failures[f"{provider_name}-external"] = (
+                    f"identity_bundle_{bundle.get('reason', 'invalid')}"
+                )
+    return proofs, failures, authentications, observed_external
 
 
 def profile_status(registry: Registry, profile_id: str) -> dict[str, Any]:
@@ -22,35 +145,46 @@ def profile_status(registry: Registry, profile_id: str) -> dict[str, Any]:
             "active_leases": 0,
             "cooldown": None,
             "quota": {},
+            "live_identity_failure": None,
+            "identity_binding_conflict": None,
             "routeability": {
                 "eligible": False,
                 "mode": "blocked",
                 "reason": "external_reserve_never_routed",
             },
         }
-    if profile.safety_policy == "worker":
-        refresh_provider_identity_anchors_if_due(registry, profile.provider)
     leases = active_leases(registry)
     provisioned = profile_is_provisioned(profile)
+    provider_scope = [
+        candidate
+        for candidate in registry.profiles.values()
+        if candidate.provider == profile.provider
+        and candidate.safety_policy == "worker"
+        and (candidate.enabled or candidate.id == profile.id)
+    ]
+    proofs, failures, authentications, observed_external = _provider_live_snapshot(
+        registry,
+        profile.provider,
+        provider_scope,
+    )
     authentication = (
-        auth_status(profile, binary=verified_provider_binary(registry, profile))
+        authentications.get(profile.id, "unknown")
         if provisioned
         else "not-provisioned"
     )
-    quota = read_quota(registry, profile.id)
-    routeability = quota_routeability(
+    proof = proofs.get(profile.id)
+    live_failure = failures.get(profile.id)
+    if proof is None and live_failure is None:
+        live_failure = "profile_unprovisioned"
+    quota, routeability, binding_conflict = _public_routeability(
         registry,
         profile,
-        quota=quota,
-        authentication=authentication,
+        authentication,
+        proof,
+        live_failure,
+        failures,
+        observed_external,
     )
-    conflict = identity_conflict(registry, profile, quota)
-    if conflict is not None:
-        routeability = {
-            "eligible": False,
-            "mode": "blocked",
-            "reason": conflict,
-        }
     return {
         **profile.public_dict(),
         "provisioned": provisioned,
@@ -58,6 +192,8 @@ def profile_status(registry: Registry, profile_id: str) -> dict[str, Any]:
         "active_leases": sum(lease.get("profile") == profile.id for lease in leases),
         "cooldown": read_cooldown(registry, profile.id),
         "quota": quota,
+        "live_identity_failure": live_failure,
+        "identity_binding_conflict": binding_conflict,
         "routeability": routeability,
     }
 
@@ -71,16 +207,20 @@ def pool_status(
     leases = active_leases(registry)
     counts = Counter(str(lease.get("profile")) for lease in leases)
     providers = [provider] if provider else list(SUPPORTED_PROVIDERS)
-    for provider_name in providers:
-        refresh_provider_identity_anchors_if_due(registry, provider_name)
-    scoped = [
-        profile
-        for profile in registry.profiles.values()
-        if profile.provider in providers and pool in profile.pools and profile.enabled
-    ]
-    refresh_due_quotas(registry, scoped)
     summaries: list[dict[str, Any]] = []
     for provider_name in providers:
+        provider_scope = [
+            profile
+            for profile in registry.profiles.values()
+            if profile.provider == provider_name
+            and profile.safety_policy == "worker"
+            and profile.enabled
+        ]
+        proofs, failures, authentications, observed_external = _provider_live_snapshot(
+            registry,
+            provider_name,
+            provider_scope,
+        )
         profiles: list[dict[str, Any]] = []
         for profile in registry.profiles.values():
             if profile.provider != provider_name or pool not in profile.pools:
@@ -95,6 +235,8 @@ def pool_status(
                         "active_leases": 0,
                         "max_concurrent": profile.max_concurrent,
                         "quota_fresh": False,
+                        "live_identity_failure": None,
+                        "identity_binding_conflict": None,
                         "headroom_percent": None,
                         "cooldown": None,
                         "routeability": {
@@ -109,28 +251,29 @@ def pool_status(
                 continue
             provisioned = profile_is_provisioned(profile)
             authentication = (
-                auth_status(profile, binary=verified_provider_binary(registry, profile))
+                authentications.get(profile.id, "unknown")
                 if provisioned
                 else "not-provisioned"
             )
-            quota = read_quota(registry, profile.id)
-            fresh = quota.get("fresh") is True
+            proof = proofs.get(profile.id)
+            live_failure = failures.get(profile.id)
+            if proof is None and live_failure is None:
+                live_failure = (
+                    "profile_disabled" if not profile.enabled else "profile_unprovisioned"
+                )
+            quota, routeability, binding_conflict = _public_routeability(
+                registry,
+                profile,
+                authentication,
+                proof,
+                live_failure,
+                failures,
+                observed_external,
+            )
+            fresh = proof is not None
             headroom = quota.get("headroom_percent") if fresh else None
             cooldown = read_cooldown(registry, profile.id)
             capacity = counts[profile.id] < profile.max_concurrent
-            routeability = quota_routeability(
-                registry,
-                profile,
-                quota=quota,
-                authentication=authentication,
-            )
-            conflict = identity_conflict(registry, profile, quota)
-            if conflict is not None:
-                routeability = {
-                    "eligible": False,
-                    "mode": "blocked",
-                    "reason": conflict,
-                }
             eligible = (
                 profile.enabled
                 and provisioned
@@ -154,40 +297,40 @@ def pool_status(
                     "active_leases": counts[profile.id],
                     "max_concurrent": profile.max_concurrent,
                     "quota_fresh": fresh,
+                    "cached_quota_fresh": read_quota(registry, profile.id).get("fresh") is True,
                     "quota_status": quota.get("status"),
                     "verified_recent": quota.get("verified_recent"),
                     "headroom_percent": headroom,
                     "adjusted_headroom_percent": adjusted,
                     "reserve_percent": profile.reserve_percent,
                     "cooldown": cooldown,
+                    "live_identity_failure": live_failure,
+                    "identity_binding_conflict": binding_conflict,
                     "eligible": eligible,
                     "routeability_reason": routeability["reason"],
                     "identity_fingerprint": quota.get("identity_fingerprint"),
                 }
             )
         fresh_eligible = [item for item in profiles if item["eligible"] and item["quota_fresh"]]
-        fallback_eligible = [
-            item for item in profiles if item["eligible"] and not item["quota_fresh"]
-        ]
-        mode = (
-            "quota"
-            if fresh_eligible
-            else "verified-fallback"
-            if fallback_eligible
-            else "unavailable"
-        )
-        eligible_profiles = fresh_eligible or fallback_eligible
+        mode = "quota" if fresh_eligible else "unavailable"
+        eligible_profiles = fresh_eligible
         summaries.append(
             {
                 "provider": provider_name,
                 "available": bool(eligible_profiles),
                 "selection_mode": mode,
-                "degraded": mode == "verified-fallback",
+                "degraded": False,
                 "best_adjusted_headroom_percent": max(
                     (float(item["adjusted_headroom_percent"]) for item in fresh_eligible),
                     default=None,
                 ),
                 "eligible_profiles": len(eligible_profiles),
+                "live_identity_failures": failures,
+                "identity_binding_conflicts": {
+                    item["profile"]: item["identity_binding_conflict"]
+                    for item in profiles
+                    if item.get("identity_binding_conflict") is not None
+                },
                 "active_leases": sum(counts[item["profile"]] for item in profiles),
                 "profiles": profiles,
             }

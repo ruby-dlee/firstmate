@@ -63,6 +63,8 @@ agent-fleet profile identity adopt codex-1
 Before `init`, set `AGENT_FLEET_CLAUDE_BIN`, `AGENT_FLEET_CODEX_BIN`, or `AGENT_FLEET_QUOTA_BIN` when the executable defaults in "State" do not match the local installation.
 The generated registry pins the resolved executable paths.
 
+`profile provision --all` provisions only profiles whose safety policy is `worker`; in the sealed Bridge topology that means the six isolated workers, never the Claude Desktop or Codex Desktop reserve profiles.
+
 Register every Git project that may host a managed worker before enrollment and launch.
 Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
 Broad, symlinked, unrelated, and unregistered working directories fail closed before a provider process or lease starts.
@@ -197,11 +199,18 @@ identities, missing remote verification, and expired verification are hard
 blocks. A cached response whose live probe says sign-in is required is also a
 hard block; cached percentages can never hide revoked credentials.
 
-When fresh quota exists, Agent Fleet selects the highest safe headroom after
-reserve and active-lease penalties. A transient stale/unavailable response may
-use weighted least-active/LRU fallback only when that exact profile has a recent
-successful remote verification (24 hours by default). A fresh profile at or
-below its reserve is never selected for new work.
+When fresh quota exists, Agent Fleet selects the highest safe headroom after reserve and active-lease penalties.
+A fresh profile at or below its reserve is never selected for new work.
+Stale or unavailable quota remains visible for diagnosis but is never routeable.
+
+`choose --dry-run`, `profile status`, and `pool status` obtain a read-only same-attempt remote proof bracketed by live credential-source attestations.
+That successful remote proof is the routeability authentication result; these hot paths do not launch a second provider `auth status` subprocess against the same isolated credentials.
+`doctor` retains its direct provider-auth diagnostic as a separate explicit health check.
+FirstMate gives each live-proof `pool status` call the selection-class timeout (120 seconds by default), rather than the five-second ordinary control-plane budget.
+They advertise a profile as eligible, or a provider pool as available, only when that fresh proof matches the profile's durable provider identity bundle.
+Missing bundles, changed sources, remote-identity mismatches, and incomplete same-provider proof sets surface as explicit non-routeable diagnostics.
+FirstMate accepts only non-degraded `selection_mode=quota` pool summaries.
+Advisory fallback still carries the ordered pool into enforced spawn, where a real fresh lease is mandatory before any provider process can launch.
 
 ```sh
 agent-fleet quota refresh --all
@@ -220,10 +229,9 @@ routing activation are deliberately separate phases. On macOS,
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
 never requests Keychain access and fails closed when verification is unavailable.
 
-`doctor` checks private profile homes, cached fresh remote identity proof for enabled workers, Agent Fleet and inherited workflow hooks/assets, provider auth state, trusted-project configuration, and configured binaries.
-It does not refresh quota evidence or change provider or project configuration.
-Disabled and non-worker reserve profiles report remote-proof state without making it a health requirement.
-`--workspace` checks for Firstmate's required Claude and Codex supervision-hook events, while `--project` independently checks provider onboarding, registered-project, profile-hook, plugin, and project-hook readiness.
+`doctor` verifies private profile homes, fresh remote identity proof for enabled workers, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
+Non-worker reserve profiles are never provisioned, remotely probed, or routed; their status is the zero-touch `external-reserve` classification with no quota payload.
+`--workspace` checks Firstmate's Claude and Codex supervision hooks, while `--project` independently checks provider onboarding, registered-project, profile-hook, plugin, and project-hook readiness without changing either location.
 
 ## Isolation and shared workflow assets
 

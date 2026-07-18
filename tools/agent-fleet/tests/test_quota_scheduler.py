@@ -51,7 +51,11 @@ def _quota_fixture(path: Path, provider: str, remaining: int) -> None:
                     "providers": [
                         {
                             "provider": provider,
-                            "account": {"accountId": account},
+                            "account": {
+                                "accountId": account,
+                                "email": account.removesuffix("-account")
+                                + "@example.invalid",
+                            },
                             "state": {
                                 "status": "fresh",
                                 "refreshedAt": datetime.now(UTC).isoformat(),
@@ -422,8 +426,8 @@ def test_stale_cache_after_remote_auth_failure_is_never_selected(
     assert active_leases(registry) == []
 
 
-def test_verified_stale_fallback_has_a_bounded_grace(
-    fleet: tuple[object, Path], monkeypatch, tmp_path: Path
+def test_dry_run_requires_a_same_attempt_fresh_proof_even_with_recent_cache(
+    fleet: tuple[object, Path], tmp_path: Path
 ) -> None:
     _, config = fleet
     registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
@@ -445,19 +449,335 @@ def test_verified_stale_fallback_has_a_bounded_grace(
         dry_run=True,
         workspace=Path.cwd(),
     )
-    assert selected["decision_reason"] == "verified-fallback"
+    assert selected["decision_reason"] == "quota"
+    assert selected["identity_proof"] == "same-attempt-read-only"
+    assert selected["degraded"] is False
 
-    cached["verified_at"] = "2000-01-01T00:00:00+00:00"
-    atomic_write_json(quota_path(registry, "claude-1"), cached)
-    with pytest.raises(ValueError, match="remote_verification_expired"):
+    live = json.loads((fixtures / "claude-1.json").read_text(encoding="utf-8"))
+    live["providers"][0]["state"]["status"] = "stale"
+    (fixtures / "claude-1.json").write_text(json.dumps(live), encoding="utf-8")
+    with pytest.raises(ValueError, match="fresh_remote_identity_proof_unavailable"):
         select_and_acquire(
             registry,
-            task="expired-proof",
+            task="stale-live-proof",
             pool="claude-crew",
             profile_id="claude-1",
             dry_run=True,
             workspace=Path.cwd(),
         )
+
+
+def test_dry_run_surfaces_durable_identity_binding_conflict(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    fixtures = tmp_path / "quota"
+    fixtures.mkdir()
+    _quota_fixture(fixtures / "claude-1.json", "claude", 70)
+    live = json.loads((fixtures / "claude-1.json").read_text(encoding="utf-8"))
+    live["providers"][0]["account"]["accountId"] = "replacement-account"
+    (fixtures / "claude-1.json").write_text(json.dumps(live), encoding="utf-8")
+    _use_quota_fixtures(registry, fixtures)
+
+    with pytest.raises(ValueError, match="identity_binding_remote_mismatch"):
+        select_and_acquire(
+            registry,
+            task="binding-conflict",
+            pool="claude-crew",
+            profile_id="claude-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+
+
+def test_dry_run_uses_fresh_external_observation_when_anchor_is_stale(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    anchor_path = registry.settings.state_dir / "identity-anchors" / "claude-base.json"
+    stale_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    stale_anchor["refreshed_at"] = "2000-01-01T00:00:00+00:00"
+    atomic_write_json(anchor_path, stale_anchor)
+
+    selected = select_and_acquire(
+        registry,
+        task="stale-anchor-fresh-observation",
+        pool="claude-crew",
+        profile_id="claude-1",
+        dry_run=True,
+        workspace=Path.cwd(),
+    )
+
+    assert selected["profile"] == "claude-1"
+    assert selected["identity_proof"] == "same-attempt-read-only"
+    assert json.loads(anchor_path.read_text(encoding="utf-8")) == stale_anchor
+
+
+def test_dry_run_rejects_changed_external_observation(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    real_probe = scheduler_module.probe_provider_external_observation
+
+    def changed_external_probe(current, provider: str):
+        observed = real_probe(current, provider)
+        observed["base"]["identity_fingerprint"] = "0" * 64
+        return observed
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "probe_provider_external_observation",
+        changed_external_probe,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="provider identity bundle changed before selection: claude:external_changed",
+    ):
+        select_and_acquire(
+            registry,
+            task="changed-external-dry-run",
+            pool="claude-crew",
+            profile_id="claude-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+    assert active_leases(registry) == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (TimeoutError("secret timeout detail"), "external_identity_timeout"),
+        (OSError("secret OS detail"), "external_identity_unavailable"),
+        (ValueError("secret parse detail"), "external_identity_indeterminate"),
+    ],
+)
+def test_final_external_probe_errors_use_safe_categories(
+    fleet: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    reason: str,
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+
+    def failed_external_probe(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "probe_provider_external_observation",
+        failed_external_probe,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "provider external identity proof failed before selection: "
+            f"claude:{reason}"
+        ),
+    ) as raised:
+        select_and_acquire(
+            registry,
+            task=f"safe-external-error-{reason}",
+            pool="claude-crew",
+            profile_id="claude-1",
+            dry_run=True,
+            workspace=Path.cwd(),
+        )
+    assert "secret" not in str(raised.value)
+
+
+def test_selection_reproves_external_identity_after_worker_proofs(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    fixtures = tmp_path / "quota"
+    fixtures.mkdir()
+    _quota_fixture(fixtures / "claude-1.json", "claude", 70)
+    _use_quota_fixtures(registry, fixtures)
+    real_probe = scheduler_module.probe_provider_external_observation
+    final_probes = 0
+
+    def switch_base_before_final_probe(current, provider: str):
+        nonlocal final_probes
+        if provider == "claude":
+            final_probes += 1
+            _quota_fixture(fixtures / "claude-base-anchor.json", "claude", 70)
+            payload = json.loads(
+                (fixtures / "claude-base-anchor.json").read_text(encoding="utf-8")
+            )
+            payload["providers"][0]["account"]["accountId"] = "claude-1-account"
+            (fixtures / "claude-base-anchor.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+        return real_probe(current, provider)
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "probe_provider_external_observation",
+        switch_base_before_final_probe,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate_provider_identity before selection: claude:claude-1",
+    ):
+        select_and_acquire(
+            registry,
+            task="external-race",
+            pool="claude-crew",
+            profile_id="claude-1",
+            workspace=Path.cwd(),
+        )
+    assert final_probes == 1
+    assert active_leases(registry) == []
+
+
+def test_final_external_probe_does_not_hold_global_state_lock(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    real_probe = scheduler_module.probe_provider_external_observation
+
+    def blocked_external_probe(current, provider: str):
+        probe_entered.set()
+        assert release_probe.wait(timeout=10)
+        return real_probe(current, provider)
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "probe_provider_external_observation",
+        blocked_external_probe,
+    )
+    outcome: dict[str, object] = {}
+
+    def select() -> None:
+        try:
+            outcome["result"] = select_and_acquire(
+                registry,
+                task="slow-external-proof",
+                pool="claude-crew",
+                profile_id="claude-1",
+                workspace=Path.cwd(),
+            )
+        except ValueError as exc:
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=select)
+    worker.start()
+    assert probe_entered.wait(timeout=10)
+    try:
+        with scheduler_module.state_lock(
+            registry.settings.state_dir,
+            registry.settings.lock_stale_seconds,
+            timeout=0.25,
+        ):
+            pass
+    finally:
+        release_probe.set()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"]["profile"] == "claude-1"
+
+
+def test_concurrent_dry_run_proof_bundles_are_provider_serialized(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+    first_probe_entered = threading.Event()
+    release_first_probe = threading.Event()
+    second_lock_attempted = threading.Event()
+    guard = threading.Lock()
+    real_probe = scheduler_module.probe_quota
+    real_provider_lock = scheduler_module.provider_selection_refresh_lock
+    probe_calls = 0
+    lock_attempts = 0
+    active_probes = 0
+    maximum_active_probes = 0
+
+    def blocked_quota_probe(*args, **kwargs):
+        nonlocal active_probes, maximum_active_probes, probe_calls
+        with guard:
+            probe_calls += 1
+            call_number = probe_calls
+            active_probes += 1
+            maximum_active_probes = max(maximum_active_probes, active_probes)
+        try:
+            if call_number == 1:
+                first_probe_entered.set()
+                assert release_first_probe.wait(timeout=10)
+            return real_probe(*args, **kwargs)
+        finally:
+            with guard:
+                active_probes -= 1
+
+    def observed_provider_lock(*args, **kwargs):
+        nonlocal lock_attempts
+        with guard:
+            lock_attempts += 1
+            if lock_attempts == 2:
+                second_lock_attempted.set()
+        return real_provider_lock(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_module, "probe_quota", blocked_quota_probe)
+    monkeypatch.setattr(
+        scheduler_module,
+        "provider_selection_refresh_lock",
+        observed_provider_lock,
+    )
+    outcomes: dict[str, dict[str, object]] = {}
+
+    def select(task: str) -> None:
+        try:
+            outcomes[task] = {
+                "result": select_and_acquire(
+                    registry,
+                    task=task,
+                    pool="claude-crew",
+                    profile_id="claude-1",
+                    dry_run=True,
+                    workspace=Path.cwd(),
+                )
+            }
+        except ValueError as exc:
+            outcomes[task] = {"error": str(exc)}
+
+    first = threading.Thread(target=select, args=("dry-run-one",))
+    second = threading.Thread(target=select, args=("dry-run-two",))
+    first.start()
+    assert first_probe_entered.wait(timeout=10)
+    second.start()
+    assert second_lock_attempted.wait(timeout=10)
+    with guard:
+        assert probe_calls == 1
+        assert maximum_active_probes == 1
+    release_first_probe.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert set(outcomes) == {"dry-run-one", "dry-run-two"}
+    assert all("error" not in outcome for outcome in outcomes.values())
+    assert all(
+        outcome["result"]["profile"] == "claude-1"
+        for outcome in outcomes.values()
+    )
+    assert probe_calls == 2
+    assert maximum_active_probes == 1
 
 
 def test_duplicate_remote_identity_is_fail_closed(
@@ -655,14 +975,18 @@ def test_registry_change_during_selection_cannot_commit_a_stale_lease(
     registry = _enable_and_provision(load_registry(config), config, ["codex-1"])
     entered = threading.Event()
     proceed = threading.Event()
-    original_auth_status = scheduler_module.auth_status
+    original_external_probe = scheduler_module.probe_provider_external_observation
 
-    def blocked_auth_status(profile, *, binary):
+    def blocked_external_probe(current, provider: str):
         entered.set()
         assert proceed.wait(timeout=10)
-        return original_auth_status(profile, binary=binary)
+        return original_external_probe(current, provider)
 
-    monkeypatch.setattr(scheduler_module, "auth_status", blocked_auth_status)
+    monkeypatch.setattr(
+        scheduler_module,
+        "probe_provider_external_observation",
+        blocked_external_probe,
+    )
     outcome: dict[str, object] = {}
 
     def select() -> None:
@@ -758,7 +1082,6 @@ def test_registry_change_before_provider_lock_aborts_before_refresh(
         unexpected("identity"),
     )
     monkeypatch.setattr(scheduler_module, "probe_quota", unexpected("quota"))
-    monkeypatch.setattr(scheduler_module, "auth_status", unexpected("auth", "authenticated"))
     before_state = {
         path.relative_to(registry.settings.state_dir): path.read_bytes()
         for path in registry.settings.state_dir.rglob("*")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +13,9 @@ from .enrollment import recover_pending_codex_transactions
 from .identity import (
     identity_binding_conflict,
     identity_conflict,
+    probe_provider_external_observation,
     refresh_provider_identity_anchors_if_due,
+    verify_identity_bundle,
 )
 from .leases import active_leases, bind_lease, get_active_lease, new_lease, write_lease
 from .locks import (
@@ -23,20 +24,17 @@ from .locks import (
 )
 from .models import Profile, Registry
 from .projects import lexical_path, resolve_trusted_project
-from .providers import auth_status
 from .provision import (
     profile_is_provisioned,
     profile_selection_ready,
-    verified_provider_binary,
 )
 from .quota import (
-    has_remote_identity_proof,
-    inspect_credential_source_contract,
     probe_quota,
     quota_routeability,
     read_quota,
     store_quota,
 )
+from .routeability import source_attested_live_proofs
 from .util import atomic_write_json, read_private_json, task_key
 
 
@@ -109,21 +107,11 @@ def _choose(
                 -item["registry_order"],
             ),
         )
-    fallback = [record for record in records if record["eligible"] and not record["fresh"]]
-    if not fallback:
-        reasons = sorted({str(record["block_reason"]) for record in records})
-        if reasons == ["quota_reserve"]:
-            raise ValueError("all eligible profiles are at or below their quota reserve")
-        detail = ", ".join(reasons) or "unknown"
-        raise ValueError(f"no remotely verified profile is routeable: {detail}")
-    return min(
-        fallback,
-        key=lambda item: (
-            item["active"] / item["profile"].weight,
-            item["last_selected"],
-            item["registry_order"],
-        ),
-    )
+    reasons = sorted({str(record["block_reason"]) for record in records})
+    if reasons == ["quota_reserve"]:
+        raise ValueError("all eligible profiles are at or below their quota reserve")
+    detail = ", ".join(reasons) or "unknown"
+    raise ValueError(f"no freshly proven profile is routeable: {detail}")
 
 
 def _inverse_timestamp(value: str) -> float:
@@ -183,6 +171,7 @@ def _select_and_acquire(
         authentication: dict[str, str],
         *,
         prune: bool,
+        external_observations: dict[str, dict[str, Any]],
         live_proofs: dict[str, dict[str, Any]] | None = None,
         live_failures: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -207,7 +196,7 @@ def _select_and_acquire(
             if profile_id is not None and profile.id != profile_id:
                 raise ValueError(f"task is already bound to profile {profile.id}")
             if existing.get("state") != "running":
-                if not dry_run and live_failures:
+                if live_failures:
                     failed = ", ".join(
                         f"{profile_id}:{live_failures[profile_id]}"
                         for profile_id in sorted(live_failures)
@@ -222,7 +211,7 @@ def _select_and_acquire(
                 ):
                     raise ValueError("sticky profile is disabled or unprovisioned")
                 proof = live_proofs.get(profile.id)
-                if not dry_run and proof is None:
+                if proof is None:
                     raise ValueError(
                         "sticky profile has no same-attempt identity proof: "
                         + live_failures.get(profile.id, "probe_failed")
@@ -232,34 +221,34 @@ def _select_and_acquire(
                     registry,
                     profile,
                     quota=quota,
-                    authentication=authentication.get(
-                        profile.id,
-                        auth_status(
-                            profile,
-                            binary=verified_provider_binary(registry, profile),
-                        ),
-                    ),
+                    authentication=authentication.get(profile.id, "unknown"),
                     # The reservation already passed new-task policy. Binding it
                     # must recheck auth/readiness without applying reserve twice.
                     ignore_reserve=True,
                 )
                 if not routeability["eligible"]:
                     raise ValueError(f"sticky profile is not routeable: {routeability['reason']}")
-                conflict = identity_conflict(registry, profile, quota)
+                observed_external = external_observations.get(profile.provider)
+                conflict = identity_conflict(
+                    registry,
+                    profile,
+                    quota,
+                    observed_external=observed_external,
+                )
                 if conflict is not None:
                     raise ValueError(f"sticky profile identity is not routeable: {conflict}")
-                if not dry_run:
-                    binding_conflict = identity_binding_conflict(
-                        registry,
-                        profile,
-                        quota,
-                        proof["source_contract"],
+                binding_conflict = identity_binding_conflict(
+                    registry,
+                    profile,
+                    quota,
+                    proof["source_contract"],
+                    observed_external=observed_external,
+                )
+                if binding_conflict is not None:
+                    raise ValueError(
+                        "sticky profile identity binding is not routeable: "
+                        f"{binding_conflict}"
                     )
-                    if binding_conflict is not None:
-                        raise ValueError(
-                            "sticky profile identity binding is not routeable: "
-                            f"{binding_conflict}"
-                        )
             else:
                 quota = read_quota(registry, profile.id)
             if bind_pid is not None and not dry_run:
@@ -294,11 +283,11 @@ def _select_and_acquire(
                 "active_lease_count": sum(lease.get("profile") == profile.id for lease in leases),
                 "degraded": False,
                 "dry_run": dry_run,
-                "identity_proof": "snapshot-only" if dry_run else "same-attempt",
+                "identity_proof": "same-attempt-read-only" if dry_run else "same-attempt",
                 "lease": existing,
             }
 
-        if not dry_run and live_failures:
+        if live_failures:
             failed = ", ".join(
                 f"{profile_id}:{live_failures[profile_id]}"
                 for profile_id in sorted(live_failures)
@@ -343,7 +332,7 @@ def _select_and_acquire(
         ]
         for record in records:
             profile = record["profile"]
-            if not dry_run and profile.id not in live_proofs:
+            if profile.id not in live_proofs:
                 record["eligible"] = False
                 record["selection_mode"] = "blocked"
                 record["block_reason"] = (
@@ -351,7 +340,13 @@ def _select_and_acquire(
                     + live_failures.get(profile.id, "probe_failed")
                 )
                 continue
-            conflict = identity_conflict(registry, record["profile"], record["quota"])
+            observed_external = external_observations.get(profile.provider)
+            conflict = identity_conflict(
+                registry,
+                record["profile"],
+                record["quota"],
+                observed_external=observed_external,
+            )
             if conflict is not None:
                 record["eligible"] = False
                 record["selection_mode"] = "blocked"
@@ -361,18 +356,18 @@ def _select_and_acquire(
                     else conflict
                 )
                 continue
-            if not dry_run:
-                proof = live_proofs[profile.id]
-                binding_conflict = identity_binding_conflict(
-                    registry,
-                    profile,
-                    record["quota"],
-                    proof["source_contract"],
-                )
-                if binding_conflict is not None:
-                    record["eligible"] = False
-                    record["selection_mode"] = "blocked"
-                    record["block_reason"] = binding_conflict
+            proof = live_proofs[profile.id]
+            binding_conflict = identity_binding_conflict(
+                registry,
+                profile,
+                record["quota"],
+                proof["source_contract"],
+                observed_external=observed_external,
+            )
+            if binding_conflict is not None:
+                record["eligible"] = False
+                record["selection_mode"] = "blocked"
+                record["block_reason"] = binding_conflict
         selected = _choose(
             records,
             registry.settings.active_lease_penalty,
@@ -380,10 +375,7 @@ def _select_and_acquire(
         )
         profile = selected["profile"]
         quota = selected["quota"]
-        if ignore_reserve:
-            reason = "sticky-resume"
-        else:
-            reason = "quota" if selected["fresh"] else "verified-fallback"
+        reason = "sticky-resume" if ignore_reserve else "quota"
         lease = None
         if not dry_run:
             lease = new_lease(
@@ -419,9 +411,9 @@ def _select_and_acquire(
             "quota_fresh": quota.get("fresh"),
             "headroom_percent": quota.get("headroom_percent"),
             "active_lease_count": counts[profile.id],
-            "degraded": not selected["fresh"],
+            "degraded": False,
             "dry_run": dry_run,
-            "identity_proof": "snapshot-only" if dry_run else "same-attempt",
+            "identity_proof": "same-attempt-read-only" if dry_run else "same-attempt",
             "lease": lease,
         }
 
@@ -446,14 +438,98 @@ def _select_and_acquire(
         if existing.get("workspace") != workspace_text:
             raise ValueError(f"task already owns a lease for workspace {existing.get('workspace')}")
 
-    if dry_run:
-        require_current_registry("before selection")
-        require_matching_live_binding()
-        validate_readiness()
-        authentication = {profile.id: "authenticated" for profile in scoped_profiles}
-        return decide(authentication, prune=False)
+    def probe_final_external_bindings() -> dict[str, dict[str, Any]]:
+        observations: dict[str, dict[str, Any]] = {}
+        for provider_name in sorted(scoped_provider_names):
+            try:
+                observations[provider_name] = probe_provider_external_observation(
+                    registry,
+                    provider_name,
+                )
+            except (OSError, TimeoutError, ValueError) as exc:
+                if isinstance(exc, TimeoutError):
+                    reason = "external_identity_timeout"
+                elif isinstance(exc, OSError):
+                    reason = "external_identity_unavailable"
+                else:
+                    reason = "external_identity_indeterminate"
+                raise ValueError(
+                    "provider external identity proof failed before selection: "
+                    f"{provider_name}:{reason}"
+                ) from exc
+        return observations
+
+    def require_final_external_binding(
+        observations: dict[str, dict[str, Any]],
+        live_proofs: dict[str, dict[str, Any]],
+    ) -> None:
+        for provider_name in sorted(scoped_provider_names):
+            observation = observations[provider_name]
+            for profile in scoped_profiles:
+                proof = live_proofs.get(profile.id)
+                if profile.provider != provider_name or proof is None:
+                    continue
+                conflict = identity_conflict(
+                    registry,
+                    profile,
+                    proof["quota"],
+                    observed_external=observation,
+                )
+                if conflict in {"base_identity", "desktop_identity"} or (
+                    conflict is not None and conflict.startswith("managed:")
+                ):
+                    raise ValueError(
+                        "duplicate_provider_identity before selection: "
+                        f"{provider_name}:{profile.id}"
+                    )
+            result = verify_identity_bundle(
+                registry,
+                provider_name,
+                observed_external=observation,
+            )
+            if result != {
+                "provider": provider_name,
+                "status": "verified",
+                "reason": None,
+            }:
+                raise ValueError(
+                    "provider identity bundle changed before selection: "
+                    f"{provider_name}:{result.get('reason', 'invalid')}"
+                )
 
     try:
+        if dry_run:
+            with ExitStack() as provider_locks:
+                for provider_name in sorted(scoped_provider_names):
+                    provider_locks.enter_context(
+                        provider_selection_refresh_lock(
+                            registry.settings.state_dir,
+                            provider_name,
+                            registry.settings.lock_stale_seconds,
+                        )
+                    )
+                require_current_registry("before provider refresh")
+                require_matching_live_binding()
+                validate_readiness()
+                live_proofs, live_failures = source_attested_live_proofs(
+                    registry,
+                    scoped_profiles,
+                    probe=probe_quota,
+                )
+                authentication = {
+                    profile_id: "authenticated" for profile_id in live_proofs
+                }
+                final_external = probe_final_external_bindings()
+                require_current_registry("during selection")
+                require_final_external_binding(final_external, live_proofs)
+                return decide(
+                    authentication,
+                    prune=False,
+                    external_observations=final_external,
+                    live_proofs=live_proofs,
+                    live_failures=live_failures,
+                )
+
         with state_lock(
             registry.settings.state_dir,
             registry.settings.lock_stale_seconds,
@@ -481,62 +557,31 @@ def _select_and_acquire(
                 recover_pending_codex_transactions(registry, provider_name)
                 refresh_provider_identity_anchors_if_due(registry, provider_name)
 
-            class SameAttemptProofFailure(ValueError):
-                pass
-
-            def prove(profile: Profile) -> tuple[dict[str, Any], dict[str, Any]]:
-                source_before = inspect_credential_source_contract(registry, profile)
-                quota = probe_quota(registry, profile)
-                source_after = inspect_credential_source_contract(registry, profile)
-                if source_before != source_after:
-                    raise SameAttemptProofFailure("credential_source_changed")
-                if not has_remote_identity_proof(quota):
-                    reason = quota.get("reason")
-                    safe_reason = (
-                        reason
-                        if isinstance(reason, str)
-                        and 0 < len(reason) <= 128
-                        and all(character.isalnum() or character in "_.:-" for character in reason)
-                        else "fresh_remote_identity_proof_unavailable"
-                    )
-                    raise SameAttemptProofFailure(safe_reason)
-                return quota, source_after
-
-            if scoped_profiles:
-                with ThreadPoolExecutor(max_workers=min(8, len(scoped_profiles))) as executor:
-                    pending = {
-                        executor.submit(prove, profile): profile for profile in scoped_profiles
-                    }
-                    for future in as_completed(pending):
-                        profile = pending[future]
-                        try:
-                            quota, source_contract = future.result()
-                            store_quota(registry, profile, quota)
-                            live_proofs[profile.id] = {
-                                "quota": read_quota(registry, profile.id),
-                                "source_contract": source_contract,
-                            }
-                        except (OSError, TimeoutError, ValueError) as exc:
-                            live_failures[profile.id] = (
-                                str(exc)
-                                if isinstance(exc, SameAttemptProofFailure)
-                                else type(exc).__name__
-                            )
+            live_proofs, live_failures = source_attested_live_proofs(
+                registry,
+                scoped_profiles,
+                probe=probe_quota,
+            )
+            for profile in scoped_profiles:
+                proof = live_proofs.get(profile.id)
+                if proof is None:
+                    continue
+                store_quota(registry, profile, proof["stored_quota"])
+                proof["quota"] = read_quota(registry, profile.id)
             authentication = {
-                profile.id: auth_status(
-                    profile,
-                    binary=verified_provider_binary(registry, profile),
-                )
-                for profile in scoped_profiles
+                profile_id: "authenticated" for profile_id in live_proofs
             }
+            final_external = probe_final_external_bindings()
             with state_lock(
                 registry.settings.state_dir,
                 registry.settings.lock_stale_seconds,
             ):
                 require_current_registry("during selection")
+                require_final_external_binding(final_external, live_proofs)
                 return decide(
                     authentication,
                     prune=True,
+                    external_observations=final_external,
                     live_proofs=live_proofs,
                     live_failures=live_failures,
                 )

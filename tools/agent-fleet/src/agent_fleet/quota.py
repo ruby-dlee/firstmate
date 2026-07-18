@@ -34,8 +34,7 @@ PRIMARY_WINDOWS = {"five_hour", "seven_day", "weekly", "week"}
 AUTH_FAILURE_RE = re.compile(r"sign[- ]?in|required|reauth|token.*(?:revoked|invalid)", re.I)
 RATE_LIMIT_RE = re.compile(r"rate.?limit", re.I)
 HARD_BLOCKED_STATUSES = {"auth_required", "rate_limited", "error"}
-FALLBACK_STATUSES = {"fresh", "stale", "unavailable"}
-KNOWN_STATUSES = HARD_BLOCKED_STATUSES | FALLBACK_STATUSES
+KNOWN_STATUSES = HARD_BLOCKED_STATUSES | {"fresh", "stale", "unavailable"}
 SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
 
@@ -704,13 +703,13 @@ def quota_routeability(
         if not ignore_reserve and headroom <= profile.reserve_percent:
             return {"eligible": False, "mode": "quota", "reason": "quota_reserve"}
         return {"eligible": True, "mode": "quota", "reason": "fresh"}
-    if status in FALLBACK_STATUSES and current.get("verified_recent") is True:
-        return {
-            "eligible": True,
-            "mode": "verified-fallback",
-            "reason": "recent_remote_verification",
-        }
-    reason = "remote_verification_expired" if current.get("verified_at") else "remote_unverified"
+    reason = (
+        "fresh_remote_identity_proof_required"
+        if status in {"stale", "unavailable"}
+        else "remote_verification_expired"
+        if current.get("verified_at")
+        else "remote_unverified"
+    )
     return {"eligible": False, "mode": "blocked", "reason": reason}
 
 

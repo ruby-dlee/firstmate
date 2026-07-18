@@ -95,7 +95,10 @@ if os.path.exists(fixture_control):
 print(json.dumps({
     "providers": [{
         "provider": provider,
-        "account": {"accountId": profile + "-account"},
+        "account": {
+            "accountId": profile + "-account",
+            "email": profile + "@example.invalid",
+        },
         "state": {
             "status": "fresh",
             "refreshedAt": datetime.now(UTC).isoformat(),
@@ -181,7 +184,54 @@ print(json.dumps({
         shared = "CLAUDE.md" if name == "claude" else "AGENTS.md"
         (base / shared).write_text("workflow rules\n", encoding="utf-8")
         binary = tmp_path / f"provider-{name}"
-        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        if name == "codex":
+            binary.write_text(
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if "app-server" not in sys.argv:
+    raise SystemExit(0)
+profile = os.environ["AGENT_FLEET_PROFILE"]
+fixture_control = {str(state / "test-quota-fixture-dir")!r}
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        print(json.dumps({{"id": message["id"], "result": {{}}}}), flush=True)
+    elif message.get("method") == "account/read":
+        email = profile + "@example.invalid"
+        if os.path.exists(fixture_control):
+            with open(fixture_control, encoding="utf-8") as handle:
+                fixture_dir = handle.read().strip()
+            fixture_path = os.path.join(fixture_dir, profile + ".json")
+            if os.path.exists(fixture_path):
+                with open(fixture_path, encoding="utf-8") as handle:
+                    fixture_payload = json.load(handle)
+                fixture_providers = fixture_payload.get("providers")
+                if isinstance(fixture_providers, list) and fixture_providers:
+                    account = fixture_providers[0].get("account")
+                    if isinstance(account, dict):
+                        fixture_email = account.get("email")
+                        account_id = account.get("accountId")
+                        if isinstance(fixture_email, str) and fixture_email:
+                            email = fixture_email
+                        elif isinstance(account_id, str) and account_id.endswith("-account"):
+                            email = account_id.removesuffix("-account") + "@example.invalid"
+        result = {{
+            "account": {{
+                "type": "chatgpt",
+                "email": email,
+                "planType": "test",
+            }},
+            "requiresOpenaiAuth": True,
+        }}
+        print(json.dumps({{"id": message["id"], "result": result}}), flush=True)
+""",
+                encoding="utf-8",
+            )
+        else:
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
         providers[name] = replace(
             provider,

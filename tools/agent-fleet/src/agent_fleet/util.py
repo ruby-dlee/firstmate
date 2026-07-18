@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -179,7 +181,117 @@ def read_owned_private_json(path: Path, *, label: str) -> Any:
         raise ValueError(f"corrupt {label}: {path}") from exc
 
 
-def unlink_private_file(path: Path, *, label: str, mode: int = 0o600) -> bool:
+def _rename_noreplace_at(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename one directory entry without replacing another."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    kernel = os.uname().sysname.lower()
+    if kernel == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError as exc:  # pragma: no cover - unsupported Darwin
+            raise ValueError("atomic no-replace rename is unavailable") from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        flags = 0x00000004  # RENAME_EXCL
+    elif kernel == "linux":
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:  # pragma: no cover - unsupported libc
+            raise ValueError("atomic no-replace rename is unavailable") from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:  # pragma: no cover - supported production/test platforms are Darwin/Linux
+        raise ValueError("atomic no-replace rename is unavailable")
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error))
+    if error in {errno.EINVAL, errno.ENOSYS, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+        raise ValueError("atomic no-replace rename is unsupported by this filesystem")
+    raise OSError(error, os.strerror(error))
+
+
+def rename_private_noreplace(source: Path, destination: Path) -> None:
+    """Atomically move one path through verified private parent descriptors."""
+
+    source_parent = open_private_dir(source.parent)
+    destination_parent = (
+        source_parent
+        if source.parent == destination.parent
+        else open_private_dir(destination.parent)
+    )
+    try:
+        _rename_noreplace_at(
+            source_parent,
+            source.name,
+            destination_parent,
+            destination.name,
+        )
+    finally:
+        if destination_parent != source_parent:
+            os.close(destination_parent)
+        os.close(source_parent)
+
+
+def _matches_expected_stat(
+    metadata: os.stat_result,
+    expected: object,
+    *,
+    ctime: bool = True,
+) -> bool:
+    if not isinstance(expected, dict) or not {"dev", "ino"}.issubset(expected):
+        return False
+    observed = {
+        "dev": metadata.st_dev,
+        "ino": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "nlink": metadata.st_nlink,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+    }
+    return all(
+        (not ctime and key == "ctime_ns")
+        or (key in observed and observed[key] == value)
+        for key, value in expected.items()
+    )
+
+
+def unlink_private_file(
+    path: Path,
+    *,
+    label: str,
+    mode: int = 0o600,
+    expected_stat: object | None = None,
+) -> bool:
     """Remove one verified private file through its verified parent descriptor."""
 
     parent_fd = open_private_dir(path.parent)
@@ -204,20 +316,35 @@ def unlink_private_file(path: Path, *, label: str, mode: int = 0o600) -> bool:
             raise ValueError(
                 f"{label} must be a current-user {mode:04o} single-link regular file: {path}"
             )
+        if expected_stat is not None and not _matches_expected_stat(opened, expected_stat):
+            raise ValueError(f"{label} changed before attributed removal: {path}")
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         identity = (opened.st_dev, opened.st_ino)
         if identity != (current.st_dev, current.st_ino):
             raise ValueError(f"{label} changed before removal: {path}")
-        os.replace(path.name, quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _rename_noreplace_at(parent_fd, path.name, parent_fd, quarantine)
         moved = True
         quarantined = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
-        if identity != (quarantined.st_dev, quarantined.st_ino):
+        if identity != (quarantined.st_dev, quarantined.st_ino) or (
+            expected_stat is not None
+            and not _matches_expected_stat(quarantined, expected_stat, ctime=False)
+        ):
             try:
-                os.replace(quarantine, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                _rename_noreplace_at(parent_fd, quarantine, parent_fd, path.name)
                 moved = False
-            except OSError:
-                pass
-            raise ValueError(f"{label} changed during removal: {path}")
+            except FileExistsError as exc:
+                raise ValueError(
+                    f"{label} changed during removal and both generations were preserved: {path}"
+                ) from exc
+            raise ValueError(f"{label} changed during attributed removal: {path}")
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(
+                f"{label} reappeared during removal and both generations were preserved: {path}"
+            )
         os.unlink(quarantine, dir_fd=parent_fd)
         moved = False
         after = os.fstat(descriptor)
@@ -229,8 +356,8 @@ def unlink_private_file(path: Path, *, label: str, mode: int = 0o600) -> bool:
         if descriptor >= 0:
             os.close(descriptor)
         if moved:
-            with suppress(OSError):
-                os.replace(quarantine, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            with suppress(OSError, ValueError):
+                _rename_noreplace_at(parent_fd, quarantine, parent_fd, path.name)
         os.close(parent_fd)
 
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ctypes
-import errno
 import json
 import os
 import pwd
@@ -55,6 +53,7 @@ from .util import (
     process_start_token,
     read_private_bytes,
     read_private_json,
+    rename_private_noreplace,
     unlink_private_file,
     utc_now,
 )
@@ -442,6 +441,16 @@ def _stat_payload(metadata: os.stat_result) -> dict[str, int]:
     }
 
 
+def _inode_payload(metadata: os.stat_result) -> dict[str, int]:
+    return {
+        "dev": metadata.st_dev,
+        "ino": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "nlink": metadata.st_nlink,
+    }
+
+
 def _private_file(path: Path, label: str) -> os.stat_result:
     metadata = path.lstat()
     if (
@@ -486,6 +495,22 @@ def _stat_matches_generation(
         return False
     fields = set(observed) if ctime else set(observed) - {"ctime_ns"}
     return all(encoded.get(field) == observed[field] for field in fields)
+
+
+def _stat_matches_inode(observed: dict[str, int], encoded: object) -> bool:
+    if not isinstance(encoded, dict):
+        return False
+    fields = {"dev", "ino", "uid", "mode", "nlink"}
+    return all(encoded.get(field) == observed[field] for field in fields)
+
+
+def _valid_inode_payload(encoded: object) -> bool:
+    fields = {"dev", "ino", "uid", "mode", "nlink"}
+    return (
+        isinstance(encoded, dict)
+        and set(encoded) == fields
+        and all(isinstance(encoded[field], int) for field in fields)
+    )
 
 
 def _file_generation(path: Path, label: str) -> dict[str, Any]:
@@ -819,7 +844,12 @@ def _validate_paths(
     return {name: Path(value) for name, value in expected.items()}
 
 
-def _copy_private_file(source: Path, destination: Path) -> os.stat_result:
+def _copy_private_file(
+    source: Path,
+    destination: Path,
+    *,
+    destination_created: Callable[[os.stat_result], None] | None = None,
+) -> os.stat_result:
     source_before = _private_file(source, "credential transaction source")
     source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     destination_fd = -1
@@ -832,6 +862,8 @@ def _copy_private_file(source: Path, destination: Path) -> os.stat_result:
             0o600,
         )
         os.fchmod(destination_fd, 0o600)
+        if destination_created is not None:
+            destination_created(os.fstat(destination_fd))
         while chunk := os.read(source_fd, 1024 * 1024):
             view = memoryview(chunk)
             while view:
@@ -2022,64 +2054,7 @@ def _install_claude(
 def _rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically move one private path without replacing the destination."""
 
-    source_parent = open_private_dir(source.parent)
-    destination_parent = (
-        source_parent
-        if source.parent == destination.parent
-        else open_private_dir(destination.parent)
-    )
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        kernel = os.uname().sysname.lower()
-        if kernel == "darwin":
-            try:
-                rename = libc.renameatx_np
-            except AttributeError as exc:  # pragma: no cover - unsupported Darwin
-                raise ValueError("atomic no-replace rename is unavailable") from exc
-            rename.argtypes = [
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            ]
-            flags = 0x00000004  # RENAME_EXCL
-        elif kernel == "linux":
-            try:
-                rename = libc.renameat2
-            except AttributeError as exc:  # pragma: no cover - unsupported libc
-                raise ValueError("atomic no-replace rename is unavailable") from exc
-            rename.argtypes = [
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            ]
-            flags = 0x00000001  # RENAME_NOREPLACE
-        else:  # pragma: no cover - supported production/test platforms are Darwin/Linux
-            raise ValueError("atomic no-replace rename is unavailable")
-        rename.restype = ctypes.c_int
-        ctypes.set_errno(0)
-        result = rename(
-            source_parent,
-            os.fsencode(source.name),
-            destination_parent,
-            os.fsencode(destination.name),
-            flags,
-        )
-        if result == 0:
-            return
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(error, os.strerror(error))
-        if error in {errno.EINVAL, errno.ENOSYS, getattr(errno, "ENOTSUP", errno.EINVAL)}:
-            raise ValueError("atomic no-replace rename is unsupported by this filesystem")
-        raise OSError(error, os.strerror(error))
-    finally:
-        if destination_parent != source_parent:
-            os.close(destination_parent)
-        os.close(source_parent)
+    rename_private_noreplace(source, destination)
 
 
 def _restore_misattributed_move(
@@ -2122,6 +2097,11 @@ def _rollback_file_credential(
         installed = journal.get("prepared_credential_stat")
     restored = journal.get("rollback_file_installed_stat")
     prepared = journal.get("rollback_file_prepared_stat")
+    copy_identity = journal.get("rollback_file_copy_identity")
+    if copy_identity is not None and not _valid_inode_payload(copy_identity):
+        raise ValueError("credential rollback copy ownership is invalid")
+    if prepared is not None and copy_identity is not None:
+        raise ValueError("credential rollback has conflicting copy ownership states")
     quarantine_generation: dict[str, int] | None = None
     if quarantine.exists() or quarantine.is_symlink():
         quarantine_generation = _stat_payload(
@@ -2211,18 +2191,46 @@ def _rollback_file_credential(
 
     if prepared is None:
         if rollback.exists() or rollback.is_symlink():
-            _private_file(rollback, "partial credential rollback temporary")
-            rollback.unlink()
-            _fsync(rollback.parent)
+            partial = _stat_payload(
+                _private_file(rollback, "partial credential rollback temporary")
+            )
+            if not _stat_matches_inode(partial, copy_identity):
+                raise ValueError(
+                    "partial credential rollback temporary has no durable transaction ownership"
+                )
+            unlink_private_file(
+                rollback,
+                label="partial credential rollback temporary",
+                expected_stat=copy_identity,
+            )
+        if copy_identity is not None:
+            journal.pop("rollback_file_copy_identity", None)
+            _write_recovery_journal(journal_path, journal, "rollback-file-copy-reset")
         _write_recovery_journal(journal_path, journal, "rollback-file-copy-running")
         _private_file(backup, "credential recovery backup")
-        _copy_private_file(backup, rollback)
-        journal["rollback_file_prepared_stat"] = _stat_payload(
-            _private_file(rollback, "prepared credential rollback generation")
+
+        def record_copy_identity(metadata: os.stat_result) -> None:
+            journal["rollback_file_copy_identity"] = _inode_payload(metadata)
+            _write_recovery_journal(journal_path, journal, "rollback-file-copy-owned")
+
+        copied = _copy_private_file(
+            backup,
+            rollback,
+            destination_created=record_copy_identity,
         )
+        copied_generation = _stat_payload(copied)
+        if not _stat_matches_inode(
+            copied_generation,
+            journal.get("rollback_file_copy_identity"),
+        ) or not _same_stat(rollback, copied_generation):
+            raise ValueError(
+                "prepared credential rollback generation changed before attribution"
+            )
+        journal["rollback_file_prepared_stat"] = copied_generation
+        journal.pop("rollback_file_copy_identity", None)
         _write_recovery_journal(journal_path, journal, "rollback-file-prepared")
     else:
-        if not _same_stat(rollback, prepared, ctime=False):
+        if not _same_stat(rollback, prepared):
             raise ValueError("prepared credential rollback generation changed")
 
     prepared_generation = _stat_payload(
@@ -2231,7 +2239,7 @@ def _rollback_file_credential(
     if not _stat_matches_generation(
         prepared_generation,
         journal.get("rollback_file_prepared_stat"),
-        ctime=False,
+        ctime=True,
     ):
         raise ValueError("prepared credential rollback generation changed")
     _write_recovery_journal(journal_path, journal, "rollback-file-publish-authorized")
@@ -2370,6 +2378,7 @@ def _clean_exact_temporaries(paths: dict[str, Path], journal: dict[str, Any]) ->
         unlink_private_file(
             credential_quarantine,
             label="quarantined credential generation",
+            expected_stat=journal.get("rollback_file_quarantine_stat"),
         )
     for name in (
         "install_temp",

@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from agent_fleet import recovery
+from agent_fleet import util as util_module
 from agent_fleet.config import load_registry, save_registry
 from agent_fleet.identity import (
     identity_bundle_path,
@@ -1522,15 +1523,26 @@ def test_file_rollback_sigkill_is_restart_idempotent(
         if phase_by_crash.get(rollback_crash) == phase:
             os._exit(94)
 
-    def crash_mid_copy(source: Path, destination: Path):
+    def crash_mid_copy(
+        source: Path,
+        destination: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ):
         if rollback_crash == "mid-copy" and destination == rollback:
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.fchmod(descriptor, 0o600)
+            if destination_created is not None:
+                destination_created(os.fstat(descriptor))
             os.write(descriptor, b"partial")
             os.fsync(descriptor)
             os.close(descriptor)
             os._exit(94)
-        return real_copy(source, destination)
+        return real_copy(
+            source,
+            destination,
+            destination_created=destination_created,
+        )
 
     def crash_after_atomic_move(source: Path, destination: Path) -> None:
         real_rename_noreplace(source, destination)
@@ -1678,7 +1690,12 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
     real_copy = recovery._copy_private_file
     real_replace = recovery.os.replace
 
-    def crash_restore_copy(source: Path, destination: Path):
+    def crash_restore_copy(
+        source: Path,
+        destination: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ):
         if restore_crash == "mid-copy" and destination == restore_temp:
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.fchmod(descriptor, 0o600)
@@ -1686,7 +1703,11 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
             os.fsync(descriptor)
             os.close(descriptor)
             os._exit(95)
-        return real_copy(source, destination)
+        return real_copy(
+            source,
+            destination,
+            destination_created=destination_created,
+        )
 
     def crash_restore_replace(source, destination, *args, **kwargs):
         result = real_replace(source, destination, *args, **kwargs)
@@ -2975,6 +2996,171 @@ def test_file_credential_rollback_preserves_ambiguous_unverified_publish(
     assert quarantine.read_bytes() == forward
     assert not rollback.exists()
     assert journal_path.exists()
+
+
+def test_file_credential_rollback_binds_copy_fd_before_path_attribution(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable = target.home / "auth.json"
+    backup = target.home / ".auth.json.copy-attribution-backup"
+    rollback = target.home / ".auth.json.copy-attribution-rollback"
+    quarantine = target.home / ".auth.json.copy-attribution-quarantine"
+    journal_path = target.home / ".auth.json.copy-attribution-journal"
+    original = b'{"credential":"original-generation"}\n'
+    forward = b'{"credential":"transaction-forward-generation"}\n'
+    foreign = b'{"credential":"foreign-copy-close-generation"}\n'
+
+    atomic_write_bytes(stable, original)
+    journal: dict[str, Any] = {
+        "original_credential_stat": recovery._stat_payload(
+            recovery._private_file(stable, "test original credential")
+        )
+    }
+    atomic_write_bytes(backup, original)
+    atomic_write_bytes(stable, forward)
+    journal["installed_credential_stat"] = recovery._stat_payload(
+        recovery._private_file(stable, "test transaction credential")
+    )
+    atomic_write_json(journal_path, journal)
+
+    real_copy = recovery._copy_private_file
+
+    def replace_after_copy_close(
+        source: Path,
+        destination: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ) -> os.stat_result:
+        copied = real_copy(
+            source,
+            destination,
+            destination_created=destination_created,
+        )
+        if destination == rollback:
+            atomic_write_bytes(rollback, foreign)
+        return copied
+
+    monkeypatch.setattr(recovery, "_copy_private_file", replace_after_copy_close)
+    with pytest.raises(ValueError, match="changed before attribution"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
+            journal_path,
+            journal,
+        )
+
+    assert not stable.exists()
+    assert rollback.read_bytes() == foreign
+    assert quarantine.read_bytes() == forward
+    restarted = json.loads(journal_path.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="no durable transaction ownership"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
+            journal_path,
+            restarted,
+        )
+    assert rollback.read_bytes() == foreign
+    assert quarantine.read_bytes() == forward
+    assert journal_path.exists()
+
+
+def test_quarantine_cleanup_rejects_replacement_after_generation_precheck(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    quarantine = target.home / ".auth.json.cleanup-race-quarantine"
+    expected = b'{"credential":"transaction-forward-generation"}\n'
+    foreign = b'{"credential":"foreign-cleanup-generation"}\n'
+    atomic_write_bytes(quarantine, expected)
+    journal = {
+        "rollback_file_quarantine_stat": recovery._stat_payload(
+            recovery._private_file(quarantine, "test cleanup credential")
+        )
+    }
+    paths = {
+        "credential_quarantine": quarantine,
+        "install_temp": target.home / ".cleanup-race-install",
+        "rollback_temp": target.home / ".cleanup-race-rollback",
+        "bundle_restore_temp": target.home / ".cleanup-race-bundle",
+        "provisional_restore_temp": target.home / ".cleanup-race-provisional",
+        "provisional_guard_restore_temp": target.home / ".cleanup-race-guard",
+    }
+    real_unlink = recovery.unlink_private_file
+
+    def replace_before_attributed_unlink(path: Path, **kwargs: Any) -> bool:
+        atomic_write_bytes(path, foreign)
+        return real_unlink(path, **kwargs)
+
+    monkeypatch.setattr(
+        recovery,
+        "unlink_private_file",
+        replace_before_attributed_unlink,
+    )
+    with pytest.raises(ValueError, match="changed before attributed removal"):
+        recovery._clean_exact_temporaries(paths, journal)
+
+    assert quarantine.read_bytes() == foreign
+    assert not list(target.home.glob(f".{quarantine.name}.delete.*"))
+
+
+def test_attributed_unlink_restoration_never_overwrites_reappearance(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    quarantine = target.home / ".auth.json.cleanup-restore-quarantine"
+    expected = b'{"credential":"transaction-forward-generation"}\n'
+    moved_foreign = b'{"credential":"foreign-moved-generation"}\n'
+    reappeared = b'{"credential":"foreign-reappeared-generation"}\n'
+    atomic_write_bytes(quarantine, expected)
+    expected_stat = recovery._stat_payload(
+        recovery._private_file(quarantine, "test cleanup credential")
+    )
+    real_rename = util_module._rename_noreplace_at
+
+    def substitute_then_reappear(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        if source_name == quarantine.name:
+            atomic_write_bytes(quarantine, moved_foreign)
+        elif destination_name == quarantine.name:
+            atomic_write_bytes(quarantine, reappeared)
+        real_rename(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+
+    monkeypatch.setattr(util_module, "_rename_noreplace_at", substitute_then_reappear)
+    with pytest.raises(ValueError, match="both generations were preserved"):
+        util_module.unlink_private_file(
+            quarantine,
+            label="test cleanup credential",
+            expected_stat=expected_stat,
+        )
+
+    preserved = list(target.home.glob(f".{quarantine.name}.delete.*"))
+    assert quarantine.read_bytes() == reappeared
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == moved_foreign
 
 
 def _prepare_claude_origin(

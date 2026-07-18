@@ -10,9 +10,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-import agent_fleet.scheduler as scheduler_module
 import pytest
 
+import agent_fleet.scheduler as scheduler_module
 from agent_fleet.config import load_registry, save_registry
 from agent_fleet.cooldowns import set_cooldown
 from agent_fleet.leases import active_leases, release_lease

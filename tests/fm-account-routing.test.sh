@@ -655,7 +655,7 @@ test_observe_is_dry_run_only() {
   out=$(FM_ACCOUNT_ROUTING=observe run_spawn "$id" "$PROJ_DIR")
   status=$?
   expect_code 0 "$status" "observe spawn should preserve legacy launch"
-  assert_regex 'choose --pool claude-crew --task fm-[0-9a-f]+-account-observe-z2-a[0-9a-f]+ --provider claude --dry-run' "$AF_LOG" "observe did not use a namespaced dry-run choice"
+  assert_regex "choose --pool claude-crew --task fm-[0-9a-f]+-account-observe-z2-a[0-9a-f]+ --provider claude --workspace $WT_DIR --dry-run" "$AF_LOG" "observe did not use the task worktree for its namespaced dry-run choice"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "observe created a lease"
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" ' claude --dangerously-skip-permissions ' "observe changed the provider command"
@@ -677,7 +677,7 @@ test_enforce_pool_wraps_backend_and_records_real_session() {
   account_attempt=$(sed -n 's/^account_attempt=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   assert_grep "lease choose --pool claude-crew --task $account_task --provider claude" "$AF_LOG" "enforce did not atomically choose a namespaced lease"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "'$FAKEBIN_DIR/agent-fleet' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' -- --dangerously-skip-permissions" "enforce did not build the backend-neutral Agent Fleet wrapper"
+  assert_contains "$launch" "'$FAKEBIN_DIR/agent-fleet' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' --workspace '$WT_DIR' -- --dangerously-skip-permissions" "enforce did not build the task-worktree-bound Agent Fleet wrapper"
   meta="$HOME_DIR/state/$id.meta"
   grep -q '^account_pool=' "$meta" || fail "meta missing account pool; contents: $(tr '\n' '|' < "$meta")"
   assert_grep 'account_pool=claude-crew' "$meta" "meta missing account pool"
@@ -780,7 +780,7 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   assert_grep "lease recover --task $account_task" "$AF_LOG" "resume used new-task selection instead of sticky recovery reservation"
   assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "resume ran the new-task quota path"
   launch=$(cat "$LAUNCH_LOG" "$NATIVE_LAUNCH_LOG")
-  assert_contains "$launch" "--format json resume --task '$account_task' -- \"\$@\"" "resume did not use Agent Fleet's fail-closed task mapping"
+  assert_contains "$launch" "--format json resume --task '$account_task' --workspace '$WT_DIR' -- \"\$@\"" "resume did not use Agent Fleet's fail-closed task and worktree mapping"
   assert_contains "$launch" "account-native-launch' --dangerously-skip-permissions" "resume did not pass provider arguments through its launch gate"
   assert_not_contains "$launch" 'cat ' "resume started a fresh prompted conversation"
   [ "$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)" = "$before_session" ] || fail "resume changed provider session identity"
@@ -4605,7 +4605,7 @@ test_lease_signal_handoff_publishes_cleanup_ownership() {
       printf "%s\n" "{\"task\":\"task-signal\",\"pool\":\"pool-signal\",\"profile\":\"profile-signal\",\"provider\":\"claude\"}"
     }
     trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
-    fm_account_select enforce claude pool-signal "" task-signal
+    fm_account_select enforce claude pool-signal "" task-signal "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh"
   status=$?
   set -e
@@ -4630,7 +4630,7 @@ test_recovery_signal_handoff_publishes_cleanup_ownership() {
       printf "%s\n" "{\"task\":\"task-recover\",\"pool\":\"pool-recover\",\"profile\":\"profile-recover\",\"provider\":\"claude\"}"
     }
     trap '\''printf "%s\n" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"'\'' EXIT
-    fm_account_recover task-recover profile-recover pool-recover claude
+    fm_account_recover task-recover profile-recover pool-recover claude "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh"
   status=$?
   set -e
@@ -4643,7 +4643,7 @@ test_recovery_signal_handoff_publishes_cleanup_ownership() {
     fm_account_fleet_bin() { printf "%s\n" fake-agent-fleet; }
     fm_account_validate_contract() { return 0; }
     fm_account_run_control() { printf "%s\n" "not-json"; }
-    if fm_account_recover task-recover profile-recover pool-recover claude; then rc=0; else rc=$?; fi
+    if fm_account_recover task-recover profile-recover pool-recover claude "${FM_TEST_LEASE_HANDOFF_OBSERVED%/*}"; then rc=0; else rc=$?; fi
     printf "%s:%s\n" "$rc" "${FM_ACCOUNT_MUTATION_ACQUIRED:-unset}" > "$FM_TEST_LEASE_HANDOFF_OBSERVED"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh"
   assert_regex '^2:1$' "$invalid" \
@@ -5047,6 +5047,15 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = errexit-preserve ]; then
   run_isolated_test test_release_helpers_preserve_caller_errexit_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = gate-e-workspace ]; then
+  run_isolated_test test_observe_is_dry_run_only
+  run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
+  run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+  run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
+  run_isolated_test test_recovery_signal_handoff_publishes_cleanup_ownership
   exit 0
 fi
 

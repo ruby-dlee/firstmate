@@ -16,7 +16,13 @@ from .models import (
     Registry,
     Settings,
 )
-from .paths import default_config_path, default_share_dir, default_state_dir, expand_path
+from .paths import (
+    default_config_path,
+    default_share_dir,
+    default_state_dir,
+    expand_lexical_path,
+    expand_path,
+)
 from .util import validate_id
 
 
@@ -196,7 +202,7 @@ def load_registry(path: Path | None = None) -> Registry:
                 if isinstance(desktop_identity_file_raw, str) and desktop_identity_file_raw
                 else None
             ),
-            tuple(expand_path(entry) for entry in trusted_projects_raw),
+            tuple(expand_lexical_path(entry) for entry in trusted_projects_raw),
         )
 
     profiles_raw = raw.get("profiles", {})

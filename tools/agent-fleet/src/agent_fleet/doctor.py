@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .models import Registry
-from .projects import canonical_git_project
+from .projects import registered_trusted_projects
 from .providers import auth_status
 from .provision import (
     profile_hook_health,
     profile_is_provisioned,
-    profile_launch_ready,
+    profile_selection_ready,
     profile_shared_assets_healthy,
 )
 from .quota import has_remote_identity_proof, read_quota
@@ -40,6 +40,7 @@ def run_doctor(
     config_path: Path,
     *,
     workspace: Path | None = None,
+    project: Path | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
@@ -68,8 +69,7 @@ def run_doctor(
         projects_ready = bool(config.trusted_projects)
         if projects_ready:
             try:
-                for project in config.trusted_projects:
-                    canonical_git_project(project)
+                registered_trusted_projects(registry, provider)
             except ValueError:
                 projects_ready = False
         add(
@@ -101,6 +101,7 @@ def run_doctor(
             f"profile:{profile.id}:remote-identity-proof",
             remote_verified,
             "fresh" if remote_verified else str(quota.get("reason") or quota.get("status")),
+            required=profile.enabled and profile.safety_policy == "worker",
         )
         if provisioned:
             home_mode = _mode(profile.home)
@@ -130,20 +131,22 @@ def run_doctor(
             required.issubset(claude_events),
             f"{workspace}: events={','.join(sorted(claude_events)) or 'none'}",
         )
-        codex_project_hooks = workspace / ".codex" / "hooks.json"
+        codex_events = _workspace_hook_events(workspace / ".codex" / "hooks.json")
         add(
-            "workspace:codex:project-hooks-absent",
-            not (codex_project_hooks.exists() or codex_project_hooks.is_symlink()),
-            str(codex_project_hooks),
+            "workspace:codex:supervision-hooks",
+            required.issubset(codex_events),
+            f"{workspace}: events={','.join(sorted(codex_events)) or 'none'}",
         )
+    if project is not None:
         for profile in sorted(registry.profiles.values(), key=lambda item: item.id):
-            ready = profile_is_provisioned(profile) and profile_launch_ready(
-                registry, profile, workspace
+            ready = profile_is_provisioned(profile) and profile_selection_ready(
+                registry, profile, project
             )
             add(
-                f"workspace:{profile.id}:provider-bootstrap",
+                f"project:{profile.id}:provider-bootstrap",
                 ready,
                 "ready" if ready else "project, onboarding, or hook readiness failed",
+                required=profile.enabled and profile.safety_policy == "worker",
             )
     required_failures = [check for check in checks if check["required"] and not check["ok"]]
     return {
@@ -151,5 +154,6 @@ def run_doctor(
         "profiles": len(registry.profiles),
         "enabled_profiles": sum(profile.enabled for profile in registry.profiles.values()),
         "workspace": str(workspace) if workspace else None,
+        "project": str(project) if project else None,
         "checks": checks,
     }

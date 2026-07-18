@@ -280,57 +280,50 @@ def _load_raw_quota(
     timeout: int = 30,
     allow_keychain_prompt: bool = False,
 ) -> dict[str, Any]:
-    fixture_dir = os.environ.get("AGENT_FLEET_QUOTA_FIXTURE_DIR")
-    if fixture_dir:
-        fixture = Path(fixture_dir) / f"{profile.id}.json"
-        try:
-            raw = json.loads(fixture.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise ValueError(f"quota fixture not found: {fixture}") from exc
-    else:
-        binary = registry.settings.quota_binary
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise ValueError(f"configured quota-axi candidate is not executable: {binary}")
-        cache = profile.home / ".agent-fleet-quota-cache"
-        ensure_private_dir(cache)
-        env = provider_environment(profile)
-        env["XDG_CACHE_HOME"] = str(cache)
-        if profile.provider == "codex":
-            env["QUOTA_AXI_CODEX_BINARY"] = str(registry.require_provider("codex").binary)
-        try:
-            argv = [str(binary), "--provider", profile.provider, "--json", "--full"]
-            if allow_keychain_prompt and profile.provider == "claude":
-                argv.append("--allow-keychain-prompt")
-            result = subprocess.run(
-                argv,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ValueError(f"quota refresh timed out for {profile.id}") from exc
-        try:
-            raw = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            if result.returncode != 0:
-                detail = result.stderr.strip().splitlines()[-1:] or ["unknown error"]
-                raise ValueError(f"quota refresh failed for {profile.id}: {detail[0]}") from exc
-            raise ValueError(f"quota-axi emitted invalid JSON for {profile.id}") from exc
+    binary = registry.settings.quota_binary
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError(f"configured quota-axi candidate is not executable: {binary}")
+    cache = profile.home / ".agent-fleet-quota-cache"
+    ensure_private_dir(cache)
+    env = provider_environment(profile)
+    env.pop("AGENT_FLEET_QUOTA_FIXTURE_DIR", None)
+    env.pop("AGENT_FLEET_TEST_QUOTA_FIXTURE_DIR", None)
+    env["XDG_CACHE_HOME"] = str(cache)
+    if profile.provider == "codex":
+        env["QUOTA_AXI_CODEX_BINARY"] = str(registry.require_provider("codex").binary)
+    try:
+        argv = [str(binary), "--provider", profile.provider, "--json", "--full"]
+        if allow_keychain_prompt and profile.provider == "claude":
+            argv.append("--allow-keychain-prompt")
+        result = subprocess.run(
+            argv,
+            env=env,
+            cwd=profile.home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"quota refresh timed out for {profile.id}") from exc
+    try:
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
         if result.returncode != 0:
-            providers = raw.get("providers") if isinstance(raw, dict) else None
-            fresh = isinstance(providers, list) and any(
-                isinstance(item, dict)
-                and item.get("provider") == profile.provider
-                and isinstance(item.get("state"), dict)
-                and item["state"].get("status") == "fresh"
-                for item in providers
-            )
-            if fresh:
-                raise ValueError(
-                    f"quota-axi exited nonzero with untrusted fresh data for {profile.id}"
-                )
+            detail = result.stderr.strip().splitlines()[-1:] or ["unknown error"]
+            raise ValueError(f"quota refresh failed for {profile.id}: {detail[0]}") from exc
+        raise ValueError(f"quota-axi emitted invalid JSON for {profile.id}") from exc
+    if result.returncode != 0:
+        providers = raw.get("providers") if isinstance(raw, dict) else None
+        fresh = isinstance(providers, list) and any(
+            isinstance(item, dict)
+            and item.get("provider") == profile.provider
+            and isinstance(item.get("state"), dict)
+            and item["state"].get("status") == "fresh"
+            for item in providers
+        )
+        if fresh:
+            raise ValueError(f"quota-axi exited nonzero with untrusted fresh data for {profile.id}")
     if not isinstance(raw, dict):
         raise ValueError(f"quota response for {profile.id} must be an object")
     return raw

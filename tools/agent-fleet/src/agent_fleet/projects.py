@@ -20,20 +20,6 @@ def lexical_path(path: Path) -> Path:
     return Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(path)))))
 
 
-def invocation_workspace() -> Path:
-    current = Path.cwd()
-    raw = os.environ.get("PWD")
-    if not raw:
-        return current
-    candidate = Path(raw)
-    try:
-        if candidate.resolve() == current.resolve():
-            return candidate
-    except OSError:
-        pass
-    return current
-
-
 def _owned_directory(path: Path, label: str) -> None:
     try:
         current = path.lstat()
@@ -83,20 +69,64 @@ def canonical_git_project(path: Path) -> tuple[Path, Path]:
 
 def register_trusted_project(path: Path) -> Path:
     root, _ = canonical_git_project(path)
+    if lexical_path(path) != root:
+        raise ValueError(f"trusted project must name its canonical Git worktree root: {root}")
     return root
+
+
+def registered_trusted_projects(registry: Registry, provider: str) -> tuple[TrustedProject, ...]:
+    projects: list[TrustedProject] = []
+    for configured_path in registry.require_provider(provider).trusted_projects:
+        canonical_root, common_dir = canonical_git_project(configured_path)
+        if lexical_path(configured_path) != canonical_root:
+            raise ValueError(
+                f"configured trusted project must name its canonical Git worktree root: "
+                f"{configured_path}"
+            )
+        projects.append(TrustedProject(canonical_root, canonical_root, common_dir))
+    return tuple(projects)
+
+
+def remove_trusted_project(
+    registry: Registry,
+    provider: str,
+    path: Path,
+) -> tuple[Path, ...]:
+    configured = registry.require_provider(provider).trusted_projects
+    target = lexical_path(path)
+    exact = {entry for entry in configured if lexical_path(entry) == target}
+    common_dir: Path | None = None
+    try:
+        _, common_dir = canonical_git_project(target)
+    except ValueError:
+        if not exact:
+            raise
+    retained: list[Path] = []
+    for entry in configured:
+        if entry in exact:
+            continue
+        if common_dir is not None:
+            try:
+                _, entry_common_dir = canonical_git_project(entry)
+            except ValueError:
+                retained.append(entry)
+                continue
+            if entry_common_dir == common_dir:
+                continue
+        retained.append(entry)
+    if len(retained) == len(configured):
+        raise ValueError(f"trusted project is not registered for {provider}: {target}")
+    return tuple(sorted(retained, key=str))
 
 
 def resolve_trusted_project(registry: Registry, provider: str, workspace: Path) -> TrustedProject:
     active_root, active_common_dir = canonical_git_project(workspace)
-    configured = registry.require_provider(provider).trusted_projects
+    if lexical_path(workspace) != active_root:
+        raise ValueError(f"workspace must name its Git worktree root: {active_root}")
     matches: list[Path] = []
-    for configured_path in configured:
-        try:
-            canonical_root, common_dir = canonical_git_project(configured_path)
-        except ValueError:
-            continue
-        if common_dir == active_common_dir:
-            matches.append(canonical_root)
+    for project in registered_trusted_projects(registry, provider):
+        if project.common_dir == active_common_dir:
+            matches.append(project.canonical_root)
     if not matches:
         raise ValueError(
             f"workspace is not registered for {provider}: {active_root}; "

@@ -48,6 +48,13 @@ import sys
 from datetime import UTC, datetime
 provider = sys.argv[sys.argv.index("--provider") + 1]
 profile = os.environ["AGENT_FLEET_PROFILE"]
+fixture_control = os.path.join(os.path.dirname(__file__), "quota-fixture-dir")
+if os.path.exists(fixture_control):
+    with open(fixture_control, encoding="utf-8") as handle:
+        fixture_dir = handle.read().strip()
+    with open(os.path.join(fixture_dir, profile + ".json"), encoding="utf-8") as handle:
+        print(handle.read())
+    raise SystemExit
 print(json.dumps({
     "providers": [{
         "provider": provider,

@@ -46,7 +46,11 @@ from .locks import provider_enrollment_lock, state_lock
 from .models import PROFILE_SAFETY_POLICIES, SUPPORTED_PROVIDERS, Profile, Registry
 from .output import emit, preflight
 from .paths import default_config_path, expand_path
-from .projects import invocation_workspace, lexical_path, register_trusted_project
+from .projects import (
+    lexical_path,
+    register_trusted_project,
+    remove_trusted_project,
+)
 from .providers import (
     auth_probe,
     auth_status,
@@ -175,10 +179,12 @@ def _parser() -> argparse.ArgumentParser:
     _add_route_arguments(lease_choose)
     recover = lease_commands.add_parser("recover")
     recover.add_argument("--task", required=True)
+    recover.add_argument("--workspace", type=Path, required=True)
     acquire = lease_commands.add_parser("acquire")
     acquire.add_argument("--profile", required=True)
     acquire.add_argument("--task", required=True)
     acquire.add_argument("--pool")
+    acquire.add_argument("--workspace", type=Path, required=True)
     lease_commands.add_parser("list")
     release = lease_commands.add_parser("release")
     release.add_argument("--task", required=True)
@@ -193,6 +199,7 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--profile")
     resume.add_argument("--session")
     resume.add_argument("--pool")
+    resume.add_argument("--workspace", type=Path)
     resume.add_argument("provider_args", nargs=argparse.REMAINDER)
 
     session = commands.add_parser("session")
@@ -207,6 +214,7 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--workspace", type=Path)
+    doctor.add_argument("--project", type=Path)
     commands.add_parser("status")
     commands.add_parser("contract")
     commands.add_parser("version")
@@ -224,6 +232,7 @@ def _add_route_arguments(
     parser.add_argument("--pool", required=required)
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS)
     parser.add_argument("--profile")
+    parser.add_argument("--workspace", type=Path, required=required)
 
 
 def _task(value: str) -> str:
@@ -234,6 +243,35 @@ def _task(value: str) -> str:
 
 def _strip_separator(values: list[str]) -> list[str]:
     return values[1:] if values[:1] == ["--"] else values
+
+
+def _validate_candidate_arguments(
+    registry: Registry,
+    arguments: list[str],
+    *,
+    pool: str,
+    provider: str | None,
+    profile_id: str | None,
+) -> None:
+    if profile_id is not None:
+        candidates = [registry.require_profile(profile_id)]
+    else:
+        candidates = [
+            profile
+            for profile in registry.profiles.values()
+            if profile.enabled
+            and profile.safety_policy == "worker"
+            and pool in profile.pools
+            and (provider is None or profile.provider == provider)
+        ]
+    checked: set[str] = set()
+    for profile in candidates:
+        if provider is not None and profile.provider != provider:
+            continue
+        if profile.provider in checked:
+            continue
+        validate_worker_arguments(profile, arguments)
+        checked.add(profile.provider)
 
 
 def _mutate(registry: Registry, operation: Callable[[Registry], Registry], path: Path) -> Registry:
@@ -310,13 +348,17 @@ def _contract() -> dict[str, Any]:
         ],
         "commands": {
             "pool_summary": "pool status --pool <pool> [--provider <provider>]",
-            "dry_run": "choose --pool <pool> --task <task> --dry-run",
-            "atomic_choose": "lease choose --pool <pool> --task <task>",
-            "explicit_acquire": "lease acquire --profile <profile> --task <task>",
-            "recover": "lease recover --task <task>",
+            "dry_run": "choose --pool <pool> --task <task> --workspace <path> --dry-run",
+            "atomic_choose": "lease choose --pool <pool> --task <task> --workspace <path>",
+            "explicit_acquire": (
+                "lease acquire --profile <profile> --task <task> --workspace <path>"
+            ),
+            "recover": "lease recover --task <task> --workspace <path>",
             "release": "lease release --task <task>",
-            "exec": "exec --profile <profile> [--task <task> --pool <pool>] -- <argv>",
-            "resume_task": "resume --task <task> -- <argv>",
+            "exec": (
+                "exec --profile <profile> --task <task> --pool <pool> --workspace <path> -- <argv>"
+            ),
+            "resume_task": "resume --task <task> --workspace <path> -- <argv>",
             "resume_explicit": "managed task/session mapping required",
             "session_status": "session status --task <task>",
             "session_remove": "session remove --task <task>",
@@ -488,6 +530,7 @@ def _enroll_codex_profile(
         completed = subprocess.run(
             argv,
             env=provider_environment(stage),
+            cwd=stage.home,
             check=False,
         )
         if completed.returncode != 0:
@@ -635,6 +678,7 @@ def _run_profile_enrollment(
                 completed = subprocess.run(
                     login_argv(registry, profile),
                     env=provider_environment(profile),
+                    cwd=profile.home,
                     check=False,
                 )
                 if completed.returncode != 0:
@@ -724,7 +768,6 @@ def _run(args: argparse.Namespace) -> Any | None:
                     for provider in providers
                 ]
             }
-        project_root = register_trusted_project(args.path)
         with _provider_maintenance(registry, config_path, {args.provider}) as current:
             if _provider_has_active_lease(current, args.provider):
                 raise ValueError(
@@ -733,9 +776,9 @@ def _run(args: argparse.Namespace) -> Any | None:
             provider = current.require_provider(args.provider)
             projects = set(provider.trusted_projects)
             if args.project_command == "register":
-                projects.add(project_root)
+                projects.add(register_trusted_project(args.path))
             else:
-                projects.discard(project_root)
+                projects = set(remove_trusted_project(current, args.provider, args.path))
             updated = _mutate(
                 current,
                 lambda item: with_provider(
@@ -955,6 +998,8 @@ def _run(args: argparse.Namespace) -> Any | None:
             provider=args.provider,
             profile_id=args.profile,
             dry_run=True,
+            workspace=lexical_path(args.workspace),
+            config_path=config_path,
         )
 
     if args.command == "quota":
@@ -994,9 +1039,12 @@ def _run(args: argparse.Namespace) -> Any | None:
                 pool=pool,
                 profile_id=args.profile,
                 explicit_profile=True,
+                workspace=lexical_path(args.workspace),
+                config_path=config_path,
             )
         if args.lease_command == "recover":
             task = _task(args.task)
+            workspace = lexical_path(args.workspace)
             mapping = get_session(registry, task)
             profile = registry.require_profile(str(mapping.get("profile")))
             if mapping.get("provider") != profile.provider:
@@ -1004,6 +1052,12 @@ def _run(args: argparse.Namespace) -> Any | None:
             pool = mapping.get("pool")
             if not isinstance(pool, str) or not pool:
                 raise ValueError("session mapping has no pool")
+            mapped_workspace = mapping.get("workspace")
+            if (
+                mapped_workspace is not None
+                and lexical_path(Path(str(mapped_workspace))) != workspace
+            ):
+                raise ValueError("session mapping workspace does not match recovery workspace")
             return select_and_acquire(
                 registry,
                 task=task,
@@ -1013,6 +1067,8 @@ def _run(args: argparse.Namespace) -> Any | None:
                 explicit_profile=True,
                 ignore_reserve=True,
                 recovery_reservation=True,
+                workspace=workspace,
+                config_path=config_path,
             )
         task = _task(args.task)
         return select_and_acquire(
@@ -1021,61 +1077,64 @@ def _run(args: argparse.Namespace) -> Any | None:
             pool=validate_id(args.pool, "pool id"),
             provider=args.provider,
             profile_id=args.profile,
+            workspace=lexical_path(args.workspace),
+            config_path=config_path,
         )
 
     if args.command == "exec":
         provider_args = _strip_separator(args.provider_args)
-        if args.profile:
-            validate_worker_arguments(registry.require_profile(args.profile), provider_args)
-        elif args.provider:
-            for profile in registry.profiles.values():
-                if profile.provider == args.provider:
-                    validate_worker_arguments(profile, provider_args)
-                    break
-        else:
-            for provider in SUPPORTED_PROVIDERS:
-                candidate = next(
-                    (
-                        profile
-                        for profile in registry.profiles.values()
-                        if profile.provider == provider
-                    ),
-                    None,
-                )
-                if candidate is not None:
-                    validate_worker_arguments(candidate, provider_args)
         task = _task(args.task) if args.task else None
         if task is None:
             raise ValueError("worker exec requires --task so its provider lease is tracked")
+        if args.workspace is None:
+            raise ValueError("worker exec requires the task --workspace")
+        workspace = lexical_path(args.workspace)
         pool = args.pool or ("explicit" if args.profile else None)
         if pool is None:
             raise ValueError("exec with --task requires --pool or --profile")
+        pool = validate_id(pool, "pool id")
+        _validate_candidate_arguments(
+            registry,
+            provider_args,
+            pool=pool,
+            provider=args.provider,
+            profile_id=args.profile,
+        )
         selected = select_and_acquire(
             registry,
             task=task,
-            pool=validate_id(pool, "pool id"),
+            pool=pool,
             provider=args.provider,
             profile_id=args.profile,
             bind_pid=os.getpid(),
             explicit_profile=pool == "explicit",
+            workspace=workspace,
+            config_path=config_path,
         )
         profile = registry.require_profile(str(selected["profile"]))
         validate_worker_arguments(profile, provider_args)
-        project = prepare_profile_launch(registry, profile, invocation_workspace())
+        project = prepare_profile_launch(registry, profile, workspace)
         argv = managed_argv(registry, profile, project.active_root, provider_args)
-        os.execvpe(argv[0], argv, provider_environment(profile, task))
+        os.chdir(project.active_root)
+        os.execvpe(argv[0], argv, provider_environment(profile, task, workspace))
 
     if args.command == "resume":
         provider_args = _strip_separator(args.provider_args)
         task = _task(args.task) if args.task else None
         if task is None:
             raise ValueError("worker resume requires --task so its provider lease is tracked")
+        if args.workspace is None:
+            raise ValueError("worker resume requires the task --workspace")
+        workspace = lexical_path(args.workspace)
         mapping = get_session(registry, task)
         profile = registry.require_profile(str(mapping.get("profile")))
         validate_worker_arguments(profile, provider_args)
         if args.profile and args.profile != profile.id:
             raise ValueError("explicit profile does not match task session mapping")
         session_id = mapping.get("session_id")
+        mapped_workspace = mapping.get("workspace")
+        if mapped_workspace is not None and lexical_path(Path(str(mapped_workspace))) != workspace:
+            raise ValueError("session mapping workspace does not match resume workspace")
         if args.session and args.session != session_id:
             raise ValueError("explicit session does not match task session mapping")
         pool = args.pool or str(mapping.get("pool"))
@@ -1092,17 +1151,19 @@ def _run(args: argparse.Namespace) -> Any | None:
             bind_pid=os.getpid(),
             explicit_profile=True,
             ignore_reserve=True,
+            workspace=workspace,
+            config_path=config_path,
         )
+        project = prepare_profile_launch(registry, profile, workspace)
         argv = resume_argv(
             registry,
             profile,
             session_id,
             provider_args,
-            active_root=prepare_profile_launch(
-                registry, profile, invocation_workspace()
-            ).active_root,
+            active_root=project.active_root,
         )
-        os.execvpe(argv[0], argv, provider_environment(profile, task))
+        os.chdir(project.active_root)
+        os.execvpe(argv[0], argv, provider_environment(profile, task, workspace))
 
     if args.command == "session":
         task = _task(args.task)
@@ -1122,6 +1183,7 @@ def _run(args: argparse.Namespace) -> Any | None:
             registry,
             config_path,
             workspace=lexical_path(args.workspace) if args.workspace else None,
+            project=lexical_path(args.project) if args.project else None,
         )
     if args.command == "status":
         with _provider_maintenance(

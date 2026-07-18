@@ -8,6 +8,10 @@ def expand_path(value: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
 
 
+def expand_lexical_path(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(value)))))
+
+
 def default_config_path() -> Path:
     override = os.environ.get("AGENT_FLEET_CONFIG")
     if override:

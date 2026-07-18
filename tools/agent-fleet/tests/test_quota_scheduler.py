@@ -5,10 +5,12 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import agent_fleet.scheduler as scheduler_module
 import pytest
 
 from agent_fleet.config import load_registry, save_registry
@@ -68,6 +70,12 @@ def _quota_fixture(path: Path, provider: str, remaining: int) -> None:
         write(base, f"{provider}-base-anchor-account")
 
 
+def _use_quota_fixtures(registry, fixtures: Path) -> None:
+    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
+
+
 def test_fresh_quota_selects_best_safe_profile(
     fleet: tuple[object, Path], monkeypatch, tmp_path: Path
 ) -> None:
@@ -77,11 +85,17 @@ def test_fresh_quota_selects_best_safe_profile(
     fixtures.mkdir()
     _quota_fixture(fixtures / "codex-1.json", "codex", 82)
     _quota_fixture(fixtures / "codex-2.json", "codex", 37)
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
     for profile_id in ("codex-1", "codex-2"):
         refresh_quota(registry, registry.require_profile(profile_id))
 
-    selected = select_and_acquire(registry, task="quota-task", pool="codex-crew", provider="codex")
+    selected = select_and_acquire(
+        registry,
+        task="quota-task",
+        pool="codex-crew",
+        provider="codex",
+        workspace=Path.cwd(),
+    )
     assert selected["lease"]["profile"] == "codex-1"
     assert selected["decision_reason"] == "quota"
 
@@ -99,12 +113,16 @@ def test_fresh_profile_below_reserve_is_excluded(
     fixtures.mkdir()
     _quota_fixture(fixtures / "claude-1.json", "claude", 80)
     _quota_fixture(fixtures / "claude-2.json", "claude", 40)
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
     for profile_id in ("claude-1", "claude-2"):
         refresh_quota(registry, registry.require_profile(profile_id))
 
     selected = select_and_acquire(
-        registry, task="reserve-task", pool="claude-crew", provider="claude"
+        registry,
+        task="reserve-task",
+        pool="claude-crew",
+        provider="claude",
+        workspace=Path.cwd(),
     )
     assert selected["lease"]["profile"] == "claude-2"
 
@@ -117,7 +135,7 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
     fixtures = tmp_path / "quota"
     fixtures.mkdir()
     _quota_fixture(fixtures / "codex-1.json", "codex", 5)
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
     refresh_quota(registry, registry.require_profile("codex-1"))
 
     with pytest.raises(ValueError, match="quota reserve"):
@@ -127,6 +145,7 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
             pool="codex-crew",
             provider="codex",
             profile_id="codex-1",
+            workspace=Path.cwd(),
         )
 
     atomic_write_json(
@@ -156,6 +175,8 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
             "recover",
             "--task",
             "resumed-task",
+            "--workspace",
+            str(Path.cwd()),
         ],
         cwd=Path.cwd(),
         env=env,
@@ -174,6 +195,7 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
         pool="codex-crew",
         profile_id="codex-1",
         bind_pid=os.getpid(),
+        workspace=Path.cwd(),
     )
     with pytest.raises(ValueError, match="live worker lease"):
         select_and_acquire(
@@ -183,6 +205,7 @@ def test_sticky_resume_can_reacquire_its_profile_below_reserve(
             profile_id="codex-1",
             ignore_reserve=True,
             recovery_reservation=True,
+            workspace=Path.cwd(),
         )
 
 
@@ -196,6 +219,7 @@ def test_reserved_lease_can_be_released_without_force(
         task="failed-pane-create",
         pool="claude-crew",
         profile_id="claude-1",
+        workspace=Path.cwd(),
     )
     assert selected["lease"]["state"] == "reserved"
 
@@ -215,11 +239,40 @@ def test_dry_run_does_not_lease_or_change_selection(
         pool="claude-crew",
         provider="claude",
         dry_run=True,
+        workspace=Path.cwd(),
     )
     assert selected["dry_run"] is True
     assert selected["lease"] is None
     assert active_leases(registry) == []
     assert not (registry.settings.state_dir / "selection.json").exists()
+
+
+def test_dry_run_is_a_read_only_snapshot(fleet: tuple[object, Path]) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["claude-1"])
+
+    def snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
+        return {
+            str(path.relative_to(root)): (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot(registry.settings.state_dir) | {
+        f"profile/{key}": value for key, value in snapshot(registry.settings.share_dir).items()
+    }
+    select_and_acquire(
+        registry,
+        task="read-only-dry-run",
+        pool="claude-crew",
+        provider="claude",
+        dry_run=True,
+        workspace=Path.cwd(),
+    )
+    after = snapshot(registry.settings.state_dir) | {
+        f"profile/{key}": value for key, value in snapshot(registry.settings.share_dir).items()
+    }
+    assert after == before
 
 
 def test_cooldown_excludes_profile(fleet: tuple[object, Path]) -> None:
@@ -231,6 +284,7 @@ def test_cooldown_excludes_profile(fleet: tuple[object, Path]) -> None:
         task="cooldown-task",
         pool="codex-crew",
         provider="codex",
+        workspace=Path.cwd(),
     )
     assert selected["profile"] == "codex-2"
 
@@ -300,7 +354,7 @@ def test_stale_cache_after_remote_auth_failure_is_never_selected(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
 
     quota = refresh_quota(registry, registry.require_profile("codex-1"))
 
@@ -313,6 +367,7 @@ def test_stale_cache_after_remote_auth_failure_is_never_selected(
             task="revoked-cache",
             pool="codex-crew",
             profile_id="codex-1",
+            workspace=Path.cwd(),
         )
     assert active_leases(registry) == []
 
@@ -325,7 +380,7 @@ def test_verified_stale_fallback_has_a_bounded_grace(
     fixtures = tmp_path / "quota"
     fixtures.mkdir()
     _quota_fixture(fixtures / "claude-1.json", "claude", 70)
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
     refresh_quota(registry, registry.require_profile("claude-1"))
     cached = json.loads(quota_path(registry, "claude-1").read_text(encoding="utf-8"))
     cached["status"] = "stale"
@@ -338,6 +393,7 @@ def test_verified_stale_fallback_has_a_bounded_grace(
         pool="claude-crew",
         profile_id="claude-1",
         dry_run=True,
+        workspace=Path.cwd(),
     )
     assert selected["decision_reason"] == "verified-fallback"
 
@@ -350,6 +406,7 @@ def test_verified_stale_fallback_has_a_bounded_grace(
             pool="claude-crew",
             profile_id="claude-1",
             dry_run=True,
+            workspace=Path.cwd(),
         )
 
 
@@ -385,7 +442,7 @@ def test_duplicate_remote_identity_is_fail_closed(
             ),
             encoding="utf-8",
         )
-    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+    _use_quota_fixtures(registry, fixtures)
     for profile_id in ("codex-1", "codex-2"):
         refresh_quota(registry, registry.require_profile(profile_id))
 
@@ -395,6 +452,7 @@ def test_duplicate_remote_identity_is_fail_closed(
             task="duplicate-account",
             pool="codex-crew",
             provider="codex",
+            workspace=Path.cwd(),
         )
 
 
@@ -447,6 +505,83 @@ print(json.dumps({
     assert "--allow-keychain-prompt" in json.loads(argv_log.read_text(encoding="utf-8"))
 
 
+def test_production_quota_probe_ignores_legacy_fixture_environment(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    fixtures = tmp_path / "untrusted-fixtures"
+    fixtures.mkdir()
+    (fixtures / "codex-1.json").write_text(
+        json.dumps({"schema": 1, "profile": "codex-1", "status": "fresh"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", str(fixtures))
+
+    quota = refresh_quota(registry, registry.require_profile("codex-1"))
+
+    assert quota["headroom_percent"] == 80
+    assert quota["identity_fingerprint"] is not None
+
+
+@pytest.mark.parametrize("mutation", ["disable", "remove", "revoke-project"])
+def test_registry_change_during_selection_cannot_commit_a_stale_lease(
+    fleet: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, ["codex-1"])
+    entered = threading.Event()
+    proceed = threading.Event()
+    original_auth_status = scheduler_module.auth_status
+
+    def blocked_auth_status(current_registry, profile):
+        entered.set()
+        assert proceed.wait(timeout=10)
+        return original_auth_status(current_registry, profile)
+
+    monkeypatch.setattr(scheduler_module, "auth_status", blocked_auth_status)
+    outcome: dict[str, object] = {}
+
+    def select() -> None:
+        try:
+            outcome["result"] = select_and_acquire(
+                registry,
+                task=f"raced-{mutation}",
+                pool="codex-crew",
+                profile_id="codex-1",
+                workspace=Path.cwd(),
+                config_path=config,
+            )
+        except ValueError as exc:
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=select)
+    worker.start()
+    assert entered.wait(timeout=10)
+    changed = load_registry(config)
+    if mutation == "disable":
+        profiles = dict(changed.profiles)
+        profiles["codex-1"] = replace(profiles["codex-1"], enabled=False)
+        changed = replace(changed, profiles=profiles)
+    elif mutation == "remove":
+        profiles = dict(changed.profiles)
+        del profiles["codex-1"]
+        changed = replace(changed, profiles=profiles)
+    else:
+        providers = dict(changed.providers)
+        providers["codex"] = replace(providers["codex"], trusted_projects=())
+        changed = replace(changed, providers=providers)
+    save_registry(changed, config)
+    proceed.set()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert outcome == {"error": "registry changed during selection; retry the lease request"}
+    assert active_leases(registry) == []
+
+
 def test_concurrent_reservations_are_atomic_and_balanced(
     fleet: tuple[object, Path], tmp_path: Path
 ) -> None:
@@ -473,6 +608,8 @@ def test_concurrent_reservations_are_atomic_and_balanced(
                 "claude-crew",
                 "--provider",
                 "claude",
+                "--workspace",
+                str(Path.cwd()),
             ],
             cwd=Path.cwd(),
             env=env,

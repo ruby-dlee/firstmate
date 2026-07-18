@@ -1214,9 +1214,6 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
 else
   SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
 fi
-if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
-  fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" || exit 1
-fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
@@ -1863,6 +1860,9 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   validate_spawn_worktree "treehouse get" "$T"
   WORKTREE_CREATED=1
 fi
+if [ -z "$WT" ] && [ "$BACKEND" = orca ]; then
+  WT="$PROJ_ABS"
+fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
@@ -1992,9 +1992,12 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
+if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
+  fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" "$WT" || exit 1
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
-    if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS"; then
+    if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS" "$WT"; then
       ACCOUNT_LEASE_CREATED=1
     else
       persist_failed_account_rollback_short || true
@@ -2004,7 +2007,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     fm_account_lineage_append "$DATA" "$ID" native-resume "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$RECORDED_SESSION" none || exit 1
   else
     persist_failed_account_rollback_short || exit 1
-    if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK"; then
+    if fm_account_select enforce "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" "$WT"; then
       :
     else
       account_select_status=$?
@@ -2183,7 +2186,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     ACCOUNT_NATIVE_LAUNCH_SCRIPT="$ACCOUNT_NATIVE_LAUNCH_DIR/account-native-launch"
     ACCOUNT_NATIVE_LAUNCH_READY="$ACCOUNT_NATIVE_LAUNCH_DIR/ready"
     ACCOUNT_NATIVE_LAUNCH_GO="$ACCOUNT_NATIVE_LAUNCH_DIR/go"
-    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK") || exit 1
+    resume_command=$(fm_account_resume_command "$ACCOUNT_TASK" "$WT") || exit 1
     native_ready_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_READY")
     native_go_q=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_GO")
     if ! ( set -C; cat > "$ACCOUNT_NATIVE_LAUNCH_SCRIPT" <<EOF
@@ -2201,7 +2204,7 @@ EOF
     chmod +x "$ACCOUNT_NATIVE_LAUNCH_SCRIPT"
     AGENT_COMMAND=$(fm_account_shell_quote "$ACCOUNT_NATIVE_LAUNCH_SCRIPT")
   else
-    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK") || exit 1
+    AGENT_COMMAND=$(fm_account_exec_command "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$ACCOUNT_TASK" "$WT") || exit 1
   fi
 fi
 LAUNCH=${LAUNCH//__AGENT__/$AGENT_COMMAND}

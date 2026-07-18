@@ -41,7 +41,8 @@ def record_session_from_hook(registry: Registry, payload: dict[str, Any]) -> dic
     task = os.environ.get("AGENT_FLEET_TASK_ID")
     profile_id = os.environ.get("AGENT_FLEET_PROFILE")
     provider = os.environ.get("AGENT_FLEET_PROVIDER")
-    if not task or not profile_id or not provider:
+    workspace = os.environ.get("AGENT_FLEET_WORKSPACE")
+    if not task or not profile_id or not provider or not workspace:
         return {"recorded": False, "reason": "not_agent_fleet_launch"}
     session_id = _find_session_id(payload)
     if session_id is None:
@@ -63,6 +64,7 @@ def record_session_from_hook(registry: Registry, payload: dict[str, Any]) -> dic
             "profile": profile.id,
             "provider": profile.provider,
             "pool": lease.get("pool"),
+            "workspace": workspace,
             "session_id": session_id,
             "updated_at": utc_now(),
         }

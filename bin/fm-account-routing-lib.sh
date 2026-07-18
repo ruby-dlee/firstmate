@@ -867,10 +867,10 @@ fm_account_json_field() {  # <json> <jq-expression> <label>
   printf '%s\n' "$value"
 }
 
-fm_account_reconcile_lease_mutation() {  # <binary> <task> <operation>
-  local binary=$1 task=$2 operation=$3
+fm_account_reconcile_lease_mutation() {  # <binary> <task> <workspace> <operation>
+  local binary=$1 task=$2 workspace=$3 operation=$4
   FM_ACCOUNT_RECONCILED_JSON=
-  if FM_ACCOUNT_RECONCILED_JSON=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then
+  if FM_ACCOUNT_RECONCILED_JSON=$(fm_account_run_control "$binary" --format json lease recover --task "$task" --workspace "$workspace"); then
     return 0
   fi
   echo "error: Agent Fleet $operation failed and ownership could not be reconciled for $task" >&2
@@ -901,8 +901,8 @@ fm_account_mutation_owned() {
 # Sets FM_ACCOUNT_SELECTED_PROFILE and FM_ACCOUNT_SELECTED_PROVIDER.
 # In observe mode these are shadow values only and callers must not persist or
 # apply them.
-fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
-  local mode=$1 harness=$2 pool=$3 requested_profile=$4 task=$5 binary json status acquired=0 selected_task selected_pool
+fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task> <workspace>
+  local mode=$1 harness=$2 pool=$3 requested_profile=$4 task=$5 workspace=$6 binary json status acquired=0 selected_task selected_pool
   FM_ACCOUNT_MUTATION_ACQUIRED=0
   FM_ACCOUNT_SELECTED_PROFILE=
   FM_ACCOUNT_SELECTED_PROVIDER=
@@ -917,6 +917,7 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
       ;;
   esac
   fm_account_valid_id "$pool" || { echo "error: invalid account pool '$pool'" >&2; return 1; }
+  [ -d "$workspace" ] || { echo "error: account routing workspace is unavailable: $workspace" >&2; return 1; }
   [ -z "$requested_profile" ] || fm_account_valid_id "$requested_profile" || {
     echo "error: invalid account profile '$requested_profile'" >&2
     return 1
@@ -930,7 +931,7 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
     return 1
   }
   if [ "$mode" = observe ]; then
-    if json=$(fm_account_run_control "$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --dry-run 2>/dev/null); then
+    if json=$(fm_account_run_control "$binary" --format json choose --pool "$pool" --task "$task" --provider "$harness" --workspace "$workspace" --dry-run 2>/dev/null); then
       status=0
     else
       status=$?
@@ -942,14 +943,14 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
   else
     fm_account_mutation_defer_signals
     if [ -n "$requested_profile" ] && [ "$pool" = explicit ]; then
-      if json=$(fm_account_run_control "$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool"); then status=0; else status=$?; fi
+      if json=$(fm_account_run_control "$binary" --format json lease acquire --profile "$requested_profile" --task "$task" --pool "$pool" --workspace "$workspace"); then status=0; else status=$?; fi
     elif [ -n "$requested_profile" ]; then
-      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --profile "$requested_profile"); then status=0; else status=$?; fi
+      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --profile "$requested_profile" --workspace "$workspace"); then status=0; else status=$?; fi
     else
-      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness"); then status=0; else status=$?; fi
+      if json=$(fm_account_run_control "$binary" --format json lease choose --pool "$pool" --task "$task" --provider "$harness" --workspace "$workspace"); then status=0; else status=$?; fi
     fi
     if [ "$status" -ne 0 ]; then
-      if fm_account_reconcile_lease_mutation "$binary" "$task" "lease mutation"; then
+      if fm_account_reconcile_lease_mutation "$binary" "$task" "$workspace" "lease mutation"; then
         json=$FM_ACCOUNT_RECONCILED_JSON
         status=0
       else
@@ -994,38 +995,40 @@ fm_account_select() {  # <mode> <harness> <pool> <profile-or-empty> <task>
   fi
 }
 
-fm_account_exec_command() {  # <profile> <pool> <task>
+fm_account_exec_command() {  # <profile> <pool> <task> <workspace>
   local binary
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
-  printf '%s --format json exec --profile %s --task %s --pool %s --' \
+  printf '%s --format json exec --profile %s --task %s --pool %s --workspace %s --' \
     "$(fm_account_shell_quote "$binary")" \
     "$(fm_account_shell_quote "$1")" \
     "$(fm_account_shell_quote "$3")" \
-    "$(fm_account_shell_quote "$2")"
+    "$(fm_account_shell_quote "$2")" \
+    "$(fm_account_shell_quote "$4")"
 }
 
-fm_account_resume_command() {  # <task>
+fm_account_resume_command() {  # <task> <workspace>
   local binary
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
-  printf '%s --format json resume --task %s --' \
+  printf '%s --format json resume --task %s --workspace %s --' \
     "$(fm_account_shell_quote "$binary")" \
-    "$(fm_account_shell_quote "$1")"
+    "$(fm_account_shell_quote "$1")" \
+    "$(fm_account_shell_quote "$2")"
 }
 
 # Sets FM_ACCOUNT_SELECTED_PROFILE and FM_ACCOUNT_SELECTED_PROVIDER from a
 # sticky recovery reservation. This path intentionally bypasses new-task quota
 # reserve filtering inside Agent Fleet while still refusing a live owner.
-fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-provider>
-  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 binary json status mapped_task profile pool provider
+fm_account_recover() {  # <task> <expected-profile> <expected-pool> <expected-provider> <workspace>
+  local task=$1 expected_profile=$2 expected_pool=$3 expected_provider=$4 workspace=$5 binary json status mapped_task profile pool provider
   FM_ACCOUNT_MUTATION_ACQUIRED=0
   binary=$(fm_account_fleet_bin) || return 1
   fm_account_validate_contract "$binary" || return 1
   fm_account_mutation_defer_signals
-  if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task"); then status=0; else status=$?; fi
+  if json=$(fm_account_run_control "$binary" --format json lease recover --task "$task" --workspace "$workspace"); then status=0; else status=$?; fi
   if [ "$status" -ne 0 ]; then
-    if fm_account_reconcile_lease_mutation "$binary" "$task" "recovery mutation"; then
+    if fm_account_reconcile_lease_mutation "$binary" "$task" "$workspace" "recovery mutation"; then
       json=$FM_ACCOUNT_RECONCILED_JSON
       status=0
     else

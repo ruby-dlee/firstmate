@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .audit import append_audit
+from .config import load_registry
 from .cooldowns import read_cooldown
 from .enrollment import recover_pending_codex_transactions
 from .identity import identity_conflict, refresh_provider_identity_anchors_if_due
 from .leases import active_leases, bind_lease, get_active_lease, new_lease, write_lease
 from .locks import (
-    provider_maintenance_active,
     provider_selection_refresh_lock,
     state_lock,
 )
 from .models import Profile, Registry
-from .projects import invocation_workspace
+from .projects import resolve_trusted_project
 from .providers import auth_status
-from .provision import prepare_profile_launch, profile_is_provisioned
+from .provision import profile_is_provisioned, profile_selection_ready
 from .quota import quota_routeability, read_quota, refresh_due_quotas
 from .util import atomic_write_json, task_key
 
@@ -131,7 +132,8 @@ def _select_and_acquire(
     explicit_profile: bool = False,
     ignore_reserve: bool = False,
     recovery_reservation: bool = False,
-    workspace: Path | None = None,
+    workspace: Path,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     if ignore_reserve and profile_id is None:
         raise ValueError("ignoring quota reserve requires an explicit profile")
@@ -155,64 +157,9 @@ def _select_and_acquire(
         and (profile_id is None or profile.id == profile_id)
         and profile_is_provisioned(profile)
     ]
-    active_workspace = workspace or invocation_workspace()
-    # Quota/identity writes share the provider maintenance interlock, but a
-    # selection does not hold it while committing its lease. The state-lock
-    # check below closes both races: maintenance either owns the marker first
-    # (selection refuses) or observes the newly committed lease and aborts.
-    for provider_name in sorted(scoped_provider_names):
-        if provider_maintenance_active(
-            registry.settings.state_dir,
-            provider_name,
-            registry.settings.lock_stale_seconds,
-        ):
-            raise ValueError(
-                f"provider maintenance is in progress for {provider_name}; "
-                "refusing to start a new Fleet lease"
-            )
-        try:
-            with provider_selection_refresh_lock(
-                registry.settings.state_dir,
-                provider_name,
-                registry.settings.lock_stale_seconds,
-            ):
-                recover_pending_codex_transactions(registry, provider_name)
-                for profile in scoped_profiles:
-                    if profile.provider == provider_name:
-                        prepare_profile_launch(registry, profile, active_workspace)
-                refresh_provider_identity_anchors_if_due(registry, provider_name)
-                refresh_due_quotas(
-                    registry,
-                    [profile for profile in scoped_profiles if profile.provider == provider_name],
-                )
-        except TimeoutError as exc:
-            raise ValueError(
-                f"provider maintenance is in progress for {provider_name}; "
-                "refusing to start a new Fleet lease"
-            ) from exc
-    authentication = {profile.id: auth_status(registry, profile) for profile in scoped_profiles}
-    with state_lock(
-        registry.settings.state_dir,
-        registry.settings.lock_stale_seconds,
-    ):
-        blocked_provider = next(
-            (
-                provider_name
-                for provider_name in sorted(scoped_provider_names)
-                if provider_maintenance_active(
-                    registry.settings.state_dir,
-                    provider_name,
-                    registry.settings.lock_stale_seconds,
-                )
-            ),
-            None,
-        )
-        if blocked_provider is not None:
-            raise ValueError(
-                f"provider maintenance is in progress for {blocked_provider}; "
-                "refusing to start a new Fleet lease"
-            )
-        leases = active_leases(registry, prune=True)
+
+    def decide(authentication: dict[str, str], *, prune: bool) -> dict[str, Any]:
+        leases = active_leases(registry, prune=prune)
         existing = get_active_lease(registry, task)
         if existing is not None:
             profile = registry.require_profile(str(existing.get("profile")))
@@ -225,7 +172,11 @@ def _select_and_acquire(
             if profile_id is not None and profile.id != profile_id:
                 raise ValueError(f"task is already bound to profile {profile.id}")
             if existing.get("state") != "running":
-                if not profile.enabled or not profile_is_provisioned(profile):
+                if (
+                    not profile.enabled
+                    or not profile_is_provisioned(profile)
+                    or not profile_selection_ready(registry, profile, workspace)
+                ):
                     raise ValueError("sticky profile is disabled or unprovisioned")
                 quota = read_quota(registry, profile.id)
                 routeability = quota_routeability(
@@ -360,6 +311,52 @@ def _select_and_acquire(
             "lease": lease,
         }
 
+    def validate_readiness() -> None:
+        for provider_name in scoped_provider_names:
+            resolve_trusted_project(registry, provider_name, workspace)
+        for profile in scoped_profiles:
+            if not profile_selection_ready(registry, profile, workspace):
+                raise ValueError(f"profile is not ready for the registered workspace: {profile.id}")
+
+    if dry_run:
+        validate_readiness()
+        authentication = {profile.id: "authenticated" for profile in scoped_profiles}
+        return decide(authentication, prune=False)
+
+    try:
+        with ExitStack() as provider_locks:
+            for provider_name in sorted(scoped_provider_names):
+                provider_locks.enter_context(
+                    provider_selection_refresh_lock(
+                        registry.settings.state_dir,
+                        provider_name,
+                        registry.settings.lock_stale_seconds,
+                    )
+                )
+            validate_readiness()
+            for provider_name in sorted(scoped_provider_names):
+                recover_pending_codex_transactions(registry, provider_name)
+                refresh_provider_identity_anchors_if_due(registry, provider_name)
+                refresh_due_quotas(
+                    registry,
+                    [profile for profile in scoped_profiles if profile.provider == provider_name],
+                )
+            authentication = {
+                profile.id: auth_status(registry, profile) for profile in scoped_profiles
+            }
+            with state_lock(
+                registry.settings.state_dir,
+                registry.settings.lock_stale_seconds,
+            ):
+                if config_path is not None and load_registry(config_path) != registry:
+                    raise ValueError("registry changed during selection; retry the lease request")
+                return decide(authentication, prune=True)
+    except TimeoutError as exc:
+        names = ", ".join(sorted(scoped_provider_names)) or "requested providers"
+        raise ValueError(
+            f"provider maintenance is in progress for {names}; refusing to start a new Fleet lease"
+        ) from exc
+
 
 def select_and_acquire(
     registry: Registry,
@@ -373,7 +370,8 @@ def select_and_acquire(
     explicit_profile: bool = False,
     ignore_reserve: bool = False,
     recovery_reservation: bool = False,
-    workspace: Path | None = None,
+    workspace: Path,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     return _select_and_acquire(
         registry,
@@ -387,4 +385,5 @@ def select_and_acquire(
         ignore_reserve=ignore_reserve,
         recovery_reservation=recovery_reservation,
         workspace=workspace,
+        config_path=config_path,
     )

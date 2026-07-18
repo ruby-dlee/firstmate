@@ -12,7 +12,7 @@ from typing import Any
 from . import __version__
 from .models import SHARED_WORKFLOW_ENTRIES, Profile, ProviderConfig, Registry
 from .paths import ensure_private_dir
-from .projects import TrustedProject, resolve_trusted_project
+from .projects import TrustedProject, registered_trusted_projects, resolve_trusted_project
 from .providers import session_hook_command
 from .util import atomic_write_json
 
@@ -186,6 +186,7 @@ def _install_codex_hooks(profile: Profile, provider: ProviderConfig) -> None:
 def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
     provider = registry.require_provider(profile.provider)
     try:
+        expected_command = session_hook_command()
         marker = _read_owned_json_object(profile.home / CODEX_HOOK_MARKER_FILE)
         if (
             set(marker)
@@ -206,11 +207,11 @@ def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
             or marker.get("source")
             != (str(provider.hooks_source) if provider.hooks_source is not None else None)
             or marker.get("source_hash") != _source_hash(provider.hooks_source)
-            or not isinstance(marker.get("session_command"), str)
+            or marker.get("session_command") != expected_command
         ):
             return False
         payload = _read_owned_json_object(profile.home / "hooks.json")
-        expected = _codex_hook_payload(provider.hooks_source, marker["session_command"])
+        expected = _codex_hook_payload(provider.hooks_source, expected_command)
     except (OSError, ValueError):
         return False
     expected_hash = _hook_payload_hash(expected)
@@ -221,7 +222,7 @@ def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
     )
 
 
-def _merge_claude_project_trust(profile: Profile, project: TrustedProject) -> None:
+def _merge_claude_project_trust(profile: Profile, roots: set[Path]) -> None:
     path = profile.home / ".claude.json"
     payload = _read_owned_json_object(path)
     projects = payload.setdefault("projects", {})
@@ -229,7 +230,7 @@ def _merge_claude_project_trust(profile: Profile, project: TrustedProject) -> No
         raise ValueError(f"Claude projects state must be an object: {path}")
     changed = payload.get("hasCompletedOnboarding") is not True
     payload["hasCompletedOnboarding"] = True
-    for root in {project.active_root, project.canonical_root}:
+    for root in roots:
         key = str(root)
         existing = projects.setdefault(key, {})
         if not isinstance(existing, dict):
@@ -237,6 +238,9 @@ def _merge_claude_project_trust(profile: Profile, project: TrustedProject) -> No
         if existing.get("hasTrustDialogAccepted") is not True:
             changed = True
             existing["hasTrustDialogAccepted"] = True
+        if existing.get("hasCompletedProjectOnboarding") is not True:
+            changed = True
+            existing["hasCompletedProjectOnboarding"] = True
     if changed:
         atomic_write_json(path, payload)
 
@@ -253,6 +257,7 @@ def claude_project_ready(profile: Profile, project: TrustedProject) -> bool:
         and all(
             isinstance(projects.get(str(root)), dict)
             and projects[str(root)].get("hasTrustDialogAccepted") is True
+            and projects[str(root)].get("hasCompletedProjectOnboarding") is True
             for root in {project.active_root, project.canonical_root}
         )
     )
@@ -267,7 +272,7 @@ def prepare_profile_launch(
         raise ValueError(f"profile is not provisioned: {profile.id}")
     project = resolve_trusted_project(registry, profile.provider, workspace)
     if profile.provider == "claude":
-        _merge_claude_project_trust(profile, project)
+        _merge_claude_project_trust(profile, {project.active_root, project.canonical_root})
         if not claude_project_ready(profile, project):
             raise ValueError(f"Claude project trust bootstrap failed for {profile.id}")
         hook_health = profile_hook_health(registry, profile)
@@ -284,6 +289,35 @@ def prepare_profile_launch(
         if not codex_hooks_ready(registry, profile):
             raise ValueError(f"managed Codex hook set is not ready for {profile.id}")
     return project
+
+
+def profile_selection_ready(
+    registry: Registry,
+    profile: Profile,
+    workspace: Path,
+) -> bool:
+    try:
+        project = resolve_trusted_project(registry, profile.provider, workspace)
+    except ValueError:
+        return False
+    if profile.provider == "claude":
+        canonical = TrustedProject(
+            project.canonical_root,
+            project.canonical_root,
+            project.common_dir,
+        )
+        hook_health = profile_hook_health(registry, profile)
+        return (
+            claude_project_ready(profile, canonical)
+            and hook_health["agent_fleet_session_hook"]
+            and hook_health["inherited_workflow_hooks"]
+        )
+    project_hook = project.active_root / ".codex" / "hooks.json"
+    return (
+        not (project_hook.exists() or project_hook.is_symlink())
+        and _codex_config_ready(profile.home)
+        and codex_hooks_ready(registry, profile)
+    )
 
 
 def profile_launch_ready(
@@ -334,6 +368,13 @@ def _ensure_codex_config(home: Path) -> None:
     features = raw.get("features", {})
     if not isinstance(features, dict) or features.get("hooks") is not True:
         raise ValueError(f"managed Codex profile requires [features] hooks=true: {path}")
+    if any(
+        features.get(name) is not None and features.get(name) is not False
+        for name in ("plugins", "plugin_sharing")
+    ):
+        raise ValueError(f"managed Codex profile cannot enable plugins: {path}")
+    if any(raw.get(name) for name in ("plugins", "plugin_sharing")):
+        raise ValueError(f"managed Codex profile cannot configure plugins: {path}")
     projects = raw.get("projects", {})
     if not isinstance(projects, dict) or projects:
         raise ValueError(f"managed Codex profile cannot persist project trust: {path}")
@@ -359,6 +400,11 @@ def _codex_config_ready(home: Path) -> bool:
         raw.get("cli_auth_credentials_store") == "file"
         and isinstance(features, dict)
         and features.get("hooks") is True
+        and all(
+            features.get(name) is None or features.get(name) is False
+            for name in ("plugins", "plugin_sharing")
+        )
+        and not any(raw.get(name) for name in ("plugins", "plugin_sharing"))
         and isinstance(projects, dict)
         and not projects
     )
@@ -422,17 +468,26 @@ def _share_workflow_entries(profile: Profile, provider: ProviderConfig) -> list[
 
 
 def provision_profile(registry: Registry, profile: Profile) -> dict[str, Any]:
+    provider = registry.require_provider(profile.provider)
+    trusted_projects = registered_trusted_projects(registry, profile.provider)
+    if not trusted_projects:
+        raise ValueError(f"register at least one trusted project for {profile.provider}")
+    if profile.provider == "codex":
+        _source_hash(provider.hooks_source)
     if profile.home.is_symlink():
         raise ValueError(f"managed profile home cannot be a symlink: {profile.home}")
     ensure_private_dir(profile.home)
     current = profile.home.lstat()
     if not stat.S_ISDIR(current.st_mode) or current.st_uid != os.getuid():
         raise ValueError(f"managed profile home must be a current-user directory: {profile.home}")
-    provider = registry.require_provider(profile.provider)
     shared = _share_workflow_entries(profile, provider)
     if profile.provider == "claude":
         ensure_private_dir(profile.home / "hooks")
         _install_session_hook(profile.home / "settings.json", provider.hooks_source)
+        _merge_claude_project_trust(
+            profile,
+            {project.canonical_root for project in trusted_projects},
+        )
     elif profile.provider == "codex":
         ensure_private_dir(profile.home / "hooks")
         _ensure_codex_config(profile.home)

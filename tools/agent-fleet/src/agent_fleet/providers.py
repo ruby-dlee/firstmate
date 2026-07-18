@@ -16,17 +16,27 @@ def identity_fingerprint(provider: str, identifier: str) -> str:
     return sha256(f"{provider}:{identifier}".encode()).hexdigest()
 
 
-def provider_environment(profile: Profile, task: str | None = None) -> dict[str, str]:
+def provider_environment(
+    profile: Profile,
+    task: str | None = None,
+    workspace: Path | None = None,
+) -> dict[str, str]:
     env = dict(os.environ)
     for name in tuple(env):
         if name.startswith(("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_")):
             env.pop(name, None)
+    env.pop("AGENT_FLEET_QUOTA_FIXTURE_DIR", None)
+    env.pop("AGENT_FLEET_TEST_QUOTA_FIXTURE_DIR", None)
     env["AGENT_FLEET_PROFILE"] = profile.id
     env["AGENT_FLEET_PROVIDER"] = profile.provider
     if task:
         env["AGENT_FLEET_TASK_ID"] = task
     else:
         env.pop("AGENT_FLEET_TASK_ID", None)
+    if workspace is not None:
+        env["AGENT_FLEET_WORKSPACE"] = str(workspace)
+    else:
+        env.pop("AGENT_FLEET_WORKSPACE", None)
     if profile.provider == "claude":
         env["CLAUDE_CONFIG_DIR"] = str(profile.home)
         env["DISABLE_LOGIN_COMMAND"] = "1"
@@ -43,19 +53,31 @@ def provider_argv(registry: Registry, profile: Profile, command: Iterable[str] =
     return [str(binary), *suffix]
 
 
+def _matches_long_option(argument: str, names: set[str]) -> bool:
+    return argument in names or any(argument.startswith(f"{name}=") for name in names)
+
+
+def _validate_codex_config(value: str) -> None:
+    key, separator, _ = value.partition("=")
+    if not separator or key.strip() not in {"model_reasoning_effort", "notify"}:
+        raise ValueError(
+            "worker exec allows only model_reasoning_effort and notify Codex config overrides"
+        )
+
+
 def validate_worker_arguments(profile: Profile, arguments: list[str]) -> None:
-    blocked = {
+    blocked_commands = {
         "login",
         "logout",
         "resume",
         "fork",
         "auth",
-        "-r",
         "--resume",
         "--continue",
     }
     if any(
-        argument in blocked
+        argument in blocked_commands
+        or argument == "-r"
         or argument.startswith("--resume=")
         or argument.startswith("--continue=")
         for argument in arguments
@@ -68,35 +90,85 @@ def validate_worker_arguments(profile: Profile, arguments: list[str]) -> None:
     ):
         raise ValueError("worker exec refuses provider working-directory overrides")
     if profile.provider != "codex":
+        forbidden = {
+            "--settings",
+            "--setting-sources",
+            "--bare",
+            "--safe-mode",
+            "--no-session-persistence",
+            "--session-id",
+            "--fork-session",
+            "--worktree",
+            "--tmux",
+            "--background",
+            "--from-pr",
+            "--cloud",
+            "--remote",
+            "--teleport",
+            "--setup-token",
+            "--agents",
+        }
+        if any(
+            argument == "-c"
+            or (argument.startswith("-c") and len(argument) > 2)
+            or argument == "-r"
+            or (argument.startswith("-r") and len(argument) > 2)
+            or _matches_long_option(argument, forbidden)
+            for argument in arguments
+        ):
+            raise ValueError("worker exec refuses unmanaged Claude launch and session controls")
         return
     if any(argument in {"plugin", "features", "mcp"} for argument in arguments):
         raise ValueError("worker exec refuses Codex plugin and configuration administration")
-    for index, argument in enumerate(arguments):
-        if argument in {"-p", "--profile", "--remote"} or argument.startswith(
-            ("-p=", "--profile=", "--remote=")
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if (
+            argument == "-p"
+            or (argument.startswith("-p") and len(argument) > 2)
+            or _matches_long_option(
+                argument,
+                {
+                    "--profile",
+                    "--remote",
+                    "--oss",
+                    "--local-provider",
+                    "--provider",
+                    "--credential-store",
+                    "--hooks",
+                    "--plugins",
+                    "--projects",
+                    "--trust",
+                },
+            )
         ):
             raise ValueError("worker exec refuses alternate Codex config and runtime profiles")
         if argument == "--dangerously-bypass-hook-trust":
             raise ValueError("worker exec owns the Codex hook-trust override")
-        if (
-            argument == "--enable"
-            and index + 1 < len(arguments)
-            and arguments[index + 1] in {"plugins", "plugin_sharing"}
-        ):
+        if argument == "--enable" or argument.startswith("--enable="):
             raise ValueError("managed Codex launches keep plugins disabled")
-        if argument.startswith("--enable=") and argument.split("=", 1)[1] in {
-            "plugins",
-            "plugin_sharing",
-        }:
-            raise ValueError("managed Codex launches keep plugins disabled")
-        if argument in {"-c", "--config"} and index + 1 < len(arguments):
-            value = arguments[index + 1].lower()
-            if any(token in value for token in ("project", "trust", "hook", "plugin")):
-                raise ValueError("worker exec refuses managed Codex config overrides")
-        if argument.startswith("--config=") and any(
-            token in argument.lower() for token in ("project", "trust", "hook", "plugin")
-        ):
-            raise ValueError("worker exec refuses managed Codex config overrides")
+        if argument in {"--no-hooks", "--skip-hooks", "--disable-hooks"}:
+            raise ValueError("managed Codex launches require hooks")
+        if argument == "--disable":
+            if index + 1 >= len(arguments):
+                raise ValueError("Codex --disable requires a feature name")
+            if arguments[index + 1] == "hooks":
+                raise ValueError("managed Codex launches require hooks")
+            index += 2
+            continue
+        if argument.startswith("--disable=") and argument.split("=", 1)[1] == "hooks":
+            raise ValueError("managed Codex launches require hooks")
+        if argument in {"-c", "--config"}:
+            if index + 1 >= len(arguments):
+                raise ValueError("Codex config override requires a value")
+            _validate_codex_config(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith("-c") and len(argument) > 2:
+            _validate_codex_config(argument[2:])
+        elif argument.startswith("--config="):
+            _validate_codex_config(argument.split("=", 1)[1])
+        index += 1
 
 
 def codex_launch_prefix(active_root: Path) -> list[str]:
@@ -151,6 +223,7 @@ def auth_probe(registry: Registry, profile: Profile) -> dict[str, str | None]:
         result = subprocess.run(
             [str(binary), *suffix],
             env=provider_environment(profile),
+            cwd=profile.home,
             capture_output=True,
             text=True,
             timeout=15,
@@ -175,8 +248,7 @@ def auth_status(registry: Registry, profile: Profile) -> str:
 
 
 def session_hook_command() -> str:
-    configured = os.environ.get("AGENT_FLEET_BIN")
-    executable = configured or shutil.which("agent-fleet") or "agent-fleet"
+    executable = shutil.which("agent-fleet") or "agent-fleet"
     return f"{shlex.quote(executable)} --format json hook session-start"
 
 

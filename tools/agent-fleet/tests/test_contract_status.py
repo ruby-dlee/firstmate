@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agent_fleet import __version__
 from agent_fleet.config import load_registry, save_registry
+from agent_fleet.doctor import run_doctor
 from agent_fleet.providers import identity_fingerprint
 from agent_fleet.provision import provision_profile
 from agent_fleet.quota import quota_path
@@ -205,7 +206,9 @@ def test_verify_keeps_a_remotely_rejected_profile_disabled(
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
-    env["AGENT_FLEET_QUOTA_FIXTURE_DIR"] = str(fixtures)
+    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -266,7 +269,9 @@ def test_claude_enrollment_discards_prelogin_identity_proof(
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
-    env["AGENT_FLEET_QUOTA_FIXTURE_DIR"] = str(fixtures)
+    registry.settings.quota_binary.with_name("quota-fixture-dir").write_text(
+        str(fixtures), encoding="utf-8"
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -323,3 +328,40 @@ def test_toon_preflight_precedes_registry_mutation(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert "TOON output requested" in result.stderr
     assert not config.exists()
+
+
+def test_doctor_splits_supervision_workspace_from_provider_project_and_reserves(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profiles = dict(registry.profiles)
+    profiles["claude-1"] = replace(profiles["claude-1"], enabled=True)
+    registry = replace(registry, profiles=profiles)
+    save_registry(registry, config)
+    registry = load_registry(config)
+    provision_profile(registry, registry.require_profile("claude-1"))
+    for profile in registry.profiles.values():
+        if profile.id != "claude-1":
+            quota_path(registry, profile.id).unlink(missing_ok=True)
+    supervisor = tmp_path / "supervisor"
+    (supervisor / ".claude").mkdir(parents=True)
+    (supervisor / ".codex").mkdir(parents=True)
+    hooks = {"hooks": {"PreToolUse": [], "Stop": []}}
+    (supervisor / ".claude" / "settings.json").write_text(json.dumps(hooks), encoding="utf-8")
+    (supervisor / ".codex" / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+
+    result = run_doctor(
+        registry,
+        config,
+        workspace=supervisor,
+        project=Path.cwd(),
+    )
+    checks = {check["name"]: check for check in result["checks"]}
+
+    assert checks["workspace:claude:supervision-hooks"]["ok"] is True
+    assert checks["workspace:codex:supervision-hooks"]["ok"] is True
+    assert checks["project:claude-1:provider-bootstrap"]["ok"] is True
+    assert checks["profile:claude-1:remote-identity-proof"]["required"] is True
+    assert checks["profile:claude-2:remote-identity-proof"]["required"] is False
+    assert checks["project:claude-2:provider-bootstrap"]["required"] is False

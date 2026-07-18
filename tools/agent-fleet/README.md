@@ -124,15 +124,19 @@ Shell integrations should request compact JSON explicitly:
 
 ```sh
 agent-fleet --format json lease choose \
-  --task fm:crew:example --pool codex-crew --provider codex
+  --task fm:crew:example --pool codex-crew --provider codex \
+  --workspace /absolute/path/to/task-worktree
 
 agent-fleet exec \
-  --task fm:crew:example --pool codex-crew --provider codex -- \
+  --task fm:crew:example --pool codex-crew --provider codex \
+  --workspace /absolute/path/to/task-worktree -- \
   --full-auto
 
-agent-fleet resume --task fm:crew:example -- --full-auto
+agent-fleet resume --task fm:crew:example \
+  --workspace /absolute/path/to/task-worktree -- --full-auto
 agent-fleet --format json session status --task fm:crew:example
-agent-fleet --format json lease recover --task fm:crew:example
+agent-fleet --format json lease recover --task fm:crew:example \
+  --workspace /absolute/path/to/task-worktree
 agent-fleet --format json lease release --task fm:crew:example
 agent-fleet --format json session remove --task fm:crew:example
 ```
@@ -145,10 +149,12 @@ selection. A reservation may be released normally when pane creation fails,
 while a live worker lease requires an explicit forced release after the worker
 has stopped. Worker `exec` and `resume` require a managed task id, and every live
 lease and lock requires a verified process-start token; missing tokens fail
-closed. A live task can never be rebound to a different process.
+closed. Selection, execution, and recovery require the intended task worktree
+explicitly and never infer the orchestrator's working directory. A live task
+can never be rebound to a different process.
 Raw provider auth and resume subcommands are refused by `exec` so credential maintenance and sticky session recovery cannot bypass their dedicated paths.
 
-Claude launch bootstrap atomically preserves opaque profile state while setting only completed onboarding and trust for the validated active and canonical project roots.
+Claude provisioning atomically preserves opaque profile state while setting completed onboarding and project trust for every canonical registered project; a linked worktree receives its matching active-root trust only immediately before execution.
 Codex launches require an exact current-version profile hook set derived from the declared hook source plus Agent Fleet SessionStart, reject project hooks, disable `plugins` and `plugin_sharing`, and apply trust only to the validated active root.
 
 Task resume is fail-closed: it requires the recorded provider session and
@@ -186,7 +192,7 @@ agent-fleet quota refresh --all
 agent-fleet quota show --all
 agent-fleet profile verify --all --allow-keychain-prompt
 agent-fleet doctor
-agent-fleet doctor --workspace ~/firstmate
+agent-fleet doctor --workspace ~/firstmate --project /absolute/path/to/task-worktree
 ```
 
 `profile verify --all` remotely rechecks every profile while all profiles remain
@@ -196,8 +202,9 @@ routing activation are deliberately separate phases. On macOS,
 **Always Allow** so later automatic checks stay non-interactive. Bare `enable`
 never requests Keychain access and fails closed when verification is unavailable.
 
-`doctor` verifies private profile homes, fresh remote identity proof, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
-When `--workspace` is supplied, it also verifies provider onboarding/project/hook readiness, Claude supervision hooks, and the required absence of Codex project hooks.
+`doctor` verifies private profile homes, fresh remote identity proof for enabled workers, the Agent Fleet SessionStart hook, current Herdr session-identity hooks, inherited workflow hooks/assets, provider auth state, trusted-project configuration, and pinned binaries.
+Disabled and non-worker reserve profiles report remote-proof state without making it a health requirement.
+`--workspace` checks Firstmate's Claude and Codex supervision hooks, while `--project` independently checks provider onboarding, registered-project, profile-hook, plugin, and project-hook readiness without changing either location.
 
 ## Isolation and shared workflow assets
 

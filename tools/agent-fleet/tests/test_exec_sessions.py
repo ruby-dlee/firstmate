@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from agent_fleet.config import load_registry, save_registry
+from agent_fleet.leases import active_leases
 from agent_fleet.provision import provision_profile
 from agent_fleet.scheduler import select_and_acquire
 from agent_fleet.sessions import get_session, record_session_from_hook
@@ -24,6 +25,7 @@ print(json.dumps({
     "argv": sys.argv[1:],
     "profile": os.environ.get("AGENT_FLEET_PROFILE"),
     "task": os.environ.get("AGENT_FLEET_TASK_ID"),
+    "cwd": os.getcwd(),
     "codex_home": os.environ.get("CODEX_HOME"),
     "claude_home": os.environ.get("CLAUDE_CONFIG_DIR"),
     "has_openai_key": "OPENAI_API_KEY" in os.environ,
@@ -56,6 +58,8 @@ def test_exec_uses_selected_home_and_clears_ambient_credentials(
     env = dict(os.environ)
     env["PYTHONPATH"] = str(project_root / "src")
     env["OPENAI_API_KEY"] = "must-not-reach-provider"
+    supervisor = tmp_path / "supervisor"
+    supervisor.mkdir()
     result = subprocess.run(
         [
             sys.executable,
@@ -70,10 +74,12 @@ def test_exec_uses_selected_home_and_clears_ambient_credentials(
             "codex-crew",
             "--profile",
             "codex-1",
+            "--workspace",
+            str(Path.cwd()),
             "--",
             "example-argument",
         ],
-        cwd=Path.cwd(),
+        cwd=supervisor,
         env=env,
         text=True,
         capture_output=True,
@@ -90,6 +96,7 @@ def test_exec_uses_selected_home_and_clears_ambient_credentials(
     ]
     assert payload["profile"] == "codex-1"
     assert payload["task"] == "exec-task"
+    assert payload["cwd"] == str(Path.cwd())
     assert payload["codex_home"] == str(profile.home)
     assert payload["claude_home"] is None
     assert payload["has_openai_key"] is False
@@ -113,10 +120,12 @@ def test_session_hook_persists_profile_and_provider_session(
         pool="claude-crew",
         profile_id="claude-1",
         bind_pid=os.getpid(),
+        workspace=Path.cwd(),
     )
     monkeypatch.setenv("AGENT_FLEET_TASK_ID", "hook-task")
     monkeypatch.setenv("AGENT_FLEET_PROFILE", "claude-1")
     monkeypatch.setenv("AGENT_FLEET_PROVIDER", "claude")
+    monkeypatch.setenv("AGENT_FLEET_WORKSPACE", str(Path.cwd()))
 
     result = record_session_from_hook(
         registry, {"hook_event_name": "SessionStart", "session_id": "session-123"}
@@ -127,6 +136,7 @@ def test_session_hook_persists_profile_and_provider_session(
     assert mapping["provider"] == "claude"
     assert mapping["session_id"] == "session-123"
     assert mapping["pool"] == "claude-crew"
+    assert mapping["workspace"] == str(Path.cwd())
 
     project_root = Path(__file__).parents[1]
     env = dict(os.environ)
@@ -294,6 +304,8 @@ def test_worker_exec_refuses_auth_resume_and_plugin_overrides(
                 "guarded-exec",
                 "--profile",
                 "codex-1",
+                "--workspace",
+                str(Path.cwd()),
                 "--",
                 *provider_args,
             ],
@@ -308,7 +320,61 @@ def test_worker_exec_refuses_auth_resume_and_plugin_overrides(
         assert (
             "refuses" in json.loads(result.stdout)["error"]
             or "disabled" in json.loads(result.stdout)["error"]
+            or "allows only" in json.loads(result.stdout)["error"]
         )
+    assert active_leases(load_registry(config)) == []
+
+
+def test_claude_short_continue_is_refused_before_lease_or_provider_exec(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    provider_log = tmp_path / "provider-ran"
+    binary = tmp_path / "claude-provider"
+    binary.write_text(
+        f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(provider_log)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    providers = dict(registry.providers)
+    providers["claude"] = replace(providers["claude"], binary=binary)
+    registry = replace(registry, providers=providers)
+    save_registry(registry, config)
+    project_root = Path(__file__).parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(project_root / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_fleet",
+            "--format",
+            "json",
+            "--config",
+            str(config),
+            "exec",
+            "--task",
+            "claude-continue-bypass",
+            "--profile",
+            "claude-1",
+            "--workspace",
+            str(Path.cwd()),
+            "--",
+            "-c",
+        ],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert not provider_log.exists()
+    assert active_leases(load_registry(config)) == []
 
 
 def test_init_has_no_force_replacement_path(tmp_path: Path) -> None:
@@ -354,6 +420,7 @@ def test_live_task_cannot_be_rebound(fleet: tuple[object, Path]) -> None:
         pool="claude-crew",
         profile_id="claude-1",
         bind_pid=os.getpid(),
+        workspace=Path.cwd(),
     )
     try:
         select_and_acquire(
@@ -362,6 +429,7 @@ def test_live_task_cannot_be_rebound(fleet: tuple[object, Path]) -> None:
             pool="claude-crew",
             profile_id="claude-1",
             bind_pid=os.getpid() + 1,
+            workspace=Path.cwd(),
         )
     except ValueError as exc:
         assert "already owned" in str(exc)

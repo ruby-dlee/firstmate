@@ -55,11 +55,7 @@ def _anchor_is_fresh(registry: Registry, anchor: dict[str, Any]) -> bool:
     return age is not None and age <= registry.settings.quota_stale_seconds
 
 
-def _refresh_desktop_identity_anchor(
-    registry: Registry,
-    provider: str,
-    desktop_file: Path,
-) -> dict[str, Any]:
+def _desktop_identity_snapshot(provider: str, desktop_file: Path) -> dict[str, Any]:
     try:
         payload = json.loads(desktop_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -71,7 +67,7 @@ def _refresh_desktop_identity_anchor(
         desktop_status = "present"
     else:
         desktop_status = "error"
-    result = {
+    return {
         "schema": 1,
         "provider": provider,
         "kind": "desktop",
@@ -83,6 +79,14 @@ def _refresh_desktop_identity_anchor(
         ),
         "refreshed_at": utc_now(),
     }
+
+
+def _refresh_desktop_identity_anchor(
+    registry: Registry,
+    provider: str,
+    desktop_file: Path,
+) -> dict[str, Any]:
+    result = _desktop_identity_snapshot(provider, desktop_file)
     atomic_write_json(_anchor_path(registry, provider, "desktop"), result)
     return result
 
@@ -96,49 +100,60 @@ def refresh_provider_identity_anchors(
 ) -> dict[str, dict[str, Any]]:
     provider_config = registry.require_provider(provider)
     results: dict[str, dict[str, Any]] = {}
-    if provider_config.base_home is not None and provider_config.base_home.exists():
-        base = Profile(
-            id=f"{provider}-base-anchor",
-            provider=provider,
-            home=provider_config.base_home,
-            pools=(f"{provider}-manual",),
-            enabled=False,
-            safety_policy="desktop_shared",
-        )
-        try:
-            quota = probe_quota(
-                registry,
-                base,
-                timeout=timeout,
-                allow_keychain_prompt=allow_keychain_prompt,
-            )
-        except (OSError, TimeoutError, ValueError) as exc:
+    if provider_config.base_home is not None:
+        if not provider_config.base_home.exists():
             base_result = {
                 "schema": 1,
                 "provider": provider,
                 "kind": "base",
                 "status": "error",
-                "reason": type(exc).__name__,
+                "reason": "base_home_missing",
                 "identity_fingerprint": None,
                 "refreshed_at": utc_now(),
             }
         else:
-            status = str(quota.get("status", "unavailable"))
-            fingerprint = quota.get("identity_fingerprint")
-            reason = quota.get("reason")
-            if status == "fresh" and not _quota_identity_is_verified(quota):
-                status = "error"
-                reason = "base_identity_unavailable"
-                fingerprint = None
-            base_result = {
-                "schema": 1,
-                "provider": provider,
-                "kind": "base",
-                "status": status,
-                "reason": reason,
-                "identity_fingerprint": fingerprint,
-                "refreshed_at": utc_now(),
-            }
+            base = Profile(
+                id=f"{provider}-base-anchor",
+                provider=provider,
+                home=provider_config.base_home,
+                pools=(f"{provider}-manual",),
+                enabled=False,
+                safety_policy="desktop_shared",
+            )
+            try:
+                quota = probe_quota(
+                    registry,
+                    base,
+                    timeout=timeout,
+                    allow_keychain_prompt=allow_keychain_prompt,
+                )
+            except (OSError, TimeoutError, ValueError) as exc:
+                base_result = {
+                    "schema": 1,
+                    "provider": provider,
+                    "kind": "base",
+                    "status": "error",
+                    "reason": type(exc).__name__,
+                    "identity_fingerprint": None,
+                    "refreshed_at": utc_now(),
+                }
+            else:
+                status = str(quota.get("status", "unavailable"))
+                fingerprint = quota.get("identity_fingerprint")
+                reason = quota.get("reason")
+                if status == "fresh" and not _quota_identity_is_verified(quota):
+                    status = "error"
+                    reason = "base_identity_unavailable"
+                    fingerprint = None
+                base_result = {
+                    "schema": 1,
+                    "provider": provider,
+                    "kind": "base",
+                    "status": status,
+                    "reason": reason,
+                    "identity_fingerprint": fingerprint,
+                    "refreshed_at": utc_now(),
+                }
         atomic_write_json(_anchor_path(registry, provider, "base"), base_result)
         results["base"] = base_result
     if provider == "claude" and provider_config.desktop_identity_file is not None:
@@ -159,10 +174,14 @@ def refresh_provider_identity_anchors_if_due(
 ) -> None:
     provider_config = registry.require_provider(provider)
     due = False
-    if provider_config.base_home is not None and provider_config.base_home.exists():
+    if provider_config.base_home is not None:
         current = _read_anchor(registry, provider, "base")
         age = _age_seconds(current.get("refreshed_at"))
-        due = age is None or age > registry.settings.quota_stale_seconds
+        due = (
+            not provider_config.base_home.exists()
+            or age is None
+            or age > registry.settings.quota_stale_seconds
+        )
     if provider == "claude" and provider_config.desktop_identity_file is not None:
         # Desktop can switch accounts between two route attempts. This local
         # JSON read is cheap and must not inherit the base quota anchor's TTL.
@@ -191,12 +210,13 @@ def identity_conflict(
         other_quota = read_quota(registry, other.id)
         other_fingerprint = other_quota.get("identity_fingerprint")
         has_recent_proof = _managed_identity_has_recent_proof(other_quota)
-        if require_complete_worker_set and other.safety_policy == "worker" and not has_recent_proof:
+        required_worker = other.enabled and other.safety_policy == "worker"
+        if require_complete_worker_set and required_worker and not has_recent_proof:
             return f"managed_identity_unverified:{other.id}"
         if not has_recent_proof:
             continue
         if not isinstance(other_fingerprint, str) or len(other_fingerprint) != 64:
-            if require_complete_worker_set and other.safety_policy == "worker":
+            if require_complete_worker_set and required_worker:
                 return f"managed_identity_unverified:{other.id}"
             continue
         if other_fingerprint == fingerprint:
@@ -204,7 +224,9 @@ def identity_conflict(
     provider_config = registry.require_provider(profile.provider)
     if provider_config.base_home is not None and profile.home == provider_config.base_home:
         return "base_home_overlap"
-    if provider_config.base_home is not None and provider_config.base_home.exists():
+    if provider_config.base_home is not None:
+        if not provider_config.base_home.exists():
+            return "base_identity_unverified:base_home_missing"
         base = _read_anchor(registry, profile.provider, "base")
         base_status = str(base.get("status", "unavailable"))
         base_fingerprint = base.get("identity_fingerprint")
@@ -218,7 +240,10 @@ def identity_conflict(
         if base_fingerprint == fingerprint:
             return "base_identity"
     if profile.provider == "claude" and provider_config.desktop_identity_file is not None:
-        desktop = _read_anchor(registry, profile.provider, "desktop")
+        desktop = _desktop_identity_snapshot(
+            profile.provider,
+            provider_config.desktop_identity_file,
+        )
         desktop_status = desktop.get("status")
         desktop_fingerprint = desktop.get("identity_fingerprint")
         if not _anchor_is_fresh(registry, desktop):

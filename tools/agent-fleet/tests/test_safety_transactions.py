@@ -217,6 +217,7 @@ def test_provider_maintenance_marker_blocks_new_lease(
             task="blocked-by-maintenance",
             pool="codex-crew",
             profile_id="codex-1",
+            workspace=Path.cwd(),
         )
 
 
@@ -303,6 +304,7 @@ def test_enrollment_refuses_while_managed_provider_launch_is_alive(
         pool=f"{profile.provider}-crew",
         profile_id=profile.id,
         bind_pid=os.getpid(),
+        workspace=Path.cwd(),
     )
     profiles = dict(registry.profiles)
     profiles[profile.id] = replace(profile, enabled=False)
@@ -345,6 +347,7 @@ def test_claude_desktop_switch_is_seen_on_the_next_selection(
         pool="claude-crew",
         profile_id="claude-1",
         dry_run=True,
+        workspace=Path.cwd(),
     )
     assert selected["profile"] == "claude-1"
     desktop_file = registry.require_provider("claude").desktop_identity_file
@@ -361,6 +364,7 @@ def test_claude_desktop_switch_is_seen_on_the_next_selection(
             pool="claude-crew",
             profile_id="claude-1",
             dry_run=True,
+            workspace=Path.cwd(),
         )
 
 
@@ -379,6 +383,32 @@ def test_missing_configured_desktop_anchor_fails_closed(
             pool="claude-crew",
             profile_id="claude-1",
             dry_run=True,
+            workspace=Path.cwd(),
+        )
+
+
+def test_missing_configured_base_home_fails_closed(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = _enable_and_provision(load_registry(config), config, "codex-1")
+    base_home = registry.require_provider("codex").base_home
+    assert base_home is not None
+    providers = dict(registry.providers)
+    providers["codex"] = replace(
+        providers["codex"],
+        base_home=base_home.with_name("missing-codex-base"),
+    )
+    registry = replace(registry, providers=providers)
+
+    with pytest.raises(ValueError, match="duplicate_provider_identity"):
+        select_and_acquire(
+            registry,
+            task="missing-base-home",
+            pool="codex-crew",
+            profile_id="codex-1",
+            dry_run=True,
+            workspace=Path.cwd(),
         )
 
 
@@ -390,6 +420,7 @@ def test_claude_worker_environment_blocks_login_logout_and_scrubs_ambient(
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "poison")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "poison")
     monkeypatch.setenv("CODEX_HOME", "/tmp/poison")
+    monkeypatch.setenv("AGENT_FLEET_QUOTA_FIXTURE_DIR", "/tmp/poison")
     environment = provider_environment(profile, "managed-task")
     assert environment["CLAUDE_CONFIG_DIR"] == str(profile.home)
     assert environment["DISABLE_LOGIN_COMMAND"] == "1"
@@ -397,3 +428,4 @@ def test_claude_worker_environment_blocks_login_logout_and_scrubs_ambient(
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert "CODEX_HOME" not in environment
+    assert "AGENT_FLEET_QUOTA_FIXTURE_DIR" not in environment

@@ -99,9 +99,10 @@ class SecurityKeychain:
             raise ValueError("macOS Keychain control is unsafe")
         return self.binary
 
-    def _execution_context(self) -> tuple[Path, str, Path, dict[str, str]]:
+    def _execution_context(
+        self, account: str
+    ) -> tuple[Path, str, Path, dict[str, str]]:
         binary = self._verified_binary()
-        account = _keychain_account()
         home = current_user_home()
         environment = {
             "HOME": str(home),
@@ -116,6 +117,15 @@ class SecurityKeychain:
         return binary, account, home, environment
 
     @staticmethod
+    def _validate_scope(service: str, account: str, expected_account: str) -> None:
+        if (
+            CLAUDE_KEYCHAIN_SERVICE.fullmatch(service) is None
+            or not account
+            or account != expected_account
+        ):
+            raise ValueError("refusing an unscoped Claude Keychain operation")
+
+    @staticmethod
     def _prefix(
         binary: Path,
         operation: str,
@@ -123,16 +133,15 @@ class SecurityKeychain:
         account: str,
         expected_account: str,
     ) -> list[str]:
-        if (
-            CLAUDE_KEYCHAIN_SERVICE.fullmatch(service) is None
-            or not account
-            or account != expected_account
-        ):
-            raise ValueError("refusing an unscoped Claude Keychain operation")
+        SecurityKeychain._validate_scope(service, account, expected_account)
         return [str(binary), operation, "-s", service, "-a", account]
 
     def exists(self, service: str, account: str) -> bool:
-        binary, expected_account, home, environment = self._execution_context()
+        expected_account = _keychain_account()
+        self._validate_scope(service, account, expected_account)
+        binary, expected_account, home, environment = self._execution_context(
+            expected_account
+        )
         result = subprocess.run(
             self._prefix(
                 binary,
@@ -155,7 +164,12 @@ class SecurityKeychain:
     def copy(self, source: str, destination: str, account: str) -> None:
         # `security -w` writes the secret only to the pipe. The destination
         # command receives it through stdin because -w is its final option.
-        binary, expected_account, home, environment = self._execution_context()
+        expected_account = _keychain_account()
+        self._validate_scope(source, account, expected_account)
+        self._validate_scope(destination, account, expected_account)
+        binary, expected_account, home, environment = self._execution_context(
+            expected_account
+        )
         reader = subprocess.Popen(
             [
                 *self._prefix(
@@ -205,7 +219,11 @@ class SecurityKeychain:
             raise ValueError("scoped Claude Keychain copy failed")
 
     def delete(self, service: str, account: str, *, missing_ok: bool = False) -> None:
-        binary, expected_account, home, environment = self._execution_context()
+        expected_account = _keychain_account()
+        self._validate_scope(service, account, expected_account)
+        binary, expected_account, home, environment = self._execution_context(
+            expected_account
+        )
         result = subprocess.run(
             self._prefix(
                 binary,

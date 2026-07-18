@@ -30,6 +30,34 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def host_system_tool_paths() -> dict[str, Path]:
+    def usable(path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == 0
+            and not stat.S_IMODE(metadata.st_mode) & 0o022
+            and Path(os.path.realpath(path)) == path
+            and os.access(path, os.X_OK)
+        )
+
+    fallback = next(
+        path
+        for path in map(
+            Path,
+            ("/usr/bin/true", "/bin/true", "/usr/bin/env", "/bin/echo"),
+        )
+        if usable(path)
+    )
+    return {
+        name: path if usable(path) else fallback
+        for name, path in builder.SYSTEM_TOOL_PATHS.items()
+    }
+
+
 class ManifestFixture:
     def __init__(self, temporary: Path) -> None:
         self.root = temporary
@@ -152,10 +180,15 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sealed-builder-test-")
         self.root = Path(os.path.realpath(self.temporary.name))
+        self.system_tools_patch = mock.patch.object(
+            builder, "SYSTEM_TOOL_PATHS", host_system_tool_paths()
+        )
+        self.system_tools_patch.start()
         self.fixture = ManifestFixture(self.root)
 
     def tearDown(self) -> None:
         builder._unseal(self.root)
+        self.system_tools_patch.stop()
         self.temporary.cleanup()
 
     def test_manifest_accepts_exact_four_role_schema(self) -> None:

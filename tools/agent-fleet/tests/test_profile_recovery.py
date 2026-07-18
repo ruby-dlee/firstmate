@@ -4297,6 +4297,11 @@ def test_security_keychain_rejects_default_or_non_derived_service(
     service: str,
 ) -> None:
     monkeypatch.setattr(recovery, "_keychain_account", lambda: "fixture-user")
+    monkeypatch.setattr(
+        SecurityKeychain,
+        "_verified_binary",
+        lambda self: pytest.fail("binary verification ran before scope validation"),
+    )
     with pytest.raises(ValueError, match="unscoped Claude Keychain operation"):
         SecurityKeychain().exists(service, "fixture-user")
 

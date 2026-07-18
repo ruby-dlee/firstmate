@@ -2740,6 +2740,93 @@ def test_non_macos_claude_file_install_refuses_pre_replace_generation_race(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "profile_id",
+        "original_state",
+        "authorized_phase",
+        "allow_absent_forward",
+        "race_target",
+    ),
+    [
+        ("codex-1", "present", "rollback-file-replace-authorized", False, "stable"),
+        ("codex-1", "absent", "rollback-file-delete-authorized", False, "stable"),
+        ("claude-1", "present", "rollback-file-replace-authorized", False, "stable"),
+        ("claude-1", "absent", "rollback-file-delete-authorized", False, "stable"),
+        ("claude-1", "removed", "rollback-file-replace-authorized", True, "stable"),
+        ("codex-1", "present", "rollback-file-replace-authorized", False, "rollback"),
+    ],
+)
+def test_file_credential_rollback_preserves_pre_mutation_race(
+    fleet: tuple[Registry, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    profile_id: str,
+    original_state: str,
+    authorized_phase: str,
+    allow_absent_forward: bool,
+    race_target: str,
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile(profile_id)
+    stable_name = ".credentials.json" if target.provider == "claude" else "auth.json"
+    stable = target.home / stable_name
+    backup = target.home / f".{stable_name}.race-backup"
+    rollback = target.home / f".{stable_name}.race-rollback"
+    journal_path = target.home / f".{stable_name}.race-journal"
+    original = b'{"credential":"original-generation"}\n'
+    forward = b'{"credential":"transaction-forward-generation"}\n'
+    foreign = b'{"credential":"foreign-racing-generation"}\n'
+    journal: dict[str, Any] = {}
+
+    if original_state in {"present", "removed"}:
+        atomic_write_bytes(stable, original)
+        journal["original_credential_stat"] = recovery._stat_payload(
+            recovery._private_file(stable, "test original credential")
+        )
+        atomic_write_bytes(backup, original)
+    else:
+        journal["original_credential_stat"] = None
+
+    if original_state == "removed":
+        stable.unlink()
+    else:
+        atomic_write_bytes(stable, forward)
+        journal["installed_credential_stat"] = recovery._stat_payload(
+            recovery._private_file(stable, "test transaction credential")
+        )
+    atomic_write_json(journal_path, journal)
+
+    real_write = recovery._write_recovery_journal
+
+    def inject_foreign_generation(
+        path: Path,
+        payload: dict[str, Any],
+        phase: str,
+    ) -> None:
+        real_write(path, payload, phase)
+        if phase == authorized_phase:
+            atomic_write_bytes(rollback if race_target == "rollback" else stable, foreign)
+
+    monkeypatch.setattr(recovery, "_write_recovery_journal", inject_foreign_generation)
+    with pytest.raises(ValueError, match="changed immediately before credential rollback"):
+        recovery._rollback_file_credential(
+            target,
+            stable_name,
+            backup,
+            {"rollback_temp": rollback},
+            journal_path,
+            journal,
+            allow_absent_forward=allow_absent_forward,
+        )
+
+    if race_target == "rollback":
+        assert stable.read_bytes() == forward
+        assert rollback.read_bytes() == foreign
+    else:
+        assert stable.read_bytes() == foreign
+    assert journal_path.exists()
+
+
 def _prepare_claude_origin(
     registry: Registry,
     keychain: FileKeychain,

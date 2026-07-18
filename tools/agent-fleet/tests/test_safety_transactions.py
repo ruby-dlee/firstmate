@@ -557,6 +557,81 @@ def test_pending_credential_journal_fences_control_plane_after_policy_drift(
     assert journal_path.exists()
 
 
+def test_selection_rechecks_pending_credential_journal_after_reclaiming_provider_lock(
+    fleet: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    registry = replace(
+        registry,
+        settings=replace(registry.settings, lock_stale_seconds=1),
+    )
+    save_registry(registry, config)
+    registry = _enable_and_provision(load_registry(config), config, "codex-1")
+
+    ready_read, ready_write = os.pipe()
+    proceed_read, proceed_write = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - intentional abandoned maintenance owner
+        os.close(ready_read)
+        os.close(proceed_write)
+        lock = provider_enrollment_lock(
+            registry.settings.state_dir,
+            "codex",
+            registry.settings.lock_stale_seconds,
+        )
+        lock.acquire()
+        os.write(ready_write, b"1")
+        if os.read(proceed_read, 1) != b"1":
+            os._exit(90)
+        _write_pending_credential_journal(registry, "codex", "codex-1")
+        os._exit(0)
+
+    os.close(ready_write)
+    os.close(proceed_read)
+    assert os.read(ready_read, 1) == b"1"
+    real_fence = scheduler_module.assert_no_pending_credential_recovery
+    fence_calls = 0
+    child_reaped = False
+
+    def create_abandoned_transaction_after_entry_fence(*args, **kwargs) -> None:
+        nonlocal child_reaped, fence_calls
+        fence_calls += 1
+        real_fence(*args, **kwargs)
+        if fence_calls == 1:
+            os.write(proceed_write, b"1")
+            _, status = os.waitpid(child, 0)
+            child_reaped = True
+            assert os.waitstatus_to_exitcode(status) == 0
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "assert_no_pending_credential_recovery",
+        create_abandoned_transaction_after_entry_fence,
+    )
+    try:
+        with pytest.raises(ValueError, match="blocks profile selection"):
+            select_and_acquire(
+                registry,
+                task="pending-after-selection-entry-fence",
+                pool="codex-crew",
+                profile_id="codex-1",
+                workspace=Path.cwd(),
+                config_path=config,
+            )
+    finally:
+        os.close(ready_read)
+        os.close(proceed_write)
+        if not child_reaped:
+            _, status = os.waitpid(child, 0)
+            child_reaped = True
+            assert os.waitstatus_to_exitcode(status) == 90
+
+    assert fence_calls == 2
+    assert active_leases(registry) == []
+
+
 def test_lease_creation_and_binding_require_process_start_tokens(
     fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

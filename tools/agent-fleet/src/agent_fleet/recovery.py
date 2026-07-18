@@ -473,6 +473,18 @@ def _same_stat(path: Path, encoded: object, *, ctime: bool = True) -> bool:
     return all(encoded.get(field) == observed[field] for field in fields)
 
 
+def _stat_matches_generation(
+    observed: dict[str, int],
+    encoded: object,
+    *,
+    ctime: bool,
+) -> bool:
+    if not isinstance(encoded, dict):
+        return False
+    fields = set(observed) if ctime else set(observed) - {"ctime_ns"}
+    return all(encoded.get(field) == observed[field] for field in fields)
+
+
 def _file_generation(path: Path, label: str) -> dict[str, Any]:
     before = _private_file(path, label)
     payload = read_private_bytes(path, label=label)
@@ -2013,17 +2025,32 @@ def _rollback_file_credential(
 ) -> None:
     stable = target.home / stable_name
     original = journal.get("original_credential_stat")
-    installed = journal.get("installed_credential_stat") or journal.get(
-        "prepared_credential_stat"
-    )
+    installed = journal.get("installed_credential_stat")
+    installed_requires_ctime = installed is not None
+    if installed is None:
+        installed = journal.get("prepared_credential_stat")
     restored = journal.get("rollback_file_installed_stat")
     if original is None:
         if not (stable.exists() or stable.is_symlink()):
             _fsync(target.home)
             return
-        if not (installed and _same_stat(stable, installed, ctime=False)):
+        observed_forward = _stat_payload(
+            _private_file(stable, "transaction-installed stable credential")
+        )
+        if not _stat_matches_generation(
+            observed_forward,
+            installed,
+            ctime=installed_requires_ctime,
+        ):
             raise ValueError("stable credential changed outside the recovery transaction")
         _write_recovery_journal(journal_path, journal, "rollback-file-delete-authorized")
+        current_forward = _stat_payload(
+            _private_file(stable, "transaction-installed stable credential")
+        )
+        if current_forward != observed_forward:
+            raise ValueError(
+                "stable credential changed immediately before credential rollback deletion"
+            )
         stable.unlink()
         _fsync(target.home)
         journal["rollback_file_deleted"] = True
@@ -2046,11 +2073,21 @@ def _rollback_file_credential(
         _write_recovery_journal(journal_path, journal, "rollback-file-installed")
         return
 
-    current_forward = bool(installed and _same_stat(stable, installed, ctime=False))
-    if not current_forward and not (
-        allow_absent_forward and not (stable.exists() or stable.is_symlink())
-    ):
-        raise ValueError("stable credential changed outside the recovery transaction")
+    forward_absent = not (stable.exists() or stable.is_symlink())
+    observed_forward: dict[str, int] | None = None
+    if forward_absent:
+        if not allow_absent_forward:
+            raise ValueError("stable credential changed outside the recovery transaction")
+    else:
+        observed_forward = _stat_payload(
+            _private_file(stable, "transaction-installed stable credential")
+        )
+        if not _stat_matches_generation(
+            observed_forward,
+            installed,
+            ctime=installed_requires_ctime,
+        ):
+            raise ValueError("stable credential changed outside the recovery transaction")
 
     if prepared is None:
         if rollback.exists() or rollback.is_symlink():
@@ -2068,7 +2105,36 @@ def _rollback_file_credential(
         if not _same_stat(rollback, prepared, ctime=False):
             raise ValueError("prepared credential rollback generation changed")
 
+    prepared_generation = _stat_payload(
+        _private_file(rollback, "prepared credential rollback generation")
+    )
+    if not _stat_matches_generation(
+        prepared_generation,
+        journal.get("rollback_file_prepared_stat"),
+        ctime=False,
+    ):
+        raise ValueError("prepared credential rollback generation changed")
     _write_recovery_journal(journal_path, journal, "rollback-file-replace-authorized")
+    if forward_absent:
+        if stable.exists() or stable.is_symlink():
+            raise ValueError(
+                "stable credential changed immediately before credential rollback replacement"
+            )
+    else:
+        current_forward = _stat_payload(
+            _private_file(stable, "transaction-installed stable credential")
+        )
+        if current_forward != observed_forward:
+            raise ValueError(
+                "stable credential changed immediately before credential rollback replacement"
+            )
+    current_prepared = _stat_payload(
+        _private_file(rollback, "prepared credential rollback generation")
+    )
+    if current_prepared != prepared_generation:
+        raise ValueError(
+            "prepared credential changed immediately before credential rollback replacement"
+        )
     os.replace(rollback, stable)
     _fsync(target.home)
     journal["rollback_file_installed_stat"] = _stat_payload(

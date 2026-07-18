@@ -555,6 +555,16 @@ def _select_and_acquire(
             ):
                 require_matching_live_binding()
             require_current_registry("before provider refresh")
+            # The entry fence is the dry-run snapshot point, but a real
+            # selection may wait long enough to reclaim an abandoned provider
+            # lock. Recheck only after the complete provider-lock set is held
+            # so a crashed credential transaction cannot be routed around by
+            # that same invocation.
+            assert_no_pending_credential_recovery(
+                registry,
+                scoped_provider_names,
+                operation="profile selection",
+            )
             validate_readiness()
             live_proofs: dict[str, dict[str, Any]] = {}
             live_failures: dict[str, str] = {}

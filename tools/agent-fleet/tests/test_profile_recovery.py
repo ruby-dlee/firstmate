@@ -1444,11 +1444,14 @@ def test_codex_sigkill_inside_config_atomic_write_is_safely_collectable(
 @pytest.mark.parametrize(
     "rollback_crash",
     [
+        "quarantine-authorized",
+        "post-quarantine",
+        "quarantined",
         "copy-running",
         "mid-copy",
         "prepared",
-        "replace-authorized",
-        "post-replace",
+        "publish-authorized",
+        "post-publish",
         "installed",
         "credential-complete",
     ],
@@ -1494,15 +1497,18 @@ def test_file_rollback_sigkill_is_restart_idempotent(
     )
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     rollback = Path(journal["paths"]["rollback_temp"])
+    quarantine = Path(journal["paths"]["credential_quarantine"])
     stable_name = "auth.json" if provider == "codex" else ".credentials.json"
     stable = registry.require_profile(profile_id).home / stable_name
     real_recovery_write = recovery._write_recovery_journal
     real_copy = recovery._copy_private_file
-    real_replace = recovery.os.replace
+    real_rename_noreplace = recovery._rename_noreplace
     phase_by_crash = {
+        "quarantine-authorized": "rollback-file-quarantine-authorized",
+        "quarantined": "rollback-file-quarantined",
         "copy-running": "rollback-file-copy-running",
         "prepared": "rollback-file-prepared",
-        "replace-authorized": "rollback-file-replace-authorized",
+        "publish-authorized": "rollback-file-publish-authorized",
         "installed": "rollback-file-installed",
         "credential-complete": "rollback-credential-complete",
     }
@@ -1526,15 +1532,20 @@ def test_file_rollback_sigkill_is_restart_idempotent(
             os._exit(94)
         return real_copy(source, destination)
 
-    def crash_post_replace(source, destination, *args, **kwargs):
-        result = real_replace(source, destination, *args, **kwargs)
-        if rollback_crash == "post-replace" and source == rollback and destination == stable:
+    def crash_after_atomic_move(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
+        if (
+            rollback_crash == "post-quarantine"
+            and source == stable
+            and destination == quarantine
+        ):
             os._exit(94)
-        return result
+        if rollback_crash == "post-publish" and source == rollback and destination == stable:
+            os._exit(94)
 
     monkeypatch.setattr(recovery, "_write_recovery_journal", crash_recovery_phase)
     monkeypatch.setattr(recovery, "_copy_private_file", crash_mid_copy)
-    monkeypatch.setattr(recovery.os, "replace", crash_post_replace)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_after_atomic_move)
     reloaded = load_registry(config)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional recovery crash child
@@ -1553,7 +1564,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
     assert os.waitstatus_to_exitcode(status) == 94
     monkeypatch.setattr(recovery, "_write_recovery_journal", real_recovery_write)
     monkeypatch.setattr(recovery, "_copy_private_file", real_copy)
-    monkeypatch.setattr(recovery.os, "replace", real_replace)
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     _expire_abandoned_provider_lock(reloaded, provider)
 
     converged = load_registry(config)
@@ -1570,6 +1581,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
     assert recovered[0]["committed"] is False
     assert _old_auth(converged, profile_id) == old
     assert not rollback.exists()
+    assert not quarantine.exists()
     assert not list(
         (converged.settings.state_dir / "transactions" / "credential-recovery").glob(
             "*.json"
@@ -2749,12 +2761,12 @@ def test_non_macos_claude_file_install_refuses_pre_replace_generation_race(
         "race_target",
     ),
     [
-        ("codex-1", "present", "rollback-file-replace-authorized", False, "stable"),
-        ("codex-1", "absent", "rollback-file-delete-authorized", False, "stable"),
-        ("claude-1", "present", "rollback-file-replace-authorized", False, "stable"),
-        ("claude-1", "absent", "rollback-file-delete-authorized", False, "stable"),
-        ("claude-1", "removed", "rollback-file-replace-authorized", True, "stable"),
-        ("codex-1", "present", "rollback-file-replace-authorized", False, "rollback"),
+        ("codex-1", "present", "rollback-file-quarantine-authorized", False, "stable"),
+        ("codex-1", "absent", "rollback-file-quarantine-authorized", False, "stable"),
+        ("claude-1", "present", "rollback-file-quarantine-authorized", False, "stable"),
+        ("claude-1", "absent", "rollback-file-quarantine-authorized", False, "stable"),
+        ("claude-1", "removed", "rollback-file-publish-authorized", True, "stable"),
+        ("codex-1", "present", "rollback-file-publish-authorized", False, "rollback"),
     ],
 )
 def test_file_credential_rollback_preserves_pre_mutation_race(
@@ -2772,6 +2784,7 @@ def test_file_credential_rollback_preserves_pre_mutation_race(
     stable = target.home / stable_name
     backup = target.home / f".{stable_name}.race-backup"
     rollback = target.home / f".{stable_name}.race-rollback"
+    quarantine = target.home / f".{stable_name}.race-quarantine"
     journal_path = target.home / f".{stable_name}.race-journal"
     original = b'{"credential":"original-generation"}\n'
     forward = b'{"credential":"transaction-forward-generation"}\n'
@@ -2808,22 +2821,159 @@ def test_file_credential_rollback_preserves_pre_mutation_race(
             atomic_write_bytes(rollback if race_target == "rollback" else stable, foreign)
 
     monkeypatch.setattr(recovery, "_write_recovery_journal", inject_foreign_generation)
-    with pytest.raises(ValueError, match="changed immediately before credential rollback"):
+    with pytest.raises(ValueError, match="credential"):
         recovery._rollback_file_credential(
             target,
             stable_name,
             backup,
-            {"rollback_temp": rollback},
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
             journal_path,
             journal,
             allow_absent_forward=allow_absent_forward,
         )
 
     if race_target == "rollback":
-        assert stable.read_bytes() == forward
+        assert not stable.exists()
         assert rollback.read_bytes() == foreign
+        assert quarantine.read_bytes() == forward
+    elif original_state == "removed":
+        assert stable.read_bytes() == foreign
+        assert rollback.read_bytes() == original
+        assert not quarantine.exists()
     else:
         assert stable.read_bytes() == foreign
+        assert not quarantine.exists()
+    assert journal_path.exists()
+
+
+def test_file_credential_rollback_preserves_stable_reappearance_after_quarantine(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable = target.home / "auth.json"
+    backup = target.home / ".auth.json.reappearance-backup"
+    rollback = target.home / ".auth.json.reappearance-rollback"
+    quarantine = target.home / ".auth.json.reappearance-quarantine"
+    journal_path = target.home / ".auth.json.reappearance-journal"
+    original = b'{"credential":"original-generation"}\n'
+    forward = b'{"credential":"transaction-forward-generation"}\n'
+    foreign = b'{"credential":"foreign-racing-generation"}\n'
+
+    atomic_write_bytes(stable, original)
+    journal: dict[str, Any] = {
+        "original_credential_stat": recovery._stat_payload(
+            recovery._private_file(stable, "test original credential")
+        )
+    }
+    atomic_write_bytes(backup, original)
+    atomic_write_bytes(stable, forward)
+    journal["installed_credential_stat"] = recovery._stat_payload(
+        recovery._private_file(stable, "test transaction credential")
+    )
+    atomic_write_json(journal_path, journal)
+
+    real_rename_noreplace = recovery._rename_noreplace
+
+    def reappear_after_quarantine(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
+        if source == stable and destination == quarantine:
+            atomic_write_bytes(stable, foreign)
+
+    monkeypatch.setattr(recovery, "_rename_noreplace", reappear_after_quarantine)
+    with pytest.raises(ValueError, match="reappeared after atomic quarantine"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
+            journal_path,
+            journal,
+        )
+
+    assert stable.read_bytes() == foreign
+    assert quarantine.read_bytes() == forward
+    assert not rollback.exists()
+    assert journal_path.exists()
+
+    with pytest.raises(ValueError, match="prior generation is quarantined"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
+            journal_path,
+            journal,
+        )
+    assert stable.read_bytes() == foreign
+    assert quarantine.read_bytes() == forward
+
+
+def test_file_credential_rollback_preserves_ambiguous_unverified_publish(
+    fleet: tuple[Registry, Path],
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable = target.home / "auth.json"
+    backup = target.home / ".auth.json.ambiguous-backup"
+    rollback = target.home / ".auth.json.ambiguous-rollback"
+    quarantine = target.home / ".auth.json.ambiguous-quarantine"
+    journal_path = target.home / ".auth.json.ambiguous-journal"
+    original = b'{"credential":"original-generation"}\n'
+    forward = b'{"credential":"transaction-forward-generation"}\n'
+    foreign = b'{"credential":"foreign-prepared-generation"}\n'
+
+    atomic_write_bytes(stable, original)
+    journal: dict[str, Any] = {
+        "original_credential_stat": recovery._stat_payload(
+            recovery._private_file(stable, "test original credential")
+        )
+    }
+    atomic_write_bytes(backup, original)
+    atomic_write_bytes(stable, forward)
+    journal["installed_credential_stat"] = recovery._stat_payload(
+        recovery._private_file(stable, "test transaction credential")
+    )
+    journal["rollback_file_observed_forward_stat"] = journal["installed_credential_stat"]
+    recovery._rename_noreplace(stable, quarantine)
+    journal["rollback_file_quarantine_stat"] = recovery._stat_payload(
+        recovery._private_file(quarantine, "test quarantined credential")
+    )
+    atomic_write_bytes(rollback, original)
+    journal["rollback_file_prepared_stat"] = recovery._stat_payload(
+        recovery._private_file(rollback, "test prepared credential")
+    )
+    journal["recovery_phase"] = "rollback-file-publish-authorized"
+    atomic_write_json(journal_path, journal)
+
+    atomic_write_bytes(rollback, foreign)
+    recovery._rename_noreplace(rollback, stable)
+
+    with pytest.raises(ValueError, match="prior generation is quarantined"):
+        recovery._rollback_file_credential(
+            target,
+            "auth.json",
+            backup,
+            {
+                "rollback_temp": rollback,
+                "credential_quarantine": quarantine,
+            },
+            journal_path,
+            journal,
+        )
+
+    assert stable.read_bytes() == foreign
+    assert quarantine.read_bytes() == forward
+    assert not rollback.exists()
     assert journal_path.exists()
 
 

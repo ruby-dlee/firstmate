@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import pwd
@@ -53,6 +55,7 @@ from .util import (
     process_start_token,
     read_private_bytes,
     read_private_json,
+    unlink_private_file,
     utc_now,
 )
 
@@ -780,6 +783,9 @@ def _transaction_paths(
         "provisional_guard_backup": str(stage / ".provisional-guard.backup"),
         "install_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.new"),
         "rollback_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.rollback"),
+        "credential_quarantine": str(
+            profile.home / f".agent-fleet-recovery-{nonce}.quarantine"
+        ),
         "bundle_restore_temp": str(
             identity_bundle_path(registry, profile.provider).with_name(
                 f".{identity_bundle_path(registry, profile.provider).name}.rollback-{nonce}"
@@ -2013,6 +2019,89 @@ def _install_claude(
     _write_journal(journal_path, journal, "credential-installed")
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically move one private path without replacing the destination."""
+
+    source_parent = open_private_dir(source.parent)
+    destination_parent = (
+        source_parent
+        if source.parent == destination.parent
+        else open_private_dir(destination.parent)
+    )
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        kernel = os.uname().sysname.lower()
+        if kernel == "darwin":
+            try:
+                rename = libc.renameatx_np
+            except AttributeError as exc:  # pragma: no cover - unsupported Darwin
+                raise ValueError("atomic no-replace rename is unavailable") from exc
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            flags = 0x00000004  # RENAME_EXCL
+        elif kernel == "linux":
+            try:
+                rename = libc.renameat2
+            except AttributeError as exc:  # pragma: no cover - unsupported libc
+                raise ValueError("atomic no-replace rename is unavailable") from exc
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            flags = 0x00000001  # RENAME_NOREPLACE
+        else:  # pragma: no cover - supported production/test platforms are Darwin/Linux
+            raise ValueError("atomic no-replace rename is unavailable")
+        rename.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = rename(
+            source_parent,
+            os.fsencode(source.name),
+            destination_parent,
+            os.fsencode(destination.name),
+            flags,
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error))
+        if error in {errno.EINVAL, errno.ENOSYS, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+            raise ValueError("atomic no-replace rename is unsupported by this filesystem")
+        raise OSError(error, os.strerror(error))
+    finally:
+        if destination_parent != source_parent:
+            os.close(destination_parent)
+        os.close(source_parent)
+
+
+def _restore_misattributed_move(
+    source: Path,
+    destination: Path,
+    moved_generation: dict[str, int],
+    *,
+    label: str,
+) -> None:
+    """Return a moved foreign generation without overwriting a new destination."""
+
+    try:
+        _rename_noreplace(source, destination)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"{label} attribution failed and both generations were preserved"
+        ) from exc
+    restored = _stat_payload(_private_file(destination, label))
+    if not _stat_matches_generation(restored, moved_generation, ctime=False):
+        raise ValueError(f"{label} changed while its misattributed move was restored")
+
+
 def _rollback_file_credential(
     target: Profile,
     stable_name: str,
@@ -2024,61 +2113,59 @@ def _rollback_file_credential(
     allow_absent_forward: bool = False,
 ) -> None:
     stable = target.home / stable_name
+    rollback = paths["rollback_temp"]
+    quarantine = paths["credential_quarantine"]
     original = journal.get("original_credential_stat")
     installed = journal.get("installed_credential_stat")
     installed_requires_ctime = installed is not None
     if installed is None:
         installed = journal.get("prepared_credential_stat")
     restored = journal.get("rollback_file_installed_stat")
-    if original is None:
-        if not (stable.exists() or stable.is_symlink()):
-            _fsync(target.home)
-            return
-        observed_forward = _stat_payload(
-            _private_file(stable, "transaction-installed stable credential")
+    prepared = journal.get("rollback_file_prepared_stat")
+    quarantine_generation: dict[str, int] | None = None
+    if quarantine.exists() or quarantine.is_symlink():
+        quarantine_generation = _stat_payload(
+            _private_file(quarantine, "quarantined credential generation")
         )
+        expected_quarantine = journal.get("rollback_file_quarantine_stat") or journal.get(
+            "rollback_file_observed_forward_stat"
+        )
+        expected_has_post_move_ctime = journal.get("rollback_file_quarantine_stat") is not None
         if not _stat_matches_generation(
-            observed_forward,
-            installed,
-            ctime=installed_requires_ctime,
+            quarantine_generation,
+            expected_quarantine,
+            ctime=expected_has_post_move_ctime,
         ):
-            raise ValueError("stable credential changed outside the recovery transaction")
-        _write_recovery_journal(journal_path, journal, "rollback-file-delete-authorized")
-        current_forward = _stat_payload(
-            _private_file(stable, "transaction-installed stable credential")
-        )
-        if current_forward != observed_forward:
-            raise ValueError(
-                "stable credential changed immediately before credential rollback deletion"
-            )
-        stable.unlink()
-        _fsync(target.home)
+            raise ValueError("credential quarantine contains an unattributed generation")
+        if journal.get("rollback_file_quarantine_stat") is None:
+            journal["rollback_file_quarantine_stat"] = quarantine_generation
+            _write_recovery_journal(journal_path, journal, "rollback-file-quarantined")
+
+    stable_exists = stable.exists() or stable.is_symlink()
+    if original is not None and stable_exists:
+        for expected in (original, restored, prepared):
+            if expected is not None and _same_stat(stable, expected, ctime=False):
+                if rollback.exists() or rollback.is_symlink():
+                    raise ValueError(
+                        "restored credential and prepared rollback source both exist"
+                    )
+                journal["rollback_file_installed_stat"] = _stat_payload(
+                    _private_file(stable, "restored credential generation")
+                )
+                _write_recovery_journal(journal_path, journal, "rollback-file-installed")
+                return
+
+    if quarantine_generation is not None and stable_exists:
+        raise ValueError("stable credential appeared while its prior generation is quarantined")
+
+    if original is None and quarantine_generation is not None:
+        if stable_exists:
+            raise ValueError("stable credential reappeared during rollback deletion")
         journal["rollback_file_deleted"] = True
         _write_recovery_journal(journal_path, journal, "rollback-file-installed")
         return
-    if _same_stat(stable, original):
-        return
-    if restored is not None and _same_stat(stable, restored, ctime=False):
-        return
 
-    rollback = paths["rollback_temp"]
-    prepared = journal.get("rollback_file_prepared_stat")
-    if prepared is not None and _same_stat(stable, prepared, ctime=False):
-        if rollback.exists() or rollback.is_symlink():
-            raise ValueError("rollback generation exists at both stable and temporary paths")
-        _fsync(target.home)
-        journal["rollback_file_installed_stat"] = _stat_payload(
-            _private_file(stable, "restored credential generation")
-        )
-        _write_recovery_journal(journal_path, journal, "rollback-file-installed")
-        return
-
-    forward_absent = not (stable.exists() or stable.is_symlink())
-    observed_forward: dict[str, int] | None = None
-    if forward_absent:
-        if not allow_absent_forward:
-            raise ValueError("stable credential changed outside the recovery transaction")
-    else:
+    if quarantine_generation is None and stable_exists:
         observed_forward = _stat_payload(
             _private_file(stable, "transaction-installed stable credential")
         )
@@ -2088,6 +2175,39 @@ def _rollback_file_credential(
             ctime=installed_requires_ctime,
         ):
             raise ValueError("stable credential changed outside the recovery transaction")
+        journal["rollback_file_observed_forward_stat"] = observed_forward
+        _write_recovery_journal(journal_path, journal, "rollback-file-quarantine-authorized")
+        try:
+            _rename_noreplace(stable, quarantine)
+        except FileExistsError as exc:
+            raise ValueError("credential quarantine path already exists") from exc
+        moved_forward = _stat_payload(
+            _private_file(quarantine, "quarantined credential generation")
+        )
+        if not _stat_matches_generation(moved_forward, observed_forward, ctime=False):
+            _restore_misattributed_move(
+                quarantine,
+                stable,
+                moved_forward,
+                label="misattributed stable credential",
+            )
+            raise ValueError("stable credential changed during atomic quarantine")
+        journal["rollback_file_quarantine_stat"] = moved_forward
+        _write_recovery_journal(journal_path, journal, "rollback-file-quarantined")
+        quarantine_generation = moved_forward
+        if stable.exists() or stable.is_symlink():
+            raise ValueError("stable credential reappeared after atomic quarantine")
+    elif quarantine_generation is None and not stable_exists:
+        if original is None:
+            _fsync(target.home)
+            return
+        if not allow_absent_forward:
+            raise ValueError("stable credential changed outside the recovery transaction")
+
+    if original is None:
+        journal["rollback_file_deleted"] = True
+        _write_recovery_journal(journal_path, journal, "rollback-file-installed")
+        return
 
     if prepared is None:
         if rollback.exists() or rollback.is_symlink():
@@ -2114,32 +2234,24 @@ def _rollback_file_credential(
         ctime=False,
     ):
         raise ValueError("prepared credential rollback generation changed")
-    _write_recovery_journal(journal_path, journal, "rollback-file-replace-authorized")
-    if forward_absent:
-        if stable.exists() or stable.is_symlink():
-            raise ValueError(
-                "stable credential changed immediately before credential rollback replacement"
-            )
-    else:
-        current_forward = _stat_payload(
-            _private_file(stable, "transaction-installed stable credential")
+    _write_recovery_journal(journal_path, journal, "rollback-file-publish-authorized")
+    try:
+        _rename_noreplace(rollback, stable)
+    except FileExistsError as exc:
+        raise ValueError("stable credential appeared before no-replace rollback publish") from exc
+    published = _stat_payload(_private_file(stable, "restored credential generation"))
+    if not _stat_matches_generation(published, prepared_generation, ctime=False):
+        _restore_misattributed_move(
+            stable,
+            rollback,
+            published,
+            label="misattributed published credential",
         )
-        if current_forward != observed_forward:
-            raise ValueError(
-                "stable credential changed immediately before credential rollback replacement"
-            )
-    current_prepared = _stat_payload(
-        _private_file(rollback, "prepared credential rollback generation")
-    )
-    if current_prepared != prepared_generation:
-        raise ValueError(
-            "prepared credential changed immediately before credential rollback replacement"
-        )
-    os.replace(rollback, stable)
+        raise ValueError("prepared credential changed during no-replace rollback publish")
+    if rollback.exists() or rollback.is_symlink():
+        raise ValueError("prepared credential source reappeared after rollback publish")
     _fsync(target.home)
-    journal["rollback_file_installed_stat"] = _stat_payload(
-        _private_file(stable, "restored credential generation")
-    )
+    journal["rollback_file_installed_stat"] = published
     _write_recovery_journal(journal_path, journal, "rollback-file-installed")
 
 
@@ -2243,7 +2355,22 @@ def _rollback_local_credential(
     _write_recovery_journal(journal_path, journal, "rollback-credential-complete")
 
 
-def _clean_exact_temporaries(paths: dict[str, Path]) -> None:
+def _clean_exact_temporaries(paths: dict[str, Path], journal: dict[str, Any]) -> None:
+    credential_quarantine = paths["credential_quarantine"]
+    if credential_quarantine.exists() or credential_quarantine.is_symlink():
+        observed = _stat_payload(
+            _private_file(credential_quarantine, "quarantined credential generation")
+        )
+        if not _stat_matches_generation(
+            observed,
+            journal.get("rollback_file_quarantine_stat"),
+            ctime=True,
+        ):
+            raise ValueError("credential quarantine changed before attributed cleanup")
+        unlink_private_file(
+            credential_quarantine,
+            label="quarantined credential generation",
+        )
     for name in (
         "install_temp",
         "rollback_temp",
@@ -2394,7 +2521,7 @@ def recover_pending_profile_recoveries(
                     journal_path,
                     journal,
                 )
-        _clean_exact_temporaries(paths)
+        _clean_exact_temporaries(paths, journal)
         _cleanup_keychain(
             transaction_controls,
             target,
@@ -3082,7 +3209,7 @@ def _profile_login_transaction(
                 initialization_complete=workflow == "initialize" and ready,
             )
             failure_stage = "transaction_cleanup"
-            _clean_exact_temporaries(paths)
+            _clean_exact_temporaries(paths, journal)
             _cleanup_keychain(
                 controls,
                 target,

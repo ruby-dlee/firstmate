@@ -5,8 +5,11 @@ import hashlib
 import io
 import json
 import os
+import signal
 import shutil
+import subprocess
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -119,6 +122,64 @@ class WorkerStateTransactionTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(value.home))
         for path in self.manifest.identity_bundles.values():
             self.assertFalse(os.path.lexists(path))
+
+    def test_identity_rollback_resumes_sigkill_after_exchange_and_preserves_foreign_state(self) -> None:
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        self._write_identity_bundles()
+        injector = textwrap.dedent(
+            f"""\
+            import os, signal, sys
+            from pathlib import Path
+            sys.path.insert(0, {str(SCRIPT_DIR)!r})
+            import bridge_worker_state_transaction as module
+            class KillAfterIdentityExchange(module.BoundaryController):
+                def hit(self, label):
+                    super().hit(label)
+                    if label == "after_exchange:identity:claude":
+                        os.kill(os.getpid(), signal.SIGKILL)
+            manifest = module.load_manifest(Path({str(self.manifest_path)!r}))
+            module.rollback(manifest, KillAfterIdentityExchange())
+            """
+        )
+        killed = subprocess.run(
+            [sys.executable, "-c", injector],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+        self.assertEqual(killed.returncode, -signal.SIGKILL)
+        journal = json.loads(
+            self.manifest.journal_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(journal["identity_restore"]["provider"], "claude")
+        self.assertEqual(journal["identity_restore"]["phase"], "exchanged")
+        identity = self.manifest.identity_bundles["claude"]
+        temporary = list(identity.parent.glob(f".{identity.name}.restore-*"))
+        self.assertEqual(len(temporary), 1)
+
+        identity.write_text('{"foreign-after-crash":true}', encoding="utf-8")
+        identity.chmod(0o600)
+        with self.assertRaisesRegex(
+            worker_state.WorkerStateError,
+            "ambiguous interrupted absent restore",
+        ):
+            worker_state.rollback(self.manifest)
+        self.assertEqual(
+            identity.read_text(encoding="utf-8"), '{"foreign-after-crash":true}'
+        )
+        self.assertEqual(list(identity.parent.glob(f".{identity.name}.restore-*")), temporary)
+
+        identity.unlink()
+        result = worker_state.rollback(self.manifest)
+        self.assertEqual(result["phase"], "rolled_back")
+        self.assertFalse(os.path.lexists(identity))
+        self.assertFalse(list(identity.parent.glob(f".{identity.name}.restore-*")))
 
     def test_credential_guard_blocks_verification_and_secret_is_not_snapshotted(self) -> None:
         target_worker = next(

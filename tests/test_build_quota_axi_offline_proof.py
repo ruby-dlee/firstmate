@@ -13,6 +13,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/bridge-cutover/build_quota_axi_offline_proof.py"
@@ -271,21 +272,29 @@ class QuotaOfflineProofTests(unittest.TestCase):
             quota_proof._package_members(package),
         )
         controls = sorted(path.name for path in scratch.iterdir())
-        self.assertEqual(len(controls), 2)
-        self.assertTrue(any(name.endswith(".journal.json") for name in controls))
-        self.assertTrue(any(name.endswith(".lock") for name in controls))
+        self.assertEqual(len(controls), 1)
+        self.assertTrue(controls[0].endswith(".journal.json"))
         self.assertEqual(quota_proof.build(spec_path), (package, proof))
 
-        build_id = hashlib.sha256(
-            b"bridge-quota-offline-build-v1\0"
-            + bytes.fromhex(quota_proof._sha(spec_path))
-        ).hexdigest()
+        winner_package = package.read_bytes()
+        winner_proof = proof.read_bytes()
+        second_scratch = self.root / "second-scratch"
+        second_scratch.mkdir()
+        second_spec = {**spec, "scratch_parent": str(second_scratch)}
+        second_spec_path = self.root / "second-spec.json"
+        second_spec_path.write_bytes(quota_proof._canonical(second_spec))
+        self.assertEqual(
+            quota_proof._lock_path(package, proof),
+            quota_proof._lock_path(
+                Path(second_spec["package_tarball"]), Path(second_spec["proof"])
+            ),
+        )
         held_lock = quota_proof._open_build_lock(
-            quota_proof._lock_path(scratch, build_id)
+            quota_proof._lock_path(package, proof)
         )
         try:
             concurrent = subprocess.run(
-                [sys.executable, str(SCRIPT), "--spec", str(spec_path)],
+                [sys.executable, str(SCRIPT), "--spec", str(second_spec_path)],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -296,6 +305,12 @@ class QuotaOfflineProofTests(unittest.TestCase):
             os.close(held_lock)
         self.assertNotEqual(concurrent.returncode, 0)
         self.assertIn("already running", concurrent.stderr)
+        self.assertEqual(package.read_bytes(), winner_package)
+        self.assertEqual(proof.read_bytes(), winner_proof)
+        with self.assertRaisesRegex(quota_proof.ProofError, "without an attributable journal"):
+            quota_proof.build(second_spec_path)
+        self.assertEqual(package.read_bytes(), winner_package)
+        self.assertEqual(proof.read_bytes(), winner_proof)
 
         for phase in quota_proof.JOURNAL_PHASES:
             with self.subTest(kill_after_phase=phase):
@@ -363,6 +378,125 @@ class QuotaOfflineProofTests(unittest.TestCase):
                         for path in crash_scratch.iterdir()
                     )
                 )
+
+        for output_name in ("package_tarball", "proof"):
+            with self.subTest(kill_after_output_link=output_name):
+                link_root = self.root / f"link-crash-{output_name}"
+                link_root.mkdir()
+                link_scratch = link_root / "scratch"
+                link_scratch.mkdir()
+                link_spec = {
+                    **spec,
+                    "package_tarball": str(link_root / "quota-axi.tgz"),
+                    "proof": str(link_root / "quota-build-proof.json"),
+                    "scratch_parent": str(link_scratch),
+                }
+                link_spec_path = link_root / "spec.json"
+                link_spec_path.write_bytes(quota_proof._canonical(link_spec))
+                linked_output = Path(link_spec[output_name])
+                injector = textwrap.dedent(
+                    f"""\
+                    import importlib.util, os, signal
+                    from pathlib import Path
+                    source = Path({str(SCRIPT)!r})
+                    spec = importlib.util.spec_from_file_location("quota_link_crash", source)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    original = module.os.link
+                    def link(source, destination, *args, **kwargs):
+                        result = original(source, destination, *args, **kwargs)
+                        if Path(destination) == Path({str(linked_output)!r}):
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        return result
+                    module.os.link = link
+                    module.build(Path({str(link_spec_path)!r}))
+                    """
+                )
+                killed = subprocess.run(
+                    [sys.executable, "-c", injector],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(killed.returncode, -signal.SIGKILL)
+                linked_payload = linked_output.read_bytes()
+                linked_output.unlink()
+                linked_output.write_bytes(linked_payload)
+                linked_output.chmod(0o600)
+                foreign_identity = os.lstat(linked_output)
+                with self.assertRaisesRegex(
+                    quota_proof.ProofError, "output generation changed"
+                ):
+                    quota_proof.build(link_spec_path)
+                self.assertEqual(linked_output.read_bytes(), linked_payload)
+                self.assertEqual(
+                    (os.lstat(linked_output).st_dev, os.lstat(linked_output).st_ino),
+                    (foreign_identity.st_dev, foreign_identity.st_ino),
+                )
+                linked_output.unlink()
+                recovered = quota_proof.build(link_spec_path)
+                self.assertEqual(
+                    recovered,
+                    (
+                        Path(link_spec["package_tarball"]),
+                        Path(link_spec["proof"]),
+                    ),
+                )
+                self.assertEqual(recovered[0].read_bytes(), package.read_bytes())
+                self.assertEqual(recovered[1].read_bytes(), proof.read_bytes())
+
+        cleanup_root = self.root / "complete-cleanup-failure"
+        cleanup_root.mkdir()
+        cleanup_scratch = cleanup_root / "scratch"
+        cleanup_scratch.mkdir()
+        cleanup_spec = {
+            **spec,
+            "package_tarball": str(cleanup_root / "quota-axi.tgz"),
+            "proof": str(cleanup_root / "quota-build-proof.json"),
+            "scratch_parent": str(cleanup_scratch),
+        }
+        cleanup_spec_path = cleanup_root / "spec.json"
+        cleanup_spec_path.write_bytes(quota_proof._canonical(cleanup_spec))
+        original_remove = quota_proof._remove_workspace
+        failed_cleanup = False
+
+        def fail_completed_cleanup(
+            path: Path, expected: object
+        ) -> None:
+            nonlocal failed_cleanup
+            if not failed_cleanup:
+                failed_cleanup = True
+                raise OSError("injected completed workspace cleanup failure")
+            original_remove(path, expected)
+
+        with mock.patch.object(
+            quota_proof, "_remove_workspace", side_effect=fail_completed_cleanup
+        ):
+            with self.assertRaisesRegex(OSError, "completed workspace cleanup"):
+                quota_proof.build(cleanup_spec_path)
+        cleanup_build_id = hashlib.sha256(
+            b"bridge-quota-offline-build-v1\0"
+            + bytes.fromhex(quota_proof._sha(cleanup_spec_path))
+        ).hexdigest()
+        cleanup_journal = quota_proof._strict_json(
+            quota_proof._journal_path(cleanup_scratch, cleanup_build_id),
+            "cleanup failure journal",
+        )
+        self.assertEqual(cleanup_journal["phase"], "complete")
+        cleanup_outputs = (
+            Path(cleanup_spec["package_tarball"]),
+            Path(cleanup_spec["proof"]),
+        )
+        self.assertTrue(all(path.exists() for path in cleanup_outputs))
+        self.assertEqual(quota_proof.build(cleanup_spec_path), cleanup_outputs)
+        self.assertEqual(
+            quota_proof._strict_json(
+                quota_proof._journal_path(cleanup_scratch, cleanup_build_id),
+                "recovered cleanup journal",
+            )["phase"],
+            "complete",
+        )
 
         forged_package = self.root / "forged-quota-axi.tgz"
         forged_members = quota_proof._package_members(package)

@@ -21,7 +21,7 @@ import subprocess
 import tarfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 
 class ProofError(RuntimeError):
@@ -33,7 +33,7 @@ COMMIT = __import__("re").compile(r"^[0-9a-f]{40}$")
 SRI = __import__("re").compile(r"^sha512-[A-Za-z0-9+/]+={0,2}$")
 VERSION = __import__("re").compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9._-]+)?$")
 MAX_SPEC = 1_000_000
-JOURNAL_SCHEMA = 1
+JOURNAL_SCHEMA = 2
 JOURNAL_PHASES = ("planned", "workspace", "package", "proof", "complete")
 
 
@@ -448,8 +448,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _lock_path(scratch: Path, build_id: str) -> Path:
-    return scratch / f".quota-proof-{build_id[:32]}.lock"
+def _lock_path(package: Path, proof: Path) -> Path:
+    pair = _canonical(
+        {
+            "package_path": str(package),
+            "proof_path": str(proof),
+        }
+    )
+    digest = _sha_bytes(b"bridge-quota-output-pair-v1\0" + pair)
+    return package.parent / f".quota-proof-output-{digest[:32]}.lock"
 
 
 def _journal_path(scratch: Path, build_id: str) -> Path:
@@ -473,7 +480,9 @@ def _open_build_lock(path: Path) -> int:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise ProofError("an exact-spec Quota offline build is already running") from exc
+            raise ProofError(
+                "a Quota offline build for these output destinations is already running"
+            ) from exc
         return descriptor
     except Exception:
         os.close(descriptor)
@@ -545,8 +554,8 @@ def _journal_value(
     workspaces: Sequence[Path],
     package_path: Path,
     proof_path: Path,
-    package_sha256: str | None = None,
-    proof_sha256: str | None = None,
+    package_generation: Mapping[str, Any] | None = None,
+    proof_generation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if phase not in JOURNAL_PHASES:
         raise ProofError(f"invalid offline-build journal phase: {phase}")
@@ -559,9 +568,86 @@ def _journal_value(
         "workspaces": [str(path) for path in workspaces],
         "package_path": str(package_path),
         "proof_path": str(proof_path),
-        "package_sha256": package_sha256,
-        "proof_sha256": proof_sha256,
+        "package_generation": (
+            None if package_generation is None else dict(package_generation)
+        ),
+        "proof_generation": (
+            None if proof_generation is None else dict(proof_generation)
+        ),
     }
+
+
+def _output_generation(
+    path: Path,
+    payload: bytes,
+    build_id: str,
+    identity: tuple[int, int, str] | None = None,
+) -> dict[str, Any]:
+    digest = _sha_bytes(payload)
+    generation = hashlib.sha256(
+        b"bridge-quota-output-generation-v1\0"
+        + bytes.fromhex(build_id)
+        + str(path).encode("utf-8")
+        + bytes.fromhex(digest)
+    ).hexdigest()
+    staging = path.with_name(
+        f".{path.name}.bridge-write-{generation[:24]}-{digest[:16]}"
+    )
+    return {
+        "path": str(path),
+        "staging_path": str(staging),
+        "generation": generation,
+        "sha256": digest,
+        "size": len(payload),
+        "dev": None if identity is None else identity[0],
+        "ino": None if identity is None else identity[1],
+    }
+
+
+def _validate_output_generation(
+    value: Any,
+    expected_path: Path,
+    build_id: str,
+    label: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "path", "staging_path", "generation", "sha256", "size", "dev", "ino"
+    }:
+        raise ProofError(f"{label} generation fields are not exact")
+    if (
+        value["path"] != str(expected_path)
+        or not isinstance(value["generation"], str)
+        or not SHA256.fullmatch(value["generation"])
+        or not isinstance(value["sha256"], str)
+        or not SHA256.fullmatch(value["sha256"])
+        or not isinstance(value["size"], int)
+        or isinstance(value["size"], bool)
+        or value["size"] < 0
+    ):
+        raise ProofError(f"{label} generation identity is invalid")
+    expected_generation = hashlib.sha256(
+        b"bridge-quota-output-generation-v1\0"
+        + bytes.fromhex(build_id)
+        + str(expected_path).encode("utf-8")
+        + bytes.fromhex(value["sha256"])
+    ).hexdigest()
+    expected_staging = expected_path.with_name(
+        f".{expected_path.name}.bridge-write-"
+        f"{expected_generation[:24]}-{value['sha256'][:16]}"
+    )
+    if (
+        value["generation"] != expected_generation
+        or value["staging_path"] != str(expected_staging)
+    ):
+        raise ProofError(f"{label} generation binding is invalid")
+    identity = (value["dev"], value["ino"])
+    if identity == (None, None):
+        return value
+    if not all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in identity):
+        raise ProofError(f"{label} generation inode is invalid")
+    return value
 
 
 def _read_owned_journal(path: Path, expected_base: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[int, int, str]]:
@@ -576,7 +662,7 @@ def _read_owned_journal(path: Path, expected_base: Mapping[str, Any]) -> tuple[d
     value = _strict_json(path, "offline-build journal")
     if set(value) != {
         "schema_version", "spec_path", "spec_sha256", "build_id", "phase",
-        "workspaces", "package_path", "proof_path", "package_sha256", "proof_sha256",
+        "workspaces", "package_path", "proof_path", "package_generation", "proof_generation",
     }:
         raise ProofError("offline-build journal fields are not exact")
     for key, expected in expected_base.items():
@@ -584,30 +670,104 @@ def _read_owned_journal(path: Path, expected_base: Mapping[str, Any]) -> tuple[d
             raise ProofError("offline-build journal belongs to another build")
     if value["schema_version"] != JOURNAL_SCHEMA or value["phase"] not in JOURNAL_PHASES:
         raise ProofError("offline-build journal schema/phase is invalid")
-    for key in ("package_sha256", "proof_sha256"):
-        if value[key] is not None and (
-            not isinstance(value[key], str) or not SHA256.fullmatch(value[key])
-        ):
-            raise ProofError(f"offline-build journal {key} is invalid")
+    package = _validate_output_generation(
+        value["package_generation"],
+        Path(value["package_path"]),
+        value["build_id"],
+        "package",
+    )
+    proof = _validate_output_generation(
+        value["proof_generation"],
+        Path(value["proof_path"]),
+        value["build_id"],
+        "proof",
+    )
+    if value["phase"] in {"planned", "workspace"} and (package is not None or proof is not None):
+        raise ProofError("pre-publication journal unexpectedly owns output generations")
+    if value["phase"] == "package" and (package is None or proof is not None):
+        raise ProofError("package journal does not own the exact package generation")
+    if value["phase"] in {"proof", "complete"} and (package is None or proof is None):
+        raise ProofError("proof/complete journal does not own both output generations")
     return value, (info.st_dev, info.st_ino, _sha(path))
 
 
-def _unlink_exact_output(path: Path, expected_sha256: str | None) -> None:
-    if not os.path.lexists(path):
+def _cleanup_output_generation(
+    value: Mapping[str, Any] | None,
+    *,
+    completed: bool,
+) -> None:
+    if value is None:
         return
-    if expected_sha256 is None:
-        raise ProofError(f"offline-build output exists before it was planned: {path}")
-    info = os.lstat(path)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or _sha(path) != expected_sha256
-    ):
-        raise ProofError(f"offline-build output is not attributable: {path}")
-    path.unlink()
-    _fsync_directory(path.parent)
+    path = Path(value["path"])
+    staging = Path(value["staging_path"])
+    existing = [candidate for candidate in (path, staging) if os.path.lexists(candidate)]
+    if completed and existing != [path]:
+        raise ProofError("completed offline-build output generation is incomplete")
+    if value["dev"] is None:
+        if path in existing:
+            raise ProofError("offline-build output appeared before inode ownership was journaled")
+        for candidate in existing:
+            info = os.lstat(candidate)
+            if (
+                candidate != staging
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > value["size"]
+            ):
+                raise ProofError(f"offline-build output staging is not attributable: {candidate}")
+            candidate.unlink()
+            _fsync_directory(candidate.parent)
+        return
+    for candidate in existing:
+        info, observed_digest = _output_generation_identity(candidate)
+        if (
+            (info.st_dev, info.st_ino) != (value["dev"], value["ino"])
+            or observed_digest != value["sha256"]
+        ):
+            raise ProofError(f"offline-build output generation changed: {candidate}")
+    if completed:
+        if os.lstat(path).st_nlink != 1:
+            raise ProofError("completed offline-build output has unexpected hard links")
+        return
+    for candidate in existing:
+        candidate.unlink()
+        _fsync_directory(candidate.parent)
+
+
+def _output_generation_identity(path: Path) -> tuple[os.stat_result, str]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink not in {1, 2}
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ProofError(f"offline-build output generation is unsafe: {path}")
+        payload = bytearray()
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            payload.extend(block)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        fields = (
+            "st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_size",
+            "st_mtime_ns", "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(value, field)
+            for field in fields
+            for value in (after, current)
+        ):
+            raise ProofError(f"offline-build output generation changed: {path}")
+        return after, _sha_bytes(bytes(payload))
+    finally:
+        os.close(descriptor)
 
 
 def _recover_journal_state(
@@ -617,27 +777,12 @@ def _recover_journal_state(
     workspaces = [Path(value) for value in journal["workspaces"]]
     for path, marker in zip(workspaces, markers, strict=True):
         _recover_workspace(path, marker)
-    package = Path(journal["package_path"])
-    proof = Path(journal["proof_path"])
     if journal["phase"] == "complete":
-        for path, digest in (
-            (package, journal["package_sha256"]),
-            (proof, journal["proof_sha256"]),
-        ):
-            if digest is None or not os.path.lexists(path):
-                raise ProofError("completed offline-build journal has missing output")
-            info = os.lstat(path)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or _sha(path) != digest
-            ):
-                raise ProofError("completed offline-build output drifted")
+        _cleanup_output_generation(journal["package_generation"], completed=True)
+        _cleanup_output_generation(journal["proof_generation"], completed=True)
         return True
-    _unlink_exact_output(proof, journal["proof_sha256"])
-    _unlink_exact_output(package, journal["package_sha256"])
+    _cleanup_output_generation(journal["proof_generation"], completed=False)
+    _cleanup_output_generation(journal["package_generation"], completed=False)
     return False
 
 
@@ -728,12 +873,19 @@ def _create_workspace(path: Path, marker: Mapping[str, Any]) -> None:
 
 
 def _publish_bytes_no_replace(
-    path: Path, payload: bytes, mode: int = 0o600
+    path: Path,
+    payload: bytes,
+    mode: int = 0o600,
+    *,
+    staging_path: Path | None = None,
+    before_publish: Callable[[tuple[int, int, str]], None] | None = None,
 ) -> tuple[int, int, str]:
     if path.exists() or path.is_symlink():
         raise ProofError(f"refusing to overwrite output: {path}")
     digest = _sha_bytes(payload)
-    staging = path.with_name(f".{path.name}.bridge-write-{digest[:32]}")
+    staging = staging_path or path.with_name(
+        f".{path.name}.bridge-write-{digest[:32]}"
+    )
     if staging.exists() or staging.is_symlink():
         info = os.lstat(staging)
         if (
@@ -761,20 +913,28 @@ def _publish_bytes_no_replace(
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    staged_info = os.lstat(staging)
+    identity = (staged_info.st_dev, staged_info.st_ino, digest)
+    if before_publish is not None:
+        before_publish(identity)
     try:
         os.link(staging, path, follow_symlinks=False)
         _fsync_directory(path.parent)
         staging.unlink()
         _fsync_directory(path.parent)
     except Exception:
-        if staging.exists() and _sha(staging) == digest:
-            staging.unlink()
-            _fsync_directory(staging.parent)
+        if staging.exists():
+            _, staged_digest = _output_generation_identity(staging)
+            if staged_digest == digest:
+                staging.unlink()
+                _fsync_directory(staging.parent)
         raise
     info = os.lstat(path)
     if info.st_nlink != 1 or _sha(path) != digest:
         raise ProofError(f"published output identity is invalid: {path}")
-    return info.st_dev, info.st_ino, digest
+    if (info.st_dev, info.st_ino) != identity[:2]:
+        raise ProofError(f"published output inode changed: {path}")
+    return identity
 
 
 def _unlink_owned(path: Path, identity: tuple[int, int, str]) -> None:
@@ -1003,7 +1163,7 @@ def build(spec_path: Path) -> tuple[Path, Path]:
         for index, path in enumerate(workspaces, start=1)
     )
     journal_path = _journal_path(scratch, build_id)
-    lock_descriptor = _open_build_lock(_lock_path(scratch, build_id))
+    lock_descriptor = _open_build_lock(_lock_path(package_path, proof_path))
     expected_journal = {
         "schema_version": JOURNAL_SCHEMA,
         "spec_path": str(spec_path),
@@ -1184,8 +1344,6 @@ def build(spec_path: Path) -> tuple[Path, Path]:
         }
         package_payload = first_tar.read_bytes()
         proof_payload = _canonical(proof)
-        package_digest = _sha_bytes(package_payload)
-        proof_digest = _sha_bytes(proof_payload)
         journal = _journal_value(
             spec_path=spec_path,
             spec_sha256=spec_sha256,
@@ -1194,18 +1352,57 @@ def build(spec_path: Path) -> tuple[Path, Path]:
             workspaces=workspaces,
             package_path=package_path,
             proof_path=proof_path,
-            package_sha256=package_digest,
-            proof_sha256=proof_digest,
+            package_generation=_output_generation(
+                package_path, package_payload, build_id
+            ),
         )
         journal_identity = _replace_owned_json(
             journal_path, journal_identity, journal
         )
-        _publish_bytes_no_replace(package_path, package_payload)
-        journal = {**journal, "phase": "proof"}
+        package_generation = dict(journal["package_generation"])
+
+        def bind_package(identity: tuple[int, int, str]) -> None:
+            nonlocal journal, journal_identity, package_generation
+            package_generation = _output_generation(
+                package_path, package_payload, build_id, identity
+            )
+            journal = {**journal, "package_generation": package_generation}
+            journal_identity = _replace_owned_json(
+                journal_path, journal_identity, journal
+            )
+
+        _publish_bytes_no_replace(
+            package_path,
+            package_payload,
+            staging_path=Path(package_generation["staging_path"]),
+            before_publish=bind_package,
+        )
+        proof_generation = _output_generation(proof_path, proof_payload, build_id)
+        journal = {
+            **journal,
+            "phase": "proof",
+            "proof_generation": proof_generation,
+        }
         journal_identity = _replace_owned_json(
             journal_path, journal_identity, journal
         )
-        _publish_bytes_no_replace(proof_path, proof_payload)
+
+        def bind_proof(identity: tuple[int, int, str]) -> None:
+            nonlocal journal, journal_identity, proof_generation
+            proof_generation = _output_generation(
+                proof_path, proof_payload, build_id, identity
+            )
+            journal = {**journal, "proof_generation": proof_generation}
+            journal_identity = _replace_owned_json(
+                journal_path, journal_identity, journal
+            )
+
+        _publish_bytes_no_replace(
+            proof_path,
+            proof_payload,
+            staging_path=Path(proof_generation["staging_path"]),
+            before_publish=bind_proof,
+        )
         journal = {**journal, "phase": "complete"}
         journal_identity = _replace_owned_json(
             journal_path, journal_identity, journal
@@ -1215,7 +1412,9 @@ def build(spec_path: Path) -> tuple[Path, Path]:
         created.clear()
     except Exception:
         if journal is not None:
-            _recover_journal_state(journal, markers)
+            completed = _recover_journal_state(journal, markers)
+            if completed:
+                raise
             planned = _journal_value(
                 spec_path=spec_path,
                 spec_sha256=spec_sha256,

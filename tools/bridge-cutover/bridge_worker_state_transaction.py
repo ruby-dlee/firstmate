@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
-JOURNAL_SCHEMA_VERSION = 1
+JOURNAL_SCHEMA_VERSION = 2
 SNAPSHOT_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 1_000_000
 MAX_JOURNAL_BYTES = 2_000_000
@@ -780,6 +780,32 @@ def _snapshot_manifest(manifest: Manifest, staging: Path) -> dict[str, Any]:
     }
 
 
+def _validate_identity_journal_state(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("type") not in {"absent", "file"}:
+        raise WorkerStateError(f"{label} is invalid")
+    if value["type"] == "absent":
+        if value != {"type": "absent"}:
+            raise WorkerStateError(f"{label} absent fields are not exact")
+        return value
+    _exact_keys(
+        value,
+        {"type", "mode", "sha256", "size"},
+        set(),
+        label,
+    )
+    if (
+        not isinstance(value["mode"], str)
+        or not __import__("re").fullmatch(r"[0-7]{4}", value["mode"])
+        or not isinstance(value["sha256"], str)
+        or not SHA256.fullmatch(value["sha256"])
+        or not isinstance(value["size"], int)
+        or isinstance(value["size"], bool)
+        or value["size"] < 0
+    ):
+        raise WorkerStateError(f"{label} file fields are invalid")
+    return value
+
+
 def _journal(manifest: Manifest) -> dict[str, Any] | None:
     if not os.path.lexists(manifest.journal_path):
         return None
@@ -794,6 +820,7 @@ def _journal(manifest: Manifest) -> dict[str, Any] | None:
             "phase",
             "snapshot_sha256",
             "restore_completed",
+            "identity_restore",
             "credential_drift",
             "terminal_outcome",
             "history",
@@ -833,6 +860,51 @@ def _journal(manifest: Manifest) -> dict[str, Any] | None:
         or len(value["restore_completed"]) != len(set(value["restore_completed"]))
     ):
         raise WorkerStateError("worker-state journal restore list is invalid")
+    identity_restore = value["identity_restore"]
+    if identity_restore is not None:
+        if not isinstance(identity_restore, dict):
+            raise WorkerStateError("worker-state identity restore must be an object")
+        _exact_keys(
+            identity_restore,
+            {"provider", "key", "phase", "authority", "restore_state"},
+            set(),
+            "worker-state identity restore",
+        )
+        provider = identity_restore["provider"]
+        if (
+            provider not in {"claude", "codex"}
+            or identity_restore["key"] != f"identity:{provider}"
+            or identity_restore["phase"] not in {"prepared", "exchanged"}
+            or identity_restore["key"] in value["restore_completed"]
+        ):
+            raise WorkerStateError("worker-state identity restore phase/key is invalid")
+        authority = identity_restore["authority"]
+        if not isinstance(authority, dict):
+            raise WorkerStateError("worker-state identity authority must be an object")
+        _exact_keys(
+            authority,
+            {"state", "dev", "ino"},
+            set(),
+            "worker-state identity authority",
+        )
+        state = _validate_identity_journal_state(
+            authority["state"], "worker-state identity authority state"
+        )
+        if state["type"] == "absent":
+            if (authority["dev"], authority["ino"]) != (None, None):
+                raise WorkerStateError("absent identity authority generation is invalid")
+        else:
+            if (
+                not all(
+                    isinstance(item, int) and not isinstance(item, bool) and item >= 0
+                    for item in (authority["dev"], authority["ino"])
+                )
+            ):
+                raise WorkerStateError("file identity authority generation is invalid")
+        _validate_identity_journal_state(
+            identity_restore["restore_state"],
+            "worker-state identity restore state",
+        )
     if (
         not isinstance(value["credential_drift"], list)
         or not all(item in WORKERS for item in value["credential_drift"])
@@ -886,6 +958,7 @@ def begin(
                 "phase": "snapshotted",
                 "snapshot_sha256": snapshot_sha256,
                 "restore_completed": [],
+                "identity_restore": None,
                 "credential_drift": [],
                 "terminal_outcome": None,
                 "history": [],
@@ -948,6 +1021,7 @@ def begin(
             "phase": "snapshotted",
             "snapshot_sha256": snapshot_sha256,
             "restore_completed": [],
+            "identity_restore": None,
             "credential_drift": [],
             "terminal_outcome": None,
             "history": [],
@@ -1022,7 +1096,13 @@ def _guards_unchanged(
             )
 
 
-def _read_regular_at(parent_fd: int, name: str, label: str) -> dict[str, Any]:
+def _read_regular_at(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    include_generation: bool = False,
+) -> dict[str, Any]:
     """Return a stable fd-relative regular-file identity without following links."""
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1053,12 +1133,15 @@ def _read_regular_at(parent_fd: int, name: str, label: str) -> dict[str, Any]:
         leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if _file_identity(after) != _file_identity(before) or _file_identity(leaf) != _file_identity(before):
             raise WorkerStateError(f"{label} changed while being read")
-        return {
+        value = {
             "type": "file",
             "mode": f"{stat.S_IMODE(after.st_mode):04o}",
             "sha256": _hash_bytes(bytes(payload)),
             "size": len(payload),
         }
+        if include_generation:
+            value["generation"] = {"dev": after.st_dev, "ino": after.st_ino}
+        return value
     finally:
         os.close(fd)
 
@@ -1209,6 +1292,39 @@ def _identity_file_state(path: Path) -> dict[str, Any]:
     }
 
 
+def _identity_generation(path: Path) -> dict[str, Any]:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"state": {"type": "absent"}, "dev": None, "ino": None}
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise WorkerStateError(f"identity bundle generation is unsupported: {path}")
+    payload, stable = _read_stable_file(path, "identity bundle generation")
+    return {
+        "state": {
+            "type": "file",
+            "mode": f"{stat.S_IMODE(stable.st_mode):04o}",
+            "sha256": _hash_bytes(payload),
+            "size": len(payload),
+        },
+        "dev": stable.st_dev,
+        "ino": stable.st_ino,
+    }
+
+
+def _identity_generation_at(parent_fd: int | None, name: str) -> dict[str, Any]:
+    if parent_fd is None or not _lexists_at(parent_fd, name):
+        return {"state": {"type": "absent"}, "dev": None, "ino": None}
+    value = _read_regular_at(
+        parent_fd,
+        name,
+        "identity displaced generation",
+        include_generation=True,
+    )
+    generation = value.pop("generation")
+    return {"state": value, **generation}
+
+
 def _identity_matches_snapshot(current: Mapping[str, Any], original: Mapping[str, Any]) -> bool:
     if current.get("type") != original.get("type"):
         return False
@@ -1220,7 +1336,7 @@ def _identity_matches_snapshot(current: Mapping[str, Any], original: Mapping[str
 def _assert_identity_authority(
     path: Path, expected: Mapping[str, Any], provider: str
 ) -> None:
-    if _identity_file_state(path) != expected:
+    if _identity_generation(path) != expected:
         raise WorkerStateError(
             f"{provider} identity changed immediately before restore"
         )
@@ -1232,7 +1348,7 @@ def _assert_identity_authority_at(
     expected: Mapping[str, Any],
     provider: str,
 ) -> None:
-    if not _node_matches_at(parent_fd, name, expected, exact_directory=True):
+    if _identity_generation_at(parent_fd, name) != expected:
         raise WorkerStateError(
             f"{provider} identity displaced live state is not attributable"
         )
@@ -1552,6 +1668,7 @@ def _restore_node_at(
     validate_displaced: Callable[[str], None] | None = None,
     boundaries: BoundaryController | None = None,
     exchange_label: str = "restore",
+    exchange_phase: Callable[[str], None] | None = None,
 ) -> None:
     controller = boundaries or BoundaryController()
     node_type = state.get("type")
@@ -1579,6 +1696,8 @@ def _restore_node_at(
             pre_replace()
         controller.hit(f"immediately_before_exchange:{exchange_label}")
         _rename_at(parent_fd, name, temporary, exchange=False)
+        if exchange_phase is not None:
+            exchange_phase("exchanged")
         controller.hit(f"after_exchange:{exchange_label}")
         try:
             if validate_displaced is not None:
@@ -1587,6 +1706,8 @@ def _restore_node_at(
             try:
                 _rename_at(parent_fd, temporary, name, exchange=False)
                 os.fsync(parent_fd)
+                if exchange_phase is not None:
+                    exchange_phase("prepared")
             except WorkerStateError as restore_exc:
                 raise WorkerStateError(
                     f"ambiguous displaced absent restore is preserved: {temporary}"
@@ -1616,6 +1737,8 @@ def _restore_node_at(
             pre_replace()
         controller.hit(f"immediately_before_exchange:{exchange_label}")
         _rename_at(parent_fd, temporary, name, exchange=True)
+        if exchange_phase is not None:
+            exchange_phase("exchanged")
         controller.hit(f"after_exchange:{exchange_label}")
         try:
             if validate_displaced is not None:
@@ -1625,6 +1748,8 @@ def _restore_node_at(
                 _rename_at(parent_fd, temporary, name, exchange=True)
                 _remove_entry_at(parent_fd, temporary)
                 os.fsync(parent_fd)
+                if exchange_phase is not None:
+                    exchange_phase("prepared")
             except WorkerStateError as restore_exc:
                 raise WorkerStateError(
                     f"ambiguous displaced restore is preserved: {temporary}"
@@ -1727,11 +1852,22 @@ def rollback(
 
             identity_authority: dict[str, dict[str, Any]] = {}
             identity_api: tuple[Any, Any] | None = None
+            inflight_identity = journal["identity_restore"]
             for provider in ("claude", "codex"):
+                if (
+                    inflight_identity is not None
+                    and inflight_identity["provider"] == provider
+                ):
+                    identity_authority[provider] = dict(
+                        inflight_identity["authority"]
+                    )
+                    continue
                 path = manifest.identity_bundles[provider]
-                current = _identity_file_state(path)
+                current_generation = _identity_generation(path)
+                current = current_generation["state"]
                 original = snapshot["identity_bundles"][provider]["state"]
                 if not _identity_matches_snapshot(current, original):
+                    candidate_generation = current_generation
                     if identity_api is None:
                         identity_api = _candidate_api(manifest)
                     api, registry = identity_api
@@ -1748,8 +1884,12 @@ def rollback(
                         raise WorkerStateError(
                             f"live {provider} identity drift is not attributable"
                         )
-                    current = _identity_file_state(path)
-                identity_authority[provider] = current
+                    current_generation = _identity_generation(path)
+                    if current_generation != candidate_generation:
+                        raise WorkerStateError(
+                            f"live {provider} identity changed during attribution"
+                        )
+                identity_authority[provider] = current_generation
             journal["credential_drift"] = sorted(drifted)
             if drifted:
                 _event(journal, "credential-drift-preserved")
@@ -1811,53 +1951,110 @@ def rollback(
                     _write_journal(manifest, journal)
 
             drifted_providers = {WORKERS[profile] for profile in drifted}
-            for provider in ("claude", "codex"):
+            provider_order = ["claude", "codex"]
+            if inflight_identity is not None:
+                provider_order.remove(inflight_identity["provider"])
+                provider_order.insert(0, inflight_identity["provider"])
+            for provider in provider_order:
                 key = f"identity:{provider}"
                 invalidate = provider in drifted_providers
                 if key in completed and not invalidate:
                     continue
                 value = snapshot["identity_bundles"][provider]
-                state = {"type": "absent"} if invalidate else value["state"]
+                desired_state = {"type": "absent"} if invalidate else value["state"]
                 identity_path = manifest.identity_bundles[provider]
-                parent_fd = _open_identity_parent(identity_path, state)
-                try:
-                    temporary_tag = hashlib.sha256(
-                        f"{manifest.transaction_id}:{key}".encode()
-                    ).hexdigest()[:16]
-                    _restore_node_at(
-                        state,
-                        parent_fd,
-                        identity_path.name,
-                        data_root,
-                        temporary_tag,
-                        pre_replace=lambda provider=provider, identity_path=identity_path: (
-                            _assert_identity_authority(
-                                identity_path,
-                                identity_authority[provider],
-                                provider,
-                            )
-                        ),
-                        validate_displaced=lambda observed_name, provider=provider, parent_fd=parent_fd: (
-                            _assert_identity_authority_at(
-                                parent_fd,
-                                observed_name,
-                                identity_authority[provider],
-                                provider,
-                            )
-                        ),
-                        boundaries=boundaries,
-                        exchange_label=f"identity:{provider}",
-                    )
-                    if parent_fd is not None:
-                        _assert_bound_directory(
-                            parent_fd,
-                            identity_path.parent,
-                            f"identity bundle parent {provider}",
+                while True:
+                    active = journal["identity_restore"]
+                    if active is not None and active["provider"] != provider:
+                        raise WorkerStateError(
+                            "another identity restore generation must be resumed first"
                         )
-                finally:
-                    if parent_fd is not None:
-                        os.close(parent_fd)
-                boundaries.hit(f"restore:{key}")
+                    if active is None:
+                        authority = identity_authority.get(provider)
+                        if authority is None:
+                            authority = _identity_generation(identity_path)
+                        active = {
+                            "provider": provider,
+                            "key": key,
+                            "phase": "prepared",
+                            "authority": authority,
+                            "restore_state": desired_state,
+                        }
+                        journal["identity_restore"] = active
+                        _event(journal, f"identity-restore-prepared:{provider}")
+                        _write_journal(manifest, journal)
+                    restore_state = active["restore_state"]
+                    authority = active["authority"]
+                    parent_fd = _open_identity_parent(identity_path, restore_state)
+                    try:
+                        temporary_tag = hashlib.sha256(
+                            f"{manifest.transaction_id}:{key}".encode()
+                        ).hexdigest()[:16]
+
+                        def record_exchange_phase(
+                            phase: str,
+                            *,
+                            provider: str = provider,
+                        ) -> None:
+                            current_restore = journal["identity_restore"]
+                            if (
+                                current_restore is None
+                                or current_restore["provider"] != provider
+                            ):
+                                raise WorkerStateError(
+                                    "identity restore generation disappeared during exchange"
+                                )
+                            current_restore["phase"] = phase
+                            _event(
+                                journal,
+                                f"identity-restore-{phase}:{provider}",
+                            )
+                            _write_journal(manifest, journal)
+
+                        _restore_node_at(
+                            restore_state,
+                            parent_fd,
+                            identity_path.name,
+                            data_root,
+                            temporary_tag,
+                            pre_replace=lambda provider=provider, identity_path=identity_path, authority=authority: (
+                                _assert_identity_authority(
+                                    identity_path,
+                                    authority,
+                                    provider,
+                                )
+                            ),
+                            validate_displaced=lambda observed_name, provider=provider, parent_fd=parent_fd, authority=authority: (
+                                _assert_identity_authority_at(
+                                    parent_fd,
+                                    observed_name,
+                                    authority,
+                                    provider,
+                                )
+                            ),
+                            boundaries=boundaries,
+                            exchange_label=f"identity:{provider}",
+                            exchange_phase=record_exchange_phase,
+                        )
+                        if parent_fd is not None:
+                            _assert_bound_directory(
+                                parent_fd,
+                                identity_path.parent,
+                                f"identity bundle parent {provider}",
+                            )
+                    finally:
+                        if parent_fd is not None:
+                            os.close(parent_fd)
+                    boundaries.hit(f"restore:{key}")
+                    journal["identity_restore"] = None
+                    if restore_state != desired_state:
+                        identity_authority[provider] = _identity_generation(
+                            identity_path
+                        )
+                        _event(journal, f"identity-restore-generation-finished:{provider}")
+                        _write_journal(manifest, journal)
+                        continue
+                    break
                 if key not in completed:
                     journal["restore_completed"].append(key)
                     completed.add(key)

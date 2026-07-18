@@ -119,9 +119,7 @@ class FakeRecovery:
     def __init__(self, registry: Registry) -> None:
         self.registry = registry
         self.identity_by_profile = {
-            profile.id: str(
-                read_identity_binding(registry, profile).get("remote_fingerprint", "")
-            )
+            profile.id: str(read_identity_binding(registry, profile).get("remote_fingerprint", ""))
             for profile in registry.profiles.values()
         }
         self.keychain = FakeKeychain()
@@ -212,9 +210,8 @@ class FakeRecovery:
             profile.id,
             str(binding.get("remote_fingerprint") or self.identity_by_profile[profile.id]),
         )
-        if (
-            profile.id in self.stable_fingerprint_override
-            and "credential-recovery" not in str(profile.home)
+        if profile.id in self.stable_fingerprint_override and "credential-recovery" not in str(
+            profile.home
         ):
             fingerprint = self.stable_fingerprint_override[profile.id]
         proof = {
@@ -398,17 +395,16 @@ def test_codex_recovery_is_staged_device_login_and_leaves_routing_disabled(
     assert environment["CODEX_HOME"] == str(stage)
     assert environment["HOME"] == str(stage)
     assert not any("logout" in item for item in argv)
-    assert b"fixture-recovered-value" in (
-        registry.require_profile("codex-1").home / "auth.json"
-    ).read_bytes()
+    assert (
+        b"fixture-recovered-value"
+        in (registry.require_profile("codex-1").home / "auth.json").read_bytes()
+    )
     assert not list(
         (registry.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
 
 
-def test_recovery_login_and_claude_browser_modes_are_explicit(
-    fleet: tuple[Registry, Path]
-) -> None:
+def test_recovery_login_and_claude_browser_modes_are_explicit(fleet: tuple[Registry, Path]) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
     with pytest.raises(ValueError, match="requires the explicit --browser flag"):
@@ -426,6 +422,7 @@ def test_recovery_login_and_claude_browser_modes_are_explicit(
     assert not list(
         (registry.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
+
 
 def test_claude_recovery_uses_only_exact_scoped_services_and_ignores_hostile_user(
     fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
@@ -473,7 +470,7 @@ def test_claude_recovery_uses_only_exact_scoped_services_and_ignores_hostile_use
 
 
 def test_claude_keychain_source_without_exact_passwd_account_fails_closed(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, _config = _loaded(fleet)
     target = registry.require_profile("claude-1")
@@ -545,11 +542,14 @@ def test_pending_recovery_filters_reserves_before_transaction_path_derivation(
         return original(registry, profile)
 
     monkeypatch.setattr(recovery, "_journal_path_for_worker", observed)
-    assert recover_pending_profile_recoveries(
-        registry,
-        "codex",
-        hooks=FakeRecovery(registry).hooks(),
-    ) == []
+    assert (
+        recover_pending_profile_recoveries(
+            registry,
+            "codex",
+            hooks=FakeRecovery(registry).hooks(),
+        )
+        == []
+    )
     assert "codex-2" not in derived
 
 
@@ -574,7 +574,7 @@ def test_recovery_refuses_enabled_worker_and_live_lease_before_login(
 
 
 def test_recovery_refuses_dormant_continuable_provider_session_without_live_lease(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -603,7 +603,7 @@ def test_recovery_refuses_dormant_continuable_provider_session_without_live_leas
 
 
 def test_registry_change_at_boundary_fails_closed_and_cleans_stage(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -630,7 +630,7 @@ def test_registry_change_at_boundary_fails_closed_and_cleans_stage(
 
 
 def test_pinned_identity_mismatch_rolls_back_without_disclosure(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -653,9 +653,7 @@ def test_pinned_identity_mismatch_rolls_back_without_disclosure(
     )
 
 
-def test_missing_target_binding_fails_before_provider_login(
-    fleet: tuple[Registry, Path]
-) -> None:
+def test_missing_target_binding_fails_before_provider_login(fleet: tuple[Registry, Path]) -> None:
     registry, config = _loaded(fleet)
     identity_bundle_path(registry, "codex").unlink()
     fake = FakeRecovery(registry)
@@ -685,9 +683,7 @@ def test_staged_login_conflicting_with_external_identity_is_rejected(
     )
     bundle_path = identity_bundle_path(registry, provider)
     bundle = read_private_json(bundle_path, label="fixture identity bundle")
-    bundle["workers"][profile_id]["remote_fingerprint"] = anchor_payload[
-        "identity_fingerprint"
-    ]
+    bundle["workers"][profile_id]["remote_fingerprint"] = anchor_payload["identity_fingerprint"]
     atomic_write_json(bundle_path, bundle)
     fake = FakeRecovery(registry)
     with pytest.raises(ValueError, match="credential recovery failed") as error:
@@ -704,7 +700,7 @@ def test_staged_login_conflicting_with_external_identity_is_rejected(
 
 
 def test_unrecorded_stage_entry_fails_closed_instead_of_cleanup(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -713,9 +709,7 @@ def test_unrecorded_stage_entry_fails_closed_instead_of_cleanup(
         if phase != "stage-verified":
             return
         roots = list(
-            (registry.settings.state_dir / "staging" / "credential-recovery").rglob(
-                "*.login-*"
-            )
+            (registry.settings.state_dir / "staging" / "credential-recovery").rglob("*.login-*")
         )
         assert len(roots) == 1
         unexpected = roots[0] / "unrecorded"
@@ -736,7 +730,7 @@ def test_unrecorded_stage_entry_fails_closed_instead_of_cleanup(
 
 
 def test_target_remote_failure_rolls_back_but_peer_ejection_commits_disabled_recovery(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     old = _old_auth(registry, "codex-1")
@@ -757,7 +751,7 @@ def test_target_remote_failure_rolls_back_but_peer_ejection_commits_disabled_rec
 
 
 def test_hostile_hardlinked_credential_is_rejected_before_provider_action(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     auth = registry.require_profile("codex-1").home / "auth.json"
@@ -769,7 +763,7 @@ def test_hostile_hardlinked_credential_is_rejected_before_provider_action(
 
 
 def test_result_audit_and_journal_never_contain_fake_credential_value(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -784,7 +778,7 @@ def test_result_audit_and_journal_never_contain_fake_credential_value(
 
 
 def test_failure_message_audit_and_journal_never_disclose_provider_text(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -899,7 +893,7 @@ def test_initialize_durably_records_partial_batch_then_atomically_adopts_full_bu
 
 
 def test_initialize_rejects_wrong_promoted_identity_and_duplicate_or_external_staging(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -993,7 +987,7 @@ def test_initialize_reproves_and_validates_provisional_batch_before_next_login(
 
 
 def test_initialize_reserve_target_never_derives_or_touches_reserve_state(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -1026,7 +1020,7 @@ def test_initialize_reserve_target_never_derives_or_touches_reserve_state(
 
 
 def test_synthetic_external_anchor_refresh_never_reads_reserve_home(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     registry, fake, first_id, second_id, reserve_id = _two_worker_initialization_topology(
@@ -1090,7 +1084,7 @@ def test_synthetic_external_anchor_refresh_never_reads_reserve_home(
 
 
 def test_final_verification_failure_restores_credentials_without_touching_quota_cache(
-    fleet: tuple[Registry, Path]
+    fleet: tuple[Registry, Path],
 ) -> None:
     registry, config = _loaded(fleet)
     fake = FakeRecovery(registry)
@@ -1172,16 +1166,12 @@ def test_committed_transaction_rerun_fresh_verifies_without_provider_login(
     )
 
     assert replay.login_calls == []
-    assert replay.proof_calls == [
-        worker.id for worker in recovery._workers(reloaded, "codex")
-    ]
+    assert replay.proof_calls == [worker.id for worker in recovery._workers(reloaded, "codex")]
     assert result["provider_login_invoked"] is False
     assert result["replayed_committed_transaction"] is True
     assert result["provider_ready"] is True
     assert not list(
-        (reloaded.settings.state_dir / "transactions" / "credential-recovery").glob(
-            "*.json"
-        )
+        (reloaded.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
 
 
@@ -1390,12 +1380,7 @@ def test_sigkill_inside_stage_construction_is_safely_collectable(
     assert _old_auth(reloaded, profile_id) == old
     transaction_root = reloaded.settings.state_dir / "transactions" / "credential-recovery"
     assert not list(transaction_root.glob("*.json"))
-    stage_root = (
-        reloaded.settings.state_dir
-        / "staging"
-        / "credential-recovery"
-        / provider
-    )
+    stage_root = reloaded.settings.state_dir / "staging" / "credential-recovery" / provider
     assert not list(stage_root.iterdir())
 
 
@@ -1499,14 +1484,24 @@ def test_file_rollback_sigkill_is_restart_idempotent(
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     rollback = Path(journal["paths"]["rollback_temp"])
     quarantine = Path(journal["paths"]["credential_quarantine"])
+    original_quarantine = Path(journal["paths"]["credential_original_quarantine"])
+    backup_copy_cases = {
+        "copy-running",
+        "mid-copy",
+        "prepared",
+        "publish-authorized",
+        "post-publish",
+    }
+    if rollback_crash in backup_copy_cases:
+        original_quarantine.unlink()
     stable_name = "auth.json" if provider == "codex" else ".credentials.json"
     stable = registry.require_profile(profile_id).home / stable_name
     real_recovery_write = recovery._write_recovery_journal
     real_copy = recovery._copy_private_file
     real_rename_noreplace = recovery._rename_noreplace
     phase_by_crash = {
-        "quarantine-authorized": "rollback-file-quarantine-authorized",
-        "quarantined": "rollback-file-quarantined",
+        "quarantine-authorized": "credential-forward-rollback-quarantine-authorized",
+        "quarantined": "credential-forward-rollback-quarantined",
         "copy-running": "rollback-file-copy-running",
         "prepared": "rollback-file-prepared",
         "publish-authorized": "rollback-file-publish-authorized",
@@ -1546,11 +1541,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
 
     def crash_after_atomic_move(source: Path, destination: Path) -> None:
         real_rename_noreplace(source, destination)
-        if (
-            rollback_crash == "post-quarantine"
-            and source == stable
-            and destination == quarantine
-        ):
+        if rollback_crash == "post-quarantine" and source == stable and destination == quarantine:
             os._exit(94)
         if rollback_crash == "post-publish" and source == rollback and destination == stable:
             os._exit(94)
@@ -1595,9 +1586,7 @@ def test_file_rollback_sigkill_is_restart_idempotent(
     assert not rollback.exists()
     assert not quarantine.exists()
     assert not list(
-        (converged.settings.state_dir / "transactions" / "credential-recovery").glob(
-            "*.json"
-        )
+        (converged.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
 
 
@@ -1682,13 +1671,19 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
         "provisional_guard": "provisional_guard_restore_temp",
     }[restore_component]
     restore_temp = Path(journal["paths"][temp_key])
+    original_quarantine_key = {
+        "bundle": "bundle_original_quarantine",
+        "provisional": "provisional_original_quarantine",
+        "provisional_guard": "provisional_guard_original_quarantine",
+    }[restore_component]
+    Path(journal["paths"][original_quarantine_key]).unlink()
     restore_target = {
         "bundle": bundle,
         "provisional": recovery._provisional_path(registry, provider),
         "provisional_guard": recovery._provisional_guard_path(registry, provider),
     }[restore_component]
     real_copy = recovery._copy_private_file
-    real_replace = recovery.os.replace
+    real_rename_noreplace = recovery._rename_noreplace
 
     def crash_restore_copy(
         source: Path,
@@ -1699,6 +1694,8 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
         if restore_crash == "mid-copy" and destination == restore_temp:
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.fchmod(descriptor, 0o600)
+            if destination_created is not None:
+                destination_created(os.fstat(descriptor))
             os.write(descriptor, b"partial")
             os.fsync(descriptor)
             os.close(descriptor)
@@ -1709,18 +1706,17 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
             destination_created=destination_created,
         )
 
-    def crash_restore_replace(source, destination, *args, **kwargs):
-        result = real_replace(source, destination, *args, **kwargs)
+    def crash_restore_replace(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
         if (
             restore_crash == "post-replace"
             and source == restore_temp
             and destination == restore_target
         ):
             os._exit(95)
-        return result
 
     monkeypatch.setattr(recovery, "_copy_private_file", crash_restore_copy)
-    monkeypatch.setattr(recovery.os, "replace", crash_restore_replace)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_restore_replace)
     reloaded = load_registry(config)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional recovery crash child
@@ -1738,7 +1734,7 @@ def test_metadata_restore_sigkill_is_restart_idempotent(
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 95
     monkeypatch.setattr(recovery, "_copy_private_file", real_copy)
-    monkeypatch.setattr(recovery.os, "replace", real_replace)
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     _expire_abandoned_provider_lock(reloaded, provider)
 
     converged = load_registry(config)
@@ -1826,9 +1822,7 @@ def test_metadata_rollback_rejects_unknown_generation_without_overwrite(
 
     _crash_transaction_at_phase(monkeypatch, transaction, crash_phase)
     journal_path = next(
-        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
-            "*.json"
-        )
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
     journal = read_private_json(journal_path, label="test credential recovery journal")
     assert journal[f"{component}_existed"] is snapshot_existed
@@ -1875,6 +1869,9 @@ def test_metadata_rollback_immediate_cas_rejects_pre_replace_race(
     target = root / "target.json"
     backup = root / "backup.json"
     temporary = root / "restore.json"
+    temporary_cleanup = root / "restore-cleanup.json"
+    quarantine = root / "forward-quarantine.json"
+    original_quarantine = root / "original-quarantine.json"
     journal_path = root / "journal.json"
     original = {"schema": 1, "generation": "original"}
     forward = {"schema": 1, "generation": "forward"}
@@ -1895,11 +1892,7 @@ def test_metadata_rollback_immediate_cas_rejects_pre_replace_race(
     }
     atomic_write_json(journal_path, journal)
     real_write = recovery._write_recovery_journal
-    expected_phase = (
-        "bundle-restore-replace-authorized"
-        if snapshot_existed
-        else "bundle-restore-delete-authorized"
-    )
+    expected_phase = "bundle-forward-rollback-quarantine-authorized"
 
     def inject_unknown_generation(
         path: Path,
@@ -1915,11 +1908,14 @@ def test_metadata_rollback_immediate_cas_rejects_pre_replace_race(
         "_write_recovery_journal",
         inject_unknown_generation,
     )
-    with pytest.raises(ValueError, match="changed immediately before rollback"):
+    with pytest.raises(ValueError, match="changed (?:before|during) its quarantine move"):
         recovery._restore_snapshot_file(
             target=target,
             backup=backup,
             temporary=temporary,
+            temporary_cleanup=temporary_cleanup,
+            quarantine=quarantine,
+            original_quarantine=original_quarantine,
             existed=snapshot_existed,
             key="bundle",
             label="test provider identity bundle",
@@ -1989,7 +1985,7 @@ def test_stage_quarantine_cleanup_sigkill_converges_without_orphan(
 ) -> None:
     registry, config = _loaded(fleet)
     real_recovery_write = recovery._write_recovery_journal
-    real_replace = recovery.os.replace
+    real_rename_noreplace = recovery._rename_noreplace
     real_rmtree = recovery.shutil.rmtree
 
     def crash_cleanup_phase(
@@ -2001,8 +1997,8 @@ def test_stage_quarantine_cleanup_sigkill_converges_without_orphan(
         if cleanup_crash == phase:
             os._exit(96)
 
-    def crash_post_quarantine_rename(source, destination, *args, **kwargs):
-        result = real_replace(source, destination, *args, **kwargs)
+    def crash_post_quarantine_rename(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
         if (
             cleanup_crash == "post-quarantine-rename"
             and isinstance(source, Path)
@@ -2011,7 +2007,6 @@ def test_stage_quarantine_cleanup_sigkill_converges_without_orphan(
             and ".cleanup-" in destination.name
         ):
             os._exit(96)
-        return result
 
     def crash_mid_rmtree(path: Path, *args, **kwargs) -> None:
         if cleanup_crash == "mid-rmtree" and ".cleanup-" in path.name:
@@ -2021,7 +2016,7 @@ def test_stage_quarantine_cleanup_sigkill_converges_without_orphan(
         real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(recovery, "_write_recovery_journal", crash_cleanup_phase)
-    monkeypatch.setattr(recovery.os, "replace", crash_post_quarantine_rename)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_post_quarantine_rename)
     monkeypatch.setattr(recovery.shutil, "rmtree", crash_mid_rmtree)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional cleanup crash child
@@ -2035,7 +2030,7 @@ def test_stage_quarantine_cleanup_sigkill_converges_without_orphan(
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 96
     monkeypatch.setattr(recovery, "_write_recovery_journal", real_recovery_write)
-    monkeypatch.setattr(recovery.os, "replace", real_replace)
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     monkeypatch.setattr(recovery.shutil, "rmtree", real_rmtree)
     _expire_abandoned_provider_lock(registry, "codex")
 
@@ -2235,11 +2230,14 @@ def test_recovery_refuses_live_keychain_helper_then_converges_after_it_exits(
     reloaded = load_registry(config)
     blocked_controls = FakeRecovery(reloaded)
     blocked_controls.keychain = keychain  # type: ignore[assignment]
-    with provider_enrollment_lock(
-        reloaded.settings.state_dir,
-        "claude",
-        reloaded.settings.lock_stale_seconds,
-    ), pytest.raises(ValueError, match="Keychain operation is still live"):
+    with (
+        provider_enrollment_lock(
+            reloaded.settings.state_dir,
+            "claude",
+            reloaded.settings.lock_stale_seconds,
+        ),
+        pytest.raises(ValueError, match="Keychain operation is still live"),
+    ):
         recover_pending_profile_recoveries(
             reloaded,
             "claude",
@@ -2250,8 +2248,7 @@ def test_recovery_refuses_live_keychain_helper_then_converges_after_it_exits(
     atomic_write_bytes(release, b"release")
     deadline = time.monotonic() + 10
     while (
-        process_identity_state(helper_pid, helper_start) != "dead"
-        and time.monotonic() < deadline
+        process_identity_state(helper_pid, helper_start) != "dead" and time.monotonic() < deadline
     ):
         time.sleep(0.01)
     assert process_identity_state(helper_pid, helper_start) == "dead"
@@ -2307,6 +2304,7 @@ def test_provider_login_detached_group_fences_live_descendant_until_exit(
     )
     owner = os.fork()
     if owner == 0:  # pragma: no cover - production-shaped login owner
+
         def record_child(pid: int, start: str, pgid: int) -> None:
             atomic_write_json(
                 ownership,
@@ -2331,9 +2329,8 @@ def test_provider_login_detached_group_fences_live_descendant_until_exit(
 
     deadline = time.monotonic() + 10
     while (
-        (not ownership.exists() or not descendant_started.exists())
-        and time.monotonic() < deadline
-    ):
+        not ownership.exists() or not descendant_started.exists()
+    ) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert ownership.exists()
     assert descendant_started.exists()
@@ -2594,21 +2591,21 @@ def test_initialize_crash_after_planned_metadata_write_rolls_back(
     original_guard = guard.read_bytes()
     second_before = _old_auth(registry, second_id)
     crash_target = provisional if written_component == "provisional" else guard
-    real_atomic_write = recovery.atomic_write_json
+    real_rename_noreplace = recovery._rename_noreplace
 
-    def crash_after_atomic_write(path: Path, payload: dict[str, Any]) -> None:
-        real_atomic_write(path, payload)
-        if path == crash_target:
+    def crash_after_metadata_publish(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
+        if destination == crash_target and ".install-" in source.name:
             os._exit(94)
 
-    monkeypatch.setattr(recovery, "atomic_write_json", crash_after_atomic_write)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_after_metadata_publish)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional planned-generation crash
         initialize_profile_login(registry, second_id, config, hooks=fake.hooks())
         os._exit(0)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 94
-    monkeypatch.setattr(recovery, "atomic_write_json", real_atomic_write)
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     _expire_abandoned_provider_lock(registry, "codex")
 
     reloaded = load_registry(config)
@@ -2645,29 +2642,22 @@ def test_initialize_crash_after_planned_bundle_write_rolls_back(
     original_provisional = provisional.read_bytes()
     original_guard = guard.read_bytes()
     second_before = _old_auth(registry, second_id)
-    hooks = fake.hooks()
+    real_rename_noreplace = recovery._rename_noreplace
+    bundle_path = identity_bundle_path(registry, "codex")
 
-    def crash_after_bundle_write(
-        current: Registry,
-        provider: str,
-        payload: dict[str, Any],
-        before_install: Callable[[], None] | None,
-    ) -> dict[str, Any]:
-        hooks.install_bundle(
-            current,
-            provider,
-            payload,
-            before_install,
-        )
-        os._exit(95)
+    def crash_after_bundle_write(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
+        if destination == bundle_path and ".install-" in source.name:
+            os._exit(95)
 
-    crashing_hooks = replace(hooks, install_bundle=crash_after_bundle_write)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_after_bundle_write)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional planned-generation crash
-        initialize_profile_login(registry, second_id, config, hooks=crashing_hooks)
+        initialize_profile_login(registry, second_id, config, hooks=fake.hooks())
         os._exit(0)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 95
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     _expire_abandoned_provider_lock(registry, "codex")
 
     reloaded = load_registry(config)
@@ -2704,21 +2694,21 @@ def test_initialize_crash_between_provisional_deletes_rolls_back(
     original_provisional = provisional.read_bytes()
     original_guard = guard.read_bytes()
     second_before = _old_auth(registry, second_id)
-    real_unlink = Path.unlink
+    real_rename_noreplace = recovery._rename_noreplace
 
-    def crash_after_provisional_delete(path: Path, *args, **kwargs) -> None:
-        real_unlink(path, *args, **kwargs)
-        if path == provisional:
+    def crash_after_provisional_quarantine(source: Path, destination: Path) -> None:
+        real_rename_noreplace(source, destination)
+        if source == provisional and ".forward-" in destination.name:
             os._exit(96)
 
-    monkeypatch.setattr(Path, "unlink", crash_after_provisional_delete)
+    monkeypatch.setattr(recovery, "_rename_noreplace", crash_after_provisional_quarantine)
     pid = os.fork()
     if pid == 0:  # pragma: no cover - intentional metadata-removal crash
         initialize_profile_login(registry, second_id, config, hooks=fake.hooks())
         os._exit(0)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 96
-    monkeypatch.setattr(Path, "unlink", real_unlink)
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename_noreplace)
     _expire_abandoned_provider_lock(registry, "codex")
 
     reloaded = load_registry(config)
@@ -2767,9 +2757,7 @@ def test_non_macos_claude_file_install_refuses_pre_replace_generation_race(
 
     assert read_private_json(stable, label="test raced Claude credential") == unknown
     assert list(
-        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
-            "*.json"
-        )
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
 
 
@@ -2782,10 +2770,34 @@ def test_non_macos_claude_file_install_refuses_pre_replace_generation_race(
         "race_target",
     ),
     [
-        ("codex-1", "present", "rollback-file-quarantine-authorized", False, "stable"),
-        ("codex-1", "absent", "rollback-file-quarantine-authorized", False, "stable"),
-        ("claude-1", "present", "rollback-file-quarantine-authorized", False, "stable"),
-        ("claude-1", "absent", "rollback-file-quarantine-authorized", False, "stable"),
+        (
+            "codex-1",
+            "present",
+            "credential-forward-rollback-quarantine-authorized",
+            False,
+            "stable",
+        ),
+        (
+            "codex-1",
+            "absent",
+            "credential-forward-rollback-quarantine-authorized",
+            False,
+            "stable",
+        ),
+        (
+            "claude-1",
+            "present",
+            "credential-forward-rollback-quarantine-authorized",
+            False,
+            "stable",
+        ),
+        (
+            "claude-1",
+            "absent",
+            "credential-forward-rollback-quarantine-authorized",
+            False,
+            "stable",
+        ),
         ("claude-1", "removed", "rollback-file-publish-authorized", True, "stable"),
         ("codex-1", "present", "rollback-file-publish-authorized", False, "rollback"),
     ],
@@ -2805,7 +2817,9 @@ def test_file_credential_rollback_preserves_pre_mutation_race(
     stable = target.home / stable_name
     backup = target.home / f".{stable_name}.race-backup"
     rollback = target.home / f".{stable_name}.race-rollback"
+    rollback_cleanup = target.home / f".{stable_name}.race-rollback-cleanup"
     quarantine = target.home / f".{stable_name}.race-quarantine"
+    original_quarantine = target.home / f".{stable_name}.race-original"
     journal_path = target.home / f".{stable_name}.race-journal"
     original = b'{"credential":"original-generation"}\n'
     forward = b'{"credential":"transaction-forward-generation"}\n'
@@ -2849,7 +2863,9 @@ def test_file_credential_rollback_preserves_pre_mutation_race(
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             journal,
@@ -2878,7 +2894,9 @@ def test_file_credential_rollback_preserves_stable_reappearance_after_quarantine
     stable = target.home / "auth.json"
     backup = target.home / ".auth.json.reappearance-backup"
     rollback = target.home / ".auth.json.reappearance-rollback"
+    rollback_cleanup = target.home / ".auth.json.reappearance-rollback-cleanup"
     quarantine = target.home / ".auth.json.reappearance-quarantine"
+    original_quarantine = target.home / ".auth.json.reappearance-original"
     journal_path = target.home / ".auth.json.reappearance-journal"
     original = b'{"credential":"original-generation"}\n'
     forward = b'{"credential":"transaction-forward-generation"}\n'
@@ -2905,14 +2923,16 @@ def test_file_credential_rollback_preserves_stable_reappearance_after_quarantine
             atomic_write_bytes(stable, foreign)
 
     monkeypatch.setattr(recovery, "_rename_noreplace", reappear_after_quarantine)
-    with pytest.raises(ValueError, match="reappeared after atomic quarantine"):
+    with pytest.raises(ValueError, match="reappeared after its quarantine move"):
         recovery._rollback_file_credential(
             target,
             "auth.json",
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             journal,
@@ -2930,7 +2950,9 @@ def test_file_credential_rollback_preserves_stable_reappearance_after_quarantine
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             journal,
@@ -2947,7 +2969,9 @@ def test_file_credential_rollback_preserves_ambiguous_unverified_publish(
     stable = target.home / "auth.json"
     backup = target.home / ".auth.json.ambiguous-backup"
     rollback = target.home / ".auth.json.ambiguous-rollback"
+    rollback_cleanup = target.home / ".auth.json.ambiguous-rollback-cleanup"
     quarantine = target.home / ".auth.json.ambiguous-quarantine"
+    original_quarantine = target.home / ".auth.json.ambiguous-original"
     journal_path = target.home / ".auth.json.ambiguous-journal"
     original = b'{"credential":"original-generation"}\n'
     forward = b'{"credential":"transaction-forward-generation"}\n'
@@ -2955,23 +2979,29 @@ def test_file_credential_rollback_preserves_ambiguous_unverified_publish(
 
     atomic_write_bytes(stable, original)
     journal: dict[str, Any] = {
-        "original_credential_stat": recovery._stat_payload(
-            recovery._private_file(stable, "test original credential")
+        "original_credential_generation": recovery._file_generation(
+            stable,
+            "test original credential",
         )
     }
     atomic_write_bytes(backup, original)
     atomic_write_bytes(stable, forward)
-    journal["installed_credential_stat"] = recovery._stat_payload(
-        recovery._private_file(stable, "test transaction credential")
+    journal["installed_credential_generation"] = recovery._file_generation(
+        stable,
+        "test transaction credential",
     )
-    journal["rollback_file_observed_forward_stat"] = journal["installed_credential_stat"]
+    journal["credential-forward-rollback_observed_generation"] = journal[
+        "installed_credential_generation"
+    ]
     recovery._rename_noreplace(stable, quarantine)
-    journal["rollback_file_quarantine_stat"] = recovery._stat_payload(
-        recovery._private_file(quarantine, "test quarantined credential")
+    journal["credential-forward-rollback_quarantine_generation"] = recovery._file_generation(
+        quarantine,
+        "test quarantined credential",
     )
     atomic_write_bytes(rollback, original)
-    journal["rollback_file_prepared_stat"] = recovery._stat_payload(
-        recovery._private_file(rollback, "test prepared credential")
+    journal["rollback-file_prepared_generation"] = recovery._file_generation(
+        rollback,
+        "test prepared credential",
     )
     journal["recovery_phase"] = "rollback-file-publish-authorized"
     atomic_write_json(journal_path, journal)
@@ -2986,7 +3016,9 @@ def test_file_credential_rollback_preserves_ambiguous_unverified_publish(
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             journal,
@@ -3006,7 +3038,9 @@ def test_file_credential_rollback_binds_copy_fd_before_path_attribution(
     stable = target.home / "auth.json"
     backup = target.home / ".auth.json.copy-attribution-backup"
     rollback = target.home / ".auth.json.copy-attribution-rollback"
+    rollback_cleanup = target.home / ".auth.json.copy-attribution-rollback-cleanup"
     quarantine = target.home / ".auth.json.copy-attribution-quarantine"
+    original_quarantine = target.home / ".auth.json.copy-attribution-original"
     journal_path = target.home / ".auth.json.copy-attribution-journal"
     original = b'{"credential":"original-generation"}\n'
     forward = b'{"credential":"transaction-forward-generation"}\n'
@@ -3043,14 +3077,16 @@ def test_file_credential_rollback_binds_copy_fd_before_path_attribution(
         return copied
 
     monkeypatch.setattr(recovery, "_copy_private_file", replace_after_copy_close)
-    with pytest.raises(ValueError, match="changed before attribution"):
+    with pytest.raises(ValueError, match="changed before final attribution"):
         recovery._rollback_file_credential(
             target,
             "auth.json",
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             journal,
@@ -3060,14 +3096,16 @@ def test_file_credential_rollback_binds_copy_fd_before_path_attribution(
     assert rollback.read_bytes() == foreign
     assert quarantine.read_bytes() == forward
     restarted = json.loads(journal_path.read_text(encoding="utf-8"))
-    with pytest.raises(ValueError, match="no durable transaction ownership"):
+    with pytest.raises(ValueError, match="changed before attributed cleanup"):
         recovery._rollback_file_credential(
             target,
             "auth.json",
             backup,
             {
                 "rollback_temp": rollback,
+                "rollback_temp_cleanup": rollback_cleanup,
                 "credential_quarantine": quarantine,
+                "credential_original_quarantine": original_quarantine,
             },
             journal_path,
             restarted,
@@ -3083,38 +3121,360 @@ def test_quarantine_cleanup_rejects_replacement_after_generation_precheck(
     registry, _config = _loaded(fleet)
     target = registry.require_profile("codex-1")
     quarantine = target.home / ".auth.json.cleanup-race-quarantine"
+    cleanup = target.home / ".auth.json.cleanup-race-tombstone"
+    journal_path = target.home / ".auth.json.cleanup-race-journal"
     expected = b'{"credential":"transaction-forward-generation"}\n'
     foreign = b'{"credential":"foreign-cleanup-generation"}\n'
     atomic_write_bytes(quarantine, expected)
-    journal = {
-        "rollback_file_quarantine_stat": recovery._stat_payload(
-            recovery._private_file(quarantine, "test cleanup credential")
-        )
-    }
-    paths = {
-        "credential_quarantine": quarantine,
-        "install_temp": target.home / ".cleanup-race-install",
-        "rollback_temp": target.home / ".cleanup-race-rollback",
-        "bundle_restore_temp": target.home / ".cleanup-race-bundle",
-        "provisional_restore_temp": target.home / ".cleanup-race-provisional",
-        "provisional_guard_restore_temp": target.home / ".cleanup-race-guard",
-    }
-    real_unlink = recovery.unlink_private_file
-
-    def replace_before_attributed_unlink(path: Path, **kwargs: Any) -> bool:
-        atomic_write_bytes(path, foreign)
-        return real_unlink(path, **kwargs)
-
-    monkeypatch.setattr(
-        recovery,
-        "unlink_private_file",
-        replace_before_attributed_unlink,
+    expected_generation = recovery._file_generation(
+        quarantine,
+        "test cleanup credential",
     )
-    with pytest.raises(ValueError, match="changed before attributed removal"):
-        recovery._clean_exact_temporaries(paths, journal)
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_rename = recovery._rename_noreplace
+
+    def replace_before_attributed_move(source: Path, destination: Path) -> None:
+        if source == quarantine and destination == cleanup:
+            atomic_write_bytes(source, foreign)
+        real_rename(source, destination)
+
+    monkeypatch.setattr(recovery, "_rename_noreplace", replace_before_attributed_move)
+    with pytest.raises(ValueError, match="changed during attributed cleanup move"):
+        recovery._cleanup_owned_generation(
+            quarantine,
+            cleanup,
+            expected_generation,
+            key="test-cleanup",
+            label="test cleanup credential",
+            journal_path=journal_path,
+            journal=journal,
+        )
 
     assert quarantine.read_bytes() == foreign
-    assert not list(target.home.glob(f".{quarantine.name}.delete.*"))
+    assert not cleanup.exists()
+
+
+def test_cleanup_sigkill_after_real_rename_is_restart_discoverable(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / ".cleanup-kill-source"
+    cleanup = target.home / ".cleanup-kill-tombstone"
+    journal_path = target.home / ".cleanup-kill-journal"
+    atomic_write_bytes(source, b"owned cleanup generation\n")
+    expected = recovery._file_generation(source, "test cleanup source")
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_rename = recovery._rename_noreplace
+
+    def kill_after_rename(rename_source: Path, rename_destination: Path) -> None:
+        real_rename(rename_source, rename_destination)
+        if rename_source == source and rename_destination == cleanup:
+            os._exit(96)
+
+    monkeypatch.setattr(recovery, "_rename_noreplace", kill_after_rename)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional cleanup crash child
+        recovery._cleanup_owned_generation(
+            source,
+            cleanup,
+            expected,
+            key="test-cleanup-kill",
+            label="test cleanup kill generation",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 96
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename)
+    assert not source.exists()
+    assert cleanup.exists()
+
+    restarted = json.loads(journal_path.read_text(encoding="utf-8"))
+    recovery._cleanup_owned_generation(
+        source,
+        cleanup,
+        expected,
+        key="test-cleanup-kill",
+        label="test cleanup kill generation",
+        journal_path=journal_path,
+        journal=restarted,
+    )
+    assert not source.exists()
+    assert not cleanup.exists()
+    assert restarted["test-cleanup-kill_cleanup_complete"] is True
+
+
+def test_owned_copy_kill_after_create_before_callback_preserves_ambiguity(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / "auth.json"
+    destination = target.home / ".copy-before-callback"
+    cleanup = target.home / ".copy-before-callback-cleanup"
+    journal_path = target.home / ".copy-before-callback-journal"
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_copy = recovery._copy_private_file
+
+    def kill_before_callback(
+        _source: Path,
+        created: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ) -> os.stat_result:
+        descriptor = os.open(created, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, b"ambiguous partial generation")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        os._exit(97)
+
+    monkeypatch.setattr(recovery, "_copy_private_file", kill_before_callback)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional pre-attribution crash child
+        recovery._prepare_owned_copy(
+            source,
+            destination,
+            cleanup,
+            key="test-pre-callback",
+            label="test pre-callback copy",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 97
+    monkeypatch.setattr(recovery, "_copy_private_file", real_copy)
+
+    restarted = json.loads(journal_path.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="no durable transaction ownership"):
+        recovery._prepare_owned_copy(
+            source,
+            destination,
+            cleanup,
+            key="test-pre-callback",
+            label="test pre-callback copy",
+            journal_path=journal_path,
+            journal=restarted,
+        )
+    assert destination.read_bytes() == b"ambiguous partial generation"
+    assert journal_path.exists()
+
+
+def test_publish_rejects_same_inode_content_mutation_with_restored_mtime(
+    fleet: tuple[Registry, Path],
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / ".same-inode-prepared"
+    destination = target.home / ".same-inode-published"
+    journal_path = target.home / ".same-inode-journal"
+    atomic_write_bytes(source, b"original-generation")
+    expected = recovery._file_generation(source, "test prepared generation")
+    with source.open("r+b") as handle:
+        handle.write(b"tampered-generation")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.utime(
+        source,
+        ns=(source.stat().st_atime_ns, expected["stat"]["mtime_ns"]),
+    )
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+
+    with pytest.raises(ValueError, match="changed before publication"):
+        recovery._publish_owned_generation(
+            source,
+            destination,
+            expected,
+            key="test-same-inode",
+            label="test same-inode generation",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    assert source.read_bytes() == b"tampered-generation"
+    assert not destination.exists()
+
+
+def test_publish_never_overwrites_destination_reappearance(
+    fleet: tuple[Registry, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    source = target.home / ".publish-race-prepared"
+    destination = target.home / ".publish-race-destination"
+    journal_path = target.home / ".publish-race-journal"
+    atomic_write_bytes(source, b"transaction generation\n")
+    expected = recovery._file_generation(source, "test publish source")
+    foreign = b"foreign destination generation\n"
+    journal: dict[str, Any] = {}
+    atomic_write_json(journal_path, journal)
+    real_write = recovery._write_recovery_journal
+
+    def reappear_at_publication(
+        path: Path,
+        payload: dict[str, Any],
+        phase: str,
+    ) -> None:
+        real_write(path, payload, phase)
+        if phase == "test-publish-publish-authorized":
+            atomic_write_bytes(destination, foreign)
+
+    monkeypatch.setattr(recovery, "_write_recovery_journal", reappear_at_publication)
+    with pytest.raises(ValueError, match="destination appeared"):
+        recovery._publish_owned_generation(
+            source,
+            destination,
+            expected,
+            key="test-publish",
+            label="test publish generation",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    assert source.read_bytes() == b"transaction generation\n"
+    assert destination.read_bytes() == foreign
+
+
+@pytest.mark.parametrize("component", ["credential", "bundle"])
+def test_forward_install_sigkill_after_original_quarantine_restores_on_restart(
+    fleet: tuple[Registry, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    registry, config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable_auth = target.home / "auth.json"
+    original_auth = stable_auth.read_bytes()
+    bundle = identity_bundle_path(registry, "codex")
+    original_bundle = bundle.read_bytes()
+    real_rename = recovery._rename_noreplace
+
+    def kill_after_original_quarantine(source: Path, destination: Path) -> None:
+        real_rename(source, destination)
+        credential_boundary = (
+            component == "credential"
+            and source == stable_auth
+            and destination.name.endswith(".original")
+        )
+        bundle_boundary = (
+            component == "bundle" and source == bundle and ".original-" in destination.name
+        )
+        if credential_boundary or bundle_boundary:
+            os._exit(98)
+
+    monkeypatch.setattr(recovery, "_rename_noreplace", kill_after_original_quarantine)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional forward quarantine crash child
+        recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=FakeRecovery(registry).hooks(),
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 98
+    monkeypatch.setattr(recovery, "_rename_noreplace", real_rename)
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert stable_auth.read_bytes() == original_auth
+    assert bundle.read_bytes() == original_bundle
+    assert not list(
+        (reloaded.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
+    )
+
+
+@pytest.mark.parametrize("backup_component", ["credential", "bundle"])
+def test_owned_backup_mid_copy_sigkill_is_collected_after_rollback(
+    fleet: tuple[Registry, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    backup_component: str,
+) -> None:
+    registry, config = _loaded(fleet)
+    target = registry.require_profile("codex-1")
+    stable_auth = target.home / "auth.json"
+    original_auth = stable_auth.read_bytes()
+    bundle = identity_bundle_path(registry, "codex")
+    original_bundle = bundle.read_bytes()
+    real_copy = recovery._copy_private_file
+
+    def kill_mid_backup(
+        source: Path,
+        destination: Path,
+        *,
+        destination_created: Callable[[os.stat_result], None] | None = None,
+    ) -> os.stat_result:
+        credential_boundary = (
+            backup_component == "credential" and destination.name == ".stable-auth.backup"
+        )
+        bundle_boundary = (
+            backup_component == "bundle" and destination.name == ".identity-bundle.backup"
+        )
+        if credential_boundary or bundle_boundary:
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.fchmod(descriptor, 0o600)
+            if destination_created is not None:
+                destination_created(os.fstat(descriptor))
+            os.write(descriptor, b"attributed partial backup")
+            os.fsync(descriptor)
+            os.close(descriptor)
+            os._exit(99)
+        return real_copy(
+            source,
+            destination,
+            destination_created=destination_created,
+        )
+
+    monkeypatch.setattr(recovery, "_copy_private_file", kill_mid_backup)
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - intentional backup crash child
+        recover_profile_login(
+            registry,
+            "codex-1",
+            config,
+            hooks=FakeRecovery(registry).hooks(),
+        )
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 99
+    monkeypatch.setattr(recovery, "_copy_private_file", real_copy)
+    _expire_abandoned_provider_lock(registry, "codex")
+
+    reloaded = load_registry(config)
+    with provider_enrollment_lock(
+        reloaded.settings.state_dir,
+        "codex",
+        reloaded.settings.lock_stale_seconds,
+    ):
+        recover_pending_profile_recoveries(
+            reloaded,
+            "codex",
+            hooks=FakeRecovery(reloaded).hooks(),
+        )
+    assert stable_auth.read_bytes() == original_auth
+    assert bundle.read_bytes() == original_bundle
+    stage_root = reloaded.settings.state_dir / "staging" / "credential-recovery" / "codex"
+    assert not list(stage_root.iterdir())
 
 
 def test_attributed_unlink_restoration_never_overwrites_reappearance(
@@ -3235,16 +3595,12 @@ def test_corrupt_claude_keychain_scope_journal_performs_no_keychain_operation(
         "credential-installed",
     )
     journal_path = next(
-        (registry.settings.state_dir / "transactions" / "credential-recovery").glob(
-            "*.json"
-        )
+        (registry.settings.state_dir / "transactions" / "credential-recovery").glob("*.json")
     )
     journal = read_private_json(journal_path, label="test Claude recovery journal")
     journal[field] = corrupt_value
     atomic_write_json(journal_path, journal)
-    keychain_before = {
-        path.name: path.read_bytes() for path in sorted(keychain.root.iterdir())
-    }
+    keychain_before = {path.name: path.read_bytes() for path in sorted(keychain.root.iterdir())}
     _expire_abandoned_provider_lock(registry, "claude")
 
     reloaded = load_registry(config)

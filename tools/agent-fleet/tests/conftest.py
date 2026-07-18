@@ -52,6 +52,7 @@ def fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Registry, Pa
         """#!/usr/bin/env python3
 import json
 import os
+import pwd
 import sys
 from datetime import UTC, datetime
 provider = sys.argv[sys.argv.index("--provider") + 1]
@@ -68,7 +69,7 @@ if "auth" in sys.argv:
             {
                 "source": "keychain",
                 "status": "missing",
-                "account": os.environ["USER"],
+                "account": pwd.getpwuid(os.getuid()).pw_name,
             },
         ]
     else:

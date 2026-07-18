@@ -54,7 +54,6 @@ from .util import (
     read_private_bytes,
     read_private_json,
     rename_private_noreplace,
-    unlink_private_file,
     utc_now,
 )
 
@@ -66,6 +65,10 @@ CLAUDE_AUTH = ".credentials.json"
 CLAUDE_KEYCHAIN_SERVICE = re.compile(
     r"(?:Claude Code-credentials-[0-9a-f]{8}|Claude Code-agent-fleet-backup-[0-9a-f]{32})"
 )
+
+
+class _BundlePlanValidated(Exception):
+    """Internal fence proving bundle validation reached the mutation boundary."""
 
 
 class KeychainControl(Protocol):
@@ -554,10 +557,7 @@ def _same_directory_identity(path: Path, encoded: object) -> bool:
         observed = _stat_payload(_private_directory(path, "credential recovery stage"))
     except (FileNotFoundError, ValueError):
         return False
-    return all(
-        encoded.get(field) == observed[field]
-        for field in ("dev", "ino", "uid", "mode")
-    )
+    return all(encoded.get(field) == observed[field] for field in ("dev", "ino", "uid", "mode"))
 
 
 def _journal_root(registry: Registry) -> Path:
@@ -798,7 +798,7 @@ def _transaction_paths(
     nonce: str,
 ) -> dict[str, str]:
     stage = _stage_root(registry, profile.provider) / f".{profile.id}.login-{nonce}"
-    return {
+    paths = {
         "stage": str(stage),
         "quarantine": str(stage.with_name(f".{stage.name}.cleanup-{nonce}")),
         "codex_backup": str(stage / ".stable-auth.backup"),
@@ -808,8 +808,9 @@ def _transaction_paths(
         "provisional_guard_backup": str(stage / ".provisional-guard.backup"),
         "install_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.new"),
         "rollback_temp": str(profile.home / f".agent-fleet-recovery-{nonce}.rollback"),
-        "credential_quarantine": str(
-            profile.home / f".agent-fleet-recovery-{nonce}.quarantine"
+        "credential_quarantine": str(profile.home / f".agent-fleet-recovery-{nonce}.quarantine"),
+        "credential_original_quarantine": str(
+            profile.home / f".agent-fleet-recovery-{nonce}.original"
         ),
         "bundle_restore_temp": str(
             identity_bundle_path(registry, profile.provider).with_name(
@@ -826,7 +827,78 @@ def _transaction_paths(
                 f".{_provisional_guard_path(registry, profile.provider).name}.rollback-{nonce}"
             )
         ),
+        "bundle_install_temp": str(
+            identity_bundle_path(registry, profile.provider).with_name(
+                f".{identity_bundle_path(registry, profile.provider).name}.install-{nonce}"
+            )
+        ),
+        "provisional_install_temp": str(
+            _provisional_path(registry, profile.provider).with_name(
+                f".{_provisional_path(registry, profile.provider).name}.install-{nonce}"
+            )
+        ),
+        "provisional_guard_install_temp": str(
+            _provisional_guard_path(registry, profile.provider).with_name(
+                f".{_provisional_guard_path(registry, profile.provider).name}.install-{nonce}"
+            )
+        ),
+        "bundle_original_quarantine": str(
+            identity_bundle_path(registry, profile.provider).with_name(
+                f".{identity_bundle_path(registry, profile.provider).name}.original-{nonce}"
+            )
+        ),
+        "provisional_original_quarantine": str(
+            _provisional_path(registry, profile.provider).with_name(
+                f".{_provisional_path(registry, profile.provider).name}.original-{nonce}"
+            )
+        ),
+        "provisional_guard_original_quarantine": str(
+            _provisional_guard_path(registry, profile.provider).with_name(
+                f".{_provisional_guard_path(registry, profile.provider).name}.original-{nonce}"
+            )
+        ),
+        "bundle_restore_quarantine": str(
+            identity_bundle_path(registry, profile.provider).with_name(
+                f".{identity_bundle_path(registry, profile.provider).name}.forward-{nonce}"
+            )
+        ),
+        "provisional_restore_quarantine": str(
+            _provisional_path(registry, profile.provider).with_name(
+                f".{_provisional_path(registry, profile.provider).name}.forward-{nonce}"
+            )
+        ),
+        "provisional_guard_restore_quarantine": str(
+            _provisional_guard_path(registry, profile.provider).with_name(
+                f".{_provisional_guard_path(registry, profile.provider).name}.forward-{nonce}"
+            )
+        ),
     }
+    for name in (
+        "codex_backup",
+        "claude_file_backup",
+        "bundle_backup",
+        "provisional_backup",
+        "provisional_guard_backup",
+        "install_temp",
+        "rollback_temp",
+        "bundle_install_temp",
+        "provisional_install_temp",
+        "provisional_guard_install_temp",
+        "bundle_original_quarantine",
+        "provisional_original_quarantine",
+        "provisional_guard_original_quarantine",
+        "credential_quarantine",
+        "credential_original_quarantine",
+        "bundle_restore_temp",
+        "provisional_restore_temp",
+        "provisional_guard_restore_temp",
+        "bundle_restore_quarantine",
+        "provisional_restore_quarantine",
+        "provisional_guard_restore_quarantine",
+    ):
+        path = Path(paths[name])
+        paths[f"{name}_cleanup"] = str(path.with_name(f".{path.name}.cleanup-{nonce}"))
+    return paths
 
 
 def _validate_paths(
@@ -868,6 +940,8 @@ def _copy_private_file(
             view = memoryview(chunk)
             while view:
                 view = view[os.write(destination_fd, view) :]
+        if _stat_payload(os.fstat(source_fd)) != _stat_payload(source_before):
+            raise ValueError("credential transaction source changed while copying")
         os.fsync(destination_fd)
         installed = os.fstat(destination_fd)
     finally:
@@ -883,6 +957,286 @@ def _fsync(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _generation_matches(
+    observed: dict[str, Any],
+    expected: object,
+    *,
+    ctime: bool,
+) -> bool:
+    """Match either a full content generation or an owned in-progress inode."""
+
+    if not isinstance(expected, dict):
+        return False
+    if set(expected) == {"stat", "sha256"}:
+        expected_stat = expected.get("stat")
+        expected_digest = expected.get("sha256")
+        return (
+            isinstance(expected_digest, str)
+            and observed.get("sha256") == expected_digest
+            and isinstance(observed.get("stat"), dict)
+            and _stat_matches_generation(
+                observed["stat"],
+                expected_stat,
+                ctime=ctime,
+            )
+        )
+    return isinstance(observed.get("stat"), dict) and _stat_matches_inode(
+        observed["stat"],
+        expected,
+    )
+
+
+def _read_fd_generation(descriptor: int) -> dict[str, Any]:
+    before = os.fstat(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if _stat_payload(before) != _stat_payload(after):
+        raise ValueError("credential transaction file changed while hashing")
+    return {"stat": _stat_payload(after), "sha256": digest.hexdigest()}
+
+
+def _unlink_prequarantined_generation(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Unlink a deterministic private tombstone through its verified parent fd."""
+
+    parent_fd = open_private_dir(path.parent)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            raise ValueError(f"{label} is not a private transaction tombstone")
+        observed = _read_fd_generation(descriptor)
+        if not _generation_matches(observed, expected, ctime=True):
+            raise ValueError(f"{label} changed before attributed unlink")
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if _stat_payload(current) != observed["stat"]:
+            raise ValueError(f"{label} changed immediately before attributed unlink")
+        os.unlink(path.name, dir_fd=parent_fd)
+        after = os.fstat(descriptor)
+        if after.st_nlink != 0 or (after.st_dev, after.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise RuntimeError(f"{label} unlink identity was not stable")
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
+def _cleanup_owned_generation(
+    path: Path,
+    cleanup: Path,
+    expected: object,
+    *,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    """Remove only an attributed generation through a deterministic tombstone."""
+
+    moved_key = f"{key}_cleanup_generation"
+    complete_key = f"{key}_cleanup_complete"
+    if journal.get(complete_key) is True:
+        if any(candidate.exists() or candidate.is_symlink() for candidate in (path, cleanup)):
+            raise ValueError(f"{label} reappeared after attributed cleanup")
+        return
+    path_exists = path.exists() or path.is_symlink()
+    cleanup_exists = cleanup.exists() or cleanup.is_symlink()
+    if path_exists and cleanup_exists:
+        raise ValueError(f"{label} exists at both source and cleanup paths")
+    if cleanup_exists:
+        moved = _file_generation(cleanup, f"quarantined {label}")
+        durable = journal.get(moved_key)
+        if durable is not None:
+            if not _generation_matches(moved, durable, ctime=True):
+                raise ValueError(f"quarantined {label} changed after cleanup move")
+        elif not _generation_matches(moved, expected, ctime=False):
+            raise ValueError(f"quarantined {label} has no transaction attribution")
+        else:
+            journal[moved_key] = moved
+            _write_recovery_journal(journal_path, journal, f"{key}-cleanup-moved")
+    elif path_exists:
+        observed = _file_generation(path, label)
+        if not _generation_matches(observed, expected, ctime=True):
+            raise ValueError(f"{label} changed before attributed cleanup")
+        _write_recovery_journal(journal_path, journal, f"{key}-cleanup-move-authorized")
+        try:
+            _rename_noreplace(path, cleanup)
+        except FileExistsError as exc:
+            raise ValueError(f"{label} cleanup tombstone already exists") from exc
+        moved = _file_generation(cleanup, f"quarantined {label}")
+        if not _generation_matches(moved, observed, ctime=False):
+            _restore_misattributed_move(
+                cleanup,
+                path,
+                moved["stat"],
+                label=f"misattributed {label} cleanup",
+            )
+            raise ValueError(f"{label} changed during attributed cleanup move")
+        journal[moved_key] = moved
+        _write_recovery_journal(journal_path, journal, f"{key}-cleanup-moved")
+    else:
+        journal[complete_key] = True
+        _write_recovery_journal(journal_path, journal, f"{key}-cleanup-complete")
+        return
+    moved = journal.get(moved_key)
+    if not isinstance(moved, dict):
+        raise ValueError(f"{label} cleanup generation is not durable")
+    _write_recovery_journal(journal_path, journal, f"{key}-cleanup-unlink-authorized")
+    _unlink_prequarantined_generation(cleanup, moved, label=f"quarantined {label}")
+    journal[complete_key] = True
+    _write_recovery_journal(journal_path, journal, f"{key}-cleanup-complete")
+
+
+def _prepare_owned_copy(
+    source: Path,
+    destination: Path,
+    cleanup: Path,
+    *,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a restart-attributed O_EXCL copy and bind its final digest."""
+
+    identity_key = f"{key}_copy_identity"
+    prepared_key = f"{key}_prepared_generation"
+    prepared = journal.get(prepared_key)
+    identity = journal.get(identity_key)
+    if prepared is not None:
+        observed = _file_generation(destination, f"prepared {label}")
+        if not _generation_matches(observed, prepared, ctime=True):
+            raise ValueError(f"prepared {label} changed")
+        return observed
+    if identity is not None and not _valid_inode_payload(identity):
+        raise ValueError(f"{label} copy ownership is invalid")
+    if destination.exists() or destination.is_symlink():
+        if identity is None:
+            raise ValueError(f"partial {label} has no durable transaction ownership")
+        _cleanup_owned_generation(
+            destination,
+            cleanup,
+            identity,
+            key=f"{key}-partial",
+            label=f"partial {label}",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        journal.pop(identity_key, None)
+        _write_recovery_journal(journal_path, journal, f"{key}-copy-reset")
+    _write_recovery_journal(journal_path, journal, f"{key}-copy-running")
+
+    def record_identity(metadata: os.stat_result) -> None:
+        journal[identity_key] = _inode_payload(metadata)
+        _write_recovery_journal(journal_path, journal, f"{key}-copy-owned")
+
+    copied = _copy_private_file(
+        source,
+        destination,
+        destination_created=record_identity,
+    )
+    observed = _file_generation(destination, f"prepared {label}")
+    if not _stat_matches_inode(
+        observed["stat"], journal.get(identity_key)
+    ) or not _stat_matches_inode(_stat_payload(copied), journal.get(identity_key)):
+        raise ValueError(f"prepared {label} changed before final attribution")
+    journal[prepared_key] = observed
+    journal.pop(identity_key, None)
+    _write_recovery_journal(journal_path, journal, f"{key}-prepared")
+    return observed
+
+
+def _prepare_owned_payload(
+    destination: Path,
+    cleanup: Path,
+    payload: bytes,
+    *,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a journal-owned exact-path payload without atomic-write temp aliases."""
+
+    identity_key = f"{key}_copy_identity"
+    prepared_key = f"{key}_prepared_generation"
+    prepared = journal.get(prepared_key)
+    identity = journal.get(identity_key)
+    if prepared is not None:
+        observed = _file_generation(destination, f"prepared {label}")
+        if not _generation_matches(observed, prepared, ctime=True):
+            raise ValueError(f"prepared {label} changed")
+        return observed
+    if identity is not None and not _valid_inode_payload(identity):
+        raise ValueError(f"{label} payload ownership is invalid")
+    if destination.exists() or destination.is_symlink():
+        if identity is None:
+            raise ValueError(f"partial {label} has no durable transaction ownership")
+        _cleanup_owned_generation(
+            destination,
+            cleanup,
+            identity,
+            key=f"{key}-partial",
+            label=f"partial {label}",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        journal.pop(identity_key, None)
+        _write_recovery_journal(journal_path, journal, f"{key}-copy-reset")
+    _write_recovery_journal(journal_path, journal, f"{key}-copy-running")
+    parent_fd = open_private_dir(destination.parent)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            destination.name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        journal[identity_key] = _inode_payload(os.fstat(descriptor))
+        _write_recovery_journal(journal_path, journal, f"{key}-copy-owned")
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+        observed = _read_fd_generation(descriptor)
+        current = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _stat_matches_inode(observed["stat"], journal.get(identity_key)) or (
+            _stat_payload(current) != observed["stat"]
+        ):
+            raise ValueError(f"prepared {label} changed before final attribution")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+    journal[prepared_key] = observed
+    journal.pop(identity_key, None)
+    _write_recovery_journal(journal_path, journal, f"{key}-prepared")
+    return observed
 
 
 def _stage_marker_payload(profile: Profile, nonce: str) -> dict[str, Any]:
@@ -920,12 +1274,19 @@ def _prepare_stage(
     # trust, plugins, and provider history are deliberately absent.
     atomic_write_bytes(
         stage / ".agent-fleet-profile.json",
-        (json.dumps({
-            "schema": 2,
-            "agent_fleet_version": __version__,
-            "profile": profile.id,
-            "provider": profile.provider,
-        }, indent=2, sort_keys=True) + "\n").encode(),
+        (
+            json.dumps(
+                {
+                    "schema": 2,
+                    "agent_fleet_version": __version__,
+                    "profile": profile.id,
+                    "provider": profile.provider,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
     )
     _write_journal(journal_path, journal, "stage-profile-ready")
     stable_binary_marker = profile.home / PROVIDER_BINARY_MARKER_FILE
@@ -1074,7 +1435,10 @@ def _remove_stage(
             _validate_stage(profile, stage, journal)
         journal["stage_cleanup_stat"] = expected
         _write_recovery_journal(journal_path, journal, "stage-quarantine-authorized")
-        os.replace(stage, quarantine)
+        try:
+            _rename_noreplace(stage, quarantine)
+        except FileExistsError as exc:
+            raise ValueError("credential recovery stage quarantine appeared") from exc
         _fsync(quarantine.parent)
         moved = _validate_partial_stage_tree(quarantine, expected)
         journal["quarantine_stat"] = _stat_payload(moved)
@@ -1229,7 +1593,12 @@ def _preflight_stable_credential(profile: Profile) -> None:
         _private_file(credential, f"stable {profile.provider} credential")
 
 
-def _snapshot_bundle(registry: Registry, paths: dict[str, Path], journal: dict[str, Any]) -> None:
+def _snapshot_bundle(
+    registry: Registry,
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
     bundle = identity_bundle_path(registry, str(journal["provider"]))
     journal["bundle_existed"] = bundle.exists()
     if bundle.exists() or bundle.is_symlink():
@@ -1237,7 +1606,15 @@ def _snapshot_bundle(registry: Registry, paths: dict[str, Path], journal: dict[s
             bundle,
             "provider identity bundle",
         )
-        _copy_private_file(bundle, paths["bundle_backup"])
+        _prepare_owned_copy(
+            bundle,
+            paths["bundle_backup"],
+            paths["bundle_backup_cleanup"],
+            key="bundle-backup",
+            label="provider identity bundle backup",
+            journal_path=journal_path,
+            journal=journal,
+        )
 
 
 def _provisional_path(registry: Registry, provider: str) -> Path:
@@ -1299,9 +1676,7 @@ def _provider_initialization_contract(registry: Registry, provider: str) -> dict
         "quota_node_sha256": registry.settings.quota_node_sha256,
         "quota_release_tree_sha256": registry.settings.quota_release_tree_sha256,
         "quota_stale_seconds": registry.settings.quota_stale_seconds,
-        "quota_verification_grace_seconds": (
-            registry.settings.quota_verification_grace_seconds
-        ),
+        "quota_verification_grace_seconds": (registry.settings.quota_verification_grace_seconds),
         "lease_grace_seconds": registry.settings.lease_grace_seconds,
         "active_lease_penalty": registry.settings.active_lease_penalty,
         "lock_stale_seconds": registry.settings.lock_stale_seconds,
@@ -1337,7 +1712,8 @@ def _read_provisional_batch(
     expected = _provider_initialization_contract(registry, provider)
     if (
         not isinstance(payload, dict)
-        or set(payload) != {
+        or set(payload)
+        != {
             "schema",
             "kind",
             "provider",
@@ -1360,7 +1736,8 @@ def _read_provisional_batch(
     for profile_id, record in payload["workers"].items():
         if (
             not isinstance(record, dict)
-            or set(record) != {
+            or set(record)
+            != {
                 "profile",
                 "provider",
                 "stable_home",
@@ -1371,8 +1748,7 @@ def _read_provisional_batch(
             }
             or record.get("profile") != profile_id
             or record.get("provider") != provider
-            or record.get("stable_home")
-            != str(registry.require_profile(profile_id).home)
+            or record.get("stable_home") != str(registry.require_profile(profile_id).home)
             or not isinstance(record.get("identity_fingerprint"), str)
             or len(str(record["identity_fingerprint"])) != 64
             or not isinstance(record.get("source_contract"), dict)
@@ -1480,6 +1856,7 @@ def _snapshot_provisional(
     registry: Registry,
     provider: str,
     paths: dict[str, Path],
+    journal_path: Path,
     journal: dict[str, Any],
 ) -> None:
     path = _provisional_path(registry, provider)
@@ -1495,12 +1872,28 @@ def _snapshot_provisional(
             path,
             "provider provisional identity batch",
         )
-        _copy_private_file(path, paths["provisional_backup"])
+        _prepare_owned_copy(
+            path,
+            paths["provisional_backup"],
+            paths["provisional_backup_cleanup"],
+            key="provisional-backup",
+            label="provider provisional identity batch backup",
+            journal_path=journal_path,
+            journal=journal,
+        )
         journal["provisional_guard_original_generation"] = _file_generation(
             guard,
             "provider initialization locator",
         )
-        _copy_private_file(guard, paths["provisional_guard_backup"])
+        _prepare_owned_copy(
+            guard,
+            paths["provisional_guard_backup"],
+            paths["provisional_guard_backup_cleanup"],
+            key="provisional-guard-backup",
+            label="provider initialization locator backup",
+            journal_path=journal_path,
+            journal=journal,
+        )
 
 
 def _snapshot_state(
@@ -1552,22 +1945,77 @@ def _require_snapshot_original(
         raise ValueError(f"{label} changed before transaction installation")
 
 
+def _install_metadata_payload(
+    *,
+    target: Path,
+    temporary: Path,
+    temporary_cleanup: Path,
+    original_quarantine: Path,
+    payload: dict[str, Any],
+    existed: bool,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish transaction metadata without replacing a concurrent generation."""
+
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    prepared = _prepare_owned_payload(
+        temporary,
+        temporary_cleanup,
+        encoded,
+        key=f"{key}-install",
+        label=f"{label} install generation",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    original = journal.get(f"{key}_original_generation")
+    if existed:
+        if not isinstance(original, dict):
+            raise ValueError(f"{label} original generation is unavailable")
+        _quarantine_owned_generation(
+            target,
+            original_quarantine,
+            original,
+            key=f"{key}-original",
+            label=f"original {label}",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    elif target.exists() or target.is_symlink():
+        raise ValueError(f"{label} appeared before transaction installation")
+    installed = _publish_owned_generation(
+        temporary,
+        target,
+        prepared,
+        key=f"{key}-forward",
+        label=label,
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal[f"{key}_forward_generation"] = installed
+    return installed
+
+
 def _restore_snapshot_file(
     *,
     target: Path,
     backup: Path,
     temporary: Path,
+    temporary_cleanup: Path,
+    quarantine: Path,
+    original_quarantine: Path,
     existed: bool,
     key: str,
     label: str,
     journal_path: Path,
     journal: dict[str, Any],
 ) -> None:
-    """Restore one private snapshot through a restart-idempotent generation."""
+    """Restore one snapshot through attributed quarantine and no-replace publication."""
 
     complete_key = f"{key}_restore_complete"
     restored_key = f"{key}_restored_generation"
-    prepared_key = f"{key}_restore_prepared_generation"
     if journal.get(complete_key) is True:
         if existed:
             if not _same_file_generation(target, journal.get(restored_key)):
@@ -1576,6 +2024,26 @@ def _restore_snapshot_file(
             raise ValueError(f"{label} appeared after rollback completed")
         return
 
+    installed = journal.get(f"{key}-restore_installed_generation")
+    if installed is not None and (target.exists() or target.is_symlink()):
+        observed_installed = _file_generation(target, f"restored {label}")
+        if _generation_matches(observed_installed, installed, ctime=True):
+            journal[restored_key] = observed_installed
+            journal[complete_key] = True
+            _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+            return
+    prepared_after_move = journal.get(f"{key}-restore_prepared_generation")
+    if prepared_after_move is not None and (target.exists() or target.is_symlink()):
+        observed_prepared = _file_generation(target, f"restored {label}")
+        if _generation_matches(observed_prepared, prepared_after_move, ctime=False):
+            if temporary.exists() or temporary.is_symlink():
+                raise ValueError(f"restored {label} exists at two paths")
+            journal[f"{key}-restore_installed_generation"] = observed_prepared
+            journal[restored_key] = observed_prepared
+            journal[complete_key] = True
+            _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+            return
+
     state, observed = _snapshot_state(
         target,
         existed=existed,
@@ -1583,95 +2051,102 @@ def _restore_snapshot_file(
         label=label,
         journal=journal,
     )
-    if not existed:
-        if state not in {"original-absent", "forward", "forward-planned"}:
-            raise ValueError(f"{label} has an unknown generation during rollback")
-        if state != "original-absent":
-            _write_recovery_journal(
-                journal_path,
-                journal,
-                f"{key}-restore-delete-authorized",
-            )
-            current_state, current_observed = _snapshot_state(
-                target,
-                existed=existed,
-                key=key,
-                label=label,
-                journal=journal,
-            )
-            if current_state != state or current_observed != observed:
-                raise ValueError(f"{label} changed immediately before rollback removal")
-            target.unlink()
-            _fsync(target.parent)
-        else:
-            _fsync(target.parent)
-        journal[complete_key] = True
-        _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
-        return
-
     if state in {"original", "restored"}:
         journal[restored_key] = _file_generation(target, f"restored {label}")
         journal[complete_key] = True
         _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
         return
-    if state not in {"forward", "forward-planned", "forward-absent", "prepared-restore"}:
-        raise ValueError(f"{label} has an unknown generation during rollback")
-
-    prepared = journal.get(prepared_key)
-    if state == "prepared-restore":
-        if temporary.exists() or temporary.is_symlink():
-            raise ValueError(f"{label} rollback generation exists at two paths")
-        _fsync(target.parent)
-    else:
-        if prepared is None:
-            if temporary.exists() or temporary.is_symlink():
-                _private_file(temporary, f"partial {label} rollback temporary")
-                temporary.unlink()
-                _fsync(temporary.parent)
-            _write_recovery_journal(
-                journal_path,
-                journal,
-                f"{key}-restore-copy-running",
-            )
-            backup_generation = _file_generation(backup, f"{label} backup")
-            original_generation = journal.get(f"{key}_original_generation")
-            if (
-                not isinstance(original_generation, dict)
-                or backup_generation["sha256"] != original_generation.get("sha256")
-            ):
-                raise ValueError(f"{label} backup is not the snapshotted generation")
-            _copy_private_file(backup, temporary)
-            prepared = _file_generation(
-                temporary,
-                f"prepared {label} rollback generation",
-            )
-            journal[prepared_key] = prepared
-            _write_recovery_journal(
-                journal_path,
-                journal,
-                f"{key}-restore-prepared",
-            )
-        elif not _same_file_generation(temporary, prepared):
-            raise ValueError(f"prepared {label} rollback generation changed")
-
-        _write_recovery_journal(
-            journal_path,
-            journal,
-            f"{key}-restore-replace-authorized",
+    forward_key = f"{key}-forward-rollback"
+    quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+    if quarantine_exists:
+        moved = _file_generation(quarantine, f"quarantined {label}")
+        expected_moved = journal.get(f"{forward_key}_quarantine_generation") or journal.get(
+            f"{forward_key}_observed_generation"
         )
-        current_state, current_observed = _snapshot_state(
+        if not _generation_matches(
+            moved,
+            expected_moved,
+            ctime=journal.get(f"{forward_key}_quarantine_generation") is not None,
+        ):
+            raise ValueError(f"quarantined {label} has no transaction attribution")
+        if journal.get(f"{forward_key}_quarantine_generation") is None:
+            journal[f"{forward_key}_quarantine_generation"] = moved
+            _write_recovery_journal(journal_path, journal, f"{forward_key}-quarantined")
+        if target.exists() or target.is_symlink():
+            raise ValueError(f"{label} appeared while its forward generation is quarantined")
+    elif state in {"forward", "forward-planned", "prepared-restore"}:
+        if observed is None:
+            raise ValueError(f"{label} forward generation is unavailable")
+        _quarantine_owned_generation(
             target,
-            existed=existed,
-            key=key,
+            quarantine,
+            observed,
+            key=forward_key,
             label=label,
+            journal_path=journal_path,
             journal=journal,
         )
-        if current_state != state or current_observed != observed:
-            raise ValueError(f"{label} changed immediately before rollback replacement")
-        os.replace(temporary, target)
-        _fsync(target.parent)
+    elif state == "unknown-absent" and (
+        original_quarantine.exists() or original_quarantine.is_symlink()
+    ):
+        pass
+    elif state not in {"original-absent", "forward-absent"}:
+        raise ValueError(f"{label} has an unknown generation during rollback")
+    if not existed:
+        journal[complete_key] = True
+        _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+        return
 
-    journal[restored_key] = _file_generation(target, f"restored {label}")
+    original_generation = journal.get(f"{key}_original_generation")
+    if original_quarantine.exists() or original_quarantine.is_symlink():
+        original_moved = _file_generation(
+            original_quarantine,
+            f"quarantined original {label}",
+        )
+        durable_original = journal.get(f"{key}-original_quarantine_generation")
+        if durable_original is not None:
+            if not _generation_matches(original_moved, durable_original, ctime=True):
+                raise ValueError(f"quarantined original {label} changed")
+        elif not _generation_matches(original_moved, original_generation, ctime=False):
+            raise ValueError(f"quarantined original {label} has no attribution")
+        restored_generation = _publish_owned_generation(
+            original_quarantine,
+            target,
+            original_moved,
+            key=f"{key}-restore",
+            label=f"restored {label}",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        journal[restored_key] = restored_generation
+        journal[complete_key] = True
+        _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
+        return
+    backup_generation = _file_generation(backup, f"{label} backup")
+    if not isinstance(original_generation, dict) or backup_generation[
+        "sha256"
+    ] != original_generation.get("sha256"):
+        raise ValueError(f"{label} backup is not the snapshotted generation")
+    prepared = _prepare_owned_copy(
+        backup,
+        temporary,
+        temporary_cleanup,
+        key=f"{key}-restore",
+        label=f"{label} rollback generation",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal[f"{key}_restore_prepared_generation"] = prepared
+    restored_generation = _publish_owned_generation(
+        temporary,
+        target,
+        prepared,
+        key=f"{key}-restore",
+        label=f"restored {label}",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal[restored_key] = restored_generation
     journal[complete_key] = True
     _write_recovery_journal(journal_path, journal, f"{key}-restore-complete")
 
@@ -1693,6 +2168,9 @@ def _restore_provisional(
         target=path,
         backup=paths["provisional_backup"],
         temporary=paths["provisional_restore_temp"],
+        temporary_cleanup=paths["provisional_restore_temp_cleanup"],
+        quarantine=paths["provisional_restore_quarantine"],
+        original_quarantine=paths["provisional_original_quarantine"],
         existed=provisional_existed,
         key="provisional",
         label="provider provisional identity batch",
@@ -1703,6 +2181,9 @@ def _restore_provisional(
         target=guard,
         backup=paths["provisional_guard_backup"],
         temporary=paths["provisional_guard_restore_temp"],
+        temporary_cleanup=paths["provisional_guard_restore_temp_cleanup"],
+        quarantine=paths["provisional_guard_restore_quarantine"],
+        original_quarantine=paths["provisional_guard_original_quarantine"],
         existed=guard_existed,
         key="provisional_guard",
         label="provider initialization locator",
@@ -1725,6 +2206,9 @@ def _restore_bundle(
         target=bundle,
         backup=paths["bundle_backup"],
         temporary=paths["bundle_restore_temp"],
+        temporary_cleanup=paths["bundle_restore_temp_cleanup"],
+        quarantine=paths["bundle_restore_quarantine"],
+        original_quarantine=paths["bundle_original_quarantine"],
         existed=bundle_existed,
         key="bundle",
         label="provider identity bundle",
@@ -1907,6 +2391,192 @@ def _assert_initial_staged_identity(
         raise ValueError(f"staged login conflicts with {conflict}")
 
 
+def _quarantine_owned_generation(
+    source: Path,
+    quarantine: Path,
+    expected: dict[str, Any],
+    *,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """Move an exact source generation aside without replacing either side."""
+
+    observed_key = f"{key}_observed_generation"
+    moved_key = f"{key}_quarantine_generation"
+    source_exists = source.exists() or source.is_symlink()
+    quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+    if source_exists and quarantine_exists:
+        raise ValueError(f"{label} exists at both stable and quarantine paths")
+    if quarantine_exists:
+        moved = _file_generation(quarantine, f"quarantined {label}")
+        durable = journal.get(moved_key)
+        before_move = journal.get(observed_key) or expected
+        if durable is not None:
+            if not _generation_matches(moved, durable, ctime=True):
+                raise ValueError(f"quarantined {label} changed after its move")
+        elif not _generation_matches(moved, before_move, ctime=False):
+            raise ValueError(f"quarantined {label} has no transaction attribution")
+        else:
+            journal[moved_key] = moved
+            _write_recovery_journal(journal_path, journal, f"{key}-quarantined")
+        return moved
+    if not source_exists:
+        raise ValueError(f"{label} disappeared before its quarantine move")
+    observed = _file_generation(source, label)
+    if not _generation_matches(observed, expected, ctime=True):
+        raise ValueError(f"{label} changed before its quarantine move")
+    journal[observed_key] = observed
+    _write_recovery_journal(journal_path, journal, f"{key}-quarantine-authorized")
+    try:
+        _rename_noreplace(source, quarantine)
+    except FileExistsError as exc:
+        raise ValueError(f"{label} quarantine path already exists") from exc
+    moved = _file_generation(quarantine, f"quarantined {label}")
+    if not _generation_matches(moved, observed, ctime=False):
+        _restore_misattributed_move(
+            quarantine,
+            source,
+            moved["stat"],
+            label=f"misattributed {label}",
+        )
+        raise ValueError(f"{label} changed during its quarantine move")
+    journal[moved_key] = moved
+    _write_recovery_journal(journal_path, journal, f"{key}-quarantined")
+    if source.exists() or source.is_symlink():
+        raise ValueError(f"{label} reappeared after its quarantine move")
+    return moved
+
+
+def _publish_owned_generation(
+    source: Path,
+    destination: Path,
+    expected: dict[str, Any],
+    *,
+    key: str,
+    label: str,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish one prepared generation with atomic no-replace semantics."""
+
+    installed_key = f"{key}_installed_generation"
+    source_exists = source.exists() or source.is_symlink()
+    destination_exists = destination.exists() or destination.is_symlink()
+    if source_exists and destination_exists:
+        raise ValueError(f"{label} exists at both prepared and destination paths")
+    if destination_exists:
+        installed = _file_generation(destination, f"installed {label}")
+        durable = journal.get(installed_key)
+        if durable is not None:
+            if not _generation_matches(installed, durable, ctime=True):
+                raise ValueError(f"installed {label} changed after publication")
+        elif not _generation_matches(installed, expected, ctime=False):
+            raise ValueError(f"destination contains an unattributed {label}")
+        else:
+            journal[installed_key] = installed
+            _write_recovery_journal(journal_path, journal, f"{key}-installed")
+        return installed
+    if not source_exists:
+        raise ValueError(f"prepared {label} disappeared before publication")
+    prepared = _file_generation(source, f"prepared {label}")
+    if not _generation_matches(prepared, expected, ctime=True):
+        raise ValueError(f"prepared {label} changed before publication")
+    _write_recovery_journal(journal_path, journal, f"{key}-publish-authorized")
+    try:
+        _rename_noreplace(source, destination)
+    except FileExistsError as exc:
+        raise ValueError(f"destination appeared before {label} publication") from exc
+    installed = _file_generation(destination, f"installed {label}")
+    if not _generation_matches(installed, prepared, ctime=False):
+        _restore_misattributed_move(
+            destination,
+            source,
+            installed["stat"],
+            label=f"misattributed published {label}",
+        )
+        raise ValueError(f"prepared {label} changed during publication")
+    journal[installed_key] = installed
+    _write_recovery_journal(journal_path, journal, f"{key}-installed")
+    if source.exists() or source.is_symlink():
+        raise ValueError(f"prepared {label} reappeared after publication")
+    _fsync(destination.parent)
+    return installed
+
+
+def _install_file_credential(
+    staged: Path,
+    stable: Path,
+    backup: Path,
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+    *,
+    label: str,
+    stage_home: Path,
+    backup_name: str,
+) -> None:
+    """Install a file credential through attributed copies and no-replace moves."""
+
+    original = (
+        _file_generation(stable, f"stable {label}")
+        if stable.exists() or stable.is_symlink()
+        else None
+    )
+    journal["original_credential_generation"] = original
+    journal["original_credential_stat"] = original["stat"] if original else None
+    _write_journal(journal_path, journal, "credential-backup-running")
+    if original is not None:
+        _prepare_owned_copy(
+            stable,
+            backup,
+            paths[f"{backup_name}_cleanup"],
+            key=f"{backup_name}-snapshot",
+            label=f"{label} backup",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    _record_stage_manifest(stage_home, journal)
+    _write_journal(journal_path, journal, "credential-backup-ready")
+    prepared = _prepare_owned_copy(
+        staged,
+        paths["install_temp"],
+        paths["install_temp_cleanup"],
+        key="credential-install",
+        label=f"{label} install generation",
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal["prepared_credential_generation"] = prepared
+    journal["prepared_credential_stat"] = prepared["stat"]
+    _write_journal(journal_path, journal, "credential-prepared")
+    if original is not None:
+        _quarantine_owned_generation(
+            stable,
+            paths["credential_original_quarantine"],
+            original,
+            key="credential-original",
+            label=f"original stable {label}",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    elif stable.exists() or stable.is_symlink():
+        raise ValueError(f"stable {label} appeared during recovery")
+    installed = _publish_owned_generation(
+        paths["install_temp"],
+        stable,
+        prepared,
+        key="credential-forward",
+        label=label,
+        journal_path=journal_path,
+        journal=journal,
+    )
+    journal["installed_credential_generation"] = installed
+    journal["installed_credential_stat"] = installed["stat"]
+    _write_journal(journal_path, journal, "credential-installed")
+
+
 def _install_codex(
     target: Profile,
     stage: Profile,
@@ -1918,36 +2588,18 @@ def _install_codex(
     staged_auth = stage.home / CODEX_AUTH
     _private_file(staged_auth, "staged Codex auth")
     stable = target.home / CODEX_AUTH
-    original = None
-    if stable.exists() or stable.is_symlink():
-        original = _private_file(stable, "stable Codex auth")
-        journal["original_credential_stat"] = _stat_payload(original)
-    else:
-        journal["original_credential_stat"] = None
     journal["credential_kind"] = "codex-file"
-    _write_journal(journal_path, journal, "credential-backup-running")
-    if original is not None:
-        _copy_private_file(stable, paths["codex_backup"])
-    _record_stage_manifest(stage.home, journal)
-    _write_journal(journal_path, journal, "credential-backup-ready")
-    temporary = paths["install_temp"]
-    _copy_private_file(staged_auth, temporary)
-    journal["prepared_credential_stat"] = _stat_payload(
-        _private_file(temporary, "prepared Codex auth")
+    _install_file_credential(
+        staged_auth,
+        stable,
+        paths["codex_backup"],
+        paths,
+        journal_path,
+        journal,
+        label="Codex auth",
+        stage_home=stage.home,
+        backup_name="codex_backup",
     )
-    _write_journal(journal_path, journal, "credential-prepared")
-    if original is not None:
-        current = _stat_payload(_private_file(stable, "stable Codex auth"))
-        if current != journal["original_credential_stat"]:
-            raise ValueError("stable Codex auth changed during recovery")
-    elif stable.exists() or stable.is_symlink():
-        raise ValueError("stable Codex auth appeared during recovery")
-    os.replace(temporary, stable)
-    _fsync(target.home)
-    journal["installed_credential_stat"] = _stat_payload(
-        _private_file(stable, "installed Codex auth")
-    )
-    _write_journal(journal_path, journal, "credential-installed")
 
 
 def _install_claude(
@@ -1967,28 +2619,18 @@ def _install_claude(
         # Non-macOS Claude keeps the same durable file transaction semantics.
         staged = stage.home / CLAUDE_AUTH
         stable = target.home / CLAUDE_AUTH
-        original = _private_file(stable, "stable Claude auth") if stable.exists() else None
         journal["credential_kind"] = "claude-file"
-        journal["original_credential_stat"] = _stat_payload(original) if original else None
-        _write_journal(journal_path, journal, "credential-backup-running")
-        if original:
-            _copy_private_file(stable, paths["claude_file_backup"])
-        _record_stage_manifest(stage.home, journal)
-        _write_journal(journal_path, journal, "credential-backup-ready")
-        temporary = paths["install_temp"]
-        _copy_private_file(staged, temporary)
-        journal["prepared_credential_stat"] = _stat_payload(temporary.lstat())
-        _write_journal(journal_path, journal, "credential-prepared")
-        if original is not None:
-            current = _stat_payload(_private_file(stable, "stable Claude auth"))
-            if current != journal["original_credential_stat"]:
-                raise ValueError("stable Claude auth changed during recovery")
-        elif stable.exists() or stable.is_symlink():
-            raise ValueError("stable Claude auth appeared during recovery")
-        os.replace(temporary, stable)
-        _fsync(target.home)
-        journal["installed_credential_stat"] = _stat_payload(stable.lstat())
-        _write_journal(journal_path, journal, "credential-installed")
+        _install_file_credential(
+            staged,
+            stable,
+            paths["claude_file_backup"],
+            paths,
+            journal_path,
+            journal,
+            label="Claude auth",
+            stage_home=stage.home,
+            backup_name="claude_file_backup",
+        )
         return
     if source.get("kind") != "keychain":
         raise ValueError("staged Claude login has no single scoped credential source")
@@ -2012,9 +2654,12 @@ def _install_claude(
         raise ValueError("stable Claude worker has ambiguous credential sources")
     stable_keychain = stable_source.get("kind") == "keychain"
     stable_file = target.home / CLAUDE_AUTH
-    stable_file_stat = None
+    stable_file_generation = None
     if stable_source.get("kind") == "oauth-file":
-        stable_file_stat = _private_file(stable_file, "stable Claude auth file")
+        stable_file_generation = _file_generation(
+            stable_file,
+            "stable Claude auth file",
+        )
     journal.update(
         {
             "credential_kind": "claude-keychain",
@@ -2023,27 +2668,39 @@ def _install_claude(
             "stable_service": stable_service,
             "backup_service": backup_service,
             "stable_keychain_existed": stable_keychain,
+            "original_credential_generation": stable_file_generation,
             "original_credential_stat": (
-                _stat_payload(stable_file_stat) if stable_file_stat else None
+                stable_file_generation["stat"] if stable_file_generation else None
             ),
         }
     )
     _write_journal(journal_path, journal, "credential-backup-running")
-    if stable_file_stat is not None:
-        _copy_private_file(stable_file, paths["claude_file_backup"])
+    if stable_file_generation is not None:
+        _prepare_owned_copy(
+            stable_file,
+            paths["claude_file_backup"],
+            paths["claude_file_backup_cleanup"],
+            key="claude_file_backup-snapshot",
+            label="Claude auth backup",
+            journal_path=journal_path,
+            journal=journal,
+        )
     if stable_keychain:
         if not _scoped_keychain_exists(hooks, target, paths, journal, "stable"):
             raise ValueError("stable scoped Claude Keychain item disappeared")
         _scoped_keychain_copy(hooks, target, paths, journal, "stable", "backup")
     _record_stage_manifest(stage.home, journal)
     _write_journal(journal_path, journal, "credential-backup-ready")
-    if stable_file_stat is not None:
-        if _stat_payload(_private_file(stable_file, "stable Claude auth file")) != (
-            journal["original_credential_stat"]
-        ):
-            raise ValueError("stable Claude auth file changed during recovery")
-        stable_file.unlink()
-        _fsync(target.home)
+    if stable_file_generation is not None:
+        _quarantine_owned_generation(
+            stable_file,
+            paths["credential_original_quarantine"],
+            stable_file_generation,
+            key="credential-original",
+            label="original stable Claude auth file",
+            journal_path=journal_path,
+            journal=journal,
+        )
     _write_journal(journal_path, journal, "credential-prepared")
     _scoped_keychain_copy(hooks, target, paths, journal, "staged", "stable")
     if not _scoped_keychain_exists(hooks, target, paths, journal, "stable"):
@@ -2069,9 +2726,7 @@ def _restore_misattributed_move(
     try:
         _rename_noreplace(source, destination)
     except FileExistsError as exc:
-        raise ValueError(
-            f"{label} attribution failed and both generations were preserved"
-        ) from exc
+        raise ValueError(f"{label} attribution failed and both generations were preserved") from exc
     restored = _stat_payload(_private_file(destination, label))
     if not _stat_matches_generation(restored, moved_generation, ctime=False):
         raise ValueError(f"{label} changed while its misattributed move was restored")
@@ -2090,176 +2745,134 @@ def _rollback_file_credential(
     stable = target.home / stable_name
     rollback = paths["rollback_temp"]
     quarantine = paths["credential_quarantine"]
-    original = journal.get("original_credential_stat")
-    installed = journal.get("installed_credential_stat")
-    installed_requires_ctime = installed is not None
-    if installed is None:
-        installed = journal.get("prepared_credential_stat")
-    restored = journal.get("rollback_file_installed_stat")
-    prepared = journal.get("rollback_file_prepared_stat")
-    copy_identity = journal.get("rollback_file_copy_identity")
-    if copy_identity is not None and not _valid_inode_payload(copy_identity):
-        raise ValueError("credential rollback copy ownership is invalid")
-    if prepared is not None and copy_identity is not None:
-        raise ValueError("credential rollback has conflicting copy ownership states")
-    quarantine_generation: dict[str, int] | None = None
-    if quarantine.exists() or quarantine.is_symlink():
-        quarantine_generation = _stat_payload(
-            _private_file(quarantine, "quarantined credential generation")
-        )
-        expected_quarantine = journal.get("rollback_file_quarantine_stat") or journal.get(
-            "rollback_file_observed_forward_stat"
-        )
-        expected_has_post_move_ctime = journal.get("rollback_file_quarantine_stat") is not None
-        if not _stat_matches_generation(
-            quarantine_generation,
-            expected_quarantine,
-            ctime=expected_has_post_move_ctime,
+    original_quarantine = paths.get("credential_original_quarantine")
+
+    original = journal.get("original_credential_generation")
+    if original is None and isinstance(journal.get("original_credential_stat"), dict):
+        backup_generation = _file_generation(backup, "credential recovery backup")
+        original = {
+            "stat": journal["original_credential_stat"],
+            "sha256": backup_generation["sha256"],
+        }
+    installed = journal.get("installed_credential_generation") or journal.get(
+        "credential-forward_installed_generation"
+    )
+    if (
+        installed is None
+        and isinstance(journal.get("installed_credential_stat"), dict)
+        and (stable.exists() or stable.is_symlink())
+    ):
+        candidate = _file_generation(stable, "transaction-installed stable credential")
+        if _stat_matches_generation(
+            candidate["stat"],
+            journal["installed_credential_stat"],
+            ctime=True,
         ):
-            raise ValueError("credential quarantine contains an unattributed generation")
-        if journal.get("rollback_file_quarantine_stat") is None:
-            journal["rollback_file_quarantine_stat"] = quarantine_generation
-            _write_recovery_journal(journal_path, journal, "rollback-file-quarantined")
+            installed = candidate
+    restored = journal.get("rollback-file_installed_generation")
+    rollback_prepared = journal.get("rollback-file_prepared_generation")
 
     stable_exists = stable.exists() or stable.is_symlink()
     if original is not None and stable_exists:
-        for expected in (original, restored, prepared):
-            if expected is not None and _same_stat(stable, expected, ctime=False):
-                if rollback.exists() or rollback.is_symlink():
-                    raise ValueError(
-                        "restored credential and prepared rollback source both exist"
-                    )
-                journal["rollback_file_installed_stat"] = _stat_payload(
-                    _private_file(stable, "restored credential generation")
-                )
-                _write_recovery_journal(journal_path, journal, "rollback-file-installed")
-                return
-
-    if quarantine_generation is not None and stable_exists:
-        raise ValueError("stable credential appeared while its prior generation is quarantined")
-
-    if original is None and quarantine_generation is not None:
-        if stable_exists:
-            raise ValueError("stable credential reappeared during rollback deletion")
-        journal["rollback_file_deleted"] = True
-        _write_recovery_journal(journal_path, journal, "rollback-file-installed")
-        return
-
-    if quarantine_generation is None and stable_exists:
-        observed_forward = _stat_payload(
-            _private_file(stable, "transaction-installed stable credential")
-        )
-        if not _stat_matches_generation(
-            observed_forward,
-            installed,
-            ctime=installed_requires_ctime,
+        observed_stable = _file_generation(stable, "stable credential during rollback")
+        if any(
+            expected is not None and _generation_matches(observed_stable, expected, ctime=False)
+            for expected in (original, restored, rollback_prepared)
         ):
-            raise ValueError("stable credential changed outside the recovery transaction")
-        journal["rollback_file_observed_forward_stat"] = observed_forward
-        _write_recovery_journal(journal_path, journal, "rollback-file-quarantine-authorized")
-        try:
-            _rename_noreplace(stable, quarantine)
-        except FileExistsError as exc:
-            raise ValueError("credential quarantine path already exists") from exc
-        moved_forward = _stat_payload(
-            _private_file(quarantine, "quarantined credential generation")
-        )
-        if not _stat_matches_generation(moved_forward, observed_forward, ctime=False):
-            _restore_misattributed_move(
-                quarantine,
-                stable,
-                moved_forward,
-                label="misattributed stable credential",
-            )
-            raise ValueError("stable credential changed during atomic quarantine")
-        journal["rollback_file_quarantine_stat"] = moved_forward
-        _write_recovery_journal(journal_path, journal, "rollback-file-quarantined")
-        quarantine_generation = moved_forward
-        if stable.exists() or stable.is_symlink():
-            raise ValueError("stable credential reappeared after atomic quarantine")
-    elif quarantine_generation is None and not stable_exists:
-        if original is None:
-            _fsync(target.home)
+            journal["rollback-file_installed_generation"] = observed_stable
+            journal["rollback_file_installed_stat"] = observed_stable["stat"]
+            _write_recovery_journal(journal_path, journal, "rollback-file-installed")
             return
-        if not allow_absent_forward:
-            raise ValueError("stable credential changed outside the recovery transaction")
+
+    if quarantine.exists() or quarantine.is_symlink():
+        expected_forward = (
+            journal.get("credential-forward-rollback_quarantine_generation")
+            or journal.get("credential-forward-rollback_observed_generation")
+            or installed
+        )
+        forward_quarantine = _file_generation(
+            quarantine,
+            "quarantined transaction credential",
+        )
+        if not _generation_matches(
+            forward_quarantine,
+            expected_forward,
+            ctime=journal.get("credential-forward-rollback_quarantine_generation") is not None,
+        ):
+            raise ValueError("credential quarantine contains an unattributed generation")
+        if journal.get("credential-forward-rollback_quarantine_generation") is None:
+            journal["credential-forward-rollback_quarantine_generation"] = forward_quarantine
+            _write_recovery_journal(journal_path, journal, "rollback-file-quarantined")
+        if stable_exists:
+            raise ValueError("stable credential appeared while its prior generation is quarantined")
+    elif stable_exists:
+        if installed is None:
+            raise ValueError("stable credential has no transaction-installed attribution")
+        _quarantine_owned_generation(
+            stable,
+            quarantine,
+            installed,
+            key="credential-forward-rollback",
+            label="transaction-installed stable credential",
+            journal_path=journal_path,
+            journal=journal,
+        )
+        stable_exists = False
+    elif (
+        original is not None
+        and not allow_absent_forward
+        and not (
+            original_quarantine
+            and (original_quarantine.exists() or original_quarantine.is_symlink())
+        )
+    ):
+        raise ValueError("stable credential changed outside the recovery transaction")
 
     if original is None:
         journal["rollback_file_deleted"] = True
         _write_recovery_journal(journal_path, journal, "rollback-file-installed")
         return
 
-    if prepared is None:
-        if rollback.exists() or rollback.is_symlink():
-            partial = _stat_payload(
-                _private_file(rollback, "partial credential rollback temporary")
-            )
-            if not _stat_matches_inode(partial, copy_identity):
-                raise ValueError(
-                    "partial credential rollback temporary has no durable transaction ownership"
-                )
-            unlink_private_file(
-                rollback,
-                label="partial credential rollback temporary",
-                expected_stat=copy_identity,
-            )
-        if copy_identity is not None:
-            journal.pop("rollback_file_copy_identity", None)
-            _write_recovery_journal(journal_path, journal, "rollback-file-copy-reset")
-        _write_recovery_journal(journal_path, journal, "rollback-file-copy-running")
-        _private_file(backup, "credential recovery backup")
-
-        def record_copy_identity(metadata: os.stat_result) -> None:
-            journal["rollback_file_copy_identity"] = _inode_payload(metadata)
-            _write_recovery_journal(journal_path, journal, "rollback-file-copy-owned")
-
-        copied = _copy_private_file(
+    if original_quarantine and (original_quarantine.exists() or original_quarantine.is_symlink()):
+        original_moved = _file_generation(
+            original_quarantine,
+            "quarantined original credential",
+        )
+        durable_original = journal.get("credential-original_quarantine_generation")
+        if durable_original is not None:
+            if not _generation_matches(original_moved, durable_original, ctime=True):
+                raise ValueError("quarantined original credential changed")
+        elif not _generation_matches(original_moved, original, ctime=False):
+            raise ValueError("quarantined original credential has no attribution")
+        published = _publish_owned_generation(
+            original_quarantine,
+            stable,
+            original_moved,
+            key="rollback-file",
+            label="restored credential generation",
+            journal_path=journal_path,
+            journal=journal,
+        )
+    else:
+        prepared = _prepare_owned_copy(
             backup,
             rollback,
-            destination_created=record_copy_identity,
+            paths["rollback_temp_cleanup"],
+            key="rollback-file",
+            label="credential rollback generation",
+            journal_path=journal_path,
+            journal=journal,
         )
-        copied_generation = _stat_payload(copied)
-        if not _stat_matches_inode(
-            copied_generation,
-            journal.get("rollback_file_copy_identity"),
-        ) or not _same_stat(rollback, copied_generation):
-            raise ValueError(
-                "prepared credential rollback generation changed before attribution"
-            )
-        journal["rollback_file_prepared_stat"] = copied_generation
-        journal.pop("rollback_file_copy_identity", None)
-        _write_recovery_journal(journal_path, journal, "rollback-file-prepared")
-    else:
-        if not _same_stat(rollback, prepared):
-            raise ValueError("prepared credential rollback generation changed")
-
-    prepared_generation = _stat_payload(
-        _private_file(rollback, "prepared credential rollback generation")
-    )
-    if not _stat_matches_generation(
-        prepared_generation,
-        journal.get("rollback_file_prepared_stat"),
-        ctime=True,
-    ):
-        raise ValueError("prepared credential rollback generation changed")
-    _write_recovery_journal(journal_path, journal, "rollback-file-publish-authorized")
-    try:
-        _rename_noreplace(rollback, stable)
-    except FileExistsError as exc:
-        raise ValueError("stable credential appeared before no-replace rollback publish") from exc
-    published = _stat_payload(_private_file(stable, "restored credential generation"))
-    if not _stat_matches_generation(published, prepared_generation, ctime=False):
-        _restore_misattributed_move(
-            stable,
+        published = _publish_owned_generation(
             rollback,
-            published,
-            label="misattributed published credential",
+            stable,
+            prepared,
+            key="rollback-file",
+            label="restored credential generation",
+            journal_path=journal_path,
+            journal=journal,
         )
-        raise ValueError("prepared credential changed during no-replace rollback publish")
-    if rollback.exists() or rollback.is_symlink():
-        raise ValueError("prepared credential source reappeared after rollback publish")
-    _fsync(target.home)
-    journal["rollback_file_installed_stat"] = published
+    journal["rollback_file_installed_stat"] = published["stat"]
     _write_recovery_journal(journal_path, journal, "rollback-file-installed")
 
 
@@ -2363,35 +2976,163 @@ def _rollback_local_credential(
     _write_recovery_journal(journal_path, journal, "rollback-credential-complete")
 
 
-def _clean_exact_temporaries(paths: dict[str, Path], journal: dict[str, Any]) -> None:
-    credential_quarantine = paths["credential_quarantine"]
-    if credential_quarantine.exists() or credential_quarantine.is_symlink():
-        observed = _stat_payload(
-            _private_file(credential_quarantine, "quarantined credential generation")
-        )
-        if not _stat_matches_generation(
-            observed,
-            journal.get("rollback_file_quarantine_stat"),
-            ctime=True,
-        ):
-            raise ValueError("credential quarantine changed before attributed cleanup")
-        unlink_private_file(
-            credential_quarantine,
-            label="quarantined credential generation",
-            expected_stat=journal.get("rollback_file_quarantine_stat"),
-        )
-    for name in (
-        "install_temp",
-        "rollback_temp",
-        "bundle_restore_temp",
-        "provisional_restore_temp",
-        "provisional_guard_restore_temp",
-    ):
+def _clean_exact_temporaries(
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    cleanup_specs: tuple[tuple[str, str, object], ...] = (
+        (
+            "credential_quarantine",
+            "credential-forward-rollback",
+            journal.get("credential-forward-rollback_quarantine_generation"),
+        ),
+        (
+            "credential_original_quarantine",
+            "credential-original",
+            journal.get("credential-original_quarantine_generation"),
+        ),
+        (
+            "install_temp",
+            "credential-install",
+            journal.get("credential-install_prepared_generation")
+            or journal.get("credential-install_copy_identity"),
+        ),
+        (
+            "rollback_temp",
+            "rollback-file",
+            journal.get("rollback-file_prepared_generation")
+            or journal.get("rollback-file_copy_identity"),
+        ),
+        (
+            "bundle_install_temp",
+            "bundle-install",
+            journal.get("bundle-install_prepared_generation")
+            or journal.get("bundle-install_copy_identity"),
+        ),
+        (
+            "provisional_install_temp",
+            "provisional-install",
+            journal.get("provisional-install_prepared_generation")
+            or journal.get("provisional-install_copy_identity"),
+        ),
+        (
+            "provisional_guard_install_temp",
+            "provisional-guard-install",
+            journal.get("provisional_guard-install_prepared_generation")
+            or journal.get("provisional_guard-install_copy_identity"),
+        ),
+        (
+            "bundle_original_quarantine",
+            "bundle-original",
+            journal.get("bundle-original_quarantine_generation"),
+        ),
+        (
+            "provisional_original_quarantine",
+            "provisional-original",
+            journal.get("provisional-original_quarantine_generation"),
+        ),
+        (
+            "provisional_guard_original_quarantine",
+            "provisional_guard-original",
+            journal.get("provisional_guard-original_quarantine_generation"),
+        ),
+        (
+            "bundle_restore_temp",
+            "bundle-restore",
+            journal.get("bundle-restore_prepared_generation")
+            or journal.get("bundle-restore_copy_identity"),
+        ),
+        (
+            "provisional_restore_temp",
+            "provisional-restore",
+            journal.get("provisional-restore_prepared_generation")
+            or journal.get("provisional-restore_copy_identity"),
+        ),
+        (
+            "provisional_guard_restore_temp",
+            "provisional_guard-restore",
+            journal.get("provisional_guard-restore_prepared_generation")
+            or journal.get("provisional_guard-restore_copy_identity"),
+        ),
+        (
+            "bundle_restore_quarantine",
+            "bundle-forward-rollback",
+            journal.get("bundle-forward-rollback_quarantine_generation"),
+        ),
+        (
+            "provisional_restore_quarantine",
+            "provisional-forward-rollback",
+            journal.get("provisional-forward-rollback_quarantine_generation"),
+        ),
+        (
+            "provisional_guard_restore_quarantine",
+            "provisional_guard-forward-rollback",
+            journal.get("provisional_guard-forward-rollback_quarantine_generation"),
+        ),
+    )
+    for name, key, expected in cleanup_specs:
         path = paths[name]
-        if path.exists() or path.is_symlink():
-            _private_file(path, "credential recovery temporary")
-            path.unlink()
-            _fsync(path.parent)
+        cleanup = paths[f"{name}_cleanup"]
+        if (
+            not any(candidate.exists() or candidate.is_symlink() for candidate in (path, cleanup))
+            and journal.get(f"{key}_cleanup_complete") is not True
+        ):
+            continue
+        if expected is None and journal.get(f"{key}_cleanup_generation") is None:
+            raise ValueError(f"{name} has no durable cleanup ownership")
+        _cleanup_owned_generation(
+            path,
+            cleanup,
+            expected,
+            key=key,
+            label=name.replace("_", " "),
+            journal_path=journal_path,
+            journal=journal,
+        )
+
+
+def _clean_stage_backups(
+    paths: dict[str, Path],
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> None:
+    """Remove attributed secret-bearing backups before final stage collection."""
+
+    specs = (
+        ("codex_backup", "codex_backup-snapshot"),
+        ("claude_file_backup", "claude_file_backup-snapshot"),
+        ("bundle_backup", "bundle-backup"),
+        ("provisional_backup", "provisional-backup"),
+        ("provisional_guard_backup", "provisional-guard-backup"),
+    )
+    changed = False
+    for name, key in specs:
+        path = paths[name]
+        cleanup = paths[f"{name}_cleanup"]
+        if (
+            not any(candidate.exists() or candidate.is_symlink() for candidate in (path, cleanup))
+            and journal.get(f"{key}_cleanup_complete") is not True
+        ):
+            continue
+        expected = journal.get(f"{key}_prepared_generation") or journal.get(f"{key}_copy_identity")
+        if expected is None and journal.get(f"{key}_cleanup_generation") is None:
+            raise ValueError(f"{name} has no durable backup cleanup ownership")
+        _cleanup_owned_generation(
+            path,
+            cleanup,
+            expected,
+            key=key,
+            label=name.replace("_", " "),
+            journal_path=journal_path,
+            journal=journal,
+        )
+        changed = True
+    stage = paths["stage"]
+    if changed and (stage.exists() or stage.is_symlink()):
+        _validate_partial_stage_tree(stage, journal.get("stage_stat"))
+        _record_stage_manifest(stage, journal)
+        _write_recovery_journal(journal_path, journal, "stage-backups-cleaned")
 
 
 def _cleanup_keychain(
@@ -2476,11 +3217,7 @@ def recover_pending_profile_recoveries(
             continue
         profile_id = str(discovered.get("profile", ""))
         target = registry.profiles.get(profile_id)
-        if (
-            target is None
-            or target.provider != provider
-            or target.safety_policy != "worker"
-        ):
+        if target is None or target.provider != provider or target.safety_policy != "worker":
             raise ValueError(
                 "pending credential recovery journal is hidden by profile topology drift"
             )
@@ -2530,7 +3267,8 @@ def recover_pending_profile_recoveries(
                     journal_path,
                     journal,
                 )
-        _clean_exact_temporaries(paths, journal)
+        _clean_stage_backups(paths, journal_path, journal)
+        _clean_exact_temporaries(paths, journal_path, journal)
         _cleanup_keychain(
             transaction_controls,
             target,
@@ -2608,9 +3346,7 @@ def _verify_committed_receipt(
     elif workflow == "initialize" and provisional is not None:
         records = provisional["workers"]
         provisional_workers = sorted(records)
-        pending_initialization = sorted(
-            set(provisional["expected_workers"]) - set(records)
-        )
+        pending_initialization = sorted(set(provisional["expected_workers"]) - set(records))
         if profile_id not in records:
             raise ValueError(
                 "committed initialization receipt is absent from its provisional batch"
@@ -2635,11 +3371,7 @@ def _verify_committed_receipt(
     for worker_id, (proof, _source) in proofs.items():
         if worker_id not in blockers:
             store_quota(registry, registry.require_profile(worker_id), proof)
-    ready = (
-        bundle
-        and not blockers
-        and len(proofs) == len(_workers(registry, target.provider))
-    )
+    ready = bundle and not blockers and len(proofs) == len(_workers(registry, target.provider))
     return {
         "profile": profile_id,
         "provider": target.provider,
@@ -2654,9 +3386,7 @@ def _verify_committed_receipt(
         "provider_login_invoked": False,
         "browser_mode": False,
         "replayed_committed_transaction": True,
-        "provider_side_revocation_possible": bool(
-            receipt.get("provider_side_revocation_possible")
-        ),
+        "provider_side_revocation_possible": bool(receipt.get("provider_side_revocation_possible")),
         "provider_side_revocation_locally_reversible": False,
         "next_step": (
             "run the existing explicit profile enable gate for each worker"
@@ -2784,8 +3514,7 @@ def _profile_login_transaction(
                 and target.id in working_batch["workers"]
             ):
                 pending = sorted(
-                    set(working_batch["expected_workers"])
-                    - set(working_batch["workers"])
+                    set(working_batch["expected_workers"]) - set(working_batch["workers"])
                 )
                 raise ValueError(
                     f"worker {target.id} is already recorded in the provisional identity batch; "
@@ -3054,9 +3783,7 @@ def _profile_login_transaction(
                     and len(proofs) == len(_workers(current, target.provider))
                 )
             else:
-                ready = not blockers and len(proofs) == len(
-                    _workers(current, target.provider)
-                )
+                ready = not blockers and len(proofs) == len(_workers(current, target.provider))
             if boundary_hook:
                 boundary_hook("final-verified")
             current, target = checked(current, "commit")
@@ -3069,6 +3796,7 @@ def _profile_login_transaction(
                     current,
                     target.provider,
                     paths,
+                    journal_path,
                     journal,
                 )
                 journal["provisional_snapshot_ready"] = True
@@ -3081,47 +3809,43 @@ def _profile_login_transaction(
                     target.provider,
                     updated_batch,
                 )
-                journal["provisional_forward_sha256"] = _json_payload_sha256(
-                    updated_batch
-                )
-                journal["provisional_guard_forward_sha256"] = _json_payload_sha256(
-                    guard_payload
-                )
+                journal["provisional_forward_sha256"] = _json_payload_sha256(updated_batch)
+                journal["provisional_guard_forward_sha256"] = _json_payload_sha256(guard_payload)
                 _write_journal(
                     journal_path,
                     journal,
                     "provisional-install-authorized",
                 )
-                _require_snapshot_original(
-                    provisional_path,
+                _install_metadata_payload(
+                    target=provisional_path,
+                    temporary=paths["provisional_install_temp"],
+                    temporary_cleanup=paths["provisional_install_temp_cleanup"],
+                    original_quarantine=paths["provisional_original_quarantine"],
+                    payload=updated_batch,
                     existed=bool(journal["provisional_existed"]),
                     key="provisional",
                     label="provider provisional identity batch",
+                    journal_path=journal_path,
                     journal=journal,
                 )
-                atomic_write_json(provisional_path, updated_batch)
-                journal["provisional_forward_generation"] = _file_generation(
-                    provisional_path,
-                    "transaction-installed provider provisional identity batch",
-                )
-                _require_snapshot_original(
-                    provisional_guard,
+                _install_metadata_payload(
+                    target=provisional_guard,
+                    temporary=paths["provisional_guard_install_temp"],
+                    temporary_cleanup=paths["provisional_guard_install_temp_cleanup"],
+                    original_quarantine=paths["provisional_guard_original_quarantine"],
+                    payload=guard_payload,
                     existed=bool(journal["provisional_guard_existed"]),
                     key="provisional_guard",
                     label="provider initialization locator",
+                    journal_path=journal_path,
                     journal=journal,
-                )
-                atomic_write_json(provisional_guard, guard_payload)
-                journal["provisional_guard_forward_generation"] = _file_generation(
-                    provisional_guard,
-                    "transaction-installed provider initialization locator",
                 )
                 persisted_batch = updated_batch
                 _write_journal(journal_path, journal, "provisional-installed")
             if ready:
                 _validate_stage(target, stage.home, journal)
                 _write_journal(journal_path, journal, "bundle-backup-running")
-                _snapshot_bundle(current, paths, journal)
+                _snapshot_bundle(current, paths, journal_path, journal)
                 journal["bundle_snapshot_ready"] = True
                 _record_stage_manifest(stage.home, journal)
                 _write_journal(journal_path, journal, "bundle-backup-ready")
@@ -3145,20 +3869,32 @@ def _profile_login_transaction(
                         label="provider identity bundle",
                         journal=journal,
                     )
+                    raise _BundlePlanValidated
 
-                installed_bundle = controls.install_bundle(
-                    current,
-                    target.provider,
-                    planned_bundle,
-                    require_bundle_snapshot_original,
-                )
-                if installed_bundle != planned_bundle:
-                    raise ValueError(
-                        "provider identity bundle installation changed from its authorized plan"
+                try:
+                    controls.install_bundle(
+                        current,
+                        target.provider,
+                        planned_bundle,
+                        require_bundle_snapshot_original,
                     )
-                journal["bundle_forward_generation"] = _file_generation(
-                    bundle_path,
-                    "transaction-installed provider identity bundle",
+                except _BundlePlanValidated:
+                    pass
+                else:
+                    raise ValueError(
+                        "provider identity bundle validator bypassed its pre-install fence"
+                    )
+                _install_metadata_payload(
+                    target=bundle_path,
+                    temporary=paths["bundle_install_temp"],
+                    temporary_cleanup=paths["bundle_install_temp_cleanup"],
+                    original_quarantine=paths["bundle_original_quarantine"],
+                    payload=planned_bundle,
+                    existed=bool(journal["bundle_existed"]),
+                    key="bundle",
+                    label="provider identity bundle",
+                    journal_path=journal_path,
+                    journal=journal,
                 )
                 _write_journal(journal_path, journal, "binding-installed")
                 if workflow == "initialize":
@@ -3177,7 +3913,7 @@ def _profile_login_transaction(
                         journal,
                         "provisional-remove-authorized",
                     )
-                    provisional_state, _ = _snapshot_state(
+                    provisional_state, provisional_generation = _snapshot_state(
                         provisional_path,
                         existed=bool(journal["provisional_existed"]),
                         key="provisional",
@@ -3188,9 +3924,20 @@ def _profile_login_transaction(
                         raise ValueError(
                             "provider provisional identity batch changed before removal"
                         )
-                    provisional_path.unlink()
-                    _fsync(provisional_path.parent)
-                    guard_state, _ = _snapshot_state(
+                    if provisional_generation is None:
+                        raise ValueError(
+                            "provider provisional identity batch generation is unavailable"
+                        )
+                    _quarantine_owned_generation(
+                        provisional_path,
+                        paths["provisional_restore_quarantine"],
+                        provisional_generation,
+                        key="provisional-forward-rollback",
+                        label="provider provisional identity batch",
+                        journal_path=journal_path,
+                        journal=journal,
+                    )
+                    guard_state, guard_generation = _snapshot_state(
                         provisional_guard,
                         existed=bool(journal["provisional_guard_existed"]),
                         key="provisional_guard",
@@ -3198,11 +3945,20 @@ def _profile_login_transaction(
                         journal=journal,
                     )
                     if guard_state != "forward":
+                        raise ValueError("provider initialization locator changed before removal")
+                    if guard_generation is None:
                         raise ValueError(
-                            "provider initialization locator changed before removal"
+                            "provider initialization locator generation is unavailable"
                         )
-                    provisional_guard.unlink()
-                    _fsync(provisional_guard.parent)
+                    _quarantine_owned_generation(
+                        provisional_guard,
+                        paths["provisional_guard_restore_quarantine"],
+                        guard_generation,
+                        key="provisional_guard-forward-rollback",
+                        label="provider initialization locator",
+                        journal_path=journal_path,
+                        journal=journal,
+                    )
                     persisted_batch = None
                     _write_journal(journal_path, journal, "provisional-removed")
             _write_journal(journal_path, journal, "committed")
@@ -3218,7 +3974,8 @@ def _profile_login_transaction(
                 initialization_complete=workflow == "initialize" and ready,
             )
             failure_stage = "transaction_cleanup"
-            _clean_exact_temporaries(paths, journal)
+            _clean_stage_backups(paths, journal_path, journal)
+            _clean_exact_temporaries(paths, journal_path, journal)
             _cleanup_keychain(
                 controls,
                 target,

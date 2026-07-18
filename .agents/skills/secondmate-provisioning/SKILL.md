@@ -131,11 +131,14 @@ bin/fm-spawn.sh <id> --resume-account
 
 This path requires the recorded Agent Fleet SessionStart mapping and uses `lease recover` rather than new-task quota selection.
 If exact native resume is unavailable, recover the same task under a fresh Claude or Codex profile with `bin/fm-spawn.sh <id> --continue-account` after re-verifying the endpoint is dead; `bin/fm-account-continuation.sh` owns the provider-neutral packet and fail-closed state checks.
-For unmanaged `kind=secondmate` meta with no window, treat the secondmate as a dead persistent direct report and respawn it with:
+For unmanaged `kind=secondmate` metadata with a missing or confidently dead endpoint, bootstrap deliberately defers recovery rather than silently changing its routing state.
+Surface the required routing decision; to preserve the unmanaged generation after an explicit operator decision, respawn it with:
 
 ```sh
-bin/fm-spawn.sh <id> --secondmate
+bin/fm-spawn.sh <id> --secondmate --no-account-routing
 ```
+
+If the operator instead intends to convert the generation to managed routing, use an explicit `--account-pool` or `--account-profile` under the normal enforced-routing contract.
 
 Use the recorded `home=` in meta.
 If meta is missing but `data/secondmates.md` still registers the secondmate, respawn from the registry entry and its persistent on-disk home.

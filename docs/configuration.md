@@ -193,7 +193,7 @@ Continuation verifies a bounded repository identity before replacement and fails
 Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
 If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
-Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
+Bootstrap uses that managed recovery path for a confidently dead secondmate, but deliberately defers an unmanaged generation until an operator makes the explicit routing decision owned by the `secondmate-provisioning` skill's "Recovery" section.
 Teardown kills the recorded endpoint and releases the Agent Fleet lease and session mapping only after the backend confirms absence; a live or unknown endpoint state retains metadata and storage for retry.
 Off and observe mode support the tmux, Herdr, zellij, and cmux session backends.
 Production enforce mode supports only a Herdr server carrying Firstmate's live process-bound schema-v2 closed-shell certificate, including the exact SHA-256 and opened-file identity of its content-addressed worker helper and managed terminal configuration.
@@ -286,7 +286,7 @@ It never removes a live lock, leaves any other failure shape untouched, and prin
 The locked session-start bootstrap step also runs the guarded local secondmate sync for recorded live secondmate homes, then propagates declared inheritable local config into each validated live home.
 It emits `SECONDMATE_SYNC:` only when a home was skipped for an actionable sync reason or config inheritance failed, and `NUDGE_SECONDMATES:` only when a running home advanced and its instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) changed.
 `NUDGE_SECONDMATES:` lists stable `fm-<id>` task selectors; the `bootstrap-diagnostics` skill owns the send procedure.
-The same bootstrap run also emits `SECONDMATE_LIVENESS:` for live secondmate endpoints: `already-live` and `respawned` are handled states, while `skipped` or `respawn failed` means the secondmate still needs attention.
+The same bootstrap run also emits `SECONDMATE_LIVENESS:` outcomes for live secondmate endpoints; the `bootstrap-diagnostics` skill owns the response to handled, deferred, skipped, and failed outcomes.
 For a mid-session inherited config edit where tracked-file sync and reread nudges are not needed, run `bin/fm-config-push.sh`.
 It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, and `account-routing-mode` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero only for real propagation errors.
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
@@ -294,7 +294,7 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 
 ### Herdr detached launcher prerequisites
 
-The Herdr adapter requires the exact `nohup` and `perl` commands on `PATH` for its portable detached `setsid` server launcher.
+Bootstrap requires `nohup` and `perl` to be discoverable on `PATH` as availability gates, while the production Herdr adapter executes only the fixed system binaries documented in [herdr-backend.md](herdr-backend.md#control-plane-and-filesystem-hardening).
 Both commands ship with macOS and are commonly supplied by the platform's coreutils and Perl packages on other Unix-like systems.
 If bootstrap reports either command missing, restore or install the corresponding platform package, confirm it with `command -v nohup` or `command -v perl`, and rerun bootstrap.
 Bootstrap treats these as manual prerequisites because package names and command exposure differ across supported platforms.

@@ -15,6 +15,8 @@ The manifest supplies exact source repositories, full Git commits, source-tree d
 
 The builder reads no live release, account registry, credential directory, browser state, desktop session, or ambient package cache.
 
+No sealed adoption, normal cutover, live-checkout change, Desktop-app or provider-auth change, routing activation, or live canary may run until the Bridge cutover code is merged to `main`, the labs pass from that merged code, and the captain explicitly declares the quiet point.
+
 ## Build contract
 
 Run the builder with an absent proof path and four absent release paths.
@@ -181,6 +183,7 @@ No Desktop login, logout, or relogin is part of Fleet cutover.
 Worker-state guards open and read only the exact six routed workers' declared credential guard files.
 Credential bytes are hashed in memory for private rollback invalidation and are never copied into snapshots, journals, proof manifests, logs, or public artifacts.
 Reserve homes and Desktop-shared homes are never `stat`ed, opened, read, snapshotted, or compared.
+Preparation also refuses any reserve home that lexically overlaps a worker home, Agent Fleet identity state, or the worker-snapshot parent.
 
 ## Authentication activation contract
 

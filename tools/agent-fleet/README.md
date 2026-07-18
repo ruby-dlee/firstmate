@@ -63,7 +63,7 @@ agent-fleet profile identity adopt codex-1
 Before `init`, set `AGENT_FLEET_CLAUDE_BIN`, `AGENT_FLEET_CODEX_BIN`, or `AGENT_FLEET_QUOTA_BIN` when the executable defaults in "State" do not match the local installation.
 The generated registry pins the resolved executable paths.
 
-`profile provision --all` provisions only profiles whose safety policy is `worker`; in the sealed Bridge topology that means the six isolated workers, never the Claude Desktop or Codex Desktop reserve profiles.
+`profile provision --all` provisions only profiles whose safety policy is `worker`; the sealed Bridge topology and its exact worker/reserve split are owned by the [cutover guide](../../docs/bridge-cutover-sealed-runtimes.md#exact-worker-topology).
 
 Register every Git project that may host a managed worker before enrollment and launch.
 Registration stores the canonical worktree root, while launch authorization compares Git common directories so linked Treehouse worktrees remain eligible.
@@ -190,12 +190,7 @@ If a process died after the transaction was durably committed, repeating the exp
 Fresh quota proofs are cached only after the credential and identity-binding transaction is durably committed.
 Any pre-commit error or crash restores the previous credential generation without changing quota cache bytes; blocked or unproved workers are never written as successful cache entries.
 
-The Relvino Bridge topology is fixed during cutover:
-
-- `claude-1` and `claude-2` are isolated workers in `claude-crew` and `claude-manual`.
-- `codex-1` through `codex-4` are isolated workers in `codex-crew` and `codex-manual`.
-- `claude-3` and `codex-5` are disabled, unprovisioned `desktop_shared` manual-only reserves; they are structurally excluded from recovery, remote proof, cleanup, enable, and routed pools.
-- The captain is outside Agent Fleet; there is no `claude-captain` pool.
+The [Bridge cutover guide](../../docs/bridge-cutover-sealed-runtimes.md#exact-worker-topology) owns its fixed worker/reserve topology and exclusions.
 
 Do not run raw provider login/logout, relogin the Desktop apps, or treat login as
 idempotent. Those actions can rotate or revoke sessions shared by other
@@ -330,14 +325,11 @@ agent-fleet doctor
 agent-fleet doctor --workspace ~/firstmate --project /absolute/path/to/task-worktree
 ```
 
-`profile verify --all` remotely rechecks every profile while all profiles remain
-disabled. Enable each verified worker explicitly afterward; each enable again
-requires fresh same-attempt proof for the target and every already-enabled
-same-provider worker before its single registry mutation. Verification and
-routing activation are deliberately separate phases. On macOS,
-`--allow-keychain-prompt` is the explicit one-time Claude Keychain grant; choose
-**Always Allow** so later automatic checks stay non-interactive. Bare `enable`
-never requests Keychain access and fails closed when verification is unavailable.
+`profile verify --all` remotely rechecks every worker profile while all worker profiles remain disabled.
+Enable each verified worker explicitly afterward; each enable again requires fresh same-attempt proof for the target and every already-enabled same-provider worker before its single registry mutation.
+Verification and routing activation are deliberately separate phases.
+On macOS, `--allow-keychain-prompt` is the explicit one-time Claude Keychain grant; choose **Always Allow** so later automatic checks stay non-interactive.
+Bare `enable` never requests Keychain access and fails closed when verification is unavailable.
 The grant is bound to the canonical unsuffixed `Claude Code-credentials`
 service, the passwd-derived Keychain account, bounded non-secret live item
 metadata, and the exact hash-pinned Quota wrapper, Node runtime, and release
@@ -411,7 +403,7 @@ The current release layout stores those files at `~/.local/libexec/agent-fleet/q
 
 `agent-fleet init` may resolve a caller-supplied convenience symlink once, but the generated registry stores only the two resolved non-symlink release paths and their SHA-256 digests.
 
-Legacy registries without the hashes migrate only when their configured Quota path is already an exact regular file and the exact Node runtime is available at the release path or through `AGENT_FLEET_QUOTA_NODE_BIN`.
+Registries missing any hash-pinned Quota wrapper, Node runtime, or release-tree provenance are rejected; runtime loading performs no legacy migration.
 
 Moving `current`, npm `.bin`, and shebang/PATH execution are rejected.
 

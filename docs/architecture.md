@@ -125,7 +125,7 @@ When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without 
 Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
-The account axis is independent across the supported tmux, Herdr, zellij, and cmux session backends, while enforced Agent Fleet routing rejects Orca until managed Orca recovery exists.
+Account routing remains backend-neutral only in off and observe modes; production enforcement uses the certified backend contract owned by [configuration.md](configuration.md#agent-fleet-account-routing).
 Routing remains default-off and adds no managed account fields or provider wrapper until an explicit account flag or enforce policy enables it; observe performs only a dry-run selection.
 For quota-balanced account-pool candidates, dispatch compares Agent Fleet pool summaries and then atomically leases within the winning pool, never mixing that decision with quota-axi's default-account view.
 Enforced routing rejects poolless quota-balanced candidates, while off and observe retain the legacy quota-only selector path.

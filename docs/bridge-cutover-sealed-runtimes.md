@@ -89,6 +89,10 @@ Sealed releases materialize each accepted link as a regular file and record the 
 
 The candidate wheel and proof set require the enrollment, identity, provision, and recovery modules that implement the sealed activation contract.
 
+Preparation invokes those planning APIs itself under a guard that refuses process and shell execution, so a candidate whose planning path shells out to any external tool is refused instead of prepared.
+It also binds the candidate registry to the specification's `live_registry` path, because the sealed provision API composes managed hook commands from the loaded registry path and the recorded plans must match what post-cutover provisioning produces against the exact path runtime hooks embed.
+`tests/test_prepare_bridge_cutover.py` pins both: a gate that drives the real Agent Fleet package through prepare's own loader under that guard, and a synthetic provision API that refuses a registry carrying no path.
+
 Quota AXI package members and dependency tarballs must match their exact source commits and lock file without ambient npm resolution.
 
 Quota AXI 0.1.6 is disqualified and refused by both the builder and preparer because its Claude Keychain reads did not bind the passwd-derived account.

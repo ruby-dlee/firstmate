@@ -1030,6 +1030,7 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
   [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
   if ! cmp -s "$HOME_DIR/state/$id.meta" "$expected"; then
     printf '%s\n' "$out" >&2
+    sed 's/^/agent-fleet: /' "$AF_LOG" >&2
     diff -u "$expected" "$HOME_DIR/state/$id.meta" >&2 || true
     fail "failed managed respawn did not restore the original unmanaged metadata"
   fi

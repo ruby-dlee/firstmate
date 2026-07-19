@@ -1433,19 +1433,20 @@ fm_backend_herdr_server_lock_is_stale_age() {  # <path>
 }
 
 fm_backend_herdr_server_lock_mark_launch_epoch() {  # <lock> <token> <inode>
-  local lock=$1 token=$2 expected_inode=$3 current_start PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  local lock=$1 token=$2 expected_inode=$3 pid current_start PATH=$FM_BACKEND_HERDR_CONTROL_PATH
   fm_backend_herdr_server_lock_file_ready "$lock" || return 1
   [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
   fm_backend_herdr_server_lock_owner_read "$lock" || return 1
-  current_start=$(fm_backend_herdr_process_start "${BASHPID:-$$}") || return 1
-  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "${BASHPID:-$$}" ] \
+  pid=${BASHPID:-$$}
+  current_start=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ] || return 1
   fm_backend_herdr_control_exec touch "$lock" 2>/dev/null || return 1
   [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] \
     && fm_backend_herdr_server_lock_file_ready "$lock" \
     && fm_backend_herdr_server_lock_owner_read "$lock" \
-    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "${BASHPID:-$$}" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ]
 }
@@ -1735,15 +1736,16 @@ fm_backend_herdr_server_lock_recover_quarantines() {  # <lock>
 }
 
 fm_backend_herdr_server_lock_release() {  # <lock> <token> [inode]
-  local lock=$1 token=$2 expected_inode=${3:-} current_start
+  local lock=$1 token=$2 expected_inode=${3:-} pid current_start
   fm_backend_herdr_server_lock_file_ready "$lock" || return 1
   [ -n "$expected_inode" ] || expected_inode=$(fm_backend_herdr_path_inode "$lock") || return 1
   if [ -n "$expected_inode" ]; then
     [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
   fi
   fm_backend_herdr_server_lock_owner_read "$lock" || return 1
-  current_start=$(fm_backend_herdr_process_start "${BASHPID:-$$}") || return 1
-  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "${BASHPID:-$$}" ] \
+  pid=${BASHPID:-$$}
+  current_start=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
     && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ] || return 1
   fm_backend_herdr_server_lock_remove_exact "$lock" "$expected_inode"

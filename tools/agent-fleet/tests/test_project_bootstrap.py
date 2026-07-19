@@ -16,6 +16,7 @@ import agent_fleet.routeability as routeability_module
 import agent_fleet.scheduler as scheduler_module
 from agent_fleet.config import load_registry
 from agent_fleet.doctor import run_doctor
+from agent_fleet.identity import identity_bundle_path
 from agent_fleet.leases import active_leases
 from agent_fleet.projects import (
     enter_trusted_project,
@@ -321,6 +322,245 @@ def test_trusted_project_registration_requires_exact_owned_git_root(
     symlink.symlink_to(Path.cwd(), target_is_directory=True)
     with pytest.raises(ValueError, match="must not be symlinked"):
         register_trusted_project(symlink)
+
+
+def test_sealed_planning_apis_never_execute_processes(
+    fleet: tuple[object, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planning against a real git-backed trusted project must stay process-free.
+
+    Mirrors the Bridge preparer's pure-planning guard, which refuses any process or
+    shell execution while invoking the sealed planning APIs; regression for the live
+    cutover NO-GO where closed_claude_state_payload shelled to `git rev-parse`.
+    """
+
+    _, config = fleet
+    registry = load_registry(config)
+
+    def refused(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("sealed planning API attempted process or shell execution")
+
+    for name in (
+        "Popen",
+        "run",
+        "call",
+        "check_call",
+        "check_output",
+        "getoutput",
+        "getstatusoutput",
+    ):
+        monkeypatch.setattr(subprocess, name, refused)
+    for name in (
+        "system",
+        "popen",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+    ):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, refused)
+
+    payload = provision_module.closed_claude_state_payload(registry)
+    assert str(Path.cwd()) in payload["projects"]
+    for provider in ("claude", "codex"):
+        bundle_path = identity_bundle_path(registry, provider)
+        assert bundle_path.name == f"{provider}-bundle.json"
+    workers = [
+        profile
+        for profile in registry.profiles.values()
+        if profile.safety_policy == "worker"
+    ]
+    assert workers
+    for profile in workers:
+        plan = provision_module.provision_plan(registry, profile.id)
+        assert plan["profile"] == profile.id
+        assert plan["home"] == str(profile.home)
+
+
+def test_linked_worktree_relative_gitfile_matches_git_metadata(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    registered = Path.cwd()
+    (registered / "relative-pointer.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "relative-pointer.txt"], cwd=registered, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Agent Fleet Tests",
+            "-c",
+            "user.email=agent-fleet@example.invalid",
+            "commit",
+            "-qm",
+            "relative pointer fixture",
+        ],
+        cwd=registered,
+        check=True,
+    )
+    linked = tmp_path / "relative-pointer-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "relative-pointer", str(linked)],
+        cwd=registered,
+        check=True,
+    )
+    gitfile = linked / ".git"
+    absolute_target = gitfile.read_text(encoding="utf-8").removeprefix("gitdir: ").strip()
+    relative_target = os.path.relpath(absolute_target, linked)
+    gitfile.write_text(f"gitdir: {relative_target}\n", encoding="utf-8")
+
+    project = resolve_trusted_project(registry, "codex", linked)
+
+    assert project.active_root == linked
+    assert project.canonical_root == registered
+    reported_common = subprocess.run(
+        ["git", "-C", str(linked), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert project.common_dir == Path(reported_common)
+
+
+def test_detached_head_repository_registers(tmp_path: Path) -> None:
+    repository = tmp_path / "detached-repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Agent Fleet Tests",
+            "-c",
+            "user.email=agent-fleet@example.invalid",
+            "commit",
+            "-qm",
+            "detached fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "--detach"], cwd=repository, check=True)
+    head = (repository / ".git" / "HEAD").read_text(encoding="utf-8")
+    assert not head.startswith("ref:")
+
+    assert register_trusted_project(repository) == repository
+
+
+def test_symlinked_head_matches_git_readlink_semantics(tmp_path: Path) -> None:
+    accepted = tmp_path / "dangling-symref-head"
+    accepted.mkdir()
+    subprocess.run(["git", "init", "-q", str(accepted)], check=True)
+    head = accepted / ".git" / "HEAD"
+    head.unlink()
+    # Git readlink-checks a symlink HEAD for a refs/ prefix and accepts even a
+    # dangling one; it never reads the target's content.
+    head.symlink_to("refs/heads/nonexistent")
+    assert register_trusted_project(accepted) == accepted
+
+    refused = tmp_path / "content-followed-head"
+    refused.mkdir()
+    subprocess.run(["git", "init", "-q", str(refused)], check=True)
+    outside = tmp_path / "outside-hexfile"
+    outside.write_text("0123456789abcdef0123456789abcdef01234567\n", encoding="utf-8")
+    head = refused / ".git" / "HEAD"
+    head.unlink()
+    head.symlink_to(outside)
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(refused)
+
+
+def test_commondir_trailing_space_is_refused_like_git(tmp_path: Path) -> None:
+    repository = tmp_path / "commondir-space"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / ".git" / "commondir").write_text(". \n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(repository)
+
+
+def test_gitfile_pointer_through_symlink_resolves_physically(
+    fleet: tuple[object, Path], tmp_path: Path
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    registered = Path.cwd()
+    (registered / "physical-pointer.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "physical-pointer.txt"], cwd=registered, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Agent Fleet Tests",
+            "-c",
+            "user.email=agent-fleet@example.invalid",
+            "commit",
+            "-qm",
+            "physical pointer fixture",
+        ],
+        cwd=registered,
+        check=True,
+    )
+    linked = tmp_path / "physical-pointer-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "physical-pointer", str(linked)],
+        cwd=registered,
+        check=True,
+    )
+    gitfile = linked / ".git"
+    absolute_target = Path(
+        gitfile.read_text(encoding="utf-8").removeprefix("gitdir: ").strip()
+    )
+    alias = tmp_path / "registered-alias"
+    alias.symlink_to(registered, target_is_directory=True)
+    rewritten = alias / absolute_target.relative_to(registered)
+    gitfile.write_text(f"gitdir: {rewritten}\n", encoding="utf-8")
+
+    # Git realpaths the pointer, so the common dir comes back physical and the
+    # linked worktree still matches its registered project.
+    project = resolve_trusted_project(registry, "codex", linked)
+    assert project.canonical_root == registered
+    assert alias.name not in str(project.common_dir)
+
+    # A ".." that lexically cancels a symlink component must resolve like git:
+    # symlink first, then "..", leaving a dangling physical target -> refusal.
+    main_repo = tmp_path / "main-repo"
+    main_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(main_repo)], check=True)
+    (tmp_path / "deep" / "sub").mkdir(parents=True)
+    (tmp_path / "lsym").symlink_to(tmp_path / "deep" / "sub", target_is_directory=True)
+    escaping = tmp_path / "lexical-escape"
+    escaping.mkdir()
+    (escaping / ".git").write_text(
+        f"gitdir: ../lsym/../{main_repo.name}/.git\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(escaping)
+
+
+def test_bare_and_broken_git_layouts_are_refused(tmp_path: Path) -> None:
+    bare = tmp_path / "bare-repository"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(bare)
+    repository = tmp_path / "regular-repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(repository / ".git")
+    broken = tmp_path / "broken-gitfile"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /nonexistent-git-directory\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Git worktree"):
+        register_trusted_project(broken)
 
 
 def test_project_removal_accepts_deleted_root_and_linked_common_dir(

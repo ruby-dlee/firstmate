@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import os
 import stat
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .executables import CONTROL_PATH, resolve_control_executable, validated_safe_directory
+from .executables import validated_safe_directory
 from .models import Registry
 from .paths import current_user_home, expand_lexical_path
 
@@ -51,30 +50,168 @@ def _owned_directory(path: Path, label: str) -> tuple[int, int]:
     return current.st_dev, current.st_ino
 
 
-def _git_path(path: Path, argument: str) -> Path:
-    git = resolve_control_executable("git")
-    environment = {
-        "HOME": str(current_user_home()),
-        "PATH": CONTROL_PATH,
-        "LC_ALL": "C",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_TERMINAL_PROMPT": "0",
-    }
+_GITFILE_PREFIX = b"gitdir: "
+
+
+def _valid_head_reference(head: Path) -> bool:
+    """Mirror Git's validate_headref: a symlink HEAD is readlink-checked without ever
+    reading its target, and a regular HEAD must carry a refs/ symref or an object id."""
+
     try:
-        result = subprocess.run(
-            [str(git), "-C", str(path), "rev-parse", "--path-format=absolute", argument],
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        info = os.lstat(head)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            return os.readlink(head).startswith("refs/")
+        except OSError:
+            return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    try:
+        with open(head, "rb") as handle:
+            buffer = handle.read(256)
+    except OSError:
+        return False
+    # Git parses a NUL-terminated buffer, skips any whitespace (newlines included)
+    # after "ref:", and accepts an object id terminated by end, NUL, or whitespace.
+    buffer = buffer.split(b"\0", 1)[0]
+    if buffer.startswith(b"ref:"):
+        return buffer[len(b"ref:") :].lstrip().startswith(b"refs/")
+    for size in (40, 64):
+        if (
+            len(buffer) >= size
+            and all(character in b"0123456789abcdefABCDEF" for character in buffer[:size])
+            and (len(buffer) == size or buffer[size : size + 1].isspace())
+        ):
+            return True
+    return False
+
+
+def _physical_path(path: Path) -> Path | None:
+    """Resolve like Git's real_pathdup: symlink-aware, refusing unresolvable paths."""
+
+    try:
+        return Path(os.path.realpath(path, strict=True))
+    except OSError:
+        return None
+
+
+def _git_common_dir(git_dir: Path) -> Path | None:
+    """Resolve a Git directory's common directory through its optional commondir file."""
+
+    try:
+        raw = (git_dir / "commondir").read_bytes()
+    except FileNotFoundError:
+        return git_dir
+    except OSError:
+        return None
+    # Git trims only trailing newline bytes here; other whitespace stays significant.
+    value = raw.rstrip(b"\r\n")
+    if not value or b"\n" in value or b"\x00" in value:
+        return None
+    target = Path(os.fsdecode(value))
+    if not target.is_absolute():
+        target = git_dir / target
+    return _physical_path(target)
+
+
+def _validated_git_dir(git_dir: Path) -> Path | None:
+    """Return the common directory when git_dir passes Git's is_git_directory checks."""
+
+    physical = _physical_path(git_dir)
+    if physical is None:
+        return None
+    try:
+        info = os.stat(physical, follow_symlinks=False)
+    except OSError:
+        return None
+    # Git's dubious-ownership refusal covered the discovered Git directory itself;
+    # the old sanitized subprocess inherited it, so keep the same fail-closed check.
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if not _valid_head_reference(physical / "HEAD"):
+        return None
+    common = _git_common_dir(physical)
+    if common is None:
+        return None
+    if not os.access(common / "objects", os.X_OK) or not os.access(common / "refs", os.X_OK):
+        return None
+    return common
+
+
+def _read_gitfile(dotgit: Path, containing: Path) -> Path | None:
+    """Parse a .git file's gitdir pointer, or None when malformed."""
+
+    try:
+        if os.stat(dotgit, follow_symlinks=True).st_size > 1 << 20:
+            # Git refuses oversized .git files ("too large to be a .git file").
+            return None
+        raw = dotgit.read_bytes()
+    except OSError:
+        return None
+    if not raw.startswith(_GITFILE_PREFIX):
+        return None
+    value = raw[len(_GITFILE_PREFIX) :].rstrip(b"\r\n")
+    if not value or b"\n" in value or b"\x00" in value:
+        return None
+    target = Path(os.fsdecode(value))
+    if not target.is_absolute():
+        target = containing / target
+    return _physical_path(target)
+
+
+def _discover_git_worktree(start: Path) -> tuple[Path, Path]:
+    """Mirror `git rev-parse --show-toplevel` / `--git-common-dir` with pure filesystem reads.
+
+    This runs under the sealed pure-planning guard, which forbids process and shell
+    execution, so Git worktree membership must be resolved without spawning git.
+    Discovery matches git run under the sanitized control environment the previous
+    subprocess used: no GIT_* environment overrides are honored, and upward discovery
+    stops at a filesystem boundary.
+    Deliberate fail-closed micro-divergences, all refusing hand-corrupted layouts git
+    never writes: an existing-but-unreadable commondir file skips the level instead of
+    dying, and NUL bytes in a commondir or gitdir pointer are refused rather than
+    C-truncated.
+    """
+
+    def refused() -> ValueError:
+        return ValueError(f"trusted project must be inside a Git worktree: {start}")
+
+    try:
+        device = os.lstat(start).st_dev
     except OSError as exc:
-        raise ValueError("Git is required to validate trusted projects") from exc
-    value = result.stdout.strip()
-    if result.returncode != 0 or not value:
-        raise ValueError(f"trusted project must be inside a Git worktree: {path}")
-    return Path(value)
+        raise refused() from exc
+    level = start
+    while True:
+        dotgit = level / ".git"
+        try:
+            info: os.stat_result | None = os.stat(dotgit, follow_symlinks=True)
+        except OSError:
+            info = None
+        if info is not None and stat.S_ISREG(info.st_mode):
+            pointed = _read_gitfile(dotgit, level)
+            common = _validated_git_dir(pointed) if pointed is not None else None
+            if common is None:
+                # Git treats a malformed or dangling .git file as fatal, never skippable.
+                raise refused()
+            return level, common
+        if info is not None and stat.S_ISDIR(info.st_mode):
+            common = _validated_git_dir(dotgit)
+            if common is not None:
+                return level, common
+        if _validated_git_dir(level) is not None:
+            # A bare repository (or the inside of a .git directory) has no work tree.
+            raise refused()
+        parent = level.parent
+        if parent == level:
+            raise refused()
+        try:
+            if os.lstat(parent).st_dev != device:
+                raise refused()
+        except OSError as exc:
+            raise refused() from exc
+        level = parent
 
 
 def _canonical_git_project(path: Path) -> tuple[Path, Path, tuple[int, int], tuple[int, int]]:
@@ -82,17 +219,14 @@ def _canonical_git_project(path: Path) -> tuple[Path, Path, tuple[int, int], tup
     if expanded.is_symlink() or expanded.resolve() != expanded:
         raise ValueError(f"trusted project path must not be symlinked: {path}")
     expanded_identity = _owned_directory(expanded, "trusted project path")
-    root = _git_path(expanded, "--show-toplevel")
-    common_dir = _git_path(expanded, "--git-common-dir")
+    root, common_dir = _discover_git_worktree(expanded)
     if root.is_symlink() or root.resolve() != root:
         raise ValueError(f"Git worktree root must not be symlinked: {root}")
     root_identity = _owned_directory(root, "Git worktree root")
     common_identity = _owned_directory(common_dir, "Git common directory")
     if expanded == root and expanded_identity != root_identity:
         raise ValueError("trusted project root changed during validation")
-    if _git_path(expanded, "--show-toplevel") != root or _git_path(
-        expanded, "--git-common-dir"
-    ) != common_dir:
+    if _discover_git_worktree(expanded) != (root, common_dir):
         raise ValueError("trusted project Git metadata changed during validation")
     if _owned_directory(root, "Git worktree root") != root_identity or _owned_directory(
         common_dir, "Git common directory"

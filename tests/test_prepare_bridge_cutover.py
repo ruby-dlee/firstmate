@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import os
@@ -72,6 +73,7 @@ class Registry:
     settings: Settings
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     profiles: dict[str, Profile] = field(default_factory=dict)
+    config_path: Path | None = None
 """
 
 
@@ -258,6 +260,10 @@ def provision_plan(registry, profile_id):
     profile = registry.profiles[profile_id]
     if profile.safety_policy != "worker":
         raise ValueError("reserve profiles cannot be provisioned")
+    if registry.config_path is None:
+        # The real provision API composes managed hook commands from the loaded
+        # registry path and refuses a pathless registry; mirror that contract.
+        raise ValueError("loaded registry path is unavailable for managed hooks")
     common = [
         ".agent-fleet-hooks.json",
         ".agent-fleet-profile.json",
@@ -2504,6 +2510,90 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         self.assertTrue(result["rollback_refused_after_irreversible_boundary"])
         self.assertEqual(list(self.fixture.scratch.iterdir()), [self.fixture.snapshot_parent])
         self.assertEqual(list(self.fixture.snapshot_parent.iterdir()), [])
+
+
+class RealAgentFleetPurePlanningTest(unittest.TestCase):
+    """Regression gate for the 2026-07-19 live-cutover preparer NO-GO.
+
+    The synthetic agent_fleet modules elsewhere in this suite never resolve trusted
+    projects through git, so the sealed provision API's project canonicalization was
+    first exercised live, where the pure-planning guard refused its subprocess call.
+    This gate loads the REAL agent_fleet package exactly the way ``prepare`` does and
+    invokes the sealed planning APIs under the REAL guard against a REAL git-backed
+    trusted project.
+    """
+
+    @staticmethod
+    def _stage_sealed_quota_release(root: Path) -> tuple[Path, Path]:
+        """Stage a self-contained sealed quota-axi release layout under ``root``.
+
+        ``initial_registry`` otherwise pins the operator machine's installed release,
+        which no continuous-integration runner has; the release only has to satisfy the
+        sealed-layout and identity checks for this gate, never to execute.
+        """
+
+        entrypoint = root / "node_modules" / "quota-axi" / "dist" / "bin" / "quota-axi.js"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("export const fixture = true;\n", encoding="utf-8")
+        entrypoint.chmod(0o444)
+        node_binary = root / "runtime" / "node"
+        node_binary.parent.mkdir(parents=True)
+        node_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        node_binary.chmod(0o755)
+        quota_binary = root / "bin" / "quota-axi"
+        quota_binary.parent.mkdir(parents=True)
+        quota_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        quota_binary.chmod(0o755)
+        return quota_binary, node_binary
+
+    def test_real_provision_planning_is_pure_for_git_backed_project(self) -> None:
+        pythonpath = SCRIPT_DIR.parents[0] / "agent-fleet" / "src"
+        init_text = (pythonpath / "agent_fleet" / "__init__.py").read_text("utf-8")
+        version = next(
+            line.split('"')[1]
+            for line in init_text.splitlines()
+            if line.startswith("__version__")
+        )
+        api = prepare.load_agent_fleet_api(
+            pythonpath,
+            pythonpath.parent,
+            version,
+            "real source planning gate",
+            require_provision_api=True,
+        )
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = Path(raw_temp).resolve()
+            project = temp / "trusted-project"
+            project.mkdir(mode=0o700)
+            subprocess.run(["git", "init", "-q", str(project)], check=True)
+            quota_binary, quota_node_binary = self._stage_sealed_quota_release(
+                temp / "quota-release"
+            )
+            environment = {
+                "AGENT_FLEET_CONFIG": str(temp / "config" / "accounts.toml"),
+                "AGENT_FLEET_STATE_DIR": str(temp / "state"),
+                "AGENT_FLEET_SHARE_DIR": str(temp / "share"),
+                "AGENT_FLEET_QUOTA_BIN": str(quota_binary),
+                "AGENT_FLEET_QUOTA_NODE_BIN": str(quota_node_binary),
+            }
+            with mock.patch.dict(os.environ, environment):
+                registry = api.config.initial_registry(1, 1)
+            self.assertEqual(registry.settings.quota_binary, quota_binary)
+            providers = dict(registry.providers)
+            providers["claude"] = dataclasses.replace(
+                providers["claude"], trusted_projects=(project,)
+            )
+            registry = dataclasses.replace(registry, providers=providers)
+
+            payload = prepare._invoke_pure_provision_api(
+                api.provision.closed_claude_state_payload, registry
+            )
+
+            self.assertEqual(sorted(payload["projects"]), [str(project)])
+            bundle_path = prepare._invoke_pure_provision_api(
+                api.identity.identity_bundle_path, registry, "claude"
+            )
+            self.assertTrue(str(bundle_path).endswith("claude-bundle.json"))
 
 
 if __name__ == "__main__":

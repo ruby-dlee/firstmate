@@ -1385,7 +1385,20 @@ def _candidate_api(manifest: Manifest) -> tuple[ModuleType, Any]:
             ),
             "worker-state candidate registry",
         )
-        registry = prepare._lexical_candidate_registry(api, raw)
+        driver = _driver()
+        cutover = driver.load_manifest(manifest.cutover_manifest_path)
+        live_registries = [
+            operation
+            for operation in cutover.operations
+            if isinstance(operation, driver.RegistryOperation)
+        ]
+        if len(live_registries) != 1:
+            raise ValueError("cutover manifest must bind exactly one registry operation")
+        # Managed hook commands embed the live registry path, so verification must
+        # rebuild plans against it, not against the bundled registry copy's path.
+        registry = prepare._lexical_candidate_registry(
+            api, raw, live_registries[0].path
+        )
     except Exception as exc:
         raise WorkerStateError(f"cannot load exact candidate API/registry: {exc}") from exc
     return api, registry

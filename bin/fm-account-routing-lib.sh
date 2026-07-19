@@ -198,15 +198,21 @@ fm_account_run_bounded() {
       [ "$status" -ne 137 ] || status=124
       return "$status"
     }
+    return 0
   elif fm_account_test_lab_enabled && command -v gtimeout >/dev/null 2>&1; then
     gtimeout "${foreground_flag[@]}" --kill-after=1 "$seconds" "$@" || {
       status=$?
       [ "$status" -ne 137 ] || status=124
       return "$status"
     }
+    return 0
   elif [ -n "$FM_ACCOUNT_SYSTEM_PERL_BIN" ]; then
     # shellcheck disable=SC2016
-    fm_account_system_perl -e 'my $t = shift; my $inherit = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0) unless $inherit; exec @ARGV } my $target = $inherit ? $pid : -$pid; local $SIG{ALRM} = sub { kill "TERM", $target; select undef, undef, undef, 0.2; kill "KILL", $target; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$seconds" "${FM_ACCOUNT_BOUND_INHERIT_GROUP:-0}" "$@"
+    fm_account_system_perl -e 'my $t = shift; my $inherit = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0) unless $inherit; exec @ARGV } my $target = $inherit ? $pid : -$pid; local $SIG{ALRM} = sub { kill "TERM", $target; select undef, undef, undef, 0.2; kill "KILL", $target; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$seconds" "${FM_ACCOUNT_BOUND_INHERIT_GROUP:-0}" "$@" || {
+      status=$?
+      return "$status"
+    }
+    return 0
   else
     return 127
   fi

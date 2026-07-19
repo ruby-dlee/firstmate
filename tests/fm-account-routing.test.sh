@@ -4323,10 +4323,12 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   set -e
   [ "$rc" -ne 0 ] || fail "young ownerless metadata lock was reclaimed before its grace"
   assert_present "$lock" "young ownerless metadata lock was deleted"
+  assert_present "$lock/.ownerless-since" "ownerless metadata lock did not persist its grace baseline"
 
+  printf '946684800\n' > "$lock/.ownerless-since"
   touch -t 200001010000 "$lock"
   FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
-    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \
+    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit; fm_account_meta_lock_release "$held"' \
     _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "old ownerless metadata lock was not reclaimed"
 
   owner_lines=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '

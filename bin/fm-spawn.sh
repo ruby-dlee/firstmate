@@ -711,7 +711,7 @@ cleanup_continuation_launch_transport() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp release_status
   trap - EXIT
   # This is an EXIT trap whose job is to attempt every independent cleanup
   # action and then return the original spawn status. The parent script runs
@@ -779,9 +779,11 @@ spawn_abort_cleanup() {
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ] || fm_account_mutation_owned; then
-      if ! fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null; then
+      release_status=0
+      fm_account_release "$ACCOUNT_TASK" --force 2>/dev/null || release_status=$?
+      if [ "$release_status" -ne 0 ]; then
         account_clean=0
-        echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown}" >&2
+        echo "warning: failed to roll back Agent Fleet lease for ${ID:-unknown} (exit $release_status)" >&2
       elif [ "$RESUME_ACCOUNT" != 1 ] && ! fm_account_session_remove "$ACCOUNT_TASK" 2>/dev/null; then
         account_clean=0
         echo "warning: failed to roll back Agent Fleet session for ${ID:-unknown}" >&2

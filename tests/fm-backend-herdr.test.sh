@@ -1270,7 +1270,7 @@ SH
   printf '%s\n' "$old_pid" > "$pids"
   : > "$running"
   write_legacy_certificate default || fail "could not establish legacy adapter ownership for empty restart"
-  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+  if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
     FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
     FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
@@ -1280,7 +1280,12 @@ SH
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_server_ensure default || exit 1
       fm_backend_herdr_server_closed_shell_environment_ready default
-    ' "$ROOT" || fail "adapter-owned exact-empty drift did not stop, relaunch, and recertify"
+    ' "$ROOT" 2>&1); then status=0; else status=$?; fi
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$out" >&2
+    sed 's/^/herdr: /' "$log" >&2
+    fail "adapter-owned exact-empty drift did not stop, relaunch, and recertify"
+  fi
   wait "$old_pid" >/dev/null 2>&1 || true
   kill -0 "$old_pid" 2>/dev/null \
     && fail "exact-empty restart left the release-drifted adapter server alive"

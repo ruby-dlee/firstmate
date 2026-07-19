@@ -1547,7 +1547,7 @@ SH
 }
 
 test_concurrent_server_ensure_launches_exactly_one_server() {
-  local dir fb log lock_root running pids first second launch_count server_pid
+  local dir fb log lock_root running pids ps_fake first second launch_count server_pid
   dir="$TMP_ROOT/server-ensure-race"
   fb="$dir/fakebin"
   log="$dir/herdr.log"
@@ -1582,14 +1582,25 @@ case "${1:-} ${2:-}" in
 esac
 SH
   chmod +x "$fb/herdr"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
   PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
     FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
-    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
   first=$!
   PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
     FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
-    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
   second=$!
   wait "$first" || fail "first concurrent server ensure failed"

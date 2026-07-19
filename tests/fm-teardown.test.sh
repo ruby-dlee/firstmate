@@ -524,6 +524,7 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -1446,7 +1447,7 @@ set -u
 printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
 case "$*" in
   '--format json contract')
-    printf '{"contract_version":1}\n'
+    printf '{"contract_version":2}\n'
     exit 0
     ;;
   *"lease release"*)

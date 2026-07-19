@@ -179,7 +179,7 @@ Herdr tasks additionally record:
 | Operation | Verified herdr call | What was verified |
 |---|---|---|
 | Version/protocol gate | `herdr status --json` -> `.client.protocol` | Session-independent; `.server.*` fields ARE session-dependent. |
-| Headless server start | `fm_backend_herdr_server_launch_detached <name>` | A bare socket call does NOT auto-start the server, so the adapter starts through a `nohup` + Perl double-fork/`setsid` launcher and then polls before any workspace/tab/pane call. The launcher execs `herdr server --session <name>` with `HERDR_SESSION=<name>`, stdin redirected from `/dev/null`, and discarded output. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
+| Headless server start | `fm_backend_herdr_server_launch_detached <name>` | A bare socket call does NOT auto-start the server, so the adapter starts through a `nohup` + Perl double-fork/`setsid` launcher and then polls before any workspace/tab/pane call. The launcher execs `herdr server --session <name>` with `HERDR_SESSION=<name>`, a Firstmate-owned `HERDR_CONFIG_PATH`, and the physical `fm-herdr-worker-shell` as `SHELL`; stdin is `/dev/null` and output is discarded. This fact is for start only, not cleanup, and the explicit `--session` flag is intentional because `HERDR_SESSION` alone is not safe session targeting. |
 | Duplicate task check | `herdr tab list --workspace <id>`, match by `.label` | Herdr does NOT enforce tab-label uniqueness itself; two tabs can share a label. The adapter's own duplicate check is required. |
 | Send literal (unsubmitted) | `herdr pane send-text <pane> <text>` | Does NOT auto-submit, contrary to the original design addendum's guess. Verified directly: a unique marker sent this way sits unexecuted in the composer until a separate Enter. Behaves exactly like tmux's `send-keys -l`. |
 | Send + submit atomically | `herdr pane run <pane> <command>` | Runs and submits a command in one call; used for the two fixed spawn-time commands (`treehouse get`, the `GOTMPDIR` export) exactly where tmux used one `send-keys ... Enter` call. |
@@ -207,6 +207,47 @@ Before the kill, driver PID 16023 was in process group 16023 while server PID 16
 After the parent window was absent for 84 seconds, server PID 16206 and dummy agent PID 16413 remained alive, `status --json` reported the scoped server running and compatible, and `pane get` plus `agent get` returned pane `w1:p2` with `agent_status=working`.
 Guarded teardown removed only `fm-lab-bridge-fix-91917`, and the default Herdr server remained running.
 `tests/fm-backend-herdr.test.sh` also launches a fake server through the detached helper and asserts survival after caller exit, reparenting, a distinct process group, closed terminal stdin, and the exact scoped server arguments.
+
+### Control-plane and filesystem hardening
+
+Production does not resolve Herdr or its launch controls from the caller's `PATH`.
+The adapter starts from the current passwd user's `~/.local/bin/herdr`, resolves the installed symlink layout to one physical executable, and revalidates that leaf before every use: regular executable, current-user/root ownership, no group/world write bit, exactly one hard link, and safe physical ancestry.
+Every ancestor must be current-user/root owned and non-writable; a root-owned sticky directory such as `/private/tmp` is the only writable exception.
+JSON parsing and startup controls use fixed system `jq`, `env`, `nohup`, and Perl paths.
+
+The detached server is launched through `env -i` with passwd `HOME`, a separately validated worker-tool `PATH`, `HERDR_SESSION`, `LC_ALL=C`, the private managed `HERDR_CONFIG_PATH`, and the physical managed shell in `SHELL`.
+That worker path physically resolves each absolute caller entry, accepts only current-user/root-owned directories with non-writable leaves and safe ancestry, deduplicates them, and appends the fixed control directories.
+This preserves safe Homebrew and user toolchains (for example `node`, `npm`, and `uv`) for pane descendants without allowing a writable caller path to become server execution authority; Herdr's own control operations still use their fixed absolute binaries rather than this worker path.
+That envelope applies to both the double-fork Perl process and the exec'd Herdr grandchild, so ambient `PERL5OPT`, `PERLLIB`, loader injection, and tool shadows cannot alter startup.
+The per-session lifecycle lock lives at `/tmp/firstmate-herdr-server-locks-<uid>` regardless of `TMPDIR`; its physical parent ancestry is validated and its leaf must remain a current-user `0700` directory.
+It serializes current-certificate reuse, release-drift classification, any exact-session stop, recertified launch, and readiness before a caller can inspect or create a workspace.
+Lock candidates and owner records are inode-, mode-, link-, owner-, PID-, and process-start-checked around atomic link/rename operations.
+
+The managed per-session Herdr config is a private, helper-content-addressed exact-content file in that lock root.
+It pins `terminal.default_shell` to a private `0500` content-addressed copy of `bin/fm-herdr-worker-shell`, selects `terminal.shell_mode = "non_login"`, and disables restored-agent resume.
+The worker shell is a fixed Perl executable that removes shell startup hooks, exported functions, loader/language injections, Agent Fleet/Quota authority variables, and XDG redirects before it resolves the passwd identity and execs `/bin/bash --noprofile --norc`.
+Sanitization therefore happens before Bash can import `BASH_ENV`, `SHELLOPTS=xtrace`, or a hostile `PS4`; a command prefix inside an already-started pane shell is not treated as isolation.
+
+The detached grandchild durably publishes a private schema-v2 certificate containing the session hash, PID/process-start token, exact content-addressed helper path plus SHA-256 and file identity, and exact managed-config path plus SHA-256 and file identity before it execs the verified Herdr server.
+Certificate, helper, and config verification opens with `O_NOFOLLOW`, hashes through the descriptor, and rechecks descriptor/path identity after the read.
+An enforced spawn accepts Herdr only when those recorded objects still match, the reviewed source helper still has the recorded digest, the config bytes still pin that exact helper, and the certified process identity is live.
+The check runs after server ensure and immediately before any routed tab is created.
+A manual, restored, pre-upgrade, dead, PID-reused, helper-replaced, config-replaced, or post-update server has no valid proof and fails closed.
+
+Helper, config, certificate, and lifecycle-lock publication use private candidate files.
+Recovery removes only a current-user, exact-mode candidate whose numeric owner PID is proven absent and whose age exceeds the startup stale threshold; foreign, live, malformed, or otherwise indeterminate candidates are never deleted.
+Every final cleanup first moves the pathname without replacement into a private deterministic quarantine keyed by the attributed device/inode, verifies the moved generation and quarantine identity, and deletes only that verified moved object.
+A last-check substitution is preserved in quarantine and the operation fails closed; an unresolved quarantine blocks reuse of that exact pathname.
+
+These controls defend against other users, ambient shell configuration, accidental Desktop/provider activity, and ordinary release switches.
+They do not claim to defeat a malicious process already running as the same Unix uid: portable shell cannot atomically bind an already-validated executable inode to the later `exec`, and a same-uid attacker can race user-owned paths between checks.
+That residual is explicit; the adapter revalidates immediately before use and keeps the verified install and lock paths private to make normal non-hostile mutation fail closed.
+The regression suite covers hostile `PATH`, Perl/loader variables, unsafe ancestry, hardlinks, cached-leaf mutation, unsafe lock parents, hostile `TMPDIR`, a detached descendant that retains a safe user tool while excluding a writable search directory, inherited `BASH_ENV` plus `SHELLOPTS=xtrace`, exact managed-config shape, certificate liveness, helper/config replacement and source-update drift, guarded helper/config/certificate candidate recovery, last-check substitution quarantine, serialized exact-empty drift restart, occupied/indeterminate refusal before workspace mutation, and refusal of every uncertified production backend before Fleet, lease, or endpoint mutation.
+
+`fm_backend_herdr_server_ensure` reuses a server only when its full current-release process/helper/config certificate verifies under the lifecycle lock.
+For an older adapter-owned certificate, it queries the explicitly named session's workspace, tab, and pane collections and stops only that exact session after two complete empty proofs plus repeated process-ownership proof; it then performs the detached launch and current-release recertification before releasing the lock.
+Occupied, unreadable/indeterminate, manual, or uncertified servers are never stopped or routed.
+This convergence path never uses ambient `herdr server stop`, never deletes session state (including `default`), and never moves Herdr ownership into a captain launcher.
 
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker
 

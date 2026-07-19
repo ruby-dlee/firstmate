@@ -13,11 +13,13 @@
 #     are direct per-spawn overrides, never inputs to quota-balanced selection.
 #   - A candidate set carrying account_pool uses only Agent Fleet's no-secret
 #     `pool status` summaries. Every candidate must then carry account_pool and
-#     use claude/codex. The best available pool's adjusted headroom wins; exact
-#     ties use the first array element. A quota-fresh pool beats a degraded
-#     fallback pool; if every available pool is degraded, the first available
-#     candidate wins. Agent Fleet trouble degrades to the first element and
-#     never falls through to default-account quota-axi data.
+#     use claude/codex. Only a non-degraded, quota-fresh provider summary backed
+#     by at least one freshly proven eligible profile is available. The best
+#     adjusted headroom wins; exact ties use the first array element. Stale or
+#     otherwise degraded summaries are diagnostics only. Agent Fleet trouble
+#     degrades to the first element and never falls through to default-account
+#     quota-axi data; enforced spawn still obtains the real fresh lease before
+#     any provider launch.
 #   - Enforced account routing rejects quota-balanced candidates without pools.
 #     Off and observe retain the legacy no-pool quota-axi path.
 #   - Per candidate vendor it takes the minimum percentRemaining across that
@@ -38,26 +40,43 @@
 #
 # quota-balanced uses quota-axi --json unless --quota-json supplies a fixture.
 # FM_DISPATCH_QUOTA_AXI overrides the quota command.
-# FM_DISPATCH_AGENT_FLEET overrides FM_AGENT_FLEET_BIN, which overrides the
-# Agent Fleet command resolved from PATH.
+# FM_DISPATCH_AGENT_FLEET and FM_AGENT_FLEET_BIN are test/lab-only. Production
+# uses the fixed passwd-home ~/.local/bin/agent-fleet front door.
 # FM_DISPATCH_STALE_CLEAR_MARGIN overrides the default 20 point stale margin.
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_DISPATCH_SOURCE=${BASH_SOURCE[0]}
+case "$FM_DISPATCH_SOURCE" in
+  */*) FM_DISPATCH_SOURCE_DIR=${FM_DISPATCH_SOURCE%/*} ;;
+  *) FM_DISPATCH_SOURCE_DIR=. ;;
+esac
+SCRIPT_DIR=$(CDPATH='' builtin cd -- "$FM_DISPATCH_SOURCE_DIR" 2>/dev/null && builtin pwd -P) || {
+  echo "error: cannot resolve fm-dispatch-select directory" >&2
+  exit 2
+}
+if [ -n "${FM_ROOT_OVERRIDE:-}" ]; then
+  FM_ROOT=$FM_ROOT_OVERRIDE
+else
+  FM_ROOT=$(CDPATH='' builtin cd -- "$SCRIPT_DIR/.." 2>/dev/null && builtin pwd -P) || {
+    echo "error: cannot resolve FirstMate root" >&2
+    exit 2
+  }
+fi
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+FM_DISPATCH_JQ_BIN=$FM_ACCOUNT_SYSTEM_JQ_BIN
+FM_DISPATCH_AWK_BIN=$FM_ACCOUNT_SYSTEM_AWK_BIN
+FM_DISPATCH_CAT_BIN=$FM_ACCOUNT_SYSTEM_CAT_BIN
 
 STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
-AGENT_FLEET_TIMEOUT=${FM_DISPATCH_AGENT_FLEET_TIMEOUT:-5}
 SELECT_OVERRIDE=
 QUOTA_JSON_FILE=
 ARGS=()
 
 usage() {
-  awk '
+  "$FM_DISPATCH_AWK_BIN" '
     NR == 1 { next }
     /^#/ { sub(/^# ?/, ""); print; next }
     { exit }
@@ -68,7 +87,17 @@ log() {
   printf 'fm-dispatch-select: %s\n' "$*" >&2
 }
 
-case "$AGENT_FLEET_TIMEOUT" in ''|*[!0-9]*|0) AGENT_FLEET_TIMEOUT=5 ;; esac
+if [ -n "${FM_DISPATCH_AGENT_FLEET_TIMEOUT:-}" ]; then
+  AGENT_FLEET_TIMEOUT=$FM_DISPATCH_AGENT_FLEET_TIMEOUT
+  case "$AGENT_FLEET_TIMEOUT" in
+    ''|*[!0-9]*|0)
+      echo "error: FM_DISPATCH_AGENT_FLEET_TIMEOUT must be a positive integer" >&2
+      exit 2
+      ;;
+  esac
+else
+  AGENT_FLEET_TIMEOUT=$(fm_account_selection_timeout) || exit 2
+fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -113,15 +142,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "${#ARGS[@]}" -le 1 ] || { echo "error: expected at most one JSON argument" >&2; exit 2; }
-command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+[ -x "$FM_DISPATCH_JQ_BIN" ] || { echo "error: fixed system jq is required" >&2; exit 2; }
+[ -x "$FM_DISPATCH_AWK_BIN" ] || { echo "error: fixed system awk is required" >&2; exit 2; }
+[ -x "$FM_DISPATCH_CAT_BIN" ] || { echo "error: fixed system cat is required" >&2; exit 2; }
 
 if [ "${#ARGS[@]}" -eq 1 ]; then
   SPEC_JSON=${ARGS[0]}
 else
-  SPEC_JSON=$(cat)
+  SPEC_JSON=$("$FM_DISPATCH_CAT_BIN")
 fi
 
-profiles_json=$(printf '%s\n' "$SPEC_JSON" | jq -ec '
+profiles_json=$(printf '%s\n' "$SPEC_JSON" | "$FM_DISPATCH_JQ_BIN" -ec '
   (if type == "object" and has("use") then .use else . end)
   | if type == "array" then .
     elif type == "object" then [.]
@@ -129,11 +160,12 @@ profiles_json=$(printf '%s\n' "$SPEC_JSON" | jq -ec '
     end
 ' 2>/dev/null) || { echo "error: dispatch input must be a rule, profile, or profile array" >&2; exit 2; }
 
-profile_count=$(printf '%s\n' "$profiles_json" | jq 'length')
+profile_count=$(printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" 'length')
 [ "$profile_count" -gt 0 ] || { echo "error: dispatch profile array must not be empty" >&2; exit 2; }
 
 first_profile() {
-  printf '%s\n' "$profiles_json" | jq -c '
+  # shellcheck disable=SC2016
+  printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -c '
     def clean($p):
       {harness: $p.harness}
       + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
@@ -146,7 +178,7 @@ first_profile() {
 
 select_strategy=$SELECT_OVERRIDE
 if [ -z "$select_strategy" ]; then
-  select_strategy=$(printf '%s\n' "$SPEC_JSON" | jq -r '
+  select_strategy=$(printf '%s\n' "$SPEC_JSON" | "$FM_DISPATCH_JQ_BIN" -r '
     if type == "object" and has("use") and (.select? | type) == "string" then .select else "" end
   ' 2>/dev/null || true)
 fi
@@ -159,7 +191,7 @@ if [ "$select_strategy" != quota-balanced ]; then
   exit 0
 fi
 
-if printf '%s\n' "$profiles_json" | jq -e 'any(.[]; (.account_profile? | type) == "string")' >/dev/null 2>&1; then
+if printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -e 'any(.[]; (.account_profile? | type) == "string")' >/dev/null 2>&1; then
   echo "error: quota-balanced candidates cannot carry account_profile" >&2
   exit 2
 fi
@@ -167,7 +199,7 @@ fi
 # Once any account pool participates, provider choice must come from Agent
 # Fleet's same per-account view that concrete selection will use. Never compare
 # those pools against quota-axi's default-account cache (double selection).
-pooled_count=$(printf '%s\n' "$profiles_json" | jq '[.[] | select((.account_pool? | type) == "string")] | length')
+pooled_count=$(printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" '[.[] | select((.account_pool? | type) == "string")] | length')
 pool_ids_valid=1
 while IFS= read -r encoded_pool; do
   case "$encoded_pool" in
@@ -175,7 +207,7 @@ while IFS= read -r encoded_pool; do
     *) pool_ids_valid=0; continue ;;
   esac
   fm_account_valid_id "$pool" || pool_ids_valid=0
-done < <(printf '%s\n' "$profiles_json" | jq -c '.[].account_pool')
+done < <(printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -c '.[].account_pool')
 if [ "$pooled_count" -eq "$profile_count" ] && [ "$pool_ids_valid" = 1 ]; then
   routing_mode=off
 else
@@ -188,13 +220,12 @@ if [ "$routing_mode" = enforce ]; then
   fi
 fi
 if [ "$pooled_count" -gt 0 ]; then
-  if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | jq -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
+  if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
     log "account_pool quota-balanced candidates must all name claude/codex pools; using first profile"
     first_profile
     exit 0
   fi
-  agent_fleet_cmd=${FM_DISPATCH_AGENT_FLEET:-${FM_AGENT_FLEET_BIN:-agent-fleet}}
-  if ! command -v "$agent_fleet_cmd" >/dev/null 2>&1; then
+  if ! agent_fleet_cmd=$(fm_account_fleet_bin "${FM_DISPATCH_AGENT_FLEET:-}"); then
     log "agent-fleet missing for account_pool summaries; using first profile"
     first_profile
     exit 0
@@ -206,31 +237,63 @@ if [ "$pooled_count" -gt 0 ]; then
   fi
   summaries='[]'
   while IFS=$(printf '\t') read -r index harness pool; do
-    if ! pool_json=$(fm_account_run_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
+    if ! pool_json=$(fm_account_run_fleet_bounded "$AGENT_FLEET_TIMEOUT" "$agent_fleet_cmd" --format json pool status --pool "$pool" --provider "$harness" 2>/dev/null); then
       log "agent-fleet pool status failed for $pool/$harness; using first profile"
       first_profile
       exit 0
     fi
-    if ! summary=$(printf '%s\n' "$pool_json" | jq -ec --arg harness "$harness" '
-      .providers[]? | select(.provider == $harness)
-      | select((.available | type) == "boolean")
-      | {
-          available,
-          selection_mode: (.selection_mode // "unavailable"),
+    # shellcheck disable=SC2016
+    if ! summary=$(printf '%s\n' "$pool_json" | "$FM_DISPATCH_JQ_BIN" -ec \
+      --arg harness "$harness" --arg pool "$pool" '
+      select(.schema == 1 and .pool == $pool and (.providers | type) == "array")
+      | [.providers[] | select(.provider == $harness)]
+      | select(length == 1)
+      | .[0]
+      | select(
+          (.available | type) == "boolean"
+          and (.selection_mode | type) == "string"
+          and (.degraded | type) == "boolean"
+          and (.eligible_profiles | type) == "number"
+          and (.profiles | type) == "array"
+        )
+      | ([.profiles[]
+          | select(
+              .eligible == true
+              and .quota_fresh == true
+              and (.identity_binding_conflict // null) == null
+              and (.live_identity_failure // null) == null
+            )] | length) as $fresh_profiles
+      | if (
+          .available == true
+          and .selection_mode == "quota"
+          and .degraded == false
+          and (.best_adjusted_headroom_percent | type) == "number"
+          and .eligible_profiles == $fresh_profiles
+          and $fresh_profiles > 0
+        ) then {
+          available: true,
+          selection_mode: "quota",
           headroom: .best_adjusted_headroom_percent
-        }
+        } else {
+          available: false,
+          selection_mode: "unavailable",
+          headroom: null
+        } end
     ' 2>/dev/null); then
       log "agent-fleet returned invalid pool summary for $pool/$harness; using first profile"
       first_profile
       exit 0
     fi
-    profile=$(printf '%s\n' "$profiles_json" | jq -c --argjson index "$index" '.[$index]')
-    summaries=$(printf '%s\n' "$summaries" | jq -c \
+    # shellcheck disable=SC2016
+    profile=$(printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -c --argjson index "$index" '.[$index]')
+    # shellcheck disable=SC2016
+    summaries=$(printf '%s\n' "$summaries" | "$FM_DISPATCH_JQ_BIN" -c \
       --argjson index "$index" --argjson profile "$profile" --argjson summary "$summary" \
       '. + [{index: $index, profile: $profile, summary: $summary}]')
-  done < <(printf '%s\n' "$profiles_json" | jq -r 'to_entries[] | [.key, .value.harness, .value.account_pool] | @tsv')
+  done < <(printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -r 'to_entries[] | [.key, .value.harness, .value.account_pool] | @tsv')
 
-  selection=$(printf '%s\n' "$summaries" | jq -ec '
+  # shellcheck disable=SC2016
+  selection=$(printf '%s\n' "$summaries" | "$FM_DISPATCH_JQ_BIN" -ec '
     def clean($p):
       {harness: $p.harness}
       + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
@@ -239,26 +302,23 @@ if [ "$pooled_count" -gt 0 ]; then
       + (if ($p.account_profile? | type) == "string" then {account_profile: $p.account_profile} else {} end);
     ([.[] | select(.summary.available == true and .summary.selection_mode == "quota" and (.summary.headroom | type) == "number")]
       | sort_by([-(.summary.headroom), .index])) as $fresh
-    | ([.[] | select(.summary.available == true and .summary.selection_mode != "quota")]
-      | sort_by(.index)) as $fallback
     | if ($fresh | length) > 0 then {fallback: false, profile: clean($fresh[0].profile)}
-      elif ($fallback | length) > 0 then {fallback: false, profile: clean($fallback[0].profile)}
-      else {fallback: true, reason: "no available Agent Fleet account pools", profile: clean(.[0].profile)}
+      else {fallback: true, reason: "no freshly routeable Agent Fleet account pools", profile: clean(.[0].profile)}
       end
   ') || {
     log "Agent Fleet pool summaries could not be evaluated; using first profile"
     first_profile
     exit 0
   }
-  if [ "$(printf '%s\n' "$selection" | jq -r '.fallback')" = true ]; then
-    log "$(printf '%s\n' "$selection" | jq -r '.reason'); using first profile"
+  if [ "$(printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -r '.fallback')" = true ]; then
+    log "$(printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -r '.reason'); using first profile"
   fi
-  printf '%s\n' "$selection" | jq -c '.profile'
+  printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -c '.profile'
   exit 0
 fi
 
 if [ -n "$QUOTA_JSON_FILE" ]; then
-  if ! quota_json=$(cat "$QUOTA_JSON_FILE" 2>/dev/null); then
+  if ! quota_json=$("$FM_DISPATCH_CAT_BIN" "$QUOTA_JSON_FILE" 2>/dev/null); then
     log "cannot read quota JSON; using first profile"
     first_profile
     exit 0
@@ -279,13 +339,14 @@ else
   fi
 fi
 
-if ! printf '%s\n' "$quota_json" | jq -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1; then
+if ! printf '%s\n' "$quota_json" | "$FM_DISPATCH_JQ_BIN" -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1; then
   log "quota-axi returned unparseable JSON; using first profile"
   first_profile
   exit 0
 fi
 
-selection=$(printf '%s\n' "$quota_json" | jq -ec \
+# shellcheck disable=SC2016
+selection=$(printf '%s\n' "$quota_json" | "$FM_DISPATCH_JQ_BIN" -ec \
   --argjson profiles "$profiles_json" \
   --argjson margin "$STALE_CLEAR_MARGIN" '
   def clean($p):
@@ -352,7 +413,7 @@ selection=$(printf '%s\n' "$quota_json" | jq -ec \
   exit 0
 }
 
-if [ "$(printf '%s\n' "$selection" | jq -r '.fallback')" = true ]; then
-  log "$(printf '%s\n' "$selection" | jq -r '.reason'); using first profile"
+if [ "$(printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -r '.fallback')" = true ]; then
+  log "$(printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -r '.reason'); using first profile"
 fi
-printf '%s\n' "$selection" | jq -c '.profile'
+printf '%s\n' "$selection" | "$FM_DISPATCH_JQ_BIN" -c '.profile'

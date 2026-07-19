@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Test fixtures deliberately scope PATH changes to subshells; no parent-shell
+# mutation is expected or subsequently consumed.
+# shellcheck disable=SC2031
 # tests/fm-backend-herdr.test.sh - fake-herdr-CLI unit tests for the herdr
 # session-provider adapter (bin/backends/herdr.sh), P2 of
 # data/fm-backend-design-d7 (herdr-addendum.md). Mirrors tests/fm-backend.test.sh's
@@ -17,6 +20,28 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-herdr-tests)
 export FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=0
+export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
+
+assert_no_server_transients() {  # <lock-root> <label>
+  local root=$1 label=$2 artifact leaf mode
+  for artifact in "$root"/*; do
+    [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    leaf=${artifact##*/}
+    case "$leaf" in
+      *.closed-shell-v2|*.closed-shell-config-v2.toml|*.closed-shell-config-v2-*.toml)
+        if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$artifact"); else mode=$(stat -c %a "$artifact"); fi
+        [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$mode" = 600 ] \
+          || fail "$label left an unsafe persistent managed artifact: $artifact"
+        ;;
+      managed-worker-shell-v1-*)
+        if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$artifact"); else mode=$(stat -c %a "$artifact"); fi
+        [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$mode" = 500 ] \
+          || fail "$label left an unsafe persistent managed helper: $artifact"
+        ;;
+      *) fail "$label left a lock, candidate, quarantine, or unknown artifact: $artifact" ;;
+    esac
+  done
+}
 
 # make_herdr_fakebin: a `herdr` stub that logs every invocation (one line,
 # unit-separated args, to $FM_HERDR_LOG) and returns the canned response for
@@ -213,8 +238,1149 @@ test_version_check_refuses_missing_herdr() {
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_version_check' "$ROOT" 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "version_check should refuse when herdr is not installed"
-  assert_contains "$out" "not installed" "version_check did not report herdr as missing"
+  assert_contains "$out" "unavailable or unsafe" "version_check did not report Herdr as missing or unsafe"
   pass "fm_backend_herdr_version_check: refuses loudly when herdr is not installed"
+}
+
+test_herdr_binary_revalidates_leaf_and_physical_ancestry() {
+  local dir safe bin release unsafe hardlink out status
+  dir="$TMP_ROOT/herdr-physical-pin"
+  safe="$dir/safe"
+  bin="$safe/bin"
+  release="$safe/libexec/herdr/current/herdr"
+  unsafe="$dir/unsafe"
+  mkdir -p "$bin" "${release%/*}" "$unsafe/bin"
+  chmod 700 "$safe" "$unsafe"
+  cat > "$release" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod 755 "$release"
+  ln -s ../libexec/herdr/current/herdr "$bin/herdr"
+
+  out=$(PATH="$bin:/usr/bin:/bin" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    first=$(fm_backend_herdr_bin) || exit 1
+    chmod 777 "$first"
+    fm_backend_herdr_bin >/dev/null 2>&1 && exit 2
+    printf "%s\n" "$first"
+  ' "$ROOT") || fail "safe Herdr symlink layout was not resolved and revalidated"
+  [ "$out" = "$(cd "${release%/*}" && pwd -P)/${release##*/}" ] \
+    || fail "Herdr pin returned the wrong physical release: $out"
+  chmod 755 "$release"
+
+  cp "$release" "$unsafe/bin/herdr"
+  chmod 755 "$unsafe/bin/herdr"
+  chmod 777 "$unsafe"
+  if PATH="$unsafe/bin:/usr/bin:/bin" bash -c \
+    '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_bin' "$ROOT" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Herdr binary under writable physical ancestry was accepted"
+
+  chmod 700 "$unsafe"
+  hardlink="$unsafe/bin/herdr-link"
+  ln "$unsafe/bin/herdr" "$hardlink"
+  if PATH="$unsafe/bin:/usr/bin:/bin" bash -c \
+    '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_bin' "$ROOT" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "hardlinked Herdr binary was accepted"
+  pass "Herdr supports the installed symlink layout, revalidates its cached leaf, and rejects unsafe ancestry/hardlinks"
+}
+
+test_server_launch_scrubs_hostile_perl_and_control_environment() {
+  local dir fb perl_lib marker launched tool
+  dir="$TMP_ROOT/herdr-hostile-environment"
+  fb="$dir/fakebin"
+  perl_lib="$dir/perl-lib"
+  marker="$dir/hostile-ran"
+  launched="$dir/server-launched"
+  mkdir -p "$fb" "$perl_lib"
+  cat > "$fb/herdr" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "${FM_HERDR_DETACH_MARKER:?}"
+SH
+  chmod 755 "$fb/herdr"
+  for tool in perl uname stat id date shasum sha256sum cksum awk sed jq; do
+    cat > "$fb/$tool" <<SH
+#!/bin/sh
+printf '%s\n' '$tool' >> '$marker'
+exit 97
+SH
+    chmod 755 "$fb/$tool"
+  done
+  cat > "$perl_lib/BridgeHerdrEvil.pm" <<PERL
+package BridgeHerdrEvil;
+BEGIN { open my \$fh, '>', '$marker' or die \$!; print {\$fh} "PERL5OPT\n"; close \$fh; }
+1;
+PERL
+  PATH="$fb" PERL5OPT=-MBridgeHerdrEvil PERL5LIB="$perl_lib" PERLLIB="$perl_lib" \
+    DYLD_INSERT_LIBRARIES="$dir/not-a-library" LD_PRELOAD="$dir/not-a-library" \
+    FM_HERDR_DETACH_MARKER="$launched" /bin/bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_launch_detached fmtest || exit 1
+      attempt=1
+      while [ "$attempt" -le 100 ]; do
+        [ -s "$FM_HERDR_DETACH_MARKER" ] && exit 0
+        /bin/sleep 0.02
+        attempt=$((attempt + 1))
+      done
+      exit 2
+    ' "$ROOT" || fail "closed-environment detached launch did not execute the verified fake Herdr"
+  [ "$(cat "$launched")" = "server --session fmtest" ] \
+    || fail "closed detached launch changed the Herdr command"
+  [ ! -e "$marker" ] || fail "hostile PATH/Perl/loader environment executed during Herdr launch: $(cat "$marker")"
+  pass "Herdr detached launch uses fixed controls and a closed grandchild environment"
+}
+
+test_server_launch_preserves_only_safe_worker_tool_paths() {
+  local dir fb safe unsafe safe_physical unsafe_physical marker path_line tool_line
+  dir="$TMP_ROOT/herdr-worker-path"
+  fb="$dir/herdr-bin"
+  safe="$dir/safe-worker-bin"
+  unsafe="$dir/writable-worker-bin"
+  marker="$dir/worker-path.tsv"
+  mkdir -p "$fb" "$safe" "$unsafe"
+  chmod 700 "$fb" "$safe"
+  chmod 777 "$unsafe"
+  safe_physical=$(cd "$safe" && pwd -P)
+  unsafe_physical=$(cd "$unsafe" && pwd -P)
+  cat > "$safe/bridge-worker-tool" <<'SH'
+#!/bin/sh
+printf 'safe-worker-tool\n'
+SH
+  cat > "$unsafe/bridge-worker-tool" <<'SH'
+#!/bin/sh
+printf 'unsafe-worker-tool\n'
+SH
+  cat > "$fb/herdr" <<'SH'
+#!/bin/sh
+marker=${FM_HERDR_DETACH_MARKER:?}
+tmp=$marker.tmp.$$
+printf 'PATH\t%s\n' "$PATH" > "$tmp"
+printf 'TOOL\t%s\n' "$(/bin/sh -c bridge-worker-tool)" >> "$tmp"
+/bin/mv "$tmp" "$marker"
+SH
+  chmod 755 "$safe/bridge-worker-tool" "$unsafe/bridge-worker-tool" "$fb/herdr"
+
+  PATH="$unsafe:$safe:$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$marker" /bin/bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_server_launch_detached fmtest || exit 1
+    attempt=1
+    while [ "$attempt" -le 100 ]; do
+      [ -s "$FM_HERDR_DETACH_MARKER" ] && exit 0
+      /bin/sleep 0.02
+      attempt=$((attempt + 1))
+    done
+    exit 2
+  ' "$ROOT" || fail "detached Herdr descendant did not inherit its validated worker PATH"
+  path_line=$(sed -n '1p' "$marker")
+  tool_line=$(sed -n '2p' "$marker")
+  assert_contains "$path_line" "$safe_physical" "safe user tool directory was stripped from the Herdr server PATH"
+  assert_not_contains "$path_line" "$unsafe_physical" "writable PATH directory reached the Herdr server"
+  [ "$tool_line" = $'TOOL\tsafe-worker-tool' ] \
+    || fail "Herdr descendant did not resolve the safe worker tool: $tool_line"
+  pass "detached Herdr descendants retain safe worker tools and exclude writable PATH entries"
+}
+
+test_managed_shell_and_server_certificate_close_startup_before_bash() {
+  local dir fb lock_root lock_physical server_marker shell_marker bash_env shell_dump ps_fake ps_dead result certificate config wrapper helper_digest pid
+  dir="$TMP_ROOT/herdr-managed-shell-certificate"
+  fb="$dir/fakebin"
+  lock_root="$dir/locks"
+  server_marker="$dir/server-environment"
+  shell_marker="$dir/shell-startup-injection-ran"
+  bash_env="$dir/hostile-bash-env"
+  shell_dump="$dir/worker-environment"
+  ps_fake="$dir/fake-ps"
+  ps_dead="$dir/ps-dead"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  lock_physical=$(cd "$lock_root" && pwd -P)
+  cat > "$fb/herdr" <<'SH'
+#!/bin/sh
+printf '%s\n%s\n%s\n' "${HERDR_CONFIG_PATH-}" "${SHELL-}" "$*" \
+  > "${FM_HERDR_DETACH_MARKER:?}"
+exec /bin/sleep 20
+SH
+  chmod 755 "$fb/herdr"
+  cat > "$bash_env" <<SH
+/usr/bin/touch '$shell_marker'
+SH
+  cat > "$ps_fake" <<SH
+#!/bin/sh
+[ ! -e '$ps_dead' ] || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+
+  result=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$server_marker" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_launch_detached fmtest || exit 1
+      for _attempt in $(seq 1 100); do
+        [ -s "$FM_HERDR_DETACH_MARKER" ] && break
+        /bin/sleep 0.02
+      done
+      [ -s "$FM_HERDR_DETACH_MARKER" ] || exit 2
+      fm_backend_herdr_server_closed_shell_environment_ready fmtest || exit 3
+      certificate=$(fm_backend_herdr_server_env_certificate_path fmtest) || exit 4
+      config=$(fm_backend_herdr_managed_config_path fmtest) || exit 5
+      wrapper=$(fm_backend_herdr_managed_shell_bin) || exit 6
+      printf "%s\n%s\n%s\n" "$certificate" "$config" "$wrapper"
+    ' "$ROOT") || fail "closed Herdr server certificate was not established"
+  certificate=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  config=${result%%$'\n'*}
+  wrapper=${result#*$'\n'}
+  [ "$(sed -n '1p' "$server_marker")" = "$config" ] \
+    || fail "Herdr server did not receive the managed config path"
+  [ "$(sed -n '2p' "$server_marker")" = "$wrapper" ] \
+    || fail "Herdr server did not receive the pre-Bash managed shell"
+  [ "$(sed -n '3p' "$server_marker")" = 'server --session fmtest' ] \
+    || fail "certified server launch changed its scoped command"
+  [ "$(sed -n '1p' "$certificate")" = firstmate-herdr-closed-env-v2 ] \
+    || fail "Herdr server published the wrong closed-shell certificate schema"
+  [ "$(sed -n '5p' "$certificate")" = "$wrapper" ] \
+    || fail "Herdr certificate did not bind the exact managed helper path"
+  [ "$(sed -n '8p' "$certificate")" = "$config" ] \
+    || fail "Herdr certificate did not bind the exact managed config path"
+  helper_digest=$(sed -n '6p' "$certificate")
+  [ "${#helper_digest}" -eq 64 ] \
+    && [ "$wrapper" = "$lock_physical/managed-worker-shell-v1-$helper_digest" ] \
+    || fail "managed Herdr worker shell was not installed at its certified content address: $wrapper"
+  assert_grep "default_shell = \"$wrapper\"" "$config" \
+    "managed Herdr config did not force the pre-Bash worker shell"
+  assert_grep 'shell_mode = "non_login"' "$config" \
+    "managed Herdr config did not disable login startup"
+  assert_grep 'resume_agents_on_restore = false' "$config" \
+    "managed Herdr config did not disable autonomous restored-agent launch"
+
+  /usr/bin/env SHELLOPTS=xtrace \
+    "PS4=\$(/usr/bin/touch '$shell_marker')" \
+    BASH_ENV="$bash_env" AGENT_FLEET_CONFIG=/tmp/hostile-fleet \
+    QUOTA_AXI_CACHE_DIR=/tmp/hostile-quota XDG_CONFIG_HOME=/tmp/hostile-xdg \
+    "BASH_FUNC_hostile_shell%%=() { /usr/bin/touch '$shell_marker'; }" \
+    "$wrapper" -c "/usr/bin/env > '$shell_dump'" \
+    || fail "managed worker shell did not start under hostile inherited Bash state"
+  [ ! -e "$shell_marker" ] \
+    || fail "managed worker shell interpreted hostile startup state before scrubbing"
+  if grep -Eq '^(AGENT_FLEET_|QUOTA_AXI_|XDG_|BASH_FUNC_|BASH_ENV=|SHELLOPTS=|PS4=)' \
+    "$shell_dump"; then
+    fail "managed worker shell retained a startup/authority injection variable"
+  fi
+
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+  : > "$ps_dead"
+  for _attempt in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || break
+    /bin/sleep 0.05
+  done
+  if PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 FM_TEST_HERDR_PS_BIN="$ps_fake" \
+    /bin/bash --noprofile --norc -c \
+      '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_closed_shell_environment_ready fmtest' \
+      "$ROOT" >/dev/null 2>&1; then
+    fail "dead certified Herdr server retained closed-shell authority"
+  fi
+  pass "Herdr managed config, process certificate, and pre-Bash shell close hostile startup state"
+}
+
+test_managed_shell_certificate_rejects_release_and_artifact_drift() {
+  local dir fb lock_root source ps_fake result certificate config wrapper pid replacement session marker
+  dir="$TMP_ROOT/herdr-managed-shell-drift"
+  fb="$dir/fakebin"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  cat > "$fb/herdr" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "${FM_HERDR_DETACH_MARKER:?}"
+exec /bin/sleep 20
+SH
+  chmod 755 "$fb/herdr"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+
+  launch_fixture() {
+    local fixture_session=$1 fixture_marker="$dir/$1.server"
+    PATH="$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$fixture_marker" \
+      FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_server_launch_detached "$1" || exit 1
+        for _attempt in $(seq 1 100); do
+          [ -s "$FM_HERDR_DETACH_MARKER" ] && break
+          /bin/sleep 0.02
+        done
+        [ -s "$FM_HERDR_DETACH_MARKER" ] || exit 2
+        fm_backend_herdr_server_closed_shell_environment_ready "$1" || exit 3
+        printf "%s\n%s\n%s\n" \
+          "$(fm_backend_herdr_server_env_certificate_path "$1")" \
+          "$(fm_backend_herdr_managed_config_path "$1")" \
+          "$(fm_backend_herdr_managed_shell_bin)"
+      ' "$ROOT" "$fixture_session"
+  }
+
+  certificate_ready() {
+    local fixture_session=$1
+    PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      /bin/bash --noprofile --norc -c \
+        '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_closed_shell_environment_ready "$1"' \
+        "$ROOT" "$fixture_session"
+  }
+
+  session=fm-config-drift
+  result=$(launch_fixture "$session") || fail "config-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  config=${result%%$'\n'*}
+  wrapper=${result#*$'\n'}
+  replacement="$dir/config-replacement"
+  cp "$config" "$replacement"
+  chmod 600 "$replacement"
+  mv "$replacement" "$config"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "identical-byte managed-config replacement retained certificate authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+
+  session=fm-helper-drift
+  result=$(launch_fixture "$session") || fail "helper-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  config=${result%%$'\n'*}
+  wrapper=${result#*$'\n'}
+  replacement="$dir/helper-replacement"
+  cp "$wrapper" "$replacement"
+  chmod 500 "$replacement"
+  mv "$replacement" "$wrapper"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "identical-byte managed helper replacement retained certificate authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+
+  session=fm-source-drift
+  result=$(launch_fixture "$session") || fail "source-drift fixture did not establish a certificate"
+  certificate=${result%%$'\n'*}
+  replacement="$dir/source-replacement"
+  cp "$source" "$replacement"
+  printf '\n# release drift fixture\n' >> "$replacement"
+  chmod 755 "$replacement"
+  mv "$replacement" "$source"
+  certificate_ready "$session" >/dev/null 2>&1 \
+    && fail "post-launch reviewed helper-source update retained old server authority"
+  pid=$(sed -n '3p' "$certificate")
+  kill "$pid" 2>/dev/null || true
+  pass "Herdr certificate rejects config/helper inode replacement and release-source drift"
+}
+
+test_managed_artifact_candidate_recovery_is_guarded() {
+  local dir lock_root source ps_fake result config certificate helper stale_config stale_certificate stale_helper
+  local foreign_config foreign_certificate indeterminate_certificate raced_config raced_original ready proceed preserved recovery_pid candidate
+  dir="$TMP_ROOT/herdr-managed-candidates"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+if [ "$pid" = 999996 ]; then
+  printf 'indeterminate process probe\n' >&2
+  exit 1
+fi
+case "$pid" in 999995|999998|999999) exit 1 ;; esac
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+  result=$(FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      printf "%s\n%s\n%s\n" \
+        "$(fm_backend_herdr_managed_config_path fm-candidates)" \
+        "$(fm_backend_herdr_server_env_certificate_path fm-candidates)" \
+        "$(fm_backend_herdr_managed_shell_bin)"
+    ' "$ROOT") || fail "candidate recovery paths were unavailable"
+  config=${result%%$'\n'*}
+  result=${result#*$'\n'}
+  certificate=${result%%$'\n'*}
+  helper=${result#*$'\n'}
+  stale_config="$config.candidate.999999"
+  stale_certificate="$certificate.candidate.999998"
+  stale_helper="$helper.candidate.999995"
+  foreign_config="$config.candidate.foreign"
+  foreign_certificate="$certificate.candidate.999997"
+  indeterminate_certificate="$certificate.candidate.999996"
+  printf 'stale config candidate\n' > "$stale_config"
+  printf 'stale certificate candidate\n' > "$stale_certificate"
+  printf 'stale helper candidate\n' > "$stale_helper"
+  printf 'foreign suffix\n' > "$foreign_config"
+  printf 'foreign mode\n' > "$foreign_certificate"
+  printf 'indeterminate owner\n' > "$indeterminate_certificate"
+  chmod 600 "$stale_config" "$stale_certificate" "$foreign_config" "$indeterminate_certificate"
+  chmod 500 "$stale_helper"
+  chmod 640 "$foreign_certificate"
+  touch -t 202001010000 "$stale_config" "$stale_certificate" "$stale_helper" "$foreign_config" "$foreign_certificate" "$indeterminate_certificate"
+
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+      fm_backend_herdr_artifact_recover_candidates "$2" 0600
+      fm_backend_herdr_artifact_recover_candidates "$3" 0500
+    ' "$ROOT" "$config" "$certificate" "$helper" \
+    || fail "guarded artifact candidate recovery failed"
+  [ ! -e "$stale_config" ] || fail "proven-stale config candidate was not recovered"
+  [ ! -e "$stale_certificate" ] || fail "proven-stale certificate candidate was not recovered"
+  [ ! -e "$stale_helper" ] || fail "proven-stale helper candidate was not recovered"
+  [ -e "$foreign_config" ] || fail "non-numeric foreign candidate was deleted"
+  [ -e "$foreign_certificate" ] || fail "wrong-mode indeterminate candidate was deleted"
+  [ -e "$indeterminate_certificate" ] || fail "output-bearing indeterminate PID candidate was deleted"
+
+  raced_config="$config.candidate.999999"
+  raced_original="$raced_config.original"
+  ready="$dir/remove-ready"
+  proceed="$dir/remove-proceed"
+  printf 'attributed generation\n' > "$raced_config"
+  chmod 600 "$raced_config"
+  touch -t 202001010000 "$raced_config"
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$raced_config" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_READY="$ready" \
+    FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED="$proceed" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+    ' "$ROOT" "$config" >/dev/null 2>&1 &
+  recovery_pid=$!
+  for _attempt in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
+  [ -e "$ready" ] || { kill "$recovery_pid" 2>/dev/null || true; fail "artifact substitution fixture never reached its final mutation barrier"; }
+  mv "$raced_config" "$raced_original"
+  printf 'foreign replacement\n' > "$raced_config"
+  chmod 600 "$raced_config"
+  : > "$proceed"
+  wait "$recovery_pid" >/dev/null 2>&1 \
+    && fail "candidate cleanup accepted a last-check-to-rename substitution"
+  preserved=
+  for candidate in "$raced_config".quarantine.*/artifact; do
+    [ -f "$candidate" ] || continue
+    preserved=$candidate
+    break
+  done
+  [ -n "$preserved" ] && [ "$(cat "$preserved")" = 'foreign replacement' ] \
+    || fail "candidate cleanup deleted or lost the substituted foreign generation"
+  [ "$(cat "$raced_original")" = 'attributed generation' ] \
+    || fail "candidate cleanup mutated the originally attributed generation after substitution"
+  pass "managed artifact recovery deletes only proven generations and quarantines last-check substitutions without data loss"
+}
+
+# Literal programs are intentionally passed to isolated Bash subprocesses.
+# shellcheck disable=SC2016
+test_managed_artifact_recovers_every_published_pair_crash_boundary() {
+  local dir lock_root source ps_fake helper helper_candidate helper_marker recovered
+  local config config_candidate config_marker helper_quarantine_marker helper_quarantine
+  local helper_mkdir_marker helper_mkdir_quarantine config_mkdir_marker config_mkdir_quarantine
+  local empty_marker config_empty_quarantine foreign foreign_candidate helper_before
+  local substitution_config substitution_candidate substitution_marker substitution_ready substitution_proceed
+  local substitution_original substitution_expected recovery_pid recovery_status artifact
+  dir="$TMP_ROOT/herdr-published-pair-crashes"
+  lock_root="$dir/locks"
+  source="$dir/fm-herdr-worker-shell"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  lock_root=$(cd "$lock_root" && pwd -P) || fail "could not resolve artifact test lock root"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  chmod 755 "$ps_fake"
+
+  artifact_inode() {
+    if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$1"; else stat -c '%d:%i' "$1"; fi
+  }
+  artifact_nlink() {
+    if [ "$(uname)" = Darwin ]; then stat -f %l "$1"; else stat -c %h "$1"; fi
+  }
+  first_candidate() {
+    local found
+    for found in "$1".candidate.*; do
+      [ -f "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  first_candidate_quarantine() {
+    local found
+    for found in "$1".candidate.*.quarantine.*; do
+      [ -d "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  artifact_bash() {
+    local program=$1
+    shift
+    PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" \
+      FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" \
+      FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_READY="${FM_TEST_HERDR_ARTIFACT_PAIR_READY:-}" \
+      FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED="${FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED:-}" \
+      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+  }
+
+  # Helper: kill immediately after no-replace link publication, then converge
+  # the exact target/candidate nlink=2 pair to one validated target.
+  helper_marker="$dir/helper-linked"
+  if FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="$helper_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "managed helper publisher survived its post-link SIGKILL fixture"
+  fi
+  [ -e "$helper_marker" ] || fail "managed helper publisher never reached its post-link kill boundary"
+  helper=
+  for artifact in "$lock_root"/managed-worker-shell-v1-*; do
+    case "$artifact" in *.candidate.*|*.quarantine.*) continue ;; esac
+    [ -f "$artifact" ] || continue
+    helper=$artifact
+    break
+  done
+  [ -n "$helper" ] || fail "killed helper publisher left no installed target"
+  helper_candidate=$(first_candidate "$helper") || fail "killed helper publisher left no candidate alias"
+  if [ "$(artifact_inode "$helper")" != "$(artifact_inode "$helper_candidate")" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 2 ]; then
+    fail "killed helper publisher did not leave one exact two-link inode"
+  fi
+  touch -t 202001010000 "$helper_candidate"
+  helper_mkdir_marker="$dir/helper-quarantine-created"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$helper_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$helper_mkdir_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "managed helper recovery survived its post-quarantine-mkdir SIGKILL fixture"
+  fi
+  [ -e "$helper_mkdir_marker" ] || fail "managed helper never reached its post-quarantine-mkdir kill boundary"
+  helper_mkdir_quarantine=$(first_candidate_quarantine "$helper") \
+    || fail "managed helper mkdir crash left no attributed quarantine"
+  if [ ! -e "$helper_candidate" ] || [ -e "$helper_mkdir_quarantine/artifact" ]; then
+    fail "managed helper mkdir crash did not retain the public pair and exact empty quarantine"
+  fi
+  touch -t 202001010000 "$helper_mkdir_quarantine"
+  recovered=$(artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin') \
+    || fail "managed helper did not recover its killed post-link publisher"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$helper")" ] \
+    || [ -e "$helper_candidate" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 1 ]; then
+    fail "managed helper post-link recovery did not converge to one validated target"
+  fi
+
+  # Config: exercise the same direct post-link recovery independently.
+  config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-link "$1"
+  ' "$helper") || fail "could not derive post-link config path"
+  config_marker="$dir/config-linked"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$config_marker" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "managed config publisher survived its post-link SIGKILL fixture"
+  fi
+  [ -e "$config_marker" ] || fail "managed config publisher never reached its post-link kill boundary"
+  config_candidate=$(first_candidate "$config") || fail "killed config publisher left no candidate alias"
+  if [ "$(artifact_inode "$config")" != "$(artifact_inode "$config_candidate")" ] \
+    || [ "$(artifact_nlink "$config")" -ne 2 ]; then
+    fail "killed config publisher did not leave one exact two-link inode"
+  fi
+  touch -t 202001010000 "$config_candidate"
+  config_mkdir_marker="$dir/config-quarantine-created"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$config_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$config_mkdir_marker" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+    ' "$helper" >/dev/null 2>&1; then
+    fail "managed config recovery survived its post-quarantine-mkdir SIGKILL fixture"
+  fi
+  [ -e "$config_mkdir_marker" ] || fail "managed config never reached its post-quarantine-mkdir kill boundary"
+  config_mkdir_quarantine=$(first_candidate_quarantine "$config") \
+    || fail "managed config mkdir crash left no attributed quarantine"
+  if [ ! -e "$config_candidate" ] || [ -e "$config_mkdir_quarantine/artifact" ]; then
+    fail "managed config mkdir crash did not retain the public pair and exact empty quarantine"
+  fi
+  touch -t 202001010000 "$config_mkdir_quarantine"
+  recovered=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-link "$1"
+  ' "$helper") || fail "managed config did not recover its killed post-link publisher"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$config")" ] \
+    || [ -e "$config_candidate" ] \
+    || [ "$(artifact_nlink "$config")" -ne 1 ]; then
+    fail "managed config post-link recovery did not converge to one validated target"
+  fi
+
+  # Kill after the helper candidate alias has moved to its attributed
+  # quarantine but before unlink. The next call must recover that exact
+  # target/quarantine-artifact pair and remove the quarantine.
+  printf '\n# second helper generation\n' >> "$source"
+  helper_quarantine_marker="$dir/helper-quarantined"
+  if FM_TEST_HERDR_KILL_AFTER_HELPER_LINK="$dir/helper-linked-2" artifact_bash \
+    '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' >/dev/null 2>&1; then
+    fail "second helper publisher survived its post-link SIGKILL fixture"
+  fi
+  helper=
+  for artifact in "$lock_root"/managed-worker-shell-v1-*; do
+    case "$artifact" in *.candidate.*|*.quarantine.*) continue ;; esac
+    [ -f "$artifact" ] || continue
+    [ "$(artifact_nlink "$artifact")" -eq 2 ] || continue
+    helper=$artifact
+    break
+  done
+  [ -n "$helper" ] || fail "second killed helper publisher left no two-link target"
+  helper_candidate=$(first_candidate "$helper") || fail "second killed helper publisher left no candidate"
+  touch -t 202001010000 "$helper_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$helper_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$helper_quarantine_marker" \
+    artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin' \
+      >/dev/null 2>&1; then
+    fail "helper recovery survived its post-quarantine SIGKILL fixture"
+  fi
+  [ -e "$helper_quarantine_marker" ] || fail "helper recovery never reached its post-quarantine kill boundary"
+  [ ! -e "$helper_candidate" ] || fail "post-quarantine helper crash retained the public candidate alias"
+  helper_quarantine=$(first_candidate_quarantine "$helper") \
+    || fail "post-quarantine helper crash left no recoverable quarantine"
+  if [ ! -f "$helper_quarantine/artifact" ] \
+    || [ "$(artifact_inode "$helper_quarantine/artifact")" != "$(artifact_inode "$helper")" ]; then
+    fail "post-quarantine helper crash lost its attributed target alias"
+  fi
+  touch -t 202001010000 "$helper_quarantine" "$helper_quarantine/artifact"
+  recovered=$(artifact_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_managed_shell_bin') \
+    || fail "managed helper did not recover its post-quarantine crash"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$helper")" ] \
+    || [ -e "$helper_quarantine" ] \
+    || [ "$(artifact_nlink "$helper")" -ne 1 ]; then
+    fail "post-quarantine helper recovery did not converge without transients"
+  fi
+
+  # Kill after the config candidate's quarantined alias is unlinked but before
+  # rmdir. Recovery must prove the target inode and remove only the empty owned
+  # quarantine.
+  config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-empty-q "$1"
+  ' "$helper") || fail "could not derive empty-quarantine config path"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$dir/config-linked-2" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "second config publisher survived its post-link SIGKILL fixture"
+  fi
+  config_candidate=$(first_candidate "$config") || fail "second killed config publisher left no candidate"
+  touch -t 202001010000 "$config_candidate"
+  empty_marker="$dir/config-artifact-unlinked"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$config_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$empty_marker" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+    ' "$helper" >/dev/null 2>&1; then
+    fail "config recovery survived its post-unlink SIGKILL fixture"
+  fi
+  [ -e "$empty_marker" ] || fail "config recovery never reached its post-unlink kill boundary"
+  config_empty_quarantine=$(first_candidate_quarantine "$config") \
+    || fail "post-unlink config crash left no empty quarantine"
+  if [ -e "$config_empty_quarantine/artifact" ] \
+    || [ "$(artifact_nlink "$config")" -ne 1 ]; then
+    fail "post-unlink config crash did not preserve exactly one target alias"
+  fi
+  touch -t 202001010000 "$config_empty_quarantine"
+  recovered=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-empty-q "$1"
+  ' "$helper") || fail "managed config did not recover its empty quarantine"
+  if [ ! -e "$recovered" ] \
+    || [ "$(artifact_inode "$recovered")" != "$(artifact_inode "$config")" ] \
+    || [ -e "$config_empty_quarantine" ]; then
+    fail "empty config quarantine recovery did not converge"
+  fi
+
+  # A stale two-link candidate that is not the target's inode is foreign and
+  # must block recovery without losing either generation.
+  helper_before=$(cat "$helper")
+  foreign="$dir/foreign-helper"
+  foreign_candidate="$helper.candidate.999999"
+  printf 'foreign helper generation\n' > "$foreign"
+  chmod 500 "$foreign"
+  ln "$foreign" "$foreign_candidate"
+  touch -t 202001010000 "$foreign_candidate"
+  if artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_artifact_recover_candidates "$1" 0500
+  ' "$helper" >/dev/null 2>&1; then
+    fail "foreign two-link helper candidate was accepted as a published pair"
+  fi
+  if [ "$(cat "$helper")" != "$helper_before" ] \
+    || [ ! -e "$foreign" ] \
+    || [ ! -e "$foreign_candidate" ]; then
+    fail "foreign two-link refusal deleted or changed a generation"
+  fi
+
+  # Substitute the config target after the last pair proof and before the
+  # candidate's quarantine rename. Recovery may delete its attributed stale
+  # alias, but must refuse and preserve both the substituted target and the
+  # displaced original generation.
+  substitution_config=$(artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_path fm-config-substitute "$1"
+  ' "$helper") || fail "could not derive substitution config path"
+  substitution_marker="$dir/config-linked-substitute"
+  if FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK="$substitution_marker" artifact_bash '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_managed_config_ensure fm-config-substitute "$1"
+  ' "$helper" >/dev/null 2>&1; then
+    fail "substitution config publisher survived its post-link SIGKILL fixture"
+  fi
+  substitution_candidate=$(first_candidate "$substitution_config") \
+    || fail "substitution fixture left no published candidate pair"
+  touch -t 202001010000 "$substitution_candidate"
+  substitution_expected=$(cat "$substitution_config")
+  substitution_original="$substitution_config.attributed"
+  substitution_ready="$dir/pair-ready"
+  substitution_proceed="$dir/pair-proceed"
+  FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="$substitution_config" \
+    FM_TEST_HERDR_ARTIFACT_PAIR_READY="$substitution_ready" \
+    FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED="$substitution_proceed" artifact_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_artifact_recover_candidates "$1" 0600
+    ' "$substitution_config" >/dev/null 2>&1 &
+  recovery_pid=$!
+  for _attempt in $(seq 1 100); do [ -e "$substitution_ready" ] && break; sleep 0.02; done
+  [ -e "$substitution_ready" ] \
+    || { kill "$recovery_pid" 2>/dev/null || true; fail "published-pair recovery never reached its substitution barrier"; }
+  mv "$substitution_config" "$substitution_original"
+  printf 'foreign substituted config\n' > "$substitution_config"
+  chmod 600 "$substitution_config"
+  : > "$substitution_proceed"
+  if wait "$recovery_pid" >/dev/null 2>&1; then recovery_status=0; else recovery_status=$?; fi
+  [ "$recovery_status" -ne 0 ] || fail "published-pair recovery accepted a substituted target generation"
+  if [ "$(cat "$substitution_config")" != 'foreign substituted config' ] \
+    || [ "$(cat "$substitution_original")" != "$substitution_expected" ]; then
+    fail "published-pair substitution refusal deleted or changed a target generation"
+  fi
+  pass "managed helper/config publication recovers every two-link cleanup crash boundary and refuses foreign/substituted pairs"
+}
+
+# Literal programs are intentionally passed to isolated Bash subprocesses.
+# shellcheck disable=SC2016
+test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases() {
+  local dir lock_root ps_fake lock candidate quarantine marker phase hook_mkdir hook_moved hook_unlinked
+  local original occupied_candidate occupied_quarantine substituted_candidate substituted_quarantine
+  local substitution_lock occupied_lock
+  dir="$TMP_ROOT/herdr-attributed-cleanup-phases"
+  lock_root="$dir/locks"
+  ps_fake="$dir/fake-ps"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  lock_root=$(cd "$lock_root" && pwd -P) || fail "could not resolve attributed-cleanup lock root"
+  lock="$lock_root/lifecycle.lock"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+[ "$pid" != 999999 ] || exit 1
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+
+  first_attributed_quarantine() {
+    local found
+    for found in "$1".quarantine.*; do
+      [ -d "$found" ] || continue
+      printf '%s\n' "$found"
+      return 0
+    done
+    return 1
+  }
+  cleanup_bash() {
+    local program=$1
+    shift
+    PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" \
+      FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
+      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+  }
+  write_dead_candidate() {
+    printf '999999\nMon Jan  1 00:00:00 2024\n%s\n' "${1##*.candidate.}" > "$1"
+    chmod 600 "$1"
+    touch -t 202001010000 "$1"
+  }
+
+  # Lifecycle lock candidates can be nlink=1 when publication never happened.
+  # Crash each phase of their attributed deletion and require convergence.
+  for phase in mkdir moved unlinked; do
+    candidate="$lock.candidate.999999-nlink1-$phase"
+    marker="$dir/nlink1-$phase"
+    write_dead_candidate "$candidate"
+    hook_mkdir=
+    hook_moved=
+    hook_unlinked=
+    case "$phase" in
+      mkdir) hook_mkdir=$marker ;;
+      moved) hook_moved=$marker ;;
+      unlinked) hook_unlinked=$marker ;;
+    esac
+    if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$candidate" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$hook_mkdir" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$hook_moved" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$hook_unlinked" cleanup_bash '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_server_lock_recover_candidates "$1"
+      ' "$lock" >/dev/null 2>&1; then
+      fail "nlink1 lifecycle candidate survived its $phase cleanup SIGKILL fixture"
+    fi
+    [ -e "$marker" ] || fail "nlink1 lifecycle candidate never reached its $phase crash boundary"
+    quarantine=$(first_attributed_quarantine "$candidate") \
+      || fail "nlink1 $phase crash left no attributed quarantine"
+    touch -t 202001010000 "$quarantine"
+    [ ! -e "$quarantine/artifact" ] || touch -t 202001010000 "$quarantine/artifact"
+    [ ! -e "$candidate" ] || touch -t 202001010000 "$candidate"
+    cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+      "$lock" >/dev/null 2>&1 || fail "nlink1 lifecycle candidate did not recover its $phase crash"
+    if [ -e "$candidate" ] || [ -e "$quarantine" ]; then
+      fail "nlink1 lifecycle candidate left residue after $phase recovery"
+    fi
+  done
+
+  # Exact release of the owned lifecycle lock uses the same primitive. Build
+  # the record inside the killed process so release ownership is authentic.
+  for phase in mkdir moved unlinked; do
+    marker="$dir/release-$phase"
+    hook_mkdir=
+    hook_moved=
+    hook_unlinked=
+    case "$phase" in
+      mkdir) hook_mkdir=$marker ;;
+      moved) hook_moved=$marker ;;
+      unlinked) hook_unlinked=$marker ;;
+    esac
+    if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$lock" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$hook_mkdir" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="$hook_moved" \
+      FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="$hook_unlinked" cleanup_bash '
+        . "$0/bin/backends/herdr.sh"
+        pid=${BASHPID:-$$}
+        start=$(fm_backend_herdr_process_start "$pid") || exit 2
+        token="release-$1"
+        (umask 077; printf "%s\n%s\n%s\n" "$pid" "$start" "$token" > "$2") || exit 3
+        chmod 600 "$2" || exit 4
+        inode=$(fm_backend_herdr_path_inode "$2") || exit 5
+        fm_backend_herdr_server_lock_release "$2" "$token" "$inode"
+      ' "$phase" "$lock" >/dev/null 2>&1; then
+      fail "exact lock release survived its $phase cleanup SIGKILL fixture"
+    fi
+    [ -e "$marker" ] || fail "exact lock release never reached its $phase crash boundary"
+    quarantine=$(first_attributed_quarantine "$lock") \
+      || fail "exact lock $phase crash left no attributed quarantine"
+    touch -t 202001010000 "$quarantine"
+    [ ! -e "$quarantine/artifact" ] || touch -t 202001010000 "$quarantine/artifact"
+    [ ! -e "$lock" ] || touch -t 202001010000 "$lock"
+    cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_quarantines "$1"' \
+      "$lock" >/dev/null 2>&1 || fail "exact lock release did not recover its $phase crash"
+    if [ -e "$lock" ] || [ -e "$quarantine" ]; then
+      fail "exact lock release left residue after $phase recovery"
+    fi
+  done
+
+  # A foreign replacement at the empty-quarantine boundary is preserved, as
+  # is an occupied private quarantine; neither can be guessed away.
+  substitution_lock="$lock_root/substitution.lock"
+  substituted_candidate="$substitution_lock.candidate.999999-substituted"
+  write_dead_candidate "$substituted_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$substituted_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$dir/substituted-mkdir" cleanup_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_recover_candidates "$1"
+    ' "$substitution_lock" >/dev/null 2>&1; then
+    fail "substitution fixture survived its quarantine-mkdir SIGKILL"
+  fi
+  substituted_quarantine=$(first_attributed_quarantine "$substituted_candidate") \
+    || fail "substitution fixture left no empty quarantine"
+  original="$substituted_candidate.original"
+  mv "$substituted_candidate" "$original"
+  write_dead_candidate "$substituted_candidate"
+  touch -t 202001010000 "$substituted_quarantine"
+  if cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+    "$substitution_lock" >/dev/null 2>&1; then
+    fail "attributed recovery accepted a foreign substituted lifecycle candidate"
+  fi
+  if [ ! -e "$original" ] || [ ! -e "$substituted_candidate" ] || [ ! -e "$substituted_quarantine" ]; then
+    fail "substituted lifecycle candidate refusal lost a generation"
+  fi
+
+  occupied_lock="$lock_root/occupied.lock"
+  occupied_candidate="$occupied_lock.candidate.999999-occupied"
+  write_dead_candidate "$occupied_candidate"
+  if FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$occupied_candidate" \
+    FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="$dir/occupied-mkdir" cleanup_bash '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_recover_candidates "$1"
+    ' "$occupied_lock" >/dev/null 2>&1; then
+    fail "occupied fixture survived its quarantine-mkdir SIGKILL"
+  fi
+  occupied_quarantine=$(first_attributed_quarantine "$occupied_candidate") \
+    || fail "occupied fixture left no empty quarantine"
+  printf 'foreign quarantine content\n' > "$occupied_quarantine/foreign"
+  touch -t 202001010000 "$occupied_candidate" "$occupied_quarantine"
+  if cleanup_bash '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_recover_candidates "$1"' \
+    "$occupied_lock" >/dev/null 2>&1; then
+    fail "attributed recovery accepted an occupied lifecycle quarantine"
+  fi
+  if [ ! -e "$occupied_candidate" ] || [ ! -e "$occupied_quarantine/foreign" ]; then
+    fail "occupied lifecycle quarantine refusal lost foreign state"
+  fi
+  pass "attributed cleanup recovers every nlink1 candidate and exact-lock phase while preserving foreign/occupied states"
+}
+
+test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
+  local dir fb fake source ps_fake mode case_dir lock_root running pids state log mutation old_pid new_pid out status
+  dir="$TMP_ROOT/herdr-certified-lifecycle"
+  fb="$dir/fakebin"
+  fake="$fb/herdr"
+  source="$dir/fm-herdr-worker-shell"
+  mkdir -p "$fb"
+  cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
+  chmod 755 "$source"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+  cat > "$fake" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+mode=$(cat "${FM_FAKE_HERDR_STATE:?}")
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then running=true; else running=false; fi
+    printf '{"client":{"version":"0.7.3","protocol":16},"server":{"running":%s}}\n' "$running"
+    ;;
+  "workspace list")
+    case "$mode" in
+      empty) printf '{"result":{"workspaces":[]}}\n' ;;
+      occupied) printf '{"result":{"workspaces":[{"workspace_id":"foreign-w1","label":"captain"}]}}\n' ;;
+      indeterminate) printf '{not-json\n' ;;
+    esac
+    ;;
+  "tab list") printf '{"result":{"tabs":[]}}\n' ;;
+  "pane list") printf '{"result":{"panes":[]}}\n' ;;
+  "session stop")
+    [ "${3:-}" = "${HERDR_SESSION:-}" ] || exit 71
+    kill "$(tail -1 "${FM_FAKE_HERDR_SERVER_PIDS:?}")" 2>/dev/null || true
+    rm -f "$FM_FAKE_HERDR_RUNNING"
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    : > "$FM_FAKE_HERDR_RUNNING"
+    exec /bin/sleep 30
+    ;;
+  "workspace create")
+    : > "${FM_FAKE_HERDR_MUTATION:?}"
+    printf '{"result":{"workspace":{"workspace_id":"w1"},"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:p1"}}}\n'
+    ;;
+esac
+SH
+  chmod 755 "$fake"
+
+  write_legacy_certificate() {
+    PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" OLD_PID="$old_pid" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        key=$(fm_backend_herdr_server_lock_key "$1") || exit 1
+        certificate=$(fm_backend_herdr_server_legacy_env_certificate_path "$1") || exit 1
+        start=$(fm_backend_herdr_process_start "$OLD_PID") || exit 1
+        printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+          "$key" "$OLD_PID" "$start" > "$certificate" || exit 1
+        chmod 600 "$certificate"
+      ' "$ROOT" "$1"
+  }
+
+  case_dir="$dir/empty"
+  lock_root="$case_dir/locks"
+  running="$case_dir/running"
+  pids="$case_dir/pids"
+  state="$case_dir/state"
+  log="$case_dir/log"
+  mutation="$case_dir/workspace-created"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  printf 'empty\n' > "$state"
+  : > "$log"
+  /bin/sleep 30 & old_pid=$!
+  printf '%s\n' "$old_pid" > "$pids"
+  : > "$running"
+  write_legacy_certificate default || fail "could not establish legacy adapter ownership for empty restart"
+  if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+    FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_ensure default || exit 1
+      fm_backend_herdr_server_closed_shell_environment_ready default
+    ' "$ROOT" 2>&1); then status=0; else status=$?; fi
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$out" >&2
+    sed 's/^/herdr: /' "$log" >&2
+    fail "adapter-owned exact-empty drift did not stop, relaunch, and recertify"
+  fi
+  wait "$old_pid" >/dev/null 2>&1 || true
+  kill -0 "$old_pid" 2>/dev/null \
+    && fail "exact-empty restart left the release-drifted adapter server alive"
+  new_pid=$(tail -1 "$pids")
+  if [ "$new_pid" = "$old_pid" ] || ! kill -0 "$new_pid" 2>/dev/null; then
+    fail "exact-empty restart did not leave one newly certified server alive"
+  fi
+  assert_grep $'\x1fsession\x1fstop\x1fdefault\x1f--json\x1f--session\x1fdefault' "$log" \
+    "empty drift restart did not use the positional exact-default session stop"
+  assert_no_grep $'\x1fserver\x1fstop' "$log" \
+    "empty drift restart used a generic server stop"
+  assert_no_grep $'\x1fsession\x1fdelete' "$log" \
+    "empty drift restart deleted session state"
+  [ ! -e "$mutation" ] || fail "server lifecycle decision created a workspace before recertification"
+  kill "$new_pid" 2>/dev/null || true
+
+  for mode in occupied indeterminate; do
+    case_dir="$dir/$mode"
+    lock_root="$case_dir/locks"
+    running="$case_dir/running"
+    pids="$case_dir/pids"
+    state="$case_dir/state"
+    log="$case_dir/log"
+    mutation="$case_dir/workspace-created"
+    mkdir -p "$lock_root"
+    chmod 700 "$lock_root"
+    printf '%s\n' "$mode" > "$state"
+    : > "$log"
+    /bin/sleep 30 & old_pid=$!
+    printf '%s\n' "$old_pid" > "$pids"
+    : > "$running"
+    write_legacy_certificate "fm-$mode" || fail "could not establish legacy adapter ownership for $mode refusal"
+    if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+      FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+      FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      HERDR_SESSION="fm-$mode" \
+      /bin/bash --noprofile --norc -c '
+        . "$0/bin/backends/herdr.sh"
+        fm_backend_herdr_container_ensure "$PWD"
+      ' "$ROOT" "fm-$mode" 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "$mode release-drifted server was restarted or routed"
+    assert_contains "$out" "$mode" "$mode drift refusal was not explicit"
+    kill -0 "$old_pid" 2>/dev/null || fail "$mode refusal stopped the existing adapter server"
+    assert_no_grep $'\x1fsession\x1fstop' "$log" \
+      "$mode refusal stopped the server before its lifecycle decision"
+    assert_no_grep $'\x1fserver\x1f--session' "$log" \
+      "$mode refusal launched a server before its lifecycle decision"
+    assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
+      "$mode refusal created a workspace before its lifecycle decision"
+    [ ! -e "$mutation" ] || fail "$mode refusal reached workspace creation"
+    kill "$old_pid" 2>/dev/null || true
+    wait "$old_pid" >/dev/null 2>&1 || true
+  done
+  pass "server ensure serializes certificate drift: exact-empty restarts safely; occupied/indeterminate refuse before workspace mutation"
+}
+
+test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir() {
+  local dir unsafe lock_root out status
+  dir="$TMP_ROOT/herdr-lock-ancestry"
+  unsafe="$dir/public-parent"
+  lock_root="$unsafe/locks"
+  mkdir -p "$unsafe"
+  chmod 777 "$unsafe"
+  if FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_server_lock_root_prepare
+  ' "$ROOT" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Herdr accepted a lock root below a writable non-sticky parent"
+
+  # $0 belongs to the nested Bash process.
+  # shellcheck disable=SC2016
+  out=$(env -u FM_BACKEND_HERDR_TEST_LAB -u FM_BACKEND_HERDR_SERVER_LOCK_ROOT \
+    TMPDIR="$unsafe" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root
+    ' "$ROOT") || fail "production lock root could not be resolved with hostile TMPDIR"
+  case "$out" in "$unsafe"/*) fail "production Herdr lock root trusted hostile TMPDIR: $out" ;; esac
+  pass "Herdr lock-root resolution rejects unsafe ancestry and ignores ambient TMPDIR"
 }
 
 # --- workspace_label: per-firstmate-HOME resolution (P3, herdr-sm-spaces-k4) -
@@ -282,6 +1448,50 @@ test_cli_helper_sets_env_and_appends_trailing_session_flag() {
   pass "fm_backend_herdr_cli: sets HERDR_SESSION AND appends a trailing --session flag on every call"
 }
 
+test_cli_helper_scrubs_loader_and_runtime_injection() {
+  local dir fb log evil marker path_marker out
+  dir="$TMP_ROOT/cli-loader-scrub"
+  fb="$dir/fakebin"
+  log="$dir/env.log"
+  evil="$dir/evil-bash-env"
+  marker="$dir/injected"
+  path_marker="$dir/path-injected"
+  mkdir -p "$fb"
+  cat > "$evil" <<SH
+printf 'injected\n' > '$marker'
+SH
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s|%s|%s|%s|%s\n' \
+  "${LD_PRELOAD-}" "${DYLD_INSERT_LIBRARIES-}" "${NODE_OPTIONS-}" \
+  "${PERL5OPT-}" "${BASH_ENV-}" > "$FM_HERDR_LOADER_LOG"
+printf '{"result":{"workspaces":[]}}\n'
+SH
+  cat > "$fb/id" <<SH
+#!/usr/bin/env bash
+printf 'injected\n' > '$path_marker'
+printf '99999\n'
+SH
+  chmod 755 "$fb/herdr" "$fb/id"
+  PATH="$fb:$PATH" FM_HERDR_LOADER_LOG="$log" FM_HERDR_EVIL_ENV="$evil" \
+    bash -c '
+      export LD_PRELOAD=/tmp/hostile.so
+      export DYLD_INSERT_LIBRARIES=/tmp/hostile.dylib
+      export NODE_OPTIONS="--require /tmp/hostile-node.js"
+      export PERL5OPT=-MHostile
+      export BASH_ENV="$FM_HERDR_EVIL_ENV"
+      . "$0/bin/backends/herdr.sh"
+      control_uid=$(fm_backend_herdr_control_exec id -u) || exit 1
+      case "$control_uid" in ""|*[!0-9]*) exit 1 ;; esac
+      fm_backend_herdr_cli fmtest workspace list
+    ' "$ROOT" > "$dir/out" || fail "scrubbed non-launch Herdr CLI call failed"
+  out=$(cat "$log")
+  [ "$out" = '||||' ] || fail "Herdr CLI inherited loader/runtime injection: $out"
+  [ ! -e "$marker" ] || fail "Herdr CLI child sourced hostile BASH_ENV"
+  [ ! -e "$path_marker" ] || fail "Herdr control utility resolved from hostile caller PATH"
+  pass "fm_backend_herdr_cli: scrubs loader and language-runtime injection on ordinary control calls"
+}
+
 test_server_launch_detaches_from_callers_session() {
   local dir fb marker result parent child parent_pid parent_pgid child_pid child_ppid child_pgid child_tty child_args
   dir="$TMP_ROOT/server-detach"; fb="$dir/fakebin"; marker="$dir/detached.tsv"
@@ -336,6 +1546,543 @@ SH
   pass "fm_backend_herdr_server_launch_detached: server survives caller exit reparented in a distinct process group with closed stdin"
 }
 
+test_concurrent_server_ensure_launches_exactly_one_server() {
+  local dir fb log lock_root running pids ps_fake first second launch_count server_pid
+  dir="$TMP_ROOT/server-ensure-race"
+  fb="$dir/fakebin"
+  log="$dir/herdr.log"
+  lock_root="$dir/locks"
+  running="$dir/running"
+  pids="$dir/server-pids"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$log"
+  : > "$pids"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    sleep 0.25
+    : > "$FM_FAKE_HERDR_RUNNING"
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  first=$!
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  second=$!
+  wait "$first" || fail "first concurrent server ensure failed"
+  wait "$second" || fail "second concurrent server ensure failed"
+
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] \
+    || fail "concurrent server ensure launched $launch_count Herdr servers instead of one"
+  [ "$(wc -l < "$pids" | tr -d ' ')" -eq 1 ] \
+    || fail "concurrent server ensure recorded more than one detached server process"
+  server_pid=$(cat "$pids")
+  for _attempt in $(seq 1 50); do
+    kill -0 "$server_pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  kill -0 "$server_pid" 2>/dev/null \
+    && fail "concurrent server ensure left the fake detached server orphaned"
+  assert_no_server_transients "$lock_root" "concurrent server ensure"
+  pass "fm_backend_herdr_server_ensure: concurrent callers launch one detached server and leave no lock or process orphan"
+}
+
+test_server_ensure_reclaims_killed_owner_and_rejects_public_root() {
+  local dir fb log lock_root running pids ready holder status launch_count mode lock candidate_ready candidate_release first second
+  dir="$TMP_ROOT/server-ensure-stale-owner"
+  fb="$dir/fakebin"
+  log="$dir/herdr.log"
+  lock_root="$dir/locks"
+  running="$dir/running"
+  pids="$dir/server-pids"
+  ready="$dir/owner-ready"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$log"
+  : > "$pids"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    : > "$FM_FAKE_HERDR_RUNNING"
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  lock=$(PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    root=$(fm_backend_herdr_server_lock_root) || exit 1
+    key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+    printf "%s/%s.lock\n" "$root" "$key"
+  ' "$ROOT") || fail "could not derive the stale-owner lock path"
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_TEST_HERDR_LOCK_READY="$ready" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root_prepare || exit 1
+      root=$(fm_backend_herdr_server_lock_root) || exit 1
+      key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+      fm_backend_herdr_server_lock_try_acquire "$root/$key.lock" || exit 1
+      : > "$FM_TEST_HERDR_LOCK_READY"
+      while :; do sleep 1; done
+    ' "$ROOT" &
+  holder=$!
+  for _attempt in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  [ -e "$ready" ] || { kill -KILL "$holder" 2>/dev/null || true; fail "stale-owner fixture never acquired the Herdr lock"; }
+  kill -KILL "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  touch -t 202001010000 "$lock"
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" \
+    || fail "server ensure could not reclaim a lock whose exact owner was killed"
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] || fail "stale-lock recovery launched $launch_count servers instead of one"
+  assert_no_server_transients "$lock_root" "stale-lock recovery"
+
+  # A contender delayed before the atomic hard-link publication owns only its
+  # private candidate. Even after the stale threshold, it cannot be mistaken
+  # for the public lock owner or prevent another caller from launching.
+  rm -f "$running"
+  : > "$log"
+  : > "$pids"
+  candidate_ready="$dir/candidate-ready"
+  candidate_release="$dir/candidate-release"
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_CANDIDATE_READY_FILE="$candidate_ready" \
+    FM_TEST_HERDR_CANDIDATE_RELEASE_FILE="$candidate_release" \
+    FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS=11 FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  first=$!
+  for _attempt in $(seq 1 100); do
+    [ -e "$candidate_ready" ] && break
+    sleep 0.02
+  done
+  [ -e "$candidate_ready" ] || { kill -KILL "$first" 2>/dev/null || true; fail "candidate-boundary fixture never reached the pre-publication barrier"; }
+  sleep 12
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  second=$!
+  wait "$second" || fail "server ensure was blocked by a stale private lock candidate"
+  : > "$candidate_release"
+  wait "$first" || fail "delayed candidate owner did not converge on server readiness"
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] || fail "candidate-publication race launched $launch_count servers instead of one"
+  assert_no_server_transients "$lock_root" "candidate-publication race"
+
+  rm -f "$running"
+  chmod 755 "$lock_root"
+  if PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" \
+    >/dev/null 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "server ensure accepted a group/world-accessible lock root"
+  if [ "$(uname)" = Darwin ]; then mode=$(stat -f %Lp "$lock_root"); else mode=$(stat -c %a "$lock_root"); fi
+  [ "$mode" = 755 ] \
+    || fail "server ensure silently changed an existing lock-root mode"
+  pass "fm_backend_herdr_server_ensure: killed owners are reclaimed, private candidates publish atomically, and existing lock roots stay private"
+}
+
+test_server_ensure_never_steals_indeterminate_live_owner() {
+  local dir fb log lock_root running pids ready holder waiter lock candidate inode_before inode_after owner_before owner_after
+  dir="$TMP_ROOT/server-ensure-indeterminate-owner"
+  fb="$dir/fakebin"
+  log="$dir/herdr.log"
+  lock_root="$dir/locks"
+  running="$dir/running"
+  pids="$dir/server-pids"
+  ready="$dir/owner-ready"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$log"
+  : > "$pids"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    ;;
+esac
+SH
+  cat > "$fb/ps" <<'SH'
+#!/usr/bin/env bash
+printf 'process probe denied\n' >&2
+exit 42
+SH
+  chmod +x "$fb/herdr" "$fb/ps"
+
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_TEST_HERDR_LOCK_READY="$ready" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root_prepare || exit 1
+      root=$(fm_backend_herdr_server_lock_root) || exit 1
+      key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+      fm_backend_herdr_server_lock_try_acquire "$root/$key.lock" || exit 1
+      : > "$FM_TEST_HERDR_LOCK_READY"
+      while :; do sleep 1; done
+    ' "$ROOT" &
+  holder=$!
+  for _attempt in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  [ -e "$ready" ] || { kill -KILL "$holder" 2>/dev/null || true; fail "indeterminate-owner fixture never acquired the Herdr lock"; }
+  lock=
+  for candidate in "$lock_root"/*.lock; do
+    [ -f "$candidate" ] || continue
+    lock=$candidate
+    break
+  done
+  [ -n "$lock" ] || fail "indeterminate-owner fixture has no lock file"
+  if [ "$(uname)" = Darwin ]; then inode_before=$(stat -f '%d:%i' "$lock"); else inode_before=$(stat -c '%d:%i' "$lock"); fi
+  owner_before=$(cat "$lock")
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$fb/ps" \
+    FM_BACKEND_HERDR_SERVER_LOCK_WAIT_STEPS=100 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  waiter=$!
+  sleep 0.25
+  kill -0 "$waiter" 2>/dev/null || fail "waiter stole or rejected a live owner after an indeterminate process probe"
+  if [ "$(uname)" = Darwin ]; then inode_after=$(stat -f '%d:%i' "$lock"); else inode_after=$(stat -c '%d:%i' "$lock"); fi
+  owner_after=$(cat "$lock")
+  [ "$inode_after" = "$inode_before" ] && [ "$owner_after" = "$owner_before" ] \
+    || fail "indeterminate process probing replaced the live Herdr lock owner"
+  : > "$running"
+  wait "$waiter" || fail "waiter did not accept server readiness while preserving the live lock owner"
+  [ ! -s "$pids" ] || fail "waiter launched a server while an indeterminate live lock owner existed"
+
+  kill -KILL "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  touch -t 202001010000 "$lock"
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_try_reclaim "$1"' "$ROOT" "$lock" \
+    || fail "could not clean the killed indeterminate-owner fixture"
+  assert_no_server_transients "$lock_root" "indeterminate-owner boundary"
+  pass "fm_backend_herdr_server_ensure: an indeterminate ps probe never steals a live owner and readiness still unblocks waiters"
+}
+
+test_server_ensure_recovers_crash_after_quarantine_rename() {
+  local dir fb log lock_root running pids ready crash_ready link_crash holder crasher lock quarantine candidate launch_count lock_inode candidate_inode
+  dir="$TMP_ROOT/server-ensure-quarantine-crash"
+  fb="$dir/fakebin"
+  log="$dir/herdr.log"
+  lock_root="$dir/locks"
+  running="$dir/running"
+  pids="$dir/server-pids"
+  ready="$dir/owner-ready"
+  crash_ready="$dir/quarantine-renamed"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$log"
+  : > "$pids"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    : > "$FM_FAKE_HERDR_RUNNING"
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  lock=$(PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    root=$(fm_backend_herdr_server_lock_root) || exit 1
+    key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+    printf "%s/%s.lock\n" "$root" "$key"
+  ' "$ROOT") || fail "could not derive the quarantine-crash lock path"
+
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_TEST_HERDR_LOCK_READY="$ready" bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root_prepare || exit 1
+      fm_backend_herdr_server_lock_try_acquire "$1" || exit 1
+      : > "$FM_TEST_HERDR_LOCK_READY"
+      while :; do sleep 1; done
+    ' "$ROOT" "$lock" &
+  holder=$!
+  for _attempt in $(seq 1 100); do
+    [ -e "$ready" ] && break
+    sleep 0.02
+  done
+  [ -e "$ready" ] || { kill -KILL "$holder" 2>/dev/null || true; fail "quarantine-crash fixture never acquired its lock"; }
+  kill -KILL "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  touch -t 202001010000 "$lock"
+
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_KILL_AFTER_QUARANTINE_RENAME="$crash_ready" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_try_reclaim "$1"' \
+    "$ROOT" "$lock" &
+  crasher=$!
+  wait "$crasher" 2>/dev/null || true
+  [ -e "$crash_ready" ] || fail "quarantine crash injection did not reach the post-rename boundary"
+  [ ! -e "$lock" ] || fail "post-rename crash unexpectedly restored the primary lock"
+  quarantine=
+  for candidate in "$lock".stale.*; do
+    [ -f "$candidate" ] || continue
+    quarantine=$candidate
+    break
+  done
+  [ -n "$quarantine" ] || fail "post-rename crash left no recoverable quarantine"
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" \
+    || fail "server ensure could not recover a stale post-rename quarantine"
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] || fail "quarantine crash recovery launched $launch_count servers instead of one"
+  assert_no_server_transients "$lock_root" "quarantine crash recovery"
+
+  rm -f "$running"
+  : > "$log"
+  : > "$pids"
+  link_crash="$dir/lock-linked"
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_KILL_AFTER_LOCK_LINK="$link_crash" \
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root_prepare || exit 1
+      fm_backend_herdr_server_lock_try_acquire "$1"
+    ' "$ROOT" "$lock" &
+  crasher=$!
+  wait "$crasher" 2>/dev/null || true
+  [ -e "$link_crash" ] || fail "post-link crash injection did not reach the hard-link boundary"
+  [ -f "$lock" ] || fail "post-link crash left no public lock alias"
+  candidate=
+  for quarantine in "$lock".candidate.*; do
+    [ -f "$quarantine" ] || continue
+    candidate=$quarantine
+    break
+  done
+  [ -n "$candidate" ] || fail "post-link crash left no recoverable candidate alias"
+  if [ "$(uname)" = Darwin ]; then
+    lock_inode=$(stat -f '%d:%i' "$lock")
+    candidate_inode=$(stat -f '%d:%i' "$candidate")
+  else
+    lock_inode=$(stat -c '%d:%i' "$lock")
+    candidate_inode=$(stat -c '%d:%i' "$candidate")
+  fi
+  [ "$lock_inode" = "$candidate_inode" ] \
+    || fail "post-link crash aliases do not identify the same inode"
+  touch -t 202001010000 "$lock" "$candidate"
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" \
+    || fail "server ensure could not recover a killed post-link owner"
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] || fail "post-link crash recovery launched $launch_count servers instead of one"
+  assert_no_server_transients "$lock_root" "post-link crash recovery"
+  pass "fm_backend_herdr_server_ensure: crashes after quarantine rename or atomic link publication recover without leaks or duplicate launch"
+}
+
+test_server_test_hooks_are_inert_without_explicit_opt_in() {
+  local dir lock_root ready release kill_marker hook_probe
+  dir="$TMP_ROOT/server-hooks-inert"
+  lock_root="$dir/locks"
+  ready="$dir/candidate-ready"
+  release="$dir/candidate-release"
+  kill_marker="$dir/post-link-kill"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$release"
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=not-the-validated-opt-in \
+    FM_TEST_HERDR_PS_BIN="$dir/nonexistent-ps" \
+    FM_TEST_HERDR_CANDIDATE_READY_FILE="$ready" \
+    FM_TEST_HERDR_CANDIDATE_RELEASE_FILE="$release" \
+    FM_TEST_HERDR_KILL_AFTER_LOCK_LINK="$kill_marker" \
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_lock_root_prepare || exit 1
+      root=$(fm_backend_herdr_server_lock_root) || exit 1
+      key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+      lock="$root/$key.lock"
+      fm_backend_herdr_server_lock_try_acquire "$lock" || exit 1
+      fm_backend_herdr_server_lock_release \
+        "$lock" "$FM_BACKEND_HERDR_SERVER_LOCK_TOKEN" "$FM_BACKEND_HERDR_SERVER_LOCK_INODE"
+    ' "$ROOT" || fail "inherited test-hook variables affected production lock acquisition"
+  [ ! -e "$ready" ] && [ ! -e "$kill_marker" ] \
+    || fail "a Herdr test hook ran without the validated test-only opt-in"
+  # $1 is intentionally expanded by bash -c.
+  # shellcheck disable=SC2016
+  hook_probe='. "$1"; fm_backend_herdr_test_hooks_enabled'
+  if env -u FM_BACKEND_HERDR_TEST_LAB \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    bash -c "$hook_probe" \
+      _ "$ROOT/bin/backends/herdr.sh"; then
+    fail "the Herdr test-hook opt-in worked without the exact test-lab opt-in"
+  fi
+  assert_no_server_transients "$lock_root" "inert test-hook check"
+  pass "Herdr launch-lock fault hooks are inert unless the validated test-only opt-in is present"
+}
+
+test_server_ensure_waits_for_inflight_launch_after_owner_kill() {
+  local dir fb log lock_root running pids invoked first second lock candidate owner_pid launch_count
+  dir="$TMP_ROOT/server-ensure-owner-killed-after-launch"
+  fb="$dir/fakebin"
+  log="$dir/herdr.log"
+  lock_root="$dir/locks"
+  running="$dir/running"
+  pids="$dir/server-pids"
+  invoked="$dir/launch-invoked"
+  mkdir -p "$fb" "$lock_root"
+  chmod 700 "$lock_root"
+  : > "$log"
+  : > "$pids"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for argument in "$@"; do printf '\x1f%s' "$argument"; done
+  printf '\n'
+} >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "status --json")
+    if [ -e "${FM_FAKE_HERDR_RUNNING:?}" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  "server --session")
+    printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
+    : > "${FM_FAKE_HERDR_LAUNCH_INVOKED:?}"
+    sleep 0.5
+    : > "$FM_FAKE_HERDR_RUNNING"
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_LAUNCH_INVOKED="$invoked" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS=11 FM_TEST_HERDR_DELAY_BEFORE_LAUNCH=12 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  first=$!
+  for _attempt in $(seq 1 1500); do
+    [ -e "$invoked" ] && break
+    sleep 0.01
+  done
+  [ -e "$invoked" ] || { kill -KILL "$first" 2>/dev/null || true; fail "delayed fake server was never launched"; }
+  lock=
+  for candidate in "$lock_root"/*.lock; do
+    [ -f "$candidate" ] || continue
+    lock=$candidate
+    break
+  done
+  [ -n "$lock" ] || fail "inflight-launch fixture has no owner lock"
+  owner_pid=$(sed -n '1p' "$lock")
+  kill -KILL "$owner_pid" 2>/dev/null || fail "could not kill the inflight launch lock owner"
+  wait "$first" 2>/dev/null || true
+
+  PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_LAUNCH_INVOKED="$invoked" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
+  second=$!
+  wait "$second" || fail "waiter failed while the first detached server became ready"
+  launch_count=$(grep -c $'\x1fserver\x1f--session\x1ffmtest' "$log" || true)
+  [ "$launch_count" -eq 1 ] \
+    || fail "owner death during startup launched $launch_count servers instead of preserving the first"
+  touch -t 202001010000 "$lock"
+  PATH="/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_lock_try_reclaim "$1"' "$ROOT" "$lock" \
+    || fail "could not clean the completed inflight-launch fixture"
+  assert_no_server_transients "$lock_root" "inflight-launch boundary"
+  pass "fm_backend_herdr_server_ensure: the lock-file launch epoch prevents stale prelaunch time from duplicating a detached server after owner death"
+}
+
 # --- container_ensure / create_task ------------------------------------------
 
 test_container_ensure_starts_server_and_workspace() {
@@ -345,14 +2092,16 @@ test_container_ensure_starts_server_and_workspace() {
   printf '{"client":{"version":"0.7.1","protocol":14}}\n' > "$resp/1.out"
   # 2: server_ensure's status --json check -> not running
   printf '{"server":{"running":false}}\n' > "$resp/2.out"
-  # 3: `herdr server` backgrounded launch - no meaningful output
-  # 4: server_ensure poll -> now running
-  printf '{"server":{"running":true}}\n' > "$resp/4.out"
-  # 5: workspace list -> empty (no "firstmate" workspace yet)
-  printf '{"result":{"workspaces":[]}}\n' > "$resp/5.out"
-  # 6: workspace create -> w1, seeding default tab w1:t9 (real herdr returns
+  # 3: server_ensure's under-lock recheck -> still not running
+  printf '{"server":{"running":false}}\n' > "$resp/3.out"
+  # 4: `herdr server` backgrounded launch - no meaningful output
+  # 5: server_ensure poll -> now running
+  printf '{"server":{"running":true}}\n' > "$resp/5.out"
+  # 6: workspace list -> empty (no "firstmate" workspace yet)
+  printf '{"result":{"workspaces":[]}}\n' > "$resp/6.out"
+  # 7: workspace create -> w1, seeding default tab w1:t9 (real herdr returns
   # the seeded tab/pane ids in the SAME response - verified empirically).
-  printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"},"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' > "$resp/6.out"
+  printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"},"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 HERDR_SESSION=fmtest \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" )
@@ -2276,16 +4025,91 @@ if [ "${FM_TEST_FOCUSED:-}" = herdr-identity-absence ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = server-ensure-race ]; then
+  test_server_test_hooks_are_inert_without_explicit_opt_in
+  test_concurrent_server_ensure_launches_exactly_one_server
+  test_server_ensure_reclaims_killed_owner_and_rejects_public_root
+  test_server_ensure_never_steals_indeterminate_live_owner
+  test_server_ensure_recovers_crash_after_quarantine_rename
+  test_server_ensure_waits_for_inflight_launch_after_owner_kill
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = server-startup ]; then
+  test_server_test_hooks_are_inert_without_explicit_opt_in
+  test_herdr_binary_revalidates_leaf_and_physical_ancestry
+  test_server_launch_scrubs_hostile_perl_and_control_environment
+  test_server_launch_preserves_only_safe_worker_tool_paths
+  test_managed_shell_and_server_certificate_close_startup_before_bash
+  test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
+  test_server_launch_detaches_from_callers_session
+  test_concurrent_server_ensure_launches_exactly_one_server
+  test_server_ensure_reclaims_killed_owner_and_rejects_public_root
+  test_server_ensure_never_steals_indeterminate_live_owner
+  test_server_ensure_recovers_crash_after_quarantine_rename
+  test_server_ensure_waits_for_inflight_launch_after_owner_kill
+  test_container_ensure_starts_server_and_workspace
+  test_container_ensure_reuses_existing_workspace
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-shell-cert ]; then
+  test_managed_shell_and_server_certificate_close_startup_before_bash
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
+  test_managed_shell_and_server_certificate_close_startup_before_bash
+  test_managed_shell_certificate_rejects_release_and_artifact_drift
+  test_managed_artifact_candidate_recovery_is_guarded
+  test_managed_artifact_recovers_every_published_pair_crash_boundary
+  test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = published-pair ]; then
+  test_managed_artifact_recovers_every_published_pair_crash_boundary
+  test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = server-cert-lifecycle ]; then
+  test_server_ensure_converges_only_adapter_owned_exact_empty_drift
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
+  test_workspace_ensure_prunes_default_tab
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
+test_server_test_hooks_are_inert_without_explicit_opt_in
+test_herdr_binary_revalidates_leaf_and_physical_ancestry
+test_server_launch_scrubs_hostile_perl_and_control_environment
+test_server_launch_preserves_only_safe_worker_tool_paths
+test_managed_shell_and_server_certificate_close_startup_before_bash
+test_managed_shell_certificate_rejects_release_and_artifact_drift
+test_managed_artifact_candidate_recovery_is_guarded
+test_managed_artifact_recovers_every_published_pair_crash_boundary
+test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
+test_server_ensure_converges_only_adapter_owned_exact_empty_drift
+test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id
 test_workspace_label_secondmate_marker_trims_whitespace
 test_workspace_label_empty_marker_falls_back_to_primary
 test_workspace_label_different_secondmates_get_different_labels
 test_cli_helper_sets_env_and_appends_trailing_session_flag
+test_cli_helper_scrubs_loader_and_runtime_injection
 test_server_launch_detaches_from_callers_session
+test_concurrent_server_ensure_launches_exactly_one_server
+test_server_ensure_reclaims_killed_owner_and_rejects_public_root
+test_server_ensure_never_steals_indeterminate_live_owner
+test_server_ensure_recovers_crash_after_quarantine_rename
+test_server_ensure_waits_for_inflight_launch_after_owner_kill
 test_container_ensure_starts_server_and_workspace
 test_container_ensure_reuses_existing_workspace
 test_container_ensure_creates_with_no_focus_flag

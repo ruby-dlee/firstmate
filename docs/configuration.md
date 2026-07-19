@@ -166,34 +166,47 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 ## Agent Fleet account routing
 
 Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
-Agent Fleet is a private CLI with no Firstmate-managed installer; obtain an approved release bundle from the maintainer, follow that bundle's installation instructions, and ensure `agent-fleet` is on `PATH` before enabling routing.
+Agent Fleet's public, provider-neutral source and installation instructions live under [`tools/agent-fleet`](../tools/agent-fleet/README.md); the sealed cutover installs a regular native front door at the current passwd user's `~/.local/bin/agent-fleet` before enabling routing.
 Account routing is default-off, so an unchanged installation makes no Agent Fleet calls, does not wrap the provider launch, and adds no managed account-routing fields to task metadata.
 Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
-The effective mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, `--no-account-routing` disables it for that spawn, `FM_ACCOUNT_ROUTING`, the single value in local `config/account-routing-mode`, then `off`.
+The production mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, emergency `--no-account-routing` disables it for that spawn, the single value in local `config/account-routing-mode`, then `off`.
+The emergency bypass is printed loudly and persisted as `account_routing_emergency_bypass=1` in task metadata.
+Ambient `FM_ACCOUNT_ROUTING=off` cannot override the authoritative config.
 The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
-`observe` asks Agent Fleet for a non-leasing dry-run decision, reports the non-secret pool/provider/profile choice, does not wrap the provider launch, and writes no managed account-routing fields even when Agent Fleet is unavailable.
-`enforce` prepares the isolated runtime endpoint and worktree first, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
+`observe` asks Agent Fleet for a read-only, non-leasing dry-run decision against the explicit task worktree, reports the non-secret pool/provider/profile choice, does not wrap the provider launch, and writes no managed account-routing fields even when Agent Fleet is unavailable.
+`enforce` is a certified-Herdr-only production path.
+It rejects tmux, zellij, cmux, and Orca before Fleet selection, lease acquisition, worktree creation, or endpoint creation because those backends cannot prove that the pane shell was sanitized before startup.
+On Herdr it prepares the isolated runtime endpoint and worktree, passes that exact worktree to selection, recovery, execution, and resume, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
 Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
 `--account-profile <profile>` pins one dynamic profile, using the supplied `--account-pool` when present and the reserved `explicit` pool otherwise.
 Firstmate's direct spawn flags and `config/secondmate-account-pool` accept non-secret pool and profile aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
 Account email addresses and filesystem paths are invalid in every input surface.
 Managed task metadata records `account_pool=`, `account_profile=`, a home-namespaced and generation-unique `account_task=`, `account_attempt=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
 Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
-Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a newer SessionStart update after its local launch gate before committing the recovered lease.
+Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a higher monotonic `session_event_seq` from a SessionStart accepted after its local launch gate before committing the recovered lease.
+Wall-clock `updated_at` remains diagnostic only and never decides launch freshness.
+Schema-1 mappings remain readable as virtual sequence zero; the next same-binding SessionStart atomically migrates them to schema 2 / sequence 1, while a changed binding is rejected without modifying the legacy record.
 The per-task lifecycle lock serializes concurrent managed recovery attempts, and a waiter re-reads the committed metadata generation after acquiring ownership before it acts.
 When native resume is unavailable or a different Claude/Codex profile must take over, `bin/fm-spawn.sh <id> --continue-account` builds and validates the provider-neutral task packet owned by `bin/fm-account-continuation.sh`, launches a fresh generation from that packet, and releases the predecessor only after the new SessionStart mapping is bound.
 Continuation verifies a bounded repository identity before replacement and fails closed when the file, byte, enumeration, or time limit cannot cover the repository; the environment-variable table below owns those tuning defaults.
 Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
 If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
-Bootstrap uses that managed recovery path for a confidently dead secondmate; unmanaged tasks keep the legacy respawn path.
+Bootstrap uses that managed recovery path for a confidently dead secondmate, but deliberately defers an unmanaged generation until an operator makes the explicit routing decision owned by the `secondmate-provisioning` skill's "Recovery" section.
 Teardown kills the recorded endpoint and releases the Agent Fleet lease and session mapping only after the backend confirms absence; a live or unknown endpoint state retains metadata and storage for retry.
-Agent Fleet routing supports the tmux, Herdr, zellij, and cmux session backends; enforced Orca launches are rejected before lease, worktree, endpoint, or metadata mutation because managed Orca recovery is not implemented.
+Off and observe mode support the tmux, Herdr, zellij, and cmux session backends.
+Production enforce mode supports only a Herdr server carrying Firstmate's live process-bound schema-v2 closed-shell certificate, including the exact SHA-256 and opened-file identity of its content-addressed worker helper and managed terminal configuration.
+A manually started, restored, pre-upgrade, or post-update stale Herdr server is not certified and routed spawn refuses it; stop that server only after proving the session idle, then let Firstmate launch it on the next spawn.
+Test labs retain fake backends behind their explicit opt-in so backend-neutral routing behavior remains covered without weakening production.
 `config/secondmate-account-pool` optionally selects the primary's dynamic pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
 An explicit per-spawn account pool or profile overrides that secondmate pool, and an explicit profile without a pool uses only the reserved `explicit` pool.
 `config/account-routing-mode` is inherited, so a secondmate can apply the same off/observe/enforce policy to its own crewmates while resolving its own pools from dispatch profiles or the standard provider defaults.
-`FM_AGENT_FLEET_BIN` is a test/lab override for the CLI path; normal operation resolves `agent-fleet` from `PATH`.
+Production does not resolve Agent Fleet from ambient `PATH` and never executes `FM_AGENT_FLEET_BIN` or `FM_DISPATCH_AGENT_FLEET` overrides.
+Spawn/control operations fail closed on such an override.
+Quota-balanced dispatch remains advisory: it surfaces the refusal and falls back to the first ordered candidate, preserving that candidate's `account_pool`; the later spawn still enforces that pool through the fixed production front door, so this fallback cannot become a default-account launch.
+It verifies the fixed passwd-home `~/.local/bin/agent-fleet` as a physical current-user/root-owned non-writable regular executable with safe ancestry and reuses that exact path for selection, execution, recovery, and cleanup.
+Environment mode and executable overrides exist only behind the unmistakable `FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1` test/lab opt-in.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -273,7 +286,7 @@ It never removes a live lock, leaves any other failure shape untouched, and prin
 The locked session-start bootstrap step also runs the guarded local secondmate sync for recorded live secondmate homes, then propagates declared inheritable local config into each validated live home.
 It emits `SECONDMATE_SYNC:` only when a home was skipped for an actionable sync reason or config inheritance failed, and `NUDGE_SECONDMATES:` only when a running home advanced and its instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) changed.
 `NUDGE_SECONDMATES:` lists stable `fm-<id>` task selectors; the `bootstrap-diagnostics` skill owns the send procedure.
-The same bootstrap run also emits `SECONDMATE_LIVENESS:` for live secondmate endpoints: `already-live` and `respawned` are handled states, while `skipped` or `respawn failed` means the secondmate still needs attention.
+The same bootstrap run also emits `SECONDMATE_LIVENESS:` outcomes for live secondmate endpoints; the `bootstrap-diagnostics` skill owns the response to handled, deferred, skipped, and failed outcomes.
 For a mid-session inherited config edit where tracked-file sync and reread nudges are not needed, run `bin/fm-config-push.sh`.
 It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, and `account-routing-mode` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero only for real propagation errors.
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
@@ -281,7 +294,7 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 
 ### Herdr detached launcher prerequisites
 
-The Herdr adapter requires the exact `nohup` and `perl` commands on `PATH` for its portable detached `setsid` server launcher.
+Bootstrap requires `nohup` and `perl` to be discoverable on `PATH` as availability gates, while the production Herdr adapter executes only the fixed system binaries documented in [herdr-backend.md](herdr-backend.md#control-plane-and-filesystem-hardening).
 Both commands ship with macOS and are commonly supplied by the platform's coreutils and Perl packages on other Unix-like systems.
 If bootstrap reports either command missing, restore or install the corresponding platform package, confirm it with `command -v nohup` or `command -v perl`, and rerun bootstrap.
 Bootstrap treats these as manual prerequisites because package names and command exposure differ across supported platforms.
@@ -370,9 +383,11 @@ FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
 FM_BACKEND=             # optional runtime backend override; tmux/herdr/zellij/cmux support new ship/scout spawns, Orca is legacy-recovery-only, and codex-app is not accepted
-FM_ACCOUNT_ROUTING=off  # optional Agent Fleet mode override: off, observe, or enforce; explicit per-spawn account flags still take precedence
-FM_AGENT_FLEET_BIN=agent-fleet  # test/lab override for the Agent Fleet executable; normal operation resolves agent-fleet from PATH
-FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per Agent Fleet control-plane command
+FM_ACCOUNT_ROUTING=off  # test/lab-only mode override; production config/account-routing-mode is authoritative
+FM_AGENT_FLEET_BIN=agent-fleet  # test/lab-only Agent Fleet executable override
+FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1  # unmistakable opt-in required for either override; never set in production
+FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per ordinary Agent Fleet control-plane command; an explicit value also remains the legacy selection override when the next variable is unset
+FM_ACCOUNT_SELECTION_TIMEOUT=120  # seconds allowed per choose/acquire/recover command; unset falls back to an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
 FM_ACCOUNT_SESSION_WAIT_SECONDS=10  # seconds a managed spawn waits for its required SessionStart mapping
 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5  # seconds allowed per Agent Fleet session-status query
 FM_ACCOUNT_SESSION_SYNC_INTERVAL=60  # watcher cadence for reconciling missing managed provider-session mappings
@@ -385,7 +400,7 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES=100000  # maximum repository entries v
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository content bytes verified for a provider-neutral continuation
 FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
-FM_DISPATCH_AGENT_FLEET_TIMEOUT=5  # seconds quota-balanced dispatch waits for each Agent Fleet pool summary
+FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
 FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
 FM_REPORT_RETENTION_COHORT_MS=300000  # retention cohort width; this plus the owner interval may not exceed 15 days

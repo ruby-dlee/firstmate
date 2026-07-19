@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-fleet"
+version = "0.2.0"
+description = "Machine-global account profile routing for local agent CLIs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Dongkeun Lee" }]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/ruby-dlee/firstmate/tree/main/tools/agent-fleet"
+
+[project.scripts]
+agent-fleet = "agent_fleet.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_fleet"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.12"]

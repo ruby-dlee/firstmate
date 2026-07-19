@@ -537,6 +537,8 @@ test_generation_identity_falls_back_only_when_both_sides_are_legacy() {
   first=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
   /bin/sleep 0.02
   run_stack publish "$id" >/dev/null || fail "new-id-over-legacy publication failed"
+  entry=$(run_stack path "$id") || fail "new-id-over-legacy path lookup failed"
+  manifest="$(dirname "$entry")/manifest.json"
   second=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
   [ -n "$second" ] && [ "$second" != "$first" ] \
     || fail "a new generation id reused a legacy manifest completion time"
@@ -554,6 +556,8 @@ test_generation_identity_falls_back_only_when_both_sides_are_legacy() {
   first=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
   /bin/sleep 0.02
   run_stack publish "$id" >/dev/null || fail "legacy-over-new-id publication failed"
+  entry=$(run_stack path "$id") || fail "legacy-over-new-id path lookup failed"
+  manifest="$(dirname "$entry")/manifest.json"
   second=$(sed -n 's/.*"completedAt": "\([^"]*\)".*/\1/p' "$manifest")
   [ -n "$second" ] && [ "$second" != "$first" ] \
     || fail "legacy metadata reused a generation-bound manifest completion time"

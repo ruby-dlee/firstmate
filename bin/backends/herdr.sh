@@ -47,9 +47,30 @@
 # default (the firstmate repo root - never a secondmate home, so
 # fm_backend_herdr_workspace_label falls through to "firstmate" exactly like
 # pre-P3 behavior when a test does not care about home-specific labeling).
-FM_BACKEND_HERDR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FM_BACKEND_HERDR_SOURCE_DIR=${BASH_SOURCE[0]%/*}
+[ "$FM_BACKEND_HERDR_SOURCE_DIR" != "${BASH_SOURCE[0]}" ] || FM_BACKEND_HERDR_SOURCE_DIR=.
+FM_BACKEND_HERDR_ROOT="$(cd "$FM_BACKEND_HERDR_SOURCE_DIR/../.." && pwd -P)"
+unset FM_BACKEND_HERDR_SOURCE_DIR
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_HERDR_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+FM_BACKEND_HERDR_CONTROL_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+FM_BACKEND_HERDR_ENV_BIN=
+[ ! -x /usr/bin/env ] || FM_BACKEND_HERDR_ENV_BIN=/usr/bin/env
+[ -n "$FM_BACKEND_HERDR_ENV_BIN" ] || [ ! -x /bin/env ] || FM_BACKEND_HERDR_ENV_BIN=/bin/env
+FM_BACKEND_HERDR_PERL_BIN=
+[ ! -x /usr/bin/perl ] || FM_BACKEND_HERDR_PERL_BIN=/usr/bin/perl
+FM_BACKEND_HERDR_NOHUP_BIN=
+[ ! -x /usr/bin/nohup ] || FM_BACKEND_HERDR_NOHUP_BIN=/usr/bin/nohup
+[ -n "$FM_BACKEND_HERDR_NOHUP_BIN" ] || [ ! -x /bin/nohup ] || FM_BACKEND_HERDR_NOHUP_BIN=/bin/nohup
+FM_BACKEND_HERDR_JQ_BIN=
+[ ! -x /usr/bin/jq ] || FM_BACKEND_HERDR_JQ_BIN=/usr/bin/jq
+[ -n "$FM_BACKEND_HERDR_JQ_BIN" ] || [ ! -x /bin/jq ] || FM_BACKEND_HERDR_JQ_BIN=/bin/jq
+FM_BACKEND_HERDR_HEAD_BIN=
+[ ! -x /usr/bin/head ] || FM_BACKEND_HERDR_HEAD_BIN=/usr/bin/head
+[ -n "$FM_BACKEND_HERDR_HEAD_BIN" ] || [ ! -x /bin/head ] || FM_BACKEND_HERDR_HEAD_BIN=/bin/head
+FM_BACKEND_HERDR_GREP_BIN=
+[ ! -x /usr/bin/grep ] || FM_BACKEND_HERDR_GREP_BIN=/usr/bin/grep
+[ -n "$FM_BACKEND_HERDR_GREP_BIN" ] || [ ! -x /bin/grep ] || FM_BACKEND_HERDR_GREP_BIN=/bin/grep
 
 # Shared composer-content classifier (empty|pending|unknown, and the fleet-wide
 # dead-shell-vs-agent-composer rule). Owned by bin/fm-composer-lib.sh, reused by
@@ -85,6 +106,104 @@ FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
 # The primary firstmate home never carries this marker.
 FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 
+fm_backend_herdr_test_lab_enabled() {
+  [ "${FM_BACKEND_HERDR_TEST_LAB:-}" = firstmate-herdr-test-lab-v1 ]
+}
+
+# Perl honors ambient module and dynamic-loader injection variables even when
+# invoked by absolute path.  Control-plane Perl runs in a closed environment;
+# detached Herdr launch below has its own separately closed runtime envelope.
+fm_backend_herdr_control_perl() {
+  [ -n "$FM_BACKEND_HERDR_ENV_BIN" ] && [ -n "$FM_BACKEND_HERDR_PERL_BIN" ] || return 127
+  "$FM_BACKEND_HERDR_ENV_BIN" -i HOME=/ PATH="$FM_BACKEND_HERDR_CONTROL_PATH" LC_ALL=C \
+    "$FM_BACKEND_HERDR_PERL_BIN" "$@"
+}
+
+# Absolute paths and a fixed PATH do not neutralize dynamic-loader or language
+# runtime injection inherited from the caller.  Every authority-bearing Herdr
+# control subprocess runs through this scrubbed envelope.  Keep the ordinary
+# environment (HOME, the validated worker PATH, session/test controls) because
+# the Herdr CLI and its panes intentionally consume it; remove only executable
+# startup hooks that can run code before the requested program reaches main.
+fm_backend_herdr_scrubbed_exec() {
+  local -x LD_PRELOAD='' LD_LIBRARY_PATH='' LD_AUDIT='' LD_DEBUG=''
+  local -x DYLD_INSERT_LIBRARIES='' DYLD_LIBRARY_PATH='' DYLD_FRAMEWORK_PATH=''
+  local -x DYLD_FALLBACK_LIBRARY_PATH='' DYLD_FALLBACK_FRAMEWORK_PATH=''
+  local -x PERL5OPT='' PERL5LIB='' PERLLIB='' NODE_OPTIONS='' NODE_PATH=''
+  local -x PYTHONHOME='' PYTHONPATH='' RUBYOPT='' RUBYLIB='' BASH_ENV='' ENV=''
+  local -x GCONV_PATH=''
+  "$@"
+}
+
+# Resolve ordinary control utilities only from the fixed system PATH, bypassing
+# same-name shell functions, then launch the resolved absolute binary through
+# the same loader/runtime scrub as Herdr itself. This keeps lock, marker, and
+# event-stream authority independent of both caller PATH and injected runtimes.
+fm_backend_herdr_control_exec() {
+  local name=$1 bin
+  shift
+  # Two submit-timing regressions install an in-process sleep recorder. Honor
+  # that function only behind the adapter's exact lab opt-in; production never
+  # accepts shell functions as control-command authority.
+  if [ "$name" = sleep ] && fm_backend_herdr_test_lab_enabled \
+    && declare -F sleep >/dev/null 2>&1; then
+    fm_backend_herdr_scrubbed_exec sleep "$@"
+    return
+  fi
+  bin=$(PATH="$FM_BACKEND_HERDR_CONTROL_PATH" builtin type -P "$name") || return 127
+  case "$bin" in
+    /usr/bin/*|/bin/*|/usr/sbin/*|/sbin/*) ;;
+    *) return 127 ;;
+  esac
+  fm_backend_herdr_scrubbed_exec "$bin" "$@"
+}
+
+fm_backend_herdr_control_jq() {
+  [ -n "$FM_BACKEND_HERDR_JQ_BIN" ] || return 127
+  fm_backend_herdr_scrubbed_exec "$FM_BACKEND_HERDR_JQ_BIN" "$@"
+}
+
+fm_backend_herdr_control_head() {
+  [ -n "$FM_BACKEND_HERDR_HEAD_BIN" ] || return 127
+  fm_backend_herdr_scrubbed_exec "$FM_BACKEND_HERDR_HEAD_BIN" "$@"
+}
+
+fm_backend_herdr_control_grep() {
+  [ -n "$FM_BACKEND_HERDR_GREP_BIN" ] || return 127
+  fm_backend_herdr_scrubbed_exec "$FM_BACKEND_HERDR_GREP_BIN" "$@"
+}
+
+# shellcheck disable=SC2016
+fm_backend_herdr_passwd_home() {
+  fm_backend_herdr_control_perl -e \
+    'my @p = getpwuid($<); exit 1 unless @p && defined $p[7] && length $p[7]; print $p[7]'
+}
+
+FM_BACKEND_HERDR_PINNED_BIN=
+# shellcheck disable=SC2016
+fm_backend_herdr_bin() {
+  local passwd_home discovered physical
+  [ -z "$FM_BACKEND_HERDR_PINNED_BIN" ] || {
+    fm_backend_herdr_validate_physical_bin "$FM_BACKEND_HERDR_PINNED_BIN" || return 1
+    printf '%s\n' "$FM_BACKEND_HERDR_PINNED_BIN"
+    return 0
+  }
+  [ -n "$FM_BACKEND_HERDR_PERL_BIN" ] || return 1
+  if fm_backend_herdr_test_lab_enabled; then
+    discovered=$(command -v herdr 2>/dev/null) || return 1
+  else
+    passwd_home=$(fm_backend_herdr_passwd_home 2>/dev/null) || return 1
+    case "$passwd_home" in /*) ;; *) return 1 ;; esac
+    discovered=$passwd_home/.local/bin/herdr
+  fi
+  physical=$(fm_backend_herdr_control_perl -MCwd=abs_path -e \
+    'my $p = abs_path($ARGV[0]); exit 1 unless defined $p; print $p' \
+    "$discovered" 2>/dev/null) || return 1
+  fm_backend_herdr_validate_physical_bin "$physical" || return 1
+  FM_BACKEND_HERDR_PINNED_BIN=$physical
+  printf '%s\n' "$physical"
+}
+
 # fm_backend_herdr_workspace_label: the per-firstmate-HOME herdr workspace
 # label (docs/herdr-backend.md "Task container shape"). The PRIMARY home (no
 # secondmate marker) resolves to the constant "firstmate", byte-identical to
@@ -101,7 +220,7 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 fm_backend_herdr_workspace_label_for_home() {  # <home>
   local marker="$1/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
   if [ -f "$marker" ]; then
-    id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
+    id=$(fm_backend_herdr_control_exec tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
       printf '2ndmate-%s' "$id"
       return 0
@@ -130,18 +249,20 @@ fm_backend_herdr_workspace_label() {
 # fm_backend_herdr_version_check, which is intentionally session-independent
 # (reads only .client.* fields).
 fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
-  local session=$1
+  local session=$1 herdr_bin
   shift
-  HERDR_SESSION="$session" herdr "$@" --session "$session"
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  HERDR_SESSION="$session" fm_backend_herdr_scrubbed_exec \
+    "$herdr_bin" "$@" --session "$session"
 }
 
 # fm_backend_herdr_tool_check: refuse loudly if herdr, jq, or the portable
 # setsid launcher prerequisites are missing.
 fm_backend_herdr_tool_check() {
-  command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (dual-licensed AGPL-3.0-or-later/commercial)" >&2; return 1; }
-  command -v jq >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'jq' is not installed (required to parse herdr's JSON output)" >&2; return 1; }
-  command -v nohup >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'nohup' is not installed (required to detach the Herdr server from the launching terminal)" >&2; return 1; }
-  command -v perl >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'perl' is not installed (required for the portable setsid Herdr server launcher)" >&2; return 1; }
+  fm_backend_herdr_bin >/dev/null 2>&1 || { echo "error: backend=herdr selected but the fixed current-user Herdr CLI is unavailable or unsafe (https://herdr.dev)" >&2; return 1; }
+  [ -n "$FM_BACKEND_HERDR_JQ_BIN" ] || { echo "error: backend=herdr selected but the fixed system jq is unavailable" >&2; return 1; }
+  [ -n "$FM_BACKEND_HERDR_NOHUP_BIN" ] || { echo "error: backend=herdr selected but the fixed system nohup is unavailable" >&2; return 1; }
+  [ -n "$FM_BACKEND_HERDR_PERL_BIN" ] || { echo "error: backend=herdr selected but the fixed system perl is unavailable" >&2; return 1; }
   return 0
 }
 
@@ -150,10 +271,11 @@ fm_backend_herdr_tool_check() {
 # .client.protocol; client info is session-independent, unlike .server).
 fm_backend_herdr_version_check() {
   fm_backend_herdr_tool_check || return 1
-  local status protocol version
-  status=$(herdr status --json 2>/dev/null) || { echo "error: 'herdr status --json' failed; is herdr installed correctly?" >&2; return 1; }
-  protocol=$(printf '%s' "$status" | jq -r '.client.protocol // empty' 2>/dev/null)
-  version=$(printf '%s' "$status" | jq -r '.client.version // empty' 2>/dev/null)
+  local status protocol version herdr_bin
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  status=$(fm_backend_herdr_scrubbed_exec "$herdr_bin" status --json 2>/dev/null) || { echo "error: 'herdr status --json' failed; is herdr installed correctly?" >&2; return 1; }
+  protocol=$(printf '%s' "$status" | fm_backend_herdr_control_jq -r '.client.protocol // empty' 2>/dev/null)
+  version=$(printf '%s' "$status" | fm_backend_herdr_control_jq -r '.client.version // empty' 2>/dev/null)
   case "$protocol" in
     ''|*[!0-9]*)
       echo "error: could not read herdr client protocol from 'herdr status --json'; refusing to use an unverified herdr build" >&2
@@ -183,14 +305,62 @@ fm_backend_herdr_session() {
 # macOS, where the util-linux `setsid` executable is absent. The adapter stays
 # the single lifecycle owner; captain launchers never start or stop Herdr.
 fm_backend_herdr_server_launch_detached() {  # <session>
-  local session=$1 herdr_bin perl_bin
-  herdr_bin=$(command -v herdr) || return 1
-  perl_bin=$(command -v perl) || return 1
-  command -v nohup >/dev/null 2>&1 || return 1
+  local session=$1 herdr_bin perl_bin passwd_home worker_path certificate certificate_key managed_config managed_shell ps_bin name value launch_env=()
+  local managed_shell_proof managed_shell_digest managed_shell_identity managed_config_proof managed_config_digest managed_config_identity
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  perl_bin=$FM_BACKEND_HERDR_PERL_BIN
+  passwd_home=$(fm_backend_herdr_passwd_home 2>/dev/null) || return 1
+  case "$passwd_home" in /*) ;; *) return 1 ;; esac
+  worker_path=$(fm_backend_herdr_worker_path "${PATH:-}") || return 1
+  certificate=
+  certificate_key=
+  # Direct adapter unit tests that do not exercise the server lock may omit a
+  # test lock root. Production, and lock-aware lab tests, always publish the
+  # process-bound closed-environment certificate consumed by routed spawns.
+  if ! fm_backend_herdr_test_lab_enabled \
+    || [ -n "${FM_BACKEND_HERDR_SERVER_LOCK_ROOT:-}" ]; then
+    certificate=$(fm_backend_herdr_server_env_certificate_path "$session") || return 1
+    certificate_key=$(fm_backend_herdr_server_lock_key "$session") || return 1
+    managed_shell=$(fm_backend_herdr_managed_shell_bin) || return 1
+    managed_config=$(fm_backend_herdr_managed_config_ensure "$session" "$managed_shell") || return 1
+    managed_shell_proof=$(fm_backend_herdr_file_identity "$managed_shell" 0500 owner) || return 1
+    managed_shell_digest=${managed_shell_proof%%$'\n'*}
+    managed_shell_identity=${managed_shell_proof#*$'\n'}
+    managed_config_proof=$(fm_backend_herdr_file_identity "$managed_config" 0600 owner) || return 1
+    managed_config_digest=${managed_config_proof%%$'\n'*}
+    managed_config_identity=${managed_config_proof#*$'\n'}
+    fm_backend_herdr_artifact_recover_candidates "$certificate" 0600 || return 1
+    ps_bin=$(fm_backend_herdr_ps_bin) || return 1
+  fi
+  [ -n "$perl_bin" ] && [ -n "$FM_BACKEND_HERDR_NOHUP_BIN" ] \
+    && [ -n "$FM_BACKEND_HERDR_ENV_BIN" ] || return 1
+  launch_env=(
+    "HOME=$passwd_home"
+    "PATH=$worker_path"
+    "HERDR_SESSION=$session"
+    "LC_ALL=C"
+  )
+  if [ -n "$managed_config" ]; then
+    launch_env+=("HERDR_CONFIG_PATH=$managed_config" "SHELL=$managed_shell")
+  fi
+  # Fake servers need a narrow set of fixture paths.  This branch is reachable
+  # only behind the exact lab opt-in; production never forwards test state.
+  if fm_backend_herdr_test_lab_enabled; then
+    for name in FM_HERDR_DETACH_MARKER FM_HERDR_LOG FM_HERDR_RESPONSES \
+      FM_FAKE_HERDR_STATE FM_FAKE_AGENT_DIR FM_FAKE_HERDR_RUNNING \
+      FM_FAKE_HERDR_SERVER_PIDS FM_FAKE_HERDR_LAUNCH_INVOKED; do
+      value=${!name:-}
+      [ -z "$value" ] || launch_env+=("$name=$value")
+    done
+  fi
   (
     # Dollar expressions in the single-quoted program below belong to Perl.
     # shellcheck disable=SC2016
-    HERDR_SESSION="$session" nohup "$perl_bin" -MPOSIX -e '
+    "$FM_BACKEND_HERDR_ENV_BIN" -i "${launch_env[@]}" \
+      "$FM_BACKEND_HERDR_NOHUP_BIN" "$perl_bin" -MFcntl=:DEFAULT -MIO::Handle -MPOSIX -e '
+      my ($certificate, $certificate_key, $ps, $managed_shell,
+          $managed_shell_digest, $managed_shell_identity, $managed_config,
+          $managed_config_digest, $managed_config_identity, @command) = @ARGV;
       my $pid = fork();
       defined $pid or die "first fork: $!";
       exit 0 if $pid;
@@ -198,33 +368,1584 @@ fm_backend_herdr_server_launch_detached() {  # <session>
       $pid = fork();
       defined $pid or die "second fork: $!";
       exit 0 if $pid;
-      exec { $ARGV[0] } @ARGV;
-      die "exec $ARGV[0]: $!";
-    ' -- "$herdr_bin" server --session "$session" </dev/null >/dev/null 2>&1 &
+      if (length $certificate) {
+        open my $process, "-|", $ps, "-o", "lstart=", "-p", "$$"
+          or die "process-start probe: $!";
+        local $/;
+        my $start = <$process> // "";
+        close $process or die "process-start probe failed";
+        $start =~ s/^\s+|\s+$//g;
+        length $start or die "empty process-start token";
+        my $candidate = "$certificate.candidate.$$";
+        sysopen my $owner, $candidate, O_WRONLY | O_CREAT | O_EXCL, 0600
+          or die "certificate candidate: $!";
+        chmod 0600, $candidate or die "certificate mode: $!";
+        print {$owner} "firstmate-herdr-closed-env-v2\n",
+          "$certificate_key\n", "$$\n", "$start\n",
+          "$managed_shell\n", "$managed_shell_digest\n",
+          "$managed_shell_identity\n", "$managed_config\n",
+          "$managed_config_digest\n", "$managed_config_identity\n"
+          or die "certificate write: $!";
+        $owner->flush or die "certificate flush: $!";
+        $owner->sync or die "certificate sync: $!";
+        close $owner or die "certificate close: $!";
+        rename $candidate, $certificate or die "certificate publish: $!";
+      }
+      exec { $command[0] } @command;
+      die "exec $command[0]: $!";
+    ' -- "$certificate" "$certificate_key" "${ps_bin:-}" \
+      "${managed_shell:-}" "${managed_shell_digest:-}" "${managed_shell_identity:-}" \
+      "${managed_config:-}" "${managed_config_digest:-}" "${managed_config_identity:-}" \
+      "$herdr_bin" server --session "$session" </dev/null >/dev/null 2>&1 &
   ) || return 1
 }
 
-# fm_backend_herdr_server_ensure: start the herdr server for <session>
-# headless (no TUI client) if not already running, mirroring tmux's `tmux
-# has-session || tmux new-session -d`. Verified: a bare socket CLI call does
-# NOT auto-start the server, so this must run before any workspace/tab/pane
-# call. The detached launcher must survive the captain pane that initiated the
-# first spawn. Bounded poll for the server to report running.
-fm_backend_herdr_server_ensure() {  # <session>
-  local session=$1 running i
-  running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
-  [ "$running" = "true" ] && return 0
-  fm_backend_herdr_server_launch_detached "$session" || return 1
-  # Give the double-forked grandchild one scheduling turn to exec before the
-  # first status poll. The bounded loop below remains the readiness authority.
-  sleep "${FM_BACKEND_HERDR_LAUNCH_SETTLE:-0.1}"
-  for i in $(seq 1 20); do
-    running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
-    [ "$running" = "true" ] && return 0
-    sleep 0.5
+fm_backend_herdr_path_mode() {
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    fm_backend_herdr_control_exec stat -f %Lp "$1" 2>/dev/null
+  else
+    fm_backend_herdr_control_exec stat -c %a "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_herdr_path_age() {
+  local modified PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    modified=$(fm_backend_herdr_control_exec stat -f %m "$1" 2>/dev/null) || return 1
+  else
+    modified=$(fm_backend_herdr_control_exec stat -c %Y "$1" 2>/dev/null) || return 1
+  fi
+  printf '%s\n' "$(( $(fm_backend_herdr_control_exec date +%s) - modified ))"
+}
+
+fm_backend_herdr_path_inode() {
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    fm_backend_herdr_control_exec stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    fm_backend_herdr_control_exec stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_herdr_path_nlink() {
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    fm_backend_herdr_control_exec stat -f %l "$1" 2>/dev/null
+  else
+    fm_backend_herdr_control_exec stat -c %h "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_herdr_path_uid() {
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    fm_backend_herdr_control_exec stat -f %u "$1" 2>/dev/null
+  else
+    fm_backend_herdr_control_exec stat -c %u "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_herdr_path_has_sticky_bit() {
+  local raw PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if [ "$(fm_backend_herdr_control_exec uname)" = Darwin ]; then
+    raw=$(fm_backend_herdr_control_exec stat -f %p "$1" 2>/dev/null) || return 1
+  else
+    raw=$(fm_backend_herdr_control_exec stat -c %a "$1" 2>/dev/null) || return 1
+  fi
+  case "$raw" in ''|*[!0-7]*) return 1 ;; esac
+  [ $((8#$raw & 8#1000)) -ne 0 ]
+}
+
+# Validate one already-physical path and all of its physical ancestors.  A
+# root-owned sticky directory (notably /private/tmp) is the sole writable
+# ancestor exception.  The check is repeated whenever the cached Herdr binary
+# is requested, including immediately before detached launch.
+fm_backend_herdr_validate_safe_ancestry() {  # <physical-path> <file|directory>
+  local current=$1 kind=$2 leaf=1 owner_uid uid mode numeric links PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$current" in /*) ;; *) return 1 ;; esac
+  owner_uid=$(fm_backend_herdr_control_exec id -u) || return 1
+  while :; do
+    [ -e "$current" ] && [ ! -L "$current" ] || return 1
+    uid=$(fm_backend_herdr_path_uid "$current") || return 1
+    mode=$(fm_backend_herdr_path_mode "$current") || return 1
+    case "$uid" in ''|*[!0-9]*) return 1 ;; esac
+    case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+    numeric=$((8#$mode))
+    [ "$uid" -eq 0 ] || [ "$uid" -eq "$owner_uid" ] || return 1
+    if [ "$leaf" -eq 1 ] && [ "$kind" = file ]; then
+      [ -f "$current" ] && [ -x "$current" ] || return 1
+      links=$(fm_backend_herdr_path_nlink "$current") || return 1
+      [ "$links" = 1 ] || return 1
+      [ $((numeric & 8#22)) -eq 0 ] || return 1
+    else
+      [ -d "$current" ] || return 1
+      if [ $((numeric & 8#22)) -ne 0 ]; then
+        [ "$uid" -eq 0 ] && fm_backend_herdr_path_has_sticky_bit "$current" || return 1
+      fi
+    fi
+    [ "$current" != / ] || break
+    current=${current%/*}
+    [ -n "$current" ] || current=/
+    leaf=0
   done
-  echo "error: herdr server for session '$session' did not report running within 10s" >&2
+}
+
+fm_backend_herdr_validate_physical_bin() {  # <physical-path>
+  fm_backend_herdr_validate_safe_ancestry "$1" file
+}
+
+# Build the environment inherited by Herdr panes independently from the fixed
+# control PATH. Managed workers still need safe Homebrew/user tool directories
+# (for example node and uv), but a caller-controlled writable PATH entry must
+# never become executable search authority in the detached server. Resolve each
+# directory physically, require safe owner/mode ancestry, reject a writable
+# search leaf even when it is root-sticky, deduplicate, and append the control
+# directories as a guaranteed floor.
+fm_backend_herdr_worker_path() {  # [candidate-path]
+  local source=${1:-} combined raw physical mode numeric result='' old_ifs
+  local -a candidates=()
+  case "$source" in *$'\n'*) source= ;; esac
+  combined=${source:+$source:}$FM_BACKEND_HERDR_CONTROL_PATH
+  old_ifs=$IFS
+  IFS=:
+  read -r -a candidates <<< "$combined"
+  IFS=$old_ifs
+  for raw in "${candidates[@]}"; do
+    case "$raw" in /*) ;; *) continue ;; esac
+    # Dollar expressions in the single-quoted program belong to Perl.
+    # shellcheck disable=SC2016
+    physical=$(fm_backend_herdr_control_perl -MCwd=abs_path -e \
+      'my $p = abs_path($ARGV[0]); exit 1 unless defined $p; print $p' \
+      "$raw" 2>/dev/null) || continue
+    case "$physical" in ''|*$'\n'*|*:*) continue ;; esac
+    fm_backend_herdr_validate_safe_ancestry "$physical" directory || continue
+    mode=$(fm_backend_herdr_path_mode "$physical") || continue
+    case "$mode" in ''|*[!0-7]*) continue ;; esac
+    numeric=$((8#$mode))
+    [ $((numeric & 8#22)) -eq 0 ] || continue
+    case ":$result:" in *":$physical:"*) continue ;; esac
+    if [ -n "$result" ]; then
+      result=$result:$physical
+    else
+      result=$physical
+    fi
+  done
+  [ -n "$result" ] || return 1
+  printf '%s\n' "$result"
+}
+
+fm_backend_herdr_test_hooks_enabled() {
+  fm_backend_herdr_test_lab_enabled \
+    && [ "${FM_BACKEND_HERDR_TEST_HOOKS:-}" = firstmate-herdr-tests-v1 ]
+}
+
+fm_backend_herdr_ps_bin() {
+  if fm_backend_herdr_test_hooks_enabled && [ -n "${FM_TEST_HERDR_PS_BIN:-}" ]; then
+    [ -x "$FM_TEST_HERDR_PS_BIN" ] || return 1
+    printf '%s\n' "$FM_TEST_HERDR_PS_BIN"
+  elif [ -x /bin/ps ]; then
+    printf '%s\n' /bin/ps
+  elif [ -x /usr/bin/ps ]; then
+    printf '%s\n' /usr/bin/ps
+  else
+    return 1
+  fi
+}
+
+fm_backend_herdr_process_start() {
+  local value ps_bin PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  ps_bin=$(fm_backend_herdr_ps_bin) || return 1
+  value=$(LC_ALL=C fm_backend_herdr_scrubbed_exec "$ps_bin" -o lstart= -p "$1" 2>/dev/null) || return 1
+  value=$(printf '%s\n' "$value" | fm_backend_herdr_control_exec sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+# Return success only when ps proves a PID is absent. Any output-bearing error,
+# successful-but-empty result, or unavailable probe is indeterminate and must
+# never authorize artifact deletion.
+fm_backend_herdr_process_absent() {  # <pid>
+  local probe status ps_bin PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  ps_bin=$(fm_backend_herdr_ps_bin) || return 2
+  probe=$(LC_ALL=C fm_backend_herdr_scrubbed_exec "$ps_bin" -o lstart= -p "$1" 2>&1)
+  status=$?
+  probe=$(printf '%s\n' "$probe" | fm_backend_herdr_control_exec sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ "$status" -eq 0 ]; then
+    [ -n "$probe" ] || return 2
+    return 1
+  fi
+  [ -z "$probe" ] || return 2
+  return 0
+}
+
+fm_backend_herdr_server_lock_root() {
+  local raw parent_raw parent leaf owner_uid PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  if fm_backend_herdr_test_lab_enabled && [ -n "${FM_BACKEND_HERDR_SERVER_LOCK_ROOT:-}" ]; then
+    raw=$FM_BACKEND_HERDR_SERVER_LOCK_ROOT
+  else
+    [ -z "${FM_BACKEND_HERDR_SERVER_LOCK_ROOT:-}" ] || return 1
+    owner_uid=$(fm_backend_herdr_control_exec id -u) || return 1
+    raw=/tmp/firstmate-herdr-server-locks-$owner_uid
+  fi
+  case "$raw" in /*) ;; *) return 1 ;; esac
+  leaf=${raw##*/}
+  parent_raw=${raw%/*}
+  [ -n "$parent_raw" ] || parent_raw=/
+  case "$leaf" in ''|.|..) return 1 ;; esac
+  parent=$(cd "$parent_raw" 2>/dev/null && pwd -P) || return 1
+  fm_backend_herdr_validate_safe_ancestry "$parent" directory || {
+    echo "error: unsafe Herdr server lock-root ancestry: $parent" >&2
+    return 1
+  }
+  printf '%s/%s\n' "$parent" "$leaf"
+}
+
+fm_backend_herdr_server_lock_root_prepare() {
+  local root parent mode PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  parent=${root%/*}
+  [ -n "$parent" ] || parent=/
+  fm_backend_herdr_validate_safe_ancestry "$parent" directory || return 1
+  if [ ! -e "$root" ] && [ ! -L "$root" ]; then
+    (umask 077 && fm_backend_herdr_control_exec mkdir "$root") 2>/dev/null || true
+  fi
+  fm_backend_herdr_validate_safe_ancestry "$parent" directory || return 1
+  mode=$(fm_backend_herdr_path_mode "$root") || mode=
+  if [ ! -d "$root" ] || [ -L "$root" ] || [ ! -O "$root" ] || [ "$mode" != 700 ]; then
+    echo "error: Herdr server lock root must be a current-user 0700 directory: $root" >&2
+    return 1
+  fi
+}
+
+fm_backend_herdr_server_lock_key() {
+  local session=$1
+  printf '%s' "$session" | fm_backend_herdr_control_perl \
+    -MDigest::SHA=sha256_hex -e 'local $/; print sha256_hex(<STDIN>)'
+}
+
+fm_backend_herdr_server_env_certificate_path() {  # <session>
+  local root key
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  key=$(fm_backend_herdr_server_lock_key "$1") || return 1
+  printf '%s/%s.closed-shell-v2\n' "$root" "$key"
+}
+
+fm_backend_herdr_server_legacy_env_certificate_path() {  # <session>
+  local root key
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  key=$(fm_backend_herdr_server_lock_key "$1") || return 1
+  printf '%s/%s.closed-shell-v1\n' "$root" "$key"
+}
+
+fm_backend_herdr_server_certificate_required() {
+  ! fm_backend_herdr_test_lab_enabled && return 0
+  [ "${FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE:-}" = firstmate-herdr-tests-v1 ]
+}
+
+fm_backend_herdr_file_read_verified() {  # <identity|snapshot> <path> <mode|executable> <owner|root-or-owner>
+  local operation=$1 path=$2 expected_mode=$3 owner_policy=$4
+  case "$path" in /*) ;; *) return 1 ;; esac
+  case "$path" in *$'\n'*) return 1 ;; esac
+  # The descriptor, both fstat snapshots, and the final lstat all have to name
+  # one regular file. O_NOFOLLOW prevents a symlink from entering between the
+  # shell's ancestry check and the actual read. The first two output lines are
+  # always SHA-256 and a supplemental dev:ino:size:mtime identity.
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -e '
+    my ($operation, $path, $expected_mode, $owner_policy) = @ARGV;
+    my $nofollow = eval { O_NOFOLLOW() };
+    defined $nofollow or die "O_NOFOLLOW unavailable";
+    sysopen my $fh, $path, O_RDONLY | $nofollow or die "open: $!";
+    my @before = stat($fh);
+    @before or die "fstat before: $!";
+    -f $fh or die "not regular";
+    my $mode = $before[2] & 07777;
+    $before[3] == 1 or die "link count";
+    if ($expected_mode eq "executable") {
+      ($mode & 0111) && !($mode & 0022) or die "unsafe executable mode";
+    } else {
+      $mode == oct($expected_mode) or die "mode";
+    }
+    if ($owner_policy eq "owner") {
+      $before[4] == $< or die "owner";
+    } elsif ($owner_policy eq "root-or-owner") {
+      ($before[4] == 0 || $before[4] == $<) or die "owner";
+    } else {
+      die "owner policy";
+    }
+    my $sha = Digest::SHA->new(256);
+    my $payload = "";
+    while (1) {
+      my $count = sysread($fh, my $chunk, 65536);
+      defined $count or die "read: $!";
+      last unless $count;
+      $sha->add($chunk);
+      $payload .= $chunk if $operation eq "snapshot";
+    }
+    my @after = stat($fh);
+    @after or die "fstat after: $!";
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $before[$index] == $after[$index] or die "changed during read";
+    }
+    my @path_after = lstat($path);
+    @path_after or die "lstat after: $!";
+    ($path_after[0] == $after[0] && $path_after[1] == $after[1])
+      or die "path replaced after read";
+    close $fh or die "close: $!";
+    my $digest = $sha->hexdigest;
+    my $identity = join(":", @after[0, 1, 7, 9]);
+    print "$digest\n$identity\n";
+    print $payload if $operation eq "snapshot";
+  ' "$operation" "$path" "$expected_mode" "$owner_policy" 2>/dev/null
+}
+
+fm_backend_herdr_file_identity() {  # <path> <mode|executable> <owner-policy>
+  fm_backend_herdr_file_read_verified identity "$@"
+}
+
+fm_backend_herdr_file_snapshot() {  # <path> <mode|executable> <owner-policy>
+  fm_backend_herdr_file_read_verified snapshot "$@"
+}
+
+# Prove that <candidate> and <target> are the two names of exactly one regular,
+# current-user-owned inode left by no-replace publication. This proof is kept
+# separate from ordinary artifact reads, which intentionally require nlink=1.
+fm_backend_herdr_hardlink_pair_identity() {  # <candidate> <target> <mode>
+  local candidate=$1 target=$2 mode=$3
+  case "$candidate:$target" in *$'\n'*) return 1 ;; esac
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -e '
+    my ($candidate, $target, $expected_mode) = @ARGV;
+    my $nofollow = eval { O_NOFOLLOW() };
+    defined $nofollow or die "O_NOFOLLOW unavailable";
+    sysopen my $candidate_fh, $candidate, O_RDONLY | $nofollow
+      or die "candidate open: $!";
+    sysopen my $target_fh, $target, O_RDONLY | $nofollow
+      or die "target open: $!";
+    my @candidate_before = stat($candidate_fh);
+    my @target_before = stat($target_fh);
+    @candidate_before && @target_before or die "fstat";
+    -f $candidate_fh && -f $target_fh or die "not regular";
+    ($candidate_before[2] & 07777) == oct($expected_mode) or die "candidate mode";
+    ($target_before[2] & 07777) == oct($expected_mode) or die "target mode";
+    $candidate_before[3] == 2 && $target_before[3] == 2 or die "link count";
+    $candidate_before[4] == $< && $target_before[4] == $< or die "owner";
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $candidate_before[$index] == $target_before[$index] or die "not one inode";
+    }
+    my $sha = Digest::SHA->new(256);
+    while (1) {
+      my $count = sysread($candidate_fh, my $chunk, 65536);
+      defined $count or die "read: $!";
+      last unless $count;
+      $sha->add($chunk);
+    }
+    my @candidate_after = stat($candidate_fh);
+    my @target_after = stat($target_fh);
+    for my $index (0, 1, 2, 3, 4, 7, 9) {
+      $candidate_before[$index] == $candidate_after[$index]
+        && $target_before[$index] == $target_after[$index]
+        or die "changed during read";
+    }
+    my @candidate_path = lstat($candidate);
+    my @target_path = lstat($target);
+    @candidate_path && @target_path or die "path disappeared";
+    $candidate_path[0] == $candidate_after[0]
+      && $candidate_path[1] == $candidate_after[1]
+      && $target_path[0] == $target_after[0]
+      && $target_path[1] == $target_after[1]
+      or die "path replaced";
+    close $candidate_fh or die "candidate close: $!";
+    close $target_fh or die "target close: $!";
+    print $sha->hexdigest, "\n",
+      join(":", @candidate_after[0, 1, 7, 9]), "\n";
+  ' "$candidate" "$target" "$mode" 2>/dev/null
+}
+
+fm_backend_herdr_managed_shell_source() {
+  local physical candidate="$FM_BACKEND_HERDR_ROOT/bin/fm-herdr-worker-shell"
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_MANAGED_SHELL_SOURCE:-}" ]; then
+    candidate=$FM_TEST_HERDR_MANAGED_SHELL_SOURCE
+  fi
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  physical=$(fm_backend_herdr_control_perl -MCwd=abs_path -e \
+    'my $p = abs_path($ARGV[0]); exit 1 unless defined $p; print $p' \
+    "$candidate" 2>/dev/null) || return 1
+  fm_backend_herdr_validate_physical_bin "$physical" || return 1
+  printf '%s\n' "$physical"
+}
+
+fm_backend_herdr_managed_shell_path_for_digest() {  # <sha256>
+  local digest=$1 root
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  printf '%s/managed-worker-shell-v1-%s\n' "$root" "$digest"
+}
+
+fm_backend_herdr_artifact_has_quarantine() {  # <target>
+  local quarantine
+  for quarantine in "$1".quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    return 0
+  done
   return 1
+}
+
+# Read one quarantine through its directory descriptor, accepting only an
+# owner-private 0700 directory whose exact contents are empty or `artifact`.
+fm_backend_herdr_artifact_quarantine_snapshot() {  # <quarantine>
+  local quarantine=$1
+  case "$quarantine" in *$'\n'*) return 1 ;; esac
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -e '
+    my ($path) = @ARGV;
+    opendir my $dir, $path or die "opendir: $!";
+    my @before = stat($dir);
+    @before && -d $dir or die "not directory";
+    ($before[2] & 07777) == 0700 or die "mode";
+    $before[4] == $< or die "owner";
+    my @names = sort grep { $_ ne "." && $_ ne ".." } readdir $dir;
+    my @after = stat($dir);
+    for my $index (0, 1, 2, 3, 4, 9) {
+      $before[$index] == $after[$index] or die "directory changed";
+    }
+    my @path_after = lstat($path);
+    @path_after
+      && $path_after[0] == $after[0]
+      && $path_after[1] == $after[1]
+      && ($path_after[2] & 07777) == 0700
+      && $path_after[4] == $<
+      or die "path replaced";
+    closedir $dir or die "closedir: $!";
+    my $contents = !@names ? "empty"
+      : @names == 1 && $names[0] eq "artifact" ? "artifact"
+      : "occupied";
+    print "$after[0]:$after[1]\n$contents\n";
+  ' "$quarantine" 2>/dev/null
+}
+
+# Resume any finite phase of one already-authorized attributed deletion. The
+# caller owns the safety proof for <path>; this primitive descriptor-proves the
+# private quarantine and never deletes a moved generation until its inode is
+# exactly the attributed inode. Ambiguous or occupied generations are kept.
+fm_backend_herdr_artifact_resume_attributed() {  # <path> <expected-dev:ino>
+  local path=$1 expected_inode=$2 quarantine quarantine_key snapshot quarantine_inode contents
+  local moved_inode after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$expected_inode" in ''|*[!0-9:]*|:*|*:) return 1 ;; esac
+  quarantine_key=${expected_inode/:/_}
+  quarantine="$path.quarantine.$quarantine_key"
+  snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+  case "$snapshot" in *$'\n'*) ;; *) return 1 ;; esac
+  quarantine_inode=${snapshot%%$'\n'*}
+  contents=${snapshot#*$'\n'}
+  case "$contents" in
+    empty)
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        [ "$(fm_backend_herdr_path_inode "$path" 2>/dev/null)" = "$expected_inode" ] \
+          || return 1
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        [ "$after" = "$snapshot" ] || return 1
+        if fm_backend_herdr_test_hooks_enabled \
+          && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_READY:-}" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED:-}" ]; then
+          : > "$FM_TEST_HERDR_ARTIFACT_REMOVE_READY"
+          while [ ! -e "$FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED" ]; do
+            fm_backend_herdr_control_exec sleep 0.01
+          done
+        fi
+        fm_backend_herdr_control_exec mv "$path" "$quarantine/artifact" 2>/dev/null \
+          || return 1
+        moved_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null) \
+          || return 1
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        if [ "$moved_inode" != "$expected_inode" ] \
+          || [ "${after%%$'\n'*}" != "$quarantine_inode" ] \
+          || [ "${after#*$'\n'}" != artifact ]; then
+          echo "error: preserved ambiguous Herdr artifact generation at $quarantine/artifact" >&2
+          return 1
+        fi
+        contents=artifact
+      else
+        after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+        [ "$after" = "$snapshot" ] || return 1
+      fi
+      ;;
+    artifact)
+      [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+      moved_inode=$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null) \
+        || return 1
+      [ "$moved_inode" = "$expected_inode" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$contents" = artifact ]; then
+    after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+    [ "${after%%$'\n'*}" = "$quarantine_inode" ] \
+      && [ "${after#*$'\n'}" = artifact ] \
+      && [ "$(fm_backend_herdr_path_inode "$quarantine/artifact" 2>/dev/null)" = "$expected_inode" ] \
+      || return 1
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" ]; then
+      : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE"
+      kill -KILL "${BASHPID:-$$}"
+    fi
+    fm_backend_herdr_control_exec rm -f "$quarantine/artifact" 2>/dev/null || return 1
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" ]; then
+      : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK"
+      kill -KILL "${BASHPID:-$$}"
+    fi
+  fi
+  after=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+  [ "${after%%$'\n'*}" = "$quarantine_inode" ] \
+    && [ "${after#*$'\n'}" = empty ] || return 1
+  fm_backend_herdr_control_exec rmdir "$quarantine" 2>/dev/null || return 1
+}
+
+# Move the pathname generation into a private, deterministic device/inode-keyed
+# quarantine before deletion. Every later phase is resumable by the state
+# machine above.
+fm_backend_herdr_artifact_remove_attributed() {  # <path> <expected-dev:ino>
+  local path=$1 expected_inode=$2 quarantine quarantine_key PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$expected_inode" in ''|*[!0-9:]*|:*|*:) return 1 ;; esac
+  quarantine_key=${expected_inode/:/_}
+  fm_backend_herdr_artifact_has_quarantine "$path" && return 1
+  quarantine="$path.quarantine.$quarantine_key"
+  (umask 077 && fm_backend_herdr_control_exec mkdir "$quarantine") 2>/dev/null || return 1
+  fm_backend_herdr_control_exec chmod 700 "$quarantine" 2>/dev/null || return 1
+  fm_backend_herdr_artifact_quarantine_snapshot "$quarantine" >/dev/null || return 1
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ "${FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET:-}" = "$path" ] \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR"
+    kill -KILL "${BASHPID:-$$}"
+  fi
+  fm_backend_herdr_artifact_resume_attributed "$path" "$expected_inode"
+}
+
+# Recover every attributed candidate cleanup phase: empty quarantine before
+# move, quarantined artifact before unlink, and empty quarantine before rmdir.
+# Both ordinary nlink=1 candidates and published target/candidate nlink=2 pairs
+# use the same state machine and retain their stale/dead PID authorization.
+fm_backend_herdr_artifact_recover_candidate_quarantines() {  # <target> <mode>
+  local target=$1 mode=$2 quarantine candidate pid key expected_inode snapshot contents artifact_path
+  local links identity_before identity_after artifact_inode target_after PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  for quarantine in "$target".candidate.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    candidate=${quarantine%.quarantine.*}
+    pid=${candidate##*.candidate.}
+    key=${quarantine##*.quarantine.}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case "$key" in ''|*[!0-9_]*|_*|*_|*_*_*) return 1 ;; esac
+    expected_inode=${key/_/:}
+    fm_backend_herdr_server_lock_is_stale_age "$quarantine" || continue
+    fm_backend_herdr_process_absent "$pid" || continue
+    snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") || return 1
+    contents=${snapshot#*$'\n'}
+    case "$contents" in
+      empty)
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+          identity_before=
+          links=0
+        else
+          artifact_path=$candidate
+          links=$(fm_backend_herdr_path_nlink "$artifact_path" 2>/dev/null) || return 1
+        fi
+        ;;
+      artifact)
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+        artifact_path="$quarantine/artifact"
+        links=$(fm_backend_herdr_path_nlink "$artifact_path" 2>/dev/null) || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    case "$links" in
+      0) ;;
+      1)
+        identity_before=$(fm_backend_herdr_file_identity "$artifact_path" "$mode" owner 2>/dev/null) \
+          || return 1
+        artifact_inode=$(fm_backend_herdr_path_inode "$artifact_path") || return 1
+        [ "$artifact_inode" = "$expected_inode" ] || return 1
+        identity_after=$(fm_backend_herdr_file_identity "$artifact_path" "$mode" owner 2>/dev/null) \
+          || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        ;;
+      2)
+        identity_before=$(fm_backend_herdr_hardlink_pair_identity \
+          "$artifact_path" "$target" "$mode") || return 1
+        artifact_inode=$(fm_backend_herdr_path_inode "$artifact_path") || return 1
+        [ "$artifact_inode" = "$expected_inode" ] || return 1
+        identity_after=$(fm_backend_herdr_hardlink_pair_identity \
+          "$artifact_path" "$target" "$mode") || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    [ "$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine")" = "$snapshot" ] \
+      || return 1
+    fm_backend_herdr_process_absent "$pid" || return 1
+    fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+    fm_backend_herdr_artifact_resume_attributed "$candidate" "$expected_inode" || return 1
+    if [ "$links" -eq 2 ]; then
+      target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) \
+        || return 1
+      [ "$target_after" = "$identity_after" ] || return 1
+    fi
+  done
+}
+
+fm_backend_herdr_artifact_recover_candidates() {  # <target> <mode>
+  local target=$1 mode=$2 candidate pid inode links identity_before identity_after target_after
+  fm_backend_herdr_artifact_has_quarantine "$target" && return 1
+  fm_backend_herdr_artifact_recover_candidate_quarantines "$target" "$mode" || return 1
+  for candidate in "$target".candidate.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    pid=${candidate##*.candidate.}
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    links=$(fm_backend_herdr_path_nlink "$candidate" 2>/dev/null) || continue
+    case "$links" in
+      1)
+        identity_before=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        inode=$(fm_backend_herdr_path_inode "$candidate") || continue
+        identity_after=$(fm_backend_herdr_file_identity "$candidate" "$mode" owner 2>/dev/null) || continue
+        [ "$identity_after" = "$identity_before" ] || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_artifact_remove_attributed "$candidate" "$inode" || return 1
+        ;;
+      2)
+        identity_before=$(fm_backend_herdr_hardlink_pair_identity "$candidate" "$target" "$mode") || {
+          if fm_backend_herdr_server_lock_is_stale_age "$candidate" \
+            && fm_backend_herdr_process_absent "$pid"; then
+            echo "error: refusing ambiguous Herdr published candidate pair: $candidate" >&2
+            return 1
+          fi
+          continue
+        }
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        fm_backend_herdr_process_absent "$pid" || continue
+        inode=$(fm_backend_herdr_path_inode "$candidate") || continue
+        identity_after=$(fm_backend_herdr_hardlink_pair_identity "$candidate" "$target" "$mode") || return 1
+        [ "$identity_after" = "$identity_before" ] || return 1
+        fm_backend_herdr_process_absent "$pid" || continue
+        fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue
+        if fm_backend_herdr_test_hooks_enabled \
+          && [ "${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" = "$target" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_PAIR_READY:-}" ] \
+          && [ -n "${FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED:-}" ]; then
+          : > "$FM_TEST_HERDR_ARTIFACT_PAIR_READY"
+          while [ ! -e "$FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED" ]; do
+            fm_backend_herdr_control_exec sleep 0.01
+          done
+        fi
+        fm_backend_herdr_artifact_remove_attributed "$candidate" "$inode" || return 1
+        target_after=$(fm_backend_herdr_file_identity "$target" "$mode" owner 2>/dev/null) || return 1
+        if [ "$target_after" != "$identity_after" ]; then
+          echo "error: Herdr published target changed during candidate recovery: $target" >&2
+          return 1
+        fi
+        ;;
+      *)
+        if fm_backend_herdr_server_lock_is_stale_age "$candidate" \
+          && fm_backend_herdr_process_absent "$pid"; then
+          echo "error: refusing Herdr candidate with ambiguous link count: $candidate" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+}
+
+fm_backend_herdr_managed_shell_bin() {
+  local source source_identity digest target target_identity publication candidate candidate_inode kill_after_link=
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  source=$(fm_backend_herdr_managed_shell_source) || return 1
+  source_identity=$(fm_backend_herdr_file_identity "$source" executable root-or-owner) || return 1
+  digest=${source_identity%%$'\n'*}
+  target=$(fm_backend_herdr_managed_shell_path_for_digest "$digest") || return 1
+  fm_backend_herdr_artifact_recover_candidates "$target" 0500 || return 1
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    # Copy through O_NOFOLLOW descriptors, publish with a no-overwrite hard
+    # link, and verify both the source snapshot and installed digest. A racing
+    # installer may win the link; both converge on the same content address.
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ -n "${FM_TEST_HERDR_KILL_AFTER_HELPER_LINK:-}" ]; then
+      kill_after_link=$FM_TEST_HERDR_KILL_AFTER_HELPER_LINK
+    fi
+    # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+    publication=$(fm_backend_herdr_control_perl -MDigest::SHA -MFcntl=:DEFAULT -MIO::Handle -e '
+      my ($source, $target, $expected_digest, $kill_after_link) = @ARGV;
+      my $nofollow = eval { O_NOFOLLOW() };
+      defined $nofollow or die "O_NOFOLLOW unavailable";
+      sysopen my $input, $source, O_RDONLY | $nofollow or die "source: $!";
+      my @before = stat($input);
+      @before && -f $input && $before[3] == 1 or die "source identity";
+      my $payload = "";
+      my $sha = Digest::SHA->new(256);
+      while (1) {
+        my $count = sysread($input, my $chunk, 65536);
+        defined $count or die "source read: $!";
+        last unless $count;
+        $payload .= $chunk;
+        $sha->add($chunk);
+      }
+      my @after = stat($input);
+      for my $index (0, 1, 2, 3, 4, 7, 9) {
+        $before[$index] == $after[$index] or die "source changed";
+      }
+      my @source_path = lstat($source);
+      ($source_path[0] == $after[0] && $source_path[1] == $after[1])
+        or die "source path changed";
+      $sha->hexdigest eq $expected_digest or die "source digest changed";
+      close $input or die "source close: $!";
+      my $candidate = "$target.candidate.$$";
+      sysopen my $output, $candidate,
+        O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0500 or die "candidate: $!";
+      chmod 0500, $candidate or die "candidate mode: $!";
+      my $offset = 0;
+      while ($offset < length $payload) {
+        my $count = syswrite($output, $payload, length($payload) - $offset, $offset);
+        defined $count && $count > 0 or die "candidate write: $!";
+        $offset += $count;
+      }
+      $output->flush or die "candidate flush: $!";
+      $output->sync or die "candidate sync: $!";
+      my @candidate = stat($output);
+      close $output or die "candidate close: $!";
+      my $published = link($candidate, $target);
+      if (!$published) {
+        die "publish: $!" unless -e $target;
+      }
+      if ($published && length $kill_after_link) {
+        sysopen my $marker, $kill_after_link, O_WRONLY | O_CREAT | O_EXCL, 0600
+          or die "kill marker: $!";
+        close $marker or die "kill marker close: $!";
+        kill "KILL", $$;
+        die "post-link kill failed";
+      }
+      my @candidate_path = lstat($candidate);
+      @candidate_path && $candidate_path[0] == $candidate[0]
+        && $candidate_path[1] == $candidate[1] or die "candidate replaced";
+      print "$candidate\n$candidate[0]:$candidate[1]\n";
+    ' "$source" "$target" "$digest" "$kill_after_link") || return 1
+    case "$publication" in *$'\n'*) ;; *) return 1 ;; esac
+    candidate=${publication%%$'\n'*}
+    candidate_inode=${publication#*$'\n'}
+    case "$candidate_inode" in ''|*$'\n'*|*[!0-9:]*) return 1 ;; esac
+    fm_backend_herdr_artifact_remove_attributed "$candidate" "$candidate_inode" || return 1
+  fi
+  target_identity=$(fm_backend_herdr_file_identity "$target" 0500 owner) || return 1
+  [ "${target_identity%%$'\n'*}" = "$digest" ] || return 1
+  [ "$(fm_backend_herdr_file_identity "$source" executable root-or-owner)" = "$source_identity" ] || return 1
+  printf '%s\n' "$target"
+}
+
+fm_backend_herdr_managed_config_path() {  # <session> [managed-shell]
+  local root key shell_bin shell_proof shell_digest
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  key=$(fm_backend_herdr_server_lock_key "$1") || return 1
+  shell_bin=${2:-}
+  [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
+  shell_proof=$(fm_backend_herdr_file_identity "$shell_bin" 0500 owner) || return 1
+  shell_digest=${shell_proof%%$'\n'*}
+  printf '%s/%s.closed-shell-config-v2-%s.toml\n' "$root" "$key" "$shell_digest"
+}
+
+fm_backend_herdr_managed_config_expected() {  # [managed-shell]
+  local shell_bin=${1:-}
+  [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  fm_backend_herdr_control_perl -e '
+    my $shell = $ARGV[0];
+    exit 1 if $shell =~ /[\x00-\x1f\x7f]/;
+    $shell =~ s/\\/\\\\/g;
+    $shell =~ s/"/\\"/g;
+    print "onboarding = false\n",
+      "[terminal]\n",
+      "default_shell = \"$shell\"\n",
+      "shell_mode = \"non_login\"\n",
+      "[session]\n",
+      "resume_agents_on_restore = false\n";
+  ' "$shell_bin"
+}
+
+fm_backend_herdr_managed_config_ready() {  # <session> [managed-shell]
+  local path expected snapshot actual
+  path=$(fm_backend_herdr_managed_config_path "$1" "${2:-}") || return 1
+  expected=$(fm_backend_herdr_managed_config_expected "${2:-}") || return 1
+  snapshot=$(fm_backend_herdr_file_snapshot "$path" 0600 owner) || return 1
+  snapshot=${snapshot#*$'\n'}
+  actual=${snapshot#*$'\n'}
+  [ "$actual" = "$expected" ]
+}
+
+fm_backend_herdr_managed_config_ensure() {  # <session> [managed-shell]; prints path
+  local path expected shell_bin publication candidate candidate_inode kill_after_link=
+  shell_bin=${2:-}
+  [ -n "$shell_bin" ] || shell_bin=$(fm_backend_herdr_managed_shell_bin) || return 1
+  path=$(fm_backend_herdr_managed_config_path "$1" "$shell_bin") || return 1
+  expected=$(fm_backend_herdr_managed_config_expected "$shell_bin") || return 1
+  fm_backend_herdr_artifact_recover_candidates "$path" 0600 || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    fm_backend_herdr_managed_config_ready "$1" "$shell_bin" || return 1
+    printf '%s\n' "$path"
+    return 0
+  fi
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK:-}" ]; then
+    kill_after_link=$FM_TEST_HERDR_KILL_AFTER_CONFIG_LINK
+  fi
+  # shellcheck disable=SC2016  # Dollar expressions belong to Perl.
+  publication=$(fm_backend_herdr_control_perl -MFcntl=:DEFAULT -MIO::Handle -e '
+    my ($path, $payload, $kill_after_link) = @ARGV;
+    my $candidate = "$path.candidate.$$";
+    sysopen my $fh, $candidate, O_WRONLY | O_CREAT | O_EXCL, 0600 or die $!;
+    chmod 0600, $candidate or die $!;
+    print {$fh} $payload, "\n" or die $!;
+    $fh->flush or die $!;
+    $fh->sync or die $!;
+    close $fh or die $!;
+    my $published = link($candidate, $path);
+    if (!$published) {
+      die $! unless -e $path;
+    }
+    if ($published && length $kill_after_link) {
+      sysopen my $marker, $kill_after_link, O_WRONLY | O_CREAT | O_EXCL, 0600
+        or die "kill marker: $!";
+      close $marker or die "kill marker close: $!";
+      kill "KILL", $$;
+      die "post-link kill failed";
+    }
+    my @candidate = lstat($candidate);
+    @candidate or die "candidate identity: $!";
+    print "$candidate\n$candidate[0]:$candidate[1]\n";
+  ' "$path" "$expected" "$kill_after_link") || return 1
+  case "$publication" in *$'\n'*) ;; *) return 1 ;; esac
+  candidate=${publication%%$'\n'*}
+  candidate_inode=${publication#*$'\n'}
+  case "$candidate_inode" in ''|*$'\n'*|*[!0-9:]*) return 1 ;; esac
+  fm_backend_herdr_artifact_remove_attributed "$candidate" "$candidate_inode" || return 1
+  fm_backend_herdr_managed_config_ready "$1" "$shell_bin" || return 1
+  printf '%s\n' "$path"
+}
+
+# Prove that the live server process for this session was launched by the
+# adapter's env-i path. Herdr panes inherit the server environment, so routed
+# workers may enter a pane only while this process-bound certificate remains
+# valid. A restored/manual/older server has no usable proof and fails closed.
+fm_backend_herdr_server_closed_shell_environment_ready() {  # <session>
+  local session=$1 certificate key certificate_snapshot payload schema recorded_key pid start current
+  local managed_shell managed_shell_digest managed_shell_identity managed_shell_proof expected_shell
+  local source source_proof source_digest managed_config managed_config_digest managed_config_identity expected_config
+  local config_snapshot config_proof_digest config_proof_identity config_payload expected_config_payload
+  certificate=$(fm_backend_herdr_server_env_certificate_path "$session") || return 1
+  key=$(fm_backend_herdr_server_lock_key "$session") || return 1
+  certificate_snapshot=$(fm_backend_herdr_file_snapshot "$certificate" 0600 owner) || return 1
+  certificate_snapshot=${certificate_snapshot#*$'\n'}
+  payload=${certificate_snapshot#*$'\n'}
+  schema=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  recorded_key=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  pid=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  start=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell_digest=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_shell_identity=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_config=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  managed_config_digest=${payload%%$'\n'*}
+  managed_config_identity=${payload#*$'\n'}
+  case "$managed_config_identity" in ''|*$'\n'*) return 1 ;; esac
+  [ "$schema" = firstmate-herdr-closed-env-v2 ] \
+    && [ "$recorded_key" = "$key" ] || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$start" ] || return 1
+  expected_shell=$(fm_backend_herdr_managed_shell_path_for_digest "$managed_shell_digest") || return 1
+  [ "$managed_shell" = "$expected_shell" ] || return 1
+  managed_shell_proof=$(fm_backend_herdr_file_identity "$managed_shell" 0500 owner) || return 1
+  [ "${managed_shell_proof%%$'\n'*}" = "$managed_shell_digest" ] \
+    && [ "${managed_shell_proof#*$'\n'}" = "$managed_shell_identity" ] || return 1
+  # An fm-update that changes the reviewed source wrapper invalidates an old
+  # live server even though its immutable content-addressed copy still exists.
+  # The adapter must restart that server while idle before routing any worker.
+  source=$(fm_backend_herdr_managed_shell_source) || return 1
+  source_proof=$(fm_backend_herdr_file_identity "$source" executable root-or-owner) || return 1
+  source_digest=${source_proof%%$'\n'*}
+  [ "$source_digest" = "$managed_shell_digest" ] || return 1
+  expected_config=$(fm_backend_herdr_managed_config_path "$session" "$managed_shell") || return 1
+  [ "$managed_config" = "$expected_config" ] || return 1
+  config_snapshot=$(fm_backend_herdr_file_snapshot "$managed_config" 0600 owner) || return 1
+  config_proof_digest=${config_snapshot%%$'\n'*}
+  config_snapshot=${config_snapshot#*$'\n'}
+  config_proof_identity=${config_snapshot%%$'\n'*}
+  config_payload=${config_snapshot#*$'\n'}
+  [ "$config_proof_digest" = "$managed_config_digest" ] \
+    && [ "$config_proof_identity" = "$managed_config_identity" ] || return 1
+  expected_config_payload=$(fm_backend_herdr_managed_config_expected "$managed_shell") || return 1
+  [ "$config_payload" = "$expected_config_payload" ] || return 1
+  current=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$current" = "$start" ]
+}
+
+# Establish only lifecycle ownership, independently from the stronger current-
+# release helper/config proof above. This permits a server launched by the
+# immediately preceding adapter release to be restarted after an update, while
+# a manual or forged/unreadable server remains ineligible for automatic stop.
+fm_backend_herdr_server_adapter_owned() {  # <session>
+  local session=$1 certificate key snapshot payload schema recorded_key pid start current
+  key=$(fm_backend_herdr_server_lock_key "$session") || return 1
+  certificate=$(fm_backend_herdr_server_env_certificate_path "$session") || return 1
+  if [ ! -e "$certificate" ] && [ ! -L "$certificate" ]; then
+    certificate=$(fm_backend_herdr_server_legacy_env_certificate_path "$session") || return 1
+  fi
+  snapshot=$(fm_backend_herdr_file_snapshot "$certificate" 0600 owner) || return 1
+  snapshot=${snapshot#*$'\n'}
+  payload=${snapshot#*$'\n'}
+  schema=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  recorded_key=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  pid=${payload%%$'\n'*}
+  payload=${payload#*$'\n'}
+  start=${payload%%$'\n'*}
+  case "$schema" in
+    firstmate-herdr-closed-env-v1|firstmate-herdr-closed-env-v2) ;;
+    *) return 1 ;;
+  esac
+  [ "$recorded_key" = "$key" ] || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$start" ] || return 1
+  current=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$current" = "$start" ]
+}
+
+fm_backend_herdr_server_lock_file_ready() {  # <lock>
+  local mode links
+  mode=$(fm_backend_herdr_path_mode "$1") || return 1
+  links=$(fm_backend_herdr_path_nlink "$1") || return 1
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] \
+    && [ "$mode" = 600 ] && [ "$links" -eq 1 ]
+}
+
+FM_BACKEND_HERDR_SERVER_OWNER_PID=
+FM_BACKEND_HERDR_SERVER_OWNER_START=
+FM_BACKEND_HERDR_SERVER_OWNER_TOKEN=
+FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT=
+fm_backend_herdr_server_lock_owner_read() {  # <lock>
+  local owner=$1 mode payload line_count inode_before inode_after links PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  FM_BACKEND_HERDR_SERVER_OWNER_PID=
+  FM_BACKEND_HERDR_SERVER_OWNER_START=
+  FM_BACKEND_HERDR_SERVER_OWNER_TOKEN=
+  FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT=
+  [ -f "$owner" ] && [ ! -L "$owner" ] && [ -O "$owner" ] || return 1
+  mode=$(fm_backend_herdr_path_mode "$owner") || return 1
+  [ "$mode" = 600 ] || return 1
+  links=$(fm_backend_herdr_path_nlink "$owner") || return 1
+  [ "$links" -eq 1 ] || [ "$links" -eq 2 ] || return 1
+  inode_before=$(fm_backend_herdr_path_inode "$owner") || return 1
+  payload=$(fm_backend_herdr_control_exec cat "$owner" 2>/dev/null) || return 1
+  inode_after=$(fm_backend_herdr_path_inode "$owner") || return 1
+  [ "$inode_before" = "$inode_after" ] || return 1
+  line_count=$(printf '%s\n' "$payload" | fm_backend_herdr_control_exec awk 'END { print NR }')
+  [ "$line_count" -eq 3 ] || return 1
+  FM_BACKEND_HERDR_SERVER_OWNER_PID=$(printf '%s\n' "$payload" | fm_backend_herdr_control_exec sed -n '1p')
+  FM_BACKEND_HERDR_SERVER_OWNER_START=$(printf '%s\n' "$payload" | fm_backend_herdr_control_exec sed -n '2p')
+  FM_BACKEND_HERDR_SERVER_OWNER_TOKEN=$(printf '%s\n' "$payload" | fm_backend_herdr_control_exec sed -n '3p')
+  case "$FM_BACKEND_HERDR_SERVER_OWNER_PID" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$FM_BACKEND_HERDR_SERVER_OWNER_START" ] || return 1
+  case "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT=$payload
+}
+
+# Return 0 only for the same live process, 1 only when ps proves that the PID
+# is absent or reused, 2 for an indeterminate process probe, and 3 for an
+# incomplete owner record. Indeterminate probes are never treated as stale.
+fm_backend_herdr_server_lock_owner_state() {  # <lock>
+  local probe_status probe ps_bin PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  fm_backend_herdr_server_lock_owner_read "$1" || return 3
+  ps_bin=$(fm_backend_herdr_ps_bin) || return 2
+  probe=$(LC_ALL=C fm_backend_herdr_scrubbed_exec "$ps_bin" -o lstart= -p "$FM_BACKEND_HERDR_SERVER_OWNER_PID" 2>&1)
+  probe_status=$?
+  probe=$(printf '%s\n' "$probe" | fm_backend_herdr_control_exec sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ "$probe_status" -eq 0 ]; then
+    [ -n "$probe" ] || return 2
+    [ "$probe" = "$FM_BACKEND_HERDR_SERVER_OWNER_START" ] && return 0
+    return 1
+  fi
+  [ -n "$probe" ] && return 2
+  return 1
+}
+
+fm_backend_herdr_server_lock_has_quarantine() {  # <lock>
+  local candidate
+  for candidate in "$1".stale.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    return 0
+  done
+  fm_backend_herdr_artifact_has_quarantine "$1" && return 0
+  return 1
+}
+
+fm_backend_herdr_server_lock_token() {
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  printf '%s-%s-%s%s\n' "${BASHPID:-$$}" "$(fm_backend_herdr_control_exec date +%s)" "${RANDOM:-0}" "${RANDOM:-0}"
+}
+
+fm_backend_herdr_server_lock_stale_seconds() {
+  local seconds=${FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS:-11}
+  case "$seconds" in
+    ''|*[!0-9]*)
+      echo "error: FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS must be an integer of at least 11" >&2
+      return 1
+      ;;
+  esac
+  [ "$seconds" -ge 11 ] || {
+    echo "error: FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS must cover the 10-second Herdr startup window" >&2
+    return 1
+  }
+  printf '%s\n' "$seconds"
+}
+
+fm_backend_herdr_server_lock_is_stale_age() {  # <path>
+  local path=$1 age seconds
+  age=$(fm_backend_herdr_path_age "$path") || return 1
+  seconds=$(fm_backend_herdr_server_lock_stale_seconds) || return 1
+  [ "$age" -ge "$seconds" ]
+}
+
+fm_backend_herdr_server_lock_mark_launch_epoch() {  # <lock> <token> <inode>
+  local lock=$1 token=$2 expected_inode=$3 pid current_start PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  fm_backend_herdr_server_lock_file_ready "$lock" || return 1
+  [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
+  fm_backend_herdr_server_lock_owner_read "$lock" || return 1
+  pid=${BASHPID:-$$}
+  current_start=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ] || return 1
+  fm_backend_herdr_control_exec touch "$lock" 2>/dev/null || return 1
+  [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] \
+    && fm_backend_herdr_server_lock_file_ready "$lock" \
+    && fm_backend_herdr_server_lock_owner_read "$lock" \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ]
+}
+
+fm_backend_herdr_server_lock_remove_exact() {  # <path> <inode>
+  fm_backend_herdr_artifact_remove_attributed "$1" "$2"
+}
+
+# Resume an interrupted attributed deletion of a lifecycle lock, lock
+# candidate, or stale-lock quarantine. Authorization mirrors ordinary stale
+# lock recovery: a present generation must be proven dead/reused or malformed
+# and stale twice; a post-unlink empty quarantine can only be removed after its
+# own private descriptor identity and stale age are repeated.
+fm_backend_herdr_server_lock_recover_attributed() {  # <path> <quarantine>
+  local path=$1 quarantine=$2 key expected_inode quarantine_snapshot contents artifact
+  local artifact_inode state snapshot current_state PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  case "$quarantine" in "$path".quarantine.*) ;; *) return 1 ;; esac
+  key=${quarantine##*.quarantine.}
+  case "$key" in ''|*[!0-9_]*|_*|*_|*_*_*) return 1 ;; esac
+  expected_inode=${key/_/:}
+  quarantine_snapshot=$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine") \
+    || return 1
+  contents=${quarantine_snapshot#*$'\n'}
+  fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+  case "$contents" in
+    empty)
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        artifact=
+      else
+        artifact=$path
+      fi
+      ;;
+    artifact)
+      [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+      artifact="$quarantine/artifact"
+      ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$artifact" ]; then
+    artifact_inode=$(fm_backend_herdr_path_inode "$artifact" 2>/dev/null) || return 1
+    [ "$artifact_inode" = "$expected_inode" ] || return 1
+    if fm_backend_herdr_server_lock_owner_state "$artifact"; then state=0; else state=$?; fi
+    snapshot=$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT
+    case "$state" in
+      1|3) fm_backend_herdr_server_lock_is_stale_age "$artifact" || return 1 ;;
+      *) return 1 ;;
+    esac
+    [ "$(fm_backend_herdr_path_inode "$artifact" 2>/dev/null)" = "$artifact_inode" ] \
+      || return 1
+    if [ "$state" -eq 1 ]; then
+      if fm_backend_herdr_server_lock_owner_state "$artifact"; then current_state=0; else current_state=$?; fi
+      [ "$current_state" -eq 1 ] \
+        && [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+    else
+      fm_backend_herdr_server_lock_owner_read "$artifact" && return 1
+      fm_backend_herdr_server_lock_is_stale_age "$artifact" || return 1
+    fi
+  fi
+  [ "$(fm_backend_herdr_artifact_quarantine_snapshot "$quarantine")" = "$quarantine_snapshot" ] \
+    || return 1
+  fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+  fm_backend_herdr_artifact_resume_attributed "$path" "$expected_inode"
+}
+
+fm_backend_herdr_server_lock_cleanup_initialization() {  # <lock> <inode> <token>
+  local lock=$1 expected_inode=$2 token=$3
+  [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
+  fm_backend_herdr_server_lock_owner_read "$lock" || return 1
+  [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ] || return 1
+  fm_backend_herdr_server_lock_remove_exact "$lock" "$expected_inode"
+}
+
+FM_BACKEND_HERDR_SERVER_LOCK_TOKEN=
+FM_BACKEND_HERDR_SERVER_LOCK_INODE=
+fm_backend_herdr_server_lock_try_create() {  # <lock>
+  local lock=$1 pid start token inode candidate lock_inode PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  FM_BACKEND_HERDR_SERVER_LOCK_TOKEN=
+  FM_BACKEND_HERDR_SERVER_LOCK_INODE=
+  pid=${BASHPID:-$$}
+  start=$(fm_backend_herdr_process_start "$pid") || return 1
+  token=$(fm_backend_herdr_server_lock_token) || return 1
+  fm_backend_herdr_server_lock_has_quarantine "$lock" && return 1
+  candidate="$lock.candidate.$token"
+  (umask 077; set -C; printf '%s\n%s\n%s\n' "$pid" "$start" "$token" > "$candidate") \
+    2>/dev/null || return 1
+  fm_backend_herdr_control_exec chmod 600 "$candidate" 2>/dev/null || {
+    fm_backend_herdr_control_exec rm -f "$candidate" 2>/dev/null || true
+    return 1
+  }
+  inode=$(fm_backend_herdr_path_inode "$candidate") || {
+    fm_backend_herdr_control_exec rm -f "$candidate" 2>/dev/null || true
+    return 1
+  }
+  if ! fm_backend_herdr_server_lock_file_ready "$candidate" \
+    || ! fm_backend_herdr_server_lock_owner_read "$candidate" \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" != "$pid" ] \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" != "$start" ] \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" != "$token" ]; then
+    fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_CANDIDATE_READY_FILE:-}" ]; then
+    : > "$FM_TEST_HERDR_CANDIDATE_READY_FILE"
+  fi
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_CANDIDATE_RELEASE_FILE:-}" ]; then
+    while [ ! -e "$FM_TEST_HERDR_CANDIDATE_RELEASE_FILE" ]; do fm_backend_herdr_control_exec sleep 0.01; done
+  fi
+  if fm_backend_herdr_server_lock_has_quarantine "$lock" \
+    || ! fm_backend_herdr_control_exec ln "$candidate" "$lock" 2>/dev/null; then
+    fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode" >/dev/null 2>&1 || true
+    return 1
+  fi
+  lock_inode=$(fm_backend_herdr_path_inode "$lock") || lock_inode=
+  if [ "$lock_inode" != "$inode" ]; then
+    fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_LOCK_LINK:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_LOCK_LINK"
+    kill -KILL "${BASHPID:-$$}"
+  fi
+  if ! fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode"; then
+    fm_backend_herdr_server_lock_remove_exact "$lock" "$inode" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! fm_backend_herdr_server_lock_file_ready "$lock" \
+    || ! fm_backend_herdr_server_lock_owner_read "$lock" \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" != "$pid" ] \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" != "$start" ] \
+    || [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" != "$token" ] \
+    || fm_backend_herdr_server_lock_has_quarantine "$lock"; then
+    fm_backend_herdr_server_lock_cleanup_initialization "$lock" "$inode" "$token" \
+      >/dev/null 2>&1 || true
+    return 1
+  fi
+  FM_BACKEND_HERDR_SERVER_LOCK_TOKEN=$token
+  FM_BACKEND_HERDR_SERVER_LOCK_INODE=$inode
+}
+
+fm_backend_herdr_server_lock_restore_quarantine() {  # <quarantine> <lock>
+  local PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+  fm_backend_herdr_control_exec mv "$1" "$2" 2>/dev/null
+}
+
+fm_backend_herdr_server_lock_remove_quarantine() {  # <quarantine>
+  local quarantine=$1 inode
+  inode=$(fm_backend_herdr_path_inode "$quarantine") || return 1
+  fm_backend_herdr_server_lock_remove_exact "$quarantine" "$inode"
+}
+
+fm_backend_herdr_server_lock_recover_candidates() {  # <lock>
+  local lock=$1 candidate quarantine inode state snapshot current_state
+  for quarantine in "$lock".candidate.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    candidate=${quarantine%.quarantine.*}
+    fm_backend_herdr_server_lock_recover_attributed "$candidate" "$quarantine" || return 1
+  done
+  for candidate in "$lock".candidate.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    case "$candidate" in *.quarantine.*) continue ;; esac
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -O "$candidate" ] || return 1
+    inode=$(fm_backend_herdr_path_inode "$candidate") || return 1
+    if fm_backend_herdr_server_lock_owner_state "$candidate"; then state=0; else state=$?; fi
+    snapshot=$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT
+    case "$state" in
+      0|2) continue ;;
+      1|3) fm_backend_herdr_server_lock_is_stale_age "$candidate" || continue ;;
+      *) return 1 ;;
+    esac
+    [ "$(fm_backend_herdr_path_inode "$candidate" 2>/dev/null)" = "$inode" ] || return 1
+    if [ "$state" -eq 1 ]; then
+      if fm_backend_herdr_server_lock_owner_state "$candidate"; then current_state=0; else current_state=$?; fi
+      [ "$current_state" -eq 1 ] \
+        && [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+    else
+      fm_backend_herdr_server_lock_owner_read "$candidate" && return 1
+      fm_backend_herdr_server_lock_is_stale_age "$candidate" || return 1
+    fi
+    fm_backend_herdr_server_lock_remove_exact "$candidate" "$inode" || return 1
+  done
+}
+
+fm_backend_herdr_server_lock_try_reclaim() {  # <lock>
+  local lock=$1 inode state snapshot quarantine quarantine_token current_state PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  [ -f "$lock" ] && [ ! -L "$lock" ] && [ -O "$lock" ] || return 1
+  inode=$(fm_backend_herdr_path_inode "$lock") || return 1
+  if fm_backend_herdr_server_lock_owner_state "$lock"; then state=0; else state=$?; fi
+  snapshot=$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT
+  case "$state" in
+    1|3) fm_backend_herdr_server_lock_is_stale_age "$lock" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$inode" ] || return 1
+  if [ "$state" -eq 1 ]; then
+    if fm_backend_herdr_server_lock_owner_state "$lock"; then current_state=0; else current_state=$?; fi
+    [ "$current_state" -eq 1 ] \
+      && [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+  else
+    fm_backend_herdr_server_lock_owner_read "$lock" && return 1
+    fm_backend_herdr_server_lock_is_stale_age "$lock" || return 1
+  fi
+  quarantine_token=$(fm_backend_herdr_server_lock_token) || return 1
+  quarantine="$lock.stale.$quarantine_token"
+  fm_backend_herdr_control_exec mv "$lock" "$quarantine" 2>/dev/null || return 1
+  if fm_backend_herdr_test_hooks_enabled \
+    && [ -n "${FM_TEST_HERDR_KILL_AFTER_QUARANTINE_RENAME:-}" ]; then
+    : > "$FM_TEST_HERDR_KILL_AFTER_QUARANTINE_RENAME"
+    kill -KILL "${BASHPID:-$$}"
+  fi
+  if [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" != "$inode" ]; then
+    fm_backend_herdr_server_lock_restore_quarantine "$quarantine" "$lock" >/dev/null 2>&1 || true
+    return 2
+  fi
+  if [ "$state" -eq 1 ]; then
+    if fm_backend_herdr_server_lock_owner_state "$quarantine"; then current_state=0; else current_state=$?; fi
+    if [ "$current_state" -ne 1 ] \
+      || [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" != "$snapshot" ]; then
+      fm_backend_herdr_server_lock_restore_quarantine "$quarantine" "$lock" >/dev/null 2>&1 || true
+      return 2
+    fi
+  else
+    if fm_backend_herdr_server_lock_owner_read "$quarantine"; then
+      fm_backend_herdr_server_lock_restore_quarantine "$quarantine" "$lock" >/dev/null 2>&1 || true
+      return 2
+    fi
+    if ! fm_backend_herdr_server_lock_is_stale_age "$quarantine"; then
+      fm_backend_herdr_server_lock_restore_quarantine "$quarantine" "$lock" >/dev/null 2>&1 || true
+      return 2
+    fi
+  fi
+  fm_backend_herdr_server_lock_remove_quarantine "$quarantine" || return 2
+}
+
+fm_backend_herdr_server_lock_recover_quarantine() {  # <quarantine> <lock>
+  local quarantine=$1 lock=$2 inode state snapshot current_state PATH=$FM_BACKEND_HERDR_CONTROL_PATH
+  [ -f "$quarantine" ] && [ ! -L "$quarantine" ] && [ -O "$quarantine" ] || return 1
+  inode=$(fm_backend_herdr_path_inode "$quarantine") || return 1
+  if fm_backend_herdr_server_lock_owner_state "$quarantine"; then state=0; else state=$?; fi
+  snapshot=$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT
+  case "$state" in
+    0|2)
+      [ ! -e "$lock" ] && [ ! -L "$lock" ] || return 1
+      [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$inode" ] || return 1
+      fm_backend_herdr_server_lock_owner_read "$quarantine" || return 1
+      [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+      fm_backend_herdr_control_exec mv "$quarantine" "$lock" 2>/dev/null || return 1
+      [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$inode" ] || return 1
+      ;;
+    1|3)
+      fm_backend_herdr_server_lock_is_stale_age "$quarantine" || return 1
+      [ "$(fm_backend_herdr_path_inode "$quarantine" 2>/dev/null)" = "$inode" ] || return 1
+      if [ "$state" -eq 1 ]; then
+        if fm_backend_herdr_server_lock_owner_state "$quarantine"; then current_state=0; else current_state=$?; fi
+        [ "$current_state" -eq 1 ] \
+          && [ "$FM_BACKEND_HERDR_SERVER_OWNER_SNAPSHOT" = "$snapshot" ] || return 1
+      else
+        fm_backend_herdr_server_lock_owner_read "$quarantine" && return 1
+      fi
+      fm_backend_herdr_server_lock_remove_quarantine "$quarantine" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_backend_herdr_server_lock_recover_quarantines() {  # <lock>
+  local lock=$1 quarantine attributed
+  for quarantine in "$lock".quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    fm_backend_herdr_server_lock_recover_attributed "$lock" "$quarantine" || return 1
+  done
+  for quarantine in "$lock".stale.*.quarantine.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    attributed=${quarantine%.quarantine.*}
+    fm_backend_herdr_server_lock_recover_attributed "$attributed" "$quarantine" || return 1
+  done
+  for quarantine in "$lock".stale.*; do
+    [ -e "$quarantine" ] || [ -L "$quarantine" ] || continue
+    case "$quarantine" in *.quarantine.*) continue ;; esac
+    fm_backend_herdr_server_lock_recover_quarantine "$quarantine" "$lock" || return 1
+  done
+  fm_backend_herdr_server_lock_has_quarantine "$lock" && return 1
+  return 0
+}
+
+fm_backend_herdr_server_lock_release() {  # <lock> <token> [inode]
+  local lock=$1 token=$2 expected_inode=${3:-} pid current_start
+  fm_backend_herdr_server_lock_file_ready "$lock" || return 1
+  [ -n "$expected_inode" ] || expected_inode=$(fm_backend_herdr_path_inode "$lock") || return 1
+  if [ -n "$expected_inode" ]; then
+    [ "$(fm_backend_herdr_path_inode "$lock" 2>/dev/null)" = "$expected_inode" ] || return 1
+  fi
+  fm_backend_herdr_server_lock_owner_read "$lock" || return 1
+  pid=${BASHPID:-$$}
+  current_start=$(fm_backend_herdr_process_start "$pid") || return 1
+  [ "$FM_BACKEND_HERDR_SERVER_OWNER_PID" = "$pid" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_START" = "$current_start" ] \
+    && [ "$FM_BACKEND_HERDR_SERVER_OWNER_TOKEN" = "$token" ] || return 1
+  fm_backend_herdr_server_lock_remove_exact "$lock" "$expected_inode"
+}
+
+fm_backend_herdr_server_lock_try_acquire() {  # <lock>
+  local lock=$1
+  fm_backend_herdr_server_lock_recover_candidates "$lock" || return 1
+  fm_backend_herdr_server_lock_recover_quarantines "$lock" || return 1
+  fm_backend_herdr_server_lock_try_create "$lock" && return 0
+  fm_backend_herdr_server_lock_try_reclaim "$lock" || return 1
+  fm_backend_herdr_server_lock_try_create "$lock"
+}
+
+FM_BACKEND_HERDR_SERVER_LOCK=
+fm_backend_herdr_server_lock_acquire() {  # <session> [launch|lifecycle]; launch rc=2 means server became ready
+  local session=$1 purpose=${2:-launch} root key lock attempt wait_steps running
+  FM_BACKEND_HERDR_SERVER_LOCK=
+  FM_BACKEND_HERDR_SERVER_LOCK_TOKEN=
+  FM_BACKEND_HERDR_SERVER_LOCK_INODE=
+  fm_backend_herdr_server_lock_root_prepare || return 1
+  root=$(fm_backend_herdr_server_lock_root) || return 1
+  key=$(fm_backend_herdr_server_lock_key "$session") || return 1
+  lock="$root/$key.lock"
+  wait_steps=${FM_BACKEND_HERDR_SERVER_LOCK_WAIT_STEPS:-300}
+  case "$wait_steps" in ''|*[!0-9]*|0) echo "error: FM_BACKEND_HERDR_SERVER_LOCK_WAIT_STEPS must be a positive integer" >&2; return 1 ;; esac
+  fm_backend_herdr_server_lock_stale_seconds >/dev/null || return 1
+  case "$purpose" in launch|lifecycle) ;; *) return 1 ;; esac
+  attempt=1
+  while [ "$attempt" -le "$wait_steps" ]; do
+    if fm_backend_herdr_server_lock_try_acquire "$lock"; then
+      FM_BACKEND_HERDR_SERVER_LOCK=$lock
+      return 0
+    fi
+    if [ "$purpose" = launch ]; then
+      running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
+      [ "$running" != true ] || return 2
+    fi
+    fm_backend_herdr_control_exec sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  echo "error: timed out waiting for the Herdr server launch lock for session '$session'" >&2
+  return 1
+}
+
+fm_backend_herdr_server_exact_session_state() {  # <session>; prints empty|occupied|indeterminate
+  local session=$1 payload count
+  payload=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || {
+    printf 'indeterminate'
+    return 0
+  }
+  count=$(printf '%s' "$payload" | fm_backend_herdr_control_jq -er \
+    'if (.result.workspaces | type) == "array" then (.result.workspaces | length) else error("workspaces") end' \
+    2>/dev/null) || { printf 'indeterminate'; return 0; }
+  [ "$count" -eq 0 ] || { printf 'occupied'; return 0; }
+
+  payload=$(fm_backend_herdr_cli "$session" tab list 2>/dev/null) || {
+    printf 'indeterminate'
+    return 0
+  }
+  count=$(printf '%s' "$payload" | fm_backend_herdr_control_jq -er \
+    'if (.result.tabs | type) == "array" then (.result.tabs | length) else error("tabs") end' \
+    2>/dev/null) || { printf 'indeterminate'; return 0; }
+  [ "$count" -eq 0 ] || { printf 'occupied'; return 0; }
+
+  payload=$(fm_backend_herdr_cli "$session" pane list 2>/dev/null) || {
+    printf 'indeterminate'
+    return 0
+  }
+  count=$(printf '%s' "$payload" | fm_backend_herdr_control_jq -er \
+    'if (.result.panes | type) == "array" then (.result.panes | length) else error("panes") end' \
+    2>/dev/null) || { printf 'indeterminate'; return 0; }
+  [ "$count" -eq 0 ] && printf 'empty' || printf 'occupied'
+}
+
+# Stop only the exact, explicitly named session after two complete empty-state
+# proofs and a repeated adapter-process ownership proof. Never use Herdr's
+# ambient `server stop`, and never delete session state (including `default`).
+fm_backend_herdr_server_stop_owned_empty() {  # <session>
+  local session=$1 state running attempt false_count=0
+  fm_backend_herdr_server_adapter_owned "$session" || return 1
+  state=$(fm_backend_herdr_server_exact_session_state "$session") || return 1
+  [ "$state" = empty ] || return 1
+  fm_backend_herdr_server_adapter_owned "$session" || return 1
+  state=$(fm_backend_herdr_server_exact_session_state "$session") || return 1
+  [ "$state" = empty ] || return 1
+  fm_backend_herdr_cli "$session" session stop "$session" --json >/dev/null 2>&1 || return 1
+  attempt=1
+  while [ "$attempt" -le 100 ]; do
+    running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
+      | fm_backend_herdr_control_jq -er 'if (.server.running | type) == "boolean" then (.server.running | tostring) else error("running") end' 2>/dev/null) \
+      || running=indeterminate
+    if [ "$running" = false ]; then
+      false_count=$((false_count + 1))
+      [ "$false_count" -lt 2 ] || return 0
+    else
+      false_count=0
+    fi
+    fm_backend_herdr_control_exec sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# fm_backend_herdr_server_ensure: serialize the complete process/certificate
+# lifecycle before any caller may inspect or create a workspace. A current
+# certified server is reused. An adapter-owned but release-drifted server is
+# restarted only when the exact named session is proven structurally empty;
+# occupied, unreadable, or manual servers fail closed without mutation.
+fm_backend_herdr_server_ensure() {  # <session>
+  local session=$1 running
+  running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
+  if ! fm_backend_herdr_server_certificate_required; then
+    [ "$running" = "true" ] && return 0
+  fi
+  (
+    lock_status=0
+    if fm_backend_herdr_server_certificate_required; then
+      fm_backend_herdr_server_lock_acquire "$session" lifecycle || lock_status=$?
+    else
+      fm_backend_herdr_server_lock_acquire "$session" launch || lock_status=$?
+    fi
+    [ "$lock_status" -ne 2 ] || exit 0
+    [ "$lock_status" -eq 0 ] || exit "$lock_status"
+    server_lock=$FM_BACKEND_HERDR_SERVER_LOCK
+    server_lock_token=$FM_BACKEND_HERDR_SERVER_LOCK_TOKEN
+    server_lock_inode=$FM_BACKEND_HERDR_SERVER_LOCK_INODE
+    # Invoked through the EXIT trap below.
+    # shellcheck disable=SC2329
+    cleanup_server_lock() {
+      fm_backend_herdr_server_lock_release \
+        "$server_lock" "$server_lock_token" "$server_lock_inode" >/dev/null 2>&1 || true
+    }
+    trap cleanup_server_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Recheck under the per-session machine-local lock. Two FirstMate homes or
+    # two simultaneous callers may both observe the server as absent, but only
+    # the lifecycle owner is allowed to reuse, stop, or launch it.
+    running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
+      | fm_backend_herdr_control_jq -er 'if (.server.running | type) == "boolean" then (.server.running | tostring) else error("running") end' 2>/dev/null) \
+      || running=indeterminate
+    if [ "$running" = true ]; then
+      if ! fm_backend_herdr_server_certificate_required; then
+        exit 0
+      fi
+      if fm_backend_herdr_server_closed_shell_environment_ready "$session"; then
+        exit 0
+      fi
+      if ! fm_backend_herdr_server_adapter_owned "$session"; then
+        echo "error: refusing to replace an uncertified or manually launched Herdr server for exact session '$session'" >&2
+        exit 1
+      fi
+      exact_state=$(fm_backend_herdr_server_exact_session_state "$session") || exact_state=indeterminate
+      case "$exact_state" in
+        empty) ;;
+        occupied)
+          echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is occupied" >&2
+          exit 1
+          ;;
+        *)
+          echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is indeterminate" >&2
+          exit 1
+          ;;
+      esac
+      fm_backend_herdr_server_stop_owned_empty "$session" || {
+        echo "error: exact Herdr session '$session' changed or did not stop cleanly before its certified restart" >&2
+        exit 1
+      }
+      running=false
+    elif [ "$running" != false ]; then
+      echo "error: cannot determine whether exact Herdr session '$session' is running; refusing lifecycle mutation" >&2
+      exit 1
+    fi
+    if fm_backend_herdr_test_hooks_enabled \
+      && [ -n "${FM_TEST_HERDR_DELAY_BEFORE_LAUNCH:-}" ]; then
+      fm_backend_herdr_control_exec sleep "$FM_TEST_HERDR_DELAY_BEFORE_LAUNCH"
+    fi
+    fm_backend_herdr_server_lock_mark_launch_epoch \
+      "$server_lock" "$server_lock_token" "$server_lock_inode" || exit 1
+    fm_backend_herdr_server_launch_detached "$session" || exit 1
+    # Give the double-forked grandchild one scheduling turn to exec before the
+    # first status poll. The bounded loop below remains the readiness authority.
+    fm_backend_herdr_control_exec sleep "${FM_BACKEND_HERDR_LAUNCH_SETTLE:-0.1}"
+    i=1
+    while [ "$i" -le 20 ]; do
+      running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
+      if [ "$running" = "true" ]; then
+        if ! fm_backend_herdr_server_certificate_required \
+          || fm_backend_herdr_server_closed_shell_environment_ready "$session"; then
+          exit 0
+        fi
+      fi
+      fm_backend_herdr_control_exec sleep 0.5
+      i=$((i + 1))
+    done
+    echo "error: herdr server for session '$session' did not report running within 10s" >&2
+    exit 1
+  )
 }
 
 # fm_backend_herdr_workspace_find: this HOME's own workspace id inside
@@ -234,6 +1955,7 @@ fm_backend_herdr_server_ensure() {  # <session>
 # uniqueness at all, so this adopts the FIRST matching workspace `jq` returns
 # (list order, normally creation order/oldest) rather than disambiguating -
 # identical in spirit to the pre-existing tab duplicate-label check below.
+# shellcheck disable=SC2016
 fm_backend_herdr_workspace_find() {  # <session>
   local session=$1 label list
   label=$(fm_backend_herdr_workspace_label)
@@ -243,8 +1965,8 @@ fm_backend_herdr_workspace_find() {  # <session>
   # compile error that `2>/dev/null` would silently swallow, making this find
   # ALWAYS return empty and every spawn mint a fresh "firstmate" workspace
   # (the workspace leak).
-  printf '%s' "$list" | jq -r --arg want "$label" \
-    '.result.workspaces[]? | select(.label == $want) | .workspace_id' 2>/dev/null | head -1
+  printf '%s' "$list" | fm_backend_herdr_control_jq -r --arg want "$label" \
+    '.result.workspaces[]? | select(.label == $want) | .workspace_id' 2>/dev/null | fm_backend_herdr_control_head -1
 }
 
 # fm_backend_herdr_workspace_prune_seeded_default_tab: close EXACTLY
@@ -289,18 +2011,19 @@ fm_backend_herdr_workspace_find() {  # <session>
 # workspace - callers only invoke it once at least one other (real task) tab
 # exists alongside it, never right after workspace creation - and this
 # function independently re-checks the tab count as a second layer.
+# shellcheck disable=SC2016
 fm_backend_herdr_workspace_prune_seeded_default_tab() {  # <session> <workspace_id> <seeded_tab_id>
   local session=$1 wsid=$2 tab_id=$3 tabs tab_count current_label pane_id agent_out agent_status
   [ -n "$tab_id" ] || return 0
   tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 0
-  tab_count=$(printf '%s' "$tabs" | jq -r '.result.tabs? // [] | length' 2>/dev/null)
+  tab_count=$(printf '%s' "$tabs" | fm_backend_herdr_control_jq -r '.result.tabs? // [] | length' 2>/dev/null)
   case "$tab_count" in ''|*[!0-9]*|0|1) return 0 ;; esac
-  current_label=$(printf '%s' "$tabs" | jq -r --arg t "$tab_id" '.result.tabs[]? | select(.tab_id == $t) | .label' 2>/dev/null)
+  current_label=$(printf '%s' "$tabs" | fm_backend_herdr_control_jq -r --arg t "$tab_id" '.result.tabs[]? | select(.tab_id == $t) | .label' 2>/dev/null)
   [ "$current_label" = "1" ] || return 0
   pane_id=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$tab_id") || return 0
   [ -n "$pane_id" ] || return 0
   agent_out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>/dev/null)
-  agent_status=$(printf '%s' "$agent_out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  agent_status=$(printf '%s' "$agent_out" | fm_backend_herdr_control_jq -r '.result.agent.agent_status // empty' 2>/dev/null)
   [ "$agent_status" = working ] && return 0
   fm_backend_herdr_cli "$session" pane close "$pane_id" >/dev/null 2>&1 || true
 }
@@ -354,7 +2077,7 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
   fi
   label=$(fm_backend_herdr_workspace_label)
   out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
-  wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
+  wsid=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
   [ -n "$wsid" ] || return 1
   FM_BACKEND_HERDR_WS_ID=$wsid
   # Herdr seeds a new workspace with one auto-created default tab firstmate
@@ -364,7 +2087,7 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
   # workspace we just created. fm_backend_herdr_create_task prunes it instead,
   # once the first real task tab exists alongside it, and only ever targets
   # this exact captured tab_id.
-  FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+  FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   printf '%s' "$wsid"
 }
 
@@ -432,23 +2155,23 @@ fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
   # same final answer, which this function's dead/no-agent/live/unknown
   # distinction cannot afford to do.
   out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
-  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  code=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.error.code // empty' 2>/dev/null)
   if [ -n "$code" ]; then
     [ "$code" = "pane_not_found" ] && printf 'dead' || printf 'unknown'
     return 0
   fi
-  pid=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty' 2>/dev/null)
+  pid=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.pane.pane_id // empty' 2>/dev/null)
   if [ "$pid" != "$pane_id" ]; then
     printf 'unknown'
     return 0
   fi
   out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>&1)
-  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  code=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.error.code // empty' 2>/dev/null)
   if [ -n "$code" ]; then
     [ "$code" = "agent_not_found" ] && printf 'no-agent' || printf 'unknown'
     return 0
   fi
-  status=$(printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  status=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.agent.agent_status // empty' 2>/dev/null)
   case "$status" in
     working|idle|done|blocked) printf 'live' ;;
     *) printf 'unknown' ;;
@@ -540,12 +2263,13 @@ fm_backend_herdr_agent_alive() {  # <target> [expected-label]
 # the safety argument). An ADOPTED workspace's caller always passes an empty
 # 4th arg, so this function never even queries for a prune candidate in that
 # case. Echoes "<tab_id> <pane_id>" on success.
+# shellcheck disable=SC2016
 fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_tab_id>
   local container=$1 label=$2 cwd=$3 seeded_tab_id=${4:-} session wsid list dup_tabs dup dup_pane dup_tab_ids out tab_id pane_id remaining_dup_tabs
   session=${container%%:*}
   wsid=${container#*:}
   list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 1
-  dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" 'if (.result.tabs | type) == "array" then .result.tabs[] | select(.label == $want) | .tab_id else error("missing result.tabs") end' 2>/dev/null) || {
+  dup_tabs=$(printf '%s' "$list" | fm_backend_herdr_control_jq -r --arg want "$label" 'if (.result.tabs | type) == "array" then .result.tabs[] | select(.label == $want) | .tab_id else error("missing result.tabs") end' 2>/dev/null) || {
     echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
     return 1
   }
@@ -564,8 +2288,8 @@ $dup_tabs
 EOF
   fi
   out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
-  tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
-  pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
+  tab_id=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+  pane_id=$(printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
     echo "error: could not parse tab/pane id from herdr tab create output" >&2
     return 1
@@ -583,12 +2307,12 @@ EOF
       fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     }
-    if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
+    if ! printf '%s' "$list" | fm_backend_herdr_control_jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
       fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       return 1
     fi
-    remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
+    remaining_dup_tabs=$(printf '%s' "$list" | fm_backend_herdr_control_jq -r --arg want "$label" --arg replacement "$tab_id" \
       '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null) || {
       echo "error: could not parse herdr husk-removal verification listing for tab '$label' in workspace $wsid (session $session)" >&2
       fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
@@ -658,7 +2382,8 @@ fm_backend_herdr_identity_from_meta() {  # <target> <expected-label>
     if [ "$kind" = secondmate ]; then
       endpoint_home=$(fm_meta_get "$meta" home)
       [ -n "$endpoint_home" ] || return 1
-      marker_id=$(tr -d '[:space:]' < "$endpoint_home/$FM_BACKEND_HERDR_SECONDMATE_MARKER" 2>/dev/null) || return 1
+      marker_id=$(fm_backend_herdr_control_exec tr -d '[:space:]' \
+        < "$endpoint_home/$FM_BACKEND_HERDR_SECONDMATE_MARKER" 2>/dev/null) || return 1
       [ "$marker_id" = "$id" ] || return 1
     fi
     workspace_label=$(fm_backend_herdr_workspace_label_for_home "$endpoint_home")
@@ -684,6 +2409,7 @@ fm_backend_herdr_expected_identity() {  # <target> <expected-label-or-identity>
   fm_backend_herdr_identity_pack "$expected" "$workspace" "$workspace_label"
 }
 
+# shellcheck disable=SC2016
 fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   local target=$1 expected=${2:-} identity panes pane_record tabs tab_id workspaces labeled_workspaces labeled_workspace
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
@@ -694,7 +2420,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   fi
   panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$panes" | jq -e '
+  if ! printf '%s\n' "$panes" | fm_backend_herdr_control_jq -e '
     (.result.panes | type) == "array"
     and all(.result.panes[];
       type == "object"
@@ -706,7 +2432,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     printf 'unknown'
     return 0
   fi
-  pane_record=$(printf '%s\n' "$panes" | jq -cr --arg pane "$FM_BACKEND_HERDR_PANE" \
+  pane_record=$(printf '%s\n' "$panes" | fm_backend_herdr_control_jq -cr --arg pane "$FM_BACKEND_HERDR_PANE" \
     '[.result.panes[] | select(.pane_id == $pane)] | first // null' 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   if [ -z "$expected" ]; then
@@ -715,7 +2441,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
   fi
   workspaces=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" workspace list 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$workspaces" | jq -e '
+  if ! printf '%s\n' "$workspaces" | fm_backend_herdr_control_jq -e '
     (.result.workspaces | type) == "array"
     and all(.result.workspaces[];
       type == "object"
@@ -726,7 +2452,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     printf 'unknown'
     return 0
   fi
-  if ! printf '%s\n' "$workspaces" | jq -e \
+  if ! printf '%s\n' "$workspaces" | fm_backend_herdr_control_jq -e \
     --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
     --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
     'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace and .label == $want_label)' >/dev/null 2>&1; then
@@ -740,13 +2466,13 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
     # including any CLI or parse failure below - stays mismatch/unknown so
     # callers fail closed instead of releasing a live target's lease.
     if [ "$pane_record" != null ]; then printf 'mismatch'; return 0; fi
-    if printf '%s\n' "$workspaces" | jq -e \
+    if printf '%s\n' "$workspaces" | fm_backend_herdr_control_jq -e \
       --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
       'any(.result.workspaces[]?; (.workspace_id | tostring) == $workspace)' >/dev/null 2>&1; then
       printf 'mismatch'
       return 0
     fi
-    labeled_workspaces=$(printf '%s\n' "$workspaces" | jq -r \
+    labeled_workspaces=$(printf '%s\n' "$workspaces" | fm_backend_herdr_control_jq -r \
       --arg want_label "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE_LABEL" \
       '.result.workspaces[]? | select(.label == $want_label) | .workspace_id' 2>/dev/null) \
       || { printf 'unknown'; return 0; }
@@ -754,7 +2480,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
       [ -n "$labeled_workspace" ] || continue
       tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$labeled_workspace" 2>/dev/null) \
         || { printf 'unknown'; return 0; }
-      if ! printf '%s\n' "$tabs" | jq -e '
+      if ! printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e '
         (.result.tabs | type) == "array"
         and all(.result.tabs[];
           type == "object"
@@ -767,7 +2493,7 @@ fm_backend_herdr_identity_state() {  # <target> [expected-label-or-identity]
         printf 'unknown'
         return 0
       fi
-      if printf '%s\n' "$tabs" | jq -e \
+      if printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e \
         --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
         'any(.result.tabs[]?; .label == $want_label)' >/dev/null 2>&1; then
         printf 'mismatch'
@@ -781,7 +2507,7 @@ EOF
   fi
   tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list --workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if ! printf '%s\n' "$tabs" | jq -e '
+  if ! printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e '
     (.result.tabs | type) == "array"
     and all(.result.tabs[];
       type == "object"
@@ -795,7 +2521,7 @@ EOF
     return 0
   fi
   if [ "$pane_record" = null ]; then
-    if printf '%s\n' "$tabs" | jq -e \
+    if printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e \
       --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
       --arg want_label "$FM_BACKEND_HERDR_EXPECTED_LABEL" \
       'any(.result.tabs[]?;
@@ -807,9 +2533,9 @@ EOF
     fi
     return 0
   fi
-  tab_id=$(printf '%s\n' "$pane_record" | jq -r '.tab_id' 2>/dev/null) \
+  tab_id=$(printf '%s\n' "$pane_record" | fm_backend_herdr_control_jq -r '.tab_id' 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  if printf '%s\n' "$tabs" | jq -e \
+  if printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e \
     --arg tab "$tab_id" \
     --arg recorded_tab "$FM_BACKEND_HERDR_EXPECTED_TAB" \
     --arg workspace "$FM_BACKEND_HERDR_EXPECTED_WORKSPACE" \
@@ -820,7 +2546,7 @@ EOF
       and (.workspace_id | tostring) == $workspace
       and .label == $want_label)' >/dev/null 2>&1; then
     printf 'match'
-  elif printf '%s\n' "$tabs" | jq -e --arg tab "$tab_id" \
+  elif printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -e --arg tab "$tab_id" \
     'any(.result.tabs[]?; (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
     printf 'mismatch'
   else
@@ -854,7 +2580,7 @@ fm_backend_herdr_target_ready() {  # <target> [expected-label]
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+    | fm_backend_herdr_control_jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,
@@ -1026,7 +2752,7 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
         found=1
         ;;
       *)
-        if printf '%s' "$trimmed" | grep -qE "$FM_BACKEND_HERDR_BARE_PROMPT_RE"; then
+        if printf '%s' "$trimmed" | fm_backend_herdr_control_grep -qE "$FM_BACKEND_HERDR_BARE_PROMPT_RE"; then
           shape=bare
           raw_match=$line
           found=1
@@ -1127,7 +2853,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'send-failed'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
-  sleep "$settle"
+  fm_backend_herdr_control_exec sleep "$settle"
   baseline=$(fm_backend_herdr_classify_submit_agent_status \
     "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
@@ -1137,7 +2863,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
     else
-      sleep "$sleep_s"
+      fm_backend_herdr_control_exec sleep "$sleep_s"
       verdict=$(fm_backend_herdr_composer_state "$target")
     fi
     case "$verdict" in
@@ -1197,7 +2923,7 @@ fm_backend_herdr_classify_submit_agent_status() {  # <raw-agent_status>
 fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
   local session=$1 pane_id=$2 out
   out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>/dev/null) || { printf ''; return 0; }
-  printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null
+  printf '%s' "$out" | fm_backend_herdr_control_jq -r '.result.agent.agent_status // empty' 2>/dev/null
 }
 
 # fm_backend_herdr_busy_state: semantic busy state from herdr's native
@@ -1255,7 +2981,7 @@ FM_BACKEND_HERDR_SUBMIT_POLLS=${FM_BACKEND_HERDR_SUBMIT_POLLS:-6}
 FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=${FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP:-0.6}
 
 fm_backend_herdr_submit_confirm_budget() {  # <caller-budget-seconds>
-  awk -v b="${1:-0}" -v m="$FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP" 'BEGIN {
+  fm_backend_herdr_control_exec awk -v b="${1:-0}" -v m="$FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP" 'BEGIN {
     b += 0
     m += 0
     if (b < 0) b = 0
@@ -1268,11 +2994,11 @@ fm_backend_herdr_submit_confirm_budget() {  # <caller-budget-seconds>
 fm_backend_herdr_wait_for_working() {  # <session> <pane_id> <budget-seconds> <polls>
   local session=$1 pane_id=$2 budget=$3 polls=${4:-1} i interval raw bs saw_idle=0
   case "$polls" in ''|*[!0-9]*|0) polls=1 ;; esac
-  interval=$(awk -v b="$budget" -v p="$polls" 'BEGIN { d = p - 1; if (d < 1) d = 1; v = b / d; if (v < 0) v = 0; printf "%.4f", v }' 2>/dev/null)
+  interval=$(fm_backend_herdr_control_exec awk -v b="$budget" -v p="$polls" 'BEGIN { d = p - 1; if (d < 1) d = 1; v = b / d; if (v < 0) v = 0; printf "%.4f", v }' 2>/dev/null)
   case "$interval" in ''|*[!0-9.]*) interval=0 ;; esac
   for ((i = 0; i < polls; i++)); do
     if [ "$polls" -eq 1 ] || [ "$i" -gt 0 ]; then
-      sleep "$interval"
+      fm_backend_herdr_control_exec sleep "$interval"
     fi
     raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
     bs=$(fm_backend_herdr_classify_submit_agent_status "$raw")
@@ -1291,11 +3017,12 @@ fm_backend_herdr_wait_for_working() {  # <session> <pane_id> <budget-seconds> <p
 # fm_backend_herdr_pane_for_tab: the root pane id for <tab_id> in <workspace_id>
 # of <session>, via one pane list call filtered by tab_id (never assumes a
 # tab-number/pane-number correspondence - herdr numbers them independently).
+# shellcheck disable=SC2016
 fm_backend_herdr_pane_for_tab() {  # <session> <workspace_id> <tab_id>
   local session=$1 wsid=$2 tab_id=$3 panes
   panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$wsid" 2>/dev/null) || return 1
-  printf '%s' "$panes" | jq -r --arg tab "$tab_id" \
-    '.result.panes[]? | select(.tab_id == $tab) | .pane_id' 2>/dev/null | head -1
+  printf '%s' "$panes" | fm_backend_herdr_control_jq -r --arg tab "$tab_id" \
+    '.result.panes[]? | select(.tab_id == $tab) | .pane_id' 2>/dev/null | fm_backend_herdr_control_head -1
 }
 
 # fm_backend_herdr_resolve_bare_selector: the live-tab-listing fallback for an
@@ -1304,16 +3031,19 @@ fm_backend_herdr_pane_for_tab() {  # <session> <workspace_id> <tab_id>
 # matches <name>, since herdr sessions are not addressed by one ambient
 # server the way a single tmux server is. Rare path in practice (herdr tasks
 # normally carry meta), best-effort.
+# shellcheck disable=SC2016
 fm_backend_herdr_resolve_bare_selector() {  # <name>
-  local name=$1 sessions session tabs tab_id wsid pane_id
-  sessions=$(herdr session list --json 2>/dev/null | jq -r '.sessions[]? | select(.running == true) | .name' 2>/dev/null)
+  local name=$1 sessions session tabs tab_id wsid pane_id herdr_bin
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  sessions=$(fm_backend_herdr_scrubbed_exec "$herdr_bin" session list --json 2>/dev/null \
+    | fm_backend_herdr_control_jq -r '.sessions[]? | select(.running == true) | .name' 2>/dev/null)
   while IFS= read -r session; do
     [ -n "$session" ] || continue
     tabs=$(fm_backend_herdr_cli "$session" tab list 2>/dev/null) || continue
-    tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$name" \
-      '.result.tabs[]? | select(.label == $want) | .tab_id' 2>/dev/null | head -1)
+    tab_id=$(printf '%s' "$tabs" | fm_backend_herdr_control_jq -r --arg want "$name" \
+      '.result.tabs[]? | select(.label == $want) | .tab_id' 2>/dev/null | fm_backend_herdr_control_head -1)
     [ -n "$tab_id" ] || continue
-    wsid=$(printf '%s' "$tabs" | jq -r --arg tab "$tab_id" '.result.tabs[]? | select(.tab_id == $tab) | .workspace_id' 2>/dev/null | head -1)
+    wsid=$(printf '%s' "$tabs" | fm_backend_herdr_control_jq -r --arg tab "$tab_id" '.result.tabs[]? | select(.tab_id == $tab) | .workspace_id' 2>/dev/null | fm_backend_herdr_control_head -1)
     [ -n "$wsid" ] || continue
     pane_id=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$tab_id") || continue
     [ -n "$pane_id" ] || continue
@@ -1347,7 +3077,7 @@ fm_backend_herdr_list_live() {  # <session>
     pane_id=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$tab_id") || continue
     [ -n "$pane_id" ] || continue
     printf '%s:%s\t%s\n' "$session" "$pane_id" "$label"
-  done < <(printf '%s' "$tabs" | jq -r '.result.tabs[]? | select(.label | startswith("fm-")) | "\(.tab_id)\t\(.label)"' 2>/dev/null)
+  done < <(printf '%s' "$tabs" | fm_backend_herdr_control_jq -r '.result.tabs[]? | select(.label | startswith("fm-")) | "\(.tab_id)\t\(.label)"' 2>/dev/null)
 }
 
 # --- native event push: pane.agent_status_changed subscriber -----------------
@@ -1368,11 +3098,13 @@ fm_backend_herdr_list_live() {  # <session>
 # `herdr session list --json` (the default session's socket differs from a named
 # session's - verified: default -> ~/.config/herdr/herdr.sock, named ->
 # ~/.config/herdr/sessions/<name>/herdr.sock). Empty on any failure.
+# shellcheck disable=SC2016
 fm_backend_herdr_socket_path() {  # <session>
-  local session=$1
-  herdr session list --json 2>/dev/null \
-    | jq -r --arg name "$session" '.sessions[]? | select(.name == $name) | .socket_path // empty' 2>/dev/null \
-    | head -1
+  local session=$1 herdr_bin
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  fm_backend_herdr_scrubbed_exec "$herdr_bin" session list --json 2>/dev/null \
+    | fm_backend_herdr_control_jq -r --arg name "$session" '.sessions[]? | select(.name == $name) | .socket_path // empty' 2>/dev/null \
+    | fm_backend_herdr_control_head -1
 }
 
 # fm_backend_herdr_events_capable: the version/capability gate for the event
@@ -1385,7 +3117,7 @@ fm_backend_herdr_socket_path() {  # <session>
 # `api schema` read is ~220KB, so callers (the watcher) memoize this per session
 # for a process lifetime rather than probing every poll.
 fm_backend_herdr_events_capable() {  # <session>
-  local session=$1 protocol schema
+  local session=$1 protocol schema herdr_bin
   case "${FM_BACKEND_HERDR_EVENTS_FORCE:-}" in
     1) return 0 ;;
     0) return 1 ;;
@@ -1394,12 +3126,14 @@ fm_backend_herdr_events_capable() {  # <session>
   if [ -z "${FM_BACKEND_HERDR_EVENT_READER:-}" ]; then
     command -v python3 >/dev/null 2>&1 || return 1
   fi
-  protocol=$(herdr status --json 2>/dev/null | jq -r '.client.protocol // empty' 2>/dev/null)
+  herdr_bin=$(fm_backend_herdr_bin) || return 1
+  protocol=$(fm_backend_herdr_scrubbed_exec "$herdr_bin" status --json 2>/dev/null \
+    | fm_backend_herdr_control_jq -r '.client.protocol // empty' 2>/dev/null)
   case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
   [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
-  schema=$(herdr api schema --json 2>/dev/null) || return 1
-  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  schema=$(fm_backend_herdr_scrubbed_exec "$herdr_bin" api schema --json 2>/dev/null) || return 1
+  printf '%s' "$schema" | fm_backend_herdr_control_grep -Fq 'events.subscribe' || return 1
+  printf '%s' "$schema" | fm_backend_herdr_control_grep -Fq 'pane.agent_status_changed' || return 1
   return 0
 }
 
@@ -1434,7 +3168,7 @@ fm_backend_herdr_event_reader_cmd() {
 # .stale-<key> (tr ':/.' '___'), under <state_dir>.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
   local state=$1 window=$2 key
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(printf '%s' "$window" | fm_backend_herdr_control_exec tr ':/.' '___')
   printf '%s/%s%s' "$state" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$key"
 }
 
@@ -1463,7 +3197,7 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
       fi
       ;;
     absorb)
-      rm -f "$marker" 2>/dev/null || true
+      fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || true
       ;;
   esac
   return 1
@@ -1482,7 +3216,7 @@ fm_backend_herdr_clear_transition() {  # <state_dir> <window>
   local state=$1 window=$2 marker
   [ -n "$window" ] || return 0
   marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  rm -f "$marker" 2>/dev/null || true
+  fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || true
 }
 
 # fm_backend_herdr_wait_transition: the bounded event wait. Blocks up to
@@ -1527,18 +3261,18 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   [ "${#reader[@]}" -gt 0 ] || return 2
 
   local fifo_dir fifo reader_pid line ws status agent raw record hit rc=1 reader_rc=0
-  fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
+  fifo_dir=$(fm_backend_herdr_control_exec mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
   fifo="$fifo_dir/events"
-  if ! mkfifo "$fifo" 2>/dev/null; then
-    rm -rf "$fifo_dir" 2>/dev/null || true
+  if ! fm_backend_herdr_control_exec mkfifo "$fifo" 2>/dev/null; then
+    fm_backend_herdr_control_exec rm -rf "$fifo_dir" 2>/dev/null || true
     return 2
   fi
-  "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
+  fm_backend_herdr_scrubbed_exec "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
   reader_pid=$!
   if ! exec 9< "$fifo"; then
     kill "$reader_pid" 2>/dev/null || true
     wait "$reader_pid" 2>/dev/null || true
-    rm -rf "$fifo_dir" 2>/dev/null || true
+    fm_backend_herdr_control_exec rm -rf "$fifo_dir" 2>/dev/null || true
     return 2
   fi
   if ! IFS= read -r -u 9 line || [ "$line" != "@subscribed" ]; then
@@ -1575,10 +3309,10 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   # status into the wrong column. `cut` preserves empty fields.
   while [ "$rc" -eq 1 ] && IFS= read -r line <&9; do
     [ -n "$line" ] || continue
-    pane_id=$(printf '%s' "$line" | cut -f1)
-    ws=$(printf '%s' "$line" | cut -f2)
-    status=$(printf '%s' "$line" | cut -f3)
-    agent=$(printf '%s' "$line" | cut -f4)
+    pane_id=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f1)
+    ws=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f2)
+    status=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f3)
+    agent=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f4)
     [ -n "$pane_id" ] || continue
     record=$(fm_backend_herdr_normalize_event "$pane_id" "$ws" "$status" "$agent")
     if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
@@ -1599,7 +3333,7 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   # runtime-disable threshold).
   wait "$reader_pid" 2>/dev/null || reader_rc=$?
   exec 9<&-
-  rm -rf "$fifo_dir" 2>/dev/null || true
+  fm_backend_herdr_control_exec rm -rf "$fifo_dir" 2>/dev/null || true
   [ "$rc" -eq 0 ] && return 0
   [ "$rc" -eq 2 ] && return 2
   [ "$reader_rc" -eq 0 ] && return 1

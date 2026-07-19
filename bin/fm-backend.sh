@@ -50,7 +50,10 @@
 # on their own for on-demand reads (fm-peek.sh, fm-crew-state.sh).
 
 FM_BACKEND_SCRIPT=${BASH_SOURCE[0]:-$0}
-FM_BACKEND_LIB_DIR="$(cd "$(dirname "$FM_BACKEND_SCRIPT")" && pwd)"
+FM_BACKEND_SCRIPT_DIR=${FM_BACKEND_SCRIPT%/*}
+[ "$FM_BACKEND_SCRIPT_DIR" != "$FM_BACKEND_SCRIPT" ] || FM_BACKEND_SCRIPT_DIR=.
+FM_BACKEND_LIB_DIR="$(cd "$FM_BACKEND_SCRIPT_DIR" && pwd -P)"
+unset FM_BACKEND_SCRIPT_DIR
 unset FM_BACKEND_SCRIPT
 FM_BACKEND_DEFAULT_ROOT="$(cd "$FM_BACKEND_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_DEFAULT_ROOT}}"
@@ -727,7 +730,7 @@ fm_backend_endpoint_home() {  # <backend> <kind> <owner-home> [secondmate-home]
 fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-scoped-target]
   local backend=$1 target=$2 expected_label=${3:-} recorded_scoped_target=${4:-} identity session pane sessions panes pane_record tabs tab_id scoped scoped_count count expected_tab_id windows
   local tmux_identity
-  local workspace surface workspaces workspace_record title_record title title_count expected_title resolved_workspace
+  local workspace surface workspaces workspace_record title_record title_count expected_title resolved_workspace
   session=
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then

@@ -1,0 +1,31 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# Herdr starts this executable directly for every Firstmate-managed interactive
+# pane. Scrub before Bash exists, then force a non-login/no-rc shell so neither
+# inherited startup variables nor user startup files can execute ahead of the
+# routed worker launcher.
+my %blocked = map { $_ => 1 } qw(
+  BASH_ENV ENV SHELLOPTS BASHOPTS PS4 BASH_XTRACEFD BASH_COMPAT
+  BASH_LOADABLES_PATH CDPATH GLOBIGNORE IFS KSHENV ZDOTDIR GCONV_PATH
+);
+for my $variable (keys %ENV) {
+    delete $ENV{$variable}
+      if $blocked{$variable}
+      || $variable =~ /^(?:AGENT_FLEET_|QUOTA_AXI_|XDG_|BASH_FUNC_)/
+      || $variable =~ /^(?:LD_|DYLD_|PERL|PYTHON|RUBY|NODE_)/;
+}
+
+my @passwd = getpwuid($<);
+die "cannot resolve current passwd identity\n"
+  unless @passwd && defined $passwd[0] && length $passwd[0]
+  && defined $passwd[7] && $passwd[7] =~ m{^/};
+$ENV{HOME} = $passwd[7];
+$ENV{USER} = $passwd[0];
+$ENV{LOGNAME} = $passwd[0];
+$ENV{SHELL} = "/bin/bash";
+
+my @arguments = grep { $_ ne "-l" && $_ ne "--login" } @ARGV;
+exec { "/bin/bash" } "/bin/bash", "--noprofile", "--norc", @arguments;
+die "cannot exec fixed worker shell: $!\n";

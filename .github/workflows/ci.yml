@@ -27,14 +27,16 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # The complete suite now takes roughly 16 minutes on ubuntu-latest. Keep a
-    # bounded cap that accommodates healthy growth while still failing loudly
-    # on a genuinely hung watcher or tmux test.
-    timeout-minutes: 30
+    # The pre-cutover suite reached 25m35s, and the exhaustive Bridge crash
+    # matrix adds bounded work. Keep enough margin without masking a real hang.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -58,6 +60,26 @@ jobs:
           for test_script in tests/*.test.sh; do
             "$test_script"
           done
+
+  agent-fleet:
+    name: Agent Fleet package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install pinned uv
+        run: python -m pip install uv==0.9.10
+      - name: Verify locked package
+        working-directory: tools/agent-fleet
+        run: |
+          set -eu
+          uv sync --locked
+          uv run --locked ruff check .
+          uv run --locked pytest
+          uv run --locked python -m compileall -q src
+          uv build --out-dir "$RUNNER_TEMP/agent-fleet-dist"
 
   invariants:
     name: Repo invariants

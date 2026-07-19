@@ -1,0 +1,14 @@
+#!/bin/sh
+# Deterministic process-start probe for sandboxed shell tests. Production never
+# discovers this helper: account routing also requires the exact test-hook pair.
+pid=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -p ]; then
+    pid=${2:-}
+    break
+  fi
+  shift
+done
+case "$pid" in ''|*[!0-9]*) exit 2 ;; esac
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'test-process-start-%s\n' "$pid"

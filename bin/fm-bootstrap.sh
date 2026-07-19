@@ -15,7 +15,7 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
-#                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
+#                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
@@ -32,12 +32,11 @@
 #          and successful updates stay quiet.
 #          SECONDMATE_LIVENESS lines report every live secondmate's deeper
 #          agent-liveness verdict (bin/fm-backend.sh's fm_backend_agent_alive,
-#          distinct from the endpoint pane-presence check): already-live is a
-#          no-op, respawned means a confirmed-dead endpoint (a bare shell left
-#          behind by an exited secondmate agent) was killed and relaunched via
-#          bin/fm-spawn.sh --secondmate, and skipped means the probe could not
-#          confidently classify the endpoint (never acted on - a false-dead
-#          reading would spin up a duplicate agent). Session-start scope only;
+#          distinct from the endpoint pane-presence check): outcomes distinguish
+#          no-op, successful respawn, explicit-routing deferral, skipped
+#          recovery, and failed recovery. A confirmed-dead unmanaged generation
+#          is deferred until an operator chooses whether to preserve unmanaged
+#          routing or convert it to managed routing. Session-start scope only;
 #          see AGENTS.md "Session start" and docs/tmux-backend.md /
 #          docs/herdr-backend.md "Agent liveness probe" for the empirical basis.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
@@ -368,7 +367,9 @@ secondmate_liveness_sweep() {
         if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)
         else
-          resume_args+=(--no-account-routing)
+          fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+          echo "SECONDMATE_LIVENESS: secondmate $id: respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision"
+          continue
         fi
         if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
           "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
@@ -387,7 +388,9 @@ secondmate_liveness_sweep() {
           if [ -n "$retry_profile" ]; then
             retry_args+=(--resume-account)
           else
-            retry_args+=(--no-account-routing)
+            fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
+            echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: restored unmanaged generation requires an explicit operator --no-account-routing decision"
+            continue
           fi
           if [ -n "$retry_profile" ] \
             && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
@@ -600,30 +603,33 @@ EOF
 
 BOOTSTRAP_JQ_REPORTED=0
 ACCOUNT_ROUTING_MODE=off
+ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=0
+CREW_DISPATCH_ROUTING_VALID=unknown
 
 account_routing_preflight() {
-  local mode mode_error needs_agent_fleet=0 dispatch
+  local mode mode_error
   if mode=$(fm_account_resolve_mode "$CONFIG" 0 0 2>&1); then
     ACCOUNT_ROUTING_MODE=$mode
   else
     mode_error=${mode#error: }
     echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
   fi
-  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || needs_agent_fleet=1
+  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=1
+}
+
+account_routing_dependency_preflight() {
+  local needs_agent_fleet=$ACCOUNT_ROUTING_NEEDS_AGENT_FLEET dispatch
   dispatch="$CONFIG/crew-dispatch.json"
   if [ -f "$dispatch" ]; then
-    if command -v jq >/dev/null 2>&1; then
+    if [ "$CREW_DISPATCH_ROUTING_VALID" = 1 ]; then
       jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_agent_fleet=1
-    elif grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
+    elif [ "$CREW_DISPATCH_ROUTING_VALID" = unknown ] \
+      && grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
       needs_agent_fleet=1
     fi
   fi
   [ "$needs_agent_fleet" = 1 ] || return 0
-  if [ -n "${FM_AGENT_FLEET_BIN:-}" ]; then
-    [ -x "$FM_AGENT_FLEET_BIN" ] || missing_tool_diagnostic agent-fleet
-  else
-    command -v agent-fleet >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
-  fi
+  fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
   if ! command -v jq >/dev/null 2>&1; then
     echo "MISSING: jq (install: $(install_cmd jq))"
     BOOTSTRAP_JQ_REPORTED=1
@@ -633,12 +639,16 @@ account_routing_preflight() {
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
-  [ -f "$file" ] || return 0
+  if [ ! -f "$file" ]; then
+    CREW_DISPATCH_ROUTING_VALID=0
+    return 0
+  fi
   if ! command -v jq >/dev/null 2>&1; then
     [ "$BOOTSTRAP_JQ_REPORTED" = 1 ] || echo "MISSING: jq (install: $(install_cmd jq))"
     return 0
   fi
   if ! jq -e . "$file" >/dev/null 2>&1; then
+    CREW_DISPATCH_ROUTING_VALID=0
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - malformed JSON"
     return 0
   fi
@@ -706,9 +716,11 @@ crew_dispatch_validate() {
     end
   ' "$file" 2>/dev/null || true)
   if [ -n "$err" ]; then
+    CREW_DISPATCH_ROUTING_VALID=0
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0
   fi
+  CREW_DISPATCH_ROUTING_VALID=1
   jq -r '
     def profile($p):
       ($p.harness | tostring)
@@ -793,6 +805,7 @@ crew=
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"
 account_routing_preflight
 crew_dispatch_validate
+account_routing_dependency_preflight
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi

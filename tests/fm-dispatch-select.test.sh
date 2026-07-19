@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Behavior tests for deterministic crew-dispatch profile selection.
 set -u
+export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -180,8 +181,7 @@ make_fake_agent_fleet() {
 #!/usr/bin/env bash
 set -u
 [ -z "${FM_FAKE_AF_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_AF_LOG"
-[ "$*" != "--format json contract" ] || { printf '{"contract_version":1}\n'; exit 0; }
-[ -z "${FM_FAKE_AF_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SLEEP"
+[ "$*" != "--format json contract" ] || { printf '{"contract_version":2}\n'; exit 0; }
 pool=
 provider=
 prev=
@@ -189,14 +189,21 @@ for arg in "$@"; do
   case "$prev" in --pool) pool=$arg ;; --provider) provider=$arg ;; esac
   prev=$arg
 done
+sleep_seconds=${FM_FAKE_AF_SLEEP:-}
+case "$provider" in
+  claude) sleep_seconds=${FM_FAKE_CLAUDE_SLEEP:-$sleep_seconds} ;;
+  codex) sleep_seconds=${FM_FAKE_CODEX_SLEEP:-$sleep_seconds} ;;
+esac
+[ -z "$sleep_seconds" ] || sleep "$sleep_seconds"
 case "$pool" in
   claude-crew) available=true; mode=quota; headroom=${FM_FAKE_CLAUDE_HEADROOM:-25} ;;
   codex-crew) available=true; mode=quota; headroom=${FM_FAKE_CODEX_HEADROOM:-70} ;;
   stale-crew) available=true; mode=least-active-fallback; headroom=null ;;
   *) available=false; mode=unavailable; headroom=null ;;
 esac
-printf '{"schema":1,"pool":"%s","providers":[{"provider":"%s","available":%s,"selection_mode":"%s","degraded":false,"best_adjusted_headroom_percent":%s,"eligible_profiles":1,"active_leases":0,"profiles":[]}]}\n' \
-  "$pool" "$provider" "$available" "$mode" "$headroom"
+if [ "$available" = true ]; then eligible=true; eligible_profiles=1; else eligible=false; eligible_profiles=0; fi
+printf '{"schema":1,"pool":"%s","providers":[{"provider":"%s","available":%s,"selection_mode":"%s","degraded":false,"best_adjusted_headroom_percent":%s,"eligible_profiles":%s,"active_leases":0,"profiles":[{"profile":"%s-1","eligible":%s,"quota_fresh":true,"identity_binding_conflict":null,"live_identity_failure":null}]}]}\n' \
+  "$pool" "$provider" "$available" "$mode" "$headroom" "$eligible_profiles" "$pool" "$eligible"
 SH
   chmod +x "$fakebin/agent-fleet"
 }
@@ -215,6 +222,91 @@ test_account_pool_query_timeout_falls_back() {
   [ "$elapsed" -lt 5 ] || fail "pool query exceeded its command timeout (${elapsed}s)"
   assert_contains "$(cat "$TMP_ROOT/agent-fleet-timeout.err")" 'agent-fleet pool status failed' "pool timeout fallback was not logged"
   pass "quota-balanced dispatch bounds Agent Fleet pool queries"
+}
+
+test_slow_valid_pool_status_uses_selection_class_timeout() {
+  local fakebin pooled out started elapsed err
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-slow-valid")
+  make_fake_agent_fleet "$fakebin"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  started=$(date +%s)
+  out=$(FM_FAKE_CLAUDE_SLEEP=6 FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" \
+    2>"$TMP_ROOT/agent-fleet-slow-valid.err")
+  elapsed=$(( $(date +%s) - started ))
+  err=$(cat "$TMP_ROOT/agent-fleet-slow-valid.err")
+  [ "$elapsed" -ge 5 ] || fail "slow pool summary did not cross the former five-second bound"
+  [ "$out" = '{"harness":"codex","account_pool":"codex-crew"}' ] \
+    || fail "slow valid pool summary fell back instead of selecting fresh headroom: $out"
+  assert_not_contains "$err" 'agent-fleet pool status failed' \
+    "slow valid pool summary hit the former control-plane timeout"
+  pass "live-proof pool summaries use the honest selection-class timeout"
+}
+
+test_invalid_pool_status_timeout_is_rejected() {
+  local fakebin pooled out status err
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-invalid-timeout")
+  make_fake_agent_fleet "$fakebin"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"}]'
+  if out=$(FM_DISPATCH_AGENT_FLEET_TIMEOUT=invalid \
+    FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" \
+    2>"$TMP_ROOT/agent-fleet-invalid-timeout.err"); then
+    status=0
+  else
+    status=$?
+  fi
+  err=$(cat "$TMP_ROOT/agent-fleet-invalid-timeout.err")
+  expect_code 2 "$status" "invalid pool-status timeout should fail configuration validation"
+  [ -z "$out" ] || fail "invalid pool-status timeout unexpectedly emitted a profile: $out"
+  assert_contains "$err" 'FM_DISPATCH_AGENT_FLEET_TIMEOUT must be a positive integer' \
+    "invalid pool-status timeout diagnostic did not name its variable"
+  pass "pool-status timeout validation fails closed"
+}
+
+test_dispatch_ignores_hostile_path_jq_and_dirname() {
+  local fakebin jq_marker dirname_marker cat_marker awk_marker spec out stdin_out
+  fakebin=$(fm_fakebin "$TMP_ROOT/hostile-path-tools")
+  jq_marker="$TMP_ROOT/hostile-path-tools/jq-called"
+  dirname_marker="$TMP_ROOT/hostile-path-tools/dirname-called"
+  cat_marker="$TMP_ROOT/hostile-path-tools/cat-called"
+  awk_marker="$TMP_ROOT/hostile-path-tools/awk-called"
+  cat > "$fakebin/jq" <<SH
+#!/bin/sh
+printf called > '$jq_marker'
+printf '%s\n' '{"harness":"forged"}'
+SH
+  cat > "$fakebin/dirname" <<SH
+#!/bin/sh
+printf called > '$dirname_marker'
+printf '%s\n' /forged
+SH
+  cat > "$fakebin/cat" <<SH
+#!/bin/sh
+printf called > '$cat_marker'
+printf '%s\n' '{"harness":"forged"}'
+SH
+  cat > "$fakebin/awk" <<SH
+#!/bin/sh
+printf called > '$awk_marker'
+printf '%s\n' 'forged help'
+SH
+  chmod +x "$fakebin/jq" "$fakebin/dirname" "$fakebin/cat" "$fakebin/awk"
+  spec='{"harness":"claude","model":"sonnet"}'
+
+  out=$(CDPATH='' builtin cd -- "$ROOT/bin" && \
+    PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh "$spec")
+  stdin_out=$(printf '%s\n' "$spec" | (CDPATH='' builtin cd -- "$ROOT/bin" && \
+    PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh))
+
+  [ "$out" = '{"harness":"claude","model":"sonnet"}' ] \
+    || fail "hostile PATH forged dispatch selection: $out"
+  [ "$stdin_out" = "$out" ] || fail "hostile PATH forged stdin dispatch selection: $stdin_out"
+  [ ! -e "$jq_marker" ] || fail "dispatch executed hostile PATH jq"
+  [ ! -e "$dirname_marker" ] || fail "dispatch executed hostile PATH dirname"
+  [ ! -e "$cat_marker" ] || fail "dispatch executed hostile PATH cat"
+  [ ! -e "$awk_marker" ] || fail "dispatch executed hostile PATH awk"
+  pass "dispatch pins its parser and input tools without ambient PATH resolution"
 }
 
 test_account_pool_summary_owns_provider_quota_choice() {
@@ -238,6 +330,28 @@ SH
   assert_grep 'pool status --pool codex-crew --provider codex' "$af_log" "codex pool summary was not queried"
   [ ! -e "$quota_marker" ] || fail "account_pool selection consulted default-account quota-axi"
   pass "account_pool quota-balanced selection consumes only Agent Fleet pool summaries"
+}
+
+test_degraded_pool_summary_is_diagnostic_only() {
+  local fakebin out pooled err
+  fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-degraded-pool")
+  make_fake_agent_fleet "$fakebin"
+  pooled='[{"harness":"claude","account_pool":"stale-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled")
+  [ "$out" = '{"harness":"codex","account_pool":"codex-crew"}' ] \
+    || fail "degraded pool displaced a freshly routeable pool: $out"
+
+  pooled='[{"harness":"claude","account_pool":"stale-crew"},{"harness":"codex","account_pool":"missing-crew"}]'
+  out=$(FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" \
+    2>"$TMP_ROOT/agent-fleet-degraded-pool/error.log")
+  err=$(cat "$TMP_ROOT/agent-fleet-degraded-pool/error.log")
+  [ "$out" = '{"harness":"claude","account_pool":"stale-crew"}' ] \
+    || fail "advisory total-unavailable fallback changed the ordered first profile: $out"
+  assert_contains "$err" 'no freshly routeable Agent Fleet account pools' \
+    "degraded-only fallback was not logged as unavailable"
+  pass "degraded Agent Fleet summaries remain diagnostic-only and never compete as available"
 }
 
 test_enforced_quota_balancing_rejects_poolless_candidates() {
@@ -332,6 +446,32 @@ SH
   pass "dispatch and spawn honor the same pinned Agent Fleet binary"
 }
 
+test_production_dispatch_override_is_never_executed() {
+  local fakebin marker pooled out status error
+  fakebin=$(fm_fakebin "$TMP_ROOT/production-agent-fleet-override")
+  marker="$TMP_ROOT/production-agent-fleet-override/override-ran"
+  cat > "$fakebin/agent-fleet" <<SH
+#!/usr/bin/env bash
+touch '$marker'
+exit 1
+SH
+  chmod +x "$fakebin/agent-fleet"
+  pooled='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}]'
+  out=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB \
+    FM_CONFIG_OVERRIDE="$TMP_ROOT/production-agent-fleet-override/config" \
+    FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
+    "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" \
+    2>"$TMP_ROOT/production-agent-fleet-override/error.log")
+  status=$?
+  error=$(cat "$TMP_ROOT/production-agent-fleet-override/error.log")
+  expect_code 0 "$status" "selector should safely degrade after refusing production override"
+  [ "$out" = '{"harness":"claude","account_pool":"claude-crew"}' ] \
+    || fail "forbidden override fallback changed the ordered first profile: $out"
+  [ ! -e "$marker" ] || fail "production dispatch executed its forbidden Agent Fleet override"
+  assert_contains "$error" 'test/lab opt-in' "production override refusal was not surfaced"
+  pass "production dispatch never executes overrides and degrades only to the first routed profile"
+}
+
 test_account_fields_survive_direct_selection() {
   local fakebin marker out profile
   fakebin=$(fm_fakebin "$TMP_ROOT/account-direct")
@@ -401,10 +541,15 @@ test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_backward_compatible_first_selection
 test_account_pool_summary_owns_provider_quota_choice
+test_degraded_pool_summary_is_diagnostic_only
 test_account_pool_query_timeout_falls_back
+test_slow_valid_pool_status_uses_selection_class_timeout
+test_invalid_pool_status_timeout_is_rejected
+test_dispatch_ignores_hostile_path_jq_and_dirname
 test_enforced_quota_balancing_rejects_poolless_candidates
 test_fully_pooled_dispatch_ignores_overridden_ambient_mode
 test_agent_fleet_binary_precedence_matches_routing
+test_production_dispatch_override_is_never_executed
 test_account_fields_survive_direct_selection
 test_pooled_failures_degrade_without_default_account_quota
 

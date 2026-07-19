@@ -34,6 +34,7 @@ fm_git_identity fmtest fmtest@example.com
 
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-sync)
 export FM_BACKEND=tmux
+export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 
 # --- world builders --------------------------------------------------------
 
@@ -435,6 +436,7 @@ test_nudge_selector_stable_after_herdr_respawn() {
     printf 'home=%s/sm-instr\n' "$w"
     printf 'herdr_workspace_id=ws-home\n'
     printf 'herdr_tab_id=tab-stale\n'
+    printf 'account_profile=claude-1\n'
   } > "$meta"
 
   spawn_stub="$w/spawn-stub.sh"
@@ -451,6 +453,11 @@ exit 0
 SH
   chmod +x "$spawn_stub"
   cp "$spawn_stub" "$w/main/bin/fm-spawn.sh"
+  cat > "$w/main/bin/fm-account-session-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$w/main/bin/fm-account-session-sync.sh"
 
   herdrfb=$(make_nudge_herdr_fake "$w/herdr" "$stale" "$fresh")
   toolchain=$(make_fake_toolchain "$w")

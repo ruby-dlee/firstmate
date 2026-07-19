@@ -1216,6 +1216,7 @@ test_watcher_timeout_wrapper_uses_hard_kill_fallback() {
 printf '%s\n' "$*" > "$FM_FAKE_TIMEOUT_LOG"
 SH
   chmod +x "$fakebin/timeout"
+  # shellcheck disable=SC2031  # The PATH assignment intentionally scopes only the child.
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_FAKE_TIMEOUT_LOG="$log" bash -c '
     . "$1"
     run_bounded 4 true

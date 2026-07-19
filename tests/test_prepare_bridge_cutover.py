@@ -73,6 +73,7 @@ class Registry:
     settings: Settings
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     profiles: dict[str, Profile] = field(default_factory=dict)
+    config_path: Path | None = None
 """
 
 
@@ -259,6 +260,10 @@ def provision_plan(registry, profile_id):
     profile = registry.profiles[profile_id]
     if profile.safety_policy != "worker":
         raise ValueError("reserve profiles cannot be provisioned")
+    if registry.config_path is None:
+        # The real provision API composes managed hook commands from the loaded
+        # registry path and refuses a pathless registry; mirror that contract.
+        raise ValueError("loaded registry path is unavailable for managed hooks")
     common = [
         ".agent-fleet-hooks.json",
         ".agent-fleet-profile.json",

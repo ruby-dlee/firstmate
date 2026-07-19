@@ -1351,8 +1351,14 @@ def _dataclass_from_mapping(
 def _lexical_candidate_registry(
     api: AgentFleetAPI,
     raw: Mapping[str, Any],
+    config_path: Path,
 ) -> Any:
-    """Construct the v2 model without resolving, statting, or opening any home."""
+    """Construct the v2 model without resolving, statting, or opening any home.
+
+    config_path must name the live registry: the sealed provision API composes
+    managed hook commands from it, and the recorded plans must byte-match what
+    post-cutover provisioning produces against that exact live path.
+    """
 
     settings_raw = raw["settings"]
     settings_values = dict(settings_raw)
@@ -1408,7 +1414,12 @@ def _lexical_candidate_registry(
     return _dataclass_from_mapping(
         api.models.Registry,
         {"version": raw["version"]},
-        {"settings": settings, "providers": providers, "profiles": profiles},
+        {
+            "settings": settings,
+            "providers": providers,
+            "profiles": profiles,
+            "config_path": config_path,
+        },
         "candidate registry",
     )
 
@@ -5090,7 +5101,9 @@ def _prepare_locked(spec_path: Path, driver_path: Path) -> dict[str, Any]:
     _semantic_validate_candidate_raw(sealed_raw, candidate_reloaded_raw, spec)
     if candidate_reloaded_raw != candidate_raw:
         raise PreparationError("candidate registry did not round-trip exactly")
-    reloaded = _lexical_candidate_registry(candidate_api, candidate_reloaded_raw)
+    reloaded = _lexical_candidate_registry(
+        candidate_api, candidate_reloaded_raw, spec.live_registry
+    )
     sealed_provision_contract = _sealed_provision_contract(candidate_api, reloaded)
 
     final_initial = spec.output_dir / initial_staged.name
@@ -5388,7 +5401,9 @@ def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
     _semantic_validate_candidate_raw(sealed_raw, candidate_raw, spec)
     if candidate_raw != _construct_candidate_raw(sealed_raw, spec):
         raise PreparationError("bundled candidate registry is not exact")
-    candidate = _lexical_candidate_registry(candidate_api, candidate_raw)
+    candidate = _lexical_candidate_registry(
+        candidate_api, candidate_raw, spec.live_registry
+    )
 
     manifest_path = _normalized_absolute(bundle["manifest_path"], "manifest_path")
     if manifest_path != bundle_path.parent / "cutover.manifest.json":

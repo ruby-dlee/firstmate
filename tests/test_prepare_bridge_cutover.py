@@ -2523,6 +2523,29 @@ class RealAgentFleetPurePlanningTest(unittest.TestCase):
     trusted project.
     """
 
+    @staticmethod
+    def _stage_sealed_quota_release(root: Path) -> tuple[Path, Path]:
+        """Stage a self-contained sealed quota-axi release layout under ``root``.
+
+        ``initial_registry`` otherwise pins the operator machine's installed release,
+        which no continuous-integration runner has; the release only has to satisfy the
+        sealed-layout and identity checks for this gate, never to execute.
+        """
+
+        entrypoint = root / "node_modules" / "quota-axi" / "dist" / "bin" / "quota-axi.js"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("export const fixture = true;\n", encoding="utf-8")
+        entrypoint.chmod(0o444)
+        node_binary = root / "runtime" / "node"
+        node_binary.parent.mkdir(parents=True)
+        node_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        node_binary.chmod(0o755)
+        quota_binary = root / "bin" / "quota-axi"
+        quota_binary.parent.mkdir(parents=True)
+        quota_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        quota_binary.chmod(0o755)
+        return quota_binary, node_binary
+
     def test_real_provision_planning_is_pure_for_git_backed_project(self) -> None:
         pythonpath = SCRIPT_DIR.parents[0] / "agent-fleet" / "src"
         init_text = (pythonpath / "agent_fleet" / "__init__.py").read_text("utf-8")
@@ -2543,13 +2566,19 @@ class RealAgentFleetPurePlanningTest(unittest.TestCase):
             project = temp / "trusted-project"
             project.mkdir(mode=0o700)
             subprocess.run(["git", "init", "-q", str(project)], check=True)
+            quota_binary, quota_node_binary = self._stage_sealed_quota_release(
+                temp / "quota-release"
+            )
             environment = {
                 "AGENT_FLEET_CONFIG": str(temp / "config" / "accounts.toml"),
                 "AGENT_FLEET_STATE_DIR": str(temp / "state"),
                 "AGENT_FLEET_SHARE_DIR": str(temp / "share"),
+                "AGENT_FLEET_QUOTA_BIN": str(quota_binary),
+                "AGENT_FLEET_QUOTA_NODE_BIN": str(quota_node_binary),
             }
             with mock.patch.dict(os.environ, environment):
                 registry = api.config.initial_registry(1, 1)
+            self.assertEqual(registry.settings.quota_binary, quota_binary)
             providers = dict(registry.providers)
             providers["claude"] = dataclasses.replace(
                 providers["claude"], trusted_projects=(project,)

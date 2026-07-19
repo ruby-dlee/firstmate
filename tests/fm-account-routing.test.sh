@@ -297,6 +297,12 @@ case "$*" in
     printf '{"schema":%s,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$session_schema" "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$session_event_seq" "$updated_at"
     ;;
   *" lease release "*)
+    if [ "${FM_FAKE_AF_RELEASE_TRACE:-0}" = 1 ]; then
+      printf 'release-trace fail=%s fail-once=%s swap=%s sleep=%s marker=%s\n' \
+        "${FM_FAKE_AF_RELEASE_FAIL:-}" "${FM_FAKE_AF_RELEASE_FAIL_ONCE:-}" \
+        "${FM_FAKE_AF_RELEASE_SWAP_BACKUP:-}" "${FM_FAKE_AF_RELEASE_SLEEP:-}" \
+        "${FM_FAKE_AF_RELEASE_MARKER:-}" >> "$FM_FAKE_AF_LOG"
+    fi
     [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
     [ -z "${FM_FAKE_AF_RELEASE_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_MARKER"
     [ "${FM_FAKE_AF_RELEASE_FAIL:-0}" != 1 ] || exit 43
@@ -1025,7 +1031,8 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_TRACE=1 \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
   if ! cmp -s "$HOME_DIR/state/$id.meta" "$expected"; then

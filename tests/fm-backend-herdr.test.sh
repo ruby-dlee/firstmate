@@ -1191,7 +1191,7 @@ SH
 }
 
 test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
-  local dir fb fake source mode case_dir lock_root running pids state log mutation old_pid new_pid out status
+  local dir fb fake source ps_fake mode case_dir lock_root running pids state log mutation old_pid new_pid out status
   dir="$TMP_ROOT/herdr-certified-lifecycle"
   fb="$dir/fakebin"
   fake="$fb/herdr"
@@ -1199,6 +1199,15 @@ test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
   mkdir -p "$fb"
   cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
   chmod 755 "$source"
+  ps_fake="$dir/fake-ps"
+  cat > "$ps_fake" <<'SH'
+#!/bin/sh
+pid=
+for argument in "$@"; do pid=$argument; done
+kill -0 "$pid" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+SH
+  chmod 755 "$ps_fake"
   cat > "$fake" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -1243,7 +1252,7 @@ SH
   write_legacy_certificate() {
     PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
-      FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" OLD_PID="$old_pid" \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" OLD_PID="$old_pid" \
       /bin/bash --noprofile --norc -c '
         . "$0/bin/backends/herdr.sh"
         key=$(fm_backend_herdr_server_lock_key "$1") || exit 1
@@ -1275,7 +1284,8 @@ SH
     FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
-    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
     /bin/bash --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_server_ensure default || exit 1
@@ -1323,7 +1333,8 @@ SH
       FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
       FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
-      FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" HERDR_SESSION="fm-$mode" \
+      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+      HERDR_SESSION="fm-$mode" \
       /bin/bash --noprofile --norc -c '
         . "$0/bin/backends/herdr.sh"
         fm_backend_herdr_container_ensure "$PWD"

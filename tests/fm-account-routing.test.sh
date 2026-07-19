@@ -5310,7 +5310,7 @@ SH
     cleanup() {
       local original=$? bounded_status
       set +e
-      fm_account_run_bounded 3 true
+      fm_account_run_control true
       bounded_status=$?
       printf "%s:%s\n" "$original" "$bounded_status"
     }

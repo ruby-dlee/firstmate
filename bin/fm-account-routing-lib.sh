@@ -422,8 +422,8 @@ fm_account_run_fleet_bounded() {  # <seconds> <binary> <args...>
   local seconds=$1 binary=$2
   shift 2
   if fm_account_test_lab_enabled; then
-    fm_account_run_bounded "$seconds" "$binary" "$@"
-    return
+    fm_account_run_bounded "$seconds" "$binary" "$@" || return $?
+    return 0
   fi
   fm_account_resolve_passwd_identity || return 1
   [ -n "$FM_ACCOUNT_SYSTEM_ENV_BIN" ] || return 127
@@ -433,7 +433,8 @@ fm_account_run_fleet_bounded() {  # <seconds> <binary> <args...>
     "LOGNAME=$FM_ACCOUNT_PASSWD_NAME" \
     "PATH=$FM_ACCOUNT_SYSTEM_PATH" \
     LC_ALL=C LANG=C \
-    "$binary" --config "$FM_ACCOUNT_CANONICAL_CONFIG" "$@"
+    "$binary" --config "$FM_ACCOUNT_CANONICAL_CONFIG" "$@" || return $?
+  return 0
 }
 
 # The fixed Perl launcher starts before any new shell can interpret inherited

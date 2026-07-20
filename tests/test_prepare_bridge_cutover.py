@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 import pwd
@@ -12,7 +14,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
 
@@ -202,6 +206,9 @@ OLD_MODELS_SOURCE = MODELS_SOURCE.replace(
     "",
 ).replace(
     '    safety_policy: str = "worker"\n',
+    "",
+).replace(
+    "    config_path: Path | None = None\n",
     "",
 )
 OLD_CONFIG_SOURCE = CONFIG_SOURCE.replace(
@@ -1679,6 +1686,120 @@ class CutoverPreparationFixture:
             json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         bundle_path.chmod(0o600)
+
+
+REAL_MODELS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "tools"
+    / "agent-fleet"
+    / "src"
+    / "agent_fleet"
+    / "models.py"
+)
+
+
+class SyntheticAgentFleetSchemaDriftTest(unittest.TestCase):
+    """Regression gate for no-mistakes finding synthetic-agent-fleet-schema-drift.
+
+    MODELS_SOURCE is a deliberate hand-copy of the real agent_fleet.models
+    dataclasses so the synthetic pipeline under test never imports the real
+    package.  That copy silently drifting from the real schema (a missing
+    Registry.config_path) caused the 2026-07-19 Bridge preparer NO-GO, so this
+    gate compares every synthetic dataclass field against the real module and
+    fails on any mismatch.  Only this comparison loads the real module, under a
+    private module name in this process; the synthetic pipeline paths stay
+    synthetic.
+    """
+
+    # A drift report must always name the drifted field, never truncate.
+    maxDiff = None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _registered(module: types.ModuleType) -> Iterator[None]:
+        # dataclasses resolves string annotations through
+        # sys.modules[cls.__module__] while the classes are created, so the
+        # module must be registered for the exec; unregister right after so
+        # neither the real nor the synthetic copy leaks into import state.
+        sys.modules[module.__name__] = module
+        try:
+            yield
+        finally:
+            del sys.modules[module.__name__]
+
+    @classmethod
+    def _real_models(cls) -> types.ModuleType:
+        spec = importlib.util.spec_from_file_location(
+            "agent_fleet_models_drift_reference", REAL_MODELS_PATH
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with cls._registered(module):
+            spec.loader.exec_module(module)
+        return module
+
+    @classmethod
+    def _synthetic_models(cls) -> types.ModuleType:
+        module = types.ModuleType("agent_fleet_models_drift_synthetic")
+        # The future import matches the real module so both sides report every
+        # dataclass annotation as the literal source string.
+        source = "from __future__ import annotations\n" + MODELS_SOURCE
+        code = compile(source, "<synthetic agent_fleet.models>", "exec")
+        with cls._registered(module):
+            exec(code, module.__dict__)
+        return module
+
+    @staticmethod
+    def _model_names(module: types.ModuleType) -> set[str]:
+        return {
+            name
+            for name, value in vars(module).items()
+            if dataclasses.is_dataclass(value) and value.__module__ == module.__name__
+        }
+
+    @staticmethod
+    def _schema(module: types.ModuleType, class_name: str) -> dict[str, object]:
+        model = getattr(module, class_name)
+        return {
+            "frozen": model.__dataclass_params__.frozen,
+            "fields": [
+                {
+                    "name": item.name,
+                    "type": " ".join(str(item.type).split()),
+                    "default": (
+                        "<required>"
+                        if item.default is dataclasses.MISSING
+                        else repr(item.default)
+                    ),
+                    "default_factory": (
+                        None
+                        if item.default_factory is dataclasses.MISSING
+                        else item.default_factory.__name__
+                    ),
+                    "kw_only": item.kw_only,
+                }
+                for item in dataclasses.fields(model)
+            ],
+        }
+
+    def test_synthetic_models_match_real_agent_fleet_schema(self) -> None:
+        real = self._real_models()
+        synthetic = self._synthetic_models()
+        real_names = self._model_names(real)
+        self.assertEqual(
+            self._model_names(synthetic),
+            real_names,
+            f"MODELS_SOURCE no longer covers the dataclasses in {REAL_MODELS_PATH}; "
+            "add, rename, or drop the hand-copied model to match the real module",
+        )
+        for class_name in sorted(real_names):
+            with self.subTest(model=class_name):
+                self.assertEqual(
+                    self._schema(synthetic, class_name),
+                    self._schema(real, class_name),
+                    f"MODELS_SOURCE {class_name} drifted from {REAL_MODELS_PATH}; "
+                    "update the hand-copy to match the real schema exactly",
+                )
 
 
 @unittest.skipUnless(sys.platform == "darwin", "cutover preparation is macOS-only")

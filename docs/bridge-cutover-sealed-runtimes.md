@@ -168,9 +168,9 @@ Both transactions revalidate the quiet point, release bindings, regular-file ide
 
 That final compare-and-swap is performed after the staged object itself has been rehashed. A live symlink, regular file, registry, or adoption target that changes after the quiet-point scan is never overwritten.
 
-The worker-state gate (snapshot, provision verification, finalize, and rollback attribution) revalidates the bundle, and its candidate loader transitively re-runs the sealed-adoption assessment.
+The worker-state gate loads the candidate API through bundle validation, which transitively re-runs the sealed-adoption assessment; provision verification, finalize, and rollback identity attribution all take that path, while the snapshot step revalidates only the cutover quiet point.
 The sealed-adoption plan itself stays strict: it accepts live state only at the exact initial or sealed identities.
-Once the normal cutover is fully applied and the post-install irreversible boundary is marked, bundle validation instead accepts exactly one further live state - a fully sealed adoption journal with every adoption-managed path at its exact cutover-new identity and the live registry at the exact bundled candidate SHA-256 - reported as the `runtime-switched` phase.
+Once the normal cutover is fully applied and the post-install irreversible boundary is marked, bundle validation instead accepts exactly one further live state - a fully sealed adoption journal, the full quiet-point contract, intact retained sealed release trees, and every adoption-managed path, including the live registry, at its exact cutover-new identity pinned from the reconstructed cutover manifest - reported as the `runtime-switched` phase.
 Any other combination, including a post-cutover registry without the marked boundary or with any drifted path, refuses exactly as before.
 This pinned post-cutover acceptance exists because the documented order crosses the runtime switch before worker-state verification, so verification, finalize, and rollback attribution must remain provable on the switched machine.
 

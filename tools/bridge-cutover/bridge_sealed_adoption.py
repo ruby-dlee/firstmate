@@ -693,7 +693,14 @@ def _validate_disabled_registry(
     if post_cutover_sha256 is not None:
         accepted.add(post_cutover_sha256)
     if digest not in accepted:
-        raise AdoptionError(f"live registry has unknown SHA-256: {digest}")
+        message = f"live registry has unknown SHA-256: {digest}"
+        if post_cutover_sha256 is None:
+            message += (
+                "; if the main cutover has fully applied, validate through the "
+                "bundle (prepare_bridge_cutover.py validate), which accepts the "
+                "pinned post-cutover state"
+            )
+        raise AdoptionError(message)
     try:
         raw = tomllib.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -1483,7 +1490,7 @@ def post_cutover_plan(
             _validate_sealed_operation(operation)
         for operation in manifest.operations:
             pin = pins.get(str(operation.path))
-            if pin is None:
+            if not isinstance(pin, Mapping):
                 raise AdoptionError(
                     f"no post-cutover pin for adoption path: {operation.path}"
                 )

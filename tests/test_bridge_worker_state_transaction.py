@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import bridge_worker_state_transaction as worker_state  # noqa: E402
 from tests.test_prepare_bridge_cutover import (  # noqa: E402
+    DRIVER,
     CutoverPreparationFixture,
     prepare,
 )
@@ -150,6 +151,63 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertEqual(cleaned["phase"], "cleaned")
         self.assertFalse(cleaned["snapshot_bytes_present"])
         self.assertFalse(self.manifest.snapshot_path.exists())
+
+    def _apply_runtime_switch(self) -> None:
+        driver = prepare._load_driver(DRIVER)
+        manifest_path = self.fixture.bundle_dir / "cutover.manifest.json"
+        driver.execute(driver.load_manifest(manifest_path), "forward")
+        driver.mark_post_install_irreversible_boundary(
+            driver.load_manifest(manifest_path)
+        )
+
+    def test_verify_and_finalize_pass_after_runtime_switch(self) -> None:
+        """Regression: the 2026-07-19 live 6b NO-GO.
+
+        The documented cutover order applies the runtime switch (step 4) and
+        marks the post-install boundary (step 5) before worker-state
+        verification (6b) and finalize (6c).  Every pre-existing test ran
+        worker-state at the pre-switch baseline, so the sealed-adoption quiet
+        point refusing the legitimately advanced live registry was first
+        observed on the real machine.  This test runs the exact live order.
+        """
+
+        self._apply_runtime_switch()
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        verified = worker_state.verify_provisioned(self.manifest)
+        self.assertEqual(verified["phase"], "provision_verified")
+        self.assertTrue(verified["rollback_available"])
+        self._write_identity_bundles()
+        finalized = worker_state.finalize(self.manifest)
+        self.assertEqual(finalized["phase"], "complete")
+        self.assertTrue(finalized["worker_state_ready"])
+
+    def test_rollback_attributes_identity_drift_after_runtime_switch(self) -> None:
+        """Regression: the armed rollback trap behind the 2026-07-19 NO-GO.
+
+        Once a provider identity bundle exists and drifts from the snapshot,
+        ``rollback`` must attribute the drift through ``_candidate_api`` - the
+        exact loader the sealed-adoption quiet point was refusing post-switch.
+        Rollback must keep working in that state, not die at the moment
+        identity state is what needs restoring.
+        """
+
+        self._apply_runtime_switch()
+        self._write_identity_bundles()
+        worker_state.begin(self.manifest)
+        self._materialize_provisioned_workers()
+        self.manifest.identity_bundles["codex"].write_text(
+            '{"schema":1,"provider":"codex","fresh":true}', encoding="utf-8"
+        )
+        rolled = worker_state.rollback(self.manifest)
+        self.assertEqual(rolled["phase"], "rolled_back")
+        # Attributed drift admits the rollback, which restores the snapshot.
+        self.assertEqual(
+            json.loads(
+                self.manifest.identity_bundles["codex"].read_text(encoding="utf-8")
+            ),
+            {"schema": 1, "provider": "codex"},
+        )
 
     def test_restartable_rollback_restores_exact_absence(self) -> None:
         worker_state.begin(self.manifest)

@@ -762,6 +762,7 @@ jq() {
 }
 SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "enforce mode did not report manual Agent Fleet installation"
   assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
@@ -774,6 +775,7 @@ SH
   add_real_jq "$fakebin"
   rm -f "$fakebin/agent-fleet"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "account-routed dispatch profile did not report manual Agent Fleet installation"
   assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"

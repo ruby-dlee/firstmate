@@ -5078,7 +5078,8 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   if out=$(FM_FAKE_AF_SELECT_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
   elapsed=$(( $(date +%s) - started ))
   [ "$status" -eq 0 ] || fail "timed-out lease choice was not reconciled through recovery: $out"
-  [ "$elapsed" -lt 5 ] || fail "lease choice timeout was not bounded (elapsed ${elapsed}s)"
+  # Semantic: returns well under the 10s unbounded fake sleep; 8s absorbs full-sweep scheduling load (5s flaked in-sweep while passing standalone).
+  [ "$elapsed" -lt 8 ] || fail "lease choice timeout was not bounded (elapsed ${elapsed}s)"
   assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
 
   rm -f "$CASE_DIR/endpoint-live"
@@ -5087,7 +5088,8 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   if out=$(FM_FAKE_AF_RELEASE_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
   elapsed=$(( $(date +%s) - started ))
   [ "$status" -ne 0 ] || fail "ambiguous timed-out lease release unexpectedly completed teardown"
-  [ "$elapsed" -lt 5 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
+  # Semantic: returns well under the 10s unbounded fake sleep; 8s absorbs full-sweep scheduling load (5s flaked in-sweep while passing standalone).
+  [ "$elapsed" -lt 8 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
   assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease release discarded retry metadata"
   pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
 }

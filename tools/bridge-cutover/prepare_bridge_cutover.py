@@ -5447,26 +5447,34 @@ def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
     adoption_driver = _load_adoption_driver()
     try:
         loaded_adoption = adoption_driver.load_manifest(adoption_path)
-        adoption_plan = adoption_driver.plan(loaded_adoption)
     except adoption_driver.AdoptionError as exc:
         raise PreparationError(f"sealed-adoption state is invalid: {exc}") from exc
-    adoption_prefix = adoption_plan.get("sealed_prefix")
-    adoption_sealed = adoption_plan.get("sealed") is True
-    if adoption_prefix == 0 and not adoption_sealed:
-        cutover_phase = "sealed-adoption-pending"
-    elif adoption_prefix == 4 and adoption_sealed:
-        planned = driver.plan(loaded)
-        if _plan_prefix(planned) != 0 or planned.get(
-            "post_install_irreversible_boundary"
-        ):
-            raise PreparationError(
-                "main cutover is not at the exact sealed rollback baseline"
-            )
-        cutover_phase = "runtime-switch-ready"
-    elif adoption_plan.get("recovery_required"):
-        cutover_phase = "sealed-adoption-recovery-required"
+    try:
+        adoption_plan = adoption_driver.plan(loaded_adoption)
+    except adoption_driver.AdoptionError as exc:
+        cutover_phase = _superseded_adoption_phase(
+            driver, loaded, adoption_driver, loaded_adoption, exc
+        )
     else:
-        raise PreparationError("sealed-adoption state/journal combination is invalid")
+        adoption_prefix = adoption_plan.get("sealed_prefix")
+        adoption_sealed = adoption_plan.get("sealed") is True
+        if adoption_prefix == 0 and not adoption_sealed:
+            cutover_phase = "sealed-adoption-pending"
+        elif adoption_prefix == 4 and adoption_sealed:
+            planned = driver.plan(loaded)
+            if _plan_prefix(planned) != 0 or planned.get(
+                "post_install_irreversible_boundary"
+            ):
+                raise PreparationError(
+                    "main cutover is not at the exact sealed rollback baseline"
+                )
+            cutover_phase = "runtime-switch-ready"
+        elif adoption_plan.get("recovery_required"):
+            cutover_phase = "sealed-adoption-recovery-required"
+        else:
+            raise PreparationError(
+                "sealed-adoption state/journal combination is invalid"
+            )
     expected_topology = _topology_summary()
     if bundle["topology"] != expected_topology:
         raise PreparationError("bundle topology summary is not exact")
@@ -5643,6 +5651,61 @@ def _assert_prefix(driver: ModuleType, manifest_path: Path, expected: int) -> No
         raise PreparationError(
             f"rehearsal prefix is {observed}; expected {expected}"
         )
+
+
+def _post_cutover_pins(driver: ModuleType, loaded: Any) -> dict[str, dict[str, str]]:
+    pins: dict[str, dict[str, str]] = {}
+    for operation in loaded.operations:
+        if isinstance(operation, driver.SymlinkOperation):
+            pins[str(operation.path)] = {
+                "kind": "link",
+                "target": operation.new_target,
+            }
+        else:
+            pins[str(operation.path)] = {
+                "kind": "file",
+                "sha256": operation.new_sha256,
+            }
+    return pins
+
+
+def _superseded_adoption_phase(
+    driver: ModuleType,
+    loaded: Any,
+    adoption_driver: ModuleType,
+    loaded_adoption: Any,
+    refusal: Exception,
+) -> str:
+    """Resolve the one accepted post-cutover phase after a strict adoption refusal.
+
+    The sealed-adoption plan intentionally accepts live state only at its exact
+    initial or sealed identities, so it refuses once the normal cutover has
+    legitimately advanced the machine.  That refusal stands unless the main
+    cutover is provably complete - every operation applied and the post-install
+    irreversible boundary marked - and the sealed adoption passes the pinned
+    post-cutover assessment against the exact cutover-new identities.
+    """
+
+    invalid = f"sealed-adoption state is invalid: {refusal}"
+    try:
+        planned = driver.plan(loaded)
+        fully_applied = _plan_prefix(planned) == len(planned["states"])
+    except (driver.CutoverError, PreparationError) as exc:
+        raise PreparationError(f"{invalid} (post-cutover probe: {exc})") from refusal
+    if not fully_applied or not planned.get("post_install_irreversible_boundary"):
+        raise PreparationError(
+            f"{invalid} (post-cutover probe: main cutover is not fully applied "
+            "past the marked post-install irreversible boundary)"
+        ) from refusal
+    try:
+        adoption_driver.post_cutover_plan(
+            loaded_adoption, _post_cutover_pins(driver, loaded)
+        )
+    except adoption_driver.AdoptionError as exc:
+        raise PreparationError(
+            f"sealed-adoption state is invalid post-cutover: {exc}"
+        ) from exc
+    return "runtime-switched"
 
 
 def _plan_prefix(result: Mapping[str, Any]) -> int:

@@ -35,6 +35,11 @@ JOURNAL_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 1_000_000
 MAX_JOURNAL_BYTES = 1_000_000
 EXPECTED_OPERATION_NAMES = ("quota-current", "agent-fleet-current")
+UNKNOWN_LIVE_REGISTRY_REFUSAL = "live registry has unknown SHA-256: "
+POST_CUTOVER_CLI_HINT = (
+    "if the normal cutover has fully applied, validate through the bundle: "
+    "prepare_bridge_cutover.py validate accepts the pinned post-cutover state"
+)
 
 
 class AdoptionError(RuntimeError):
@@ -681,14 +686,19 @@ def load_manifest(path_value: str | os.PathLike[str]) -> Manifest:
     )
 
 
-def _validate_disabled_registry(manifest: Manifest) -> str:
+def _validate_disabled_registry(
+    manifest: Manifest, post_cutover_sha256: str | None = None
+) -> str:
     operation = manifest.registry_operation
     payload = _read_stable_bytes(
         operation.path, "live adoption registry", operation.mode
     )
     digest = hashlib.sha256(payload).hexdigest()
-    if digest not in {operation.initial_sha256, operation.sealed_sha256}:
-        raise AdoptionError(f"live registry has unknown SHA-256: {digest}")
+    accepted = {operation.initial_sha256, operation.sealed_sha256}
+    if post_cutover_sha256 is not None:
+        accepted.add(post_cutover_sha256)
+    if digest not in accepted:
+        raise AdoptionError(f"{UNKNOWN_LIVE_REGISTRY_REFUSAL}{digest}")
     try:
         raw = tomllib.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -720,9 +730,13 @@ def _validate_disabled_registry(manifest: Manifest) -> str:
     return digest
 
 
-def _validate_quiet_point(manifest: Manifest) -> None:
+def _validate_quiet_point(
+    manifest: Manifest, post_cutover_registry_sha256: str | None = None
+) -> str:
     quiet = manifest.quiet_point
-    _validate_disabled_registry(manifest)
+    registry_digest = _validate_disabled_registry(
+        manifest, post_cutover_sha256=post_cutover_registry_sha256
+    )
     backend_payload = _read_stable_bytes(quiet.backend_path, "backend selector")
     backend_digest = hashlib.sha256(backend_payload).hexdigest()
     if backend_digest != quiet.backend_sha256:
@@ -827,6 +841,7 @@ def _validate_quiet_point(manifest: Manifest) -> None:
                 raise AdoptionError(
                     f"Fleet process token is active at quiet point: {token}: pid {pid}"
                 )
+    return registry_digest
 
 
 def _observe_operation(operation: Operation) -> str:
@@ -1398,6 +1413,94 @@ def plan(manifest: Manifest) -> dict[str, Any]:
         }
 
 
+def _observe_post_cutover_operation(
+    operation: Operation, pin: Mapping[str, str]
+) -> None:
+    if isinstance(operation, SealedLinkOperation):
+        if pin.get("kind") != "link" or not pin.get("target"):
+            raise AdoptionError(
+                f"post-cutover pin for {operation.name} is not a link pin"
+            )
+        try:
+            info = os.lstat(operation.path)
+        except FileNotFoundError as exc:
+            raise AdoptionError(f"adoption link is missing: {operation.path}") from exc
+        if not stat.S_ISLNK(info.st_mode) or os.readlink(operation.path) != pin["target"]:
+            raise AdoptionError(
+                f"{operation.name} is not at the exact pinned post-cutover target"
+            )
+        return
+    label = (
+        "post-cutover Agent Fleet front door"
+        if isinstance(operation, FrontDoorOperation)
+        else "post-cutover live registry"
+    )
+    if pin.get("kind") != "file" or not pin.get("sha256"):
+        raise AdoptionError(
+            f"post-cutover pin for {operation.path} is not a file pin"
+        )
+    digest = _sha256(operation.path, label, operation.mode)
+    if digest != pin["sha256"]:
+        raise AdoptionError(
+            f"{label} is not at the exact pinned post-cutover SHA-256: {digest}"
+        )
+
+
+def post_cutover_plan(
+    manifest: Manifest, pins: Mapping[str, Mapping[str, str]]
+) -> dict[str, Any]:
+    """Assess a sealed adoption superseded by the fully applied main cutover.
+
+    The strict ``plan`` accepts live state only at the exact initial or sealed
+    identities, so it refuses once the normal cutover has legitimately moved
+    every adoption-managed path to its candidate identity.  This assessment
+    accepts exactly one further state, pinned by the caller from the exact
+    cutover manifest: a fully sealed adoption journal, the full quiet-point
+    contract with the live registry at the pinned candidate SHA-256, intact
+    retained sealed release trees, and every adoption-managed live path at its
+    exact pinned post-cutover identity.  Anything else refuses.  It never
+    mutates state and is never a substitute for adoption-time validation.
+    """
+
+    with _lock(manifest):
+        registry_pin = pins.get(str(manifest.registry_operation.path))
+        if (
+            not isinstance(registry_pin, Mapping)
+            or registry_pin.get("kind") != "file"
+            or not registry_pin.get("sha256")
+        ):
+            raise AdoptionError("post-cutover assessment requires a registry file pin")
+        pinned_registry_sha256 = str(registry_pin["sha256"])
+        registry_digest = _validate_quiet_point(
+            manifest, post_cutover_registry_sha256=pinned_registry_sha256
+        )
+        if registry_digest != pinned_registry_sha256:
+            raise AdoptionError(
+                "post-cutover live registry is not at the exact pinned "
+                f"post-cutover SHA-256: {registry_digest}"
+            )
+        journal = _load_journal(manifest)
+        if not (journal and journal.get("sealed")):
+            raise AdoptionError(
+                "post-cutover assessment requires a fully sealed adoption journal"
+            )
+        for operation in manifest.link_operations:
+            _validate_sealed_operation(operation)
+        for operation in manifest.operations:
+            pin = pins.get(str(operation.path))
+            if not isinstance(pin, Mapping):
+                raise AdoptionError(
+                    f"no post-cutover pin for adoption path: {operation.path}"
+                )
+            _observe_post_cutover_operation(operation, pin)
+        return {
+            "mode": "post-cutover-plan",
+            "transaction_id": manifest.transaction_id,
+            "sealed": True,
+            "superseded_by_cutover": True,
+        }
+
+
 def recover(
     manifest: Manifest,
     boundaries: BoundaryController | None = None,
@@ -1504,6 +1607,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 75
     except (AdoptionError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        if (
+            not args.apply
+            and not args.recover
+            and isinstance(exc, AdoptionError)
+            and UNKNOWN_LIVE_REGISTRY_REFUSAL in str(exc)
+        ):
+            print(POST_CUTOVER_CLI_HINT, file=sys.stderr)
         return 2
 
 

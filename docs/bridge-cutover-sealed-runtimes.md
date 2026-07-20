@@ -230,6 +230,6 @@ Without all variables, CI reports the host-only gate as skipped.
 
 The same host gate accepts exact Agent Fleet candidate and rollback repository, commit, and wheel variables; it archives both commits and requires the independent wheel consumer to match the embedded `tools/agent-fleet` candidate subtree and standalone rollback source exactly.
 
-The macOS-only builder integration and preparation tests skip on Linux, while the transaction and adoption crash matrices run cross-platform.
+The macOS-only builder integration and preparation behavior tests skip on Linux, while the transaction and adoption crash matrices and the preparation module's synthetic `agent_fleet.models` schema drift gate run cross-platform.
 
 No routing file, live `current` link, live registry, worker home, credential, browser, or Desktop session is modified by the builder or its unit tests.

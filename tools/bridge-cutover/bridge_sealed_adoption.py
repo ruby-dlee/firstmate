@@ -35,6 +35,11 @@ JOURNAL_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 1_000_000
 MAX_JOURNAL_BYTES = 1_000_000
 EXPECTED_OPERATION_NAMES = ("quota-current", "agent-fleet-current")
+UNKNOWN_LIVE_REGISTRY_REFUSAL = "live registry has unknown SHA-256: "
+POST_CUTOVER_CLI_HINT = (
+    "if the normal cutover has fully applied, validate through the bundle: "
+    "prepare_bridge_cutover.py validate accepts the pinned post-cutover state"
+)
 
 
 class AdoptionError(RuntimeError):
@@ -693,14 +698,7 @@ def _validate_disabled_registry(
     if post_cutover_sha256 is not None:
         accepted.add(post_cutover_sha256)
     if digest not in accepted:
-        message = f"live registry has unknown SHA-256: {digest}"
-        if post_cutover_sha256 is None:
-            message += (
-                "; if the main cutover has fully applied, validate through the "
-                "bundle (prepare_bridge_cutover.py validate), which accepts the "
-                "pinned post-cutover state"
-            )
-        raise AdoptionError(message)
+        raise AdoptionError(f"{UNKNOWN_LIVE_REGISTRY_REFUSAL}{digest}")
     try:
         raw = tomllib.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -1609,6 +1607,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 75
     except (AdoptionError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        if (
+            not args.apply
+            and not args.recover
+            and isinstance(exc, AdoptionError)
+            and UNKNOWN_LIVE_REGISTRY_REFUSAL in str(exc)
+        ):
+            print(POST_CUTOVER_CLI_HINT, file=sys.stderr)
         return 2
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -549,6 +551,40 @@ class BridgeSealedAdoptionTests(unittest.TestCase):
             ):
                 adoption.apply(manifest)
         self.assertEqual(fixture.registry.read_bytes(), racer)
+
+    def test_post_cutover_hint_is_cli_only_and_never_in_the_refusal(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        fixture.registry.write_bytes(b'version = 1\nmode = "post-cutover"\n')
+        fixture.registry.chmod(0o600)
+
+        with self.assertRaises(adoption.AdoptionError) as caught:
+            adoption.plan(fixture.load())
+        refusal = str(caught.exception)
+        self.assertIn(adoption.UNKNOWN_LIVE_REGISTRY_REFUSAL, refusal)
+        self.assertNotIn(adoption.POST_CUTOVER_CLI_HINT, refusal)
+        self.assertNotIn("prepare_bridge_cutover.py", refusal)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = adoption.main([str(fixture.manifest_path)])
+        printed = stderr.getvalue()
+        self.assertEqual(code, 2)
+        self.assertIn(f"refused: {refusal}", printed)
+        self.assertIn(adoption.POST_CUTOVER_CLI_HINT, printed)
+
+    def test_post_cutover_hint_is_not_printed_for_unrelated_refusals(self) -> None:
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        fixture.backend.write_text("zellij\n", encoding="utf-8")
+        fixture.backend.chmod(0o600)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = adoption.main([str(fixture.manifest_path)])
+        printed = stderr.getvalue()
+        self.assertEqual(code, 2)
+        self.assertNotIn(adoption.POST_CUTOVER_CLI_HINT, printed)
 
     def test_link_change_at_exchange_syscall_is_swapped_back_and_preserved(self) -> None:
         fixture = Fixture()

@@ -2169,6 +2169,76 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         self.assertTrue(result["runtime_switch_ready"])
         self.assertFalse(result["cutover_ready"])
 
+    def _apply_runtime_switch(
+        self, mark_boundary: bool = True
+    ) -> tuple[types.ModuleType, Path]:
+        bundle = json.loads(
+            (self.fixture.bundle_dir / "bundle.json").read_text(encoding="utf-8")
+        )
+        adoption_driver = prepare._load_adoption_driver()
+        adoption_driver.apply(
+            adoption_driver.load_manifest(Path(bundle["adoption_manifest_path"]))
+        )
+        driver = prepare._load_driver(DRIVER)
+        manifest_path = Path(bundle["manifest_path"])
+        driver.execute(driver.load_manifest(manifest_path), "forward")
+        if mark_boundary:
+            driver.mark_post_install_irreversible_boundary(
+                driver.load_manifest(manifest_path)
+            )
+        return driver, manifest_path
+
+    def test_validate_accepts_post_cutover_state_only_with_boundary_marked(self) -> None:
+        self.fixture.prepare()
+        driver, manifest_path = self._apply_runtime_switch(mark_boundary=False)
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "sealed-adoption state is invalid"
+        ):
+            prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
+        driver.mark_post_install_irreversible_boundary(
+            driver.load_manifest(manifest_path)
+        )
+        result = prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
+        self.assertEqual(result["cutover_phase"], "runtime-switched")
+        self.assertFalse(result["runtime_switch_ready"])
+        self.assertFalse(result["cutover_ready"])
+        # The accepted live-registry set stays pinned to exactly the three
+        # bundle-recorded identities; post-cutover the live file is the new one.
+        self.assertEqual(
+            prepare._sha256(self.fixture.live), result["new_registry_sha256"]
+        )
+
+    def test_validate_refuses_tampered_live_registry_after_runtime_switch(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        payload = self.fixture.live.read_bytes()
+        self.fixture.live.write_bytes(payload + b"# drift\n")
+        self.fixture.live.chmod(0o600)
+        with self.assertRaisesRegex(prepare.PreparationError, "unknown SHA-256"):
+            prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
+    def test_validate_refuses_candidate_registry_before_adoption(self) -> None:
+        self.fixture.prepare()
+        self.fixture.live.write_bytes(
+            (self.fixture.bundle_dir / "registry.new.toml").read_bytes()
+        )
+        self.fixture.live.chmod(0o600)
+        with self.assertRaisesRegex(prepare.PreparationError, "unknown SHA-256"):
+            prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
+    def test_validate_refuses_partially_reverted_state_after_runtime_switch(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        current = self.fixture.agent_root / "current"
+        os.unlink(current)
+        os.symlink("releases/0.1.5-old", current)
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "sealed-adoption state is invalid"
+        ):
+            prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
     def test_validate_refuses_extra_trusted_project(self) -> None:
         self.fixture.prepare()
         extra = self.fixture.root / "other-project"

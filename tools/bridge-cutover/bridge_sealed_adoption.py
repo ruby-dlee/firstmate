@@ -1459,11 +1459,21 @@ def post_cutover_plan(
 
     with _lock(manifest):
         registry_pin = pins.get(str(manifest.registry_operation.path))
-        if not isinstance(registry_pin, Mapping) or registry_pin.get("kind") != "file":
+        if (
+            not isinstance(registry_pin, Mapping)
+            or registry_pin.get("kind") != "file"
+            or not registry_pin.get("sha256")
+        ):
             raise AdoptionError("post-cutover assessment requires a registry file pin")
-        _validate_quiet_point(
-            manifest, post_cutover_registry_sha256=str(registry_pin["sha256"])
+        pinned_registry_sha256 = str(registry_pin["sha256"])
+        registry_digest = _validate_quiet_point(
+            manifest, post_cutover_registry_sha256=pinned_registry_sha256
         )
+        if registry_digest != pinned_registry_sha256:
+            raise AdoptionError(
+                "post-cutover live registry is not at the exact pinned "
+                f"post-cutover SHA-256: {registry_digest}"
+            )
         journal = _load_journal(manifest)
         if not (journal and journal.get("sealed")):
             raise AdoptionError(

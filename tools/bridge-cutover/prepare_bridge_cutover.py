@@ -5686,14 +5686,17 @@ def _superseded_adoption_phase(
     post-cutover assessment against the exact cutover-new identities.
     """
 
-    invalid = PreparationError(f"sealed-adoption state is invalid: {refusal}")
+    invalid = f"sealed-adoption state is invalid: {refusal}"
     try:
         planned = driver.plan(loaded)
         fully_applied = _plan_prefix(planned) == len(planned["states"])
-    except Exception:
-        raise invalid from refusal
+    except (driver.CutoverError, PreparationError) as exc:
+        raise PreparationError(f"{invalid} (post-cutover probe: {exc})") from refusal
     if not fully_applied or not planned.get("post_install_irreversible_boundary"):
-        raise invalid from refusal
+        raise PreparationError(
+            f"{invalid} (post-cutover probe: main cutover is not fully applied "
+            "past the marked post-install irreversible boundary)"
+        ) from refusal
     try:
         adoption_driver.post_cutover_plan(
             loaded_adoption, _post_cutover_pins(driver, loaded)

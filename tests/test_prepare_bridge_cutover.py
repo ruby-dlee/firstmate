@@ -2192,7 +2192,10 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         self.fixture.prepare()
         driver, manifest_path = self._apply_runtime_switch(mark_boundary=False)
         with self.assertRaisesRegex(
-            prepare.PreparationError, "sealed-adoption state is invalid"
+            prepare.PreparationError,
+            "sealed-adoption state is invalid: .*"
+            r"\(post-cutover probe: main cutover is not fully applied past the "
+            "marked post-install irreversible boundary\\)",
         ):
             prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
 
@@ -2235,9 +2238,29 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         os.unlink(current)
         os.symlink("releases/0.1.5-old", current)
         with self.assertRaisesRegex(
-            prepare.PreparationError, "sealed-adoption state is invalid"
+            prepare.PreparationError,
+            "sealed-adoption state is invalid: .*"
+            r"\(post-cutover probe: observed old/new states are not a valid "
+            "transaction prefix",
         ):
             prepare.validate_bundle(self.fixture.bundle_dir / "bundle.json", DRIVER)
+
+    def test_post_cutover_plan_refuses_registry_pin_without_sha256(self) -> None:
+        self.fixture.prepare()
+        driver, manifest_path = self._apply_runtime_switch()
+        bundle = json.loads(
+            (self.fixture.bundle_dir / "bundle.json").read_text(encoding="utf-8")
+        )
+        adoption_driver = prepare._load_adoption_driver()
+        loaded_adoption = adoption_driver.load_manifest(
+            Path(bundle["adoption_manifest_path"])
+        )
+        pins = prepare._post_cutover_pins(driver, driver.load_manifest(manifest_path))
+        pins[str(loaded_adoption.registry_operation.path)] = {"kind": "file"}
+        with self.assertRaisesRegex(
+            adoption_driver.AdoptionError, "requires a registry file pin"
+        ):
+            adoption_driver.post_cutover_plan(loaded_adoption, pins)
 
     def test_validate_refuses_extra_trusted_project(self) -> None:
         self.fixture.prepare()

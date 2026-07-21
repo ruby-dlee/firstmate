@@ -62,7 +62,8 @@ A certificate-verified HTTPS response from the cluster endpoint, including HTTP 
 
 Continue when any bounded retry succeeds, and record the transient only when it affects operational evidence or repeats.
 Apply the three-probe budget only to transient connectivity failures such as TLS handshake timeout, i/o timeout, or transient DNS or network errors; escalate when identity and context checks, kubeconfig refresh, and three total non-mutating attempts still fail.
-Escalate immediately when the intended target cannot be proved or classification confirms an authentication, AWS IAM, EKS access-entry, RBAC, or owner-controlled certificate failure, without spending the connectivity retry budget.
+Correct an expired or misselected local credential or role first, because those caller-controlled authentication failures do not require escalation.
+Escalate immediately when the intended target cannot be proved or classification confirms an owner-controlled AWS IAM, Kubernetes authentication, EKS access-entry, RBAC, or certificate failure, without spending the connectivity retry budget.
 Also escalate persistent evidence of a non-active control plane, private-route or allowlist boundary, or owner-controlled proxy fault.
 Include the redacted exact commands and errors, timestamps and attempt count, current context and namespace, AWS identity and region, cluster status and endpoint-access mode, and DNS or HTTPS observations.
 Never self-grant IAM or RBAC, edit access entries, expose a private endpoint, widen endpoint CIDRs or security groups, disable TLS verification, or mutate an uncertain context merely to get past an access failure.

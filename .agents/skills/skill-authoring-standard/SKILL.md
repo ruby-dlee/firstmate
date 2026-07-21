@@ -14,7 +14,7 @@ metadata:
 
 Apply this standard while forming a skill, before prose and resources harden around the wrong artifact or scope.
 It is self-contained so a crew in any project can read this file directly even when its harness cannot load firstmate skills.
-When delegating skill work to a project crew, resolve `FM_HOME` or the equivalent active firstmate home to an absolute path at brief-writing time and pass the absolute path to its `.agents/skills/skill-authoring-standard/SKILL.md` file in the brief because project crewmates do not inherit this repository's section 13 or internal skills.
+When delegating skill work to a project crew, resolve the absolute path to `.agents/skills/skill-authoring-standard/SKILL.md` from the active firstmate repository or instruction root that contains it, not from `FM_HOME`, and pass that path in the brief because project crewmates do not inherit this repository's section 13 or internal skills.
 
 ## Gate before drafting
 

@@ -12,6 +12,7 @@ metadata:
 
 Build every captain decision as an actionable, layout-safe Lavish surface.
 A read-only status page is not a decision surface.
+The captain cannot see the CLI, so every decision ask must go through a Lavish board.
 
 ## Build
 
@@ -31,13 +32,14 @@ A read-only status page is not a decision surface.
 1. Serve the board without auto-opening by passing `--no-open` or setting `LAVISH_AXI_NO_OPEN=1`.
 2. Extract the printed session URL without its surrounding double quotes.
    A safe extraction pattern is `grep -oE 'https?://[^ "]+'`; verify that no quote or punctuation trails the URL.
-3. Open it explicitly in headed Chrome with `CHROME_DEVTOOLS_AXI_HEADED=1 chrome-devtools-axi open "<url>"`.
+3. Open every board in its own dedicated Chrome window with `open -na "Google Chrome" --args --new-window "<url>"`.
 4. Start `lavish-axi poll <file>` silently and leave it running while review continues.
    Re-run it after every response while review continues.
    Use `chrome-devtools-axi snapshot` to confirm that the layout gate clears without the layout-issue banner, which verifies zero error-severity `layout_warnings`.
    Do not announce the board as ready until that check passes.
    If the audit finds an error while the layout gate is still holding the board, fix it and verify again before the captain can answer.
 5. Name the board when surfacing it so the captain knows which decision surface is awaiting action.
+   Accompany it in the CLI with only a bare pointer to the board, never the substantive decision content.
 
 ## Protect answers
 

@@ -31,10 +31,12 @@ A read-only status page is not a decision surface.
 1. Serve the board without auto-opening by passing `--no-open` or setting `LAVISH_AXI_NO_OPEN=1`.
 2. Extract the printed session URL without its surrounding double quotes.
    A safe extraction pattern is `grep -oE 'https?://[^ "]+'`; verify that no quote or punctuation trails the URL.
-3. Open it explicitly with `open -a "Google Chrome" "<url>"`.
-   The machine's live LaunchServices resolution sends a bare open to Safari, where Lavish's interactive layer does not work.
-4. Run `lavish-axi poll <file>` silently and do not announce the board as ready until the browser audit yields zero error-severity `layout_warnings`.
-   If the audit finds an error before the captain starts answering, fix it and verify again.
+3. Open it explicitly in headed Chrome with `CHROME_DEVTOOLS_AXI_HEADED=1 chrome-devtools-axi open "<url>"`.
+4. Start `lavish-axi poll <file>` silently and leave it running while review continues.
+   Re-run it after every response while review continues.
+   Use `chrome-devtools-axi snapshot` to confirm that the layout gate clears without the layout-issue banner, which verifies zero error-severity `layout_warnings`.
+   Do not announce the board as ready until that check passes.
+   If the audit finds an error while the layout gate is still holding the board, fix it and verify again before the captain can answer.
 5. Name the board when surfacing it so the captain knows which decision surface is awaiting action.
 
 ## Protect answers

@@ -23,6 +23,7 @@ Before writing a new fact anywhere in this repo, ask where it belongs, in this o
    If yes: `AGENTS.md`, inline.
 2. Does the agent need it only in a nameable situation - a spawn, a recovery, a specific wake type, a specific lifecycle step?
    If yes: an agent-only skill under `.agents/skills/`, plus a one-line trigger pointer left inline in `AGENTS.md` (usually section 13).
+   For the load-before-doing versus be-aware boundary, use the tie-break owned by `AGENTS.md` section 6's knowledge-routing table.
 3. Is it human/reference detail - a wire format, a verification record, a mechanism narrative, an incident writeup?
    If yes: `docs/`.
 4. Is it mechanics - exact flags, exact commands, exact paths?

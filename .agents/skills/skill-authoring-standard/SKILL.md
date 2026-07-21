@@ -3,6 +3,7 @@ name: skill-authoring-standard
 description: >-
   Agent-only fleet-wide standard for deciding whether work belongs in a skill and producing a focused, durable first draft.
   Use before authoring or substantially editing any skill in firstmate or any project.
+  Load it together with the generic `skill-creator`: `skill-creator` owns anatomy, bundled resources, and degrees of freedom, while this standard owns whether to author, scope, durability, and triggers.
   Covers the skill gate, single-concern scope, principle-level guidance, concrete load triggers, and an in-draft pre-PR rubric.
 user-invocable: false
 metadata:
@@ -13,6 +14,7 @@ metadata:
 
 Apply this standard while forming a skill, before prose and resources harden around the wrong artifact or scope.
 It is self-contained so a crew in any project can read this file directly even when its harness cannot load firstmate skills.
+When delegating skill work to a project crew, pass `.agents/skills/skill-authoring-standard/SKILL.md` in the brief because project crewmates do not inherit this repository's section 13 or internal skills.
 
 ## Gate before drafting
 

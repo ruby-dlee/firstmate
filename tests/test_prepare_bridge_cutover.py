@@ -2426,16 +2426,13 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         bundle_path = self.fixture.bundle_dir / "bundle.json"
         worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
         before = (bundle_path.read_bytes(), worker_state_path.read_bytes())
-        worker_state_driver = types.SimpleNamespace(
-            WorkerStateError=RuntimeError,
-            load_manifest=mock.Mock(return_value=object()),
-            plan=mock.Mock(return_value={"phase": "snapshotted"}),
+        worker_state_journal = (
+            self.fixture.snapshot_parent
+            / "bridge-cutover-fixture-workers.journal.json"
         )
-        with mock.patch.object(
-            prepare,
-            "_load_worker_state_driver",
-            return_value=worker_state_driver,
-        ), self.assertRaisesRegex(
+        worker_state_journal.write_text("{}\n", encoding="utf-8")
+        worker_state_journal.chmod(0o600)
+        with self.assertRaisesRegex(
             prepare.PreparationError,
             "worker-state transaction is bound.*strand the transaction",
         ):
@@ -2443,7 +2440,25 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         self.assertEqual(
             (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
         )
-        worker_state_driver.load_manifest.assert_called_once_with(worker_state_path)
+
+    def test_refresh_repairs_partial_artifact_replacement(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        worker_state = self._read_json_file(worker_state_path)
+        worker_state["bundle_sha256"] = "a" * 64
+        self._write_json_file(worker_state_path, worker_state)
+        with self.assertRaises(prepare.PreparationError):
+            prepare.validate_bundle(bundle_path, DRIVER)
+        refreshed = prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertTrue(refreshed["valid"])
+        self.assertEqual(refreshed["cutover_phase"], "runtime-switched")
+        repaired_worker_state = self._read_json_file(worker_state_path)
+        self.assertEqual(
+            repaired_worker_state["bundle_sha256"],
+            hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+        )
 
     def test_validate_refuses_extra_trusted_project(self) -> None:
         self.fixture.prepare()

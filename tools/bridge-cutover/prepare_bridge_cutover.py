@@ -4711,6 +4711,21 @@ def _activation_plan(provision_contract: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _worker_state_transaction_paths(
+    spec: PreparationSpec,
+) -> tuple[str, Path, Path, Path]:
+    transaction_id = f"{spec.transaction_id}-workers"
+    if len(transaction_id) > 64:
+        raise PreparationError("transaction_id is too long for worker-state suffix")
+    parent = spec.worker_state.snapshot_parent
+    return (
+        transaction_id,
+        parent / f"{transaction_id}.lock",
+        parent / f"{transaction_id}.journal.json",
+        parent / f"{transaction_id}.snapshot",
+    )
+
+
 def _worker_state_manifest_dict(
     spec: PreparationSpec,
     *,
@@ -4736,17 +4751,17 @@ def _worker_state_manifest_dict(
         raise PreparationError(
             "worker-state snapshot parent must not overlap bundle, workers, or identity state"
         )
-    transaction_id = f"{spec.transaction_id}-workers"
-    if len(transaction_id) > 64:
-        raise PreparationError("transaction_id is too long for worker-state suffix")
+    transaction_id, lock_path, journal_path, snapshot_path = (
+        _worker_state_transaction_paths(spec)
+    )
     return {
         "schema_version": 1,
         "transaction_id": transaction_id,
         "apply_opt_in": True,
         "snapshot_parent": str(parent),
-        "lock_path": str(parent / f"{transaction_id}.lock"),
-        "journal_path": str(parent / f"{transaction_id}.journal.json"),
-        "snapshot_path": str(parent / f"{transaction_id}.snapshot"),
+        "lock_path": str(lock_path),
+        "journal_path": str(journal_path),
+        "snapshot_path": str(snapshot_path),
         "cutover_manifest_path": str(cutover_manifest_path),
         "bundle_path": str(bundle_path),
         "bundle_sha256": bundle_sha256,
@@ -5710,41 +5725,65 @@ def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
     descriptor = _open_preparation_lock(lock_path)
     try:
         worker_state_path = bundle_path.parent / "worker-state.manifest.json"
-        worker_state_driver = _load_worker_state_driver()
+        (
+            worker_state_id,
+            worker_state_lock,
+            worker_state_journal,
+            worker_state_snapshot,
+        ) = _worker_state_transaction_paths(spec)
+        worker_state_staging = spec.worker_state.snapshot_parent / (
+            f".{worker_state_id}.snapshot-staging"
+        )
+        worker_state_flags = (
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        )
+        worker_state_descriptor = os.open(
+            worker_state_lock, worker_state_flags, 0o600
+        )
         try:
-            worker_state_loaded = worker_state_driver.load_manifest(worker_state_path)
-            worker_state_phase = worker_state_driver.plan(worker_state_loaded)["phase"]
-        except worker_state_driver.WorkerStateError as exc:
-            raise PreparationError(f"worker-state manifest is invalid: {exc}") from exc
-        if worker_state_phase != "not-started":
-            raise PreparationError(
-                "in-place refresh refuses while a worker-state transaction is "
-                "bound to the current manifest fingerprint; refreshing would "
-                "change the fingerprint and strand the transaction and its "
-                "rollback; bring worker-state back to 'not-started' before "
-                "refreshing"
-            )
-        refreshed_bundle = dict(state.bundle)
-        refreshed_bundle["activation_plan"] = _activation_plan(
-            state.expected_provision_contract
-        )
-        bundle_payload = (
-            json.dumps(refreshed_bundle, indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        worker_state_manifest = _worker_state_manifest_dict(
-            spec,
-            bundle_path=bundle_path,
-            bundle_sha256=hashlib.sha256(bundle_payload).hexdigest(),
-            cutover_manifest_path=state.manifest_path,
-            candidate_registry_path=state.new_path,
-            candidate_registry_sha256=_sha256(state.new_path),
-            candidate=state.candidate,
-            provision_contract=state.expected_provision_contract,
-        )
-        # Write the bundle first so the worker-state manifest's bundle_sha256
-        # pins the refreshed bundle bytes; both replacements are atomic.
-        _atomic_replace_bytes(bundle_path, bundle_payload, 0o600)
-        _atomic_replace_json(worker_state_path, worker_state_manifest, 0o600)
+            os.fchmod(worker_state_descriptor, 0o600)
+            fcntl.flock(worker_state_descriptor, fcntl.LOCK_EX)
+            try:
+                if any(
+                    os.path.lexists(path)
+                    for path in (
+                        worker_state_journal,
+                        worker_state_snapshot,
+                        worker_state_staging,
+                    )
+                ):
+                    raise PreparationError(
+                        "in-place refresh refuses while a worker-state transaction "
+                        "is bound to the current manifest fingerprint; refreshing "
+                        "would change the fingerprint and strand the transaction "
+                        "and its rollback; bring worker-state back to 'not-started' "
+                        "before refreshing"
+                    )
+                refreshed_bundle = dict(state.bundle)
+                refreshed_bundle["activation_plan"] = _activation_plan(
+                    state.expected_provision_contract
+                )
+                bundle_payload = (
+                    json.dumps(refreshed_bundle, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                worker_state_manifest = _worker_state_manifest_dict(
+                    spec,
+                    bundle_path=bundle_path,
+                    bundle_sha256=hashlib.sha256(bundle_payload).hexdigest(),
+                    cutover_manifest_path=state.manifest_path,
+                    candidate_registry_path=state.new_path,
+                    candidate_registry_sha256=_sha256(state.new_path),
+                    candidate=state.candidate,
+                    provision_contract=state.expected_provision_contract,
+                )
+                # Write the bundle first so the worker-state manifest's bundle_sha256
+                # pins the refreshed bundle bytes; both replacements are atomic.
+                _atomic_replace_bytes(bundle_path, bundle_payload, 0o600)
+                _atomic_replace_json(worker_state_path, worker_state_manifest, 0o600)
+            finally:
+                fcntl.flock(worker_state_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(worker_state_descriptor)
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)

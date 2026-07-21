@@ -2727,6 +2727,46 @@ def _write_json(path: Path, value: Any, mode: int = 0o600) -> None:
     _write_bytes(path, payload, mode)
 
 
+def _atomic_replace_bytes(path: Path, value: bytes, mode: int = 0o600) -> None:
+    """Durably replace an existing regular file with new bytes.
+
+    ``_write_bytes`` opens with ``O_EXCL`` and therefore only ever creates a new
+    file.  Refreshing an already-published bundle artifact must overwrite in
+    place, so this writes the payload to a private sibling temporary file and
+    atomically renames it over the target, then fsyncs the directory.  The
+    rename is atomic, so a reader either sees the whole old file or the whole new
+    file, never a partial write.
+    """
+
+    directory = path.parent
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(descriptor, mode)
+        offset = 0
+        while offset < len(value):
+            offset += os.write(descriptor, value[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temp_path, path)
+    except BaseException:
+        if os.path.lexists(temp_path):
+            os.unlink(temp_path)
+        raise
+    parent_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _atomic_replace_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _atomic_replace_bytes(path, payload, mode)
+
+
 def _native_dependencies(path: Path) -> list[str]:
     try:
         completed = subprocess.run(
@@ -5274,7 +5314,45 @@ def _spec_from_bundle(bundle_path: Path, bundle: dict[str, Any]) -> PreparationS
     return spec
 
 
-def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _BundleState:
+    """Reconstructed, journal-bound runtime state of a validated bundle.
+
+    Carries exactly the pieces both the strict validator and the in-place
+    refresh need after every shared integrity check has passed but before the
+    two identity-bound gates (recorded activation plan, worker-state manifest)
+    are enforced.  ``expected_provision_contract`` is recomputed against the
+    CURRENT provider-binary identity, so it is what the refresh writes and what
+    the validator compares against.
+    """
+
+    bundle_path: Path
+    bundle: dict[str, Any]
+    spec: PreparationSpec
+    candidate: Any
+    loaded: Any
+    loaded_adoption: Any
+    cutover_phase: str
+    manifest_path: Path
+    initial_path: Path
+    old_path: Path
+    new_path: Path
+    expected_provision_contract: dict[str, Any]
+
+
+def _reconstruct_bundle_state(bundle_path: Path, driver_path: Path) -> _BundleState:
+    """Validate a bundle and reconstruct its journal-bound runtime state.
+
+    Owns every bundle-integrity check shared by ``validate_bundle`` and the
+    in-place refresh: metadata exactness, the sealed runtime and quota proofs,
+    the three registries, the cutover and sealed-adoption manifests, the
+    journal-bound cutover phase, the topology summary, and the freshly recomputed
+    sealed provision contract (which reads the current provider-binary identity).
+    It stops just before the two identity-bound exactness gates so the validator
+    can enforce them strictly and the refresh can regenerate them.  It never
+    mutates state.
+    """
+
     bundle_path = _normalized_absolute(str(bundle_path), "bundle path")
     _canonical(bundle_path, "bundle path")
     bundle = _read_json(bundle_path, "cutover bundle")
@@ -5479,6 +5557,44 @@ def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
     if bundle["topology"] != expected_topology:
         raise PreparationError("bundle topology summary is not exact")
     expected_provision_contract = _sealed_provision_contract(candidate_api, candidate)
+    return _BundleState(
+        bundle_path=bundle_path,
+        bundle=bundle,
+        spec=spec,
+        candidate=candidate,
+        loaded=loaded,
+        loaded_adoption=loaded_adoption,
+        cutover_phase=cutover_phase,
+        manifest_path=manifest_path,
+        initial_path=initial_path,
+        old_path=old_path,
+        new_path=new_path,
+        expected_provision_contract=expected_provision_contract,
+    )
+
+
+def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
+    """Validate a bundle strictly, enforcing the two identity-bound gates.
+
+    The recorded activation plan and worker-state manifest must equal the exact
+    reconstruction from the current provider-binary identity.  These are the
+    journal-independent, identity-bound proofs the in-place refresh regenerates;
+    this function never loosens them.
+    """
+
+    state = _reconstruct_bundle_state(bundle_path, driver_path)
+    bundle = state.bundle
+    bundle_path = state.bundle_path
+    spec = state.spec
+    candidate = state.candidate
+    cutover_phase = state.cutover_phase
+    loaded = state.loaded
+    loaded_adoption = state.loaded_adoption
+    manifest_path = state.manifest_path
+    initial_path = state.initial_path
+    old_path = state.old_path
+    new_path = state.new_path
+    expected_provision_contract = state.expected_provision_contract
     if bundle["activation_plan"] != _activation_plan(expected_provision_contract):
         raise PreparationError(
             "bundle activation plan is not exact or generated-command-free"
@@ -5546,6 +5662,85 @@ def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
         "quota_binary": str(spec.quota.binary),
         "quota_node_binary": str(spec.quota.node_binary),
     }
+
+
+def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
+    """Refresh an applied runtime-switched bundle's identity artifacts in place.
+
+    The main cutover pins the live provider-binary identity (inode, mtime, and
+    content SHA-256) into the recorded activation plan and the worker-state
+    manifest.  A byte-exact reinstall of that provider binary gives it a fresh
+    inode and mtime, which re-stales those two artifacts against the live binary,
+    so ``validate_bundle``'s strict activation-plan and worker-state gates refuse
+    even though the machine is genuinely in the sealed runtime-switched state.
+
+    A from-scratch rebuild cannot recover from this: a rebuild's new output
+    directory starts with empty transaction journals, and the runtime-switched
+    proof is journal-bound - the post-install irreversible boundary and the
+    sealed-adoption journal live only inside this bundle's own ``transaction/``
+    directory, cannot be borrowed by another bundle byte-for-byte, and cannot be
+    re-sealed against the already-migrated live registry.  Only the bundle that
+    actually applied the switch validates as runtime-switched.
+
+    This mode refreshes exactly the two identity-bound artifacts of that existing
+    bundle - its recorded ``activation_plan`` and ``worker-state.manifest.json`` -
+    to the current provider-binary identity, while leaving the sealed cutover and
+    sealed-adoption journals untouched.  It refuses unless the bundle is provably
+    the applied runtime-switched one, and it gates completion on a full strict
+    ``validate_bundle`` that must still report the journal-bound runtime-switched
+    phase.  It loosens no proof: the strict gates it makes pass do so because the
+    recorded identity now equals the live binary, not because the check was
+    weakened.
+    """
+
+    state = _reconstruct_bundle_state(bundle_path, driver_path)
+    if state.cutover_phase != "runtime-switched":
+        raise PreparationError(
+            "in-place refresh applies only to an applied runtime-switched bundle; "
+            f"observed cutover phase {state.cutover_phase!r}"
+        )
+    bundle_path = state.bundle_path
+    spec = state.spec
+    # Serialize against a concurrent prepare or refresh of the same transaction.
+    staging = spec.output_dir.parent / (
+        f".{spec.output_dir.name}.prepare-"
+        f"{hashlib.sha256(spec.transaction_id.encode('utf-8')).hexdigest()[:32]}"
+    )
+    _, lock_path = _preparation_control_paths(staging)
+    descriptor = _open_preparation_lock(lock_path)
+    try:
+        refreshed_bundle = dict(state.bundle)
+        refreshed_bundle["activation_plan"] = _activation_plan(
+            state.expected_provision_contract
+        )
+        bundle_payload = (
+            json.dumps(refreshed_bundle, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        worker_state_path = bundle_path.parent / "worker-state.manifest.json"
+        worker_state_manifest = _worker_state_manifest_dict(
+            spec,
+            bundle_path=bundle_path,
+            bundle_sha256=hashlib.sha256(bundle_payload).hexdigest(),
+            cutover_manifest_path=state.manifest_path,
+            candidate_registry_path=state.new_path,
+            candidate_registry_sha256=_sha256(state.new_path),
+            candidate=state.candidate,
+            provision_contract=state.expected_provision_contract,
+        )
+        # Write the bundle first so the worker-state manifest's bundle_sha256
+        # pins the refreshed bundle bytes; both replacements are atomic.
+        _atomic_replace_bytes(bundle_path, bundle_payload, 0o600)
+        _atomic_replace_json(worker_state_path, worker_state_manifest, 0o600)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    result = validate_bundle(bundle_path, driver_path)
+    if not result.get("valid") or result.get("cutover_phase") != "runtime-switched":
+        raise PreparationError(
+            "in-place refresh did not converge on a strict runtime-switched bundle"
+        )
+    result["refreshed"] = True
+    return result
 
 
 def _validate_input_state_for_existing_bundle(
@@ -6033,6 +6228,14 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("spec", help="absolute path to the preparation JSON spec")
     validate_parser = commands.add_parser("validate", help="validate an existing bundle")
     validate_parser.add_argument("bundle", help="absolute path to bundle.json")
+    refresh_parser = commands.add_parser(
+        "refresh",
+        help=(
+            "refresh an applied runtime-switched bundle's activation plan and "
+            "worker-state manifest to the current provider-binary identity"
+        ),
+    )
+    refresh_parser.add_argument("bundle", help="absolute path to bundle.json")
     rehearse_parser = commands.add_parser(
         "rehearse", help="run exhaustive disposable transaction recovery rehearsal"
     )
@@ -6053,6 +6256,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = prepare(_normalized_absolute(args.spec, "spec path"), driver)
         elif args.command == "validate":
             result = validate_bundle(_normalized_absolute(args.bundle, "bundle path"), driver)
+        elif args.command == "refresh":
+            result = refresh_bundle(_normalized_absolute(args.bundle, "bundle path"), driver)
         else:
             scratch = _normalized_absolute(args.scratch_root, "scratch root")
             result = rehearse_bundle(

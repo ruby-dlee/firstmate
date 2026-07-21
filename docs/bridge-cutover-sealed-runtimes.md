@@ -174,6 +174,14 @@ Once the normal cutover is fully applied and the post-install irreversible bound
 Any other combination, including a post-cutover registry without the marked boundary or with any drifted path, refuses exactly as before.
 This pinned post-cutover acceptance exists because the documented order crosses the runtime switch before worker-state verification, so verification, finalize, and rollback attribution must remain provable on the switched machine.
 
+## In-place identity refresh
+
+The prepared activation plan and worker-state manifest pin the live provider-binary identity - inode, mtime, and content SHA-256 - so a byte-exact reinstall of that provider binary gives it a fresh inode and mtime and re-stales both artifacts against the live binary, and the strict activation-plan and worker-state gates then refuse even though the machine is genuinely in the `runtime-switched` state.
+A from-scratch rebuild cannot recover, because the `runtime-switched` proof is journal-bound: the post-install irreversible boundary and the sealed-adoption journal live only inside the applying bundle's own `transaction/` directory, cannot be borrowed byte-for-byte by another bundle, and cannot be re-sealed against the already-migrated live registry, so only the bundle that actually applied the switch validates as `runtime-switched`.
+`prepare_bridge_cutover.py refresh <bundle>` refreshes exactly those two identity artifacts of that existing bundle in place, atomically, to the current provider-binary identity, while leaving the sealed cutover and sealed-adoption journals untouched.
+It refuses unless the bundle is provably the applied `runtime-switched` one - it reuses the same journal-bound phase determination as validation - and it gates completion on a full strict `validate_bundle` that must still report the `runtime-switched` phase, so it makes the strict gates pass only because the recorded identity again equals the live binary, never by loosening any check.
+Refreshing the worker-state manifest changes its fingerprint, so an in-flight worker-state transaction bound to the previous manifest restarts worker-state verification from its snapshot against the refreshed bundle; rollback stays available.
+
 ## Exact worker topology
 
 The registry contains eight explicit profiles, but only six profiles are Fleet workers.

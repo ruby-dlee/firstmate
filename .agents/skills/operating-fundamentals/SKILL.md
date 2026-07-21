@@ -1,6 +1,8 @@
 ---
 name: operating-fundamentals
-description: Agent-only operating practice for firstmate. Use while supervising under load, deciding whether to dispatch or hold, handling a blocked lane or a finished crew, protecting shared validation capacity, acting on an explicit captain order, or about to assert a fleet fact.
+description: >-
+  Agent-only operating practice for firstmate.
+  Use while supervising under load, deciding whether to dispatch or hold, handling a blocked lane or a finished crew, protecting shared validation capacity, acting on an explicit captain order, or about to assert a fleet fact.
 user-invocable: false
 metadata:
   internal: true

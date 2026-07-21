@@ -3,7 +3,7 @@ name: skill-authoring-standard
 description: >-
   Agent-only fleet-wide standard for deciding whether work belongs in a skill and producing a focused, durable first draft.
   Use before authoring or substantially editing any skill in firstmate or any project.
-  Load it together with the generic `skill-creator`: `skill-creator` owns anatomy, bundled resources, and degrees of freedom, while this standard owns whether to author, scope, durability, and triggers.
+  Load it together with the generic `skill-creator`: `skill-creator` owns portable anatomy, bundled resources, and degrees of freedom, while this standard owns whether to author, scope, durability, and triggers.
   Covers the skill gate, single-concern scope, principle-level guidance, concrete load triggers, and an in-draft pre-PR rubric.
 user-invocable: false
 metadata:
@@ -66,8 +66,8 @@ This rubric improves construction and does not replace independent review-time a
 
 ## Neighbor ownership
 
-Use the generic `skill-creator` alongside this standard for skill anatomy, bundled resources, and degrees of freedom; do not restate those subjects here.
+Use the generic `skill-creator` alongside this standard for portable skill anatomy, bundled resources, and degrees of freedom; do not restate those subjects here.
 Use `firstmate-coding-guidelines` for knowledge placement, the one-owner rule, inline stubs, and `AGENTS.md` size discipline when changing firstmate itself.
 Its decision tree answers where material belongs inside firstmate, while this standard answers whether and how to author a skill anywhere in the fleet.
 Use a repository's own review-time skill audit as the independent counterpart when one exists; do not copy its finding taxonomy into this authoring standard.
-Leave mechanical syntax, metadata, symlink, and literal-reference enforcement with each repository's validators.
+Leave repository-specific frontmatter extensions and mechanical syntax, metadata, symlink, and literal-reference enforcement with each repository's documented conventions and validators.

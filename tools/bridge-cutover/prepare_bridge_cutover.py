@@ -5709,6 +5709,21 @@ def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
     _, lock_path = _preparation_control_paths(staging)
     descriptor = _open_preparation_lock(lock_path)
     try:
+        worker_state_path = bundle_path.parent / "worker-state.manifest.json"
+        worker_state_driver = _load_worker_state_driver()
+        try:
+            worker_state_loaded = worker_state_driver.load_manifest(worker_state_path)
+            worker_state_phase = worker_state_driver.plan(worker_state_loaded)["phase"]
+        except worker_state_driver.WorkerStateError as exc:
+            raise PreparationError(f"worker-state manifest is invalid: {exc}") from exc
+        if worker_state_phase != "not-started":
+            raise PreparationError(
+                "in-place refresh refuses while a worker-state transaction is "
+                "bound to the current manifest fingerprint; refreshing would "
+                "change the fingerprint and strand the transaction and its "
+                "rollback; bring worker-state back to 'not-started' before "
+                "refreshing"
+            )
         refreshed_bundle = dict(state.bundle)
         refreshed_bundle["activation_plan"] = _activation_plan(
             state.expected_provision_contract
@@ -5716,7 +5731,6 @@ def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
         bundle_payload = (
             json.dumps(refreshed_bundle, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
-        worker_state_path = bundle_path.parent / "worker-state.manifest.json"
         worker_state_manifest = _worker_state_manifest_dict(
             spec,
             bundle_path=bundle_path,

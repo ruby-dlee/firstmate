@@ -2420,6 +2420,31 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
             (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
         )
 
+    def test_refresh_refuses_active_worker_state_transaction(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        before = (bundle_path.read_bytes(), worker_state_path.read_bytes())
+        worker_state_driver = types.SimpleNamespace(
+            WorkerStateError=RuntimeError,
+            load_manifest=mock.Mock(return_value=object()),
+            plan=mock.Mock(return_value={"phase": "snapshotted"}),
+        )
+        with mock.patch.object(
+            prepare,
+            "_load_worker_state_driver",
+            return_value=worker_state_driver,
+        ), self.assertRaisesRegex(
+            prepare.PreparationError,
+            "worker-state transaction is bound.*strand the transaction",
+        ):
+            prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertEqual(
+            (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
+        )
+        worker_state_driver.load_manifest.assert_called_once_with(worker_state_path)
+
     def test_validate_refuses_extra_trusted_project(self) -> None:
         self.fixture.prepare()
         extra = self.fixture.root / "other-project"

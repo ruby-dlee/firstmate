@@ -37,7 +37,8 @@ Refreshing kubeconfig fixes stale endpoint, certificate, or generated-entry stat
 | Signal | Layer | Response |
 | --- | --- | --- |
 | `AccessDeniedException` from EKS describe or kubeconfig update | AWS IAM before the Kubernetes API | Confirm the AWS identity and intended role, then escalate an actual missing IAM grant instead of debugging the network. |
-| `ExpiredToken`, `InvalidClientTokenId`, missing credentials, or an exec-plugin failure | Local AWS credential chain before the Kubernetes request | Refresh or select the intended profile or role, then re-run the identity check without printing a token. |
+| `ExpiredToken`, `InvalidClientTokenId`, or missing credentials | Local AWS credential chain before the Kubernetes request | Refresh or select the intended profile or role, then re-run the identity check without printing a token. |
+| A generic exec-plugin failure | Local exec invocation or a wrapped nested failure | Classify the nested error first; check for a missing AWS executable, malformed exec stanza, or unsupported exec `apiVersion`, and refresh credentials only when the nested error identifies a credential failure. |
 | `Unauthorized` or a server request for credentials from `kubectl` | Kubernetes API authentication after reaching the endpoint | Confirm the generated user role and the cluster's authorized IAM principal or access entry. |
 | `Forbidden` from `kubectl` | Kubernetes authorization after successful authentication | Check the verb, resource, and namespace with `kubectl auth can-i`, then escalate the RBAC change if it is outside authority. |
 | `dial tcp`, `i/o timeout`, `TLS handshake timeout`, `no route`, or `connection refused` | DNS, route, proxy, firewall, or API-endpoint reachability | Follow the bounded connectivity retry path below rather than requesting IAM. |
@@ -60,7 +61,8 @@ A certificate-verified HTTPS response from the cluster endpoint, including HTTP 
 ## Retry and escalation line
 
 Continue when any bounded retry succeeds, and record the transient only when it affects operational evidence or repeats.
-Escalate only after the identity and context checks, kubeconfig refresh, and three total non-mutating probe attempts still fail, or immediately when the intended target cannot be proved.
-Escalate persistent evidence of a non-active control plane, private-route or allowlist boundary, AWS IAM denial, missing EKS access entry, RBAC denial, or certificate/proxy fault that requires an owner-controlled change.
+Apply the three-probe budget only to transient connectivity failures such as TLS handshake timeout, i/o timeout, or transient DNS or network errors; escalate when identity and context checks, kubeconfig refresh, and three total non-mutating attempts still fail.
+Escalate immediately when the intended target cannot be proved or classification confirms an authentication, AWS IAM, EKS access-entry, RBAC, or owner-controlled certificate failure, without spending the connectivity retry budget.
+Also escalate persistent evidence of a non-active control plane, private-route or allowlist boundary, or owner-controlled proxy fault.
 Include the redacted exact commands and errors, timestamps and attempt count, current context and namespace, AWS identity and region, cluster status and endpoint-access mode, and DNS or HTTPS observations.
 Never self-grant IAM or RBAC, edit access entries, expose a private endpoint, widen endpoint CIDRs or security groups, disable TLS verification, or mutate an uncertain context merely to get past an access failure.

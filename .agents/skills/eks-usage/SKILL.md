@@ -12,7 +12,13 @@ metadata:
 
 This skill owns generic EKS client access and diagnosis, not permission to change a cluster or deploy an application.
 Project runbooks and deployment skills remain authoritative for the intended cluster, lane, namespace, and allowed mutations.
-For Relvino deployment work, also load `deploy-realtime-platform` and `operate-deploy-lanes`; they own topology, `relctl`, and ArgoCD safety, while this skill owns kubeconfig, context, authentication, and connectivity.
+
+## During deployments
+
+Before contacting the cluster control plane during a deploy, read the project's deployment map or runbook and confirm that direct cluster access belongs to the documented lane.
+Most managed production deploys use CI, GitOps synchronization, or a platform render pipeline and do not contact the raw cluster API.
+If transient TLS, i/o, DNS, or network failures repeat after kubeconfig refresh during a deploy, treat them as a likely wrong-path signal, stop direct cluster retries, and switch to the documented deploy lane.
+Reserve the bounded retry procedure below for a confirmed correct direct-access path, because a wrong deploy path is resolved by switching lanes rather than by retrying or escalating it as a connectivity blocker.
 
 ## Establish identity and context
 

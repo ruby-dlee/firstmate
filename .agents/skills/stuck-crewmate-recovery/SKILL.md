@@ -13,7 +13,7 @@ metadata:
 
 Use this playbook when a direct report is stale, permission-blocked, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
-Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
+Load `harness-adapters` before handling a permission prompt or sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 
 ## Permission-blocked branch

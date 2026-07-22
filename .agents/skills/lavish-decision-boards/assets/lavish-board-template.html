@@ -187,6 +187,7 @@
     };
     submissionInFlight=true;
     sendButton.disabled=true;
+    submissionStatus.textContent='';
     window.lavish.queuePrompt('Explicitly submitted decision batch: '+JSON.stringify(batch),
       {tag:'decision-batch',text:'Explicitly submitted decision batch',element:sendButton,
        queueKey:'explicit-decision-batch',data:batch});

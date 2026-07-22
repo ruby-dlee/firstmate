@@ -42,6 +42,12 @@ if [ "${FM_FAKE_TCC_PARTIAL:-no}" = yes ] && [[ "$*" = *'/Library/Application Su
   printf '%s\n' 'Error: system TCC database unreadable' >&2
   exit 1
 fi
+if [ "${FM_FAKE_AUTOMATION_QUERY_PARTIAL:-no}" = yes ] && [[ "$*" = *kTCCServiceAppleEvents* ]] \
+  && [[ "$*" = *'/Library/Application Support/com.apple.TCC/TCC.db'* ]] \
+  && [[ "$*" != *"$HOME/Library/Application Support/com.apple.TCC/TCC.db"* ]]; then
+  printf '%s\n' 'Error: Automation query failed' >&2
+  exit 1
+fi
 case "$*" in
   *kTCCServiceAppleEvents*com.mitchellh.ghostty*) printf 'com.mitchellh.ghostty|com.apple.systemevents|2\n' ;;
   *kTCCServiceScreenCapture*)
@@ -59,7 +65,13 @@ SH
 #!/usr/bin/env bash
 case "${FM_FAKE_AUTOMATION_ENTITLEMENT:-missing}" in
   present)
-    printf '%s\n' '<key>com.apple.security.automation.apple-events</key>'
+    printf '%s\n' '<key>com.apple.security.automation.apple-events</key><true/>'
+    ;;
+  false)
+    printf '%s\n' '<key>com.apple.security.automation.apple-events</key><false/>'
+    ;;
+  malformed)
+    printf '%s\n' '<key>com.apple.security.automation.apple-events</key><string>yes</string>'
     ;;
   unknown)
     printf '%s\n' 'codesign inspection failed' >&2
@@ -93,7 +105,7 @@ test_missing_probe_is_honest() {
   world=$(make_world missing)
   out=$(FM_FAKE_FDA=missing FM_FAKE_TCC_READABLE=no run_report "$world")
 
-  assert_contains "$out" 'current protected-path probe: MISSING' \
+  assert_contains "$out" 'current invocation protected-path probe: MISSING' \
     'protected-path denial was not reported'
   assert_contains "$out" 'readable TCC databases: 0' \
     'TCC database chicken-and-egg was hidden'
@@ -101,8 +113,10 @@ test_missing_probe_is_honest() {
     'undetectable grants were guessed'
   assert_contains "$out" 'Automation status is always PER TARGET' \
     'Automation was presented as a blanket grant'
-  assert_contains "$out" 'BLOCKED: ENTITLEMENT MISSING' \
+  assert_contains "$out" 'ENTITLEMENT NOT PRESENT' \
     'missing no-mistakes Apple Events entitlement was hidden'
+  assert_contains "$out" 'same-team targets do not require this entitlement' \
+    'missing entitlement was presented as blocking every target'
   pass 'missing and undetectable grants are reported honestly'
 }
 
@@ -114,7 +128,7 @@ test_readable_database_reports_stored_rows() {
 
   out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes run_report "$world")
 
-  assert_contains "$out" 'current protected-path probe: GRANTED' \
+  assert_contains "$out" 'current invocation protected-path probe: GRANTED' \
     'successful behavioral Full Disk Access probe was lost'
   assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=GRANTED' \
     'stored no-mistakes Screen Recording grant was not reported'
@@ -172,6 +186,58 @@ test_failed_entitlement_probe_is_unknown() {
   pass 'failed entitlement inspection remains unknown'
 }
 
+test_entitlement_boolean_is_parsed() {
+  local world out daemon_section
+  world=$(make_world entitlement-values)
+
+  out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=false run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+  assert_contains "$daemon_section" 'ENTITLEMENT NOT PRESENT' \
+    'false Apple Events entitlement was treated as present'
+
+  out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=malformed run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
+    || fail 'non-Boolean Apple Events entitlement was reported conclusively'
+  pass 'Apple Events entitlement requires an explicit Boolean value'
+}
+
+test_partial_automation_query_is_unknown() {
+  local world out
+  world=$(make_world automation-query-partial)
+  mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
+  : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
+
+  out=$(FM_FAKE_TCC_READABLE=yes FM_FAKE_AUTOMATION_QUERY_PARTIAL=yes run_report "$world")
+
+  assert_contains "$out" 'UNKNOWN (the TCC schema could not be queried completely)' \
+    'partial Automation query evidence was not marked unknown'
+  case "$out" in
+    *'com.mitchellh.ghostty -> com.apple.systemevents: GRANTED'*)
+      fail 'partial Automation query evidence produced a conclusive relationship'
+      ;;
+  esac
+  pass 'partial Automation query evidence remains unknown'
+}
+
+test_bundle_hint_does_not_override_stored_evidence() {
+  local world out ghostty_section
+  world=$(make_world bundle-hint)
+  mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
+  : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
+
+  out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes run_report "$world")
+  ghostty_section=$(printf '%s\n' "$out" | sed -n '/^Ghostty (terminal launcher)/,/^$/p')
+
+  assert_contains "$out" 'unverified bundle environment hint: com.mitchellh.ghostty (not used for attribution)' \
+    'bundle environment value was not marked unverified'
+  printf '%s\n' "$ghostty_section" \
+    | grep -E 'Full Disk Access +requirement=CONDITIONAL +status=NOT RECORDED' >/dev/null \
+    || fail 'bundle environment hint overrode stored Ghostty evidence'
+  pass 'bundle environment hint never controls permission attribution'
+}
+
 test_exact_settings_urls_and_no_other_mutation() {
   local world pane expected log mutation_log out
   world=$(make_world panes)
@@ -185,6 +251,9 @@ test_exact_settings_urls_and_no_other_mutation() {
     if [ "$pane" = automation ]; then
       assert_contains "$out" "Opened $expected; review or change target-specific relationships there." \
         'Automation pane was presented as the first-use approval flow'
+    elif [ "$pane" = screen-recording ]; then
+      assert_contains "$out" "Opened $expected; review, change, or manually add screen-recording access there." \
+        'Screen Recording pane was presented as the only first-use approval flow'
     else
       assert_contains "$out" "Opened $expected; the human must make the grant." \
         "$pane did not report the human approval boundary"
@@ -227,5 +296,8 @@ test_readable_database_reports_stored_rows
 test_mixed_identity_evidence_is_unknown
 test_partial_database_evidence_is_unknown
 test_failed_entitlement_probe_is_unknown
+test_entitlement_boolean_is_parsed
+test_partial_automation_query_is_unknown
+test_bundle_hint_does_not_override_stored_evidence
 test_exact_settings_urls_and_no_other_mutation
 test_non_macos_refuses

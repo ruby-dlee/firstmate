@@ -4,8 +4,8 @@
 # This helper performs only read-only probes unless --open is supplied.
 # It never invokes tccutil, edits a TCC database, sends Apple Events, captures
 # the screen, synthesizes input, restarts a process, or tries to grant access.
-# macOS requires human approval on an unmanaged Mac, either in the first-use
-# Automation dialog or in System Settings for the other controls.
+# Full Disk Access and Accessibility require System Settings approval on an
+# unmanaged Mac; Automation and Screen Recording can use first-use dialogs.
 #
 # Usage:
 #   bin/fm-macos-permissions.sh
@@ -151,12 +151,12 @@ print_automation_pairs() {
       query_failed=yes
     fi
   done
+  if [ "$query_failed" = yes ]; then
+    printf '%s\n' '    UNKNOWN (the TCC schema could not be queried completely)'
+    return
+  fi
   if [ -z "$pairs" ]; then
-    if [ "$query_failed" = yes ]; then
-      printf '%s\n' '    UNKNOWN (the TCC schema could not be queried)'
-    else
-      printf '%s\n' '    NOT RECORDED'
-    fi
+    printf '%s\n' '    NOT RECORDED'
     return
   fi
 
@@ -204,15 +204,19 @@ resolved_command() {
 }
 
 has_apple_events_entitlement() {
-  local executable=$1 entitlements
+  local executable=$1 entitlements compact key
   [ -n "$executable" ] && [ -e "$executable" ] || { printf 'UNKNOWN'; return; }
   command -v codesign >/dev/null 2>&1 || { printf 'UNKNOWN'; return; }
   if ! entitlements=$(codesign -d --entitlements :- "$executable" 2>&1); then
     printf 'UNKNOWN'
     return
   fi
-  case "$entitlements" in
-    *'<key>com.apple.security.automation.apple-events</key>'*) printf 'PRESENT' ;;
+  compact=$(printf '%s' "$entitlements" | tr -d '[:space:]')
+  key='<key>com.apple.security.automation.apple-events</key>'
+  case "$compact" in
+    *"$key"'<true/>'*) printf 'PRESENT' ;;
+    *"$key"'<false/>'*) printf 'MISSING' ;;
+    *"$key"*) printf 'UNKNOWN' ;;
     *) printf 'MISSING' ;;
   esac
 }
@@ -235,9 +239,6 @@ computer_use_app="$HOME/.codex/computer-use/Codex Computer Use.app"
 current_fda=$(full_disk_probe)
 ghostty_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
   com.mitchellh.ghostty "$ghostty_binary")
-case "${__CFBundleIdentifier:-}" in
-  com.mitchellh.ghostty) ghostty_fda=$current_fda ;;
-esac
 
 ghostty_screen=$(stored_status kTCCServiceScreenCapture \
   com.mitchellh.ghostty "$ghostty_binary")
@@ -264,8 +265,9 @@ no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
 no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_binary")
 
 printf '%s\n' 'firstmate macOS permission report'
-printf '  responsible-launch hint: %s\n' "${__CFBundleIdentifier:-not exposed by this process}"
-printf '  current protected-path probe: %s\n' "$current_fda"
+printf '  unverified bundle environment hint: %s (not used for attribution)\n' \
+  "${__CFBundleIdentifier:-not exposed by this process}"
+printf '  current invocation protected-path probe: %s\n' "$current_fda"
 if [ "$tcc_db_probe_incomplete" = no ]; then
   printf '  readable TCC databases: %s\n' "${#readable_tcc_dbs[@]}"
   printf '%s\n' '  Stored rows below are advisory; behavioral probes take precedence.'
@@ -320,8 +322,8 @@ print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
   'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
 case "$no_mistakes_automation_entitlement" in
   MISSING)
-    print_permission 'Automation' 'CONDITIONAL' 'BLOCKED: ENTITLEMENT MISSING' \
-      'System Settings cannot repair this binary; its signer must add com.apple.security.automation.apple-events.'
+    print_permission 'Automation' 'CONDITIONAL' 'ENTITLEMENT NOT PRESENT' \
+      'Cross-team Apple Events may be unavailable; same-team targets do not require this entitlement.'
     ;;
   PRESENT)
     print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
@@ -348,8 +350,9 @@ print_automation_pairs 'no-mistakes daemon' com.kunchenguid.no-mistakes \
 printf '\n'
 
 printf '%s\n' 'No grant was changed.'
-printf '%s\n' 'Full Disk Access, Screen Recording, and Accessibility require a human click in System Settings.'
-printf '%s\n' 'Automation first asks for target-specific approval in a dialog; use System Settings to review or change it.'
+printf '%s\n' 'Full Disk Access and Accessibility require a human click in System Settings.'
+printf '%s\n' 'Automation and Screen Recording may first ask for approval in a dialog.'
+printf '%s\n' 'Use System Settings to review or change recorded access, or to add Screen Recording access manually.'
 printf '%s\n' 'Open one pane with --open full-disk-access|automation|screen-recording|accessibility.'
 
 if [ -n "$open_pane" ]; then
@@ -365,11 +368,17 @@ if [ -n "$open_pane" ]; then
   esac
   settings_uri="x-apple.systempreferences:com.apple.preference.security?$anchor"
   if open "$settings_uri"; then
-    if [ "$open_pane" = automation ]; then
-      printf 'Opened %s; review or change target-specific relationships there.\n' "$settings_uri"
-    else
-      printf 'Opened %s; the human must make the grant.\n' "$settings_uri"
-    fi
+    case "$open_pane" in
+      automation)
+        printf 'Opened %s; review or change target-specific relationships there.\n' "$settings_uri"
+        ;;
+      screen-recording)
+        printf 'Opened %s; review, change, or manually add screen-recording access there.\n' "$settings_uri"
+        ;;
+      *)
+        printf 'Opened %s; the human must make the grant.\n' "$settings_uri"
+        ;;
+    esac
   else
     printf 'error: failed to open %s\n' "$settings_uri" >&2
     exit 1

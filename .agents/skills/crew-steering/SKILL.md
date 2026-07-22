@@ -23,7 +23,7 @@ In both modes, preserve the captain's actual goal and use the existing owner for
 
 ## 1. Demand ownership
 
-Require the crew to solve and implement the task: it never stops at `blocked`, and `it's hard` is not a stopping point; `AGENTS.md` section 9 and `operating-fundamentals` section 3 own the solve-first escalation bar.
+Require the crew to solve and implement the task: it never stops solely because work is hard or failing, it preserves mandated safety `blocked` stops such as unsafe or non-isolated worktree placement, and it exhausts its capability before following the solve-first escalation bar owned by `AGENTS.md` section 9.
 
 ## 2. Reject vague or optimistic claims
 

@@ -2262,6 +2262,204 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         ):
             adoption_driver.post_cutover_plan(loaded_adoption, pins)
 
+    def _read_json_file(self, path: Path) -> dict:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def _write_json_file(self, path: Path, value: dict) -> None:
+        Path(path).write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        Path(path).chmod(0o600)
+
+    def _transaction_journal_bytes(self) -> dict[str, bytes]:
+        transaction = self.fixture.bundle_dir / "transaction"
+        return {
+            name: (transaction / name).read_bytes()
+            for name in ("cutover.journal.json", "sealed-adoption.journal.json")
+        }
+
+    def _restale_recorded_identity(self) -> None:
+        """Re-stale the recorded identity artifacts the way a byte-exact provider
+        reinstall does live: the sealed cutover and adoption journals stay
+        intact, but the recorded activation plan and worker-state manifest drift
+        off the current provider-binary identity.  The synthetic provision model
+        is registry-pure (it does not pin the live binary inode/mtime the real
+        provision API does), so the faithful analog of that drift is to move the
+        recorded per-worker plan identity off what a fresh contract reconstructs.
+        """
+        profile = prepare.WORKER_PROFILES[0]
+        stale = "a" * 64
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        bundle = self._read_json_file(bundle_path)
+        plans = bundle["activation_plan"]["provision"]["sealed_contract"]["plans"]
+        plans[profile]["plan_sha256"] = stale
+        self._write_json_file(bundle_path, bundle)
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        worker_state = self._read_json_file(worker_state_path)
+        worker_state["sealed_plans"][profile]["plan_sha256"] = stale
+        for worker in worker_state["workers"]:
+            if worker["profile"] == profile:
+                worker["plan_sha256"] = stale
+        self._write_json_file(worker_state_path, worker_state)
+
+    def test_refresh_updates_identity_and_revalidates_runtime_switched(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+
+        # The applied runtime-switched bundle validates strictly before drift.
+        self.assertEqual(
+            prepare.validate_bundle(bundle_path, DRIVER)["cutover_phase"],
+            "runtime-switched",
+        )
+        original_bundle_bytes = bundle_path.read_bytes()
+        original_worker_state_bytes = worker_state_path.read_bytes()
+        journal_before = self._transaction_journal_bytes()
+
+        # A byte-exact provider reinstall re-stales the two identity artifacts.
+        self._restale_recorded_identity()
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "activation plan is not exact"
+        ):
+            prepare.validate_bundle(bundle_path, DRIVER)
+
+        # The in-place refresh realigns both artifacts to the live identity and
+        # gates completion on the journal-bound runtime-switched proof.
+        refreshed = prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertTrue(refreshed["refreshed"])
+        self.assertTrue(refreshed["valid"])
+        self.assertEqual(refreshed["cutover_phase"], "runtime-switched")
+
+        # A fresh strict validation now passes with no gate loosening.
+        revalidated = prepare.validate_bundle(bundle_path, DRIVER)
+        self.assertEqual(revalidated["cutover_phase"], "runtime-switched")
+        self.assertFalse(revalidated["runtime_switch_ready"])
+        self.assertFalse(revalidated["cutover_ready"])
+
+        # Both artifacts now equal the exact live reconstruction; the sealed
+        # cutover and adoption journals were preserved byte-for-byte.
+        self.assertEqual(bundle_path.read_bytes(), original_bundle_bytes)
+        self.assertEqual(
+            worker_state_path.read_bytes(), original_worker_state_bytes
+        )
+        self.assertEqual(self._transaction_journal_bytes(), journal_before)
+
+    def test_refresh_does_not_loosen_the_strict_identity_gate(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        self._restale_recorded_identity()
+        prepare.refresh_bundle(bundle_path, DRIVER)
+
+        # Re-staling after a refresh still refuses exactly as before: the strict
+        # gate is unchanged; the refresh only realigned the recorded identity to
+        # the live binary rather than weakening the check.
+        self._restale_recorded_identity()
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "activation plan is not exact"
+        ):
+            prepare.validate_bundle(bundle_path, DRIVER)
+
+    def test_refresh_refuses_bundle_that_is_not_runtime_switched(self) -> None:
+        # Prepared but never adopted or switched: sealed-adoption-pending, not
+        # the applied runtime-switched bundle, so refresh must refuse and leave
+        # both identity artifacts untouched.
+        self.fixture.prepare()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        before = (bundle_path.read_bytes(), worker_state_path.read_bytes())
+        self.assertEqual(
+            prepare.validate_bundle(bundle_path, DRIVER)["cutover_phase"],
+            "sealed-adoption-pending",
+        )
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "only to an applied runtime-switched bundle"
+        ):
+            prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertEqual(
+            (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
+        )
+
+    def test_refresh_refuses_runtime_switch_ready_bundle(self) -> None:
+        # Sealed adoption applied but the main cutover still at the sealed
+        # baseline: runtime-switch-ready, not yet applied.  Refresh must refuse.
+        self.fixture.prepare()
+        bundle = json.loads(
+            (self.fixture.bundle_dir / "bundle.json").read_text(encoding="utf-8")
+        )
+        adoption_driver = prepare._load_adoption_driver()
+        adoption_driver.apply(
+            adoption_driver.load_manifest(Path(bundle["adoption_manifest_path"]))
+        )
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        self.assertEqual(
+            prepare.validate_bundle(bundle_path, DRIVER)["cutover_phase"],
+            "runtime-switch-ready",
+        )
+        with self.assertRaisesRegex(
+            prepare.PreparationError, "only to an applied runtime-switched bundle"
+        ):
+            prepare.refresh_bundle(bundle_path, DRIVER)
+
+    def test_refresh_refuses_when_boundary_not_marked(self) -> None:
+        # Cutover applied but the post-install irreversible boundary not marked:
+        # the journal-bound runtime-switched proof cannot be established, so the
+        # shared reconstruction refuses and refresh never mutates the bundle.
+        self.fixture.prepare()
+        self._apply_runtime_switch(mark_boundary=False)
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        before = (bundle_path.read_bytes(), worker_state_path.read_bytes())
+        with self.assertRaisesRegex(
+            prepare.PreparationError,
+            "post-cutover probe: main cutover is not fully applied",
+        ):
+            prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertEqual(
+            (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
+        )
+
+    def test_refresh_refuses_active_worker_state_transaction(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        before = (bundle_path.read_bytes(), worker_state_path.read_bytes())
+        worker_state_journal = (
+            self.fixture.snapshot_parent
+            / "bridge-cutover-fixture-workers.journal.json"
+        )
+        worker_state_journal.write_text("{}\n", encoding="utf-8")
+        worker_state_journal.chmod(0o600)
+        with self.assertRaisesRegex(
+            prepare.PreparationError,
+            "before the worker-state 6a snapshot.*strand any bound transaction",
+        ):
+            prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertEqual(
+            (bundle_path.read_bytes(), worker_state_path.read_bytes()), before
+        )
+
+    def test_refresh_repairs_partial_artifact_replacement(self) -> None:
+        self.fixture.prepare()
+        self._apply_runtime_switch()
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        worker_state_path = self.fixture.bundle_dir / "worker-state.manifest.json"
+        worker_state = self._read_json_file(worker_state_path)
+        worker_state["bundle_sha256"] = "a" * 64
+        self._write_json_file(worker_state_path, worker_state)
+        with self.assertRaises(prepare.PreparationError):
+            prepare.validate_bundle(bundle_path, DRIVER)
+        refreshed = prepare.refresh_bundle(bundle_path, DRIVER)
+        self.assertTrue(refreshed["valid"])
+        self.assertEqual(refreshed["cutover_phase"], "runtime-switched")
+        repaired_worker_state = self._read_json_file(worker_state_path)
+        self.assertEqual(
+            repaired_worker_state["bundle_sha256"],
+            hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+        )
+
     def test_validate_refuses_extra_trusted_project(self) -> None:
         self.fixture.prepare()
         extra = self.fixture.root / "other-project"

@@ -75,6 +75,7 @@
   form.q label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
   form.q input[type=radio]{margin-top:2px;accent-color:var(--accent);width:16px;height:16px;flex:none}
   .selection-status{font-size:13px;color:var(--ink-2);margin:0 0 10px;min-height:20px}
+  .submission-status{font-size:13px;color:var(--red);margin:10px 0 0;min-height:20px}
   button{font-family:inherit;font-size:13.5px;font-weight:650;border-radius:9px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:#fff;padding:8px 15px}
 </style>
 </head>
@@ -97,39 +98,78 @@
     </form>
   </div>
 
-  <button type="button" onclick="sendAnswers()">Send answers</button>
+  <button type="button" data-send-answers onclick="sendAnswers()">Send answers</button>
+  <p class="submission-status" data-submission-status role="alert" aria-live="assertive"></p>
 </div>
 <script>
-  document.querySelectorAll('form[data-lavish-question]').forEach(function(form){
+  document.querySelectorAll('form.q').forEach(function(form){
     form.addEventListener('change',function(){
-      var key=form.dataset.lavishQuestion;
+      var key=(form.dataset.lavishQuestion||'').trim();
+      if(!key){
+        form.querySelector('[data-selection-status]').textContent=
+          'Configuration error: add a unique data-lavish-question value to this decision form.';
+        return;
+      }
       var choice=new FormData(form).get(key);
       form.querySelector('[data-selection-status]').textContent=
         choice?'Selected locally (not sent): '+choice:'No answer selected.';
     });
   });
 
+  var submissionInFlight=false;
+
   function sendAnswers(){
-    var forms=Array.from(document.querySelectorAll('form[data-lavish-question]'));
+    var forms=Array.from(document.querySelectorAll('form.q'));
     var answers=[];
     var firstIncomplete=null;
-    forms.forEach(function(form){
-      var key=form.dataset.lavishQuestion;
+    var sendButton=document.querySelector('[data-send-answers]');
+    var submissionStatus=document.querySelector('[data-submission-status]');
+    if(submissionInFlight)return;
+    function failConfiguration(message){
+      sendButton.disabled=true;
+      sendButton.textContent='Cannot send answers';
+      submissionStatus.textContent=message;
+    }
+    if(!forms.length){
+      failConfiguration('Configuration error: add at least one decision form before serving this board.');
+      return;
+    }
+    var keyedForms=forms.map(function(form,index){
+      return {form:form,key:(form.dataset.lavishQuestion||'').trim(),index:index};
+    });
+    var missingKey=keyedForms.find(function(item){return !item.key;});
+    if(missingKey){
+      failConfiguration('Configuration error: decision form '+(missingKey.index+1)+' needs a unique nonempty data-lavish-question value.');
+      return;
+    }
+    var expectedQuestionKeys=keyedForms.map(function(item){return item.key;});
+    var uniqueQuestionKeys=new Set(expectedQuestionKeys);
+    if(uniqueQuestionKeys.size!==expectedQuestionKeys.length){
+      failConfiguration('Configuration error: every decision form needs a unique data-lavish-question value.');
+      return;
+    }
+    keyedForms.forEach(function(item){
+      var form=item.form;
+      var key=item.key;
       var choice=new FormData(form).get(key);
       if(!choice){firstIncomplete=firstIncomplete||form;return;}
-      answers.push({form:form,key:key,label:form.dataset.lavishLabel||key,choice:choice});
+      answers.push({key:key,label:form.dataset.lavishLabel||key,answer:choice});
     });
     if(firstIncomplete){firstIncomplete.reportValidity();return;}
-    if(!answers.length||!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
-    answers.forEach(function(answer){
-      window.lavish.queuePrompt('Explicitly submitted decision - '+answer.label+': '+answer.choice,
-        {tag:'decision',text:'Explicit submit: '+answer.label+': '+answer.choice.split(' - ')[0],
-         element:answer.form,queueKey:answer.key,
-         data:{submission:'explicit-send',question:answer.key,answer:answer.choice}});
-    });
+    if(!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
+    var batch={
+      submission:'explicit-send-batch',
+      manifest:{expectedQuestionKeys:expectedQuestionKeys,expectedCount:expectedQuestionKeys.length},
+      answers:answers
+    };
+    submissionInFlight=true;
+    sendButton.disabled=true;
+    window.lavish.queuePrompt('Explicitly submitted decision batch: '+JSON.stringify(batch),
+      {tag:'decision-batch',text:'Explicitly submitted decision batch',element:sendButton,
+       queueKey:'explicit-decision-batch',data:batch});
     window.lavish.sendQueuedPrompts();
-    answers.forEach(function(answer){
-      answer.form.querySelector('[data-selection-status]').textContent='Sent explicitly: '+answer.choice;
+    forms.forEach(function(form,index){
+      form.querySelector('[data-selection-status]').textContent='Sent explicitly: '+answers[index].answer;
     });
   }
 </script>

@@ -22,10 +22,20 @@ A read-only status page is not a decision surface.
    Treat `lavish-axi --help` as the authority for current CLI behavior and flags.
 3. Give every decision a native radio group or select control, but hold all choices in local page state until one explicit `Send answers` action.
    Never call `window.lavish.queuePrompt` on selection, change, or a per-question step; a partial selection must never be actionable.
-   The single send handler must first gather and validate all current form state, then synchronously queue each answer and immediately call `window.lavish.sendQueuedPrompts()` in that same click handler.
-   Mark each delivered answer as an explicit submit so the receiver can distinguish the captain's click from disconnect or auto-flush behavior.
+   The single send handler must first gather and validate all current form state, then call `window.lavish.queuePrompt` exactly once with one structured batch envelope and immediately call `window.lavish.sendQueuedPrompts()` in that same click handler.
+   The envelope must contain `submission: "explicit-send-batch"`, an `answers` array, and a manifest with the full expected question-key set and count.
+   Reject missing or duplicate question keys before queueing.
+   Acquire a one-shot in-flight lock and disable the send button before queueing so rapid clicks cannot duplicate the batch.
    This keeps the Lavish queue empty before the explicit send, so a disconnect has nothing to auto-flush and in-progress input cannot reach the agent.
 4. Choose a durable feedback destination before polling, such as the task spec, backlog note, or task data file.
+
+## Show the actionable plan
+
+- Include every in-flight item; silently omitted work makes the board incomplete.
+- For each item, show the real end-to-end path to done: every remaining step, the owner or condition gating it, and the concrete downstream consequence when it lands; never substitute a bare status label.
+- When work spans execution resources, show its capacity-aware distribution by lane, harness, and model using current capacity and quota without embedding values that will rot.
+- State the pacing and concurrency limits being held to protect fleet health.
+- Clearly separate work proceeding autonomously under standing rules from items that genuinely require the captain's decision, and give decision controls only to the latter.
 
 ## Serve and verify
 
@@ -35,6 +45,8 @@ A read-only status page is not a decision surface.
 3. Open every board in its own dedicated Chrome window with `open -na "Google Chrome" --args --new-window "<url>"`.
 4. Start `lavish-axi poll <file>` silently and leave it running while review continues.
    Re-run it after every response while review continues.
+   Treat the board as not ready until the tool-authoritative connection signal confirms that it is genuinely connected.
+   The transition to connected can take several minutes and is expected; during that lag, do not act on a poll return or prematurely re-serve, re-open, abandon, or otherwise thrash the session.
    Create and select a `chrome-devtools-axi` page for the exact served URL, then use a bounded retry to inspect that page's snapshots.
    Pass only after the layout-audit-in-progress indicator has cleared and no layout-issue indicator is present, confirming zero error-severity `layout_warnings` for that board.
    A returned snapshot alone is not success; if the bound expires while the audit remains in progress, treat the board as unverified and do not surface it.
@@ -50,6 +62,7 @@ A read-only status page is not a decision surface.
 - When poll feedback arrives, write every annotation to the chosen durable file immediately, before interpreting it, acting on it, or doing anything else.
 - Never rely on poll output or conversation memory as the only copy because ephemeral poll output can be reaped.
 - Treat a `lavish-axi poll` return as transport or lifecycle output, not automatically as the captain's answer.
-- Act only when the return has an unambiguous deliberate-submit marker and a nonempty structured decision payload produced by the board's explicit send action.
-- Disconnects, UI flicker, re-polls, layout or audit returns, session events, and empty or partial payloads are not submissions; ignore them and keep waiting.
+- Act only after genuine connection and receipt of one unambiguous batch with `submission: "explicit-send-batch"`, a nonempty structured `answers` array, and a manifest containing `expectedQuestionKeys` and `expectedCount`.
+- Accept the batch only when the manifest keys are nonempty and unique, its count equals its key count, and every manifest key has exactly one structured answer entry with the same key and a nonempty `answer` value.
+- Reject absent, empty, extra, or duplicate answer keys, every manifest mismatch, and every disconnect, UI flicker, re-poll, layout or audit return, session event, unmarked return, or ambiguous return; ignore them and keep waiting.
 - If a return is ambiguous or lacks a clear explicit-decision payload, treat it as not submitted and do not act until the captain's actual answer is verified in the payload.

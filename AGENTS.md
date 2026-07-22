@@ -331,12 +331,14 @@ Route each piece of durable knowledge to its most specific home:
 
 | Kind of knowledge | Home |
 | --- | --- |
-| Captain preferences and working style | `data/captain.md`, inspected first and rewritten or pruned in place |
+| Captain preferences and working style | `data/captain.md`, inspected first, kept as deduplicated rule-only essence with no drama, and rewritten or pruned in place |
 | Project-intrinsic knowledge | that project's own `AGENTS.md`, via normal crewmate delivery, never hand-written by firstmate |
-| Fleet-local facts and gotchas only: load-before-doing procedures are skills; be-aware background is a learning; when in doubt, use a skill | `data/learnings.md`, inspected first and rewritten or pruned in place |
+| Fleet-local facts and gotchas only: load-before-doing procedures are skills; be-aware background is a learning; when in doubt, use a skill | `data/learnings.md`, inspected first, kept as deduplicated fact-only essence with no drama, and rewritten or pruned in place |
 | Knowledge generalizable to every firstmate user | the shared `AGENTS.md`, shipped via PR through the pipeline |
 | Task-scoped notes | backlog item notes, inspect first with `tasks-axi show <id> --full`, then replace the body with `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when superseded prior state should remain recoverable, or hand-edit per the active backend |
 | Investigation findings | scout reports at `data/<id>/report.md` |
+
+Load `memory-hygiene` before writing or leaning `data/captain.md` or `data/learnings.md`; it owns the per-entry leanness standard while this section owns routing.
 
 When the captain invokes `/stow`, load the `stow` skill.
 It sweeps the current session for uncaptured durable knowledge, routes findings with this table, files undone next steps to the backlog, and reports whether the session is safe to reset.
@@ -783,6 +785,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `skill-authoring-standard` - load before authoring or substantially editing any skill in this repo or any project, and before briefing a project crew to do so.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
+- `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
 - `lavish-decision-boards` - load before creating or revising a captain-facing Lavish board that asks the captain to make decisions or provide structured feedback.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 

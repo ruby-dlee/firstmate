@@ -74,7 +74,7 @@
   form.q label{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:9px;cursor:pointer;font-size:14px}
   form.q label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
   form.q input[type=radio]{margin-top:2px;accent-color:var(--accent);width:16px;height:16px;flex:none}
-  .queued{font-size:13px;color:var(--ink-2);margin:0 0 10px;min-height:20px}
+  .selection-status{font-size:13px;color:var(--ink-2);margin:0 0 10px;min-height:20px}
   button{font-family:inherit;font-size:13.5px;font-weight:650;border-radius:9px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:#fff;padding:8px 15px}
 </style>
 </head>
@@ -82,34 +82,55 @@
 <div class="wrap">
   <h1>Decision board title</h1>
 
-  <!-- Queue one prompt when the question is submitted, never on each option change. -->
+  <!-- Choices stay local until the single Send answers click queues and sends every answer synchronously. -->
   <div class="card decision">
     <span class="pill amber">decision needed</span>
     <h3>What should be decided?</h3>
     <p>State the relevant context in one or two sentences.</p>
     <div class="rec"><b>Recommendation:</b> Choose option A because it best matches the stated goal.</div>
-    <form class="q" data-lavish-question="decision-key"
-      onsubmit="event.preventDefault(); queueDecision(this,'decision-key','Short decision label');">
+    <form class="q" data-lavish-question="decision-key" data-lavish-label="Short decision label">
       <div class="opts">
         <label><input type="radio" name="decision-key" value="A - first option (recommended)" required> A. First option</label>
         <label><input type="radio" name="decision-key" value="B - second option"> B. Second option</label>
       </div>
-      <p class="queued" data-queued-status role="status" aria-live="polite">No answer queued yet.</p>
-      <button type="submit">Queue this answer</button>
+      <p class="selection-status" data-selection-status role="status" aria-live="polite">No answer selected.</p>
     </form>
   </div>
 
-  <button type="button" onclick="if(window.lavish&amp;&amp;window.lavish.sendQueuedPrompts)window.lavish.sendQueuedPrompts();">Send answers</button>
+  <button type="button" onclick="sendAnswers()">Send answers</button>
 </div>
 <script>
-  function queueDecision(form,key,label){
-    var choice=new FormData(form).get(key); if(!choice)return;
-    if(window.lavish&&window.lavish.queuePrompt){
-      window.lavish.queuePrompt('Decision - '+label+': '+choice,
-        {tag:'decision',text:label+': '+choice.split(' - ')[0],element:form,queueKey:key,
-         data:{question:key,answer:choice}});
-      form.querySelector('[data-queued-status]').textContent='Queued: '+choice;
-    }
+  document.querySelectorAll('form[data-lavish-question]').forEach(function(form){
+    form.addEventListener('change',function(){
+      var key=form.dataset.lavishQuestion;
+      var choice=new FormData(form).get(key);
+      form.querySelector('[data-selection-status]').textContent=
+        choice?'Selected locally (not sent): '+choice:'No answer selected.';
+    });
+  });
+
+  function sendAnswers(){
+    var forms=Array.from(document.querySelectorAll('form[data-lavish-question]'));
+    var answers=[];
+    var firstIncomplete=null;
+    forms.forEach(function(form){
+      var key=form.dataset.lavishQuestion;
+      var choice=new FormData(form).get(key);
+      if(!choice){firstIncomplete=firstIncomplete||form;return;}
+      answers.push({form:form,key:key,label:form.dataset.lavishLabel||key,choice:choice});
+    });
+    if(firstIncomplete){firstIncomplete.reportValidity();return;}
+    if(!answers.length||!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
+    answers.forEach(function(answer){
+      window.lavish.queuePrompt('Explicitly submitted decision - '+answer.label+': '+answer.choice,
+        {tag:'decision',text:'Explicit submit: '+answer.label+': '+answer.choice.split(' - ')[0],
+         element:answer.form,queueKey:answer.key,
+         data:{submission:'explicit-send',question:answer.key,answer:answer.choice}});
+    });
+    window.lavish.sendQueuedPrompts();
+    answers.forEach(function(answer){
+      answer.form.querySelector('[data-selection-status]').textContent='Sent explicitly: '+answer.choice;
+    });
   }
 </script>
 </body>

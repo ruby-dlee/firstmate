@@ -331,9 +331,9 @@ A successful live initial answer refreshes it to the time that the relay establi
 Configured polls prune records beyond the local follow-up window, capped at the relay's seven-day window; legacy or malformed records fall back to their file modification time so they cannot remain indefinitely.
 The record is written only when a platform or explicit budget is actually known, so an unknown-platform mention leaves no useless entry.
 The `fmx-respond` skill decides whether the stashed mention is an actionable request, a question, or a pure acknowledgment.
-Actionable reversible requests are run through intake, backlog, dispatch, investigation, or ship flow as appropriate.
-If the work completes in that turn, the public reply reports the outcome.
-If the request spawns a longer-running task, firstmate posts an acknowledgement through the normal answer endpoint, links the task to the mention with `bin/fm-x-link.sh`, and posts up to three completion follow-ups on genuine milestones, always finishing with a `--final` one when the task reaches a terminal state.
+The [`operating-fundamentals`](../.agents/skills/operating-fundamentals/SKILL.md) skill owns the intake and orchestration contract for actionable requests; this section owns only the X-mode transport and generated-state mechanics.
+Fleet-state questions are answered in that turn.
+For an actionable request, firstmate posts an acknowledgement through the normal answer endpoint, links the tracked task to the mention with `bin/fm-x-link.sh`, and posts up to three completion follow-ups on genuine milestones, always finishing with a `--final` one when the task reaches a terminal state.
 That link stores optional reply-platform context so Discord-originated follow-ups keep Discord's larger message budget after the inbox file has been drained.
 Platform/budget resolution is layered and independent of the task link: a per-axis `FMX_REPLY_PLATFORM` / `FMX_REPLY_MAX_CHARS` override (how `bin/fm-x-followup.sh` passes a recorded link's context) wins.
 For either axis without an override, `bin/fm-x-lib.sh:fmx_resolve_reply_context` owns the source order: the durable per-request registry is consulted first, then the still-present inbox payload, then - for a follow-up posted live by request_id - an authoritative relay lookup via `POST /connector/request-context` (`{request_id}` in, `{platform, reply_max_chars}` back).

@@ -149,13 +149,36 @@
       return;
     }
     keyedForms.forEach(function(item){
+      item.controls=Array.from(item.form.elements).filter(function(control){
+        return control.matches('input[type="radio"],select')&&
+          !control.matches(':disabled')&&control.name===item.key;
+      });
+    });
+    var missingControl=keyedForms.find(function(item){return !item.controls.length;});
+    if(missingControl){
+      failConfiguration('Configuration error: decision form '+(missingControl.index+1)+
+        ' needs an enabled radio or select named "'+missingControl.key+'".');
+      return;
+    }
+    keyedForms.forEach(function(item){
       var form=item.form;
       var key=item.key;
       var choice=new FormData(form).get(key);
-      if(!choice){firstIncomplete=firstIncomplete||form;return;}
+      if(typeof choice!=='string'||!choice.trim()){
+        firstIncomplete=firstIncomplete||item;
+        return;
+      }
       answers.push({key:key,label:form.dataset.lavishLabel||key,answer:choice});
     });
-    if(firstIncomplete){firstIncomplete.reportValidity();return;}
+    if(firstIncomplete){
+      var incompleteLabel=firstIncomplete.form.dataset.lavishLabel||firstIncomplete.key;
+      submissionStatus.textContent='Answer required: choose an option for "'+incompleteLabel+'".';
+      firstIncomplete.form.querySelector('[data-selection-status]').textContent=
+        'No answer selected. Choose an option before sending.';
+      firstIncomplete.form.reportValidity();
+      firstIncomplete.controls[0].focus();
+      return;
+    }
     if(!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
     var batch={
       submission:'explicit-send-batch',

@@ -1,6 +1,6 @@
 ---
 name: bearings
-description: Generate a "pick up where I left off" status report from firstmate's live fleet state. Use when the captain invokes /bearings or asks for a bearings report, morning brief, status report, catch-up, "where did I leave off", or "what's in the works". Reads bounded local fleet state cheaply, optionally checks open PRs when requested, composes a scannable dated report to data/status-report-<YYYY-MM-DD>.md, and surfaces a concise version in chat; it is read-mostly and must not tear down, merge, or mutate task state as a side effect of producing the brief.
+description: Generate a "pick up where I left off" status report from firstmate's live fleet state. Use when the captain invokes /bearings or asks for a bearings report, morning brief, status report, catch-up, "where did I leave off", or "what's in the works". Reads bounded local fleet state cheaply, optionally checks open PRs when requested, composes a scannable dated report to data/status-report-<YYYY-MM-DD>.md, routes open decisions to a Lavish decision board, and surfaces a concise version in chat; it is read-mostly and must not tear down, merge, or mutate task state as a side effect of producing the brief.
 user-invocable: true
 metadata:
   internal: true
@@ -9,9 +9,9 @@ metadata:
 # bearings
 
 Generate a "pick up where I left off" report from the fleet's live state, so the captain can resume in one read after a break, a night, or a context reset.
-The deliverable is a dated markdown file plus a concise chat summary; this is the reusable version of the worked example at `data/status-report-2026-07-06.md` when that file is present in this home.
+The deliverable is a dated markdown file plus a concise chat summary, with a required decision board when open decisions exist; this is the reusable version of the worked example at `data/status-report-2026-07-06.md` when that file is present in this home.
 This skill is read-mostly.
-It reads fleet state and writes exactly one report file.
+It reads fleet state and writes one report file plus the decision board required by `lavish-decision-boards` when an open decision exists.
 It never tears down a task, merges a PR, dispatches new work, or mutates any task state as a side effect of producing the brief - those belong to the captain's explicit word and the normal task lifecycle.
 
 ## What it does
@@ -30,7 +30,7 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
    The exemplar is `data/status-report-2026-07-06.md` in this home's `data/` when present; match its scannability, not a raw state dump.
    The report uses the same four sections as the chat (see the chat-response contract below), in the same order, each always present, and adds the detail the chat omits:
    - **Title** - `# Bearings - <day> <YYYY-MM-DD>` (use "Morning status" only when the captain specifically asks for a morning brief), followed by two or three sentences framing where things stand.
-   - **Captain's Call** - every open decision relayed verbatim with its options, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
+   - **Captain's Call** - a bare pointer to the Lavish board for every open decision, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
    - **Recently Landed** - merged PRs, completed scouts, and finished local-only work since the last report, across the main fleet and every registered secondmate home.
    - **Underway** - each live direct report making progress, with its current state, and the plans / main pickup pointers worth reopening (`data/<id>/report.md` files, `.lavish/*.html` boards).
    - **Charted Next** - queued or gated next work, with each item's blocker or date reason.
@@ -40,14 +40,15 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
      This is the required artifact; it lives in gitignored `data/` alongside the worked example.
      If today's file already exists, delete it first, then create a new file from scratch.
    - The chat response is the concise four-section digest defined by the contract below: materially shorter than the report file, and it links to that file for the full picture.
-   - For a richer review surface, optionally offer a Lavish board with `lavish-axi` when the report has enough structure to deserve one, but the markdown file is the required artifact and the four-section chat digest is the required minimum.
+   - When open decisions exist, load `lavish-decision-boards`, build and surface the required board, use the report file as its durable feedback destination, and put only its bare pointer in the corresponding Captain's Call lines in the report and chat digest.
+   - For a richer review surface, optionally offer a separate read-only Lavish report when the report has enough structure to deserve one, but the markdown file is the required artifact and the four-section chat digest is the required minimum.
 
 ## Chat-response contract
 
 This skill is the one owner of the `/bearings` chat-response format; the snapshot and classifier own the data that feeds it, and no other file restates this contract.
 Every `/bearings` chat response renders EXACTLY these four sections, in THIS order, and nothing else structural (there is no At Anchor section):
 
-1. **Captain's Call** - ONLY items that need the captain's own action now: a decision to make, a PR to approve or merge, a credential or login to provide, or a blocker only the captain can clear.
+1. **Captain's Call** - ONLY items that need the captain's own action now: a bare decision-board pointer for an open decision, a PR to approve or merge, a credential or login to provide, or a blocker only the captain can clear.
    Empty-state: "Nothing needs your action right now."
 2. **Recently Landed** - work completed since the prior report: merged PRs, completed scouts, and finished local-only merges, across the main fleet and every registered secondmate home.
    Empty-state: "Nothing has landed since your last report."
@@ -61,7 +62,7 @@ Rules that keep the contract unambiguous:
 - Every section ALWAYS renders, even when empty, with its short empty-state sentence; never omit a section.
 - The four buckets are mutually exclusive, so every item is forced into exactly one: needs-your-action is Captain's Call, done is Recently Landed, self-progressing is Underway, not-yet-started is Charted Next.
 - The strict boundary keeps action-free items OUT of Captain's Call: a working or validating task, a queued item blocked on another task or a date, landed work, a completed scout's report pointer, a declared `paused:` external wait, and a bare recorded PR with no merge-ready signal each belong to one of the other three sections, never Captain's Call.
-- The chat carries one scannable line per item, each PR as the full `https://...` URL; the verbatim decisions, plans, full gate reasons, and evidence live only in the report file, which the chat links to, so the chat stays materially shorter than that file.
+- The chat carries one scannable line per item, each PR as the full `https://...` URL; substantive decision content lives only in its required Lavish board, while plans, full gate reasons, and evidence live only in the report file, which the chat links to, so the chat stays materially shorter than that file.
 
 ## Tone and content rules
 
@@ -72,5 +73,5 @@ Rules that keep the contract unambiguous:
 ## Supervision discipline
 
 This skill is read-mostly and changes no fleet state.
-Do not tear down a task, merge a PR, dispatch queued work, or mutate any `state/` or `data/` file other than the single report file as a side effect of generating the brief.
-If the state you read suggests an action - a PR ready to merge, a queued item whose gate has arrived, a needs-decision finding - name it in its section (a captain action under "Captain's Call", queued or gated work under "Charted Next") and let the captain decide, rather than taking the action from inside this skill.
+Do not tear down a task, merge a PR, dispatch queued work, or mutate any `state/` or `data/` file other than the report file as a side effect of generating the brief; the decision-board artifact is the only other permitted write.
+If the state you read suggests an action - a PR ready to merge, a queued item whose gate has arrived, a needs-decision finding - name non-decision actions in their section, route decisions through `lavish-decision-boards` with only a bare pointer under "Captain's Call", and let the captain decide rather than taking the action from inside this skill.

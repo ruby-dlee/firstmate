@@ -102,6 +102,88 @@ EOF
   pass "an in-scope capture failure blocks compaction instead of silently losing the anchor"
 }
 
+test_capture_and_recovery_do_not_require_jq() {
+  local rec root home no_jq anchor capture_out recover_out
+  rec=$(new_primary no-jq)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '# no-jq-backlog' > "$home/data/backlog.md"
+  fm_write_meta "$home/state/no-jq-1.meta" 'window=firstmate:fm-no-jq-1' 'kind=ship'
+  no_jq="$TMP_ROOT/no-jq/bash-env"
+  mkdir -p "$(dirname "$no_jq")"
+  cat > "$no_jq" <<'EOF'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+EOF
+
+  capture_out=$(printf '%s\n' '{"hook_event_name":"PreCompact","trigger":"auto","session_id":"session-no-jq","transcript_path":"/tmp/no-jq.jsonl"}' \
+    | BASH_ENV="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" capture 2>&1)
+  anchor="$home/data/autocompact-resume.md"
+  assert_present "$anchor" "capture without jq did not publish an anchor"
+  assert_contains "$capture_out" 'FIRSTMATE AUTOCOMPACT CAPTURE LIMITED' "missing jq was not surfaced loudly"
+  assert_contains "$(cat "$anchor")" 'LIMITED - jq is unavailable' "limited anchor did not explain the omitted projection"
+  assert_contains "$(cat "$anchor")" '# no-jq-backlog' "capture without jq omitted the raw backlog"
+  assert_contains "$(cat "$anchor")" 'window=firstmate:fm-no-jq-1' "capture without jq omitted in-flight metadata"
+
+  recover_out=$(printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact","session_id":"session-no-jq"}' \
+    | BASH_ENV="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover)
+  assert_contains "$recover_out" 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT' "recovery without jq emitted no context"
+  assert_contains "$recover_out" '# no-jq-backlog' "recovery without jq omitted the durable anchor"
+  assert_contains "$recover_out" 'NORMAL SESSION-START RECONCILIATION' "recovery without jq skipped reconciliation output"
+  pass "capture and compact recovery preserve durable context without jq"
+}
+
+test_intermediate_render_failure_preserves_prior_anchor() {
+  local rec root home anchor prior out rc fakebin real_sed
+  local -a leftovers
+  rec=$(new_primary render-failure)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '# render-v1' > "$home/data/backlog.md"
+  capture "$root" "$home" auto
+  anchor="$home/data/autocompact-resume.md"
+  prior=$(cat "$anchor")
+  printf '%s\n' '# render-v2' > "$home/data/backlog.md"
+  fakebin=$(fm_fakebin "$TMP_ROOT/render-failure")
+  real_sed=$(command -v sed)
+  cat > "$fakebin/sed" <<'EOF'
+#!/usr/bin/env bash
+if [ "${!#}" = "$FM_AUTOCOMPACT_FAIL_FILE" ]; then
+  exit 71
+fi
+exec "$FM_AUTOCOMPACT_REAL_SED" "$@"
+EOF
+  chmod +x "$fakebin/sed"
+
+  set +e
+  out=$(printf '%s\n' '{"hook_event_name":"PreCompact","trigger":"auto","session_id":"session-render","transcript_path":"/tmp/render.jsonl"}' \
+    | PATH="$fakebin:$PATH" \
+      FM_AUTOCOMPACT_FAIL_FILE="$home/data/backlog.md" \
+      FM_AUTOCOMPACT_REAL_SED="$real_sed" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "intermediate anchor render failure"
+  assert_contains "$out" 'could not render the resume anchor' "intermediate render failure was not surfaced"
+  [ "$(cat "$anchor")" = "$prior" ] || fail "intermediate render failure replaced the prior good anchor"
+  shopt -s nullglob
+  leftovers=("$home/data"/.autocompact-resume.md.*)
+  shopt -u nullglob
+  [ "${#leftovers[@]}" -eq 0 ] || fail "intermediate render failure left a temporary anchor"
+  pass "every intermediate render failure blocks partial anchor publication"
+}
+
 test_compact_sessionstart_injects_anchor_and_reconciles() {
   local rec root home out
   rec=$(new_primary recover)
@@ -138,5 +220,7 @@ test_tracked_hook_registration_preserves_existing_hooks
 test_capture_writes_fresh_durable_anchor
 test_capture_is_inert_in_child_worktree
 test_capture_failure_blocks_compaction
+test_capture_and_recovery_do_not_require_jq
+test_intermediate_render_failure_preserves_prior_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
 test_noncompact_sessionstart_is_inert

@@ -3,8 +3,11 @@
 #
 # Wraps bin/fm-watch.sh: runs it as a child, classifies each wake reason, and
 # either SELF-HANDLES the routine majority in bash (no firstmate turn) or
-# ESCALATES a batched, distilled digest to the supervisor pane on
-# captain-relevant events plus bounded declared-pause rechecks. This is the
+# ESCALATES a batched, distilled digest on captain-relevant events plus bounded
+# declared-pause rechecks. A native tracked-background launch delivers that
+# escalation by completing this daemon, which lets the harness's own task
+# notification wake the parked LLM. A terminal-backed compatibility launch
+# still delivers through the supervisor pane. This is the
 # token-efficient replacement for the prior always-inject daemon: routine
 # signal/stale/heartbeat wakes cost zero firstmate context; only done/
 # needs-decision/blocked/failed/persistent-wedge/check-output events and a
@@ -12,27 +15,27 @@
 # batch window.
 #
 # PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
-# injects ONLY when the durable away-mode flag state/.afk is present. Invoking
-# the /afk skill sets that flag and starts this daemon; any real (unmarked)
-# user message clears it and firstmate resumes full responsiveness.
+# delivers ONLY when the durable away-mode flag state/.afk is present. Invoking
+# the /afk skill sets that flag and starts this daemon; any real user message
+# clears it and firstmate resumes full responsiveness.
 # When afk is off, normal fm-watch.sh always-on triage is the active mechanism.
 # Any buffered daemon escalations that remain while afk is off survive in
 # state/.subsuper-escalations and are flushed on the next "while you were out"
 # catch-up or when afk is re-entered.
 #
-# IN-BAND SENTINEL MARKER. Every daemon injection is prefixed with
+# LEGACY IN-BAND SENTINEL MARKER. Every terminal-backed daemon injection is prefixed with
 # FM_INJECT_MARK (ASCII unit separator, 0x1f) — a byte a human would never type
 # at the start of a message. Firstmate's contract: a message that starts with
 # the marker is an internal escalation (stay afk); a message without it means
 # the captain is back (exit afk, flush catch-up, resume per-wake responsiveness).
-# The marker and the busy-guard solve the same problem — the daemon and the
-# human share one input channel — so they live together under /afk.
+# Native reap-wake delivery never shares the input channel and does not use this
+# marker, a busy guard, or a composer classifier.
 #
 # Reliability model (see the /afk skill):
 #   - Nothing is lost in away mode: while state/.afk exists, the watcher reverts
 #     to daemon-owned one-shot behavior and enqueues every wake to
 #     state/.wake-queue BEFORE advancing its suppression markers, so a
-#     crash/restart/missed injection is recovered on the next fm-wake-drain.sh.
+#     crash/restart/missed notification is recovered on the next fm-wake-drain.sh.
 #     The daemon does not touch the queue; it only reads the watcher's stdout
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
@@ -44,23 +47,25 @@
 #     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
-#     Buffered escalation delivery also has a max-defer alarm: if a digest stays
-#     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
-#     writes state/.subsuper-inject-wedged and attempts a configurable active
-#     alert if submit still cannot be confirmed.
+#     Native tracked delivery has no pane guard to defer indefinitely: a due
+#     digest completes this process and the harness notifies the parked LLM.
+#     The legacy terminal-backed delivery retains its max-defer alarm.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
 #
 # The robustness shell from the prior always-inject version is preserved:
-# single-instance lock (portable helper, no flock dependency), crash-loop
-# backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
-# escalations before exit.
+# single-instance lock (portable helper, no flock dependency) and crash-loop
+# backoff remain shared. The compatibility path retains its pane-gone guard and
+# shutdown flush; native shutdown preserves buffered escalations for catch-up.
 #
 # Usage: fm-supervise-daemon.sh
 #          Long-lived background loop. Normally started by the /afk skill, which
 #          sets state/.afk first. Env knobs:
-#          FM_SUPERVISOR_TARGET     supervisor pane target (override; otherwise
+#          FM_AFK_DELIVERY          reap-wake|inject. Native launch records set
+#                                   reap-wake automatically; terminal-backed
+#                                   launches retain inject compatibility.
+#          FM_SUPERVISOR_TARGET     legacy injection pane target (override; otherwise
 #                                   auto-discovered per backend - $TMUX_PANE
 #                                   under tmux, "<session>:<pane-id>" from
 #                                   $HERDR_PANE_ID under herdr - then
@@ -74,10 +79,9 @@
 #                                   resolves the runtime firstmate itself is
 #                                   executing inside - $TMUX_PANE selects tmux,
 #                                   $HERDR_ENV=1 selects herdr - falling back to
-#                                   tmux). zellij, orca, and cmux are not yet
-#                                   supported as supervisor backends; the daemon
-#                                   refuses loudly at startup rather than trying
-#                                   tmux primitives against a non-tmux pane.
+#                                   tmux). Applies only to compatibility injection:
+#                                   zellij, orca, and cmux are not supported there,
+#                                   and that mode refuses loudly at startup.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -94,10 +98,10 @@
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
 #                                   the watcher is mid-cycle (default 15)
 #          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
-#          FM_COMPOSER_IDLE_RE      empty-composer regex applied after dim-ghost
+#          FM_COMPOSER_IDLE_RE      compatibility injection empty-composer regex applied after dim-ghost
 #                                   and structural border stripping (default:
 #                                   bare prompt glyphs plus busy footers)
-#          FM_MAX_DEFER_SECS        max seconds a buffered escalation may sit
+#          FM_MAX_DEFER_SECS        compatibility-only max seconds a buffered escalation may sit
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
@@ -107,7 +111,7 @@
 #                                   absent file/var means auto: on macOS that is
 #                                   an OS-level notification, so the alarm is
 #                                   never silent. See wedge_alarm_notify below
-#                                   and docs/configuration.md.
+#                                   and docs/configuration.md. Compatibility only.
 #          FM_WEDGE_ALARM_EXEC      notifier seam: when set, every notifier
 #                                   channel routes through this command as
 #                                   `<cmd> <channel> <summary>` instead of
@@ -134,9 +138,10 @@
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
 #          instance via portable lock on state/.supervise-daemon.lock. Trapped
-#          SIGTERM/SIGINT shut down within ~1s, flush escalations, release the
-#          lock. A crashing fm-watch.sh is logged and restarted, never killing
-#          the daemon; a tight crash-restart spin is detected and backed off.
+#          SIGTERM/SIGINT shut down within ~1s and release the lock; compatibility
+#          injection flushes, while native delivery preserves its buffer. A
+#          crashing fm-watch.sh is logged and restarted, never killing the daemon;
+#          a tight crash-restart spin is detected and backed off.
 set -u
 
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -171,22 +176,23 @@ fm_refuse_if_gate_agent
 . "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
-# Supervisor backends this daemon knows how to inject into today. zellij, orca,
+# Supervisor backends the compatibility path can inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# daemon has no verified composer/busy primitives wired up for them yet - see
+# compatibility path has no verified composer/busy primitives for them yet - see
 # docs/herdr-backend.md and AGENTS.md section 4's
 # harness-verification discipline. Selecting one refuses loudly at startup
 # instead of silently running tmux primitives against a pane that is not a tmux
 # pane.
 FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr"
+FM_REAP_WAKE_PENDING=0
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
 ESCALATE_BATCH_SECS_DEFAULT=90
 HEARTBEAT_SCAN_SECS_DEFAULT=300
 HOUSEKEEPING_TICK_DEFAULT=15
-# Max time a buffered escalation may sit undelivered before the daemon retries
-# the normal flush path and, if that cannot confirm a submit, raises a loud wedge
-# alarm. The escape hatch makes a guard false-positive visible instead of silent.
+# Compatibility-only max time a buffered escalation may sit undelivered before
+# the daemon retries the injection path and, if that cannot confirm a submit,
+# raises a loud wedge alarm.
 MAX_DEFER_SECS_DEFAULT=300
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
@@ -602,19 +608,30 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
-# Flush the escalation buffer as ONE batched, single-line digest to the
-# supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
-# inject failure (buffer preserved for retry / catch-up).
+# Deliver one batched, single-line digest.
+# Native reap-wake delivery prints one completion reason and asks the main loop
+# to exit cleanly, which completes the harness-tracked background task.
+# Legacy terminal-backed delivery retains the pane injection compatibility path.
+# Returns 0 on successful delivery (or an empty buffer) and non-zero when the
+# buffer must be preserved for retry or catch-up.
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
-  n=$(wc -l < "$buf" 2>/dev/null || echo 0)
+  n=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
-  # safety net, but keeping the source single-line makes the intent explicit).
-  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read)' "$n" "$msg")
+  if [ "${FM_AFK_DELIVERY:-inject}" = reap-wake ]; then
+    afk_active "$state" || { log "reap-wake deferred: afk inactive"; return 1; }
+    msg=$(_collapse_newlines "$msg")
+    printf 'afk-reap-wake: %s; drain state/.wake-queue, handle the batch, then restart the away daemon as a native tracked background task\n' "$msg"
+    FM_REAP_WAKE_PENDING=1
+    log "reap-wake delivery ready: native tracked background task will complete"
+    : > "$buf"
+    rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+    return 0
+  fi
   if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
@@ -936,7 +953,10 @@ housekeeping() {  # <state>
     fi
   fi
 
-  # (1b) max-defer escape. If anything is still buffered past MAX_DEFER_SECS,
+# A native delivery asks the main loop to complete as soon as the batch flushes.
+  [ "$FM_REAP_WAKE_PENDING" -eq 0 ] || return 0
+
+  # (1b) legacy-injection max-defer escape. If anything is still buffered past MAX_DEFER_SECS,
   # retry the normal delivery path. If that still cannot confirm, raise a loud
   # wedge alarm while preserving the buffer.
   max_defer=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
@@ -1249,7 +1269,7 @@ trim_log() {
 # ============================================================================
 
 fm_super_main() {
-  local STATE
+  local STATE DELIVERY BACKEND TARGET backend_source target_source
   STATE="$(_state_root)"
   mkdir -p "$STATE"
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe daemon state directory: $STATE" >&2; exit 1; }
@@ -1269,6 +1289,11 @@ fm_super_main() {
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
   local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
+  DELIVERY=${FM_AFK_DELIVERY:-inject}
+  case "$DELIVERY" in
+    reap-wake|inject) ;;
+    *) echo "error: unsupported away-mode delivery '$DELIVERY' (supported: reap-wake, inject)" >&2; exit 1 ;;
+  esac
 
   for state_file in "$LOG" "$WATCH_ERR" "$PIDFILE"; do
     if [ -L "$state_file" ] || { [ -e "$state_file" ] && [ ! -f "$state_file" ]; }; then
@@ -1299,33 +1324,39 @@ fm_super_main() {
   # into FM_SUPERVISOR_BACKEND makes inject_msg/pane_is_busy/pane_input_pending
   # (which read that env var) dispatch through the right backend without an
   # extra global thread-through.
-  local discovered_backend backend_source
-  backend_source="FM_SUPERVISOR_BACKEND"
-  if [ -z "${FM_SUPERVISOR_BACKEND:-}" ]; then
-    if [ -n "${TMUX_PANE:-}" ]; then
-      backend_source="TMUX_PANE"
-    elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-      backend_source="HERDR_ENV"
-    else
-      backend_source="FALLBACK($FM_SUPERVISOR_BACKEND_DEFAULT)"
+  if [ "$DELIVERY" = reap-wake ]; then
+    BACKEND=native
+    TARGET=tracked-background-task
+    backend_source=FM_AFK_DELIVERY
+    target_source=FM_AFK_DELIVERY
+  else
+    local discovered_backend
+    backend_source="FM_SUPERVISOR_BACKEND"
+    if [ -z "${FM_SUPERVISOR_BACKEND:-}" ]; then
+      if [ -n "${TMUX_PANE:-}" ]; then
+        backend_source="TMUX_PANE"
+      elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+        backend_source="HERDR_ENV"
+      else
+        backend_source="FALLBACK($FM_SUPERVISOR_BACKEND_DEFAULT)"
+      fi
     fi
-  fi
-  discovered_backend=$(discover_supervisor_backend) || true
-  FM_SUPERVISOR_BACKEND="$discovered_backend"
-  local BACKEND="$FM_SUPERVISOR_BACKEND"
+    discovered_backend=$(discover_supervisor_backend) || true
+    FM_SUPERVISOR_BACKEND="$discovered_backend"
+    BACKEND="$FM_SUPERVISOR_BACKEND"
 
   # --- refuse an unsupported supervisor backend loudly, before ever trying a
   # tmux/herdr-specific call against it (zellij, orca, and cmux have no verified
   # composer/busy primitives wired up for this daemon yet - AGENTS.md section 4
   # harness-verification discipline). This is the clear refusal the task calls
   # for, instead of a confusing "does not resolve to a tmux pane" error.
-  if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
-    log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
-  fi
+    if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
+      echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+      log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      exit 1
+    fi
 
   # --- auto-discover the supervisor target (the pane running firstmate) -----
   # Priority: FM_SUPERVISOR_TARGET override > $TMUX_PANE (tmux; inherited from
@@ -1333,49 +1364,52 @@ fm_super_main() {
   # $HERDR_PANE_ID (herdr, composed into "<session>:<pane-id>") > firstmate:0
   # fallback. Exporting the result into FM_SUPERVISOR_TARGET makes inject_msg
   # (which reads that env var) use the discovered pane without an extra global.
-  local discovered target_source
-  target_source="FM_SUPERVISOR_TARGET"
-  if [ -z "${FM_SUPERVISOR_TARGET:-}" ]; then
-    if [ -n "${TMUX_PANE:-}" ]; then
-      target_source="TMUX_PANE"
-    elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-      target_source="HERDR_ENV(HERDR_PANE_ID)"
-    else
-      target_source="FALLBACK(firstmate:0)"
+    local discovered
+    target_source="FM_SUPERVISOR_TARGET"
+    if [ -z "${FM_SUPERVISOR_TARGET:-}" ]; then
+      if [ -n "${TMUX_PANE:-}" ]; then
+        target_source="TMUX_PANE"
+      elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+        target_source="HERDR_ENV(HERDR_PANE_ID)"
+      else
+        target_source="FALLBACK(firstmate:0)"
+      fi
     fi
-  fi
-  if discovered=$(discover_supervisor_target); then
-    : # resolved cleanly
-  else
-    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
-  fi
-  FM_SUPERVISOR_TARGET="$discovered"
-  local TARGET="$FM_SUPERVISOR_TARGET"
+    if discovered=$(discover_supervisor_target); then
+      : # resolved cleanly
+    else
+      echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' - verify this is firstmate's pane" >&2
+    fi
+    FM_SUPERVISOR_TARGET="$discovered"
+    TARGET="$FM_SUPERVISOR_TARGET"
 
   # --- validate supervisor target at startup (a missing target is a typo) ---
   # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
   # probe, so a herdr supervisor pane is checked via the herdr adapter; for
   # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
   # '#{pane_id}'` call as before.
-  if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
-    echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
-    log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
+    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+      echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+      log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      exit 1
+    fi
   fi
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); delivery=$DELIVERY; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
-  # --- shutdown: flush buffered escalations, reap child, release lock -------
+  # --- shutdown: compatibility flush or native preserve, reap child, unlock -
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
     trap - TERM INT
     wedge_alarm_stop_active_notifier
-    escalate_flush "$STATE" 2>/dev/null || true
+    if [ "$DELIVERY" = inject ]; then
+      escalate_flush "$STATE" 2>/dev/null || true
+    fi
     if [ -n "${WATCHER_PID:-}" ]; then
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
@@ -1385,6 +1419,7 @@ fm_super_main() {
     fi
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
+    [ "$DELIVERY" != reap-wake ] || rm -f "$STATE/.afk-native-process" 2>/dev/null || true
     log "daemon shutting down"
     exit 0
   }
@@ -1425,7 +1460,7 @@ fm_super_main() {
     # has nowhere to go, and firstmate itself is the consumer of escalations.
     # Catch-up signals persist in state/*.status and flow on the next run, so
     # this delays rather than loses work.
-    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+    if [ "$DELIVERY" = inject ] && ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
       # Flush is pointless with no pane; preserve any buffered escalations.
       sleep "$INJECT_FAIL_SLEEP"
@@ -1465,6 +1500,7 @@ fm_super_main() {
         log "wake: $reason"
         handle_wake "$reason" "$STATE"
         trim_log
+        [ "$FM_REAP_WAKE_PENDING" -eq 0 ] || cleanup
       fi
       start_watcher || continue
     fi
@@ -1478,6 +1514,7 @@ fm_super_main() {
     if [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
       _now > "$STATE/.subsuper-last-housekeep"
       housekeeping "$STATE"
+      [ "$FM_REAP_WAKE_PENDING" -eq 0 ] || cleanup
     fi
   done
 }

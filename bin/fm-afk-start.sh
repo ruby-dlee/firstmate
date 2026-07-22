@@ -8,9 +8,11 @@
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
 #       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
 #     - otherwise clears any prior away session's stale escalation artifacts
-#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
-#       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
-#       already cleared transactionally by bin/fm-afk-launch.sh.
+#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, selects
+#       reap-wake delivery when the launch record identifies a native tracked
+#       background task, then execs bin/fm-supervise-daemon.sh in the foreground.
+#       A prepared start was already cleared transactionally by
+#       bin/fm-afk-launch.sh.
 #
 # This file is sourceable: its BASH_SOURCE guard keeps main from running, while
 # exposing the daemon-lock helpers and fm_afk_clear_stale_artifacts. Sourcing it
@@ -20,8 +22,10 @@
 # This is the COMMON daemon entry for every backend. HOW it becomes a tracked
 # background process differs by harness/backend and is owned elsewhere:
 #   - Harnesses with a native in-pane tracked-background tool (e.g. claude, grok)
-#     run this directly via that tool, so the daemon inherits the captain pane's
-#     env and auto-discovers it.
+#     run this directly via that tool.
+#     The native launch record selects reap-wake delivery, so a captain-relevant
+#     escalation completes this process and lets the harness's own background-task
+#     notification wake the parked LLM without reading or typing into its pane.
 #   - Harnesses with NO native background mechanism (e.g. pi) run this THROUGH
 #     bin/fm-afk-launch.sh, which creates a non-visible tracked terminal per
 #     backend (herdr tab/workspace, tmux detached session) and passes the
@@ -40,6 +44,7 @@ FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 FM_AFK_NATIVE_PROCESS="$FM_AFK_STATE/.afk-native-process"
 FM_AFK_NATIVE_HANDOFF_LOCK="$FM_AFK_STATE/.afk-native-handoff.lock"
+FM_AFK_LAUNCH_RECORD="$FM_AFK_STATE/.afk-daemon-terminal"
 FM_AFK_NATIVE_PROCESS_UNSAFE=0
 FM_AFK_NATIVE_PROCESS_MAX_BYTES=4096
 
@@ -275,6 +280,21 @@ fm_afk_start_flag_write() {
   mv "$pending" "$destination" || { rm -f "$pending"; return 1; }
 }
 
+fm_afk_start_select_delivery() {
+  local record
+  if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
+    record=$(fm_afk_safe_control_read "$FM_AFK_LAUNCH_RECORD" "$FM_AFK_NATIVE_PROCESS_MAX_BYTES" 2>/dev/null) || return 1
+    case "$record" in
+      $'none\t-\tnative') FM_AFK_DELIVERY=reap-wake ;;
+      $'tmux\t'*|$'herdr\t'*) FM_AFK_DELIVERY=inject ;;
+      *) return 1 ;;
+    esac
+  else
+    : "${FM_AFK_DELIVERY:=inject}"
+  fi
+  export FM_AFK_DELIVERY
+}
+
 fm_afk_native_process_identity() {
   local pid=$1 out
   case "$pid" in
@@ -387,6 +407,12 @@ fm_afk_start_main() {
   # before the new daemon can surface them (fix for the leaked-artifact defect).
   if [ "$prepared" -eq 0 ] && ! fm_afk_clear_stale_artifacts "$FM_AFK_STATE"; then
     fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    return 1
+  fi
+
+  if ! fm_afk_start_select_delivery; then
+    fm_lock_release "$FM_AFK_NATIVE_HANDOFF_LOCK"
+    echo "afk: prepared launch record is missing, unsafe, or malformed" >&2
     return 1
   fi
 

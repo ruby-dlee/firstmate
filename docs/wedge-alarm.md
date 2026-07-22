@@ -1,7 +1,9 @@
-# Away-mode injection wedge alarm - active alert channels
+# Terminal-backed away-mode injection wedge alarm
 
-The away-mode sub-supervisor (`bin/fm-supervise-daemon.sh`) buffers escalations and injects them into firstmate's own pane.
+This alarm belongs only to the terminal-backed compatibility delivery used when a harness has no native tracked-background completion notification.
+That compatibility path buffers escalations and injects them into firstmate's own pane.
 When injection cannot confirm a submit past `FM_MAX_DEFER_SECS` (the pane is genuinely busy or wedged, or its Enter is swallowed), `inject_wedge_alarm` raises a loud, rate-limited alarm so the stall never stays invisible.
+Native tracked delivery completes the away daemon task when a batch is due, never inspects a pane, and therefore does not use this alarm.
 
 ## Why an active channel beyond the status-line flash
 
@@ -26,7 +28,7 @@ The durable marker and the tmux flash are unchanged; the active alert is added a
 - `command:<cmd>` - run `<cmd>` via `sh -c`, with the alarm summary passed as `$1` and on stdin. Lets the alert reach a phone or pager (ntfy, Slack, SMS) even when the captain is away from the machine entirely.
 
 An absent `config/wedge-alarm` behaves as `auto`, i.e. default-on on macOS.
-Default-on is deliberate: the alarm's entire purpose is that a wedged away-mode primary is never silent, so the reachable OS channel fires unless the captain explicitly disables it.
+Default-on is deliberate: the alarm's entire purpose is that a wedged compatibility delivery is never silent, so the reachable OS channel fires unless the captain explicitly disables it.
 The alarm is rate-limited to at most once per max-defer window, and fires only after a genuine wedge past max-defer, so the default-on banner is rare and never chatty.
 
 Each channel is best-effort: a missing binary or a non-zero exit logs a warning and the alarm falls through to the next channel, never crashing the daemon loop.

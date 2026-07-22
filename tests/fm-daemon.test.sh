@@ -692,6 +692,30 @@ test_busy_guard_defers_when_supervisor_busy() {
   pass "busy-guard defers injection when supervisor pane is busy"
 }
 
+test_reap_wake_bypasses_old_delivery_guards() {
+  local dir state calls output
+  dir=$(make_supercase reap-wake-guards)
+  state="$dir/state"
+  calls="$dir/guard-calls"
+  output="$dir/reap.out"
+  escalate_add "$state" "needs-decision: pick the safe rollout"
+  afk_enter "$state"
+  (
+    pane_is_busy() { printf 'busy\n' >> "$calls"; return 0; }
+    fm_backend_composer_state() { printf 'composer\n' >> "$calls"; printf 'pending\n'; }
+    fm_backend_target_exists() { printf 'target\n' >> "$calls"; return 1; }
+    FM_REAP_WAKE_PENDING=0
+    FM_AFK_DELIVERY=reap-wake escalate_flush "$state" > "$output"
+    [ "$FM_REAP_WAKE_PENDING" -eq 1 ] || exit 1
+  ) || fail "reap-wake delivery did not request tracked-task completion"
+  [ ! -e "$calls" ] || fail "reap-wake delivery consulted a legacy pane guard"
+  grep -F 'afk-reap-wake:' "$output" >/dev/null \
+    || fail "reap-wake delivery omitted its native completion reason"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "reap-wake delivery retained the delivered buffer"
+  pass "reap-wake delivery bypasses busy, pending-composer, and missing-target guards"
+}
+
 test_marker_detection() {
   # message_is_injection: marker present -> injection; absent -> real message
   message_is_injection "${FM_INJECT_MARK}Supervisor escalate: done" \
@@ -1687,6 +1711,7 @@ test_signal_escalate_marks_seen_no_catchall_refire
 test_collapse_newlines_pure
 test_afk_absent_daemon_does_not_inject
 test_busy_guard_defers_when_supervisor_busy
+test_reap_wake_bypasses_old_delivery_guards
 test_marker_detection
 test_afk_turn_exemption
 test_should_exit_afk_when_afk_inactive

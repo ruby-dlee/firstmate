@@ -84,7 +84,7 @@ config/secondmate-account-pool  optional Agent Fleet pool the PRIMARY uses for S
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend, herdr/zellij/cmux are experimental new-task spawn backends, and Orca is legacy-recovery-only (docs/tmux-backend.md, docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and Orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
-config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
+config/wedge-alarm  optional active-alert directives for wedged terminal-backed away-mode compatibility delivery; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
@@ -109,7 +109,7 @@ state/               volatile runtime signals; gitignored
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
-  .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
+  .afk               durable away-mode flag; present = sub-supervisor may deliver escalations (set by /afk, cleared on user return)
   .lock              per-home session lock written by fm-lock.sh: harness PID on line 1, holder process start time on line 2; direct readers parse only the first-line PID, while acquire/status treat it as held only when that PID is live with a matching start time (skipped for a legacy one-line lock, which is held while its PID is a live harness) and is not a Codex app-server
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
@@ -644,15 +644,17 @@ The context-% shown in a peek is not actionable as crew health; ignore it and in
 
 ### Away-mode stub
 
-Invoke the `/afk` skill when the captain says `/afk`, says they are going afk, `state/.afk` exists, an incoming message starts with `FM_INJECT_MARK`, or any `state/.subsuper-*` marker is involved.
-The skill owns the full daemon procedure: classification policy, batching, injection hardening, max-defer, verified submit, marker stripping, portable lock, dedupe, target discovery, reliability properties, and `FM_INJECT_SKIP`.
+Invoke the `/afk` skill when the captain says `/afk`, says they are going afk, `state/.afk` exists, a tracked away task completes with `afk-reap-wake:`, an incoming legacy message starts with `FM_INJECT_MARK`, or any `state/.subsuper-*` marker is involved.
+The skill owns the full daemon procedure: classification policy, batching, native reap-wake delivery, terminal-backed compatibility delivery, portable lock, dedupe, reliability properties, and `FM_INJECT_SKIP`.
 Inline facts that must survive without a loaded skill:
 
-- Every daemon injection is prefixed with `FM_INJECT_MARK`, ASCII unit separator `0x1f`, so internal escalations are distinguishable from a captain message.
+- On a native background-notify harness such as Claude, run the away daemon as its own tracked background task so completing that task is the captain-relevant wake primitive.
 - While `state/.afk` exists, the daemon owns the watcher; do not separately arm `fm-watch-arm.sh` or `fm-watch.sh`.
-- If firstmate receives a marked message while afk is active, it is an internal escalation: stay afk and process it.
+- If the tracked away task completes with `afk-reap-wake:`, stay afk, drain the durable wake queue, process the batch, and restart the away daemon as a fresh native tracked task if the flag still exists.
+- `FM_INJECT_MARK`, ASCII unit separator `0x1f`, identifies only legacy terminal-backed injections and is never used by native reap-wake delivery.
+- If firstmate receives a legacy marked message while afk is active, it is an internal escalation: stay afk and process it.
 - If the message starts with `/afk`, stay afk and refresh the flag.
-- Any other unmarked message means the captain is back: stop the daemon so its shutdown flush runs while `state/.afk` is still set and clear `state/.afk` last (the `/afk` skill owns this ordering, via `bin/fm-afk-launch.sh stop`; clearing the flag first would make the flush a no-op), flush catch-up from `state/.wake-queue`, `state/.subsuper-escalations`, and `state/.subsuper-inject-wedged`, then resume the emitted primary-harness supervision protocol.
+- Any other real user message means the captain is back: stop the daemon through `bin/fm-afk-launch.sh stop`, which clears `state/.afk` last, flush catch-up from `state/.wake-queue` and `state/.subsuper-escalations` plus any legacy `state/.subsuper-inject-wedged`, then resume the emitted primary-harness supervision protocol.
 - Afk never changes approval authority; PR merges, ask-user findings, destructive actions, irreversible actions, and security-sensitive choices still require the same approval they required before.
 - Bias ambiguous cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 

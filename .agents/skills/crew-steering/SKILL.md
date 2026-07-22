@@ -27,7 +27,7 @@ Require the crew to solve and implement the task: it never stops solely because 
 
 ## 2. Reject vague or optimistic claims
 
-Treat `almost there` as unfinished, require real evidence because work is not done until proven, and review adversarially rather than rubber-stamping; `AGENTS.md` section 9 owns truthful outcome reporting and section 6's active delivery gate owns proof.
+Treat `almost there` as unfinished, require real evidence because work is not done until proven, and review adversarially rather than rubber-stamping; `AGENTS.md` section 9 owns truthful outcome reporting and section 7's active delivery gate owns proof.
 
 ## 3. Fact-check the load-bearing premise
 

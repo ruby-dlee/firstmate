@@ -2434,7 +2434,7 @@ class PrepareBridgeCutoverTests(unittest.TestCase):
         worker_state_journal.chmod(0o600)
         with self.assertRaisesRegex(
             prepare.PreparationError,
-            "worker-state transaction is bound.*strand the transaction",
+            "before the worker-state 6a snapshot.*strand any bound transaction",
         ):
             prepare.refresh_bundle(bundle_path, DRIVER)
         self.assertEqual(

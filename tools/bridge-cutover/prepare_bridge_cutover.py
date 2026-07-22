@@ -5729,11 +5729,11 @@ def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
                     )
                 ):
                     raise PreparationError(
-                        "in-place refresh refuses while a worker-state transaction "
-                        "is bound to the current manifest fingerprint; refreshing "
-                        "would change the fingerprint and strand the transaction "
-                        "and its rollback; bring worker-state back to 'not-started' "
-                        "before refreshing"
+                        "in-place refresh must run before the worker-state 6a "
+                        "snapshot, while no worker-state transaction is bound to "
+                        "the manifest; worker-state transaction state currently "
+                        "exists, so refreshing would change the manifest fingerprint "
+                        "and strand any bound transaction and its rollback"
                     )
                 refreshed_bundle = dict(state.bundle)
                 refreshed_bundle["activation_plan"] = _activation_plan(

@@ -20,10 +20,11 @@ A read-only status page is not a decision surface.
    Do not tighten its line heights, tracking, text padding, wrapping, or card spacing because those values are the layout-audit-safe baseline.
 2. Run `lavish-axi playbook input` before writing the board, plus every other playbook that matches the content.
    Treat `lavish-axi --help` as the authority for current CLI behavior and flags.
-3. Give every decision a native radio group or select control and a queue/submit path that calls `window.lavish.queuePrompt`.
-   Queue exactly one prompt when the question is submitted, never on each option change.
-   Show selected state separately from queued state so the captain can tell what will be sent.
-   Keep a visible path for sending queued answers.
+3. Give every decision a native radio group or select control, but hold all choices in local page state until one explicit `Send answers` action.
+   Never call `window.lavish.queuePrompt` on selection, change, or a per-question step; a partial selection must never be actionable.
+   The single send handler must first gather and validate all current form state, then synchronously queue each answer and immediately call `window.lavish.sendQueuedPrompts()` in that same click handler.
+   Mark each delivered answer as an explicit submit so the receiver can distinguish the captain's click from disconnect or auto-flush behavior.
+   This keeps the Lavish queue empty before the explicit send, so a disconnect has nothing to auto-flush and in-progress input cannot reach the agent.
 4. Choose a durable feedback destination before polling, such as the task spec, backlog note, or task data file.
 
 ## Serve and verify
@@ -48,3 +49,7 @@ A read-only status page is not a decision surface.
 - Never edit a served board while the captain is answering because live reload clears in-progress input.
 - When poll feedback arrives, write every annotation to the chosen durable file immediately, before interpreting it, acting on it, or doing anything else.
 - Never rely on poll output or conversation memory as the only copy because ephemeral poll output can be reaped.
+- Treat a `lavish-axi poll` return as transport or lifecycle output, not automatically as the captain's answer.
+- Act only when the return has an unambiguous deliberate-submit marker and a nonempty structured decision payload produced by the board's explicit send action.
+- Disconnects, UI flicker, re-polls, layout or audit returns, session events, and empty or partial payloads are not submissions; ignore them and keep waiting.
+- If a return is ambiguous or lacks a clear explicit-decision payload, treat it as not submitted and do not act until the captain's actual answer is verified in the payload.

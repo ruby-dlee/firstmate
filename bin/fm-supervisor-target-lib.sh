@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # fm-supervisor-target-lib.sh - the single owner of supervisor-pane discovery.
 #
-# The away-mode daemon (bin/fm-supervise-daemon.sh) must know which pane runs
-# firstmate itself, both to inject escalations into it and, for the daemon, to
-# validate that target at startup. The script-owned away launcher
+# The terminal-backed away-mode compatibility path must know which pane runs
+# firstmate itself, both to inject escalations into it and to validate that
+# target at startup. Native tracked delivery never resolves a pane. The launcher
 # (bin/fm-afk-launch.sh) must resolve the SAME captain pane BEFORE it creates a
 # separate, non-visible terminal for the daemon, so it can pass that pane in as
 # FM_SUPERVISOR_TARGET (otherwise the daemon, running in its own terminal, would

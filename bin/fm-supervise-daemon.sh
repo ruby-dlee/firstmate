@@ -16,8 +16,8 @@
 #
 # PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
 # delivers ONLY when the durable away-mode flag state/.afk is present. Invoking
-# the /afk skill sets that flag and starts this daemon; any real (unmarked)
-# user message clears it and firstmate resumes full responsiveness.
+# the /afk skill sets that flag and starts this daemon; any real user message
+# clears it and firstmate resumes full responsiveness.
 # When afk is off, normal fm-watch.sh always-on triage is the active mechanism.
 # Any buffered daemon escalations that remain while afk is off survive in
 # state/.subsuper-escalations and are flushed on the next "while you were out"
@@ -55,9 +55,9 @@
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
 #
 # The robustness shell from the prior always-inject version is preserved:
-# single-instance lock (portable helper, no flock dependency), crash-loop
-# backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
-# escalations before exit.
+# single-instance lock (portable helper, no flock dependency) and crash-loop
+# backoff remain shared. The compatibility path retains its pane-gone guard and
+# shutdown flush; native shutdown preserves buffered escalations for catch-up.
 #
 # Usage: fm-supervise-daemon.sh
 #          Long-lived background loop. Normally started by the /afk skill, which
@@ -79,10 +79,9 @@
 #                                   resolves the runtime firstmate itself is
 #                                   executing inside - $TMUX_PANE selects tmux,
 #                                   $HERDR_ENV=1 selects herdr - falling back to
-#                                   tmux). zellij, orca, and cmux are not yet
-#                                   supported as supervisor backends; the daemon
-#                                   refuses loudly at startup rather than trying
-#                                   tmux primitives against a non-tmux pane.
+#                                   tmux). Applies only to compatibility injection:
+#                                   zellij, orca, and cmux are not supported there,
+#                                   and that mode refuses loudly at startup.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -99,10 +98,10 @@
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
 #                                   the watcher is mid-cycle (default 15)
 #          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
-#          FM_COMPOSER_IDLE_RE      empty-composer regex applied after dim-ghost
+#          FM_COMPOSER_IDLE_RE      compatibility injection empty-composer regex applied after dim-ghost
 #                                   and structural border stripping (default:
 #                                   bare prompt glyphs plus busy footers)
-#          FM_MAX_DEFER_SECS        max seconds a buffered escalation may sit
+#          FM_MAX_DEFER_SECS        compatibility-only max seconds a buffered escalation may sit
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
@@ -112,7 +111,7 @@
 #                                   absent file/var means auto: on macOS that is
 #                                   an OS-level notification, so the alarm is
 #                                   never silent. See wedge_alarm_notify below
-#                                   and docs/configuration.md.
+#                                   and docs/configuration.md. Compatibility only.
 #          FM_WEDGE_ALARM_EXEC      notifier seam: when set, every notifier
 #                                   channel routes through this command as
 #                                   `<cmd> <channel> <summary>` instead of
@@ -139,9 +138,10 @@
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
 #          instance via portable lock on state/.supervise-daemon.lock. Trapped
-#          SIGTERM/SIGINT shut down within ~1s, flush escalations, release the
-#          lock. A crashing fm-watch.sh is logged and restarted, never killing
-#          the daemon; a tight crash-restart spin is detected and backed off.
+#          SIGTERM/SIGINT shut down within ~1s and release the lock; compatibility
+#          injection flushes, while native delivery preserves its buffer. A
+#          crashing fm-watch.sh is logged and restarted, never killing the daemon;
+#          a tight crash-restart spin is detected and backed off.
 set -u
 
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -176,9 +176,9 @@ fm_refuse_if_gate_agent
 . "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
-# Supervisor backends this daemon knows how to inject into today. zellij, orca,
+# Supervisor backends the compatibility path can inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# daemon has no verified composer/busy primitives wired up for them yet - see
+# compatibility path has no verified composer/busy primitives for them yet - see
 # docs/herdr-backend.md and AGENTS.md section 4's
 # harness-verification discipline. Selecting one refuses loudly at startup
 # instead of silently running tmux primitives against a pane that is not a tmux
@@ -190,9 +190,9 @@ STALE_ESCALATE_SECS_DEFAULT=240
 ESCALATE_BATCH_SECS_DEFAULT=90
 HEARTBEAT_SCAN_SECS_DEFAULT=300
 HOUSEKEEPING_TICK_DEFAULT=15
-# Max time a buffered escalation may sit undelivered before the daemon retries
-# the normal flush path and, if that cannot confirm a submit, raises a loud wedge
-# alarm. The escape hatch makes a guard false-positive visible instead of silent.
+# Compatibility-only max time a buffered escalation may sit undelivered before
+# the daemon retries the injection path and, if that cannot confirm a submit,
+# raises a loud wedge alarm.
 MAX_DEFER_SECS_DEFAULT=300
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
@@ -1402,7 +1402,7 @@ fm_super_main() {
   log "daemon starting (pid $$); delivery=$DELIVERY; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
-  # --- shutdown: flush buffered escalations, reap child, release lock -------
+  # --- shutdown: compatibility flush or native preserve, reap child, unlock -
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
     trap - TERM INT

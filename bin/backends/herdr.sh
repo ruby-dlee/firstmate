@@ -2809,11 +2809,11 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 # away-mode daemon. Root cause: composer-content submit confirmation was too
 # sensitive to harness rendering details. Real claude/codex use bare prompt
 # rows, and real codex adds dynamic idle suggestions after `›`; the later
-# ANSI-aware composer classifier now handles the pre-injection guard for that
-# Codex shape, but idle-baseline submit confirmation deliberately stays on
-# native agent-state so delivery does not depend on composer text. Composer
-# content is retained for other callers (the away-mode daemon's PRE-injection
-# empty-box guard, still dispatched via fm_backend_composer_state /
+# ANSI-aware composer classifier now handles the compatibility pre-injection
+# guard for that Codex shape, but idle-baseline submit confirmation deliberately
+# stays on native agent-state so delivery does not depend on composer text.
+# Composer content is retained for other callers (the terminal-backed away-mode
+# compatibility path's empty-box guard, still dispatched via fm_backend_composer_state /
 # fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
 # agent-state baseline is not legibly idle.
 #

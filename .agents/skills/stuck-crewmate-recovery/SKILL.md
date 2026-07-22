@@ -1,6 +1,9 @@
 ---
 name: stuck-crewmate-recovery
-description: Agent-only playbook for stuck firstmate direct reports. Use after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer. Escalates from peek, to one-line steer, to harness-specific interrupt, to relaunch with progress, to failed status.
+description: >-
+  Agent-only playbook for stuck firstmate direct reports.
+  Use after a stale wake, permission-prompt or system-dialog suspicion, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
+  Routes permission grants to the captain before the ordinary peek, steer, interrupt, relaunch, and failed-status ladder.
 user-invocable: false
 metadata:
   internal: true
@@ -8,12 +11,30 @@ metadata:
 
 # stuck-crewmate-recovery
 
-Use this playbook when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
+Use this playbook when a direct report is stale, permission-blocked, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 
-Escalate in order:
+## Permission-blocked branch
+
+Handle permission evidence before the ordinary recovery ladder because approving, denying, interrupting, or relaunching can change the security decision or hide the only useful evidence.
+
+1. Peek the pane and read the requested command, tool, directory, or capability.
+2. If the wake says `permission-prompt detected`, or the pane matches the target's mid-run permission shape in `harness-adapters`, do not press an approval or denial key and do not interrupt or relaunch the agent.
+3. Tell the captain what action is waiting and ask them to approve or deny it in the visible prompt.
+   Keep the message product-facing, such as `Work is blocked waiting for permission to <action>; please approve or deny that request in the visible dialog.`
+   Do not name the harness, pane, task id, watcher, or other fleet machinery.
+4. If the wake says `permission/system-dialog suspected`, remember that it is a timeout heuristic rather than a directly observed macOS dialog.
+   Inspect the pane for the foreground action and any clear evidence of ordinary progress.
+   If ordinary progress is visible, resume supervision and treat the wake as a conservative false positive.
+   Otherwise tell the captain `A macOS permission dialog may be blocking <action>; please grant or deny it in the visible dialog or in Privacy & Security in System Settings.`
+5. Never try to grant a macOS TCC permission with keystrokes, AppleScript, Accessibility APIs, `tccutil`, or a settings-database edit.
+   macOS owns that decision and the captain must make it.
+6. After the captain clears the dialog, verify that the pane changes or `bin/fm-crew-state.sh <id>` reports resumed work before returning to supervision.
+   If the permission was denied and the task still cannot proceed, use the ordinary ladder below with that denial as evidence.
+
+For a non-permission stall, escalate in order:
 
 1. Peek the pane.
 2. If the crewmate is waiting on a question its brief already answers, answer in one line via `FM_HOME=<this-firstmate-home> bin/fm-send.sh` from an active firstmate session unless `FM_HOME` is already set to the active firstmate home.

@@ -47,6 +47,14 @@ When verifying a new adapter, record its env marker and command name in `bin/fm-
 For stuck recovery, the target window's harness is recorded as `harness=` in `state/<id>.meta`.
 Use that value for interrupt, exit, resume, and skill-invocation facts.
 
+## Mid-run permission prompts
+
+Firstmate launches every verified crewmate harness in its unattended mode, but a managed policy, a newly introduced tool class, or a failed autonomy flag can still produce a permission prompt after work has started.
+`bin/fm-watch.sh` owns the deterministic pane matcher and the busy/no-progress system-dialog fallback.
+`docs/permission-stall-detection.md` owns the empirical capture and macOS capability record.
+On either permission wake, load `stuck-crewmate-recovery` and follow its permission-blocked branch before using any interrupt, exit, or relaunch mechanic below.
+Never apply an adapter's startup trust-dialog acceptance rule to a mid-run command or capability grant.
+
 ## Primary turn-end guard
 
 Every verified primary harness has an empirically validated hook path for the "no turn ends blind" guard.
@@ -109,6 +117,7 @@ Natural language is acceptable if uncertain.
 | Exit command | `/exit` |
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
+| Mid-run permission shape | `Do you want to proceed?` together with the `Esc to cancel · Tab to amend` footer; treat this as a security-sensitive grant, not the startup trust dialog. |
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
@@ -139,6 +148,7 @@ Claude Code's primary watcher protocol is the lowest-friction path: run `bin/fm-
 | Exit command | `/quit` (slash popup needs about 1 second between text and Enter; `fm-send` handles it) |
 | Interrupt | single Escape |
 | Skill invocation | `$<skill>` (e.g. `$no-mistakes`); `/<skill>` is claude-only and codex rejects it as "Unrecognized command" |
+| Mid-run permission shape | One of `Would you like to run the following command?`, `Would you like to grant these permissions?`, or `Would you like to make the following edits?`, together with `Press enter to confirm or esc to cancel`; treat this as a security-sensitive grant, not directory trust. |
 
 A `$<skill>` invocation opens a `$`-autocomplete (skill) popup, the same hazard as the `/` slash popup: submitting too fast lets the popup swallow the Enter, so the invocation never lands.
 `fm-send` handles it the same way it handles `/` - it gives the popup a longer settle (1.2s) between typing and the first Enter, with the target backend's submit retry as the safety net - but the `$` settle is scoped to `harness=codex`, read from the target metadata for exact task ids or legacy `fm-<id>` labels.

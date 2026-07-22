@@ -333,7 +333,7 @@ Route each piece of durable knowledge to its most specific home:
 | --- | --- |
 | Captain preferences and working style | `data/captain.md`, inspected first and rewritten or pruned in place |
 | Project-intrinsic knowledge | that project's own `AGENTS.md`, via normal crewmate delivery, never hand-written by firstmate |
-| Fleet-local operational facts and gotchas | `data/learnings.md`, inspected first and rewritten or pruned in place |
+| Fleet-local facts and gotchas only: load-before-doing procedures are skills; be-aware background is a learning; when in doubt, use a skill | `data/learnings.md`, inspected first and rewritten or pruned in place |
 | Knowledge generalizable to every firstmate user | the shared `AGENTS.md`, shipped via PR through the pipeline |
 | Task-scoped notes | backlog item notes, inspect first with `tasks-axi show <id> --full`, then replace the body with `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when superseded prior state should remain recoverable, or hand-edit per the active backend |
 | Investigation findings | scout reports at `data/<id>/report.md` |

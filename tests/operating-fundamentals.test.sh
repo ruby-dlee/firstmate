@@ -64,11 +64,11 @@ test_single_conditional_agents_trigger() {
   local section global_count section_count
 
   section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
-  global_count=$(grep -Fc '`operating-fundamentals`' "$AGENTS")
-  section_count=$(printf '%s\n' "$section" | grep -Fc '`operating-fundamentals`')
+  global_count=$(grep -Fc "\`operating-fundamentals\`" "$AGENTS")
+  section_count=$(printf '%s\n' "$section" | grep -Fc "\`operating-fundamentals\`")
   [ "$global_count" -eq 1 ] || fail "AGENTS.md must reference operating-fundamentals exactly once"
   [ "$section_count" -eq 1 ] || fail "the sole operating-fundamentals reference must be in section 13"
-  assert_contains "$section" '`operating-fundamentals` - load when intaking any captain ask' "section 13 must conditionally load the skill at intake"
+  assert_contains "$section" "\`operating-fundamentals\` - load when intaking any captain ask" "section 13 must conditionally load the skill at intake"
   pass "AGENTS.md contains one conditional section-13 trigger and no every-turn duplicate"
 }
 

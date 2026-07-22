@@ -332,18 +332,9 @@ codex_screen=$(stored_status kTCCServiceScreenCapture \
   codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
 codex_accessibility=$(stored_status kTCCServiceAccessibility \
   codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
-if [ -n "$no_mistakes_binary" ]; then
-  no_mistakes_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
-    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
-  no_mistakes_screen=$(stored_status kTCCServiceScreenCapture \
-    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
-  no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
-    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
-else
-  no_mistakes_fda=UNKNOWN
-  no_mistakes_screen=UNKNOWN
-  no_mistakes_accessibility=UNKNOWN
-fi
+no_mistakes_fda=UNKNOWN
+no_mistakes_screen=UNKNOWN
+no_mistakes_accessibility=UNKNOWN
 
 printf '%s\n' 'firstmate macOS permission report'
 printf '  unverified bundle environment hint: %s (not used for attribution)\n' \
@@ -373,7 +364,7 @@ printf '\n'
 
 printf 'Claude Code PATH command target (%s)\n' "${claude_binary:-UNKNOWN: not found on PATH}"
 print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$claude_fda" \
-  'Normal Ghostty-launched work uses the responsible launcher grant; a separately attributed Claude entry needs its own grant.'
+  'Use the exact responsible entry macOS observes for protected-path access; command ancestry alone does not establish it.'
 print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
   'Needed only when Claude sends Apple Events to a named app; it is not needed for tmux.'
 print_permission 'Screen Recording' 'CONDITIONAL' "$claude_screen" \
@@ -384,7 +375,7 @@ printf '\n'
 
 printf 'Codex PATH command target (%s)\n' "${codex_binary:-UNKNOWN: not found on PATH}"
 print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$codex_fda" \
-  'Normal Ghostty-launched work uses the responsible launcher grant; protected paths need the entry macOS attributes.'
+  'Use the exact responsible entry macOS observes for protected-path access; the current PATH command does not establish it.'
 print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' "$codex_automation_note"
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$codex_screen" \
   'Native Computer Use needs screen pixels; chrome-devtools-axi page screenshots do not.'
@@ -394,7 +385,7 @@ printf '\n'
 
 printf 'no-mistakes CLI PATH entry (%s)\n' "${no_mistakes_command:-UNKNOWN: not found on PATH}"
 print_permission 'All four permissions' 'NOT NEEDED BY CLI CORE' 'N/A' \
-  'The CLI coordinates with the daemon; grant the TCC-responsible launcher or daemon for child-agent capabilities.'
+  'The CLI coordinates with the daemon; child-agent capabilities belong to the exact service-specific entry macOS observes.'
 printf '\n'
 
 printf 'no-mistakes daemon configured target (%s)\n' \
@@ -405,13 +396,13 @@ else
   printf '%s\n' '  authoritative launch job: UNKNOWN'
 fi
 print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
-  'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
+  'A daemon-launched agent may need it for protected paths, but the responsible identity is unknown until macOS identifies it for this service.'
 print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' \
   'The configured path cannot prove the running process image entitlement, so target-specific capability remains unknown.'
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_screen" \
-  'A daemon-launched Codex Computer Use session is attributed to this daemon and needs screen capture approval.'
+  'Daemon-launched Computer Use needs capture, but the responsible identity is unknown; use the exact Screen Recording entry macOS observes.'
 print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_accessibility" \
-  'A daemon-launched Codex Computer Use session needs UI inspection and input control under this daemon identity.'
+  'Daemon-launched Computer Use needs UI control, but the responsible identity is unknown; use the exact Accessibility entry macOS observes.'
 printf '\n'
 
 printf '%s\n' 'Stored Automation relationships'

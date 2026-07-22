@@ -146,19 +146,31 @@ test_missing_probe_is_honest() {
 }
 
 test_readable_database_reports_stored_rows() {
-  local world out
+  local world out ghostty_section daemon_section
   world=$(make_world readable)
   mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
   : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
 
   out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes run_report "$world")
+  ghostty_section=$(printf '%s\n' "$out" | sed -n '/^Ghostty (terminal launcher)/,/^$/p')
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon configured target/,/^$/p')
 
   assert_contains "$out" 'current invocation protected-path probe: ACCESSIBLE' \
     'successful behavioral Full Disk Access probe was lost'
-  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=UNKNOWN (STORED ALLOW ONLY)' \
-    'stored no-mistakes Screen Recording allow was presented as effective'
-  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=UNKNOWN (STORED DENIAL ONLY)' \
-    'stored no-mistakes Accessibility denial was presented as effective'
+  assert_contains "$ghostty_section" 'status=UNKNOWN (STORED ALLOW ONLY)' \
+    'stored Ghostty Screen Recording allow was presented as effective'
+  assert_contains "$ghostty_section" 'status=UNKNOWN (STORED DENIAL ONLY)' \
+    'stored Ghostty Accessibility denial was presented as effective'
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Screen Recording +requirement=REQUIRED FOR COMPUTER USE +status=UNKNOWN' >/dev/null \
+    || fail 'daemon Screen Recording identity was inferred from stored or cross-service evidence'
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Accessibility +requirement=REQUIRED FOR COMPUTER USE +status=UNKNOWN' >/dev/null \
+    || fail 'daemon Accessibility identity was inferred from stored or cross-service evidence'
+  assert_contains "$daemon_section" 'exact Screen Recording entry macOS observes' \
+    'daemon Screen Recording guidance lacked a service-specific identity boundary'
+  assert_contains "$daemon_section" 'exact Accessibility entry macOS observes' \
+    'daemon Accessibility guidance reused another service identity'
   assert_contains "$out" 'com.mitchellh.ghostty -> com.apple.systemevents: UNKNOWN (STORED ALLOW ONLY)' \
     'stored Ghostty-to-System Events relationship was presented as effective'
   pass 'stored TCC rows remain unknown effective status'

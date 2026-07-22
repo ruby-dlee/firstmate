@@ -30,9 +30,9 @@ Native UI control is also different because it uses macOS Accessibility APIs and
 
 TCC grants the responsible application or executable, which is not always the leaf command that encountered the denial.
 
-Ghostty is normally responsible for `claude`, `codex`, and their descendants launched from a Ghostty shell or its tmux server.
+macOS may attribute `claude`, `codex`, or descendant requests to Ghostty, but command ancestry alone does not establish the responsible identity for any service.
 
-The no-mistakes daemon is launched independently by launchd, so a Ghostty grant does not cover gate agents spawned by that daemon.
+The no-mistakes daemon is launched independently by launchd, so a Ghostty grant does not by itself establish access for gate agents spawned by that daemon.
 
 When macOS lists a different responsible entry than this guide predicts, grant only that observed entry and preserve the controller-to-target relationship shown for Automation.
 
@@ -57,8 +57,8 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 
 ## Claude Code
 
-- **Full Disk Access - no separate grant is needed for normal Ghostty-launched work.**
-  The responsible Ghostty grant covers the ordinary launch tree, while a Claude Code entry that macOS attributes separately must be granted only when protected data is in scope.
+- **Full Disk Access - captain must click only when macOS attributes protected access to a separate entry.**
+  Grant only the exact responsible entry macOS observes when protected data is in scope because command ancestry alone cannot identify it.
 - **Automation - captain must approve each requested target when Claude sends Apple Events.**
   The relationship is Claude Code controlling System Events or another named application, and it appears only after that target-specific request.
   Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
@@ -71,8 +71,8 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 
 ## Codex
 
-- **Full Disk Access - no separate grant is needed for normal Ghostty-launched work.**
-  The responsible Ghostty grant covers the ordinary launch tree, while a separately attributed Codex entry needs its own grant only for protected data.
+- **Full Disk Access - captain must click only when macOS attributes protected access to a separate entry.**
+  Grant only the exact responsible entry macOS observes when protected data is in scope because the current Codex command path cannot identify it.
 - **Automation - captain must approve each requested target when Codex sends Apple Events.**
   The helper reports Codex Automation capability as `UNKNOWN` because a command found on `PATH` does not establish the active TCC controller identity.
   When possible, it separately reports the exact `codesign` result for that current command filesystem target without applying the result to another installation or running process.
@@ -88,20 +88,21 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 ## no-mistakes and its daemon
 
 - **The interactive no-mistakes CLI needs no separate grant for its core coordination work.**
-  It communicates with the daemon, and the daemon becomes the independent TCC responsibility root for its gate agents.
+  It communicates with an independently launched daemon, but neither process ancestry nor its configured path establishes the responsible identity for a child agent's TCC request.
 - **Full Disk Access - captain must click when a daemon-launched gate agent needs protected data.**
   The helper can identify one running launch job and its configured program target, but it cannot prove that a replaced file or retargeted symlink still matches the process image already loaded by that job.
   Use the exact responsible entry shown by macOS or TCC attribution, and treat the configured path printed by the helper as diagnostic evidence only.
-  A Ghostty Full Disk Access grant cannot cover the launchd-managed daemon.
+  A Ghostty Full Disk Access grant does not by itself establish protected-path access for the independently launched daemon tree.
 - **Automation - captain approval is necessary but not sufficient for daemon-launched Apple Events.**
   Automation is still a pair such as no-mistakes controlling System Events or another named application.
   The helper reports the running daemon capability as `UNKNOWN` because inspecting the configured path cannot establish the entitlement of an already loaded process image.
   Apple documents the entitlement as target-signing-dependent, so a separate current-image inspection is required before making any capability claim.
 - **Screen & System Audio Recording - captain must approve for daemon-launched Codex Computer Use.**
-  Live TCC attribution on 2026-07-21 identified `~/.no-mistakes/bin/no-mistakes` as the responsible path for ScreenCaptureKit access by a gate agent.
+  A dated TCC observation on 2026-07-21 identified `~/.no-mistakes/bin/no-mistakes` for one ScreenCaptureKit request, but it does not establish the current responsible identity.
   Approve a first-use dialog if macOS presents one, or add and enable the exact current entry shown by macOS rather than assuming a Ghostty, Codex, configured launch-job, or interactive no-mistakes path covers it.
 - **Accessibility - captain must click for daemon-launched Codex Computer Use.**
-  Add and enable the same responsible daemon binary so its Computer Use child can inspect UI and deliver input.
+  The helper reports the responsible Accessibility identity as `UNKNOWN` because Screen Recording evidence cannot establish another service's attribution.
+  Open the Accessibility pane and add or enable only the exact responsible entry observed for that service.
 
 ## Check and open the panes
 

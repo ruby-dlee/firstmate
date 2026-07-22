@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# fm-macos-permissions.sh - inspect firstmate's macOS TCC setup without changing it.
+#
+# This helper performs only read-only probes unless --open is supplied.
+# It never invokes tccutil, edits a TCC database, sends Apple Events, captures
+# the screen, synthesizes input, restarts a process, or tries to grant access.
+# macOS requires a human approval in System Settings on an unmanaged Mac.
+#
+# Usage:
+#   bin/fm-macos-permissions.sh
+#   bin/fm-macos-permissions.sh --open full-disk-access
+#   bin/fm-macos-permissions.sh --open automation
+#   bin/fm-macos-permissions.sh --open screen-recording
+#   bin/fm-macos-permissions.sh --open accessibility
+#   bin/fm-macos-permissions.sh --help
+#
+# The protected-directory probe reports only the TCC-responsible context of
+# this invocation. Stored TCC decisions are queried only when macOS permits
+# read-only access to a TCC database; that access itself normally requires Full
+# Disk Access. Automation is pairwise, so there is no honest global status.
+set -u
+
+export LC_ALL=C
+
+usage() {
+  sed -n '2,24s/^# \{0,1\}//p' "$0"
+}
+
+open_pane=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --open)
+      [ "$#" -ge 2 ] || { printf 'error: --open requires a pane name\n' >&2; exit 2; }
+      open_pane=$2
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$(uname -s 2>/dev/null)" != Darwin ]; then
+  printf 'error: fm-macos-permissions.sh supports macOS only.\n' >&2
+  exit 1
+fi
+
+user_tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+system_tcc_db="/Library/Application Support/com.apple.TCC/TCC.db"
+readable_tcc_dbs=()
+
+if command -v sqlite3 >/dev/null 2>&1; then
+  for candidate_db in "$user_tcc_db" "$system_tcc_db"; do
+    if sqlite3 -readonly "$candidate_db" 'SELECT 1 FROM access LIMIT 1;' >/dev/null 2>&1; then
+      readable_tcc_dbs+=("$candidate_db")
+    fi
+  done
+fi
+
+sql_quote() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# stored_status <service> <client>...
+# A stored allow is useful evidence, but it is not a behavioral proof that a
+# newly replaced binary still matches the entry's code-signing requirement.
+stored_status() {
+  local service=$1 condition="" client quoted db rows values="" query_failed=no
+  shift
+
+  [ "${#readable_tcc_dbs[@]}" -gt 0 ] || { printf 'UNKNOWN'; return; }
+  for client in "$@"; do
+    [ -n "$client" ] || continue
+    quoted=$(sql_quote "$client")
+    if [ -n "$condition" ]; then
+      condition="$condition OR "
+    fi
+    condition="${condition}client='$quoted'"
+  done
+  [ -n "$condition" ] || { printf 'UNKNOWN'; return; }
+
+  service=$(sql_quote "$service")
+  for db in "${readable_tcc_dbs[@]}"; do
+    if rows=$(sqlite3 -readonly "$db" \
+      "SELECT auth_value FROM access WHERE service='$service' AND ($condition);" 2>/dev/null); then
+      [ -z "$rows" ] || values="${values}${rows}"$'\n'
+    else
+      query_failed=yes
+    fi
+  done
+
+  if printf '%s' "$values" | grep -qx '2'; then
+    printf 'GRANTED'
+  elif [ -n "$values" ] && printf '%s' "$values" | grep -qx '0' \
+    && ! printf '%s' "$values" | grep -qvx '0'; then
+    printf 'MISSING'
+  elif [ -n "$values" ]; then
+    printf 'UNKNOWN'
+  elif [ "$query_failed" = yes ]; then
+    printf 'UNKNOWN'
+  else
+    printf 'NOT RECORDED'
+  fi
+}
+
+print_automation_pairs() {
+  local label=$1 condition="" client quoted db rows pairs="" query_failed=no
+  local pair_client pair_target pair_auth pair_status
+  shift
+
+  printf '  %s:\n' "$label"
+  if [ "${#readable_tcc_dbs[@]}" -eq 0 ]; then
+    printf '%s\n' '    UNKNOWN (TCC databases are not readable in this context)'
+    return
+  fi
+  for client in "$@"; do
+    [ -n "$client" ] || continue
+    quoted=$(sql_quote "$client")
+    if [ -n "$condition" ]; then
+      condition="$condition OR "
+    fi
+    condition="${condition}client='$quoted'"
+  done
+  [ -n "$condition" ] || { printf '%s\n' '    NOT RECORDED'; return; }
+
+  for db in "${readable_tcc_dbs[@]}"; do
+    if rows=$(sqlite3 -readonly -separator '|' "$db" \
+      "SELECT client, COALESCE(indirect_object_identifier, '(unknown target)'), auth_value FROM access WHERE service='kTCCServiceAppleEvents' AND ($condition);" 2>/dev/null); then
+      [ -z "$rows" ] || pairs="${pairs}${rows}"$'\n'
+    else
+      query_failed=yes
+    fi
+  done
+  if [ -z "$pairs" ]; then
+    if [ "$query_failed" = yes ]; then
+      printf '%s\n' '    UNKNOWN (the TCC schema could not be queried)'
+    else
+      printf '%s\n' '    NOT RECORDED'
+    fi
+    return
+  fi
+
+  printf '%s' "$pairs" | sort -u | while IFS='|' read -r pair_client pair_target pair_auth; do
+    [ -n "$pair_client" ] || continue
+    case "$pair_auth" in
+      2) pair_status=GRANTED ;;
+      0) pair_status=MISSING ;;
+      *) pair_status=UNKNOWN ;;
+    esac
+    printf '    %s -> %s: %s\n' "$pair_client" "$pair_target" "$pair_status"
+  done
+}
+
+full_disk_probe() {
+  local protected_dir probe_error
+  for protected_dir in \
+    "$HOME/Library/Mail" \
+    "$HOME/Library/Messages" \
+    "$HOME/Library/Safari"; do
+    [ -d "$protected_dir" ] || continue
+    if probe_error=$(ls -1A "$protected_dir" 2>&1 >/dev/null); then
+      printf 'GRANTED'
+      return
+    fi
+    case "$probe_error" in
+      *'Operation not permitted'*) printf 'MISSING'; return ;;
+    esac
+  done
+  printf 'UNKNOWN'
+}
+
+resolved_command() {
+  local command_name=$1 resolved link
+  resolved=$(command -v "$command_name" 2>/dev/null || true)
+  [ -n "$resolved" ] || return 0
+  while [ -L "$resolved" ]; do
+    link=$(readlink "$resolved") || break
+    case "$link" in
+      /*) resolved=$link ;;
+      *) resolved="$(cd "$(dirname "$resolved")" && pwd -P)/$link" ;;
+    esac
+  done
+  printf '%s\n' "$resolved"
+}
+
+has_apple_events_entitlement() {
+  local executable=$1 entitlements
+  [ -n "$executable" ] && [ -e "$executable" ] || { printf 'UNKNOWN'; return; }
+  command -v codesign >/dev/null 2>&1 || { printf 'UNKNOWN'; return; }
+  entitlements=$(codesign -d --entitlements :- "$executable" 2>&1 || true)
+  case "$entitlements" in
+    *'<key>com.apple.security.automation.apple-events</key>'*) printf 'PRESENT' ;;
+    *) printf 'MISSING' ;;
+  esac
+}
+
+print_permission() {
+  printf '  %-31s requirement=%-25s status=%s\n' "$1" "$2" "$3"
+  printf '    %s\n' "$4"
+}
+
+ghostty_app='/Applications/Ghostty.app'
+ghostty_binary="$ghostty_app/Contents/MacOS/ghostty"
+claude_command=$(command -v claude 2>/dev/null || true)
+claude_binary=$(resolved_command claude)
+codex_command=$(command -v codex 2>/dev/null || true)
+codex_binary=$(resolved_command codex)
+no_mistakes_command=$(command -v no-mistakes 2>/dev/null || true)
+no_mistakes_binary=$(resolved_command no-mistakes)
+computer_use_app="$HOME/.codex/computer-use/Codex Computer Use.app"
+
+current_fda=$(full_disk_probe)
+ghostty_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
+  com.mitchellh.ghostty "$ghostty_binary")
+case "${__CFBundleIdentifier:-}" in
+  com.mitchellh.ghostty) ghostty_fda=$current_fda ;;
+esac
+
+ghostty_screen=$(stored_status kTCCServiceScreenCapture \
+  com.mitchellh.ghostty "$ghostty_binary")
+ghostty_accessibility=$(stored_status kTCCServiceAccessibility \
+  com.mitchellh.ghostty "$ghostty_binary")
+claude_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
+  com.anthropic.claude-code "$claude_command" "$claude_binary")
+claude_screen=$(stored_status kTCCServiceScreenCapture \
+  com.anthropic.claude-code "$claude_command" "$claude_binary")
+claude_accessibility=$(stored_status kTCCServiceAccessibility \
+  com.anthropic.claude-code "$claude_command" "$claude_binary")
+codex_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
+  codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
+codex_screen=$(stored_status kTCCServiceScreenCapture \
+  codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
+codex_accessibility=$(stored_status kTCCServiceAccessibility \
+  codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
+no_mistakes_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
+  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
+no_mistakes_screen=$(stored_status kTCCServiceScreenCapture \
+  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
+no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
+  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
+no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_binary")
+
+printf '%s\n' 'firstmate macOS permission report'
+printf '  responsible-launch hint: %s\n' "${__CFBundleIdentifier:-not exposed by this process}"
+printf '  current protected-path probe: %s\n' "$current_fda"
+if [ "${#readable_tcc_dbs[@]}" -gt 0 ]; then
+  printf '  readable TCC databases: %s\n' "${#readable_tcc_dbs[@]}"
+  printf '%s\n' '  Stored rows below are advisory; behavioral probes take precedence.'
+else
+  printf '%s\n' '  readable TCC databases: 0 (expected without Full Disk Access)'
+  printf '%s\n' '  Screen Recording and Accessibility therefore remain UNKNOWN unless behavior proves otherwise.'
+fi
+printf '%s\n' '  Automation status is always PER TARGET because macOS grants one controller-to-app relationship at a time.'
+printf '\n'
+
+printf '%s\n' 'Ghostty (terminal launcher)'
+print_permission 'Full Disk Access' 'CONDITIONAL' "$ghostty_fda" \
+  'Needed only for protected Mail, Messages, Safari, Home, backup, or administrative data.'
+print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
+  'Needed only for Apple Events from Ghostty to System Events or another named app; tmux does not use it.'
+print_permission 'Screen Recording' 'CONDITIONAL' "$ghostty_screen" \
+  'Needed for native desktop capture in this launch context, not for Chrome DevTools Protocol screenshots.'
+print_permission 'Accessibility' 'CONDITIONAL' "$ghostty_accessibility" \
+  'Needed for native UI inspection or input in this launch context, not for tmux or browser-protocol control.'
+printf '\n'
+
+printf 'Claude Code (%s)\n' "${claude_binary:-not installed}"
+print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$claude_fda" \
+  'Normal Ghostty-launched work uses the responsible launcher grant; a separately attributed Claude entry needs its own grant.'
+print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
+  'Needed only when Claude sends Apple Events to a named app; it is not needed for tmux.'
+print_permission 'Screen Recording' 'CONDITIONAL' "$claude_screen" \
+  'Needed only if a Claude-launched native visual tool captures the desktop.'
+print_permission 'Accessibility' 'CONDITIONAL' "$claude_accessibility" \
+  'Needed only if a Claude-launched native UI tool inspects or controls other applications.'
+printf '\n'
+
+printf 'Codex (%s)\n' "${codex_binary:-not installed}"
+print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$codex_fda" \
+  'Normal Ghostty-launched work uses the responsible launcher grant; protected paths need the entry macOS attributes.'
+print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
+  'Needed only for Apple Events to a named app; direct Codex is entitled to request, but the human still approves each target.'
+print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$codex_screen" \
+  'Native Computer Use needs screen pixels; chrome-devtools-axi page screenshots do not.'
+print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$codex_accessibility" \
+  'Native Computer Use needs the macOS accessibility tree and input control.'
+printf '\n'
+
+printf 'no-mistakes CLI (%s)\n' "${no_mistakes_command:-not installed}"
+print_permission 'All four permissions' 'NOT NEEDED BY CLI CORE' 'N/A' \
+  'The CLI coordinates with the daemon; grant the TCC-responsible launcher or daemon for child-agent capabilities.'
+printf '\n'
+
+printf 'no-mistakes daemon (%s)\n' "${no_mistakes_binary:-not installed}"
+print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
+  'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
+if [ "$no_mistakes_automation_entitlement" = MISSING ]; then
+  print_permission 'Automation' 'CONDITIONAL' 'BLOCKED: ENTITLEMENT MISSING' \
+    'System Settings cannot repair this binary; its signer must add com.apple.security.automation.apple-events.'
+else
+  print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
+    'Needed only when a daemon-launched agent sends Apple Events to a named app; the human approves each target.'
+fi
+print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_screen" \
+  'A daemon-launched Codex Computer Use session is attributed to this daemon and needs screen capture approval.'
+print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_accessibility" \
+  'A daemon-launched Codex Computer Use session needs UI inspection and input control under this daemon identity.'
+printf '\n'
+
+printf '%s\n' 'Stored Automation relationships'
+print_automation_pairs 'Ghostty' com.mitchellh.ghostty "$ghostty_binary"
+print_automation_pairs 'Claude Code' com.anthropic.claude-code "$claude_command" "$claude_binary"
+print_automation_pairs 'Codex' codex "$codex_command" "$codex_binary" \
+  com.openai.sky.CUAService "$computer_use_app"
+print_automation_pairs 'no-mistakes daemon' com.kunchenguid.no-mistakes \
+  "$no_mistakes_command" "$no_mistakes_binary"
+printf '\n'
+
+printf '%s\n' 'No grant was changed.'
+printf '%s\n' 'A human must click Add or enable the exact responsible app or binary in System Settings.'
+printf '%s\n' 'Open one pane with --open full-disk-access|automation|screen-recording|accessibility.'
+
+if [ -n "$open_pane" ]; then
+  case "$open_pane" in
+    full-disk-access) anchor=Privacy_AllFiles ;;
+    automation) anchor=Privacy_Automation ;;
+    screen-recording) anchor=Privacy_ScreenCapture ;;
+    accessibility) anchor=Privacy_Accessibility ;;
+    *)
+      printf 'error: unknown pane: %s\n' "$open_pane" >&2
+      exit 2
+      ;;
+  esac
+  settings_uri="x-apple.systempreferences:com.apple.preference.security?$anchor"
+  if open "$settings_uri"; then
+    printf 'Opened %s; the human must make the grant.\n' "$settings_uri"
+  else
+    printf 'error: failed to open %s\n' "$settings_uri" >&2
+    exit 1
+  fi
+fi

@@ -563,6 +563,7 @@ From there the task is an ordinary ship task through its mode-specific validatio
 ## 8. Supervision protocol
 
 The watcher is the backbone.
+Load `crew-steering` before live-steering a crew; it owns the captain-standard review and correction patterns.
 Whenever at least one task is in flight, keep exactly one live supervision wait owned by the emitted primary-harness protocol from `bin/fm-session-start.sh`.
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
@@ -683,9 +684,9 @@ Reaches the captain immediately:
 - Work ready for review, with the full PR URL.
 - Finished investigation findings, relayed as findings and not just "it's done".
 - Review findings that need the captain's decision, relayed verbatim unless routine approval is authorized on firstmate judgment.
-- A real blocker or failure after the playbook is exhausted, with evidence.
-- Anything destructive, irreversible, or security-sensitive.
-- A needed credential or login.
+- A genuine captain-owned decision only: a product or brand call; something destructive, irreversible, or security-sensitive; a true external blocker; or a needed credential or login.
+- A blocker or failure reaches this bar only after directing the crew to root-cause and implement a fix, iterating until it is genuinely solved or the crew's capability is truly exhausted.
+- `This is hard` or `the task is failing` is not an escalation trigger; get it working through the crew first.
 
 Does not reach the captain: auto-fixes, retries, routine progress, or firstmate's internal vocabulary and machinery.
 Batch non-urgent updates into your next natural reply.
@@ -752,6 +753,7 @@ Correct or delete stale free-form notes the moment you catch them, and put durab
 
 ## 11. Crewmate briefs
 
+Load `crew-steering` before writing or materially revising any crew brief.
 Scaffold with `bin/fm-brief.sh <id> <repo-name>` - it writes `data/<id>/brief.md` with the standard contract (branch setup, status-reporting protocol, push/merge rules, definition of done) and all paths filled in.
 The ship-brief Setup opens with a worktree-isolation assertion ahead of the branch step: the crewmate confirms it is in its own disposable task worktree, not the primary checkout, and stops with `blocked: launched in primary checkout, not an isolated worktree` if not - the upstream half of the worktree-tangle guard (section 8).
 For a ship task the definition of done is shaped by the project's delivery mode (section 6): `no-mistakes` stops after the implementation commit, then firstmate triggers the harness-appropriate no-mistakes validation pipeline; `direct-PR` has the crewmate push and open the PR itself, and `local-only` has it stop at "ready in branch" for firstmate to review and merge locally.
@@ -788,7 +790,8 @@ These skills are not captain-invocable; they are conditional operating reference
 
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints any diagnostic or capability line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `ACCOUNT_ROUTING:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_HARNESS_OVERRIDE:`, `CREW_DISPATCH:`, `FLEET_SYNC:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `TASKS_AXI:`, `NUDGE_SECONDMATES:`, `REPORT_RETENTION:`, or `FMX:`); silence needs no load.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust or permission dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crew, protecting shared validation capacity, acting on an explicit captain order, or about to assert a fleet fact.
+- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crew, protecting shared validation capacity, acting on an explicit captain order, about to make a consequential config/system change or an escalation, or about to assert a fleet fact.
+- `crew-steering` - load before writing or materially revising any crew brief and before live-steering a crew.
 - `firstmate-orca` - load before recovering or supervising legacy Orca-backed work, testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `stuck-crewmate-recovery` - load after a stale wake, permission-prompt or system-dialog suspicion, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, launching, handing backlog to, recovering, pushing inherited config into, or retiring a secondmate home, and before editing `data/secondmates.md`.

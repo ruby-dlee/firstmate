@@ -11,6 +11,7 @@ metadata:
 # Operating fundamentals
 
 Apply these principles together to maximize verified fleet-wide progress.
+Separate observed facts from inference, using a current authoritative check when one is available.
 
 ## 1. Orchestrate; never work inline
 

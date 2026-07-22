@@ -97,7 +97,7 @@
     </form>
   </div>
 
-  <button type="button" onclick="sendAnswers()">Send answers</button>
+  <button type="button" data-send-answers onclick="sendAnswers()">Send answers</button>
 </div>
 <script>
   document.querySelectorAll('form[data-lavish-question]').forEach(function(form){
@@ -109,27 +109,42 @@
     });
   });
 
+  var submissionInFlight=false;
+
   function sendAnswers(){
     var forms=Array.from(document.querySelectorAll('form[data-lavish-question]'));
     var answers=[];
     var firstIncomplete=null;
+    var sendButton=document.querySelector('[data-send-answers]');
+    if(submissionInFlight)return;
     forms.forEach(function(form){
       var key=form.dataset.lavishQuestion;
       var choice=new FormData(form).get(key);
       if(!choice){firstIncomplete=firstIncomplete||form;return;}
-      answers.push({form:form,key:key,label:form.dataset.lavishLabel||key,choice:choice});
+      answers.push({key:key,label:form.dataset.lavishLabel||key,answer:choice});
     });
     if(firstIncomplete){firstIncomplete.reportValidity();return;}
-    if(!answers.length||!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
-    answers.forEach(function(answer){
-      window.lavish.queuePrompt('Explicitly submitted decision - '+answer.label+': '+answer.choice,
-        {tag:'decision',text:'Explicit submit: '+answer.label+': '+answer.choice.split(' - ')[0],
-         element:answer.form,queueKey:answer.key,
-         data:{submission:'explicit-send',question:answer.key,answer:answer.choice}});
-    });
+    var expectedQuestionKeys=answers.map(function(answer){return answer.key;});
+    var uniqueQuestionKeys=new Set(expectedQuestionKeys);
+    if(!answers.length||expectedQuestionKeys.some(function(key){return !key;})||uniqueQuestionKeys.size!==expectedQuestionKeys.length){
+      sendButton.disabled=true;
+      sendButton.textContent='Board configuration error';
+      return;
+    }
+    if(!window.lavish||!window.lavish.queuePrompt||!window.lavish.sendQueuedPrompts)return;
+    var batch={
+      submission:'explicit-send-batch',
+      manifest:{expectedQuestionKeys:expectedQuestionKeys,expectedCount:expectedQuestionKeys.length},
+      answers:answers
+    };
+    submissionInFlight=true;
+    sendButton.disabled=true;
+    window.lavish.queuePrompt('Explicitly submitted decision batch: '+JSON.stringify(batch),
+      {tag:'decision-batch',text:'Explicitly submitted decision batch',element:sendButton,
+       queueKey:'explicit-decision-batch',data:batch});
     window.lavish.sendQueuedPrompts();
-    answers.forEach(function(answer){
-      answer.form.querySelector('[data-selection-status]').textContent='Sent explicitly: '+answer.choice;
+    forms.forEach(function(form,index){
+      form.querySelector('[data-selection-status]').textContent='Sent explicitly: '+answers[index].answer;
     });
   }
 </script>

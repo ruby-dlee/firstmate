@@ -12,6 +12,7 @@ metadata:
 # firstmate-coding-guidelines
 
 Load this before changing firstmate's shared, tracked material, as defined by `AGENTS.md` section 1.
+Load `skill-authoring-standard` before authoring or substantially editing a skill; this skill remains the owner of placement and ownership rules specific to firstmate changes.
 It exists because `AGENTS.md` grew from 585 to 958 lines between its last two restructures, entirely from conditional detail added inline instead of routed to its right home.
 Applying the rules below on every change is what keeps that from happening again.
 

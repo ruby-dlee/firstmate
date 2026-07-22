@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Prepare and rehearse an exact, disabled Bridge cutover bundle.
+"""Prepare, validate, refresh, and rehearse a Bridge cutover bundle.
 
 This script is deliberately installation-agnostic and standard-library only.
-It never discovers a live installation and it has no defaults for user homes,
-registries, release links, projects, or provider binaries.  Every input is an
-absolute path in a strict JSON preparation specification.
+It has no defaults for user homes, registries, release links, projects, or
+provider binaries.  Every live path is bound by an absolute path in the strict
+preparation specification or its validated bundle.
 
 ``prepare`` writes only to a new explicit output directory.  ``validate`` is
-read-only.  ``rehearse`` copies the bound release trees and registry sources
-into a disposable private directory, then exercises the existing restartable
-transaction driver there.  None of the commands enrolls an account, launches
-a provider, changes routing, or operates a live release link.
+read-only.  ``refresh`` atomically replaces only an applied bundle's recorded
+activation plan and worker-state manifest.  ``rehearse`` copies the bound
+release trees and registry sources into a disposable private directory, then
+exercises the existing restartable transaction driver there.  None of the
+commands enrolls an account, launches a provider, changes routing, or operates
+a live release link.
 """
 
 from __future__ import annotations
@@ -5680,33 +5682,7 @@ def validate_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
 
 
 def refresh_bundle(bundle_path: Path, driver_path: Path) -> dict[str, Any]:
-    """Refresh an applied runtime-switched bundle's identity artifacts in place.
-
-    The main cutover pins the live provider-binary identity (inode, mtime, and
-    content SHA-256) into the recorded activation plan and the worker-state
-    manifest.  A byte-exact reinstall of that provider binary gives it a fresh
-    inode and mtime, which re-stales those two artifacts against the live binary,
-    so ``validate_bundle``'s strict activation-plan and worker-state gates refuse
-    even though the machine is genuinely in the sealed runtime-switched state.
-
-    A from-scratch rebuild cannot recover from this: a rebuild's new output
-    directory starts with empty transaction journals, and the runtime-switched
-    proof is journal-bound - the post-install irreversible boundary and the
-    sealed-adoption journal live only inside this bundle's own ``transaction/``
-    directory, cannot be borrowed by another bundle byte-for-byte, and cannot be
-    re-sealed against the already-migrated live registry.  Only the bundle that
-    actually applied the switch validates as runtime-switched.
-
-    This mode refreshes exactly the two identity-bound artifacts of that existing
-    bundle - its recorded ``activation_plan`` and ``worker-state.manifest.json`` -
-    to the current provider-binary identity, while leaving the sealed cutover and
-    sealed-adoption journals untouched.  It refuses unless the bundle is provably
-    the applied runtime-switched one, and it gates completion on a full strict
-    ``validate_bundle`` that must still report the journal-bound runtime-switched
-    phase.  It loosens no proof: the strict gates it makes pass do so because the
-    recorded identity now equals the live binary, not because the check was
-    weakened.
-    """
+    """Refresh identity artifacts per docs/bridge-cutover-sealed-runtimes.md."""
 
     state = _reconstruct_bundle_state(bundle_path, driver_path)
     if state.cutover_phase != "runtime-switched":

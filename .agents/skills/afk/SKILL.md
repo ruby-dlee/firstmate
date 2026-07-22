@@ -1,6 +1,6 @@
 ---
 name: afk
-description: Enter away-mode supervision. Use when the user invokes /afk (e.g. "/afk", "/afk back in an hour", "going afk"). Sets a durable away-mode flag so the sub-supervisor daemon can self-handle routine wakes and escalate captain-relevant events plus bounded declared-external-wait rechecks as batched digests, cutting supervision token cost during walk-away stretches. Exit is automatic; any real (unmarked) message returns to full per-wake responsiveness.
+description: Enter away-mode supervision. Use when the user invokes /afk (e.g. "/afk", "/afk back in an hour", "going afk"). Sets a durable away-mode flag so the sub-supervisor daemon can self-handle routine wakes and escalate captain-relevant events plus bounded declared-external-wait rechecks as batched digests, cutting supervision token cost during walk-away stretches. Exit is automatic; any real user message returns to full per-wake responsiveness.
 user-invocable: true
 metadata:
   internal: true
@@ -8,228 +8,108 @@ metadata:
 
 # afk
 
-Away-mode supervision. When invoked, `/afk` makes the daemon's token-saving
-tradeoff **consented** and **explicit**: the captain is stepping away, so the
-sub-supervisor may triage routine wakes in bash instead of waking firstmate's
-LLM for each one. Escalations still reach the captain, but as one pre-read,
-batched digest rather than per-wake injections.
+Away mode is an explicit, captain-consented token-saving tradeoff.
+The daemon triages routine wakes in bash instead of waking firstmate's LLM for each one.
+Captain-relevant events still wake firstmate as one pre-read batch.
 
-## What it does
+## Enter away mode
 
-1. **Enter the lifecycle through `bin/fm-afk-launch.sh`.**
-   This owns the durable state write, session-scoped stale-artifact clearing,
-   terminal record, and rollback.
-   The flag survives a firstmate restart, so recovery re-enters afk when it is present.
+1. Run `bin/fm-afk-launch.sh start-native` when the current harness provides a native tracked-background tool, including Claude Code's background bash.
+2. Run `FM_AFK_STATE_PREPARED=1 bin/fm-afk-start.sh` as its own native tracked background task.
+3. Run `bin/fm-afk-launch.sh start` only on a harness without a native tracked-background tool.
+4. Do not wrap either daemon entry in `nohup`, shell `&`, or another fire-and-forget shell.
+5. Do not separately arm `bin/fm-watch-arm.sh` or `bin/fm-watch.sh` while `state/.afk` exists.
+6. Acknowledge that away mode is active and that any real captain message ends it.
 
-2. **Ensure the sub-supervisor daemon is running as a tracked background process.**
-   Its hosting differs by harness.
-   Pick the right path:
-   - **Harness WITH a native in-pane tracked-background tool** (e.g. claude's
-     background bash, grok's background tool): first run
-     `bin/fm-afk-launch.sh start-native`, then run
-     `FM_AFK_STATE_PREPARED=1 bin/fm-afk-start.sh` through that native tool.
-     This is a deliberate no-separate-terminal exception because the harness-hosted job creates no terminal or layout mutation, and a shell launcher cannot invoke a harness-native background tool.
-     The launcher still owns lifecycle state and records the no-terminal mode, while the daemon inherits and auto-discovers the captain pane.
-     If the native launch fails, run `bin/fm-afk-launch.sh stop` to roll back the prepared lifecycle.
-     Do not wrap it in `nohup ... &` (Codex/herdr can reap fire-and-forget shell children after a tool call returns).
-   - **Harness WITHOUT one** (e.g. pi): run `bin/fm-afk-launch.sh start`. It is
-     the single owner of the daemon terminal: it creates a NON-VISIBLE tracked
-     terminal for the current backend (a herdr dedicated `--no-focus` workspace,
-     a detached tmux session), records its exact id, and passes the captain pane
-     in as `FM_SUPERVISOR_TARGET` so the daemon injects into the captain, not its
-     own new pane. **Never manufacture a terminal by splitting the captain's
-     active pane** (`herdr pane split`): a split co-tenants the tab and visibly
-     shrinks the captain's pane (docs/herdr-backend.md "Away-mode daemon terminal
-     launch").
-   Both paths share `bin/fm-afk-start.sh` as the daemon entry.
-   The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
-   It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
-   The daemon is **presence-gated**: it injects escalations only while
-   `state/.afk` exists, and stays quiet otherwise.
+`bin/fm-afk-launch.sh` owns the durable flag, stale-artifact clearing, terminal record, rollback, and stop ordering.
+The native launch record makes `bin/fm-afk-start.sh` select `reap-wake` delivery automatically.
+The terminal-backed path remains a compatibility mode for harnesses without a native background completion notification.
+Never manufacture a daemon terminal by splitting the captain's active pane.
 
-3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
-   its child; the singleton lock no-ops a stray arm harmlessly.
+## Native reap-wake lifecycle
 
-4. **Acknowledge** to the captain that away-mode is active.
-   The daemon will self-handle routine wakes, escalate captain-relevant events and bounded declared-external-wait rechecks, and let the captain exit by sending any real message.
+On Claude, the tracked away daemon is the parked LLM's wake task.
+The daemon keeps that task running across routine signal, stale, and heartbeat events while its bash classifier absorbs them.
+When a batched captain-relevant escalation becomes due, the daemon prints one line beginning `afk-reap-wake:` and exits cleanly.
+Claude Code's native background-task completion notification then wakes the parked LLM through the same primitive used by normal Claude supervision.
+The native delivery path does not inspect a pane, type into the composer, use a busy guard, classify composer text, or call `send-keys`.
 
-## How to exit afk
+Treat a completed tracked away task whose output includes a line beginning `afk-reap-wake:` as an internal escalation rather than a captain return message.
+Stay in away mode, drain `state/.wake-queue`, process the distilled batch, and surface only captain-relevant outcomes.
+If `state/.afk` still exists at the end of that turn, run `bin/fm-afk-launch.sh start-native` and start a fresh `FM_AFK_STATE_PREPARED=1 bin/fm-afk-start.sh` native background task as the turn's final supervision action.
+Restart the away daemon, not `fm-watch-arm.sh`, because the daemon continues to own and wrap the watcher.
 
-No `/back` is needed. The first genuine message is the return signal:
+The durable wake queue is authoritative and lossless.
+The `afk-reap-wake:` line is a pre-read reason that explains why the tracked task completed.
+Routine queue records may be present beside the captain-relevant record because the daemon batches and triages before waking the LLM.
 
-- A message **without** the sentinel marker and **not** starting with `/afk` -> the captain is back.
-  Run `bin/fm-afk-launch.sh stop`: it stops the daemon in the correct order - it SIGTERMs the daemon so its shutdown flush runs **while `state/.afk` is still present** (clearing the flag first makes that flush a no-op via the daemon's presence gate, stranding undelivered escalations), then closes the daemon's own terminal by exact id, then clears `state/.afk` last.
-  Then flush one distilled "while you were out" catch-up (drain `state/.wake-queue`, summarize any pending escalations from `state/.subsuper-escalations` and any `state/.subsuper-inject-wedged` marker), and resume full per-wake responsiveness through the emitted primary-harness supervision protocol from session start.
-- A message **with** the sentinel marker (`FM_INJECT_MARK`, ASCII 0x1f) -> it
-  is a daemon escalation; stay afk and process it.
-- Re-invoking `/afk` while already away -> stay afk (refresh the flag); this
-  does **not** trigger an exit.
+## Terminal-backed compatibility delivery
 
-Bias ambiguous cases toward exit: a present captain beats token savings, and
-a false exit is self-correcting (the captain re-runs `/afk`).
+A harness without a native tracked-background tool uses `bin/fm-afk-launch.sh start` to create one non-visible tracked terminal.
+That compatibility path passes `FM_SUPERVISOR_TARGET` and `FM_SUPERVISOR_BACKEND` explicitly and delivers through the existing verified pane submit path.
+It retains the busy guard, affirmative-empty composer guard, type-once submit, `FM_MAX_DEFER_SECS` alarm, and `state/.subsuper-inject-wedged` marker.
+The compatibility path prefixes its injected message with `FM_INJECT_MARK`, ASCII unit separator `0x1f`, so firstmate can distinguish it from a real captain message in the shared input channel.
+The marker never appears on native reap-wake delivery because a background-task completion is not a user message.
 
-## Orthogonal to approval authority
+## Exit away mode
 
-afk changes how aggressively firstmate surfaces things, **not who approves
-what**. "Away" never means "approves more." A PR ready for merge, a
-needs-decision finding, or anything destructive still waits for the captain's
-explicit word - the daemon just batches the notification.
+No `/back` command is required.
 
-## Sentinel marker contract
+- A completed native task whose output includes an `afk-reap-wake:` line is internal, so stay away and follow the native reap-wake lifecycle above.
+- A legacy message beginning with `FM_INJECT_MARK` is an internal terminal-backed escalation, so stay away and process it.
+- A message beginning with `/afk` refreshes away mode rather than ending it.
+- Any other real user message means the captain is back.
 
-The daemon prefixes every injection with `FM_INJECT_MARK` (ASCII unit
-separator, 0x1f), invisible and untypable. This is how firstmate tells a
-daemon escalation apart from a real message in the same pane. The marker
-travels with the message text; it does not rely on harness-level
-typed-vs-injected detection (which is not portable across claude, codex,
-opencode, pi, and grok).
+On a real return message, run `bin/fm-afk-launch.sh stop` before clearing any state yourself.
+The launcher stops the daemon while `state/.afk` still exists, closes any exact recorded terminal, and clears `state/.afk` last.
+Native shutdown preserves any buffered escalation for catch-up, while terminal-backed compatibility shutdown may make its final guarded submit while the flag is still present.
+Drain `state/.wake-queue`, summarize any pending `state/.subsuper-escalations`, surface any legacy `state/.subsuper-inject-wedged` marker, and resume the primary harness supervision protocol emitted at session start.
+Bias ambiguous user-message cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 
-## Busy-guard and composer guard
+## Approval authority
 
-The daemon never injects into an in-use pane. Two checks run before every
-injection, dispatched through `bin/fm-backend.sh` for the supervisor's own
-backend (tmux or herdr; see "Auto-discovered supervisor pane" below):
+Away mode changes wake frequency, not approval authority.
+A PR ready for merge, an ask-user finding, a destructive action, an irreversible action, or a security-sensitive choice still requires the same approval it required before away mode.
 
-- **`pane_is_busy`** - the harness shows a busy footer (agent mid-turn) on tmux (shared with `fm-send.sh` via `bin/fm-tmux-lib.sh`); on herdr, tries the native `agent.get`-backed busy state first, trusts only `busy` outright, and corroborates every non-`busy` verdict with the same regex-over-capture reader.
-- **Composer-state guard** - `inject_msg` reads the full `empty`/`pending`/`unknown` verdict from `fm_backend_composer_state` and injects only when it is affirmatively `empty`.
-  `pending` means real unsubmitted text, while `unknown` includes an unreadable pane and a bare shell prompt left after the agent exits, so both defer.
-  The shared `bin/fm-composer-lib.sh` owns the content decision after each backend captures and structurally identifies its own composer row.
-  It preserves idle bordered composers such as claude's `│ > … │` and bare agent glyphs as empty, but a bare shell glyph is unknown unless inside a genuine bordered composer box; see `docs/herdr-backend.md` "Composer-emptiness safety" for the complete contract.
-  `pane_input_pending` remains the tested predicate for callers that only need to know whether real unsubmitted text is present, but it is insufficient for an injection-safety decision because it cannot distinguish `empty` from `unknown`.
+## Classification and batching
 
-Either condition, or any composer verdict other than `empty`, defers the injection; the buffered escalation survives in `state/.subsuper-escalations` and is retried on the next housekeeping tick.
-In afk mode the composer guard is belt-and-suspenders (no human is typing), but it protects against the race window between the captain returning and their message landing, a dead shell, and the daemon's own previous injection sitting unsent.
+The daemon wraps `bin/fm-watch.sh`, classifies each wake in bash, and self-handles the routine majority without consuming a firstmate turn.
+The shared `bin/fm-classify-lib.sh` owns the captain-relevant verbs, declared-pause vocabulary, signal and stale decisions, and catch-all scan used by both normal and away supervision.
+While `state/.afk` exists, the watcher reverts to one-shot enqueue-and-exit behavior and lets the daemon own triage.
 
-**Max-defer escape (the daemon must never silently wedge).**
-If anything stays buffered past `FM_MAX_DEFER_SECS` (default 300), the daemon
-attempts one normal flush, which still requires an idle pane and an affirmatively empty composer.
-If that submit cannot be confirmed, it raises a loud, rate-limited wedge alarm:
-an ERROR in the daemon log, a durable
-`state/.subsuper-inject-wedged` marker (surface it on the "while you were out"
-catch-up if present), a tmux status-line flash when applicable, and a configurable backend-independent active alert.
-`docs/wedge-alarm.md` owns the alert channel setup and verification record.
-So a guard false-positive becomes a visible stall, never an unbounded silent no-op.
+- A `signal` with `done:`, `needs-decision:`, `blocked:`, `failed:`, `PR ready`, `checks green`, `ready in branch`, or `merged` escalates.
+- A routine `signal` self-handles.
+- A declared `paused:` external wait self-handles and re-surfaces after `FM_PAUSE_RESURFACE_SECS`, which defaults to 3600 seconds.
+- A `check` always escalates because check scripts print only when firstmate should wake.
+- A terminal `stale` escalates immediately.
+- A non-terminal `stale` rechecks after `FM_STALE_ESCALATE_SECS`, which defaults to 240 seconds, and escalates only if it remains a possible wedge.
+- A `heartbeat` self-handles while the daemon's cheap fleet scan backs up missed captain-relevant statuses.
+- An unknown or uncertain reason escalates fail-safe.
 
-## Submit model
+Escalations batch for up to `FM_ESCALATE_BATCH_SECS`, which defaults to 90 seconds and accepts zero for immediate delivery.
+Native delivery completes the tracked task at that batch deadline without any pane-dependent defer condition.
+Legacy terminal-backed delivery retains `FM_MAX_DEFER_SECS` because its guarded submit can still defer.
+`FM_INJECT_SKIP`, which defaults to `heartbeat`, force-self-handles matching reason prefixes and should be used sparingly.
 
-The digest is typed **once** (`send-keys -l` on tmux, `pane send-text` on
-herdr - both literal, non-submitting sends), then submitted with Enter and
-**verified** through the selected backend's submit primitive.
-Enter is retried (Enter only, never a retype) until the backend confirms the
-submit landed.
-For tmux that confirmation is a cleared composer, using the same corrected,
-border-aware detector as the composer guard.
-For herdr, normal idle-baseline submits are confirmed by native agent-state showing a real turn started; the ANSI-aware composer classifier remains the affirmative-empty pre-injection guard and conservative fallback for non-idle or unreadable baselines.
-A bordered-empty or ghost-only composer is recognized as empty where that backend uses composer confirmation, rather than mistaken for a swallowed Enter.
-`fm-send.sh` uses the same primitive and exits non-zero
-when a steer's Enter is positively swallowed, so firstmate learns an instruction
-did not land instead of leaving it unsubmitted.
+## State lifecycle
 
-## Classification policy
-
-The daemon wraps `fm-watch.sh`, runs the watcher as a child, classifies each
-wake reason in bash, and self-handles the routine majority without consuming a
-firstmate turn.
-Captain-relevant events, plus a bounded recheck of a declared external wait that remains idle, escalate to firstmate's context as one pre-read, single-line, batched digest.
-The classification predicates (the captain-relevant verb set, declared-pause vocabulary, signal/stale tests, and fleet-scan) live in the shared `bin/fm-classify-lib.sh`, the same library the always-on watcher uses for its own triage when afk is off, so the two modes apply one identical policy.
-While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
-
-Classify each wake this way:
-
-- `signal` whose status content has no captain-relevant verb
-  (`done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged`)
-  -> self-handle. Captain-relevant verb -> escalate.
-- `signal` or `stale` for a declared `paused:` external wait -> self-handle and track the pause rather than a wedge.
-  If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one awaiting-external recheck and resets the pause window.
-- `check` -> always escalate. Check scripts print only when firstmate should wake.
-- `stale` with a terminal status -> escalate. Non-terminal stale is transient:
-  record a marker and self-handle. If the pane is still idle past
-  `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a
-  possible wedge. This bounds wedge-detection latency to the threshold plus a
-  tick: a delay, never a loss. Healthy crewmates are autonomous and do not wait
-  on firstmate mid-task.
-- `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
-  every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a
-  captain-relevant status line the per-wake classifier might miss.
-- Unknown reason, or any uncertainty -> escalate fail-safe.
-
-Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
-immediate) and flushed as one single-line digest prefixed with the sentinel
-marker, carrying pre-read status summaries and a recommended action.
-The single-line format makes the submission unambiguous across harnesses, and
-the marker lets firstmate distinguish it from a real captain message.
-
-## Injection hardening
-
-- **Single-line digest** - embedded newlines are collapsed to a literal
-  separator before injection, so submission is unambiguous regardless of
-  harness.
-- **Composer guard on the supervisor pane** - before injecting, the daemon checks `pane_is_busy` (harness busy footer means agent mid-turn) and reads `fm_backend_composer_state` directly.
-  Only `empty` permits injection; `pending` protects half-typed or swallowed input, and `unknown` protects unreadable panes and bare dead-shell prompts.
-  Every other result preserves the buffer for retry, so the daemon never merges its digest into the captain's half-typed line or types it into a shell.
-- The shared composer classifier receives a candidate row only after the active backend performs its own capture and structural row recognition.
-  tmux and herdr route their raw styled candidate rows through the shared `fm_composer_strip_ghost` extractor, which removes dim/faint and dark-TRUECOLOR ghost/placeholder text before classification.
-  They read the composer shape from a separately ANSI-stripped plain row because a dark TRUECOLOR border can be stripped with ghost content.
-  A ghost-only or idle bordered composer such as claude's `│ > ... │` therefore reads empty without allowing an unbordered shell prompt to do the same.
-  `FM_COMPOSER_IDLE_RE` still overrides tmux empty-composer matching after shared ghost and border stripping, and `FM_BUSY_REGEX` overrides busy footers.
-- **Max-defer escape** - the daemon must never silently wedge. If anything stays
-  buffered past `FM_MAX_DEFER_SECS` (default 300s), the daemon attempts one
-  normal flush, which still requires an idle pane and an affirmatively empty composer. If that
-  cannot confirm a submit, it raises a loud, rate-limited wedge alarm: ERROR log,
-  durable `state/.subsuper-inject-wedged` marker, a tmux status-line flash when
-  applicable, and a backend-independent active alert. A
-  composer false-positive surfaces as a visible stall, never an unbounded silent
-  no-op.
-- **Verified type-once submit model** - the digest is typed once (`send-keys -l`
-  on tmux, `pane send-text` on herdr), then submitted with Enter and verified.
-  Enter is retried, Enter only and never a retype, until the backend submit
-  primitive reports `empty` as its caller-facing success verdict.
-  For tmux that verdict means the shared-ghost-aware and border-aware composer
-  cleared.
-  For herdr's normal idle-baseline path it means native agent-state observed a real turn start; herdr uses the ANSI-aware structural classifier for the pre-injection composer guard and fallback paths.
-  This lets ghost-only or bordered-empty composers count as empty where a composer read is the active confirmation signal.
-- **Marker strip** - `strip_injection_marker` removes the sentinel prefix before
-  classification or relay, so the digest text firstmate sees is clean.
-- **Portable singleton lock** - the daemon uses the repo's portable lock helper
-  (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS.
-- **Dedupe across signal/stale/scan** - `classify_signal` and `classify_stale`
-  both check the seen-status marker before escalating, so a status escalated by
-  one path is not re-escalated by another in the same digest.
-- **Auto-discovered supervisor pane** - the daemon resolves its own BACKEND
-  (tmux vs herdr) and TARGET independently, mirroring
-  `bin/fm-backend.sh`'s own runtime auto-detection. Backend: `FM_SUPERVISOR_BACKEND`
-  override, then `$TMUX_PANE` set (tmux), then `$HERDR_ENV=1` with
-  `$HERDR_PANE_ID` present (herdr), then a tmux fallback. Target:
-  `FM_SUPERVISOR_TARGET` override (a tmux target or a herdr
-  `"<session>:<pane-id>"` target), then `$TMUX_PANE`, then
-  `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then a
-  `firstmate:0` fallback with a warning. Both resolution sources are logged at
-  startup so a wrong-but-resolving fallback is detectable. Other runtime
-  backends, including zellij, orca, and cmux, are not yet supported as
-  supervisor backends; the daemon refuses loudly at startup instead of
-  misapplying tmux primitives to a pane that isn't one
-  (docs/herdr-backend.md "Away-mode daemon: herdr supervisor-pane support").
-
-## Stale-artifact lifecycle
-
-Treat `state/.subsuper-escalations`, its `.since` sidecar, and `state/.subsuper-inject-wedged` as session-scoped delivery artifacts, not as the durable work record.
-Always enter through `bin/fm-afk-launch.sh`, which clears prior-session artifacts only for a fresh entry and preserves the current session's buffer on refresh.
-Always exit through `bin/fm-afk-launch.sh stop`, which keeps `state/.afk` present through the daemon's shutdown flush and clears it last.
-`docs/herdr-backend.md` "Stale-artifact lifecycle fix" owns the mechanism and verification evidence.
+`state/.wake-queue` is the durable work record and survives daemon crashes, notification loss, and firstmate restarts.
+`state/.subsuper-escalations` and its `.since` sidecar are a transient batch cache.
+`state/.subsuper-inject-wedged` is a legacy terminal-backed delivery alarm and is not created by native reap-wake delivery.
+Always enter through `bin/fm-afk-launch.sh`, which clears prior-session transient artifacts only on a fresh away session and preserves the current session's buffer on refresh.
+Always exit through `bin/fm-afk-launch.sh stop`, which preserves the flag until daemon shutdown completes and clears it last.
 
 ## Reliability properties
 
-These properties must hold:
+These properties must hold for native tracked delivery:
 
-- Nothing is lost. The durable queue plus `fm-wake-drain.sh` recover any missed
-  or crashed injection.
-- Wedge detection is bounded-latency, not lossy.
-- Declared external waits are rechecked on a separate, bounded cadence rather than being mislabeled as wedges.
+- Routine wakes remain bash-only and do not complete the tracked task.
+- A due captain-relevant batch completes the tracked task regardless of busy footers, composer placeholders, pending composer state, or pane readability.
+- Claude's native task-completion notification delivers the wake to the parked LLM.
+- The durable queue recovers the event if the daemon or harness restarts before firstmate drains it.
+- Declared external waits use their own bounded recheck cadence rather than being mislabeled as wedges.
 - The catch-all scan backs up the keyword classifier.
-- The daemon preserves a single-instance portable lock, crash-loop backoff,
-  a pane-gone guard, and a signal-trapped shutdown that flushes buffered
-  escalations before exit.
+- The daemon preserves a single-instance portable lock, watcher crash-loop backoff, and signal-trapped cleanup.
 
-`FM_INJECT_SKIP` (default `heartbeat`) force-self-handles matching kinds,
-overriding classification.
-Use it sparingly.
+The delivery guarantee assumes the daemon was started as the harness's native tracked background task as required above.
+Do not substitute a detached shell process because its exit has no harness notification contract.

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# fm-afk-launch.sh - the single owner of the away-mode daemon TERMINAL lifecycle:
-# launch it in a NON-VISIBLE tracked terminal per backend, record its exact id,
-# tear it down by that exact id, and reconcile a leaked one after a crash.
+# fm-afk-launch.sh - the single owner of the away-mode daemon lifecycle and any
+# compatibility terminal it needs.
+# It records exact ownership, tears a terminal down by exact id, and reconciles
+# a leaked one after a crash.
 #
 # Why this exists (docs/herdr-backend.md "Away-mode daemon terminal launch"):
 # bin/fm-afk-start.sh execs the supervise daemon in the FOREGROUND of whatever
@@ -13,11 +14,10 @@
 # workspace with --no-focus, or a detached tmux session) that never touches the
 # captain's active tab, and NEVER uses shell `&` (which herdr/codex can reap).
 #
-# Correct supervisor targeting: the daemon finds the captain pane to inject into
-# from its OWN inherited env (discover_supervisor_target). Running it in a
-# separate terminal would make it discover its OWN pane, so this captures the
-# captain pane FIRST (from the pane this script runs in) and passes it in as
-# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND explicitly.
+# Correct compatibility-targeting: a terminal-backed daemon would discover its
+# own pane, so this captures the captain pane first and passes it in as
+# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND for legacy injection delivery.
+# Native tracked launches use task completion and never inspect a pane.
 #
 # Usage:
 #   fm-afk-launch.sh start     Capture the captain pane, then (unless the daemon
@@ -29,10 +29,12 @@
 #   fm-afk-launch.sh start-native
 #                              Prepare lifecycle state for a harness-native
 #                              background job and record that no terminal exists.
-#   fm-afk-launch.sh stop      Correct-ordered exit: SIGTERM the daemon so its
-#                              cleanup flushes WHILE state/.afk is still present,
-#                              wait for it, close the recorded terminal by exact
-#                              id, then clear state/.afk last.
+#   fm-afk-launch.sh stop      Correct-ordered exit: SIGTERM the daemon while
+#                              state/.afk is still present, wait for it, close the
+#                              recorded terminal by exact id, then clear
+#                              state/.afk last. Native delivery preserves its
+#                              buffer for catch-up; compatibility injection may
+#                              perform its final guarded flush during cleanup.
 #   fm-afk-launch.sh reconcile Close a recorded-but-dead daemon terminal by exact
 #                              id and drop the record (recovery after a crash).
 #
@@ -1225,9 +1227,9 @@ fm_afk_launch_stop_locked() {
     fm_afk_launch_log "malformed daemon terminal record; refusing to stop away mode"
     return 1
   fi
-  # (1) SIGTERM the daemon so its cleanup trap flushes buffered escalations
-  # WHILE state/.afk is still present (the exit-ordering fix: clearing .afk
-  # first would make that flush a no-op via inject_msg's presence gate).
+  # (1) SIGTERM the daemon while state/.afk is still present.
+  # Terminal-backed compatibility delivery may make its final guarded flush in
+  # cleanup, while native reap-wake preserves the buffer for firstmate's catch-up.
   pid=""
   pid_identity=""
   if daemon_lock_held_by_live_daemon; then

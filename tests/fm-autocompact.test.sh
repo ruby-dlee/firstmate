@@ -204,6 +204,45 @@ EOF
   pass "compact SessionStart re-reads the anchor and runs normal durable-state reconciliation"
 }
 
+test_recovery_payload_failures_still_emit_durable_context() {
+  local rec root home out payload fakebin real_cat
+  rec=$(new_primary recover-payload-failure)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '# recovery-payload-fallback' > "$home/data/backlog.md"
+  capture "$root" "$home" auto
+
+  for payload in '' '{not-json' '{"hook_event_name":"SessionStart"}'; do
+    out=$(printf '%s' "$payload" \
+      | FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover)
+    assert_contains "$out" 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING' "invalid recovery payload was not surfaced"
+    assert_contains "$out" '# recovery-payload-fallback' "invalid recovery payload suppressed the durable anchor"
+    assert_contains "$out" 'NORMAL SESSION-START RECONCILIATION' "invalid recovery payload suppressed reconciliation"
+  done
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/recover-payload-failure")
+  real_cat=$(command -v cat)
+  cat > "$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+if [ "$#" -eq 0 ]; then
+  exit 72
+fi
+exec "$FM_AUTOCOMPACT_REAL_CAT" "$@"
+EOF
+  chmod +x "$fakebin/cat"
+  out=$(printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact"}' \
+    | PATH="$fakebin:$PATH" \
+      FM_AUTOCOMPACT_REAL_CAT="$real_cat" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" recover)
+  assert_contains "$out" 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING' "unreadable recovery payload was not surfaced"
+  assert_contains "$out" '# recovery-payload-fallback' "unreadable recovery payload suppressed the durable anchor"
+  assert_contains "$out" 'NORMAL SESSION-START RECONCILIATION' "unreadable recovery payload suppressed reconciliation"
+  pass "recovery payload failures still emit all durable context"
+}
+
 test_noncompact_sessionstart_is_inert() {
   local rec root home out
   rec=$(new_primary noncompact)
@@ -223,4 +262,5 @@ test_capture_failure_blocks_compaction
 test_capture_and_recovery_do_not_require_jq
 test_intermediate_render_failure_preserves_prior_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
+test_recovery_payload_failures_still_emit_durable_context
 test_noncompact_sessionstart_is_inert

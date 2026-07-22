@@ -13,6 +13,7 @@ An in-scope capture failure exits 2 and blocks compaction rather than silently c
 
 After compaction, Claude Code emits a new `SessionStart` event with `source=compact` before the next model request.
 The recovery phase prints the fresh anchor and the output of `bin/fm-session-start.sh` to stdout.
+If its compact-scoped hook payload is unreadable or invalid, recovery prints a loud warning and still emits durable context; only a successfully parsed non-compact `SessionStart` is a silent no-op.
 Claude Code adds that stdout to the compacted context, so Firstmate receives the normal lock, bootstrap, wake-queue, backlog, task, status-tail, endpoint, and supervision reconciliation before it resumes.
 The compact summary is explicitly treated as lossy and subordinate to those durable sources.
 

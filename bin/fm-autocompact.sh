@@ -187,24 +187,34 @@ json_string_field() {
   ' <<< "$payload"
 }
 
+PAYLOAD=
+RECOVERY_WARNING=
 if ! PAYLOAD=$(cat 2>/dev/null); then
-  [ "$MODE" = capture ] || exit 0
-  capture_failed 'could not read the PreCompact payload'
-fi
-if [ -z "$PAYLOAD" ]; then
-  [ "$MODE" = capture ] || exit 0
-  capture_failed 'the PreCompact payload was empty'
+  if [ "$MODE" = capture ]; then
+    capture_failed 'could not read the PreCompact payload'
+  fi
+  RECOVERY_WARNING='could not read the compact SessionStart payload; recovering from durable state'
 fi
 
-if ! EVENT=$(json_string_field hook_event_name "$PAYLOAD"); then
-  [ "$MODE" = capture ] || exit 0
-  capture_failed 'invalid PreCompact payload'
-fi
 if [ "$MODE" = capture ]; then
+  [ -n "$PAYLOAD" ] || capture_failed 'the PreCompact payload was empty'
+  EVENT=$(json_string_field hook_event_name "$PAYLOAD") \
+    || capture_failed 'invalid PreCompact payload'
   [ "$EVENT" = PreCompact ] || exit 0
 else
-  SOURCE=$(json_string_field source "$PAYLOAD") || exit 0
-  [ "$EVENT" = SessionStart ] && [ "$SOURCE" = compact ] || exit 0
+  if [ -n "$RECOVERY_WARNING" ]; then
+    :
+  elif [ -z "$PAYLOAD" ]; then
+    RECOVERY_WARNING='the compact SessionStart payload was empty; recovering from durable state'
+  elif ! EVENT=$(json_string_field hook_event_name "$PAYLOAD"); then
+    RECOVERY_WARNING='the compact SessionStart payload was malformed or missing its event name; recovering from durable state'
+  elif [ "$EVENT" != SessionStart ]; then
+    RECOVERY_WARNING="the recovery hook received unexpected event $EVENT; recovering from durable state"
+  elif ! SOURCE=$(json_string_field source "$PAYLOAD"); then
+    RECOVERY_WARNING='the SessionStart payload was malformed or missing its source; recovering from durable state'
+  elif [ "$SOURCE" != compact ]; then
+    exit 0
+  fi
 fi
 
 render_anchor() {
@@ -307,6 +317,9 @@ recover_context() {
   digest_rc=$?
 
   printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT'
+  if [ -n "$RECOVERY_WARNING" ]; then
+    printf 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING: %s\n' "$RECOVERY_WARNING"
+  fi
   printf '%s\n' 'Treat the fresh durable anchor and session-start digest below as authoritative over the lossy compaction summary.'
   printf '%s\n' 'Resume the in-flight work directly after reconciling the drained wake queue and live endpoints.'
   printf '\n=== FRESH RESUME ANCHOR: %s ===\n' "$ANCHOR"

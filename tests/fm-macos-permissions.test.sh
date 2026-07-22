@@ -88,6 +88,7 @@ esac
 SH
   cat > "$fakebin/codesign" <<'SH'
 #!/usr/bin/env bash
+[ -z "${FM_FAKE_CODESIGN_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_CODESIGN_LOG"
 case "${FM_FAKE_AUTOMATION_ENTITLEMENT:-missing}" in
   present)
     printf '%s\n' '<key>com.apple.security.automation.apple-events</key><true/>'
@@ -139,10 +140,8 @@ test_missing_probe_is_honest() {
     'undetectable grants were guessed'
   assert_contains "$out" 'Automation status is always PER TARGET' \
     'Automation was presented as a blanket grant'
-  assert_contains "$out" 'ENTITLEMENT NOT PRESENT' \
-    'missing no-mistakes Apple Events entitlement was hidden'
-  assert_contains "$out" 'same-team targets do not require this entitlement' \
-    'missing entitlement was presented as blocking every target'
+  assert_contains "$out" 'configured path cannot prove the running process image entitlement' \
+    'daemon filesystem state was promoted to loaded-image capability'
   pass 'missing and undetectable grants are reported honestly'
 }
 
@@ -198,32 +197,39 @@ test_partial_database_evidence_is_unknown() {
 }
 
 test_failed_entitlement_probe_is_unknown() {
-  local world out daemon_section
+  local world out codex_section
   world=$(make_world entitlement-unknown)
+  : > "$world/fakebin/codex"
+  chmod +x "$world/fakebin/codex"
 
   out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=unknown run_report "$world")
-  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+  codex_section=$(printf '%s\n' "$out" | sed -n '/^Codex PATH command target/,/^$/p')
 
-  printf '%s\n' "$daemon_section" \
+  printf '%s\n' "$codex_section" \
     | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
     || fail 'failed entitlement inspection was reported conclusively'
-  assert_contains "$daemon_section" 'The daemon entitlement could not be inspected' \
+  assert_contains "$codex_section" 'could not be inspected' \
     'failed entitlement inspection lacked an honest explanation'
   pass 'failed entitlement inspection remains unknown'
 }
 
 test_entitlement_boolean_is_parsed() {
-  local world out daemon_section
+  local world out codex_section
   world=$(make_world entitlement-values)
+  : > "$world/fakebin/codex"
+  chmod +x "$world/fakebin/codex"
 
   out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=false run_report "$world")
-  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
-  assert_contains "$daemon_section" 'ENTITLEMENT NOT PRESENT' \
+  codex_section=$(printf '%s\n' "$out" | sed -n '/^Codex PATH command target/,/^$/p')
+  assert_contains "$codex_section" 'codesign reports no true Apple Events entitlement' \
     'false Apple Events entitlement was treated as present'
+  printf '%s\n' "$codex_section" \
+    | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
+    || fail 'PATH command entitlement was promoted to controller capability'
 
   out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=malformed run_report "$world")
-  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
-  printf '%s\n' "$daemon_section" \
+  codex_section=$(printf '%s\n' "$out" | sed -n '/^Codex PATH command target/,/^$/p')
+  printf '%s\n' "$codex_section" \
     | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
     || fail 'non-Boolean Apple Events entitlement was reported conclusively'
   pass 'Apple Events entitlement requires an explicit Boolean value'
@@ -278,6 +284,41 @@ test_daemon_path_requires_running_launch_job() {
   printf '%s\n' "$daemon_section" | grep -E 'status=(ENTITLEMENT NOT PRESENT|PER TARGET)' >/dev/null \
     && fail 'unresolved daemon path produced a conclusive entitlement status'
   pass 'daemon identity requires one running authoritative launch job'
+}
+
+test_active_daemon_entitlement_stays_unknown() {
+  local world out daemon_section codesign_log
+  world=$(make_world daemon-entitlement)
+  codesign_log="$world/codesign.log"
+
+  out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=present FM_FAKE_CODESIGN_LOG="$codesign_log" \
+    run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon configured target/,/^$/p')
+
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
+    || fail 'configured daemon path produced a conclusive loaded-image capability'
+  [ ! -e "$codesign_log" ] || fail 'configured daemon path was inspected as the loaded process image'
+  pass 'active daemon entitlement remains unknown without live-image proof'
+}
+
+test_path_absence_is_not_installation_status() {
+  local world out
+  world=$(make_world path-absence)
+  unlink "$world/fakebin/no-mistakes"
+
+  out=$(run_report "$world")
+
+  assert_contains "$out" 'Claude Code PATH command target (UNKNOWN: not found on PATH)' \
+    'Claude PATH absence was reported as installation state'
+  assert_contains "$out" 'Codex PATH command target (UNKNOWN: not found on PATH)' \
+    'Codex PATH absence was reported as installation state'
+  assert_contains "$out" 'no-mistakes CLI PATH entry (UNKNOWN: not found on PATH)' \
+    'no-mistakes PATH absence was reported as installation state'
+  case "$out" in
+    *'not installed'*) fail 'PATH absence was reported as not installed' ;;
+  esac
+  pass 'PATH absence remains a limited unknown observation'
 }
 
 test_conflicting_automation_rows_are_unknown() {
@@ -361,6 +402,8 @@ test_entitlement_boolean_is_parsed
 test_partial_automation_query_is_unknown
 test_bundle_hint_does_not_override_stored_evidence
 test_daemon_path_requires_running_launch_job
+test_active_daemon_entitlement_stays_unknown
+test_path_absence_is_not_installation_status
 test_conflicting_automation_rows_are_unknown
 test_exact_settings_urls_and_no_other_mutation
 test_non_macos_refuses

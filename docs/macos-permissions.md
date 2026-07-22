@@ -74,7 +74,8 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 - **Full Disk Access - no separate grant is needed for normal Ghostty-launched work.**
   The responsible Ghostty grant covers the ordinary launch tree, while a separately attributed Codex entry needs its own grant only for protected data.
 - **Automation - captain must approve each requested target when Codex sends Apple Events.**
-  Direct Codex is signed with `com.apple.security.automation.apple-events`, which permits it to ask, but the human still approves every controller-to-target relationship.
+  The helper reports Codex Automation capability as `UNKNOWN` because a command found on `PATH` does not establish the active TCC controller identity.
+  When possible, it separately reports the exact `codesign` result for that current command filesystem target without applying the result to another installation or running process.
   Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
   Apple documents that entitlement as permission to prompt rather than permission to bypass the prompt in [Apple Events Entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.automation.apple-events).
 - **Screen & System Audio Recording - captain must approve for native Codex Computer Use.**
@@ -89,18 +90,16 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 - **The interactive no-mistakes CLI needs no separate grant for its core coordination work.**
   It communicates with the daemon, and the daemon becomes the independent TCC responsibility root for its gate agents.
 - **Full Disk Access - captain must click when a daemon-launched gate agent needs protected data.**
-  Add the daemon executable only when the helper ties it to one running no-mistakes launch job and prints the resolved path.
-  When that running identity cannot be established authoritatively, the helper prints `UNKNOWN` instead of deriving the daemon from the interactive `PATH`.
+  The helper can identify one running launch job and its configured program target, but it cannot prove that a replaced file or retargeted symlink still matches the process image already loaded by that job.
+  Use the exact responsible entry shown by macOS or TCC attribution, and treat the configured path printed by the helper as diagnostic evidence only.
   A Ghostty Full Disk Access grant cannot cover the launchd-managed daemon.
 - **Automation - captain approval is necessary but not sufficient for daemon-launched Apple Events.**
   Automation is still a pair such as no-mistakes controlling System Events or another named application.
-  The no-mistakes v1.40.0 binary inspected on 2026-07-22 lacks `com.apple.security.automation.apple-events`, and macOS 26.5.2 logs reject its observed daemon-to-target Apple Event before an approval prompt.
-  Apple documents that same-team targets do not require this entitlement, so its absence alone does not prove that every daemon-launched Apple Event is blocked.
-  For cross-team targets, System Settings cannot repair the missing entitlement, so the signer must add it or the gate must avoid that Apple Event.
-  After an entitled build is installed, the captain must trigger the operation and click Allow for each target, or use System Settings to change a relationship that was already recorded.
+  The helper reports the running daemon capability as `UNKNOWN` because inspecting the configured path cannot establish the entitlement of an already loaded process image.
+  Apple documents the entitlement as target-signing-dependent, so a separate current-image inspection is required before making any capability claim.
 - **Screen & System Audio Recording - captain must approve for daemon-launched Codex Computer Use.**
   Live TCC attribution on 2026-07-21 identified `~/.no-mistakes/bin/no-mistakes` as the responsible path for ScreenCaptureKit access by a gate agent.
-  Approve a first-use dialog if macOS presents one, or add and enable the launch-job-resolved daemon binary in System Settings rather than assuming a Ghostty, Codex, or interactive no-mistakes path covers it.
+  Approve a first-use dialog if macOS presents one, or add and enable the exact current entry shown by macOS rather than assuming a Ghostty, Codex, configured launch-job, or interactive no-mistakes path covers it.
 - **Accessibility - captain must click for daemon-launched Codex Computer Use.**
   Add and enable the same responsible daemon binary so its Computer Use child can inspect UI and deliver input.
 
@@ -112,7 +111,7 @@ Run the read-only report first.
 bin/fm-macos-permissions.sh
 ```
 
-The report uses `ACCESSIBLE`, `DENIED`, `UNKNOWN`, `PER TARGET`, and `ENTITLEMENT NOT PRESENT` literally.
+The report uses `ACCESSIBLE`, `DENIED`, `UNKNOWN`, and `PER TARGET` literally.
 
 Its Full Disk Access probe attempts to enumerate known protected directories without reading file contents.
 
@@ -131,6 +130,8 @@ The helper does not perform screen capture or Accessibility actions merely to pr
 Automation has no global status because every grant is one controller-to-target relationship, so the helper reports `PER TARGET` and directs the operator to the pane.
 
 When a TCC database is readable, the helper prints matching stored Automation controller and target pairs as `UNKNOWN` evidence, including one explicit conflict status when duplicate decisions disagree.
+
+Command lookup output says `UNKNOWN: not found on PATH` when no command is found because that observation cannot establish whether software is installed elsewhere.
 
 Open exactly one pane at a time.
 

@@ -299,6 +299,18 @@ codex_binary=$(resolved_command codex)
 no_mistakes_command=$(command -v no-mistakes 2>/dev/null || true)
 resolve_no_mistakes_daemon
 computer_use_app="$HOME/.codex/computer-use/Codex Computer Use.app"
+codex_automation_entitlement=$(has_apple_events_entitlement "$codex_binary")
+case "$codex_automation_entitlement" in
+  PRESENT)
+    codex_automation_note='codesign reports the Apple Events entitlement as true for the current PATH command filesystem target; the active controller identity remains unknown.'
+    ;;
+  MISSING)
+    codex_automation_note='codesign reports no true Apple Events entitlement on the current PATH command filesystem target; the active controller identity and target signing relationship remain unknown.'
+    ;;
+  *)
+    codex_automation_note='The current Codex PATH command entitlement could not be inspected, so the active controller capability is unknown.'
+    ;;
+esac
 
 current_fda=$(full_disk_probe)
 ghostty_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
@@ -327,12 +339,10 @@ if [ -n "$no_mistakes_binary" ]; then
     com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
   no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
     com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
-  no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_binary")
 else
   no_mistakes_fda=UNKNOWN
   no_mistakes_screen=UNKNOWN
   no_mistakes_accessibility=UNKNOWN
-  no_mistakes_automation_entitlement=UNKNOWN
 fi
 
 printf '%s\n' 'firstmate macOS permission report'
@@ -361,7 +371,7 @@ print_permission 'Accessibility' 'CONDITIONAL' "$ghostty_accessibility" \
   'Needed for native UI inspection or input in this launch context, not for tmux or browser-protocol control.'
 printf '\n'
 
-printf 'Claude Code (%s)\n' "${claude_binary:-not installed}"
+printf 'Claude Code PATH command target (%s)\n' "${claude_binary:-UNKNOWN: not found on PATH}"
 print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$claude_fda" \
   'Normal Ghostty-launched work uses the responsible launcher grant; a separately attributed Claude entry needs its own grant.'
 print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
@@ -372,23 +382,23 @@ print_permission 'Accessibility' 'CONDITIONAL' "$claude_accessibility" \
   'Needed only if a Claude-launched native UI tool inspects or controls other applications.'
 printf '\n'
 
-printf 'Codex (%s)\n' "${codex_binary:-not installed}"
+printf 'Codex PATH command target (%s)\n' "${codex_binary:-UNKNOWN: not found on PATH}"
 print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$codex_fda" \
   'Normal Ghostty-launched work uses the responsible launcher grant; protected paths need the entry macOS attributes.'
-print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
-  'Needed only for Apple Events to a named app; direct Codex is entitled to request, but the human still approves each target.'
+print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' "$codex_automation_note"
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$codex_screen" \
   'Native Computer Use needs screen pixels; chrome-devtools-axi page screenshots do not.'
 print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$codex_accessibility" \
   'Native Computer Use needs the macOS accessibility tree and input control.'
 printf '\n'
 
-printf 'no-mistakes CLI (%s)\n' "${no_mistakes_command:-not installed}"
+printf 'no-mistakes CLI PATH entry (%s)\n' "${no_mistakes_command:-UNKNOWN: not found on PATH}"
 print_permission 'All four permissions' 'NOT NEEDED BY CLI CORE' 'N/A' \
   'The CLI coordinates with the daemon; grant the TCC-responsible launcher or daemon for child-agent capabilities.'
 printf '\n'
 
-printf 'no-mistakes daemon (%s)\n' "${no_mistakes_binary:-UNKNOWN: active launch job not resolved}"
+printf 'no-mistakes daemon configured target (%s)\n' \
+  "${no_mistakes_binary:-UNKNOWN: active launch job not resolved}"
 if [ -n "$no_mistakes_daemon_label" ]; then
   printf '  authoritative launch job: %s\n' "$no_mistakes_daemon_label"
 else
@@ -396,20 +406,8 @@ else
 fi
 print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
   'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
-case "$no_mistakes_automation_entitlement" in
-  MISSING)
-    print_permission 'Automation' 'CONDITIONAL' 'ENTITLEMENT NOT PRESENT' \
-      'Cross-team Apple Events may be unavailable; same-team targets do not require this entitlement.'
-    ;;
-  PRESENT)
-    print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
-      'Needed only when a daemon-launched agent sends Apple Events to a named app; the human approves each target.'
-    ;;
-  *)
-    print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' \
-      'The daemon entitlement could not be inspected, so its ability to request target-specific approval is unknown.'
-    ;;
-esac
+print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' \
+  'The configured path cannot prove the running process image entitlement, so target-specific capability remains unknown.'
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_screen" \
   'A daemon-launched Codex Computer Use session is attributed to this daemon and needs screen capture approval.'
 print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_accessibility" \

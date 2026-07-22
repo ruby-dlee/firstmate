@@ -117,11 +117,13 @@ Natural language is acceptable if uncertain.
 | Exit command | `/exit` |
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
-| Mid-run permission shape | `Do you want to proceed?` together with the `Esc to cancel · Tab to amend` footer; treat this as a security-sensitive grant, not the startup trust dialog. |
+| Protected mid-run grant shapes | `Do you want to proceed?` together with the `Esc to cancel · Tab to amend` footer, or `Quick safety check: Is this a project you created or one you trust?` together with `Yes, I trust this folder`, `No, exit`, and the confirmation footer. |
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
-If such a dialog is showing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.
+If a workspace trust or bypass-permissions dialog is showing before the brief starts processing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.
+The separate `Hooks need review` prompt with `Trust all on first launch` is Firstmate's own supervision-hook trust path and must also be accepted with Enter before the brief starts.
+Once the brief has started processing, treat either protected shape in the table as a security-sensitive mid-run grant and escalate it to the captain without pressing an approval or denial key.
 
 Claude renders a predicted-next-prompt suggestion as dim/faint text inside an otherwise-empty composer after a turn completes.
 A plain `tmux capture-pane` cannot tell that ghost text apart from typed text.
@@ -148,7 +150,7 @@ Claude Code's primary watcher protocol is the lowest-friction path: run `bin/fm-
 | Exit command | `/quit` (slash popup needs about 1 second between text and Enter; `fm-send` handles it) |
 | Interrupt | single Escape |
 | Skill invocation | `$<skill>` (e.g. `$no-mistakes`); `/<skill>` is claude-only and codex rejects it as "Unrecognized command" |
-| Mid-run permission shape | One of `Would you like to run the following command?`, `Would you like to grant these permissions?`, or `Would you like to make the following edits?`, together with `Press enter to confirm or esc to cancel`; treat this as a security-sensitive grant, not directory trust. |
+| Protected mid-run grant shapes | One of `Would you like to run the following command?`, `Would you like to grant these permissions?`, `Would you like to make the following edits?`, or `Do you want to approve network access to "<host>"?`, together with its title-specific choices and `Press enter to confirm or esc to cancel`; or `Do you trust the contents of this directory?` together with `Yes, continue` and `No, quit`. |
 
 A `$<skill>` invocation opens a `$`-autocomplete (skill) popup, the same hazard as the `/` slash popup: submitting too fast lets the popup swallow the Enter, so the invocation never lands.
 `fm-send` handles it the same way it handles `/` - it gives the popup a longer settle (1.2s) between typing and the first Enter, with the target backend's submit retry as the safety net - but the `$` settle is scoped to `harness=codex`, read from the target metadata for exact task ids or legacy `fm-<id>` labels.
@@ -157,8 +159,9 @@ An explicit `session:window` target has no meta, so its harness is unknown and t
 This is why the validation trigger (`$no-mistakes`) to a codex crew now lands on the first Enter instead of biting the popup.
 
 Directory trust dialog on first run per repo root: "Do you trust the contents of this directory?"
-Accept with Enter.
+Accept with Enter only during the spawn-time peek before the brief starts processing.
 The decision persists for the repo, so later worktrees of the same project skip it.
+If that shape appears after work has started, escalate it to the captain as a mid-run directory-trust grant without pressing an approval or denial key.
 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.

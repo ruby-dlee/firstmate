@@ -423,10 +423,10 @@ surface_nonterminal_stale() {  # <window> <hash>
 }
 
 # Recognize the stable confirmation chrome rendered by verified harnesses when a
-# mid-run command/tool permission is waiting on a human. The question alone is
+# mid-run permission or trust grant is waiting on a human. The question alone is
 # insufficient because pane output can quote it; each shape also requires its
-# numbered choices and confirmation footer in the final 16 lines, and the caller
-# requires the harness not to show its busy indicator.
+# title-specific choices and any verified footer in the final 16 lines, and the
+# caller requires the harness not to show its busy indicator.
 # Exact live-capture evidence and version details live in
 # docs/permission-stall-detection.md.
 # Pi has no permission system, while firstmate launches OpenCode and Grok in
@@ -444,15 +444,49 @@ permission_prompt_kind() {  # <harness> <tail40>
         printf 'command/tool permission'
         return 0
       fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Quick safety check: Is this a project you created or one you trust?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, I trust this folder' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, exit' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq 'Enter to confirm.*Esc to cancel'; then
+        printf 'directory trust'
+        return 0
+      fi
       ;;
   esac
   case "$harness" in
     codex|unknown)
-      if printf '%s\n' "$tail40" | grep -Eq 'Would you like to (run the following command|grant these permissions|make the following edits)\?' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq '1\. Yes' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq '3\. No' \
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to run the following command?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently)" \
         && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
         printf 'command/tool permission'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to grant these permissions?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, grant these permissions for this turn' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, continue without permissions' \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'permission profile'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to make the following edits?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, and tell Codex what to do differently' \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'file edit permission'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Eq 'Do you want to approve network access to ".+"\?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, just this once' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently|and block this host in the future)" \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'network access'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Do you trust the contents of this directory?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, continue' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, quit'; then
+        printf 'directory trust'
         return 0
       fi
       ;;

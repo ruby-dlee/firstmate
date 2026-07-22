@@ -371,19 +371,35 @@ test_actionable_signal_surfaced() {
   pass "captain-relevant signal is surfaced (queue + exit) and marked surfaced"
 }
 
-# A mid-run permission prompt is actionable on its first capture, before the
-# generic two-identical-hashes stale path. These fixtures are the exact stable
-# question/footer pairs captured from Claude Code 2.1.216 and Codex CLI
-# 0.145.0-alpha.27; the requested command text itself is deliberately arbitrary.
+# A mid-run permission or trust prompt is actionable on its first capture, before
+# the generic two-identical-hashes stale path. The command fixtures preserve the
+# captured Claude Code 2.1.216 and Codex CLI 0.145.0-alpha.27 shapes, while the
+# sibling fixtures cover the other verified title-specific overlays.
+assert_permission_prompt_surfaced() {  # <harness> <fixture> <kind>
+  local harness=$1 fixture=$2 expected_kind=$3 dir state fakebin out drain_out capture_file window pid
+  dir=$(make_case "permission-prompt-$fixture"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-permission-$fixture"
+  cat > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=%s\n' "$window" "$harness" > "$state/permission-$fixture.meta"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "$fixture permission prompt did not wake the watcher immediately"
+  grep -F "stale: $window (permission-prompt detected: waiting for a $expected_kind grant;" "$out" >/dev/null \
+    || fail "$fixture permission prompt wake was not classified explicitly: $(cat "$out")"
+  grep -F 'do not approve it automatically' "$out" >/dev/null \
+    || fail "$fixture permission prompt wake omitted the security-sensitive escalation instruction"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
+    || fail "drain after $fixture permission prompt wake failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F 'permission-prompt detected' >/dev/null \
+    || fail "$fixture permission prompt wake was not queued durably"
+}
+
 test_harness_permission_prompts_surface_immediately() {
-  local harness dir state fakebin out drain_out capture_file window pid
-  for harness in claude codex; do
-    dir=$(make_case "permission-prompt-$harness"); state="$dir/state"; fakebin="$dir/fakebin"
-    out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
-    window="test:fm-permission-$harness"
-    case "$harness" in
-      claude)
-        cat > "$capture_file" <<'EOF'
+  local dir state fakebin out capture_file window pid
+  assert_permission_prompt_surfaced claude claude-command 'command/tool permission' <<'EOF'
 Bash command
 
   touch .permission-probe-claude
@@ -395,9 +411,7 @@ Do you want to proceed?
 
 Esc to cancel · Tab to amend · ctrl+e to explain
 EOF
-        ;;
-      codex)
-        cat > "$capture_file" <<'EOF'
+  assert_permission_prompt_surfaced codex codex-command 'command/tool permission' <<'EOF'
 Would you like to run the following command?
 
 Environment: local
@@ -410,23 +424,69 @@ $ touch .permission-probe-codex
 
 Press enter to confirm or esc to cancel
 EOF
-        ;;
-    esac
-    printf 'window=%s\nkind=ship\nharness=%s\n' "$window" "$harness" > "$state/permission-$harness.meta"
-    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
-      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
-    pid=$!
-    wait_for_exit "$pid" 40 || fail "$harness permission prompt did not wake the watcher immediately"
-    grep -F "stale: $window (permission-prompt detected:" "$out" >/dev/null \
-      || fail "$harness permission prompt wake was not classified explicitly: $(cat "$out")"
-    grep -F 'do not approve it automatically' "$out" >/dev/null \
-      || fail "$harness permission prompt wake omitted the security-sensitive escalation instruction"
-    FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
-      || fail "drain after $harness permission prompt wake failed"
-    grep "$(printf '\tstale\t')" "$drain_out" | grep -F 'permission-prompt detected' >/dev/null \
-      || fail "$harness permission prompt wake was not queued durably"
-  done
+  assert_permission_prompt_surfaced codex codex-permissions 'permission profile' <<'EOF'
+Would you like to grant these permissions?
+
+Permission rule: network; write `/private/tmp/export`
+
+› 1. Yes, grant these permissions for this turn (y)
+  2. Yes, grant for this turn with strict auto review (r)
+  3. Yes, grant these permissions for this session (p)
+  4. No, continue without permissions (n)
+
+Press enter to confirm or esc to cancel
+EOF
+  assert_permission_prompt_surfaced codex codex-network 'network access' <<'EOF'
+Do you want to approve network access to "api.example.test"?
+
+› 1. Yes, just this once (y)
+  2. Yes, and allow this host for this conversation (p)
+  3. No, continue without running it (n)
+
+Press enter to confirm or esc to cancel
+EOF
+  assert_permission_prompt_surfaced claude claude-trust 'directory trust' <<'EOF'
+Accessing workspace:
+
+/worktree/example
+
+Quick safety check: Is this a project you created or one you trust?
+
+Claude Code'll be able to read, edit, and execute files here.
+
+❯ 1. Yes, I trust this folder
+  2. No, exit
+
+Enter to confirm · Esc to cancel
+EOF
+  assert_permission_prompt_surfaced codex codex-trust 'directory trust' <<'EOF'
+You are in /worktree/example
+
+Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.
+
+› 1. Yes, continue
+  2. No, quit
+EOF
+
+  dir=$(make_case permission-prompt-hook-trust); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-permission-hook-trust"
+  cat > "$capture_file" <<'EOF'
+Hooks need review
+
+❯ 1. Trust all on first launch
+  2. Review hooks
+  3. Exit
+
+Enter to confirm · Esc to cancel
+EOF
+  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/permission-hook-trust.meta"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "hook-trust fixture did not reach ordinary stale handling"; }
+  grep -F 'permission-prompt detected' "$out" >/dev/null \
+    && fail "Firstmate's launch-time hook-trust prompt was misclassified as a protected mid-run grant"
 
   # A working agent can quote this documentation or a prior prompt in its
   # transcript. The active busy footer must outrank the quoted dialog so the

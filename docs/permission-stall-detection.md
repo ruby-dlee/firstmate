@@ -43,7 +43,11 @@ Press enter to confirm or esc to cancel
 ```
 
 The installed Codex binary also carries the sibling question strings `Would you like to grant these permissions?` and `Would you like to make the following edits?` with the same confirmation footer.
-`bin/fm-watch.sh` matches those verified shapes on the first capture and emits an explicit `permission-prompt detected` stale wake.
+Its permissions overlay has three affirmative choices followed by `No, continue without permissions`, while its network overlay asks `Do you want to approve network access to "<host>"?`.
+The matcher therefore identifies each Codex overlay from its title-specific option text and footer without depending on any option number.
+The protected trust shapes are Claude's `Quick safety check: Is this a project you created or one you trust?` dialog and Codex's `Do you trust the contents of this directory?` dialog when either reaches the stale post-spawn watcher after work has started.
+The separate Claude `Hooks need review` prompt with `Trust all on first launch` remains Firstmate's legitimate supervision-hook trust path and is handled during the spawn-time peek before the brief starts.
+`bin/fm-watch.sh` matches the protected permission and trust shapes on the first capture and emits an explicit `permission-prompt detected` stale wake.
 An unchanged prompt re-surfaces on the same bounded cadence as the system-dialog heuristic until it is cleared.
 `stuck-crewmate-recovery` owns the response: inspect what is being requested, do not auto-approve it, and ask the captain to approve or deny it.
 

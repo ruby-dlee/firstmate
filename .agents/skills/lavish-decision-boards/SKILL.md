@@ -2,7 +2,7 @@
 name: lavish-decision-boards
 description: >-
   Agent-only workflow for building actionable, captain-facing Lavish decision boards and approval or triage surfaces.
-  Use before creating or revising any Lavish board that asks the captain to choose options, approve a plan, triage findings, set scope, or provide structured feedback.
+  Use before presenting any captain-facing decision ask or creating or revising a Lavish board that collects structured feedback.
 user-invocable: false
 metadata:
   internal: true
@@ -11,6 +11,7 @@ metadata:
 # lavish-decision-boards
 
 Build captain-facing Lavish decision boards as actionable, layout-safe surfaces.
+Every captain-facing decision ask uses this workflow, including a yes/no decision.
 A read-only status page is not a decision surface.
 
 ## Build

@@ -65,6 +65,16 @@ wait_numeric_file() {
   return 1
 }
 
+wait_file_value() {
+  local file=$1 expected=$2 limit=${3:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$(cat "$file" 2>/dev/null || true)" = "$expected" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 # Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
 # fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
 file_mtime() {
@@ -376,16 +386,44 @@ test_actionable_signal_surfaced() {
 # captured Claude Code 2.1.216 and Codex CLI 0.145.0-alpha.27 shapes, while the
 # sibling fixtures cover the other verified title-specific overlays.
 assert_permission_prompt_surfaced() {  # <harness> <fixture> <kind>
-  local harness=$1 fixture=$2 expected_kind=$3 dir state fakebin out drain_out capture_file window pid
+  local harness=$1 fixture=$2 expected_kind=$3 dir state fakebin out drain_out capture_file prompt_file window pid generation marker
   dir=$(make_case "permission-prompt-$fixture"); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"; prompt_file="$dir/prompt.txt"
   window="test:fm-permission-$fixture"
-  cat > "$capture_file"
-  printf 'window=%s\nkind=ship\nharness=%s\n' "$window" "$harness" > "$state/permission-$fixture.meta"
+  generation="test:$fixture"
+  cat > "$prompt_file"
+  if [ "$expected_kind" = 'directory trust' ]; then
+    cp "$prompt_file" "$capture_file"
+    printf 'window=%s\nkind=ship\nharness=%s\ngeneration_id=%s\n' "$window" "$harness" "$generation" > "$state/permission-$fixture.meta"
+    printf 'test:previous-generation' > "$state/.brief-started-permission-$fixture"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 40 || fail "$fixture spawn-time trust prompt did not reach ordinary stale handling"
+    grep -F 'permission-prompt detected' "$out" >/dev/null \
+      && fail "$fixture metadata or prior-generation evidence was treated as current mid-run evidence"
+
+    dir=$(make_case "permission-prompt-$fixture-started"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+    window="test:fm-permission-$fixture-started"
+    generation="test:$fixture-started"
+    marker="$state/.brief-started-permission-$fixture-started"
+    printf 'window=%s\nkind=ship\nharness=%s\ngeneration_id=%s\n' "$window" "$harness" "$generation" > "$state/permission-$fixture-started.meta"
+    printf '• Working (1s • esc to interrupt)\n' > "$capture_file"
+  else
+    cp "$prompt_file" "$capture_file"
+    printf 'window=%s\nkind=ship\nharness=%s\ngeneration_id=%s\n' "$window" "$harness" "$generation" > "$state/permission-$fixture.meta"
+  fi
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
+  if [ "$expected_kind" = 'directory trust' ]; then
+    wait_file_value "$marker" "$generation" 40 \
+      || { reap "$pid"; fail "$fixture did not record current-generation brief-processing evidence"; }
+    cp "$prompt_file" "$capture_file"
+  fi
   wait_for_exit "$pid" 40 || fail "$fixture permission prompt did not wake the watcher immediately"
   grep -F "stale: $window (permission-prompt detected: waiting for a $expected_kind grant;" "$out" >/dev/null \
     || fail "$fixture permission prompt wake was not classified explicitly: $(cat "$out")"
@@ -479,7 +517,7 @@ Hooks need review
 
 Enter to confirm · Esc to cancel
 EOF
-  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/permission-hook-trust.meta"
+  printf 'window=%s\nkind=ship\nharness=claude\ngeneration_id=test:hook-trust\n' "$window" > "$state/permission-hook-trust.meta"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
@@ -1457,6 +1495,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-tmux-reverse-map ]; then
   test_managed_tmux_window_id_reverse_mapping
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = permission-prompts ]; then
+  test_harness_permission_prompts_surface_immediately
   exit 0
 fi
 

@@ -432,8 +432,8 @@ surface_nonterminal_stale() {  # <window> <hash>
 # Pi has no permission system, while firstmate launches OpenCode and Grok in
 # their verified unattended modes; their unexpected
 # or future prompt shapes remain covered by the bounded no-progress fallback.
-permission_prompt_kind() {  # <harness> <tail40>
-  local harness=$1 tail40=$2 prompt_tail
+permission_prompt_kind() {  # <harness> <tail40> <allow-directory-trust>
+  local harness=$1 tail40=$2 allow_directory_trust=${3:-0} prompt_tail
   prompt_tail=$(printf '%s\n' "$tail40" | tail -16)
   case "$harness" in
     claude|unknown)
@@ -444,7 +444,8 @@ permission_prompt_kind() {  # <harness> <tail40>
         printf 'command/tool permission'
         return 0
       fi
-      if printf '%s\n' "$tail40" | grep -Fq 'Quick safety check: Is this a project you created or one you trust?' \
+      if [ "$allow_directory_trust" = 1 ] \
+        && printf '%s\n' "$tail40" | grep -Fq 'Quick safety check: Is this a project you created or one you trust?' \
         && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, I trust this folder' \
         && printf '%s\n' "$prompt_tail" | grep -Fq 'No, exit' \
         && printf '%s\n' "$prompt_tail" | grep -Eq 'Enter to confirm.*Esc to cancel'; then
@@ -483,7 +484,8 @@ permission_prompt_kind() {  # <harness> <tail40>
         printf 'network access'
         return 0
       fi
-      if printf '%s\n' "$tail40" | grep -Fq 'Do you trust the contents of this directory?' \
+      if [ "$allow_directory_trust" = 1 ] \
+        && printf '%s\n' "$tail40" | grep -Fq 'Do you trust the contents of this directory?' \
         && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, continue' \
         && printf '%s\n' "$prompt_tail" | grep -Fq 'No, quit'; then
         printf 'directory trust'
@@ -641,6 +643,34 @@ safe_touch_marker() {  # <path>
 safe_marker_path() {  # <path>
   local marker=$1
   [ ! -L "$marker" ] && { [ ! -e "$marker" ] || [ -f "$marker" ]; }
+}
+
+task_generation_id() {  # <task>
+  local task=$1 meta generation
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  generation=$(fm_meta_get "$meta" generation_id)
+  [ -n "$generation" ] || return 1
+  printf '%s' "$generation"
+}
+
+brief_processing_started() {  # <task>
+  local task=$1 generation marker
+  generation=$(task_generation_id "$task") || return 1
+  marker="$STATE/.brief-started-$task"
+  safe_marker_path "$marker" || return 1
+  [ "$(cat "$marker" 2>/dev/null || true)" = "$generation" ]
+}
+
+mark_brief_processing_started() {  # <task>
+  local task=$1 generation marker tmp
+  brief_processing_started "$task" && return 0
+  generation=$(task_generation_id "$task") || return 1
+  marker="$STATE/.brief-started-$task"
+  tmp=$(mktemp "$STATE/.brief-started-$task.XXXXXX") || return 1
+  printf '%s' "$generation" > "$tmp" || { rm -f "$tmp"; return 1; }
+  safe_marker_path "$marker" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$marker"
 }
 
 UNSAFE_MARKERS_LOGGED='|'
@@ -1002,9 +1032,12 @@ EOF
     window_busy=0
     if window_is_busy "$w" "$tail40"; then
       window_busy=1
+      mark_brief_processing_started "$task" || true
     fi
     if [ "$window_busy" != 1 ]; then
-      prompt_kind=$(permission_prompt_kind "$(window_harness "$w")" "$tail40" || true)
+      allow_directory_trust=0
+      brief_processing_started "$task" && allow_directory_trust=1
+      prompt_kind=$(permission_prompt_kind "$(window_harness "$w")" "$tail40" "$allow_directory_trust" || true)
       if [ -n "$prompt_kind" ]; then
         handle_permission_prompt "$w" "$task" "$h" "$prompt_kind"
         continue

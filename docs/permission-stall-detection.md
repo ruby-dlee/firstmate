@@ -47,7 +47,8 @@ Its permissions overlay has three affirmative choices followed by `No, continue 
 The matcher therefore identifies each Codex overlay from its title-specific option text and footer without depending on any option number.
 The protected trust shapes are Claude's `Quick safety check: Is this a project you created or one you trust?` dialog and Codex's `Do you trust the contents of this directory?` dialog when either reaches the stale post-spawn watcher after work has started.
 The separate Claude `Hooks need review` prompt with `Trust all on first launch` remains Firstmate's legitimate supervision-hook trust path and is handled during the spawn-time peek before the brief starts.
-`bin/fm-watch.sh` matches the protected permission and trust shapes on the first capture and emits an explicit `permission-prompt detected` stale wake.
+The watcher records brief-processing evidence only after observing a harness-busy state and binds that evidence to the task's current `generation_id`, so metadata existence or evidence retained across a respawn cannot convert an initial workspace-trust dialog into a mid-run grant.
+`bin/fm-watch.sh` matches protected permission shapes on the first capture and protected trust shapes on the first capture after that current-generation evidence, then emits an explicit `permission-prompt detected` stale wake.
 An unchanged prompt re-surfaces on the same bounded cadence as the system-dialog heuristic until it is cleared.
 `stuck-crewmate-recovery` owns the response: inspect what is being requested, do not auto-approve it, and ask the captain to approve or deny it.
 

@@ -55,6 +55,6 @@ A read-only status page is not a decision surface.
 - Never rely on poll output or conversation memory as the only copy because ephemeral poll output can be reaped.
 - Treat a `lavish-axi poll` return as transport or lifecycle output, not automatically as the captain's answer.
 - Act only after genuine connection and receipt of one unambiguous batch with `submission: "explicit-send-batch"`, a nonempty structured `answers` array, and a manifest containing `expectedQuestionKeys` and `expectedCount`.
-- Accept the batch only when the manifest keys are nonempty and unique, its count equals its key count, the answer keys are nonempty and unique, and the answer-key set exactly equals the manifest-key set.
-- Disconnects, UI flicker, re-polls, layout or audit returns, session events, and empty, partial, subset, missing-answer, unmarked, or ambiguous payloads are not submissions; ignore them and keep waiting.
+- Accept the batch only when the manifest keys are nonempty and unique, its count equals its key count, and every manifest key has exactly one structured answer entry with the same key and a nonempty `answer` value.
+- Reject absent, empty, extra, or duplicate answer keys, every manifest mismatch, and every disconnect, UI flicker, re-poll, layout or audit return, session event, unmarked return, or ambiguous return; ignore them and keep waiting.
 - If a return is ambiguous or lacks a clear explicit-decision payload, treat it as not submitted and do not act until the captain's actual answer is verified in the payload.

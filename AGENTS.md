@@ -87,6 +87,7 @@ config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitig
 config/wedge-alarm  optional active-alert directives for wedged terminal-backed away-mode compatibility delivery; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
+  autocompact-resume.md  Claude-only local compaction resume anchor; see docs/autocompact-recovery.md
   backlog.md         task queue, dependencies, history
   captain.md         captain's personal preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store
@@ -128,6 +129,7 @@ For the tmux backend, the task window is always named `fm-<id>`; per-backend win
 
 Session start is one command, not a sequence of separate reads.
 Run `bin/fm-session-start.sh`.
+On a Claude compact-sourced recovery, the injected `FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT` already contains this session's one session-start digest; do not run the command again, and follow `docs/autocompact-recovery.md` for the hook boundary.
 It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - calling each as a real subprocess, never reimplementing their logic - then prints a full context digest and fleet-state digest, in one ordered, clearly delimited report:
 
 1. **Lock** - acquires the per-home session lock first, before anything mutates shared state.
@@ -343,6 +345,7 @@ Load `memory-hygiene` before writing or leaning `data/captain.md` or `data/learn
 
 When the captain invokes `/stow`, load the `stow` skill.
 It sweeps the current session for uncaptured durable knowledge, routes findings with this table, files undone next steps to the backlog, and reports whether the session is safe to reset.
+During a long Claude primary run, periodically load `stow` before compaction pressure becomes acute because the tracked `PreCompact` bridge captures deterministic file state only; `docs/autocompact-recovery.md` owns that boundary and recovery contract.
 
 **Delivery mode (choose at add).** `<mode>` is how a finished change reaches `main`, picked per project when you add it and recorded in the registry line (`fm-project-mode.sh` parses it; `fm-spawn` records it into each task's meta):
 

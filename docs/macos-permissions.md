@@ -34,52 +34,58 @@ macOS may attribute `claude`, `codex`, or descendant requests to Ghostty, but co
 
 The no-mistakes daemon is launched independently by launchd, so a Ghostty grant does not by itself establish access for gate agents spawned by that daemon.
 
-When macOS lists a different responsible entry than this guide predicts, grant only that observed entry and preserve the controller-to-target relationship shown for Automation.
+For every service, grant only the responsible entry macOS observes and preserve the controller-to-target relationship shown for Automation.
 
 Apple recommends the TCC attribution log for finding that responsible app or binary on managed machines, and the same read-only log is useful during local diagnosis.
 
 ## Ghostty
 
 - **Full Disk Access - captain must click when protected data is in scope.**
-  Add `/Applications/Ghostty.app` when firstmate or a terminal-launched agent must read Mail, Messages, Safari, Home, Time Machine backups, or protected administrative data.
+  Terminal-launched work needs this capability only when it must read Mail, Messages, Safari, Home, Time Machine backups, or protected administrative data.
+  Grant only the exact responsible entry macOS observes for that protected-path service.
+  Add `/Applications/Ghostty.app` only when macOS attributes that protected-path service to Ghostty.
   Firstmate state and repositories stored under ordinary unprotected home-directory paths do not require this grant.
-- **Automation - captain must approve each requested target when Apple Events are in scope.**
-  Click Allow in the first target-specific dialog for Ghostty controlling System Events or the other named application.
+- **Automation - captain must approve each requested target when terminal-driven app automation is in scope.**
+  Trigger the required operation and use the first-use Allow dialog to identify the exact controller-to-target pair macOS observes.
+  Approve Ghostty controlling a target only when macOS shows Ghostty as the controller for that exact pair.
   If that request was denied or later disabled, review or enable the relationship under Automation in System Settings.
   Do not grant Automation for tmux control because tmux never uses Apple Events.
 - **Screen & System Audio Recording - captain must approve when native desktop capture is in scope.**
-  This unlocks `screencapture`, ScreenCaptureKit, or native Computer Use when TCC attributes the request to Ghostty.
-  Click Allow or Allow While Using the App if macOS presents the first-use dialog, or add or enable Ghostty in System Settings if access was denied, disabled, or must be added manually.
+  This unlocks `screencapture`, ScreenCaptureKit, or native Computer Use for the exact responsible entry macOS observes.
+  Approve Ghostty only when macOS attributes that Screen Recording request to Ghostty.
+  Click Allow or Allow While Using the App if macOS presents the first-use dialog, or add or enable the observed entry in System Settings if access was denied, disabled, or must be added manually.
   It is not needed for `chrome-devtools-axi` page screenshots.
 - **Accessibility - captain must click when native application control is in scope.**
-  This unlocks accessibility-tree inspection, focus changes, clicks, typing, and other UI control when TCC attributes the request to Ghostty.
+  This unlocks accessibility-tree inspection, focus changes, clicks, typing, and other UI control for the exact responsible entry macOS observes.
+  Approve Ghostty only when macOS attributes that Accessibility request to Ghostty.
   It is not needed for tmux or Chrome DevTools Protocol control.
 
 ## Claude Code
 
 - **Full Disk Access - captain must click only when macOS attributes protected access to a separate entry.**
   Grant only the exact responsible entry macOS observes when protected data is in scope because command ancestry alone cannot identify it.
-- **Automation - captain must approve each requested target when Claude sends Apple Events.**
-  The relationship is Claude Code controlling System Events or another named application, and it appears only after that target-specific request.
+- **Automation - captain must approve each requested target when this workflow performs app automation.**
+  Trigger the required operation and use the first-use Allow dialog to identify the exact controller-to-target pair macOS observes.
+  Approve Claude Code controlling a target only when macOS shows Claude Code as the controller for that exact pair.
   Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
   Claude Code does not need Automation for tmux.
 - **Screen & System Audio Recording - no baseline grant is needed.**
-  Grant the responsible entry only if a Claude-launched native visual tool captures the desktop rather than a browser page through DevTools.
+  Grant the exact responsible entry macOS observes only if a native visual tool invoked by this workflow captures the desktop rather than a browser page through DevTools.
   Approve a first-use dialog if macOS presents one, or use System Settings after denial or when adding the entry manually.
 - **Accessibility - no baseline grant is needed.**
-  Grant the responsible entry only if a Claude-launched native UI tool inspects or controls another application.
+  Grant the exact responsible entry macOS observes only if a native UI tool invoked by this workflow inspects or controls another application.
 
 ## Codex
 
 - **Full Disk Access - captain must click only when macOS attributes protected access to a separate entry.**
   Grant only the exact responsible entry macOS observes when protected data is in scope because the current Codex command path cannot identify it.
-- **Automation - captain must approve each requested target when Codex sends Apple Events.**
+- **Automation - captain must approve each requested target when this workflow performs app automation.**
   The helper reports Codex Automation capability as `UNKNOWN` because a command found on `PATH` does not establish the active TCC controller identity.
   When possible, it separately reports the exact `codesign` result for that current command filesystem target without applying the result to another installation or running process.
-  Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
+  Trigger the required operation and approve only the controller-to-target pair shown by the first-use Allow dialog, or use Automation in System Settings to review or change a recorded relationship.
   Apple documents that entitlement as permission to prompt rather than permission to bypass the prompt in [Apple Events Entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.automation.apple-events).
 - **Screen & System Audio Recording - captain must approve for native Codex Computer Use.**
-  This unlocks desktop pixels for Computer Use when the responsible entry is Codex, Ghostty, or the Codex Computer Use helper shown by macOS.
+  This unlocks desktop pixels for Computer Use only for the exact responsible entry macOS observes for that Screen Recording request.
   Click Allow or Allow While Using the App if macOS presents the first-use dialog, or add or enable the responsible entry in System Settings if access was denied, disabled, or must be added manually.
   It is not needed for `chrome-devtools-axi` page screenshots.
 - **Accessibility - captain must click for native Codex Computer Use.**
@@ -94,7 +100,7 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
   Use the exact responsible entry shown by macOS or TCC attribution, and treat the configured path printed by the helper as diagnostic evidence only.
   A Ghostty Full Disk Access grant does not by itself establish protected-path access for the independently launched daemon tree.
 - **Automation - captain approval is necessary but not sufficient for daemon-launched Apple Events.**
-  Automation is still a pair such as no-mistakes controlling System Events or another named application.
+  Trigger the required operation and use the first-use Allow dialog to identify the exact controller-to-target pair macOS observes.
   The helper reports the running daemon capability as `UNKNOWN` because inspecting the configured path cannot establish the entitlement of an already loaded process image.
   Apple documents the entitlement as target-signing-dependent, so a separate current-image inspection is required before making any capability claim.
 - **Screen & System Audio Recording - captain must approve for daemon-launched Codex Computer Use.**

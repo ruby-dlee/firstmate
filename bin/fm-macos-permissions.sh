@@ -353,24 +353,24 @@ printf '\n'
 
 printf '%s\n' 'Ghostty (terminal launcher)'
 print_permission 'Full Disk Access' 'CONDITIONAL' "$ghostty_fda" \
-  'Needed only for protected Mail, Messages, Safari, Home, backup, or administrative data.'
+  'Protected-path work needs the exact responsible entry macOS observes; add Ghostty only when macOS names it.'
 print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
-  'Needed only for Apple Events from Ghostty to System Events or another named app; tmux does not use it.'
+  'The first-use Allow dialog establishes the exact controller-to-target pair for terminal-driven app automation; tmux does not use Apple Events.'
 print_permission 'Screen Recording' 'CONDITIONAL' "$ghostty_screen" \
-  'Needed for native desktop capture in this launch context, not for Chrome DevTools Protocol screenshots.'
+  'Native desktop capture needs the exact responsible entry macOS observes; add Ghostty only when macOS names it.'
 print_permission 'Accessibility' 'CONDITIONAL' "$ghostty_accessibility" \
-  'Needed for native UI inspection or input in this launch context, not for tmux or browser-protocol control.'
+  'Native UI control needs the exact responsible entry macOS observes; add Ghostty only when macOS names it.'
 printf '\n'
 
 printf 'Claude Code PATH command target (%s)\n' "${claude_binary:-UNKNOWN: not found on PATH}"
 print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$claude_fda" \
   'Use the exact responsible entry macOS observes for protected-path access; command ancestry alone does not establish it.'
 print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
-  'Needed only when Claude sends Apple Events to a named app; it is not needed for tmux.'
+  'The first-use Allow dialog establishes the exact controller-to-target pair for app automation; approve Claude only when macOS names it as controller.'
 print_permission 'Screen Recording' 'CONDITIONAL' "$claude_screen" \
-  'Needed only if a Claude-launched native visual tool captures the desktop.'
+  'Native desktop capture needs the exact responsible entry macOS observes; command ancestry does not establish it.'
 print_permission 'Accessibility' 'CONDITIONAL' "$claude_accessibility" \
-  'Needed only if a Claude-launched native UI tool inspects or controls other applications.'
+  'Native UI control needs the exact responsible entry macOS observes; command ancestry does not establish it.'
 printf '\n'
 
 printf 'Codex PATH command target (%s)\n' "${codex_binary:-UNKNOWN: not found on PATH}"
@@ -378,9 +378,9 @@ print_permission 'Full Disk Access' 'LAUNCHER OR CONDITIONAL' "$codex_fda" \
   'Use the exact responsible entry macOS observes for protected-path access; the current PATH command does not establish it.'
 print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' "$codex_automation_note"
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$codex_screen" \
-  'Native Computer Use needs screen pixels; chrome-devtools-axi page screenshots do not.'
+  'Native Computer Use needs screen pixels for the exact responsible entry macOS observes; DevTools screenshots do not.'
 print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$codex_accessibility" \
-  'Native Computer Use needs the macOS accessibility tree and input control.'
+  'Native Computer Use needs Accessibility for the exact responsible entry macOS observes.'
 printf '\n'
 
 printf 'no-mistakes CLI PATH entry (%s)\n' "${no_mistakes_command:-UNKNOWN: not found on PATH}"
@@ -405,7 +405,7 @@ print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_acces
   'Daemon-launched Computer Use needs UI control, but the responsible identity is unknown; use the exact Accessibility entry macOS observes.'
 printf '\n'
 
-printf '%s\n' 'Stored Automation relationships'
+printf '%s\n' 'Stored Automation candidate relationships (not proof of responsibility)'
 print_automation_pairs 'Ghostty' com.mitchellh.ghostty "$ghostty_binary"
 print_automation_pairs 'Claude Code' com.anthropic.claude-code "$claude_command" "$claude_binary"
 print_automation_pairs 'Codex' codex "$codex_command" "$codex_binary" \

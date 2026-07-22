@@ -145,6 +145,35 @@ test_missing_probe_is_honest() {
   pass 'missing and undetectable grants are reported honestly'
 }
 
+test_permission_guidance_requires_observed_attribution() {
+  local world out docs
+  world=$(make_world attribution-guidance)
+  out=$(run_report "$world")
+  docs=$(<"$ROOT/docs/macos-permissions.md")
+
+  assert_contains "$out" \
+    'Protected-path work needs the exact responsible entry macOS observes; add Ghostty only when macOS names it.' \
+    'Ghostty Full Disk Access guidance assumed responsibility'
+  assert_contains "$out" \
+    'The first-use Allow dialog establishes the exact controller-to-target pair for terminal-driven app automation' \
+    'terminal Automation guidance assumed a controller-to-target pair'
+  assert_contains "$out" \
+    'approve Claude only when macOS names it as controller' \
+    'Claude Automation guidance assumed the controller identity'
+  assert_contains "$docs" \
+    'only when macOS attributes that protected-path service to Ghostty.' \
+    'documentation assumed Ghostty Full Disk Access responsibility'
+  assert_contains "$docs" \
+    'use the first-use Allow dialog to identify the exact controller-to-target pair macOS observes.' \
+    'documentation did not require observed Automation attribution'
+  case "$out$docs" in
+    *'Apple Events from Ghostty to System Events'*|*'The relationship is Claude Code controlling'*)
+      fail 'fixed controller or target attribution remained in guidance'
+      ;;
+  esac
+  pass 'permission guidance requires macOS-observed attribution'
+}
+
 test_readable_database_reports_stored_rows() {
   local world out ghostty_section daemon_section
   world=$(make_world readable)
@@ -406,6 +435,7 @@ test_non_macos_refuses() {
 }
 
 test_missing_probe_is_honest
+test_permission_guidance_requires_observed_attribution
 test_readable_database_reports_stored_rows
 test_mixed_identity_evidence_is_unknown
 test_partial_database_evidence_is_unknown

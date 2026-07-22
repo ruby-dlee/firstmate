@@ -29,23 +29,43 @@ exit 1
 SH
   cat > "$fakebin/sqlite3" <<'SH'
 #!/usr/bin/env bash
+[ "${1:-}" = -readonly ] || {
+  printf '%s\n' 'sqlite3 must be invoked with -readonly' >&2
+  exit 98
+}
 if [ "${FM_FAKE_TCC_READABLE:-no}" != yes ]; then
   printf '%s\n' 'Error: authorization denied' >&2
   exit 1
 fi
+if [ "${FM_FAKE_TCC_PARTIAL:-no}" = yes ] && [[ "$*" = *'/Library/Application Support/com.apple.TCC/TCC.db'* ]] \
+  && [[ "$*" != *"$HOME/Library/Application Support/com.apple.TCC/TCC.db"* ]]; then
+  printf '%s\n' 'Error: system TCC database unreadable' >&2
+  exit 1
+fi
 case "$*" in
   *kTCCServiceAppleEvents*com.mitchellh.ghostty*) printf 'com.mitchellh.ghostty|com.apple.systemevents|2\n' ;;
-  *kTCCServiceScreenCapture*com.kunchenguid.no-mistakes*) printf '2\n' ;;
-  *kTCCServiceAccessibility*com.kunchenguid.no-mistakes*) printf '0\n' ;;
+  *kTCCServiceScreenCapture*)
+    if [ "${FM_FAKE_MIXED_IDENTITIES:-no}" = yes ] && [[ "$*" != *com.kunchenguid.no-mistakes* ]]; then
+      printf '0\n'
+    else
+      printf '2\n'
+    fi
+    ;;
+  *kTCCServiceAccessibility*) printf '0\n' ;;
   *'SELECT 1 FROM access LIMIT 1;'*) printf '1\n' ;;
 esac
 SH
   cat > "$fakebin/codesign" <<'SH'
 #!/usr/bin/env bash
-if [ "${FM_FAKE_AUTOMATION_ENTITLEMENT:-missing}" = present ]; then
-  printf '%s\n' '<key>com.apple.security.automation.apple-events</key>'
-fi
-exit 0
+case "${FM_FAKE_AUTOMATION_ENTITLEMENT:-missing}" in
+  present)
+    printf '%s\n' '<key>com.apple.security.automation.apple-events</key>'
+    ;;
+  unknown)
+    printf '%s\n' 'codesign inspection failed' >&2
+    exit 1
+    ;;
+esac
 SH
   cat > "$fakebin/open" <<'SH'
 #!/usr/bin/env bash
@@ -77,7 +97,7 @@ test_missing_probe_is_honest() {
     'protected-path denial was not reported'
   assert_contains "$out" 'readable TCC databases: 0' \
     'TCC database chicken-and-egg was hidden'
-  assert_contains "$out" 'Screen Recording and Accessibility therefore remain UNKNOWN' \
+  assert_contains "$out" 'Stored permission statuses therefore remain UNKNOWN' \
     'undetectable grants were guessed'
   assert_contains "$out" 'Automation status is always PER TARGET' \
     'Automation was presented as a blanket grant'
@@ -105,6 +125,53 @@ test_readable_database_reports_stored_rows() {
   pass 'readable TCC rows are advisory statuses while behavior stays authoritative'
 }
 
+test_mixed_identity_evidence_is_unknown() {
+  local world out daemon_section
+  world=$(make_world mixed-identities)
+  mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
+  : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
+
+  out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes FM_FAKE_MIXED_IDENTITIES=yes \
+    run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Screen Recording +requirement=REQUIRED FOR COMPUTER USE +status=UNKNOWN' >/dev/null \
+    || fail 'mixed candidate identities produced a conclusive stored status'
+  pass 'mixed candidate identity evidence remains unknown'
+}
+
+test_partial_database_evidence_is_unknown() {
+  local world out
+  world=$(make_world partial-database)
+  mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
+  : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
+
+  out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes FM_FAKE_TCC_PARTIAL=yes \
+    run_report "$world")
+
+  assert_contains "$out" 'readable TCC databases: 1 (at least one expected database is unreadable)' \
+    'partial TCC visibility was not disclosed'
+  assert_contains "$out" 'UNKNOWN (not all expected TCC databases are readable in this context)' \
+    'partial TCC evidence produced conclusive Automation relationships'
+  pass 'partial database evidence remains unknown'
+}
+
+test_failed_entitlement_probe_is_unknown() {
+  local world out daemon_section
+  world=$(make_world entitlement-unknown)
+
+  out=$(FM_FAKE_AUTOMATION_ENTITLEMENT=unknown run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+
+  printf '%s\n' "$daemon_section" \
+    | grep -E 'Automation +requirement=CONDITIONAL +status=UNKNOWN' >/dev/null \
+    || fail 'failed entitlement inspection was reported conclusively'
+  assert_contains "$daemon_section" 'The daemon entitlement could not be inspected' \
+    'failed entitlement inspection lacked an honest explanation'
+  pass 'failed entitlement inspection remains unknown'
+}
+
 test_exact_settings_urls_and_no_other_mutation() {
   local world pane expected log mutation_log out
   world=$(make_world panes)
@@ -115,8 +182,13 @@ test_exact_settings_urls_and_no_other_mutation() {
   while IFS='|' read -r pane expected; do
     out=$(FM_FAKE_OPEN_LOG="$log" FM_FAKE_MUTATION_LOG="$mutation_log" \
       run_report "$world" --open "$pane")
-    assert_contains "$out" "Opened $expected; the human must make the grant." \
-      "$pane did not report the human approval boundary"
+    if [ "$pane" = automation ]; then
+      assert_contains "$out" "Opened $expected; review or change target-specific relationships there." \
+        'Automation pane was presented as the first-use approval flow'
+    else
+      assert_contains "$out" "Opened $expected; the human must make the grant." \
+        "$pane did not report the human approval boundary"
+    fi
   done <<'EOF'
 full-disk-access|x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles
 automation|x-apple.systempreferences:com.apple.preference.security?Privacy_Automation
@@ -152,5 +224,8 @@ test_non_macos_refuses() {
 
 test_missing_probe_is_honest
 test_readable_database_reports_stored_rows
+test_mixed_identity_evidence_is_unknown
+test_partial_database_evidence_is_unknown
+test_failed_entitlement_probe_is_unknown
 test_exact_settings_urls_and_no_other_mutation
 test_non_macos_refuses

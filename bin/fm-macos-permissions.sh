@@ -4,7 +4,8 @@
 # This helper performs only read-only probes unless --open is supplied.
 # It never invokes tccutil, edits a TCC database, sends Apple Events, captures
 # the screen, synthesizes input, restarts a process, or tries to grant access.
-# macOS requires a human approval in System Settings on an unmanaged Mac.
+# macOS requires human approval on an unmanaged Mac, either in the first-use
+# Automation dialog or in System Settings for the other controls.
 #
 # Usage:
 #   bin/fm-macos-permissions.sh
@@ -54,13 +55,18 @@ fi
 user_tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
 system_tcc_db="/Library/Application Support/com.apple.TCC/TCC.db"
 readable_tcc_dbs=()
+tcc_db_probe_incomplete=no
 
 if command -v sqlite3 >/dev/null 2>&1; then
   for candidate_db in "$user_tcc_db" "$system_tcc_db"; do
     if sqlite3 -readonly "$candidate_db" 'SELECT 1 FROM access LIMIT 1;' >/dev/null 2>&1; then
       readable_tcc_dbs+=("$candidate_db")
+    else
+      tcc_db_probe_incomplete=yes
     fi
   done
+else
+  tcc_db_probe_incomplete=yes
 fi
 
 sql_quote() {
@@ -71,42 +77,50 @@ sql_quote() {
 # A stored allow is useful evidence, but it is not a behavioral proof that a
 # newly replaced binary still matches the entry's code-signing requirement.
 stored_status() {
-  local service=$1 condition="" client quoted db rows values="" query_failed=no
+  local service=$1 client quoted db rows values identity_status aggregate_status=""
+  local saw_client=no
   shift
 
-  [ "${#readable_tcc_dbs[@]}" -gt 0 ] || { printf 'UNKNOWN'; return; }
+  [ "${#readable_tcc_dbs[@]}" -gt 0 ] && [ "$tcc_db_probe_incomplete" = no ] \
+    || { printf 'UNKNOWN'; return; }
+  service=$(sql_quote "$service")
   for client in "$@"; do
     [ -n "$client" ] || continue
+    saw_client=yes
     quoted=$(sql_quote "$client")
-    if [ -n "$condition" ]; then
-      condition="$condition OR "
-    fi
-    condition="${condition}client='$quoted'"
-  done
-  [ -n "$condition" ] || { printf 'UNKNOWN'; return; }
+    values=""
+    for db in "${readable_tcc_dbs[@]}"; do
+      if rows=$(sqlite3 -readonly "$db" \
+        "SELECT auth_value FROM access WHERE service='$service' AND client='$quoted';" 2>/dev/null); then
+        [ -z "$rows" ] || values="${values}${rows}"$'\n'
+      else
+        printf 'UNKNOWN'
+        return
+      fi
+    done
 
-  service=$(sql_quote "$service")
-  for db in "${readable_tcc_dbs[@]}"; do
-    if rows=$(sqlite3 -readonly "$db" \
-      "SELECT auth_value FROM access WHERE service='$service' AND ($condition);" 2>/dev/null); then
-      [ -z "$rows" ] || values="${values}${rows}"$'\n'
+    if [ -z "$values" ]; then
+      identity_status='NOT RECORDED'
+    elif printf '%s' "$values" | grep -qx '2' \
+      && ! printf '%s' "$values" | grep -qvx '2'; then
+      identity_status=GRANTED
+    elif printf '%s' "$values" | grep -qx '0' \
+      && ! printf '%s' "$values" | grep -qvx '0'; then
+      identity_status=MISSING
     else
-      query_failed=yes
+      identity_status=UNKNOWN
+    fi
+
+    if [ -z "$aggregate_status" ]; then
+      aggregate_status=$identity_status
+    elif [ "$aggregate_status" != "$identity_status" ]; then
+      printf 'UNKNOWN'
+      return
     fi
   done
 
-  if printf '%s' "$values" | grep -qx '2'; then
-    printf 'GRANTED'
-  elif [ -n "$values" ] && printf '%s' "$values" | grep -qx '0' \
-    && ! printf '%s' "$values" | grep -qvx '0'; then
-    printf 'MISSING'
-  elif [ -n "$values" ]; then
-    printf 'UNKNOWN'
-  elif [ "$query_failed" = yes ]; then
-    printf 'UNKNOWN'
-  else
-    printf 'NOT RECORDED'
-  fi
+  [ "$saw_client" = yes ] || { printf 'UNKNOWN'; return; }
+  printf '%s' "$aggregate_status"
 }
 
 print_automation_pairs() {
@@ -115,8 +129,8 @@ print_automation_pairs() {
   shift
 
   printf '  %s:\n' "$label"
-  if [ "${#readable_tcc_dbs[@]}" -eq 0 ]; then
-    printf '%s\n' '    UNKNOWN (TCC databases are not readable in this context)'
+  if [ "${#readable_tcc_dbs[@]}" -eq 0 ] || [ "$tcc_db_probe_incomplete" = yes ]; then
+    printf '%s\n' '    UNKNOWN (not all expected TCC databases are readable in this context)'
     return
   fi
   for client in "$@"; do
@@ -193,7 +207,10 @@ has_apple_events_entitlement() {
   local executable=$1 entitlements
   [ -n "$executable" ] && [ -e "$executable" ] || { printf 'UNKNOWN'; return; }
   command -v codesign >/dev/null 2>&1 || { printf 'UNKNOWN'; return; }
-  entitlements=$(codesign -d --entitlements :- "$executable" 2>&1 || true)
+  if ! entitlements=$(codesign -d --entitlements :- "$executable" 2>&1); then
+    printf 'UNKNOWN'
+    return
+  fi
   case "$entitlements" in
     *'<key>com.apple.security.automation.apple-events</key>'*) printf 'PRESENT' ;;
     *) printf 'MISSING' ;;
@@ -249,12 +266,13 @@ no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_
 printf '%s\n' 'firstmate macOS permission report'
 printf '  responsible-launch hint: %s\n' "${__CFBundleIdentifier:-not exposed by this process}"
 printf '  current protected-path probe: %s\n' "$current_fda"
-if [ "${#readable_tcc_dbs[@]}" -gt 0 ]; then
+if [ "$tcc_db_probe_incomplete" = no ]; then
   printf '  readable TCC databases: %s\n' "${#readable_tcc_dbs[@]}"
   printf '%s\n' '  Stored rows below are advisory; behavioral probes take precedence.'
 else
-  printf '%s\n' '  readable TCC databases: 0 (expected without Full Disk Access)'
-  printf '%s\n' '  Screen Recording and Accessibility therefore remain UNKNOWN unless behavior proves otherwise.'
+  printf '  readable TCC databases: %s (at least one expected database is unreadable)\n' \
+    "${#readable_tcc_dbs[@]}"
+  printf '%s\n' '  Stored permission statuses therefore remain UNKNOWN unless behavior proves otherwise.'
 fi
 printf '%s\n' '  Automation status is always PER TARGET because macOS grants one controller-to-app relationship at a time.'
 printf '\n'
@@ -300,13 +318,20 @@ printf '\n'
 printf 'no-mistakes daemon (%s)\n' "${no_mistakes_binary:-not installed}"
 print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
   'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
-if [ "$no_mistakes_automation_entitlement" = MISSING ]; then
-  print_permission 'Automation' 'CONDITIONAL' 'BLOCKED: ENTITLEMENT MISSING' \
-    'System Settings cannot repair this binary; its signer must add com.apple.security.automation.apple-events.'
-else
-  print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
-    'Needed only when a daemon-launched agent sends Apple Events to a named app; the human approves each target.'
-fi
+case "$no_mistakes_automation_entitlement" in
+  MISSING)
+    print_permission 'Automation' 'CONDITIONAL' 'BLOCKED: ENTITLEMENT MISSING' \
+      'System Settings cannot repair this binary; its signer must add com.apple.security.automation.apple-events.'
+    ;;
+  PRESENT)
+    print_permission 'Automation' 'CONDITIONAL' 'PER TARGET' \
+      'Needed only when a daemon-launched agent sends Apple Events to a named app; the human approves each target.'
+    ;;
+  *)
+    print_permission 'Automation' 'CONDITIONAL' 'UNKNOWN' \
+      'The daemon entitlement could not be inspected, so its ability to request target-specific approval is unknown.'
+    ;;
+esac
 print_permission 'Screen Recording' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_screen" \
   'A daemon-launched Codex Computer Use session is attributed to this daemon and needs screen capture approval.'
 print_permission 'Accessibility' 'REQUIRED FOR COMPUTER USE' "$no_mistakes_accessibility" \
@@ -323,7 +348,8 @@ print_automation_pairs 'no-mistakes daemon' com.kunchenguid.no-mistakes \
 printf '\n'
 
 printf '%s\n' 'No grant was changed.'
-printf '%s\n' 'A human must click Add or enable the exact responsible app or binary in System Settings.'
+printf '%s\n' 'Full Disk Access, Screen Recording, and Accessibility require a human click in System Settings.'
+printf '%s\n' 'Automation first asks for target-specific approval in a dialog; use System Settings to review or change it.'
 printf '%s\n' 'Open one pane with --open full-disk-access|automation|screen-recording|accessibility.'
 
 if [ -n "$open_pane" ]; then
@@ -339,7 +365,11 @@ if [ -n "$open_pane" ]; then
   esac
   settings_uri="x-apple.systempreferences:com.apple.preference.security?$anchor"
   if open "$settings_uri"; then
-    printf 'Opened %s; the human must make the grant.\n' "$settings_uri"
+    if [ "$open_pane" = automation ]; then
+      printf 'Opened %s; review or change target-specific relationships there.\n' "$settings_uri"
+    else
+      printf 'Opened %s; the human must make the grant.\n' "$settings_uri"
+    fi
   else
     printf 'error: failed to open %s\n' "$settings_uri" >&2
     exit 1

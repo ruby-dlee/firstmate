@@ -2,7 +2,9 @@
 
 Firstmate can report macOS privacy state and open the right System Settings pane, but it cannot approve itself.
 
-On an unmanaged Mac, every Full Disk Access, Automation, Screen & System Audio Recording, and Accessibility grant marked below requires the captain to click in System Settings.
+On an unmanaged Mac, every Full Disk Access, Screen & System Audio Recording, and Accessibility grant marked below requires the captain to click in System Settings.
+
+Automation instead asks the captain to click Allow in the first target-specific dialog, while System Settings is where the captain reviews or changes that relationship later.
 
 macOS TCC intentionally provides no shell command that force-grants these approvals, and `tccutil` resets decisions rather than granting them.
 
@@ -39,8 +41,9 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 - **Full Disk Access - captain must click when protected data is in scope.**
   Add `/Applications/Ghostty.app` when firstmate or a terminal-launched agent must read Mail, Messages, Safari, Home, Time Machine backups, or protected administrative data.
   Firstmate state and repositories stored under ordinary unprotected home-directory paths do not require this grant.
-- **Automation - captain must click for each requested target when Apple Events are in scope.**
-  Enable the relationship shown as Ghostty controlling System Events or the other named application.
+- **Automation - captain must approve each requested target when Apple Events are in scope.**
+  Click Allow in the first target-specific dialog for Ghostty controlling System Events or the other named application.
+  If that request was denied or later disabled, review or enable the relationship under Automation in System Settings.
   Do not grant Automation for tmux control because tmux never uses Apple Events.
 - **Screen & System Audio Recording - captain must click when native desktop capture is in scope.**
   This unlocks `screencapture`, ScreenCaptureKit, or native Computer Use when TCC attributes the request to Ghostty.
@@ -53,8 +56,9 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 
 - **Full Disk Access - no separate grant is needed for normal Ghostty-launched work.**
   The responsible Ghostty grant covers the ordinary launch tree, while a Claude Code entry that macOS attributes separately must be granted only when protected data is in scope.
-- **Automation - captain must click for each requested target when Claude sends Apple Events.**
+- **Automation - captain must approve each requested target when Claude sends Apple Events.**
   The relationship is Claude Code controlling System Events or another named application, and it appears only after that target-specific request.
+  Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
   Claude Code does not need Automation for tmux.
 - **Screen & System Audio Recording - no baseline grant is needed.**
   Grant the responsible entry only if a Claude-launched native visual tool captures the desktop rather than a browser page through DevTools.
@@ -65,8 +69,9 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 
 - **Full Disk Access - no separate grant is needed for normal Ghostty-launched work.**
   The responsible Ghostty grant covers the ordinary launch tree, while a separately attributed Codex entry needs its own grant only for protected data.
-- **Automation - captain must click for each requested target when Codex sends Apple Events.**
+- **Automation - captain must approve each requested target when Codex sends Apple Events.**
   Direct Codex is signed with `com.apple.security.automation.apple-events`, which permits it to ask, but the human still approves every controller-to-target relationship.
+  Click Allow in the first dialog, or use Automation in System Settings to review or change a recorded relationship.
   Apple documents that entitlement as permission to prompt rather than permission to bypass the prompt in [Apple Events Entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.automation.apple-events).
 - **Screen & System Audio Recording - captain must click for native Codex Computer Use.**
   This unlocks desktop pixels for Computer Use when the responsible entry is Codex, Ghostty, or the Codex Computer Use helper shown by macOS.
@@ -81,11 +86,11 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 - **Full Disk Access - captain must click when a daemon-launched gate agent needs protected data.**
   Add the resolved daemon binary printed by the helper, normally `~/.no-mistakes/bin/no-mistakes` because `~/.local/bin/no-mistakes` resolves there.
   A Ghostty Full Disk Access grant cannot cover the launchd-managed daemon.
-- **Automation - a captain click is necessary but not sufficient for daemon-launched Apple Events.**
+- **Automation - captain approval is necessary but not sufficient for daemon-launched Apple Events.**
   Automation is still a pair such as no-mistakes controlling System Events or another named application.
   The no-mistakes v1.40.0 binary inspected on 2026-07-22 lacks `com.apple.security.automation.apple-events`, and macOS 26.5.2 logs reject its daemon-launched Apple Events before an approval prompt.
   System Settings cannot repair a missing code-signing entitlement, so the signer must add the entitlement or the gate must avoid native Apple Events.
-  After an entitled build is installed, the captain must still trigger the operation and enable each target shown under Automation.
+  After an entitled build is installed, the captain must trigger the operation and click Allow for each target, or use System Settings to change a relationship that was already recorded.
 - **Screen & System Audio Recording - captain must click for daemon-launched Codex Computer Use.**
   Live TCC attribution on 2026-07-21 identified `~/.no-mistakes/bin/no-mistakes` as the responsible path for ScreenCaptureKit access by a gate agent.
   Add and enable that exact daemon binary rather than assuming a Ghostty or Codex grant covers it.
@@ -108,7 +113,9 @@ That behavioral result applies only to the TCC-responsible context that launched
 
 The helper queries stored TCC decisions read-only only when macOS permits access to a TCC database.
 
-Reading either TCC database normally requires Full Disk Access, so an inaccessible database is a real chicken-and-egg limitation and the helper reports `UNKNOWN` rather than guessing.
+Reading either TCC database normally requires Full Disk Access, so an inaccessible expected database is a real chicken-and-egg limitation and the helper reports `UNKNOWN` rather than guessing from partial evidence.
+
+Candidate bundle identifiers and executable paths are alternate TCC identities, so the helper also reports `UNKNOWN` when their stored decisions disagree or only some identities have a recorded decision.
 
 The helper does not perform screen capture or Accessibility actions merely to probe them because either action would be invasive and could trigger a prompt.
 
@@ -116,7 +123,11 @@ Automation has no global status because every grant is one controller-to-target 
 
 When a TCC database is readable, the helper also prints every stored Automation controller, target bundle identifier, and decision that matches this toolchain.
 
-Open exactly one pane at a time, then make the grant by clicking Add or enabling the exact listed entry.
+Open exactly one pane at a time.
+
+For Full Disk Access, Screen & System Audio Recording, or Accessibility, add or enable the exact listed entry in System Settings.
+
+For Automation, trigger the target-specific request and click Allow in its dialog, then use the pane only to review or change recorded relationships.
 
 ```sh
 bin/fm-macos-permissions.sh --open full-disk-access

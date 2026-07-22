@@ -89,7 +89,8 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
 - **The interactive no-mistakes CLI needs no separate grant for its core coordination work.**
   It communicates with the daemon, and the daemon becomes the independent TCC responsibility root for its gate agents.
 - **Full Disk Access - captain must click when a daemon-launched gate agent needs protected data.**
-  Add the resolved daemon binary printed by the helper, normally `~/.no-mistakes/bin/no-mistakes` because `~/.local/bin/no-mistakes` resolves there.
+  Add the daemon executable only when the helper ties it to one running no-mistakes launch job and prints the resolved path.
+  When that running identity cannot be established authoritatively, the helper prints `UNKNOWN` instead of deriving the daemon from the interactive `PATH`.
   A Ghostty Full Disk Access grant cannot cover the launchd-managed daemon.
 - **Automation - captain approval is necessary but not sufficient for daemon-launched Apple Events.**
   Automation is still a pair such as no-mistakes controlling System Events or another named application.
@@ -99,7 +100,7 @@ Apple recommends the TCC attribution log for finding that responsible app or bin
   After an entitled build is installed, the captain must trigger the operation and click Allow for each target, or use System Settings to change a relationship that was already recorded.
 - **Screen & System Audio Recording - captain must approve for daemon-launched Codex Computer Use.**
   Live TCC attribution on 2026-07-21 identified `~/.no-mistakes/bin/no-mistakes` as the responsible path for ScreenCaptureKit access by a gate agent.
-  Approve a first-use dialog if macOS presents one, or add and enable that exact daemon binary in System Settings rather than assuming a Ghostty or Codex grant covers it.
+  Approve a first-use dialog if macOS presents one, or add and enable the launch-job-resolved daemon binary in System Settings rather than assuming a Ghostty, Codex, or interactive no-mistakes path covers it.
 - **Accessibility - captain must click for daemon-launched Codex Computer Use.**
   Add and enable the same responsible daemon binary so its Computer Use child can inspect UI and deliver input.
 
@@ -111,23 +112,25 @@ Run the read-only report first.
 bin/fm-macos-permissions.sh
 ```
 
-The report uses `GRANTED`, `MISSING`, `NOT RECORDED`, `UNKNOWN`, `PER TARGET`, and `ENTITLEMENT NOT PRESENT` literally.
+The report uses `ACCESSIBLE`, `DENIED`, `UNKNOWN`, `PER TARGET`, and `ENTITLEMENT NOT PRESENT` literally.
 
 Its Full Disk Access probe attempts to enumerate known protected directories without reading file contents.
 
 That behavioral result applies only to the TCC-responsible context that launched the helper.
 
+`ACCESSIBLE` and `DENIED` describe only the protected directories actually probed and never attribute that result to Ghostty or another candidate identity.
+
 The helper queries stored TCC decisions read-only only when macOS permits access to a TCC database.
 
 Reading either TCC database normally requires Full Disk Access, so an inaccessible expected database is a real chicken-and-egg limitation and the helper reports `UNKNOWN` rather than guessing from partial evidence.
 
-Candidate bundle identifiers and executable paths are alternate TCC identities, so the helper also reports `UNKNOWN` when their stored decisions disagree or only some identities have a recorded decision.
+Stored TCC rows can be stale after an executable replacement, so every stored allow, denial, absent row, or identity disagreement remains an `UNKNOWN` effective status.
 
 The helper does not perform screen capture or Accessibility actions merely to probe them because either action would be invasive and could trigger a prompt.
 
 Automation has no global status because every grant is one controller-to-target relationship, so the helper reports `PER TARGET` and directs the operator to the pane.
 
-When a TCC database is readable, the helper also prints every stored Automation controller, target bundle identifier, and decision that matches this toolchain.
+When a TCC database is readable, the helper prints matching stored Automation controller and target pairs as `UNKNOWN` evidence, including one explicit conflict status when duplicate decisions disagree.
 
 Open exactly one pane at a time.
 

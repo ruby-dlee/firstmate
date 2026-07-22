@@ -100,32 +100,31 @@ stored_status() {
     done
 
     if [ -z "$values" ]; then
-      identity_status='NOT RECORDED'
+      identity_status='NO MATCHING STORED ROW'
     elif printf '%s' "$values" | grep -qx '2' \
       && ! printf '%s' "$values" | grep -qvx '2'; then
-      identity_status=GRANTED
+      identity_status='STORED ALLOW ONLY'
     elif printf '%s' "$values" | grep -qx '0' \
       && ! printf '%s' "$values" | grep -qvx '0'; then
-      identity_status=MISSING
+      identity_status='STORED DENIAL ONLY'
     else
-      identity_status=UNKNOWN
+      identity_status='CONFLICTING STORED ROWS'
     fi
 
     if [ -z "$aggregate_status" ]; then
       aggregate_status=$identity_status
     elif [ "$aggregate_status" != "$identity_status" ]; then
-      printf 'UNKNOWN'
+      printf 'UNKNOWN (CONFLICTING STORED EVIDENCE)'
       return
     fi
   done
 
   [ "$saw_client" = yes ] || { printf 'UNKNOWN'; return; }
-  printf '%s' "$aggregate_status"
+  printf 'UNKNOWN (%s)' "$aggregate_status"
 }
 
 print_automation_pairs() {
   local label=$1 condition="" client quoted db rows pairs="" query_failed=no
-  local pair_client pair_target pair_auth pair_status
   shift
 
   printf '  %s:\n' "$label"
@@ -141,7 +140,7 @@ print_automation_pairs() {
     fi
     condition="${condition}client='$quoted'"
   done
-  [ -n "$condition" ] || { printf '%s\n' '    NOT RECORDED'; return; }
+  [ -n "$condition" ] || { printf '%s\n' '    UNKNOWN (NO AUTHORITATIVE CLIENT IDENTITY)'; return; }
 
   for db in "${readable_tcc_dbs[@]}"; do
     if rows=$(sqlite3 -readonly -separator '|' "$db" \
@@ -156,42 +155,65 @@ print_automation_pairs() {
     return
   fi
   if [ -z "$pairs" ]; then
-    printf '%s\n' '    NOT RECORDED'
+    printf '%s\n' '    UNKNOWN (NO MATCHING STORED ROW)'
     return
   fi
 
-  printf '%s' "$pairs" | sort -u | while IFS='|' read -r pair_client pair_target pair_auth; do
-    [ -n "$pair_client" ] || continue
-    case "$pair_auth" in
-      2) pair_status=GRANTED ;;
-      0) pair_status=MISSING ;;
-      *) pair_status=UNKNOWN ;;
-    esac
-    printf '    %s -> %s: %s\n' "$pair_client" "$pair_target" "$pair_status"
-  done
+  printf '%s' "$pairs" | sort -u -t '|' -k1,1 -k2,2 -k3,3 | awk -F '|' '
+    function emit() {
+      if (client == "") return
+      if (conflict) status = "UNKNOWN (CONFLICTING STORED ROWS)"
+      else if (auth == "2") status = "UNKNOWN (STORED ALLOW ONLY)"
+      else if (auth == "0") status = "UNKNOWN (STORED DENIAL ONLY)"
+      else status = "UNKNOWN (UNRECOGNIZED STORED VALUE)"
+      printf "    %s -> %s: %s\n", client, target, status
+    }
+    {
+      if (client != "" && ($1 != client || $2 != target)) {
+        emit()
+        client = ""
+      }
+      if (client == "") {
+        client = $1
+        target = $2
+        auth = $3
+        conflict = 0
+      } else if ($3 != auth) {
+        conflict = 1
+      }
+    }
+    END { emit() }
+  '
 }
 
 full_disk_probe() {
-  local protected_dir probe_error
+  local protected_dir probe_error saw_directory=no accessible=no denied=no
   for protected_dir in \
     "$HOME/Library/Mail" \
     "$HOME/Library/Messages" \
     "$HOME/Library/Safari"; do
     [ -d "$protected_dir" ] || continue
+    saw_directory=yes
     if probe_error=$(ls -1A "$protected_dir" 2>&1 >/dev/null); then
-      printf 'GRANTED'
-      return
+      accessible=yes
+      continue
     fi
     case "$probe_error" in
-      *'Operation not permitted'*) printf 'MISSING'; return ;;
+      *'Operation not permitted'*) denied=yes ;;
+      *) printf 'UNKNOWN'; return ;;
     esac
   done
-  printf 'UNKNOWN'
+  if [ "$saw_directory" = yes ] && [ "$accessible" = yes ] && [ "$denied" = no ]; then
+    printf 'ACCESSIBLE'
+  elif [ "$saw_directory" = yes ] && [ "$accessible" = no ] && [ "$denied" = yes ]; then
+    printf 'DENIED'
+  else
+    printf 'UNKNOWN'
+  fi
 }
 
-resolved_command() {
-  local command_name=$1 resolved link
-  resolved=$(command -v "$command_name" 2>/dev/null || true)
+resolved_path() {
+  local resolved=$1 link
   [ -n "$resolved" ] || return 0
   while [ -L "$resolved" ]; do
     link=$(readlink "$resolved") || break
@@ -201,6 +223,48 @@ resolved_command() {
     esac
   done
   printf '%s\n' "$resolved"
+}
+
+resolved_command() {
+  local command_name=$1 command_path
+  command_path=$(command -v "$command_name" 2>/dev/null || true)
+  resolved_path "$command_path"
+}
+
+no_mistakes_daemon_label=""
+no_mistakes_daemon_program=""
+no_mistakes_binary=""
+
+resolve_no_mistakes_daemon() {
+  local uid domain labels label label_count service state pid program arguments resolved
+  command -v launchctl >/dev/null 2>&1 || return
+  uid=$(id -u 2>/dev/null) || return
+  domain=$(launchctl print "gui/$uid" 2>/dev/null) || return
+  labels=$(printf '%s\n' "$domain" \
+    | sed -n 's/.*\(com\.kunchenguid\.no-mistakes\.daemon\.[A-Za-z0-9._-]*\).*/\1/p' \
+    | sort -u)
+  label_count=$(printf '%s\n' "$labels" | awk 'NF { count++ } END { print count + 0 }')
+  [ "$label_count" -eq 1 ] || return
+  label=$labels
+  service=$(launchctl print "gui/$uid/$label" 2>/dev/null) || return
+  state=$(printf '%s\n' "$service" | sed -n 's/^[[:space:]]*state = //p' | sed -n '1p')
+  pid=$(printf '%s\n' "$service" | sed -n 's/^[[:space:]]*pid = //p' | sed -n '1p')
+  program=$(printf '%s\n' "$service" | sed -n 's/^[[:space:]]*program = //p' | sed -n '1p')
+  arguments=$(printf '%s\n' "$service" \
+    | sed -n '/^[[:space:]]*arguments = {/,/^[[:space:]]*}/p' \
+    | sed '1d;$d;s/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ "$state" = running ] || return
+  case "$pid" in ''|*[!0-9]*) return ;; esac
+  [ "$pid" -gt 0 ] || return
+  case "$program" in /*) ;; *) return ;; esac
+  [ -x "$program" ] || return
+  printf '%s\n' "$arguments" | grep -Fx daemon >/dev/null || return
+  printf '%s\n' "$arguments" | grep -Fx run >/dev/null || return
+  resolved=$(resolved_path "$program")
+  [ -n "$resolved" ] && [ -x "$resolved" ] || return
+  no_mistakes_daemon_label=$label
+  no_mistakes_daemon_program=$program
+  no_mistakes_binary=$resolved
 }
 
 has_apple_events_entitlement() {
@@ -233,7 +297,7 @@ claude_binary=$(resolved_command claude)
 codex_command=$(command -v codex 2>/dev/null || true)
 codex_binary=$(resolved_command codex)
 no_mistakes_command=$(command -v no-mistakes 2>/dev/null || true)
-no_mistakes_binary=$(resolved_command no-mistakes)
+resolve_no_mistakes_daemon
 computer_use_app="$HOME/.codex/computer-use/Codex Computer Use.app"
 
 current_fda=$(full_disk_probe)
@@ -256,13 +320,20 @@ codex_screen=$(stored_status kTCCServiceScreenCapture \
   codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
 codex_accessibility=$(stored_status kTCCServiceAccessibility \
   codex "$codex_command" "$codex_binary" com.openai.sky.CUAService "$computer_use_app")
-no_mistakes_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
-  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
-no_mistakes_screen=$(stored_status kTCCServiceScreenCapture \
-  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
-no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
-  com.kunchenguid.no-mistakes "$no_mistakes_command" "$no_mistakes_binary")
-no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_binary")
+if [ -n "$no_mistakes_binary" ]; then
+  no_mistakes_fda=$(stored_status kTCCServiceSystemPolicyAllFiles \
+    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
+  no_mistakes_screen=$(stored_status kTCCServiceScreenCapture \
+    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
+  no_mistakes_accessibility=$(stored_status kTCCServiceAccessibility \
+    com.kunchenguid.no-mistakes "$no_mistakes_daemon_program" "$no_mistakes_binary")
+  no_mistakes_automation_entitlement=$(has_apple_events_entitlement "$no_mistakes_binary")
+else
+  no_mistakes_fda=UNKNOWN
+  no_mistakes_screen=UNKNOWN
+  no_mistakes_accessibility=UNKNOWN
+  no_mistakes_automation_entitlement=UNKNOWN
+fi
 
 printf '%s\n' 'firstmate macOS permission report'
 printf '  unverified bundle environment hint: %s (not used for attribution)\n' \
@@ -317,7 +388,12 @@ print_permission 'All four permissions' 'NOT NEEDED BY CLI CORE' 'N/A' \
   'The CLI coordinates with the daemon; grant the TCC-responsible launcher or daemon for child-agent capabilities.'
 printf '\n'
 
-printf 'no-mistakes daemon (%s)\n' "${no_mistakes_binary:-not installed}"
+printf 'no-mistakes daemon (%s)\n' "${no_mistakes_binary:-UNKNOWN: active launch job not resolved}"
+if [ -n "$no_mistakes_daemon_label" ]; then
+  printf '  authoritative launch job: %s\n' "$no_mistakes_daemon_label"
+else
+  printf '%s\n' '  authoritative launch job: UNKNOWN'
+fi
 print_permission 'Full Disk Access' 'CONDITIONAL' "$no_mistakes_fda" \
   'Needed when a daemon-launched gate agent reads protected paths; Ghostty grants do not cover this launchd process.'
 case "$no_mistakes_automation_entitlement" in
@@ -345,8 +421,13 @@ print_automation_pairs 'Ghostty' com.mitchellh.ghostty "$ghostty_binary"
 print_automation_pairs 'Claude Code' com.anthropic.claude-code "$claude_command" "$claude_binary"
 print_automation_pairs 'Codex' codex "$codex_command" "$codex_binary" \
   com.openai.sky.CUAService "$computer_use_app"
-print_automation_pairs 'no-mistakes daemon' com.kunchenguid.no-mistakes \
-  "$no_mistakes_command" "$no_mistakes_binary"
+if [ -n "$no_mistakes_binary" ]; then
+  print_automation_pairs 'no-mistakes daemon' com.kunchenguid.no-mistakes \
+    "$no_mistakes_daemon_program" "$no_mistakes_binary"
+else
+  printf '%s\n' '  no-mistakes daemon:'
+  printf '%s\n' '    UNKNOWN (active launch job not resolved)'
+fi
 printf '\n'
 
 printf '%s\n' 'No grant was changed.'

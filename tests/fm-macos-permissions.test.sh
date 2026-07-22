@@ -49,7 +49,12 @@ if [ "${FM_FAKE_AUTOMATION_QUERY_PARTIAL:-no}" = yes ] && [[ "$*" = *kTCCService
   exit 1
 fi
 case "$*" in
-  *kTCCServiceAppleEvents*com.mitchellh.ghostty*) printf 'com.mitchellh.ghostty|com.apple.systemevents|2\n' ;;
+  *kTCCServiceAppleEvents*com.mitchellh.ghostty*)
+    printf 'com.mitchellh.ghostty|com.apple.systemevents|2\n'
+    if [ "${FM_FAKE_AUTOMATION_CONFLICT:-no}" = yes ]; then
+      printf 'com.mitchellh.ghostty|com.apple.systemevents|0\n'
+    fi
+    ;;
   *kTCCServiceScreenCapture*)
     if [ "${FM_FAKE_MIXED_IDENTITIES:-no}" = yes ] && [[ "$*" != *com.kunchenguid.no-mistakes* ]]; then
       printf '0\n'
@@ -59,6 +64,26 @@ case "$*" in
     ;;
   *kTCCServiceAccessibility*) printf '0\n' ;;
   *'SELECT 1 FROM access LIMIT 1;'*) printf '1\n' ;;
+esac
+SH
+  cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+[ "${FM_FAKE_DAEMON_AUTHORITATIVE:-yes}" = yes ] || exit 1
+case "${2:-}" in
+  */com.kunchenguid.no-mistakes.daemon.test)
+    printf '%s\n' \
+      'state = running' \
+      "program = $HOME/.no-mistakes/bin/no-mistakes" \
+      'arguments = {' \
+      "    $HOME/.no-mistakes/bin/no-mistakes" \
+      '    daemon' \
+      '    run' \
+      '}' \
+      'pid = 1234'
+    ;;
+  *)
+    printf '%s\n' '1234 0 com.kunchenguid.no-mistakes.daemon.test'
+    ;;
 esac
 SH
   cat > "$fakebin/codesign" <<'SH'
@@ -97,6 +122,7 @@ run_report() {
   local world=$1
   shift
   HOME="$world/home" PATH="$world/fakebin:$BASE_PATH" \
+    FM_FAKE_DAEMON_AUTHORITATIVE="${FM_FAKE_DAEMON_AUTHORITATIVE:-yes}" \
     __CFBundleIdentifier=com.mitchellh.ghostty "$SCRIPT" "$@"
 }
 
@@ -105,7 +131,7 @@ test_missing_probe_is_honest() {
   world=$(make_world missing)
   out=$(FM_FAKE_FDA=missing FM_FAKE_TCC_READABLE=no run_report "$world")
 
-  assert_contains "$out" 'current invocation protected-path probe: MISSING' \
+  assert_contains "$out" 'current invocation protected-path probe: DENIED' \
     'protected-path denial was not reported'
   assert_contains "$out" 'readable TCC databases: 0' \
     'TCC database chicken-and-egg was hidden'
@@ -128,15 +154,15 @@ test_readable_database_reports_stored_rows() {
 
   out=$(FM_FAKE_FDA=granted FM_FAKE_TCC_READABLE=yes run_report "$world")
 
-  assert_contains "$out" 'current invocation protected-path probe: GRANTED' \
+  assert_contains "$out" 'current invocation protected-path probe: ACCESSIBLE' \
     'successful behavioral Full Disk Access probe was lost'
-  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=GRANTED' \
-    'stored no-mistakes Screen Recording grant was not reported'
-  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=MISSING' \
-    'stored no-mistakes Accessibility denial was not reported'
-  assert_contains "$out" 'com.mitchellh.ghostty -> com.apple.systemevents: GRANTED' \
-    'stored Ghostty-to-System Events Automation relationship was not reported'
-  pass 'readable TCC rows are advisory statuses while behavior stays authoritative'
+  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=UNKNOWN (STORED ALLOW ONLY)' \
+    'stored no-mistakes Screen Recording allow was presented as effective'
+  assert_contains "$out" 'requirement=REQUIRED FOR COMPUTER USE status=UNKNOWN (STORED DENIAL ONLY)' \
+    'stored no-mistakes Accessibility denial was presented as effective'
+  assert_contains "$out" 'com.mitchellh.ghostty -> com.apple.systemevents: UNKNOWN (STORED ALLOW ONLY)' \
+    'stored Ghostty-to-System Events relationship was presented as effective'
+  pass 'stored TCC rows remain unknown effective status'
 }
 
 test_mixed_identity_evidence_is_unknown() {
@@ -233,9 +259,44 @@ test_bundle_hint_does_not_override_stored_evidence() {
   assert_contains "$out" 'unverified bundle environment hint: com.mitchellh.ghostty (not used for attribution)' \
     'bundle environment value was not marked unverified'
   printf '%s\n' "$ghostty_section" \
-    | grep -E 'Full Disk Access +requirement=CONDITIONAL +status=NOT RECORDED' >/dev/null \
+    | grep -E 'Full Disk Access +requirement=CONDITIONAL +status=UNKNOWN \(NO MATCHING STORED ROW\)' >/dev/null \
     || fail 'bundle environment hint overrode stored Ghostty evidence'
   pass 'bundle environment hint never controls permission attribution'
+}
+
+test_daemon_path_requires_running_launch_job() {
+  local world out daemon_section
+  world=$(make_world daemon-unresolved)
+
+  out=$(FM_FAKE_DAEMON_AUTHORITATIVE=no run_report "$world")
+  daemon_section=$(printf '%s\n' "$out" | sed -n '/^no-mistakes daemon/,/^$/p')
+
+  assert_contains "$daemon_section" 'UNKNOWN: active launch job not resolved' \
+    'interactive PATH was presented as the daemon identity'
+  assert_contains "$daemon_section" 'authoritative launch job: UNKNOWN' \
+    'missing launch-job evidence was not disclosed'
+  printf '%s\n' "$daemon_section" | grep -E 'status=(ENTITLEMENT NOT PRESENT|PER TARGET)' >/dev/null \
+    && fail 'unresolved daemon path produced a conclusive entitlement status'
+  pass 'daemon identity requires one running authoritative launch job'
+}
+
+test_conflicting_automation_rows_are_unknown() {
+  local world out
+  world=$(make_world automation-conflict)
+  mkdir -p "$world/home/Library/Application Support/com.apple.TCC"
+  : > "$world/home/Library/Application Support/com.apple.TCC/TCC.db"
+
+  out=$(FM_FAKE_TCC_READABLE=yes FM_FAKE_AUTOMATION_CONFLICT=yes run_report "$world")
+
+  assert_contains "$out" \
+    'com.mitchellh.ghostty -> com.apple.systemevents: UNKNOWN (CONFLICTING STORED ROWS)' \
+    'conflicting Automation records were not collapsed to unknown'
+  case "$out" in
+    *'com.mitchellh.ghostty -> com.apple.systemevents: UNKNOWN (STORED ALLOW ONLY)'*)
+      fail 'conflicting Automation records also emitted a conclusive-looking allow row'
+      ;;
+  esac
+  pass 'conflicting Automation records collapse to one unknown relationship'
 }
 
 test_exact_settings_urls_and_no_other_mutation() {
@@ -299,5 +360,7 @@ test_failed_entitlement_probe_is_unknown
 test_entitlement_boolean_is_parsed
 test_partial_automation_query_is_unknown
 test_bundle_hint_does_not_override_stored_evidence
+test_daemon_path_requires_running_launch_job
+test_conflicting_automation_rows_are_unknown
 test_exact_settings_urls_and_no_other_mutation
 test_non_macos_refuses

@@ -86,6 +86,7 @@ config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitig
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
+  autocompact-resume.md  Claude-only local compaction resume anchor; see docs/autocompact-recovery.md
   backlog.md         task queue, dependencies, history
   captain.md         captain's personal preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store
@@ -127,6 +128,7 @@ For the tmux backend, the task window is always named `fm-<id>`; per-backend win
 
 Session start is one command, not a sequence of separate reads.
 Run `bin/fm-session-start.sh`.
+On a Claude compact-sourced recovery, the injected `FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT` already contains this session's one session-start digest; do not run the command again, and follow `docs/autocompact-recovery.md` for the hook boundary.
 It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - calling each as a real subprocess, never reimplementing their logic - then prints a full context digest and fleet-state digest, in one ordered, clearly delimited report:
 
 1. **Lock** - acquires the per-home session lock first, before anything mutates shared state.

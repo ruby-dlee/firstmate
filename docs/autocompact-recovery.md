@@ -15,6 +15,7 @@ After compaction, Claude Code emits a new `SessionStart` event with `source=comp
 The recovery phase prints the fresh anchor and the output of `bin/fm-session-start.sh` to stdout.
 If its compact-scoped hook payload is unreadable or invalid, recovery prints a loud warning and still emits durable context; only a successfully parsed non-compact `SessionStart` is a silent no-op.
 Claude Code adds that stdout to the compacted context, so Firstmate receives the normal lock, bootstrap, wake-queue, backlog, task, status-tail, endpoint, and supervision reconciliation before it resumes.
+That injected digest is the resumed session's single session-start pass; Firstmate does not run `bin/fm-session-start.sh` again after control returns to the model.
 The compact summary is explicitly treated as lossy and subordinate to those durable sources.
 
 The tracked hook is inert in a non-Firstmate repository and in an unmarked linked crewmate or scout worktree.

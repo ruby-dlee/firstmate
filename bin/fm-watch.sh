@@ -30,7 +30,12 @@
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
-#                          resume. Unless afk is active.
+#                          resume. A recognized harness permission prompt surfaces
+#                          immediately with an explicit permission-blocked reason.
+#                          A pane that remains busy without meaningful output,
+#                          status, or turn-end progress surfaces after
+#                          FM_PERMISSION_STALL_ESCALATE_SECS as a possible macOS
+#                          permission/system-dialog block. Unless afk is active.
 #   check: <script>: <out> per-task check output, always actionable
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
@@ -136,6 +141,16 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+# A macOS TCC/system dialog can block a foreground tool while the harness keeps
+# rendering its busy footer, so ordinary stale detection never starts. Track a
+# semantic pane fingerprint that excludes verified busy-footer churn and surface
+# a suspected permission/system-dialog block after this bounded interval. This is
+# deliberately a timeout heuristic: direct OS-dialog inspection requires
+# pre-granted Accessibility or Screen Recording access and cannot be assumed.
+PERMISSION_STALL_ESCALATE_SECS=${FM_PERMISSION_STALL_ESCALATE_SECS:-900}
+case "$PERMISSION_STALL_ESCALATE_SECS" in
+  ''|*[!0-9]*|0) PERMISSION_STALL_ESCALATE_SECS=900 ;;
+esac
 # A crew that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
@@ -216,6 +231,16 @@ window_kind() {
     return 0
   fi
   echo unknown
+}
+
+window_harness() {
+  local w=$1 meta harness
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  if [ -n "$meta" ]; then
+    harness=$(grep '^harness=' "$meta" | tail -1 | cut -d= -f2- || true)
+    [ -n "$harness" ] && { printf '%s' "$harness"; return 0; }
+  fi
+  printf 'unknown'
 }
 
 # window_backend: the backend recorded in the meta whose window= matches <w>,
@@ -397,6 +422,168 @@ surface_nonterminal_stale() {  # <window> <hash>
   wake "stale: $win"
 }
 
+# Recognize the stable confirmation chrome rendered by verified harnesses when a
+# mid-run permission or trust grant is waiting on a human. The question alone is
+# insufficient because pane output can quote it; each shape also requires its
+# title-specific choices and any verified footer in the final 16 lines, and the
+# caller requires the harness not to show its busy indicator.
+# Exact live-capture evidence and version details live in
+# docs/permission-stall-detection.md.
+# Pi has no permission system, while firstmate launches OpenCode and Grok in
+# their verified unattended modes; their unexpected
+# or future prompt shapes remain covered by the bounded no-progress fallback.
+permission_prompt_kind() {  # <harness> <tail40> <allow-directory-trust>
+  local harness=$1 tail40=$2 allow_directory_trust=${3:-0} prompt_tail
+  prompt_tail=$(printf '%s\n' "$tail40" | tail -16)
+  case "$harness" in
+    claude|unknown)
+      if printf '%s\n' "$tail40" | grep -Fq 'Do you want to proceed?' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq '1\. Yes' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq '3\. No' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq 'Esc to cancel.*Tab to amend'; then
+        printf 'command/tool permission'
+        return 0
+      fi
+      if [ "$allow_directory_trust" = 1 ] \
+        && printf '%s\n' "$tail40" | grep -Fq 'Quick safety check: Is this a project you created or one you trust?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, I trust this folder' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, exit' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq 'Enter to confirm.*Esc to cancel'; then
+        printf 'directory trust'
+        return 0
+      fi
+      ;;
+  esac
+  case "$harness" in
+    codex|unknown)
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to run the following command?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently)" \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'command/tool permission'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to grant these permissions?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, grant these permissions for this turn' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, continue without permissions' \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'permission profile'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to make the following edits?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, and tell Codex what to do differently' \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'file edit permission'
+        return 0
+      fi
+      if printf '%s\n' "$tail40" | grep -Eq 'Do you want to approve network access to ".+"\?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, just this once' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently|and block this host in the future)" \
+        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
+        printf 'network access'
+        return 0
+      fi
+      if [ "$allow_directory_trust" = 1 ] \
+        && printf '%s\n' "$tail40" | grep -Fq 'Do you trust the contents of this directory?' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, continue' \
+        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, quit'; then
+        printf 'directory trust'
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+clear_busy_stall_tracking() {  # <window>
+  local win=$1 key
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  rm -f "$STATE/.stale-busy-hash-$key" "$STATE/.stale-busy-since-$key" \
+    "$STATE/.wedge-escalations-busy-$key"
+}
+
+handle_permission_prompt() {  # <window> <task> <hash> <kind>
+  local win=$1 task=$2 h=$3 kind=$4 key marker escalation_file prior n reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  marker="$STATE/.stale-permission-$key"
+  escalation_file="$STATE/.wedge-escalations-permission-$key"
+  prior=$(cat "$marker" 2>/dev/null || true)
+  if [ "$prior" = "$h" ] && [ "$(age_of "$marker")" -lt "$PERMISSION_STALL_ESCALATE_SECS" ]; then
+    return 0
+  fi
+  if [ "$prior" = "$h" ]; then
+    n=$(( $(cat "$escalation_file" 2>/dev/null || echo 1) + 1 ))
+  else
+    n=1
+  fi
+  printf '%s' "$n" > "$escalation_file"
+  reason="stale: $win (permission-prompt detected: waiting for a $kind grant; inspect the requested action and escalate it to the captain - do not approve it automatically; escalation $n)"
+  if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+    reason="stale: $win (permission-prompt detected: waiting for a $kind grant; inspect the requested action and escalate it to the captain - do not approve it automatically; escalation $n; demand-deep-inspection)"
+  fi
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$h" > "$marker"
+  clear_busy_stall_tracking "$win"
+  mark_surfaced "$STATE/$task.status"
+  wake "$reason"
+}
+
+# Hash meaningful progress while a harness stays busy. Verified busy-footer lines
+# are excluded because elapsed counters and spinners can change on every capture
+# while a foreground tool is actually blocked behind an OS modal. Claude's
+# separate "Running N shell command" row can also animate its leading glyph, so
+# normalize that prefix while preserving the semantic row. Status and turn-end
+# signatures are folded in so either signal resets the no-progress clock.
+busy_progress_hash() {  # <task> <tail40>
+  local task=$1 tail40=$2 status_sig turn_sig
+  status_sig=$(stat_sig "$STATE/$task.status" || true)
+  turn_sig=$(stat_sig "$STATE/$task.turn-ended" || true)
+  {
+    printf '%s\n' "$tail40" \
+      | awk -v busy_re="$BUSY_REGEX" '{ line[NR] = $0 } END { start = NR - 5; if (start < 1) start = 1; for (i = 1; i <= NR; i++) if (i < start || line[i] !~ busy_re) print line[i] }' \
+      | sed -E 's/^.*(Running [0-9]+ shell commands?)/\1/'
+    printf 'status=%s\nturn=%s\n' "$status_sig" "$turn_sig"
+  } | hash_pane
+}
+
+# The OS does not provide a reliable unprivileged TCC-dialog query. This bounded
+# fallback detects the observable consequence instead: a harness remains busy but
+# its semantic pane, status, and turn-end state make no progress. The wake says
+# "possible" rather than claiming a dialog was observed, and repeats only once per
+# threshold window while preserving the existing demand-deep-inspection counter.
+busy_stall_check() {  # <window> <task> <tail40>
+  local win=$1 task=$2 tail40=$3 key hash_file since_file escalation_file h prev since age n reason now
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  hash_file="$STATE/.stale-busy-hash-$key"
+  since_file="$STATE/.stale-busy-since-$key"
+  escalation_file="$STATE/.wedge-escalations-busy-$key"
+  h=$(busy_progress_hash "$task" "$tail40")
+  prev=$(cat "$hash_file" 2>/dev/null || true)
+  now=$(date +%s)
+  if [ "$h" != "$prev" ]; then
+    printf '%s' "$h" > "$hash_file"
+    printf '%s' "$now" > "$since_file"
+    rm -f "$escalation_file"
+    return 0
+  fi
+  since=$(cat "$since_file" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) printf '%s' "$now" > "$since_file"; return 0 ;;
+  esac
+  age=$(( now - since ))
+  [ "$age" -ge "$PERMISSION_STALL_ESCALATE_SECS" ] || return 0
+  n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$n" > "$escalation_file"
+  reason="stale: $win (permission/system-dialog suspected: no meaningful progress for ${age}s while the harness remained busy; inspect the visible macOS dialog or Privacy & Security in System Settings and escalate any grant to the captain; timeout heuristic, not direct OS detection; escalation $n)"
+  if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+    reason="stale: $win (permission/system-dialog suspected: no meaningful progress for ${age}s while the harness remained busy; inspect the visible macOS dialog or Privacy & Security in System Settings and escalate any grant to the captain; timeout heuristic, not direct OS detection; escalation $n; demand-deep-inspection)"
+  fi
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$now" > "$since_file"
+  wake "$reason"
+}
+
 # Check and heartbeat cadence must survive actionable exits and restarts: the
 # watcher may be relaunched before in-memory counters reach their threshold on a
 # busy fleet. Persist the schedule as file mtimes instead.
@@ -456,6 +643,34 @@ safe_touch_marker() {  # <path>
 safe_marker_path() {  # <path>
   local marker=$1
   [ ! -L "$marker" ] && { [ ! -e "$marker" ] || [ -f "$marker" ]; }
+}
+
+task_generation_id() {  # <task>
+  local task=$1 meta generation
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  generation=$(fm_meta_get "$meta" generation_id)
+  [ -n "$generation" ] || return 1
+  printf '%s' "$generation"
+}
+
+brief_processing_started() {  # <task>
+  local task=$1 generation marker
+  generation=$(task_generation_id "$task") || return 1
+  marker="$STATE/.brief-started-$task"
+  safe_marker_path "$marker" || return 1
+  [ "$(cat "$marker" 2>/dev/null || true)" = "$generation" ]
+}
+
+mark_brief_processing_started() {  # <task>
+  local task=$1 generation marker tmp
+  brief_processing_started "$task" && return 0
+  generation=$(task_generation_id "$task") || return 1
+  marker="$STATE/.brief-started-$task"
+  tmp=$(mktemp "$STATE/.brief-started-$task.XXXXXX") || return 1
+  printf '%s' "$generation" > "$tmp" || { rm -f "$tmp"; return 1; }
+  safe_marker_path "$marker" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$marker"
 }
 
 UNSAFE_MARKERS_LOGGED='|'
@@ -814,6 +1029,26 @@ EOF
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
+    window_busy=0
+    if window_is_busy "$w" "$tail40"; then
+      window_busy=1
+      mark_brief_processing_started "$task" || true
+    fi
+    if [ "$window_busy" != 1 ]; then
+      allow_directory_trust=0
+      brief_processing_started "$task" && allow_directory_trust=1
+      prompt_kind=$(permission_prompt_kind "$(window_harness "$w")" "$tail40" "$allow_directory_trust" || true)
+      if [ -n "$prompt_kind" ]; then
+        handle_permission_prompt "$w" "$task" "$h" "$prompt_kind"
+        continue
+      fi
+    fi
+    rm -f "$STATE/.stale-permission-$key" "$STATE/.wedge-escalations-permission-$key"
+    if [ "$window_busy" = 1 ]; then
+      busy_stall_check "$w" "$task" "$tail40"
+    else
+      clear_busy_stall_tracking "$w"
+    fi
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
@@ -828,7 +1063,7 @@ EOF
       # else the last 6 non-blank lines only (the TUI footer area, where every
       # verified harness renders its busy indicator) so busy-looking strings
       # in displayed content cannot suppress stale detection.
-      if [ "$n" -ge 2 ] && ! window_is_busy "$w" "$tail40"; then
+      if [ "$n" -ge 2 ] && [ "$window_busy" != 1 ]; then
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
         if [ "$kind" = secondmate ]; then
@@ -939,7 +1174,7 @@ EOF
       echo 0 > "$cf"
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
-      if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
+      if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
         case "$(pause_state_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
           *)      clear_pause_tracking "$w" ;;

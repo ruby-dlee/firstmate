@@ -1,6 +1,9 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, and grok.
+description: >-
+  Agent-only reference for firstmate harness operations.
+  Use before spawning or recovering a crewmate or secondmate, handling a trust or permission dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
+  Contains verified facts for claude, codex, opencode, pi, and grok.
 user-invocable: false
 metadata:
   internal: true
@@ -46,6 +49,14 @@ When verifying a new adapter, record its env marker and command name in `bin/fm-
 
 For stuck recovery, the target window's harness is recorded as `harness=` in `state/<id>.meta`.
 Use that value for interrupt, exit, resume, and skill-invocation facts.
+
+## Mid-run permission prompts
+
+Firstmate launches every verified crewmate harness in its unattended mode, but a managed policy, a newly introduced tool class, or a failed autonomy flag can still produce a permission prompt after work has started.
+`bin/fm-watch.sh` owns the deterministic pane matcher and the busy/no-progress system-dialog fallback.
+`docs/permission-stall-detection.md` owns the empirical capture and macOS capability record.
+On either permission wake, load `stuck-crewmate-recovery` and follow its permission-blocked branch before using any interrupt, exit, or relaunch mechanic below.
+Never apply an adapter's startup trust-dialog acceptance rule to a mid-run command or capability grant.
 
 ## Primary turn-end guard
 
@@ -109,10 +120,13 @@ Natural language is acceptable if uncertain.
 | Exit command | `/exit` |
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
+| Protected mid-run grant shapes | `Do you want to proceed?` together with the `Esc to cancel · Tab to amend` footer, or `Quick safety check: Is this a project you created or one you trust?` together with `Yes, I trust this folder`, `No, exit`, and the confirmation footer. |
 
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
-If such a dialog is showing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.
+If a workspace trust or bypass-permissions dialog is showing before the brief starts processing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.
+The separate `Hooks need review` prompt with `Trust all on first launch` is Firstmate's own supervision-hook trust path and must also be accepted with Enter before the brief starts.
+Once the brief has started processing, treat either protected shape in the table as a security-sensitive mid-run grant and escalate it to the captain without pressing an approval or denial key.
 
 Claude renders a predicted-next-prompt suggestion as dim/faint text inside an otherwise-empty composer after a turn completes.
 A plain `tmux capture-pane` cannot tell that ghost text apart from typed text.
@@ -139,6 +153,7 @@ Claude Code's primary watcher protocol is the lowest-friction path: run `bin/fm-
 | Exit command | `/quit` (slash popup needs about 1 second between text and Enter; `fm-send` handles it) |
 | Interrupt | single Escape |
 | Skill invocation | `$<skill>` (e.g. `$no-mistakes`); `/<skill>` is claude-only and codex rejects it as "Unrecognized command" |
+| Protected mid-run grant shapes | One of `Would you like to run the following command?`, `Would you like to grant these permissions?`, `Would you like to make the following edits?`, or `Do you want to approve network access to "<host>"?`, together with its title-specific choices and `Press enter to confirm or esc to cancel`; or `Do you trust the contents of this directory?` together with `Yes, continue` and `No, quit`. |
 
 A `$<skill>` invocation opens a `$`-autocomplete (skill) popup, the same hazard as the `/` slash popup: submitting too fast lets the popup swallow the Enter, so the invocation never lands.
 `fm-send` handles it the same way it handles `/` - it gives the popup a longer settle (1.2s) between typing and the first Enter, with the target backend's submit retry as the safety net - but the `$` settle is scoped to `harness=codex`, read from the target metadata for exact task ids or legacy `fm-<id>` labels.
@@ -147,8 +162,9 @@ An explicit `session:window` target has no meta, so its harness is unknown and t
 This is why the validation trigger (`$no-mistakes`) to a codex crew now lands on the first Enter instead of biting the popup.
 
 Directory trust dialog on first run per repo root: "Do you trust the contents of this directory?"
-Accept with Enter.
+Accept with Enter only during the spawn-time peek before the brief starts processing.
 The decision persists for the repo, so later worktrees of the same project skip it.
+If that shape appears after work has started, escalate it to the captain as a mid-run directory-trust grant without pressing an approval or denial key.
 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.

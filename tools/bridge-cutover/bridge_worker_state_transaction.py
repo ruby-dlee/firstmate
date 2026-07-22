@@ -946,6 +946,12 @@ def begin(
     boundaries = boundaries or BoundaryController()
     lock_fd = _lock(manifest)
     try:
+        current_manifest = load_manifest(manifest.path)
+        if current_manifest.lock_path != manifest.lock_path:
+            raise WorkerStateError(
+                "worker-state lock binding changed while acquiring the lock"
+            )
+        manifest = current_manifest
         existing = _journal(manifest)
         if existing is not None:
             return plan(manifest)

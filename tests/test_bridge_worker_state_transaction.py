@@ -152,6 +152,29 @@ class WorkerStateTransactionTests(unittest.TestCase):
         self.assertFalse(cleaned["snapshot_bytes_present"])
         self.assertFalse(self.manifest.snapshot_path.exists())
 
+    def test_begin_reloads_manifest_after_lock_acquisition(self) -> None:
+        stale_manifest = self.manifest
+        bundle_path = self.fixture.bundle_dir / "bundle.json"
+        bundle_path.write_bytes(bundle_path.read_bytes() + b"\n")
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["bundle_sha256"] = hashlib.sha256(
+            bundle_path.read_bytes()
+        ).hexdigest()
+        self.manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.manifest_path.chmod(0o600)
+        current_manifest = worker_state.load_manifest(self.manifest_path)
+        self.assertNotEqual(stale_manifest.fingerprint, current_manifest.fingerprint)
+        worker_state.begin(stale_manifest)
+        journal = json.loads(
+            current_manifest.journal_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            journal["manifest_fingerprint"], current_manifest.fingerprint
+        )
+
     def _apply_runtime_switch(self) -> None:
         driver = prepare._load_driver(DRIVER)
         manifest_path = self.fixture.bundle_dir / "cutover.manifest.json"

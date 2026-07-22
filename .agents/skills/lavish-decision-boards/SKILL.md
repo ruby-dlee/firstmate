@@ -34,8 +34,9 @@ A read-only status page is not a decision surface.
 3. Open every board in its own dedicated Chrome window with `open -na "Google Chrome" --args --new-window "<url>"`.
 4. Start `lavish-axi poll <file>` silently and leave it running while review continues.
    Re-run it after every response while review continues.
-   Create and select a `chrome-devtools-axi` page for the exact served URL, then inspect that page's snapshot after a bounded wait for the layout audit.
-   A completed snapshot without the layout-issue banner confirms zero error-severity `layout_warnings` for that board.
+   Create and select a `chrome-devtools-axi` page for the exact served URL, then use a bounded retry to inspect that page's snapshots.
+   Pass only after the layout-audit-in-progress indicator has cleared and no layout-issue indicator is present, confirming zero error-severity `layout_warnings` for that board.
+   A returned snapshot alone is not success; if the bound expires while the audit remains in progress, treat the board as unverified and do not surface it.
    Consult `chrome-devtools-axi --help` and the relevant command help for current commands and flags.
    Do not announce the board as ready until that check passes.
    If the audit finds an error while the layout gate is still holding the board, fix it and verify again before the captain can answer.

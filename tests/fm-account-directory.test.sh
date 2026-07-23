@@ -481,6 +481,33 @@ test_direct_recovery_preserves_recorded_task_context() {
   pass "direct recovery preserves recorded task context while refreshing account selection"
 }
 
+test_direct_recovery_rejects_secondmate_metadata() {
+  local record id meta out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  id=direct-secondmate-refused-z4
+  record=$(make_spawn_case direct-secondmate-refused codex "$id")
+  read_spawn_case "$record"
+  meta="$SPAWN_HOME/state/$id.meta"
+  printf '%s\n' \
+    'kind=secondmate' \
+    'account_home=/accounts/codex/1' \
+    > "$meta"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery accepted secondmate metadata"
+  assert_contains "$out" "--recover-direct-account supports only recorded ship or scout tasks" \
+    "direct recovery did not identify its crewmate-only scope"
+  [ ! -s "$QUOTA_LOG" ] || fail "rejected secondmate recovery read direct account quota"
+  [ ! -s "$HERDR_LOG" ] || fail "rejected secondmate recovery installed a direct account hook"
+  pass "direct account recovery refuses secondmate metadata before selection"
+}
+
 test_direct_recovery_rejects_worktree_from_another_project() {
   local record id meta unrelated meta_tmp out status recorded_git_dir
   reset_accounts
@@ -828,94 +855,6 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   pass "direct spawn persists cleanup state when worktree return cannot be confirmed"
 }
 
-test_direct_secondmate_recovery_adopts_proven_primary_fast_forward() {
-  local primary home id first_head target_head meta out
-  reset_accounts
-  set_remaining 1 90,85
-  id=direct-secondmate-sync-z9
-  primary="$TMP_ROOT/direct-secondmate-primary"
-  home="$TMP_ROOT/direct-secondmate-home"
-  mkdir -p "$primary"
-  cp -R "$ROOT/bin" "$primary/bin"
-  cp "$ROOT/AGENTS.md" "$primary/AGENTS.md"
-  printf '%s\n' 'data/' 'state/' 'config/' 'projects/' '.fm-secondmate-home' > "$primary/.gitignore"
-  git -C "$primary" init --quiet -b main
-  git -C "$primary" add AGENTS.md bin .gitignore
-  git -C "$primary" -c user.name=fmtest -c user.email=fmtest@example.invalid \
-    commit --quiet -m initial
-  git -C "$primary" worktree add --quiet --detach "$home" HEAD
-  mkdir -p "$primary/data/$id" "$primary/state" "$primary/config" "$primary/projects"
-  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
-  printf '%s\n' codex > "$primary/config/crew-harness"
-  printf '%s\n' enforce > "$primary/config/account-routing-mode"
-  printf '%s\n' "$id" > "$home/.fm-secondmate-home"
-  printf '%s\n' "charter for $id" > "$home/data/charter.md"
-  touch "$primary/state/.last-watcher-beat"
-
-  FM_TEST_ROOT_OVERRIDE="$primary" \
-    run_direct_spawn "$primary" "$home" "$TMP_ROOT/direct-secondmate-launch.log" \
-      "$id" "$home" --harness codex --secondmate >/dev/null 2>&1
-  meta="$primary/state/$id.meta"
-  first_head=$(git -C "$home" rev-parse HEAD)
-  assert_grep "worktree_git_head=$first_head" "$meta" \
-    "direct secondmate spawn did not record its detached HEAD"
-
-  printf '%s\n' advanced > "$primary/revision-marker"
-  git -C "$primary" add revision-marker
-  git -C "$primary" -c user.name=fmtest -c user.email=fmtest@example.invalid \
-    commit --quiet -m advance
-  target_head=$(git -C "$primary" rev-parse HEAD)
-  rm -f "$primary/state/.fake-endpoint"
-
-  out=$(FM_TEST_ROOT_OVERRIDE="$primary" \
-    run_direct_spawn "$primary" "$home" "$TMP_ROOT/direct-secondmate-launch.log" \
-      "$id" --recover-direct-account 2>&1)
-  assert_contains "$out" "spawned $id harness=codex kind=secondmate" \
-    "direct secondmate recovery did not launch after the proven fast-forward"
-  [ "$(git -C "$home" rev-parse HEAD)" = "$target_head" ] \
-    || fail "direct secondmate recovery did not advance to the primary target"
-  assert_grep "worktree_git_head=$target_head" "$meta" \
-    "direct secondmate recovery did not adopt the proven synchronized HEAD"
-  pass "direct secondmate recovery adopts a proven primary fast-forward"
-}
-
-test_stale_secondmate_without_direct_cutover_is_refused() {
-  local primary home id out status
-  reset_accounts
-  : > "$TMP_ROOT/agent-fleet.log"
-  set_remaining 1 80,80
-  id=stale-secondmate-z4
-  primary="$TMP_ROOT/stale-primary"
-  home="$TMP_ROOT/stale-secondmate"
-  mkdir -p "$primary/data/$id" "$primary/projects" "$primary/state" "$primary/config"
-  mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
-  printf '%s\n' codex > "$primary/config/crew-harness"
-  printf '%s\n' enforce > "$primary/config/account-routing-mode"
-  touch "$primary/state/.last-watcher-beat"
-  printf '%s\n' "$id" > "$home/.fm-secondmate-home"
-  printf '%s\n' '# Firstmate' > "$home/AGENTS.md"
-  printf '%s\n' charter > "$home/data/charter.md"
-  printf '%s\n' 'fm_account_resolve_mode() {' '  :' '}' > "$home/bin/fm-account-routing-lib.sh"
-  printf '%s\n' \
-    'ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0)' \
-    '"$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS"' \
-    > "$home/bin/fm-spawn.sh"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$home/bin/fm-account-directory.sh"
-  chmod +x "$home/bin/fm-account-directory.sh"
-
-  if out=$(run_direct_spawn "$primary" "$home" "$TMP_ROOT/stale-secondmate-launch.log" \
-    "$id" "$home" --harness codex --secondmate 2>&1); then
-    status=0
-  else
-    status=$?
-  fi
-  [ "$status" -ne 0 ] || fail "stale enforced secondmate launched without the direct account-directory cutover"
-  assert_contains "$out" "lacks direct account-directory routing support" \
-    "stale secondmate refusal did not identify the missing direct cutover"
-  [ ! -s "$TMP_ROOT/stale-secondmate-launch.log" ] || fail "stale secondmate reached provider launch"
-  pass "enforced secondmates require the direct account-directory cutover after a skipped sync"
-}
-
 test_routing_off_keeps_default_provider_launch() {
   local record id out launch meta
   reset_accounts
@@ -943,9 +882,10 @@ make_spawn_fakebin "$FAKEBIN"
 
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
+  test_direct_recovery_preserves_recorded_task_context
+  test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
-  test_direct_secondmate_recovery_adopts_proven_primary_fast_forward
   exit 0
 fi
 
@@ -961,6 +901,7 @@ test_spawn_uses_direct_claude_fallback_and_hook
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
+test_direct_recovery_rejects_secondmate_metadata
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief
 test_direct_recovery_rejects_changed_worktree_identity
@@ -969,8 +910,6 @@ test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
-test_direct_secondmate_recovery_adopts_proven_primary_fast_forward
-test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 
 echo "# all fm-account-directory tests passed"

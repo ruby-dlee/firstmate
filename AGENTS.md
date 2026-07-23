@@ -79,8 +79,9 @@ tools/               independently versioned provider-neutral components, commit
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
-config/account-routing-mode  optional account routing policy (`off`, `observe`, or `enforce`); new observe/enforce launches use direct account directories while existing managed metadata retains legacy Agent Fleet recovery; LOCAL, gitignored; default off; inherited by secondmate homes (docs/configuration.md "Agent Fleet account routing")
-config/secondmate-account-pool  compatibility account-routing input the PRIMARY uses for SECONDMATE launches when routing is enabled; LOCAL, gitignored; activation-only and NOT inherited
+config/account-routing-mode  optional account routing policy (`off`, `observe`, or `enforce`); new ship/scout observe/enforce launches use direct account directories, secondmate launches retain legacy Agent Fleet routing, and existing managed metadata retains legacy Agent Fleet recovery; LOCAL, gitignored; default off; inherited by secondmate homes (docs/configuration.md "Agent Fleet account routing")
+config/secondmate-account-pool  optional Agent Fleet pool the PRIMARY uses for SECONDMATE launches when routing is enabled; LOCAL, gitignored; selection-only and NOT inherited
+Direct account-directory launch currently covers ship/scout crewmates only; secondmate integration is deferred to a dedicated follow-up.
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend, herdr/zellij/cmux are experimental new-task spawn backends, and Orca is legacy-recovery-only (docs/tmux-backend.md, docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and Orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
@@ -103,10 +104,10 @@ state/               volatile runtime signals; gitignored
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=, generation_id=, report_required=
-  Direct account launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD. Ship and scout metadata may temporarily carry worktree_git_setup_ref= and worktree_git_setup_head= while the brief's required `fm/<id>` branch transition is pending; recovery accepts only that exact setup state or the authoritative `fm/<id>` ref and removes the setup fields after adoption.
+  Direct ship and scout launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD. Their metadata may temporarily carry worktree_git_setup_ref= and worktree_git_setup_head= while the brief's required `fm/<id>` branch transition is pending; recovery accepts only that exact setup state or the authoritative `fm/<id>` ref and removes the setup fields after adoption.
   Direct recovery validates the canonical worktree path, exact physical Git-dir identity, and authoritative final state before account preparation and again immediately before endpoint creation; any drift fails closed without launching.
   If endpoint removal after a failed new direct spawn cannot be confirmed, direct_spawn_cleanup=pending and rollback_pending=1 retain the endpoint and worktree identity for explicit teardown.
-  Legacy managed recovery retains account_pool=, account_profile=, account_task=, account_attempt=, and provider_session_id= (docs/configuration.md "Agent Fleet account routing").
+  Secondmate Agent Fleet routing and legacy managed recovery own account_pool=, account_profile=, account_task=, account_attempt=, and provider_session_id= (docs/configuration.md "Agent Fleet account routing").
   kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
@@ -212,7 +213,7 @@ That refusal is the consultation backstop, so the rules are never silently skipp
 The requirement is gated only on the file's presence; when the file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness` as before.
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
-`quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; every real new launch uses direct account-directory selection.
+`quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; every real new ship/scout launch uses direct account-directory selection.
 When candidates carry account pools, the selector chooses the ordered first profile and passes its pool to spawn only as a compatibility activation input, never as an account choice or lease request.
 The now-unreachable Agent Fleet pool-summary implementation and inactive new-lease fixtures are legacy code deferred to follow-up task `remove-fleet-routing-deadcode`.
 Quota trouble must never block dispatch.
@@ -261,7 +262,7 @@ Reconcile reality with your records before doing anything else, working from the
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
 6. For meta with no window, or an endpoint the digest reported dead, reconcile by kind.
-   If meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id> --recover-direct-account`.
+   If ship/scout meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id> --recover-direct-account`.
    That mode reloads the recorded task context and performs fresh direct account-directory selection.
    If meta records `account_profile=`, first try the exact sticky session with `bin/fm-spawn.sh <id> --resume-account`; when that session/profile is unavailable, use `--continue-account` for the task-owned provider-neutral handoff after re-verifying live and repository state, with `bin/fm-account-continuation.sh` owning the fail-closed packet contract.
    For ordinary crewmates, check the recorded backend metadata first; use `treehouse status` for treehouse-backed tasks, and the recorded `orca_worktree_id=`/`terminal=` for Orca tasks.
@@ -439,7 +440,7 @@ bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harn
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --account-pool codex-crew   # compatibility flag activating direct account-directory selection
 bin/fm-spawn.sh <id> projects/<repo> --harness claude --account-profile claude-2   # compatibility flag activating direct account-directory selection
-bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving direct account recovery with fresh selection
+bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving ship/scout direct account recovery with fresh selection
 bin/fm-spawn.sh <id> --resume-account             # sticky legacy managed recovery; never a fresh prompt
 bin/fm-spawn.sh <id> --continue-account           # fresh legacy managed session from verified task-owned continuation state
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|cmux>   # explicit new-task runtime backend (docs/configuration.md "Runtime backend")

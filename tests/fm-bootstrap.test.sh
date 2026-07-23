@@ -765,7 +765,7 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "new enforce mode still required Agent Fleet"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "enforce mode did not retain the secondmate Agent Fleet dependency"
   assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
   assert_contains "$out" 'MISSING_MANUAL: herdr' "enforce mode did not report the direct hook installer"
 
@@ -855,7 +855,7 @@ SH
   assert_contains "$out" 'MISSING_MANUAL: herdr' "direct metadata did not retain the hook dependency when routing was off"
   assert_contains "$out" 'MISSING_MANUAL: perl' "direct metadata did not preflight the fixed passwd-home resolver"
   assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "direct metadata incorrectly restored the legacy recovery dependency"
-  pass "bootstrap requires direct launch tools for new routing and Agent Fleet only for legacy recovery metadata"
+  pass "bootstrap requires direct launch tools for crews and Agent Fleet for enforced secondmates or legacy recovery"
 }
 
 test_agent_fleet_install_requires_manual_release() {

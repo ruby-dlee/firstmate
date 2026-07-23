@@ -51,24 +51,27 @@
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
 #   Account routing is independently default-off. Its precedence and off/observe/
-#   enforce resolution is owned by fm-account-routing-lib.sh. For any NEW routed
-#   Claude or Codex launch, fm-account-directory.sh discovers the current user's
-#   account homes, chooses one through its direct per-vendor usage contract,
-#   installs that profile's Herdr hook, and prefixes the provider command with
-#   CLAUDE_CONFIG_DIR or CODEX_HOME. No Agent Fleet selection or lease occurs.
+#   enforce resolution is owned by fm-account-routing-lib.sh. Direct account-
+#   directory launch currently covers ship/scout crewmates only; secondmate
+#   integration is deferred and retains legacy Agent Fleet routing.
+#   For a NEW routed Claude or Codex ship/scout, fm-account-directory.sh discovers
+#   the current user's account homes, chooses one through its direct per-vendor
+#   usage contract, installs that profile's Herdr hook, and prefixes the provider
+#   command with CLAUDE_CONFIG_DIR or CODEX_HOME.
 #   Existing --account-pool and --account-profile inputs remain compatibility
 #   activation signals for new direct launches; their aliases do not constrain
 #   the direct usage choice. --no-account-routing remains the emergency per-spawn
 #   opt-out and cannot be combined with either account flag. Off launches retain
 #   their existing default-identity behavior.
 #   config/secondmate-account-pool remains the primary's durable, non-inherited
-#   activation input for secondmate agents when routing is enabled. A secondmate's
-#   own crewmates use inherited crew dispatch/routing policy, not this setting.
+#   Agent Fleet selection input for secondmate agents when routing is enabled. A
+#   secondmate's own crewmates use inherited crew dispatch/routing policy, not
+#   this setting.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
 #   session/lease behavior needed to recover those already-managed generations;
-#   new launches never create that metadata.
-#   --recover-direct-account is the account_home recovery path. It reloads kind,
+#   ship/scout launches never create that metadata.
+#   --recover-direct-account is the ship/scout account_home recovery path. It reloads kind,
 #   project, worktree, harness, backend, model, effort, mode, yolo, and report
 #   requirements from metadata, selects a fresh account directory, and creates
 #   only a replacement endpoint in the recorded worktree.
@@ -213,24 +216,8 @@ capture_worktree_git_physical_identity() {
   [ -n "$WORKTREE_GIT_DIR" ] && [ -n "$WORKTREE_GIT_DIR_IDENTITY" ]
 }
 
-capture_worktree_git_final_state() {
-  local worktree=$1
-  WORKTREE_GIT_REF=$(git_worktree_ref "$worktree" 2>/dev/null || true)
-  WORKTREE_GIT_HEAD=
-  WORKTREE_GIT_SETUP_REF=
-  WORKTREE_GIT_SETUP_HEAD=
-  if [ -z "$WORKTREE_GIT_REF" ]; then
-    WORKTREE_GIT_HEAD=$(git_worktree_head "$worktree" 2>/dev/null) || return 1
-  fi
-  [ -n "$WORKTREE_GIT_REF" ] || [ -n "$WORKTREE_GIT_HEAD" ]
-}
-
 capture_direct_launch_authoritative_state() {
   local current_ref current_head expected_ref
-  if [ "$KIND" = secondmate ]; then
-    capture_worktree_git_final_state "$WT"
-    return
-  fi
   current_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
   current_head=$(git_worktree_head "$WT" 2>/dev/null) || return 1
   expected_ref="refs/heads/fm/$ID"
@@ -633,6 +620,10 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
     KIND=$(spawn_preflight_meta_value kind)
     [ -n "$KIND" ] || KIND=ship
+    case "$KIND" in
+      ship|scout) ;;
+      *) echo "error: --recover-direct-account supports only recorded ship or scout tasks" >&2; exit 1 ;;
+    esac
   fi
   recorded_backend=$(spawn_preflight_meta_value backend)
   [ -n "$recorded_backend" ] || recorded_backend=tmux
@@ -1079,10 +1070,6 @@ persist_failed_direct_recovery() {
       echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
       echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
     }
-    [ "${KIND:-${RECORDED_KIND:-ship}}" != secondmate ] || {
-      echo "home=${PROJ_ABS:-${RECORDED_HOME:-}}"
-      echo "projects=${SECONDMATE_PROJECTS:-${RECORDED_PROJECTS:-}}"
-    }
     echo "direct_recovery_cleanup=pending"
     echo "direct_recovery_backup=$backup_name"
     echo "direct_recovery_artifacts=$artifacts_name"
@@ -1099,13 +1086,7 @@ persist_failed_direct_spawn() {
   retained_tmux_session=
   retained_mode=${MODE:-}
   retained_yolo=${YOLO:-off}
-  if [ -z "$retained_mode" ]; then
-    if [ "${KIND:-ship}" = secondmate ]; then
-      retained_mode=secondmate
-    else
-      retained_mode=no-mistakes
-    fi
-  fi
+  [ -n "$retained_mode" ] || retained_mode=no-mistakes
   if [ "${BACKEND:-tmux}" = tmux ]; then
     retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
     retained_window=$retained_tmux_session
@@ -1161,10 +1142,6 @@ persist_failed_direct_spawn() {
       [ "${BACKEND:-tmux}" != cmux ] || {
         echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
         echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
-      }
-      [ "${KIND:-ship}" != secondmate ] || {
-        echo "home=${PROJ_ABS:-}"
-        echo "projects=${SECONDMATE_PROJECTS:-}"
       }
     } > "$tmp" || { rm -f "$tmp"; return 1; }
   fi
@@ -1600,8 +1577,6 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     RECORDED_EFFORT=$(fm_meta_get "$RESUME_META" effort)
     RECORDED_MODE=$(fm_meta_get "$RESUME_META" mode)
     RECORDED_YOLO=$(fm_meta_get "$RESUME_META" yolo)
-    RECORDED_HOME=$(fm_meta_get "$RESUME_META" home)
-    RECORDED_PROJECTS=$(fm_meta_get "$RESUME_META" projects)
     RECORDED_WORKTREE_GIT_DIR=$(fm_meta_get "$RESUME_META" worktree_git_dir)
     RECORDED_WORKTREE_GIT_DIR_IDENTITY=$(fm_meta_get "$RESUME_META" worktree_git_dir_identity)
     RECORDED_WORKTREE_GIT_REF=$(fm_meta_get "$RESUME_META" worktree_git_ref)
@@ -1617,7 +1592,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       RECORDED_REPORT_REQUIRED=$(fm_meta_get "$RESUME_META" report_required)
     fi
     case "$RECORDED_KIND" in
-      ship|scout|secondmate) ;;
+      ship|scout) ;;
       *) echo "error: direct account recovery metadata has invalid kind '$RECORDED_KIND' for $ID" >&2; exit 1 ;;
     esac
     case "$RECORDED_HARNESS" in
@@ -1652,7 +1627,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       exit 1
     fi
     if [ -n "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ] \
-      && { [ -z "$RECORDED_WORKTREE_GIT_REF" ] || [ -n "$RECORDED_WORKTREE_GIT_HEAD" ] || [ "$RECORDED_KIND" = secondmate ]; }; then
+      && { [ -z "$RECORDED_WORKTREE_GIT_REF" ] || [ -n "$RECORDED_WORKTREE_GIT_HEAD" ]; }; then
       echo "error: direct account recovery metadata has an invalid branch-setup transition for $ID" >&2
       exit 1
     fi
@@ -1672,12 +1647,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ "$EFFORT" = default ] && EFFORT=
     ARG3=$HARNESS_ARG
     DIRECT_ACCOUNT_RESPAWN=1
-    if [ "$KIND" = secondmate ]; then
-      [ -n "$RECORDED_HOME" ] || { echo "error: direct secondmate recovery metadata has no home for $ID" >&2; exit 1; }
-      FIRSTMATE_HOME=$RECORDED_HOME
-    else
-      PROJ=$RECORDED_PROJECT
-    fi
+    PROJ=$RECORDED_PROJECT
   else
     RECORDED_PROFILE=$(fm_meta_get "$RESUME_META" account_profile)
     RECORDED_POOL=$(fm_meta_get "$RESUME_META" account_pool)
@@ -1768,8 +1738,6 @@ direct_recovery_context_matches() {
     && [ "$(fm_meta_get "$RESUME_META" account_home)" = "$RECORDED_ACCOUNT_HOME" ] \
     && [ "$(fm_meta_get "$RESUME_META" generation_id)" = "$RECORDED_GENERATION" ] \
     && [ "$(fm_meta_get "$RESUME_META" tasktmp)" = "$RECORDED_TASKTMP" ] \
-    && [ "$(fm_meta_get "$RESUME_META" home)" = "$RECORDED_HOME" ] \
-    && [ "$(fm_meta_get "$RESUME_META" projects)" = "$RECORDED_PROJECTS" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" direct_recovery_cleanup)" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" direct_spawn_cleanup)" ] \
@@ -1782,46 +1750,6 @@ direct_recovery_context_matches() {
   else
     ! grep -q '^report_required=' "$RESUME_META"
   fi
-}
-
-adopt_direct_secondmate_detached_head() {
-  local new_head=$1 tmp
-  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
-  if ! direct_recovery_context_matches; then
-    fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
-    META_WRITE_LOCK=
-    return 1
-  fi
-  tmp=$(mktemp "$STATE/.$ID.meta.direct-sync.XXXXXX") || {
-    fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
-    META_WRITE_LOCK=
-    return 1
-  }
-  if ! awk -v head="$new_head" '
-    !/^worktree_git_ref=/ && !/^worktree_git_head=/ && !/^worktree_git_setup_ref=/ && !/^worktree_git_setup_head=/ { print }
-    END { print "worktree_git_head=" head }
-  ' "$RESUME_META" > "$tmp" \
-    || ! fm_account_safe_file_destination "$RESUME_META" \
-    || ! mv "$tmp" "$RESUME_META"; then
-    rm -f "$tmp"
-    fm_account_meta_lock_release "$META_WRITE_LOCK" >/dev/null 2>&1 || true
-    META_WRITE_LOCK=
-    return 1
-  fi
-  fm_account_meta_lock_release "$META_WRITE_LOCK" || return 1
-  META_WRITE_LOCK=
-  RECORDED_WORKTREE_GIT_REF=
-  RECORDED_WORKTREE_GIT_HEAD=$new_head
-  RECORDED_WORKTREE_GIT_SETUP_REF=
-  RECORDED_WORKTREE_GIT_SETUP_HEAD=
-  RECORDED_META_WORKTREE_GIT_REF=
-  RECORDED_META_WORKTREE_GIT_HEAD=$new_head
-  RECORDED_META_WORKTREE_GIT_SETUP_REF=
-  RECORDED_META_WORKTREE_GIT_SETUP_HEAD=
-  WORKTREE_GIT_REF=
-  WORKTREE_GIT_HEAD=$new_head
-  WORKTREE_GIT_SETUP_REF=
-  WORKTREE_GIT_SETUP_HEAD=
 }
 
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
@@ -1934,7 +1862,7 @@ if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
 fi
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   ACCOUNT_EXPLICIT=1
-elif [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$NO_ACCOUNT_ROUTING" = 0 ] \
+elif [ "$KIND" != secondmate ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$NO_ACCOUNT_ROUTING" = 0 ] \
   && [ "$SPAWN_META_PRESENT" = 1 ] \
   && [ -n "$(spawn_preflight_meta_value account_home)" ]; then
   echo "error: direct account metadata already exists for ${POS[0]}; use --recover-direct-account to preserve its recorded task context" >&2
@@ -1974,7 +1902,8 @@ case "$HARNESS" in
     ACCOUNT_EFFECTIVE_MODE=off
     ;;
 esac
-if { [ "$RECOVERY_ACCOUNT" = 0 ] || [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; } \
+if { [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
+    || { [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$KIND" != secondmate ]; }; } \
   && [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && fm_account_test_lab_enabled \
     && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] \
@@ -1997,8 +1926,8 @@ if { [ "$RECOVERY_ACCOUNT" = 0 ] || [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; } \
       DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
       echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
     fi
-    # Every Agent Fleet branch below is guarded by enforce. New direct launches
-    # deliberately rejoin the ordinary unmanaged spawn path after selection.
+    # Every Agent Fleet branch below is guarded by enforce. New direct crewmate
+    # launches deliberately rejoin the ordinary unmanaged spawn path after selection.
     ACCOUNT_EFFECTIVE_MODE=off
   fi
 fi
@@ -2249,22 +2178,12 @@ validate_firstmate_home_for_spawn() {
   printf '%s\n' "$abs_home"
 }
 
-secondmate_home_supports_legacy_account_routing() {
+secondmate_home_supports_account_routing() {
   local home=$1
   [ -f "$home/bin/fm-account-routing-lib.sh" ] \
     && [ -f "$home/bin/fm-spawn.sh" ] \
     && grep -q '^fm_account_resolve_mode()' "$home/bin/fm-account-routing-lib.sh" \
     && grep -Fq "ACCOUNT_EFFECTIVE_MODE=\$(fm_account_resolve_mode" "$home/bin/fm-spawn.sh"
-}
-
-secondmate_home_supports_direct_account_routing() {
-  local home=$1
-  [ -f "$home/bin/fm-account-directory.sh" ] \
-    && [ ! -L "$home/bin/fm-account-directory.sh" ] \
-    && [ -x "$home/bin/fm-account-directory.sh" ] \
-    && [ -f "$home/bin/fm-spawn.sh" ] \
-    && grep -Fqx '# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2' "$home/bin/fm-account-directory.sh" \
-    && grep -Fqx '# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2' "$home/bin/fm-spawn.sh"
 }
 
 secondmate_routing_config_inherited() {
@@ -2348,15 +2267,6 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   esac
 fi
 
-DIRECT_SECONDMATE_PRE_SYNC_HEAD=
-if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$KIND" = secondmate ]; then
-  validate_direct_recovery_worktree_identity || exit 1
-  DIRECT_SECONDMATE_PRE_SYNC_HEAD=$(git_worktree_head "$WT" 2>/dev/null) || {
-    echo "error: recorded direct secondmate recovery HEAD is unavailable for $ID" >&2
-    exit 1
-  }
-fi
-
 if [ "$KIND" = secondmate ]; then
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
@@ -2377,39 +2287,6 @@ if [ "$KIND" = secondmate ]; then
     esac
   else
     echo "warning: secondmate $ID sync skipped before launch: primary default-branch commit cannot be resolved" >&2
-  fi
-  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-    validate_direct_recovery_physical_identity || exit 1
-    direct_secondmate_post_sync_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
-    direct_secondmate_post_sync_head=$(git_worktree_head "$WT" 2>/dev/null) || {
-      echo "error: direct secondmate recovery HEAD became unavailable during synchronization for $ID" >&2
-      exit 1
-    }
-    if [ -n "$RECORDED_WORKTREE_GIT_REF" ]; then
-      [ "$direct_secondmate_post_sync_ref" = "$RECORDED_WORKTREE_GIT_REF" ] || {
-        echo "error: recorded direct secondmate recovery worktree '$WT' changed branch identity during synchronization" >&2
-        exit 1
-      }
-    elif [ -n "$direct_secondmate_post_sync_ref" ]; then
-      echo "error: recorded direct secondmate recovery worktree '$WT' attached to a branch during synchronization" >&2
-      exit 1
-    elif [ "$direct_secondmate_post_sync_head" != "$DIRECT_SECONDMATE_PRE_SYNC_HEAD" ]; then
-      if [ -z "${sm_primary_head:-}" ] \
-        || [ "$direct_secondmate_post_sync_head" != "$sm_primary_head" ] \
-        || ! git_repository_probe -C "$WT" merge-base --is-ancestor "$DIRECT_SECONDMATE_PRE_SYNC_HEAD" "$sm_primary_head" 2>/dev/null; then
-        git_repository_probe -C "$WT" checkout --detach "$DIRECT_SECONDMATE_PRE_SYNC_HEAD" >/dev/null 2>&1 || true
-        echo "error: direct secondmate recovery synchronization did not produce the proven primary fast-forward target for $ID" >&2
-        exit 1
-      fi
-      if ! adopt_direct_secondmate_detached_head "$direct_secondmate_post_sync_head"; then
-        git_repository_probe -C "$WT" checkout --detach "$DIRECT_SECONDMATE_PRE_SYNC_HEAD" >/dev/null 2>&1 || {
-          echo "error: failed to restore direct secondmate $ID after metadata adoption failed" >&2
-          exit 1
-        }
-        echo "error: failed to adopt synchronized direct secondmate identity for $ID" >&2
-        exit 1
-      fi
-    fi
   fi
   # Inheritable-config propagation: push the primary's declared LOCAL config into
   # this secondmate home's config/, so the secondmate's OWN crewmates and backlog
@@ -2441,16 +2318,13 @@ if [ "$KIND" = secondmate ]; then
     echo "error: refusing secondmate launch for $PROJ_ABS: the primary's $ACCOUNT_PRIMARY_MODE routing mode is not authoritative in the home. Run bin/fm-config-push.sh and retry." >&2
     exit 1
   fi
-  if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
-    if ! secondmate_home_supports_direct_account_routing "$PROJ_ABS"; then
-      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks direct account-directory routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
       exit 1
     fi
-  elif [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-    if ! secondmate_home_supports_legacy_account_routing "$PROJ_ABS"; then
-      echo "error: refusing legacy managed secondmate recovery for $PROJ_ABS: the home lacks Agent Fleet recovery support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
-      exit 1
-    fi
+  elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
+    echo "warning: secondmate $ID home $PROJ_ABS lacks Agent Fleet routing support; launching because account routing is $ACCOUNT_EFFECTIVE_MODE" >&2
   fi
   rm -f "$CONFIG_INHERIT_REPORT_TMP"
   CONFIG_INHERIT_REPORT_TMP=
@@ -2517,26 +2391,15 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-  if [ "$KIND" != secondmate ]; then
-    validate_spawn_worktree "recorded direct account recovery" "$RECORDED_TARGET"
-    recorded_project_common=$(git_common_dir_real "$PROJ_ABS" 2>/dev/null || true)
-    recorded_worktree_common=$(git_common_dir_real "$WT" 2>/dev/null || true)
-    if [ -z "$recorded_project_common" ] || [ -z "$recorded_worktree_common" ] \
-      || [ "$recorded_project_common" != "$recorded_worktree_common" ]; then
-      echo "error: recorded direct account recovery worktree '$WT' does not belong to recorded project '$PROJ_ABS'; refusing endpoint creation" >&2
-      exit 1
-    fi
+  validate_spawn_worktree "recorded direct account recovery" "$RECORDED_TARGET"
+  recorded_project_common=$(git_common_dir_real "$PROJ_ABS" 2>/dev/null || true)
+  recorded_worktree_common=$(git_common_dir_real "$WT" 2>/dev/null || true)
+  if [ -z "$recorded_project_common" ] || [ -z "$recorded_worktree_common" ] \
+    || [ "$recorded_project_common" != "$recorded_worktree_common" ]; then
+    echo "error: recorded direct account recovery worktree '$WT' does not belong to recorded project '$PROJ_ABS'; refusing endpoint creation" >&2
+    exit 1
   fi
   validate_direct_recovery_worktree_identity || exit 1
-elif [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] && [ "$KIND" = secondmate ]; then
-  WT=$(cd "$WT" 2>/dev/null && pwd -P) || {
-    echo "error: cannot canonicalize direct account worktree for $ID" >&2
-    exit 1
-  }
-  capture_worktree_git_physical_identity "$WT" || {
-    echo "error: cannot record exact direct account worktree identity for $ID" >&2
-    exit 1
-  }
 fi
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -2940,7 +2803,6 @@ SECONDMATE_PROJECTS=
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   MODE=$RECORDED_MODE
   YOLO=$RECORDED_YOLO
-  SECONDMATE_PROJECTS=$RECORDED_PROJECTS
 elif [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
@@ -2952,6 +2814,9 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
+if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
+  fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" "$WT" || exit 1
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
     if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS" "$WT"; then

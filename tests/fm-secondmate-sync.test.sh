@@ -361,30 +361,6 @@ test_bootstrap_sweep_nudges_only_instruction_change() {
   pass "T8 bootstrap sweeps live homes, nudges only the running real-instruction-change secondmate"
 }
 
-test_bootstrap_defers_direct_account_home_sync() {
-  local w c1 c2 fakebin out nudge_line
-  w=$(new_world boot-direct-account)
-  c1=$(head_of "$w/main")
-  add_sm_worktree "$w" sm-direct "$c1"
-  printf 'account_home=/accounts/codex/1\n' >> "$w/home/state/sm-direct.meta"
-  add_sm_worktree "$w" sm-standard "$c1"
-  bump_primary "$w" instr
-  c2=$(head_of "$w/main")
-
-  fakebin=$(make_fake_toolchain "$w")
-  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
-    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-
-  [ "$(head_of "$w/sm-direct")" = "$c1" ] \
-    || fail "bootstrap advanced a direct-account home before guarded recovery"
-  [ "$(head_of "$w/sm-standard")" = "$c2" ] \
-    || fail "bootstrap stopped syncing a standard secondmate home"
-  nudge_line=$(printf '%s\n' "$out" | grep '^NUDGE_SECONDMATES:' || true)
-  assert_contains "$nudge_line" "fm-sm-standard" "standard secondmate was not nudged after sync"
-  assert_not_contains "$nudge_line" "fm-sm-direct" "direct-account secondmate was nudged before recovery"
-  pass "bootstrap leaves direct-account HEAD adoption to guarded recovery"
-}
-
 # --- T8b: nudge selectors stay fm-<id> when liveness respawn rotates herdr ----
 # Reproduces the 2026-07-07 session-start bug: secondmate_sync used to print raw
 # backend targets (default:w9:pY) that liveness respawn immediately replaced
@@ -704,7 +680,6 @@ test_ff_inflight_feature_branch
 test_no_fetch_in_local_path
 test_sweep_nudge_requires_instruction_change
 test_bootstrap_sweep_nudges_only_instruction_change
-test_bootstrap_defers_direct_account_home_sync
 test_nudge_selector_stable_after_herdr_respawn
 test_bootstrap_sweep_surfaces_skipped_home
 test_spawn_fast_forwards_before_launch

@@ -1649,11 +1649,14 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   printf 'claude-captains\n' > "$HOME_DIR/config/secondmate-account-pool"
 
-  out=$(FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  out=$(FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST= \
+    FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "enforced secondmate spawn should succeed (exit $status): $out"
   assert_regex "lease choose --pool claude-captains --task .*-$id-.* --provider claude" "$AF_LOG" "secondmate did not use its primary-owned account pool"
   assert_grep 'account_pool=claude-captains' "$HOME_DIR/state/$id.meta" "secondmate meta lost its account pool"
+  assert_not_grep '^account_home=' "$HOME_DIR/state/$id.meta" "secondmate entered direct account-directory routing"
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
@@ -5450,6 +5453,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
   run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
+  run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
   exit 0
 fi
 

@@ -5015,60 +5015,6 @@ SH
   pass "production Fleet control, selection, recovery, and workers close authority environment before startup"
 }
 
-test_production_enforce_refuses_hostile_uncertified_parent_shell() {
-  local id rec marker hook fake_ps trace out status startup_out
-  id=uncertified-hostile-shell
-  rec=$(make_case uncertified-hostile-shell claude "$id")
-  read_case "$rec"
-  marker="$CASE_DIR/hostile-parent-ps4-ran"
-  hook="$CASE_DIR/hostile-parent-bash-env"
-  fake_ps="$CASE_DIR/hostile-parent-ps"
-  trace="$CASE_DIR/hostile-parent-trace"
-  # shellcheck disable=SC2016  # The variable expands when Bash sources the hook.
-  printf '%s\n' ': > "$FM_HOSTILE_PARENT_MARKER"' > "$hook"
-  cat > "$fake_ps" <<'SH'
-#!/bin/sh
-printf '%s\n' 'Fri Jul 18 08:00:00 2026'
-SH
-  chmod +x "$fake_ps"
-
-  # shellcheck disable=SC2016  # Dollar expressions belong to the nested shell.
-  if startup_out=$(/usr/bin/env SHELLOPTS=xtrace \
-    PS4=HOSTILE_PARENT_XTRACE: BASH_ENV="$hook" \
-    FM_HOSTILE_PARENT_MARKER="$marker" \
-    /bin/bash --noprofile --norc -c '
-      exec 2>"$9"
-      exec /usr/bin/env -u FM_ACCOUNT_ROUTING_TEST_LAB \
-        FM_ROOT_OVERRIDE= FM_HOME="$1" \
-        FM_STATE_OVERRIDE="$1/state" FM_DATA_OVERRIDE="$1/data" \
-        FM_PROJECTS_OVERRIDE="$1/projects" FM_CONFIG_OVERRIDE="$1/config" \
-        FM_SPAWN_NO_GUARD=1 FM_FAKE_TMUX_LOG="$4" \
-        FM_FAKE_ENDPOINT_FILE="$5" FM_FAKE_TMUX_LABEL_FILE="$6" \
-        FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
-        FM_TEST_ACCOUNT_PS_BIN="${10}" \
-        TMUX=fake,1,0 PATH="$3:$PATH" \
-        "$7" "$8" "$2" --backend tmux --account-pool claude-crew
-    ' _ "$HOME_DIR" "$PROJ_DIR" "$FAKEBIN_DIR" "$TMUX_LOG" \
-      "$CASE_DIR/endpoint-live" "$CASE_DIR/tmux-label" "$SPAWN" "$id" \
-      "$trace" "$fake_ps" 2>&1); then
-    status=0
-  else
-    status=$?
-  fi
-  out="$startup_out$(cat "$trace")"
-
-  [ "$status" -ne 0 ] || fail "hostile uncertified tmux parent reached enforced routing"
-  [ -e "$marker" ] || fail "hostile parent-shell fixture never executed its inherited startup hook"
-  assert_contains "$out" "HOSTILE_PARENT_XTRACE:set -eu" \
-    "hostile parent-shell fixture never imported SHELLOPTS=xtrace/PS4 into fm-spawn"
-  assert_contains "$out" "requires backend=herdr with a process-bound closed-shell certificate" \
-    "uncertified hostile parent-shell refusal was not actionable"
-  [ ! -s "$AF_LOG" ] || fail "uncertified hostile parent shell reached Agent Fleet: $(cat "$AF_LOG")"
-  [ ! -s "$TMUX_LOG" ] || fail "uncertified hostile parent shell created a tmux endpoint"
-  assert_absent "$HOME_DIR/state/$id.meta" "uncertified hostile parent shell persisted managed metadata"
-  pass "production enforce refuses a genuinely hostile parent shell before Fleet, lease, or endpoint mutation"
-}
-
 test_agent_fleet_lifecycle_calls_are_bounded() {
   local id rec out status started elapsed
   id=account-control-timeout-z27
@@ -5762,7 +5708,6 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = production-fleet-environment ]; then
   run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
-  run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
   exit 0
 fi
 
@@ -5874,7 +5819,6 @@ run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation
 run_isolated_test test_agent_fleet_validation_ignores_ambient_system_tool_shadows
 run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
 run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
-run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
 run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
 run_isolated_test test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible
 run_isolated_test test_unsuccessful_lease_mutations_always_reconcile

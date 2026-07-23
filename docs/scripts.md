@@ -30,7 +30,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
 | `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crews on the resolved account and runtime backend |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule through legacy quota or Agent Fleet pool summaries |
-| `fm-account-routing-lib.sh` | Own Firstmate's shell-side Agent Fleet mode, lease, exec, resume, and release contract |
+| `fm-account-directory.sh` | Select a direct Claude/Codex account directory and install its per-profile Herdr hook |
+| `fm-account-routing-lib.sh` | Own routing mode plus legacy Agent Fleet lease, exec, resume, and release recovery |
 | `fm-account-session-sync.sh` | Reconcile real Agent Fleet provider-session mappings into managed task metadata       |
 | `fm-account-continuation.sh` | Build a verified task-owned packet for fresh cross-profile continuation             |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |

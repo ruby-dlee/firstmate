@@ -764,8 +764,9 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "enforce mode did not report manual Agent Fleet installation"
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "new enforce mode still required Agent Fleet"
   assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
+  assert_contains "$out" 'MISSING_MANUAL: herdr' "enforce mode did not report the direct hook installer"
 
   case_dir="$TMP_ROOT/account-routing-dispatch"
   mkdir -p "$case_dir/home/config"
@@ -777,7 +778,7 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "account-routed dispatch profile did not report manual Agent Fleet installation"
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "account-routed dispatch profile still required Agent Fleet"
   assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
 
   case_dir="$TMP_ROOT/account-routing-observe"
@@ -790,7 +791,17 @@ SH
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
   assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
-  pass "bootstrap reports dependencies only when configuration can enforce routing"
+  case_dir="$TMP_ROOT/account-routing-legacy-recovery"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' 'account_profile=codex-1' > "$case_dir/home/state/legacy.meta"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "legacy managed metadata no longer reported its recovery dependency"
+  pass "bootstrap requires direct launch tools for new routing and Agent Fleet only for legacy recovery metadata"
 }
 
 test_agent_fleet_install_requires_manual_release() {

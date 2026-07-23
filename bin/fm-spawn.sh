@@ -49,27 +49,23 @@
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
 #   Account routing is independently default-off. Its precedence and off/observe/
-#   enforce behavior are owned by fm-account-routing-lib.sh. --account-pool asks
-#   Agent Fleet to atomically select one concrete profile; --account-profile pins
-#   a concrete profile (and optionally validates it belongs to --account-pool).
-#   Either explicit account flag enforces routing for this spawn even when the
-#   global mode is off/observe. --no-account-routing is the emergency per-spawn
-#   opt-out and cannot be combined with either account flag. Enforced routing is
-#   supported only for claude/codex and fails closed; it never silently launches
-#   the default account. The resolved profile wraps the provider command before
-#   it is submitted to the selected backend, so every backend receives the same
-#   launch string.
-#   config/secondmate-account-pool is the primary's durable, non-inherited pool
-#   for secondmate AGENTS. An explicit account flag overrides it. A secondmate's
-#   own crewmates use inherited crew dispatch/routing policy, not this pool.
-#   --resume-account is an internal recovery path. It requires existing sticky
-#   account/profile/session metadata plus Agent Fleet's matching SessionStart
-#   mapping, reuses the recorded worktree/home, and executes `agent-fleet resume
-#   --task`; any missing or mismatched recovery truth blocks before pane creation.
-#   --continue-account is the provider-neutral recovery path. It verifies a dead
-#   endpoint and current repository state, builds a task-owned continuation packet,
-#   launches a fresh provider session through a new namespaced Agent Fleet attempt,
-#   and releases the predecessor only after the new SessionStart mapping is bound.
+#   enforce resolution is owned by fm-account-routing-lib.sh. For a NEW enforced
+#   Claude or Codex launch, fm-account-directory.sh discovers the current user's
+#   account homes, chooses one through its direct per-vendor usage contract,
+#   installs that profile's Herdr hook, and prefixes the provider command with
+#   CLAUDE_CONFIG_DIR or CODEX_HOME. No Agent Fleet selection or lease occurs.
+#   Existing --account-pool and --account-profile inputs remain compatibility
+#   activation signals for new direct launches; their aliases do not constrain
+#   the direct usage choice. --no-account-routing remains the emergency per-spawn
+#   opt-out and cannot be combined with either account flag. Off and observe
+#   launches retain their existing default-identity behavior.
+#   config/secondmate-account-pool remains the primary's durable, non-inherited
+#   activation input for secondmate agents when routing is enabled. A secondmate's
+#   own crewmates use inherited crew dispatch/routing policy, not this setting.
+#   --resume-account and --continue-account are legacy recovery paths only for
+#   existing account_profile metadata. They retain the sealed Agent Fleet
+#   session/lease behavior needed to recover those already-managed generations;
+#   new launches never create that metadata.
 #   A --secondmate spawn also propagates the primary's declared inheritable config
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
@@ -557,6 +553,8 @@ ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
+DIRECT_ACCOUNT_ROUTING=0
+DIRECT_ACCOUNT_HOME=
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -1192,6 +1190,29 @@ case "$HARNESS" in
     ACCOUNT_EFFECTIVE_MODE=off
     ;;
 esac
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  # The old fake routing lab remains available to exercise legacy managed
+  # recovery mechanics without changing those tests into production launches.
+  # A direct-directory test opts back into the production branch explicitly.
+  if fm_account_test_lab_enabled \
+    && [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" != firstmate-account-directory-test-lab-v1 ]; then
+    :
+  else
+    [ "$RAW_LAUNCH" != 1 ] || {
+      echo "error: direct account-directory routing does not accept raw launch commands" >&2
+      exit 1
+    }
+    DIRECT_ACCOUNT_ROUTING=1
+    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+      echo "fm-spawn: --account-pool/--account-profile now activate direct account-directory selection for new launches; the legacy alias does not pin the selected account" >&2
+    fi
+    DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+    echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+    # Every Agent Fleet branch below is guarded by enforce. New direct launches
+    # deliberately rejoin the ordinary unmanaged spawn path after selection.
+    ACCOUNT_EFFECTIVE_MODE=off
+  fi
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
   if [ -n "$ACCOUNT_PROFILE" ]; then
     ACCOUNT_POOL=explicit
@@ -2087,6 +2108,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
+  [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
       RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
@@ -2196,6 +2218,12 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   esac
 fi
 AGENT_COMMAND=$HARNESS
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+  case "$HARNESS" in
+    claude) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+    codex) AGENT_COMMAND="CODEX_HOME=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+  esac
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
     rm -rf "$STATE/.$ID.account-native-launch" "$STATE/.$ID.account-native-ready" "$STATE/.$ID.account-native-go" || exit 1
@@ -2324,4 +2352,6 @@ discard_existing_artifact_backup
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
 
-echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+account_summary=
+[ -z "$DIRECT_ACCOUNT_HOME" ] || account_summary=" account_home=$DIRECT_ACCOUNT_HOME"
+echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT$account_summary"

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Contract tests for the agent-only operating-fundamentals skill.
+# Contract tests for operating fundamentals and related behavioral guardrails.
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SKILL="$ROOT/.agents/skills/operating-fundamentals/SKILL.md"
+CREW_SKILL="$ROOT/.agents/skills/crew-steering/SKILL.md"
+LAVISH_SKILL="$ROOT/.agents/skills/lavish-decision-boards/SKILL.md"
 AGENTS="$ROOT/AGENTS.md"
 
 test_agent_only_folded_frontmatter_and_size() {
@@ -62,6 +64,9 @@ test_seven_ordered_principles() {
   assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
   assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
   assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
+  assert_grep "consequential bypass that gates an irreversible or high-stakes action" "$SKILL" "purpose-before-bypass principle must scope written rationale to consequential bypasses"
+  assert_grep "record that target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale"
+  assert_grep "trivial skips do not require this written record" "$SKILL" "purpose-before-bypass principle must exempt trivial skips from written rationale"
   assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
   pass "operating-fundamentals encodes all seven principles in the required order"
 }
@@ -76,6 +81,37 @@ test_single_conditional_agents_trigger() {
   [ "$section_count" -eq 1 ] || fail "the sole operating-fundamentals reference must be in section 13"
   assert_contains "$section" "\`operating-fundamentals\` - load when intaking any captain ask" "section 13 must conditionally load the skill at intake"
   pass "AGENTS.md contains one conditional section-13 trigger and no every-turn duplicate"
+}
+
+test_crew_steering_contract_and_trigger() {
+  local section headings expected
+
+  assert_present "$CREW_SKILL" "crew-steering SKILL.md is missing"
+  assert_grep "name: crew-steering" "$CREW_SKILL" "crew-steering skill is missing its canonical name"
+  headings=$(sed -nE 's/^## ([1-6]\. .*)$/\1/p' "$CREW_SKILL")
+  expected=$(printf '%s\n' \
+    "1. Demand ownership" \
+    "2. Reject vague or optimistic claims" \
+    "3. Fact-check the load-bearing premise" \
+    "4. Prefer quality and robustness" \
+    "5. Preserve goal fidelity" \
+    "6. Be direct and early")
+  [ "$headings" = "$expected" ] || fail "crew-steering must retain all six captain-standard guardrails"
+
+  section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
+  assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crew brief and before live-steering a crew" "section 13 must trigger crew-steering for briefs and live steers"
+  pass "crew-steering retains its six guardrails and conditional trigger"
+}
+
+test_live_surface_freshness_contract() {
+  assert_grep "reconcile it against live fleet state" "$AGENTS" "captain-facing surfaces must reconcile against live state"
+  assert_grep "removing resolved actionable or decision items" "$AGENTS" "serve-fresh removal must cover resolved actionable and decision items"
+  assert_grep "Recently Landed section of \`/bearings\` and \`/reports\`" "$AGENTS" "completion-oriented surfaces must retain relevant history"
+  assert_grep "never render it from a remembered snapshot" "$LAVISH_SKILL" "Lavish boards must use live fleet state"
+  assert_grep "Answer preservation takes precedence over the serve-fresh rule" "$LAVISH_SKILL" "answer preservation must take precedence while input is unsubmitted"
+  assert_grep "Never edit, refresh, or reload a served board while the captain is answering" "$LAVISH_SKILL" "served boards must preserve in-progress answers"
+  assert_grep "After submission, reconcile and refresh before continuing" "$LAVISH_SKILL" "served boards must refresh safely after answer submission"
+  pass "live-surface freshness preserves completion history and in-progress answers"
 }
 
 test_provider_neutral_and_no_maintenance_boilerplate() {
@@ -94,4 +130,6 @@ test_provider_neutral_and_no_maintenance_boilerplate() {
 test_agent_only_folded_frontmatter_and_size
 test_seven_ordered_principles
 test_single_conditional_agents_trigger
+test_crew_steering_contract_and_trigger
+test_live_surface_freshness_contract
 test_provider_neutral_and_no_maintenance_boilerplate

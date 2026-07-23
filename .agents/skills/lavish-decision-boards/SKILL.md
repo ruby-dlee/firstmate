@@ -59,7 +59,9 @@ A Lavish board is a live surface, so reconcile it against live fleet state befor
 
 ## Protect answers
 
-- Never edit a served board while the captain is answering because live reload clears in-progress input.
+- Answer preservation takes precedence over the serve-fresh rule while the captain has unsubmitted input.
+- Never edit, refresh, or reload a served board while the captain is answering because doing so clears in-progress input.
+- After submission, reconcile and refresh before continuing; if freshness must be preserved sooner, use only a strategy proven to retain the captain's current input without editing, refreshing, or reloading the served board.
 - When poll feedback arrives, write every annotation to the chosen durable file immediately, before interpreting it, acting on it, or doing anything else.
 - Never rely on poll output or conversation memory as the only copy because ephemeral poll output can be reaped.
 - Treat a `lavish-axi poll` return as transport or lifecycle output, not automatically as the captain's answer.

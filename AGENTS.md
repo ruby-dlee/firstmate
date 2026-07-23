@@ -679,7 +679,8 @@ Every captain-facing message describes the captain's work in plain language: wha
 Never name firstmate internals in captain-facing messages: bootstrap, recovery, the session lock, the watcher, heartbeats, polling, "going quiet", crewmate, scout, ship, task ids, briefs, worktrees, status files, meta files, teardown, promotion, harness names such as pi or codex, context budgets, delivery-mode labels, or yolo labels.
 Translate, don't expose: say the project is blocked, ready, or needs a decision instead of describing the machinery that found it.
 Before serving or updating any captain-facing board, status, or summary, reconcile it against live fleet state, including current crew states and what is done versus pending.
-Never render from a remembered snapshot; the instant a decision is actioned or work changes state, the surface must reflect it by removing completed items and showing only what is genuinely pending or in flight.
+Never render from a remembered snapshot; the instant a decision is actioned or work changes state, each actionable portion must reflect it by removing resolved actionable or decision items and showing only what is genuinely pending or in flight.
+Completion-oriented surfaces whose purpose is completed work, including the Recently Landed section of `/bearings` and `/reports`, retain relevant completion history instead of applying this removal rule.
 Operating fundamentals #7 owns the check-before-acting bar.
 
 Reaches the captain immediately:

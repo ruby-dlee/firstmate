@@ -1010,7 +1010,7 @@ fm_account_safe_lineage_value() {
 
 fm_account_meta_key_owned() {  # <key>
   case "$1" in
-    window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
     *) return 1 ;;
   esac
 }

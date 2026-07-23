@@ -204,6 +204,11 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
+  *"#{session_name}"*"#{window_name}"*)
+    [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1
+    printf 'firstmate\t%s\n' "${FM_FAKE_ENDPOINT_LABEL:?}"
+    exit 0
+    ;;
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 case "${1:-}" in
@@ -222,7 +227,7 @@ case "${1:-}" in
     exit 0
     ;;
   kill-window)
-    rm -f "${FM_FAKE_ENDPOINT_FILE:?}"
+    [ "${FM_FAKE_KILL_RETAIN:-0}" = 1 ] || rm -f "${FM_FAKE_ENDPOINT_FILE:?}"
     exit 0
     ;;
   send-keys)
@@ -257,6 +262,7 @@ run_direct_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
+    FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
@@ -420,6 +426,119 @@ test_direct_recovery_preserves_recorded_task_context() {
   pass "direct recovery preserves recorded task context while refreshing account selection"
 }
 
+test_direct_recovery_rejects_worktree_from_another_project() {
+  local record id meta unrelated meta_tmp out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-project-identity-z5
+  record=$(make_spawn_case direct-project-identity codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  unrelated="$TMP_ROOT/unrelated-direct-recovery"
+  fm_git_init_commit "$unrelated"
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-project-meta.XXXXXX")
+  awk -v worktree="$unrelated" '
+    /^worktree=/ { print "worktree=" worktree; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery launched in a worktree from another project"
+  assert_contains "$out" "does not belong to recorded project" \
+    "direct recovery project-identity refusal was not actionable"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "project-identity mismatch created a replacement endpoint"
+  pass "direct recovery proves the recorded worktree belongs to the recorded project"
+}
+
+test_direct_recovery_requires_recorded_brief() {
+  local record id out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-brief-z6
+  record=$(make_spawn_case direct-brief codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  rm -f "$SPAWN_HOME/state/.fake-endpoint" "$SPAWN_HOME/data/$id/brief.md"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery launched without its recorded brief"
+  assert_contains "$out" "no brief at $SPAWN_HOME/data/$id/brief.md" \
+    "direct recovery missing-brief refusal was not actionable"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "missing direct recovery brief created a replacement endpoint"
+  pass "direct recovery refuses to launch without the recorded brief"
+}
+
+test_direct_recovery_tracks_retained_replacement_endpoint() {
+  local record id meta out status backup_name artifacts_name retry launch
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  set_remaining 2 20,15
+  id=direct-retained-endpoint-z7
+  record=$(make_spawn_case direct-retained-endpoint codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  set_remaining 1 20,15
+  set_remaining 2 95,90
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  rm -rf "/tmp/fm-$id"
+  : > "/tmp/fm-$id"
+
+  if out=$(FM_FAKE_KILL_RETAIN=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery failure fixture unexpectedly succeeded"
+  [ -f "$SPAWN_HOME/state/.fake-endpoint" ] || fail "retained-endpoint fixture did not keep the replacement endpoint alive"
+  assert_grep "direct_recovery_cleanup=pending" "$meta" "failed recovery did not record pending direct cleanup"
+  assert_grep "tmux_window_id=@1" "$meta" "failed recovery did not record the replacement endpoint identity"
+  assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" "failed recovery did not record the replacement endpoint scope"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" "failed recovery metadata still presented the old account home as current"
+  backup_name=$(sed -n 's/^direct_recovery_backup=//p' "$meta")
+  artifacts_name=$(sed -n 's/^direct_recovery_artifacts=//p' "$meta")
+  [ -f "$SPAWN_HOME/state/$backup_name" ] || fail "failed recovery did not retain its prior metadata backup"
+  [ -d "$SPAWN_HOME/state/$artifacts_name" ] || fail "failed recovery did not retain its artifact backup"
+
+  rm -f "/tmp/fm-$id" "$SPAWN_HOME/state/.fake-endpoint"
+  retry=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1)
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$retry" "cleaned retained direct recovery endpoint for $id" \
+    "direct recovery did not reconcile the retained replacement endpoint"
+  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/2' codex" \
+    "direct recovery did not launch after reconciling the retained endpoint"
+  if grep -q '^direct_recovery_' "$meta"; then fail "successful retry left direct recovery markers in metadata"; fi
+  [ ! -e "$SPAWN_HOME/state/$backup_name" ] || fail "successful retry left the retained metadata backup"
+  [ ! -e "$SPAWN_HOME/state/$artifacts_name" ] || fail "successful retry left the retained artifact backup"
+  rm -rf "/tmp/fm-$id"
+  pass "failed direct recovery tracks and reconciles a retained replacement endpoint"
+}
+
 test_stale_secondmate_without_direct_cutover_is_refused() {
   local primary home id out status
   reset_accounts
@@ -493,6 +612,9 @@ test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_recovery_preserves_recorded_task_context
+test_direct_recovery_rejects_worktree_from_another_project
+test_direct_recovery_requires_recorded_brief
+test_direct_recovery_tracks_retained_replacement_endpoint
 test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 

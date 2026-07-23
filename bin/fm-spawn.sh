@@ -328,6 +328,130 @@ spawn_refuse_report_required_orca() {
   fi
 }
 
+reconcile_failed_direct_recovery() {
+  local task=$1 meta="$STATE/$1.meta" lock marker generation backend target tmux_session_target tab kind home tasktmp
+  local backup_name backup_token backup backup_snapshot artifacts_name artifacts_token artifacts endpoint_state tmp current_backup_snapshot
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  marker=$(fm_account_meta_value "$meta" direct_recovery_cleanup)
+  if [ "$marker" != pending ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: invalid retained direct recovery state for $task" >&2
+    return 1
+  fi
+  generation=$(fm_account_meta_value "$meta" generation_id)
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  tmux_session_target=$(fm_account_meta_value "$meta" tmux_session_target)
+  tab=$(fm_account_meta_value "$meta" zellij_tab_id)
+  kind=$(fm_account_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  home=$(fm_account_meta_value "$meta" home)
+  tasktmp=$(fm_account_meta_value "$meta" tasktmp)
+  backup_name=$(fm_account_meta_value "$meta" direct_recovery_backup)
+  artifacts_name=$(fm_account_meta_value "$meta" direct_recovery_artifacts)
+  case "$backup_name" in
+    ".$task.meta.rollback."*) ;;
+    *)
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      echo "error: unsafe retained direct recovery backup for $task" >&2
+      return 1
+      ;;
+  esac
+  backup_token=${backup_name#".$task.meta.rollback."}
+  if ! fm_account_valid_id "$backup_token"; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: unsafe retained direct recovery backup for $task" >&2
+    return 1
+  fi
+  case "$artifacts_name" in
+    ".$task.artifacts.rollback."*) ;;
+    *)
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      echo "error: unsafe retained direct recovery artifacts for $task" >&2
+      return 1
+      ;;
+  esac
+  artifacts_token=${artifacts_name#".$task.artifacts.rollback."}
+  if ! fm_account_valid_id "$artifacts_token"; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: unsafe retained direct recovery artifacts for $task" >&2
+    return 1
+  fi
+  backup="$STATE/$backup_name"
+  artifacts="$STATE/$artifacts_name"
+  backup_snapshot=$(spawn_preflight_read_meta "$backup") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery backup is missing or unsafe for $task" >&2
+    return 1
+  }
+  if [ ! -d "$artifacts" ] || [ -L "$artifacts" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery artifacts are missing or unsafe for $task" >&2
+    return 1
+  fi
+  if [ "$tasktmp" != "/tmp/fm-$task" ] || [ -z "$generation" ] || [ -z "$target" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery metadata is incomplete for $task" >&2
+    return 1
+  fi
+  fm_account_meta_lock_release "$lock" || return 1
+  lock=
+
+  spawn_managed_endpoint_kill "$backend" "$target" "$tab" "fm-$task" "$kind" "$home" "$tmux_session_target" 2>/dev/null || true
+  endpoint_state=$(spawn_managed_endpoint_state "$backend" "$target" "fm-$task" "$kind" "$home" "$tmux_session_target" 2>/dev/null)
+  case "$endpoint_state" in
+    absent) ;;
+    present)
+      echo "error: retained direct recovery endpoint is still alive for $task" >&2
+      return 1
+      ;;
+    *)
+      echo "error: retained direct recovery endpoint state is unknown for $task" >&2
+      return 1
+      ;;
+  esac
+
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  current_backup_snapshot=$(spawn_preflight_read_meta "$backup" 2>/dev/null) || current_backup_snapshot=
+  if [ ! -f "$meta" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_cleanup)" != pending ] \
+    || [ "$(fm_account_meta_value "$meta" generation_id)" != "$generation" ] \
+    || [ "$(fm_backend_of_meta "$meta")" != "$backend" ] \
+    || [ "$(fm_backend_target_of_meta "$meta")" != "$target" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_backup)" != "$backup_name" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_artifacts)" != "$artifacts_name" ] \
+    || [ "$current_backup_snapshot" != "$backup_snapshot" ] \
+    || [ ! -d "$artifacts" ] || [ -L "$artifacts" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery generation changed before cleanup for $task" >&2
+    return 1
+  fi
+  if ! fm_account_restore_artifacts "$STATE" "$task" "$artifacts_name" "$tasktmp" 1; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery artifacts could not be restored for $task" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$STATE/.$task.meta.direct-recovery-restore.XXXXXX") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! printf '%s\n' "$backup_snapshot" > "$tmp" \
+    || ! fm_account_meta_merge_extensions "$meta" "$tmp" \
+    || ! fm_account_safe_file_destination "$meta" \
+    || ! mv "$tmp" "$meta"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery metadata could not be restored for $task" >&2
+    return 1
+  fi
+  rm -f "$backup" || echo "warning: retained direct recovery backup remains for $task" >&2
+  rm -rf "$artifacts" || echo "warning: retained direct recovery artifacts remain for $task" >&2
+  fm_account_meta_lock_release "$lock" || return 1
+  SPAWN_META_SNAPSHOT=$(spawn_preflight_read_meta "$meta") || return 1
+  SPAWN_META_PRESENT=1
+  echo "fm-spawn: cleaned retained direct recovery endpoint for $task" >&2
+}
+
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
   case "$SPAWN_PREFLIGHT_ID" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
@@ -452,6 +576,18 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   # replacement generation instead of rejecting that generation as stale.
   SPAWN_META_SNAPSHOT=$current_spawn_meta
   rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
+  direct_recovery_cleanup=$(fm_account_meta_value "$RESUME_META" direct_recovery_cleanup)
+  if [ -n "$direct_recovery_cleanup" ]; then
+    [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || {
+      echo "error: retained direct recovery state exists for ${POS[0]}; use --recover-direct-account" >&2
+      exit 1
+    }
+    [ "$direct_recovery_cleanup" = pending ] || {
+      echo "error: invalid retained direct recovery state for ${POS[0]}" >&2
+      exit 1
+    }
+    reconcile_failed_direct_recovery "${POS[0]}" || exit 1
+  fi
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}
     rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
@@ -709,6 +845,70 @@ persist_failed_account_rollback() {
   META_INSTALLED=1
 }
 
+persist_failed_direct_recovery() {
+  local meta="$STATE/$ID.meta" tmp backup_name artifacts_name retained_window retained_tmux_session account_home
+  [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ] || return 1
+  [ -n "$EXISTING_ARTIFACT_BACKUP" ] && [ -d "$EXISTING_ARTIFACT_BACKUP" ] || return 1
+  backup_name=${META_BACKUP##*/}
+  artifacts_name=${EXISTING_ARTIFACT_BACKUP##*/}
+  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+  retained_tmux_session=
+  if [ "${BACKEND:-tmux}" = tmux ]; then
+    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+    retained_window=$retained_tmux_session
+  fi
+  account_home=${DIRECT_ACCOUNT_HOME:-${RECORDED_ACCOUNT_HOME:-}}
+  tmp=$(mktemp "$STATE/.$ID.meta.direct-recovery-pending.XXXXXX") || return 1
+  {
+    echo "window=$retained_window"
+    echo "worktree=${WT:-${RECORDED_WORKTREE:-}}"
+    echo "project=${PROJ_ABS:-${RECORDED_PROJECT:-}}"
+    echo "harness=${HARNESS:-${RECORDED_HARNESS:-}}"
+    echo "kind=${KIND:-${RECORDED_KIND:-ship}}"
+    echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
+    echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
+    echo "tasktmp=${TASK_TMP:-${RECORDED_TASKTMP:-/tmp/fm-$ID}}"
+    echo "model=${RECORDED_MODEL:-${MODEL:-default}}"
+    echo "effort=${RECORDED_EFFORT:-${EFFORT:-default}}"
+    echo "generation_id=${RECORDED_GENERATION:-${SPAWN_GENERATION_ID:-}}"
+    [ "${RECORDED_REPORT_REQUIRED_SET:-0}" != 1 ] || echo "report_required=${RECORDED_REPORT_REQUIRED:-}"
+    [ -z "$account_home" ] || echo "account_home=$account_home"
+    [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+    [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+    [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+    [ "${BACKEND:-tmux}" != herdr ] || {
+      echo "herdr_session=${HERDR_SES:-}"
+      echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+      echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+      echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+    }
+    [ "${BACKEND:-tmux}" != zellij ] || {
+      echo "zellij_session=${ZELLIJ_SES:-}"
+      echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+      echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+    }
+    [ "${BACKEND:-tmux}" != orca ] || {
+      echo "orca_worktree_id=${ORCA_WORKTREE_ID:-}"
+      echo "terminal=${ORCA_TERMINAL:-${T:-}}"
+    }
+    [ "${BACKEND:-tmux}" != cmux ] || {
+      echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+      echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+    }
+    [ "${KIND:-${RECORDED_KIND:-ship}}" != secondmate ] || {
+      echo "home=${PROJ_ABS:-${RECORDED_HOME:-}}"
+      echo "projects=${SECONDMATE_PROJECTS:-${RECORDED_PROJECTS:-}}"
+    }
+    echo "direct_recovery_cleanup=pending"
+    echo "direct_recovery_backup=$backup_name"
+    echo "direct_recovery_artifacts=$artifacts_name"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
 clear_account_rollback_markers() {
   local meta="$STATE/$ID.meta" tmp
   tmp=$(mktemp "$STATE/.$ID.meta.rollback-commit.XXXXXX") || return 1
@@ -808,6 +1008,16 @@ spawn_abort_cleanup() {
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
   cleanup_continuation_launch_transport
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_direct_recovery || echo "warning: failed to persist retained direct recovery state for ${ID:-unknown}" >&2
+    else
+      echo "warning: failed to acquire metadata lock while preserving retained direct recovery for ${ID:-unknown}" >&2
+    fi
+  fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 1 ]; then
     if [ -z "$rollback_lock" ]; then
       rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
@@ -1182,6 +1392,7 @@ direct_recovery_context_matches() {
     && [ "$(fm_meta_get "$RESUME_META" home)" = "$RECORDED_HOME" ] \
     && [ "$(fm_meta_get "$RESUME_META" projects)" = "$RECORDED_PROJECTS" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" direct_recovery_cleanup)" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] \
     || return 1
   if [ "$RECORDED_REPORT_REQUIRED_SET" = 1 ]; then
@@ -1795,7 +2006,7 @@ if [ "$KIND" = secondmate ]; then
 else
   BRIEF="$DATA/$ID/brief.md"
 fi
-if [ "$RECOVERY_ACCOUNT" != 1 ]; then
+if [ "$RESUME_ACCOUNT" != 1 ]; then
   [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 fi
 if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
@@ -1849,8 +2060,25 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+git_common_dir_real() {
+  local repo=$1 common
+  (
+    cd "$repo" 2>/dev/null || exit 1
+    common=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1
+    cd "$common" 2>/dev/null || exit 1
+    pwd -P
+  )
+}
+
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$KIND" != secondmate ]; then
   validate_spawn_worktree "recorded direct account recovery" "$RECORDED_TARGET"
+  recorded_project_common=$(git_common_dir_real "$PROJ_ABS" 2>/dev/null || true)
+  recorded_worktree_common=$(git_common_dir_real "$WT" 2>/dev/null || true)
+  if [ -z "$recorded_project_common" ] || [ -z "$recorded_worktree_common" ] \
+    || [ "$recorded_project_common" != "$recorded_worktree_common" ]; then
+    echo "error: recorded direct account recovery worktree '$WT' does not belong to recorded project '$PROJ_ABS'; refusing endpoint creation" >&2
+    exit 1
+  fi
 fi
 
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then

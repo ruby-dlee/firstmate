@@ -133,8 +133,8 @@ Unsupported effort values are still recorded in task meta when passed to `fm-spa
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
 New observe and enforce account routing is backend-neutral and uses the direct profile-directory contract owned by [configuration.md](configuration.md#agent-fleet-account-routing).
 Routing remains default-off and adds no account field or provider environment override until an explicit account flag or observe/enforce policy enables it.
-For quota-balanced account-pool candidates, dispatch may compare legacy Agent Fleet pool summaries pending `remove-fleet-routing-deadcode`, then passes the winning compatibility alias to spawn only as the activation signal for direct per-account selection.
-Enforced routing rejects poolless quota-balanced candidates, while off and observe retain the legacy quota-only selector path.
+For quota-balanced account-pool candidates, new dispatch deterministically uses the ordered first profile and passes its compatibility alias to spawn only as the activation signal for direct per-account selection.
+The legacy Agent Fleet pool-summary selector is inactive deferred code tracked by `remove-fleet-routing-deadcode`; it is not available to new dispatches.
 
 ## Optional secondmates
 

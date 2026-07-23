@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Contract tests for the agent-only operating-fundamentals skill.
+# Contract tests for operating fundamentals and related behavioral guardrails.
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SKILL="$ROOT/.agents/skills/operating-fundamentals/SKILL.md"
+CREW_SKILL="$ROOT/.agents/skills/crew-steering/SKILL.md"
+LAVISH_SKILL="$ROOT/.agents/skills/lavish-decision-boards/SKILL.md"
 AGENTS="$ROOT/AGENTS.md"
 
 test_agent_only_folded_frontmatter_and_size() {
@@ -55,8 +57,16 @@ test_seven_ordered_principles() {
   assert_grep "Fill released capacity" "$SKILL" "continuous-reaping principle must refill freed lanes"
   assert_grep "explicit captain order as the governing objective" "$SKILL" "explicit-order principle is missing"
   assert_grep "non-overridable safety and instruction constraints" "$SKILL" "explicit-order principle must retain non-overridable constraints"
-  assert_grep "current authoritative check" "$SKILL" "verification-before-assertion principle is missing"
-  assert_grep "Separate observed facts from inference" "$SKILL" "verification principle must distinguish facts from inference"
+  assert_grep "consequential action" "$SKILL" "premise-check principle must cover consequential actions"
+  assert_grep "load-bearing assumption" "$SKILL" "premise-check principle must identify one load-bearing assumption"
+  assert_grep "clearly-false premises" "$SKILL" "premise-check principle must catch clearly-false premises"
+  assert_grep "do not overcorrect" "$SKILL" "premise-check principle must forbid overcorrection"
+  assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
+  assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
+  assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
+  assert_grep "Before adding a bypass that gates an irreversible or high-stakes action, record the target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale for consequential bypasses"
+  assert_grep "trivial skips are exempt" "$SKILL" "purpose-before-bypass principle must exempt trivial skips from recorded rationale"
+  assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
   pass "operating-fundamentals encodes all seven principles in the required order"
 }
 
@@ -70,6 +80,64 @@ test_single_conditional_agents_trigger() {
   [ "$section_count" -eq 1 ] || fail "the sole operating-fundamentals reference must be in section 13"
   assert_contains "$section" "\`operating-fundamentals\` - load when intaking any captain ask" "section 13 must conditionally load the skill at intake"
   pass "AGENTS.md contains one conditional section-13 trigger and no every-turn duplicate"
+}
+
+test_crew_steering_contract_and_trigger() {
+  local section headings expected
+
+  assert_present "$CREW_SKILL" "crew-steering SKILL.md is missing"
+  assert_grep "name: crew-steering" "$CREW_SKILL" "crew-steering skill is missing its canonical name"
+  headings=$(sed -nE 's/^## ([1-6]\. .*)$/\1/p' "$CREW_SKILL")
+  expected=$(printf '%s\n' \
+    "1. Demand ownership" \
+    "2. Reject vague or optimistic claims" \
+    "3. Fact-check the load-bearing premise" \
+    "4. Prefer quality and robustness" \
+    "5. Preserve goal fidelity" \
+    "6. Be direct and early")
+  [ "$headings" = "$expected" ] || fail "crew-steering must retain all six captain-standard guardrails"
+
+  assert_grep "name the outcome, constraint, evidence, and next action" "$CREW_SKILL" "crew steering must keep briefs and steers proportional"
+  assert_grep "expected result, authority boundaries, verification, and definition of done" "$CREW_SKILL" "crew briefs must define their result, scope, proof, and completion bar"
+  assert_grep "smallest load-bearing mistake early" "$CREW_SKILL" "live steering must correct the load-bearing mistake early"
+  assert_grep "carry the fix through implementation and proof" "$CREW_SKILL" "live steering must require implementation and proof"
+  assert_grep "preserve the captain's actual goal" "$CREW_SKILL" "crew steering must preserve the captain's actual goal"
+  assert_grep "use the existing owner for detail instead of copying its contract" "$CREW_SKILL" "crew steering must preserve contract ownership"
+  assert_grep "solve and implement the task" "$CREW_SKILL" "crews must own both solution and implementation"
+  assert_grep "never stops solely because work is hard or failing" "$CREW_SKILL" "crews must not treat difficulty as a stopping condition"
+  assert_grep "preserves mandated safety" "$CREW_SKILL" "crew ownership must preserve legitimate safety stops"
+  assert_grep "unsafe or non-isolated worktree placement" "$CREW_SKILL" "crew ownership must retain the worktree safety stop"
+  assert_grep "exhausts its capability before following the solve-first escalation bar" "$CREW_SKILL" "crew ownership must preserve legitimate blocker escalation"
+  assert_grep "Treat \`almost there\` as unfinished" "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
+  assert_grep "real evidence because work is not done until proven" "$CREW_SKILL" "crew steering must require evidence before completion"
+  assert_grep "review adversarially rather than rubber-stamping" "$CREW_SKILL" "crew steering must require adversarial review"
+  assert_grep "one load-bearing assumption before it acts" "$CREW_SKILL" "crew steering must premise-check before action"
+  assert_grep "rejecting a shallow-false premise without overcorrecting" "$CREW_SKILL" "premise checking must reject false premises without overreach"
+  assert_grep "captain's technical-decision bias" "$CREW_SKILL" "crew steering must apply the captain's quality bar"
+  assert_grep "reject preserving a leaky component merely to save development cost or sunk work" "$CREW_SKILL" "crew steering must prefer robustness over development cost or sunk work"
+  assert_grep "Reject any quiet reframing of the task into a smaller win" "$CREW_SKILL" "crew steering must reject weakened goals"
+  assert_grep "fixed-goal guardrail" "$CREW_SKILL" "crew steering must retain the fixed-goal authority"
+  assert_grep "specific, un-bloated briefs and steers" "$CREW_SKILL" "crew steering must remain direct"
+  assert_grep "correct a wrong path before it is built" "$CREW_SKILL" "crew steering must correct wrong paths early"
+  assert_grep "concrete result the crew must produce" "$CREW_SKILL" "a steer must end with the required result"
+  assert_grep "evidence that will prove it" "$CREW_SKILL" "a steer must end with required proof"
+  assert_grep "next action it should take" "$CREW_SKILL" "a steer must end with the next action"
+  assert_grep "Do not add motivational padding, duplicate background, or a second copy of an existing procedure" "$CREW_SKILL" "crew steering must avoid padding and duplicate contracts"
+
+  section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
+  assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crew brief and before live-steering a crew" "section 13 must trigger crew-steering for briefs and live steers"
+  pass "crew-steering retains its behavioral guardrails and conditional trigger"
+}
+
+test_live_surface_freshness_contract() {
+  assert_grep "reconcile it against live fleet state" "$AGENTS" "captain-facing surfaces must reconcile against live state"
+  assert_grep "removing resolved actionable or decision items" "$AGENTS" "serve-fresh removal must cover resolved actionable and decision items"
+  assert_grep "Recently Landed section of \`/bearings\` and \`/reports\`" "$AGENTS" "completion-oriented surfaces must retain relevant history"
+  assert_grep "never render it from a remembered snapshot" "$LAVISH_SKILL" "Lavish boards must use live fleet state"
+  assert_grep "Answer preservation takes precedence over the serve-fresh rule" "$LAVISH_SKILL" "answer preservation must take precedence while input is unsubmitted"
+  assert_grep "Never edit, refresh, or reload a served board while the captain is answering" "$LAVISH_SKILL" "served boards must preserve in-progress answers"
+  assert_grep "After submission, reconcile and refresh before continuing" "$LAVISH_SKILL" "served boards must refresh safely after answer submission"
+  pass "live-surface freshness preserves completion history and in-progress answers"
 }
 
 test_provider_neutral_and_no_maintenance_boilerplate() {
@@ -88,4 +156,6 @@ test_provider_neutral_and_no_maintenance_boilerplate() {
 test_agent_only_folded_frontmatter_and_size
 test_seven_ordered_principles
 test_single_conditional_agents_trigger
+test_crew_steering_contract_and_trigger
+test_live_surface_freshness_contract
 test_provider_neutral_and_no_maintenance_boilerplate

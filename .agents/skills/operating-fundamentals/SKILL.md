@@ -2,7 +2,7 @@
 name: operating-fundamentals
 description: >-
   Agent-only operating practice for firstmate.
-  Use when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or a finished crew, protecting shared validation capacity, acting on an explicit captain order, or about to assert a fleet fact.
+  Use when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or a finished crew, protecting shared validation capacity, acting on an explicit captain order, about to make a consequential config/system change or an escalation, or about to assert a fleet fact.
 user-invocable: false
 metadata:
   internal: true
@@ -29,7 +29,7 @@ Never idle a working lane merely because another lane, resource, or dependency i
 
 Treat a blocker as a routing problem, not a stopping point.
 Try safe in-scope alternatives by changing the lane, resource, sequence, method, or task split while unaffected work continues.
-Escalate only when progress genuinely requires new authority or an external change, and report the routes already tried.
+Drive the crew to a solved and implemented result, exhausting its capability before treating a hard problem as a stopping point; `AGENTS.md` section 9 owns the escalation bar.
 
 ## 4. Decouple validation from worker budgets
 
@@ -50,6 +50,9 @@ Execute it directly or find a compliant route; if none exists, surface the exact
 
 ## 7. Always check before asserting
 
-Before claiming a fleet, task, resource, deployment, or validation fact, perform a current authoritative check that actually supports the claim.
-Separate observed facts from inference, and label unknowns instead of upgrading them into assertions.
-Re-check after any event that could have changed state; never rely on remembered or last-reported state when live state is available.
+Before ANY consequential action - a config/system change, an escalation to the captain, or a confident claim of fact/status - cheaply sanity-check the ONE load-bearing assumption: is it even true at the shallowest level?
+What am I actually changing, and what is its target?
+Catch clearly-false premises; do not overcorrect.
+Before classifying any gate, check, blocker, or failure as safe to bypass, establish the operation's target outcome and verify that the failing thing is neither that outcome nor on its critical path.
+Before adding a bypass that gates an irreversible or high-stakes action, record the target outcome and the rationale for the critical-path judgment; trivial skips are exempt.
+A failure in the capability the operation exists to deliver is the operation failing, not noise.

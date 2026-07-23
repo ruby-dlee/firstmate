@@ -121,9 +121,10 @@ This is a drain over the inbox, not a single reply.
 The watcher coalesces same-key `check:` wakes, so one `x-mention` wake can stand in for several pending mentions.
 Treat `state/x-inbox/` as the source of truth and process **every** file you find there, not just the `request_id` named in the wake.
 
-1. **Gather live fleet state once.** Compose answers from what this instance genuinely knows right now:
+1. **Reconcile every state-dependent answer immediately before composing it.**
+   Use these authoritative sources instead of reusing one snapshot for the entire drain:
    - `data/backlog.md` "## In flight" - the work currently moving.
-   - `state/*.status` - the latest line of each in-flight job, for fresh phase detail.
+   - `bin/fm-crew-state.sh <id>` for each in-flight task - the current phase reconciled from its live run step, pane, and append-only status history.
    - `data/projects.md` - the active projects, for naming what you work on in plain terms.
    Translate every internal item into an outcome. Example: a backlog line `fix-login-k3 - repair OAuth redirect (repo: yourapp)` becomes "patching a sign-in redirect bug on one of the apps" - no id, no repo name unless it is already public.
 2. **Drain every pending mention.** For each `state/x-inbox/*.json` file:
@@ -141,7 +142,7 @@ Treat `state/x-inbox/` as the source of truth and process **every** file you fin
       **Link here, in step 2c, before the step 2f inbox cleanup** - `bin/fm-x-link.sh` can copy both the mention's reply platform and explicit budget from the still-present inbox payload without a relay lookup.
       If that local context is incomplete it uses the durable resolution contract in `docs/configuration.md` and warns loudly, while the follow-up path proceeds when either the platform or a valid explicit budget of at least 50 characters is resolved authoritatively and refuses only when neither is available.
       Then step 2d's reply is an **acknowledgement** ("on it, captain"), and genuine milestone updates plus the final outcome come later as follow-ups (see "Completion follow-up" below), with the terminal one posted using `--final`.
-   d. **Compose the reply.** For a **question**, answer `.text` from the fleet state gathered in step 1.
+   d. **Compose the reply.** For a **question**, apply step 1 immediately before answering `.text`.
       For an **actionable request with a linked task**, acknowledge that you have the order and are on it - milestone updates and the final outcome follow later as completion follow-ups, so do not promise a result you do not yet have.
       For work held by the trusted-channel safety exception, say only that it has been flagged for the captain.
       In every case keep it short, in firstmate's voice, and public-safe.

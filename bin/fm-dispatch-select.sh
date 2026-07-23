@@ -11,15 +11,15 @@
 # contract:
 #   - Any candidate carrying account_profile is invalid because pinned profiles
 #     are direct per-spawn overrides, never inputs to quota-balanced selection.
-#   - A candidate set carrying account_pool uses only Agent Fleet's no-secret
-#     `pool status` summaries. Every candidate must then carry account_pool and
-#     use claude/codex. Only a non-degraded, quota-fresh provider summary backed
-#     by at least one freshly proven eligible profile is available. The best
-#     adjusted headroom wins; exact ties use the first array element. Stale or
-#     otherwise degraded summaries are diagnostics only. Agent Fleet trouble
-#     degrades to the first element and never falls through to default-account
-#     quota-axi data; enforced spawn still obtains the real fresh lease before
-#     any provider launch.
+#   - A candidate set carrying account_pool uses the deferred legacy Agent Fleet
+#     `pool status` summaries pending remove-fleet-routing-deadcode. Every
+#     candidate must then carry account_pool and use claude/codex. Only a
+#     non-degraded, quota-fresh provider summary backed by at least one freshly
+#     proven eligible profile is available. The best adjusted headroom wins;
+#     exact ties use the first array element. Stale or otherwise degraded
+#     summaries are diagnostics only. Agent Fleet trouble degrades to the first
+#     element and never falls through to default-account quota-axi data; spawn
+#     treats the winning pool only as direct account-directory activation.
 #   - Enforced account routing rejects quota-balanced candidates without pools.
 #     Off and observe retain the legacy no-pool quota-axi path.
 #   - Per candidate vendor it takes the minimum percentRemaining across that

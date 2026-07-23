@@ -49,7 +49,7 @@
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
 #   Account routing is independently default-off. Its precedence and off/observe/
-#   enforce resolution is owned by fm-account-routing-lib.sh. For a NEW enforced
+#   enforce resolution is owned by fm-account-routing-lib.sh. For any NEW routed
 #   Claude or Codex launch, fm-account-directory.sh discovers the current user's
 #   account homes, chooses one through its direct per-vendor usage contract,
 #   installs that profile's Herdr hook, and prefixes the provider command with
@@ -57,8 +57,8 @@
 #   Existing --account-pool and --account-profile inputs remain compatibility
 #   activation signals for new direct launches; their aliases do not constrain
 #   the direct usage choice. --no-account-routing remains the emergency per-spawn
-#   opt-out and cannot be combined with either account flag. Off and observe
-#   launches retain their existing default-identity behavior.
+#   opt-out and cannot be combined with either account flag. Off launches retain
+#   their existing default-identity behavior.
 #   config/secondmate-account-pool remains the primary's durable, non-inherited
 #   activation input for secondmate agents when routing is enabled. A secondmate's
 #   own crewmates use inherited crew dispatch/routing policy, not this setting.
@@ -555,6 +555,7 @@ ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
 DIRECT_ACCOUNT_ROUTING=0
 DIRECT_ACCOUNT_HOME=
+DIRECT_ACCOUNT_RESPAWN=0
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -1161,6 +1162,12 @@ ACCOUNT_EXPLICIT=0
 if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$NO_ACCOUNT_ROUTING" = 0 ] \
+  && [ "$SPAWN_META_PRESENT" = 1 ] \
+  && [ -n "$(spawn_preflight_meta_value account_home)" ]; then
+  DIRECT_ACCOUNT_RESPAWN=1
+  ACCOUNT_EXPLICIT=1
+fi
 if [ "$KIND" = secondmate ]; then
   ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 1
 fi
@@ -1179,8 +1186,12 @@ fi
 case "$HARNESS" in
   claude|codex) ;;
   *)
-    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+    if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
       echo "error: --account-pool/--account-profile requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
+    if [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
+      echo "error: recorded direct account routing requires a claude or codex harness, not '$HARNESS'" >&2
       exit 1
     fi
     if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
@@ -1190,12 +1201,9 @@ case "$HARNESS" in
     ACCOUNT_EFFECTIVE_MODE=off
     ;;
 esac
-if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-  # The old fake routing lab remains available to exercise legacy managed
-  # recovery mechanics without changing those tests into production launches.
-  # A direct-directory test opts back into the production branch explicitly.
-  if fm_account_test_lab_enabled \
-    && [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" != firstmate-account-directory-test-lab-v1 ]; then
+if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && fm_account_test_lab_enabled \
+    && [ "${FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST:-}" = firstmate-remove-fleet-routing-deadcode-fixture-v1 ]; then
     :
   else
     [ "$RAW_LAUNCH" != 1 ] || {
@@ -1203,8 +1211,10 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
       exit 1
     }
     DIRECT_ACCOUNT_ROUTING=1
-    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+    if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
       echo "fm-spawn: --account-pool/--account-profile now activate direct account-directory selection for new launches; the legacy alias does not pin the selected account" >&2
+    elif [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
+      echo "fm-spawn: recorded direct account metadata activates fresh account-directory selection for this respawn" >&2
     fi
     DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
     echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
@@ -1458,12 +1468,21 @@ validate_firstmate_home_for_spawn() {
   printf '%s\n' "$abs_home"
 }
 
-secondmate_home_supports_account_routing() {
+secondmate_home_supports_legacy_account_routing() {
   local home=$1
   [ -f "$home/bin/fm-account-routing-lib.sh" ] \
     && [ -f "$home/bin/fm-spawn.sh" ] \
     && grep -q '^fm_account_resolve_mode()' "$home/bin/fm-account-routing-lib.sh" \
     && grep -Fq "ACCOUNT_EFFECTIVE_MODE=\$(fm_account_resolve_mode" "$home/bin/fm-spawn.sh"
+}
+
+secondmate_home_supports_direct_account_routing() {
+  local home=$1
+  [ -f "$home/bin/fm-account-directory.sh" ] \
+    && [ ! -L "$home/bin/fm-account-directory.sh" ] \
+    && [ -x "$home/bin/fm-account-directory.sh" ] \
+    && [ -f "$home/bin/fm-spawn.sh" ] \
+    && grep -Fq '"$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS"' "$home/bin/fm-spawn.sh"
 }
 
 secondmate_routing_config_inherited() {
@@ -1598,13 +1617,16 @@ if [ "$KIND" = secondmate ]; then
     echo "error: refusing secondmate launch for $PROJ_ABS: the primary's $ACCOUNT_PRIMARY_MODE routing mode is not authoritative in the home. Run bin/fm-config-push.sh and retry." >&2
     exit 1
   fi
-  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
-    if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
-      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+  if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+    if ! secondmate_home_supports_direct_account_routing "$PROJ_ABS"; then
+      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks direct account-directory routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
       exit 1
     fi
-  elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
-    echo "warning: secondmate $ID home $PROJ_ABS lacks Agent Fleet routing support; launching because account routing is $ACCOUNT_EFFECTIVE_MODE" >&2
+  elif [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    if ! secondmate_home_supports_legacy_account_routing "$PROJ_ABS"; then
+      echo "error: refusing legacy managed secondmate recovery for $PROJ_ABS: the home lacks Agent Fleet recovery support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      exit 1
+    fi
   fi
   rm -f "$CONFIG_INHERIT_REPORT_TMP"
   CONFIG_INHERIT_REPORT_TMP=
@@ -2030,9 +2052,6 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
-if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
-  fm_account_select observe "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" "$ACCOUNT_TASK" "$WT" || exit 1
-fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
     if fm_account_recover "$ACCOUNT_TASK" "$ACCOUNT_PROFILE" "$ACCOUNT_POOL" "$HARNESS" "$WT"; then

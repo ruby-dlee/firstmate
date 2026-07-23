@@ -787,11 +787,25 @@ SH
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
   printf '%s\n' observe > "$case_dir/home/config/account-routing-mode"
   fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/herdr"
   rm -f "$fakebin/agent-fleet"
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
-    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
-  assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
+    BASH_ENV="$bash_env" FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "observe mode treated Agent Fleet as a new-launch dependency"
+  assert_contains "$out" 'MISSING: jq' "observe mode did not report the direct selector dependency"
+  assert_contains "$out" 'MISSING_MANUAL: herdr' "observe mode did not report the direct hook installer"
   case_dir="$TMP_ROOT/account-routing-legacy-recovery"
   mkdir -p "$case_dir/home/config" "$case_dir/home/state"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
@@ -802,6 +816,17 @@ SH
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "legacy managed metadata no longer reported its recovery dependency"
+
+  case_dir="$TMP_ROOT/account-routing-pending-rollback"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' 'account_rollback_cleanup=pending' > "$case_dir/home/state/legacy.meta"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "pending rollback metadata no longer reported its cleanup dependency"
   pass "bootstrap requires direct launch tools for new routing and Agent Fleet only for legacy recovery metadata"
 }
 
@@ -883,6 +908,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
   test_herdr_detach_dependencies_have_manual_guidance
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-directory-cutover ]; then
+  test_account_routing_dependency_preflight
   exit 0
 fi
 

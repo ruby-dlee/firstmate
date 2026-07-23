@@ -15,12 +15,10 @@
 # FM_ACCOUNT_ROUTING and executable overrides are accepted only when the
 # unmistakable FM_ACCOUNT_ROUTING_TEST_LAB opt-in is active.
 # Valid modes are off, observe, and enforce.
-# Off does not invoke Agent Fleet.
-# Observe performs only `choose --dry-run`, never creates a lease, never wraps
-# the provider launch, and never writes managed account metadata.
-# Enforce atomically reserves one profile after endpoint and worktree setup,
-# immediately before provider launch, and fails closed on every Agent Fleet or
-# validation error.
+# New observe and enforce launches use bin/fm-account-directory.sh and do not
+# invoke Agent Fleet.
+# Agent Fleet selection and lease helpers remain as legacy recovery support and
+# isolated dead-code fixtures pending remove-fleet-routing-deadcode.
 #
 # FM_AGENT_FLEET_BIN may name a deterministic fake only in tests/labs.
 # Production always opens the current passwd user's fixed regular front door at

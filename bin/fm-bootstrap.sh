@@ -34,9 +34,10 @@
 #          agent-liveness verdict (bin/fm-backend.sh's fm_backend_agent_alive,
 #          distinct from the endpoint pane-presence check): outcomes distinguish
 #          no-op, successful respawn, explicit-routing deferral, skipped
-#          recovery, and failed recovery. A confirmed-dead unmanaged generation
-#          is deferred until an operator chooses whether to preserve unmanaged
-#          routing or convert it to managed routing. Session-start scope only;
+#          recovery, and failed recovery. A confirmed-dead direct generation is
+#          relaunched through fresh account-directory selection; an unmanaged
+#          generation is deferred until an operator chooses whether to preserve
+#          unmanaged routing or convert it to managed routing. Session-start scope only;
 #          see AGENTS.md "Session start" and docs/tmux-backend.md /
 #          docs/herdr-backend.md "Agent liveness probe" for the empirical basis.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
@@ -294,7 +295,8 @@ secondmate_liveness_sweep() {
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out account_profile rollback_pending retry_profile retry_out
+  local meta id window harness backend target verdict out account_profile account_home rollback_pending
+  local retry_profile retry_home retry_out
   local lifecycle_lock recheck spawn_message
   local -a resume_args retry_args
   for meta in "$STATE"/*.meta; do
@@ -355,6 +357,7 @@ secondmate_liveness_sweep() {
             ;;
         esac
         account_profile=$(fm_meta_get "$meta" account_profile)
+        account_home=$(fm_meta_get "$meta" account_home)
         rollback_pending=$(fm_meta_get "$meta" account_rollback_cleanup)
         if [ "$rollback_pending" != pending ] && [ -n "$account_profile" ] \
           && ! FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" "$FM_ROOT/bin/fm-account-session-sync.sh" "$id" --require >/dev/null 2>&1; then
@@ -366,6 +369,8 @@ secondmate_liveness_sweep() {
         resume_args=()
         if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
           resume_args+=(--resume-account)
+        elif [ -n "$account_home" ]; then
+          :
         else
           fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision"
@@ -383,10 +388,14 @@ secondmate_liveness_sweep() {
             continue
           }
           retry_profile=
+          retry_home=
           [ ! -f "$meta" ] || retry_profile=$(fm_meta_get "$meta" account_profile)
+          [ ! -f "$meta" ] || retry_home=$(fm_meta_get "$meta" account_home)
           retry_args=()
           if [ -n "$retry_profile" ]; then
             retry_args+=(--resume-account)
+          elif [ -n "$retry_home" ]; then
+            :
           else
             fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
             echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: restored unmanaged generation requires an explicit operator --no-account-routing decision"
@@ -614,7 +623,7 @@ account_routing_preflight() {
     mode_error=${mode#error: }
     echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
   fi
-  [ "$ACCOUNT_ROUTING_MODE" != enforce ] || ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS=1
+  [ "$ACCOUNT_ROUTING_MODE" = off ] || ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS=1
 }
 
 account_routing_dependency_preflight() {
@@ -637,7 +646,10 @@ account_routing_dependency_preflight() {
   fi
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
-    grep -q '^account_profile=' "$meta" 2>/dev/null || continue
+    if ! grep -q '^account_profile=' "$meta" 2>/dev/null \
+      && ! grep -qx 'account_rollback_cleanup=pending' "$meta" 2>/dev/null; then
+      continue
+    fi
     needs_agent_fleet=1
     break
   done

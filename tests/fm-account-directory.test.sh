@@ -151,6 +151,20 @@ test_claude_uses_stable_first_without_treating_usage_as_health() {
   pass "Claude deterministically selects the first directory and explains why usage is not a health signal"
 }
 
+test_default_root_uses_passwd_home_not_ambient_home() {
+  local passwd_home hostile_home expected out
+  passwd_home="$TMP_ROOT/passwd-home"
+  hostile_home="$TMP_ROOT/hostile-home"
+  expected="$passwd_home/.local/share/agent-fleet/accounts/claude/1"
+  mkdir -p "$expected" "$hostile_home/.local/share/agent-fleet/accounts/claude/0"
+  out=$(HOME="$hostile_home" \
+    FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_ACCOUNT_DIRECTORY_PASSWD_HOME="$passwd_home" \
+    "$SELECTOR" select claude 2>"$TMP_ROOT/passwd-home.err")
+  [ "$out" = "$expected" ] || fail "ambient HOME redirected account discovery away from the passwd home: $out"
+  pass "default account discovery ignores ambient HOME and stays under the passwd home"
+}
+
 test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   local codex_home claude_home
   reset_accounts
@@ -289,6 +303,60 @@ test_spawn_uses_direct_claude_fallback_and_hook() {
   pass "new account-flagged Claude spawn uses deterministic CLAUDE_CONFIG_DIR with an explicit warning"
 }
 
+test_observe_spawn_uses_direct_directory_without_agent_fleet() {
+  local record id out launch meta
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 75,70
+  id=direct-observe-z3
+  record=$(make_spawn_case direct-observe codex "$id")
+  read_spawn_case "$record"
+  printf '%s\n' observe > "$SPAWN_HOME/config/account-routing-mode"
+
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" 2>&1)
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  meta=$SPAWN_HOME/state/$id.meta
+  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/1' codex" \
+    "observe launch did not use direct Codex selection"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/1" "$meta" "observe metadata omitted the direct account home"
+  [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "observe launch invoked Agent Fleet"
+  assert_not_contains "$out" "fm-account-routing: observe" "observe launch entered the legacy dry-run selector"
+  pass "observe mode uses direct account-directory routing without Agent Fleet"
+}
+
+test_stale_secondmate_without_direct_cutover_is_refused() {
+  local primary home id out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 80,80
+  id=stale-secondmate-z4
+  primary="$TMP_ROOT/stale-primary"
+  home="$TMP_ROOT/stale-secondmate"
+  mkdir -p "$primary/data/$id" "$primary/projects" "$primary/state" "$primary/config"
+  mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
+  printf '%s\n' codex > "$primary/config/crew-harness"
+  printf '%s\n' enforce > "$primary/config/account-routing-mode"
+  touch "$primary/state/.last-watcher-beat"
+  printf '%s\n' "$id" > "$home/.fm-secondmate-home"
+  printf '%s\n' '# Firstmate' > "$home/AGENTS.md"
+  printf '%s\n' charter > "$home/data/charter.md"
+  printf '%s\n' 'fm_account_resolve_mode() {' '  :' '}' > "$home/bin/fm-account-routing-lib.sh"
+  printf '%s\n' 'ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0)' > "$home/bin/fm-spawn.sh"
+
+  if out=$(run_direct_spawn "$primary" "$home" "$TMP_ROOT/stale-secondmate-launch.log" \
+    "$id" "$home" --harness codex --secondmate 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "stale enforced secondmate launched without the direct account-directory cutover"
+  assert_contains "$out" "lacks direct account-directory routing support" \
+    "stale secondmate refusal did not identify the missing direct cutover"
+  [ ! -s "$TMP_ROOT/stale-secondmate-launch.log" ] || fail "stale secondmate reached provider launch"
+  pass "enforced secondmates require the direct account-directory cutover after a skipped sync"
+}
+
 test_routing_off_keeps_default_provider_launch() {
   local record id out launch meta
   reset_accounts
@@ -318,9 +386,12 @@ test_codex_picks_highest_fresh_minimum_and_skips_no_window
 test_codex_rechecks_health_on_every_selection
 test_codex_fails_when_no_account_has_a_fresh_window
 test_claude_uses_stable_first_without_treating_usage_as_health
+test_default_root_uses_passwd_home_not_ambient_home
 test_prepare_installs_and_verifies_per_account_herdr_hooks
 test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
+test_observe_spawn_uses_direct_directory_without_agent_fleet
+test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 
 echo "# all fm-account-directory tests passed"

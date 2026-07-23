@@ -6,8 +6,8 @@
 #   fm-account-directory.sh prepare <claude|codex>
 #
 # This header is the single owner of the direct account-directory contract.
-# Account homes are discovered under
-# $HOME/.local/share/agent-fleet/accounts/<vendor>/ without fixed counts.
+# Account homes are discovered under the current passwd user's
+# .local/share/agent-fleet/accounts/<vendor>/ tree without fixed counts.
 # Codex selection removes that account's quota-axi window cache immediately
 # before every read, sets CODEX_HOME plus the account-isolated XDG_CACHE_HOME,
 # accepts only a fresh result with at least one numeric five_hour or weekly
@@ -26,7 +26,7 @@
 #
 # Credential state is read-only.
 # This script never logs in, imports credentials, or invokes a provider model.
-# Test-only command and root overrides require
+# Test-only command, root, and passwd-home overrides require
 # FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1.
 set -u
 
@@ -44,12 +44,50 @@ test_lab_enabled() {
   [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = "$TEST_LAB_TOKEN" ]
 }
 
+passwd_home() {
+  local home
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PASSWD_HOME:-}" ]; then
+    home=$FM_ACCOUNT_DIRECTORY_PASSWD_HOME
+  else
+    [ -x /usr/bin/env ] && [ -x /usr/bin/perl ] || {
+      echo "error: /usr/bin/env and /usr/bin/perl are required to resolve the current passwd home" >&2
+      return 1
+    }
+    home=$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/perl -e '
+      my @p = getpwuid($<);
+      exit 1 unless @p && defined $p[7] && $p[7] =~ m{^/};
+      exit 1 if $p[7] =~ /[\x00-\x1f\x7f]/;
+      print $p[7];
+    ' 2>/dev/null) || {
+      echo "error: cannot resolve the current passwd home" >&2
+      return 1
+    }
+  fi
+  case "$home" in
+    *$'\n'*|*$'\r'*)
+      echo "error: passwd home contains a line break" >&2
+      return 1
+      ;;
+    /*) ;;
+    *)
+      echo "error: passwd home must be absolute: $home" >&2
+      return 1
+      ;;
+  esac
+  [ -d "$home" ] && [ ! -L "$home" ] || {
+    echo "error: passwd home is not a real directory: $home" >&2
+    return 1
+  }
+  printf '%s\n' "$home"
+}
+
 account_root() {
-  local root
+  local root home
   if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_ROOT:-}" ]; then
     root=$FM_ACCOUNT_DIRECTORY_ROOT
   else
-    root=$HOME/.local/share/agent-fleet/accounts
+    home=$(passwd_home) || return 1
+    root=$home/.local/share/agent-fleet/accounts
   fi
   case "$root" in
     *$'\n'*|*$'\r'*)

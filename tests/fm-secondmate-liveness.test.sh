@@ -417,6 +417,40 @@ test_unmanaged_respawn_requires_explicit_operator_bypass() {
   pass "unmanaged secondmate recovery requires an explicit operator bypass"
 }
 
+test_direct_account_home_respawns_through_fresh_selection() {
+  local w fb tmuxfb log out fake_root
+  w=$(new_world sweep-direct-account-home)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  printf '%s\n' 'account_home=/accounts/codex/1' >> "$w/home/state/sm1.meta"
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'spawn %s\n' "$*" >> "$FM_DIRECT_RESPAWN_LOG"
+exit 0
+SH
+  chmod +x "$fake_root/bin/"*.sh
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_DIRECT_RESPAWN_LOG="$log")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
+    "direct secondmate metadata was not recovered automatically"
+  grep -q '^spawn sm1 --secondmate$' "$log" \
+    || fail "direct secondmate recovery did not use the ordinary fresh-selection spawn path: $(cat "$log")"
+  assert_not_contains "$(cat "$log")" "--resume-account" \
+    "direct secondmate recovery entered legacy Agent Fleet resume"
+  assert_not_contains "$(cat "$log")" "--no-account-routing" \
+    "direct secondmate recovery disabled fresh account selection"
+  pass "direct secondmate metadata relaunches through fresh account-directory selection"
+}
+
 test_pending_rollback_recovery_bypasses_session_gate_and_retries() {
   local variant w fb tmuxfb log out fake_root meta
   for variant in profile profileless; do
@@ -748,6 +782,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_sweep_defers_confirmed_dead_unmanaged_secondmate
   test_sweep_rechecks_liveness_after_lifecycle_lock
   test_unmanaged_respawn_requires_explicit_operator_bypass
+  test_direct_account_home_respawns_through_fresh_selection
   test_pending_rollback_recovery_bypasses_session_gate_and_retries
   test_enforced_recovery_sweep_installs_meta_with_inherited_lock
   exit 0
@@ -767,6 +802,7 @@ test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_defers_confirmed_dead_unmanaged_secondmate
 test_sweep_rechecks_liveness_after_lifecycle_lock
 test_unmanaged_respawn_requires_explicit_operator_bypass
+test_direct_account_home_respawns_through_fresh_selection
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
 test_sweep_parent_skips_release_after_spawn_handoff
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock

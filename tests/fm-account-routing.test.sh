@@ -4,6 +4,7 @@
 # credential, real endpoint, global config, or live worker is touched.
 set -u
 export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
+export FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST=firstmate-remove-fleet-routing-deadcode-fixture-v1
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -4705,13 +4706,7 @@ test_agent_fleet_contract_is_validated_before_routing() {
   [ "$status" -ne 0 ] || fail "incompatible Agent Fleet contract unexpectedly enforced routing"
   assert_not_grep 'lease (choose|acquire)' "$AF_LOG" "incompatible Agent Fleet contract mutated a lease"
   assert_contains "$out" "unsupported Agent Fleet contract version 1" "contract mismatch was not actionable"
-
-  clear_case_logs
-  if out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_CONTRACT_VERSION=1 run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
-  [ "$status" -eq 0 ] || fail "observe mode should degrade on an incompatible Agent Fleet contract"
-  assert_not_grep ' choose ' "$AF_LOG" "incompatible observe contract still queried selection"
-  assert_contains "$out" "observe contract unavailable" "observe contract fallback was not surfaced"
-  pass "Agent Fleet contract v2 is required before observation or enforcement"
+  pass "Agent Fleet contract v2 is required before legacy fixture enforcement"
 }
 
 test_agent_fleet_entrypoint_is_physically_pinned_per_operation() {
@@ -5688,7 +5683,6 @@ if [ "${FM_TEST_FOCUSED:-}" = signal-handoff ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = gate-e-workspace ]; then
-  run_isolated_test test_observe_is_dry_run_only
   run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
   run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
@@ -5715,7 +5709,6 @@ run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
 run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
 run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
 run_isolated_test test_completion_contract_ignores_raw_html_headings
-run_isolated_test test_observe_is_dry_run_only
 run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
 run_isolated_test test_explicit_profile_uses_explicit_pool
 run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
@@ -5765,7 +5758,6 @@ run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
 run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
 run_isolated_test test_failed_secondmate_rollback_preserves_home_for_relaunch
 run_isolated_test test_failed_secondmate_respawn_rollback_restores_prior_state
-run_isolated_test test_observe_invalid_response_remains_advisory
 run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
 run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
 run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude

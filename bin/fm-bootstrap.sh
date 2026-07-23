@@ -226,9 +226,12 @@ secondmate_sync() {
   fi
   FF_NUDGE_WINDOWS=""
   FF_SEEN_HOMES=""
-  local tmp line
+  local tmp line id home window meta
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-secondmate-sync.XXXXXX" 2>/dev/null) || return 0
-  sweep_live_secondmate_metas "$STATE" "$primary_head" yes >"$tmp"
+  while IFS='|' read -r id home window meta; do
+    [ -z "$(fm_meta_get "$meta" account_home)" ] || continue
+    process_secondmate "$id" "$home" "$window" "$primary_head" yes
+  done >"$tmp" < <(live_secondmate_meta_records "$STATE" "$FM_HOME/data/secondmates.md")
   while IFS= read -r line; do
     case "$line" in
       secondmate\ *': skipped:'*) echo "SECONDMATE_SYNC: $line" ;;

@@ -193,6 +193,7 @@ git_worktree_dir_real() {
 }
 
 git_directory_identity() {
+  # shellcheck disable=SC2016 # JavaScript source is intentionally single-quoted.
   node -e '
 const fs = require("fs");
 const stat = fs.lstatSync(process.argv[1], { bigint: true });
@@ -256,10 +257,8 @@ validate_direct_recovery_worktree_identity() {
   validate_direct_recovery_physical_identity || return 1
   current_git_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
   current_git_head=$(git_worktree_head "$WT" 2>/dev/null) || current_git_head=
-  DIRECT_RECOVERY_AUTHORITATIVE_ADOPTED=0
   if [ -n "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ]; then
     if [ "$current_git_ref" = "$RECORDED_WORKTREE_GIT_REF" ]; then
-      DIRECT_RECOVERY_AUTHORITATIVE_ADOPTED=1
       WORKTREE_GIT_REF=$current_git_ref
       WORKTREE_GIT_HEAD=
       WORKTREE_GIT_SETUP_REF=
@@ -890,7 +889,6 @@ WORKTREE_GIT_REF=
 WORKTREE_GIT_HEAD=
 WORKTREE_GIT_SETUP_REF=
 WORKTREE_GIT_SETUP_HEAD=
-DIRECT_RECOVERY_AUTHORITATIVE_ADOPTED=0
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -1748,7 +1746,9 @@ direct_recovery_context_matches() {
     grep -q '^report_required=' "$RESUME_META" \
       && [ "$(fm_meta_get "$RESUME_META" report_required)" = "$RECORDED_REPORT_REQUIRED" ]
   else
-    ! grep -q '^report_required=' "$RESUME_META"
+    if grep -q '^report_required=' "$RESUME_META"; then
+      return 1
+    fi
   fi
 }
 

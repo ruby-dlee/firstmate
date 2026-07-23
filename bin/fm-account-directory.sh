@@ -63,6 +63,7 @@ passwd_home() {
       echo "error: /usr/bin/env and /usr/bin/perl are required to resolve the current passwd home" >&2
       return 1
     }
+    # shellcheck disable=SC2016 # Perl source is intentionally single-quoted.
     home=$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$perl_bin" -e '
       my @p = getpwuid($<);
       exit 1 unless @p && defined $p[7] && $p[7] =~ m{^/};
@@ -154,7 +155,8 @@ run_bounded() {
   shift
   perl_bin=$(system_perl) || return 1
   [ -x "$perl_bin" ] || return 127
-  PERL5LIB= PERL5OPT= "$perl_bin" -e '
+  # shellcheck disable=SC2016 # Perl source is intentionally single-quoted.
+  PERL5LIB='' PERL5OPT='' "$perl_bin" -e '
     use POSIX qw(setpgid WNOHANG);
     my ($timeout, @command) = @ARGV;
     my $pid = fork();

@@ -1649,7 +1649,7 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   printf 'claude-captains\n' > "$HOME_DIR/config/secondmate-account-pool"
 
-  out=$(FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST= \
+  out=$(FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST='' \
     FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" \
     run_spawn "$id" "$sm" --secondmate)
   status=$?

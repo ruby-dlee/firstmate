@@ -1372,7 +1372,7 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     echo "error: failed to restore prior task state for $ID; retaining direct spawn cleanup metadata" >&2
     exit 1
   fi
-  if ! rm -rf "$STATE/$DIRECT_SPAWN_ARTIFACTS"; then
+  if ! rm -rf "${STATE:?}/${DIRECT_SPAWN_ARTIFACTS:?}"; then
     fm_account_meta_lock_release "$direct_spawn_restore_lock" >/dev/null 2>&1 || true
     echo "error: failed to remove restored direct spawn artifact backup for $ID" >&2
     exit 1

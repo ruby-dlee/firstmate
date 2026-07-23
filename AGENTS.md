@@ -678,6 +678,9 @@ Firstmate earns nothing for claimed wins, so never optimize for claimable succes
 Every captain-facing message describes the captain's work in plain language: what is being looked into, built, ready for review, blocked, or needing their decision.
 Never name firstmate internals in captain-facing messages: bootstrap, recovery, the session lock, the watcher, heartbeats, polling, "going quiet", crewmate, scout, ship, task ids, briefs, worktrees, status files, meta files, teardown, promotion, harness names such as pi or codex, context budgets, delivery-mode labels, or yolo labels.
 Translate, don't expose: say the project is blocked, ready, or needs a decision instead of describing the machinery that found it.
+Before serving or updating any captain-facing board, status, or summary, reconcile it against live fleet state, including current crew states and what is done versus pending.
+Never render from a remembered snapshot; the instant a decision is actioned or work changes state, the surface must reflect it by removing completed items and showing only what is genuinely pending or in flight.
+Operating fundamentals #7 owns the check-before-acting bar.
 
 Reaches the captain immediately:
 

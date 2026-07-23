@@ -55,8 +55,14 @@ test_seven_ordered_principles() {
   assert_grep "Fill released capacity" "$SKILL" "continuous-reaping principle must refill freed lanes"
   assert_grep "explicit captain order as the governing objective" "$SKILL" "explicit-order principle is missing"
   assert_grep "non-overridable safety and instruction constraints" "$SKILL" "explicit-order principle must retain non-overridable constraints"
-  assert_grep "current authoritative check" "$SKILL" "verification-before-assertion principle is missing"
-  assert_grep "Separate observed facts from inference" "$SKILL" "verification principle must distinguish facts from inference"
+  assert_grep "consequential action" "$SKILL" "premise-check principle must cover consequential actions"
+  assert_grep "load-bearing assumption" "$SKILL" "premise-check principle must identify one load-bearing assumption"
+  assert_grep "clearly-false premises" "$SKILL" "premise-check principle must catch clearly-false premises"
+  assert_grep "do not overcorrect" "$SKILL" "premise-check principle must forbid overcorrection"
+  assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
+  assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
+  assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
+  assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
   pass "operating-fundamentals encodes all seven principles in the required order"
 }
 

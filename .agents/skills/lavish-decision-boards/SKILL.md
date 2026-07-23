@@ -12,6 +12,7 @@ metadata:
 
 Build a captain-facing decision surface as an actionable, layout-safe Lavish board.
 A read-only status page is not a decision surface.
+A Lavish board is a live surface, so reconcile it against live fleet state before serving or updating it and never render it from a remembered snapshot; `AGENTS.md` section 9 owns the serve-fresh rule.
 
 ## Build
 

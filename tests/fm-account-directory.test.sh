@@ -68,6 +68,9 @@ case "${3:-}" in
     ;;
   *) exit 67 ;;
 esac
+if [ -n "${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" ]; then
+  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" switch --quiet --detach || exit 68
+fi
 SH
 chmod +x "$FAKEBIN/herdr"
 
@@ -263,6 +266,7 @@ run_direct_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
+    FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
@@ -363,6 +367,39 @@ test_observe_spawn_uses_direct_directory_without_agent_fleet() {
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "observe launch invoked Agent Fleet"
   assert_not_contains "$out" "fm-account-routing: observe" "observe launch entered the legacy dry-run selector"
   pass "observe mode uses direct account-directory routing without Agent Fleet"
+}
+
+test_direct_spawn_and_recovery_support_detached_worktree() {
+  local record id meta expected_head out launch
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-detached-z4
+  record=$(make_spawn_case direct-detached codex "$id")
+  read_spawn_case "$record"
+  git -C "$SPAWN_WORKTREE" switch --quiet --detach
+  expected_head=$(git -C "$SPAWN_WORKTREE" rev-parse --verify HEAD)
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  assert_grep "worktree_git_head=$expected_head" "$meta" \
+    "detached direct spawn did not record its authoritative HEAD"
+  if grep -q '^worktree_git_ref=.' "$meta"; then
+    fail "detached direct spawn recorded a branch identity"
+  fi
+
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1)
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$out" "spawned $id harness=codex" \
+    "direct recovery rejected an intentionally detached worktree"
+  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/1' codex" \
+    "detached direct recovery did not launch with direct account routing"
+  assert_grep "worktree_git_head=$expected_head" "$meta" \
+    "detached direct recovery changed its authoritative HEAD"
+  pass "direct routing records and recovers intentionally detached worktrees"
 }
 
 test_direct_recovery_preserves_recorded_task_context() {
@@ -585,6 +622,37 @@ test_direct_recovery_rejects_changed_worktree_identity() {
   pass "direct recovery rejects wrong, redirected, and branch-changed worktrees"
 }
 
+test_direct_recovery_rechecks_identity_after_account_prepare() {
+  local record id out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-recheck-z7
+  record=$(make_spawn_case direct-recheck codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
+
+  if out=$(FM_FAKE_HERDR_DRIFT_WORKTREE="$SPAWN_WORKTREE" \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery ignored worktree identity drift during account preparation"
+  assert_contains "$out" "changed branch identity" \
+    "post-prepare identity drift refusal was not actionable"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "post-prepare identity drift created a replacement endpoint"
+  [ -s "$QUOTA_LOG" ] || fail "post-prepare identity test did not reach fresh quota selection"
+  [ -s "$HERDR_LOG" ] || fail "post-prepare identity test did not reach Herdr installation"
+  pass "direct recovery rechecks exact identity immediately before endpoint creation"
+}
+
 test_direct_recovery_tracks_retained_replacement_endpoint() {
   local record id meta out status backup_name artifacts_name retry launch
   reset_accounts
@@ -635,6 +703,57 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   [ ! -e "$SPAWN_HOME/state/$artifacts_name" ] || fail "successful retry left the retained artifact backup"
   rm -rf "/tmp/fm-$id"
   pass "failed direct recovery tracks and reconciles a retained replacement endpoint"
+}
+
+test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
+  local record id meta out status recovery_out recovery_status recorded_worktree
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-new-retained-z8
+  record=$(make_spawn_case direct-new-retained codex "$id")
+  read_spawn_case "$record"
+  : > "/tmp/fm-$id"
+
+  if out=$(FM_FAKE_KILL_RETAIN=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "new retained-endpoint failure fixture unexpectedly succeeded"
+  meta="$SPAWN_HOME/state/$id.meta"
+  recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
+  [ -f "$SPAWN_HOME/state/.fake-endpoint" ] || fail "new direct spawn fixture did not retain its endpoint"
+  assert_grep "direct_spawn_cleanup=pending" "$meta" \
+    "new direct spawn did not record pending endpoint cleanup"
+  assert_grep "rollback_pending=1" "$meta" \
+    "new direct spawn did not fail closed against duplicate spawn"
+  assert_grep "worktree=$recorded_worktree" "$meta" \
+    "new direct spawn did not retain its worktree path"
+  assert_grep "worktree_git_dir=" "$meta" \
+    "new direct spawn did not retain its exact worktree Git-dir"
+  assert_grep "worktree_git_dir_identity=" "$meta" \
+    "new direct spawn did not retain its worktree Git-dir identity"
+  assert_grep "worktree_git_ref=refs/heads/" "$meta" \
+    "new direct spawn did not retain its authoritative branch"
+  assert_grep "tmux_window_id=@1" "$meta" \
+    "new direct spawn did not retain its endpoint identity"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/1" "$meta" \
+    "new direct spawn did not retain its selected account home"
+
+  if recovery_out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    recovery_status=0
+  else
+    recovery_status=$?
+  fi
+  [ "$recovery_status" -ne 0 ] || fail "direct recovery bypassed pending new-spawn cleanup"
+  assert_contains "$recovery_out" "failed direct spawn cleanup is pending" \
+    "pending new-spawn cleanup refusal was not actionable"
+  rm -f "/tmp/fm-$id" "$SPAWN_HOME/state/.fake-endpoint"
+  pass "new direct spawn tracks retained endpoint and worktree state"
 }
 
 test_stale_secondmate_without_direct_cutover_is_refused() {
@@ -709,11 +828,14 @@ test_prepare_installs_and_verifies_per_account_herdr_hooks
 test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
 test_observe_spawn_uses_direct_directory_without_agent_fleet
+test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief
 test_direct_recovery_rejects_changed_worktree_identity
+test_direct_recovery_rechecks_identity_after_account_prepare
 test_direct_recovery_tracks_retained_replacement_endpoint
+test_new_direct_spawn_tracks_retained_endpoint_and_worktree
 test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 

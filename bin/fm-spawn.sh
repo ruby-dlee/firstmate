@@ -726,6 +726,7 @@ DIRECT_ACCOUNT_PREPARE_DEFERRED=0
 WORKTREE_GIT_DIR=
 WORKTREE_GIT_DIR_IDENTITY=
 WORKTREE_GIT_REF=
+WORKTREE_GIT_HEAD=
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -868,7 +869,8 @@ persist_failed_direct_recovery() {
     echo "worktree=${WT:-${RECORDED_WORKTREE:-}}"
     echo "worktree_git_dir=${WORKTREE_GIT_DIR:-${RECORDED_WORKTREE_GIT_DIR:-}}"
     echo "worktree_git_dir_identity=${WORKTREE_GIT_DIR_IDENTITY:-${RECORDED_WORKTREE_GIT_DIR_IDENTITY:-}}"
-    echo "worktree_git_ref=${WORKTREE_GIT_REF:-${RECORDED_WORKTREE_GIT_REF:-}}"
+    [ -z "${WORKTREE_GIT_REF:-${RECORDED_WORKTREE_GIT_REF:-}}" ] || echo "worktree_git_ref=${WORKTREE_GIT_REF:-${RECORDED_WORKTREE_GIT_REF:-}}"
+    [ -z "${WORKTREE_GIT_HEAD:-${RECORDED_WORKTREE_GIT_HEAD:-}}" ] || echo "worktree_git_head=${WORKTREE_GIT_HEAD:-${RECORDED_WORKTREE_GIT_HEAD:-}}"
     echo "project=${PROJ_ABS:-${RECORDED_PROJECT:-}}"
     echo "harness=${HARNESS:-${RECORDED_HARNESS:-}}"
     echo "kind=${KIND:-${RECORDED_KIND:-ship}}"
@@ -911,6 +913,88 @@ persist_failed_direct_recovery() {
     echo "direct_recovery_artifacts=$artifacts_name"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
+persist_failed_direct_spawn() {
+  local meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo preserve_extensions=0
+  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+  retained_tmux_session=
+  retained_mode=${MODE:-}
+  retained_yolo=${YOLO:-off}
+  if [ -z "$retained_mode" ]; then
+    if [ "${KIND:-ship}" = secondmate ]; then
+      retained_mode=secondmate
+    else
+      retained_mode=no-mistakes
+    fi
+  fi
+  if [ "${BACKEND:-tmux}" = tmux ]; then
+    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+    retained_window=$retained_tmux_session
+  fi
+  if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    if [ -z "${WORKTREE_GIT_DIR:-}" ] || [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ]; then
+      capture_worktree_git_physical_identity "$WT" >/dev/null 2>&1 || true
+    fi
+    if [ -z "${WORKTREE_GIT_REF:-}" ] && [ -z "${WORKTREE_GIT_HEAD:-}" ]; then
+      capture_worktree_git_final_state "$WT" >/dev/null 2>&1 || true
+    fi
+  fi
+  tmp=$(mktemp "$STATE/.$ID.meta.direct-spawn-pending.XXXXXX") || return 1
+  if [ "$META_INSTALLED" = 1 ] && [ -f "$meta" ] \
+    && [ "$(fm_account_meta_value "$meta" generation_id)" = "$SPAWN_GENERATION_ID" ]; then
+    awk '!/^direct_spawn_cleanup=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    [ ! -f "$meta" ] || preserve_extensions=1
+    {
+      echo "window=$retained_window"
+      echo "worktree=${WT:-}"
+      [ -z "${WORKTREE_GIT_DIR:-}" ] || echo "worktree_git_dir=$WORKTREE_GIT_DIR"
+      [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ] || echo "worktree_git_dir_identity=$WORKTREE_GIT_DIR_IDENTITY"
+      [ -z "${WORKTREE_GIT_REF:-}" ] || echo "worktree_git_ref=$WORKTREE_GIT_REF"
+      [ -z "${WORKTREE_GIT_HEAD:-}" ] || echo "worktree_git_head=$WORKTREE_GIT_HEAD"
+      echo "project=${PROJ_ABS:-}"
+      echo "harness=${HARNESS:-}"
+      echo "kind=${KIND:-ship}"
+      echo "mode=$retained_mode"
+      echo "yolo=$retained_yolo"
+      echo "tasktmp=${TASK_TMP:-/tmp/fm-$ID}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      echo "generation_id=${SPAWN_GENERATION_ID:-}"
+      echo "report_required=1"
+      [ -z "${DIRECT_ACCOUNT_HOME:-}" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
+      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+      [ "${BACKEND:-tmux}" != herdr ] || {
+        echo "herdr_session=${HERDR_SES:-}"
+        echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+        echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+        echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != zellij ] || {
+        echo "zellij_session=${ZELLIJ_SES:-}"
+        echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+        echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != cmux ] || {
+        echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+        echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+      }
+      [ "${KIND:-ship}" != secondmate ] || {
+        echo "home=${PROJ_ABS:-}"
+        echo "projects=${SECONDMATE_PROJECTS:-}"
+      }
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if [ "$preserve_extensions" = 1 ]; then
+    fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
   fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
   META_INSTALLED=1
@@ -1023,6 +1107,17 @@ spawn_abort_cleanup() {
       persist_failed_direct_recovery || echo "warning: failed to persist retained direct recovery state for ${ID:-unknown}" >&2
     else
       echo "warning: failed to acquire metadata lock while preserving retained direct recovery for ${ID:-unknown}" >&2
+    fi
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
+    && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_direct_spawn || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
+    else
+      echo "warning: failed to acquire metadata lock while preserving retained direct spawn for ${ID:-unknown}" >&2
     fi
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 1 ]; then
@@ -1276,6 +1371,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     RECORDED_WORKTREE_GIT_DIR=$(fm_meta_get "$RESUME_META" worktree_git_dir)
     RECORDED_WORKTREE_GIT_DIR_IDENTITY=$(fm_meta_get "$RESUME_META" worktree_git_dir_identity)
     RECORDED_WORKTREE_GIT_REF=$(fm_meta_get "$RESUME_META" worktree_git_ref)
+    RECORDED_WORKTREE_GIT_HEAD=$(fm_meta_get "$RESUME_META" worktree_git_head)
     RECORDED_GENERATION=$(fm_meta_get "$RESUME_META" generation_id)
     RECORDED_TASKTMP=$(fm_meta_get "$RESUME_META" tasktmp)
     RECORDED_REPORT_REQUIRED=
@@ -1292,6 +1388,14 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       claude|codex) ;;
       *) echo "error: direct account recovery metadata has unsupported harness '$RECORDED_HARNESS' for $ID" >&2; exit 1 ;;
     esac
+    [ -z "$(fm_meta_get "$RESUME_META" direct_spawn_cleanup)" ] || {
+      echo "error: failed direct spawn cleanup is pending for $ID; tear down the retained endpoint and worktree before recovery" >&2
+      exit 1
+    }
+    [ -z "$(fm_meta_get "$RESUME_META" rollback_pending)" ] || {
+      echo "error: rollback cleanup is pending for $ID; tear down the retained task state before recovery" >&2
+      exit 1
+    }
     [ -n "$RECORDED_ACCOUNT_HOME" ] || { echo "error: direct account recovery metadata has no account_home for $ID" >&2; exit 1; }
     [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] || { echo "error: direct account recovery cannot replace legacy account_profile metadata for $ID" >&2; exit 1; }
     [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] || { echo "error: direct account recovery cannot bypass pending legacy rollback cleanup for $ID" >&2; exit 1; }
@@ -1299,7 +1403,14 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_WORKTREE" ] || { echo "error: direct account recovery metadata has no worktree for $ID" >&2; exit 1; }
     [ -n "$RECORDED_WORKTREE_GIT_DIR" ] || { echo "error: direct account recovery metadata has no exact worktree Git-dir for $ID" >&2; exit 1; }
     [ -n "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ] || { echo "error: direct account recovery metadata has no worktree Git-dir identity for $ID" >&2; exit 1; }
-    [ -n "$RECORDED_WORKTREE_GIT_REF" ] || { echo "error: direct account recovery metadata has no worktree branch identity for $ID" >&2; exit 1; }
+    if [ -n "$RECORDED_WORKTREE_GIT_REF" ] && [ -n "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: direct account recovery metadata has conflicting branch and detached HEAD identities for $ID" >&2
+      exit 1
+    fi
+    if [ -z "$RECORDED_WORKTREE_GIT_REF" ] && [ -z "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: direct account recovery metadata has no authoritative worktree Git state for $ID" >&2
+      exit 1
+    fi
     [ -n "$RECORDED_MODE" ] || { echo "error: direct account recovery metadata has no mode for $ID" >&2; exit 1; }
     [ -n "$RECORDED_YOLO" ] || { echo "error: direct account recovery metadata has no yolo setting for $ID" >&2; exit 1; }
     [ -n "$RECORDED_GENERATION" ] || { echo "error: direct account recovery metadata has no generation_id for $ID" >&2; exit 1; }
@@ -1397,6 +1508,7 @@ direct_recovery_context_matches() {
     && [ "$(fm_meta_get "$RESUME_META" worktree_git_dir)" = "$RECORDED_WORKTREE_GIT_DIR" ] \
     && [ "$(fm_meta_get "$RESUME_META" worktree_git_dir_identity)" = "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ] \
     && [ "$(fm_meta_get "$RESUME_META" worktree_git_ref)" = "$RECORDED_WORKTREE_GIT_REF" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_head)" = "$RECORDED_WORKTREE_GIT_HEAD" ] \
     && [ "$(fm_backend_of_meta "$RESUME_META")" = "$BACKEND" ] \
     && [ "$(fm_meta_get "$RESUME_META" model)" = "$RECORDED_MODEL" ] \
     && [ "$(fm_meta_get "$RESUME_META" effort)" = "$RECORDED_EFFORT" ] \
@@ -1409,7 +1521,9 @@ direct_recovery_context_matches() {
     && [ "$(fm_meta_get "$RESUME_META" projects)" = "$RECORDED_PROJECTS" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" direct_recovery_cleanup)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" direct_spawn_cleanup)" ] \
     && [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" rollback_pending)" ] \
     || return 1
   if [ "$RECORDED_REPORT_REQUIRED_SET" = 1 ]; then
     grep -q '^report_required=' "$RESUME_META" \
@@ -2122,16 +2236,29 @@ git_worktree_ref() {
   git_repository_probe -C "$1" symbolic-ref -q HEAD 2>/dev/null
 }
 
-capture_worktree_git_identity() {
+git_worktree_head() {
+  git_repository_probe -C "$1" rev-parse --verify 'HEAD^{commit}' 2>/dev/null
+}
+
+capture_worktree_git_physical_identity() {
   local worktree=$1
   WORKTREE_GIT_DIR=$(git_worktree_dir_real "$worktree" 2>/dev/null) || return 1
   WORKTREE_GIT_DIR_IDENTITY=$(git_directory_identity "$WORKTREE_GIT_DIR" 2>/dev/null) || return 1
-  WORKTREE_GIT_REF=$(git_worktree_ref "$worktree" 2>/dev/null) || return 1
-  [ -n "$WORKTREE_GIT_DIR" ] && [ -n "$WORKTREE_GIT_DIR_IDENTITY" ] && [ -n "$WORKTREE_GIT_REF" ]
+  [ -n "$WORKTREE_GIT_DIR" ] && [ -n "$WORKTREE_GIT_DIR_IDENTITY" ]
+}
+
+capture_worktree_git_final_state() {
+  local worktree=$1
+  WORKTREE_GIT_REF=$(git_worktree_ref "$worktree" 2>/dev/null || true)
+  WORKTREE_GIT_HEAD=
+  if [ -z "$WORKTREE_GIT_REF" ]; then
+    WORKTREE_GIT_HEAD=$(git_worktree_head "$worktree" 2>/dev/null) || return 1
+  fi
+  [ -n "$WORKTREE_GIT_REF" ] || [ -n "$WORKTREE_GIT_HEAD" ]
 }
 
 validate_direct_recovery_worktree_identity() {
-  local worktree_real worktree_literal current_git_dir current_git_dir_identity current_git_ref
+  local worktree_real worktree_literal current_git_dir current_git_dir_identity current_git_ref current_git_head
   worktree_real=$(cd "$WT" 2>/dev/null && pwd -P) || worktree_real=
   worktree_literal=${WT%/}
   if [ -z "$worktree_real" ] || [ "$worktree_literal" != "$worktree_real" ]; then
@@ -2140,20 +2267,46 @@ validate_direct_recovery_worktree_identity() {
   fi
   current_git_dir=$(git_worktree_dir_real "$WT" 2>/dev/null) || current_git_dir=
   current_git_dir_identity=$(git_directory_identity "$current_git_dir" 2>/dev/null) || current_git_dir_identity=
-  current_git_ref=$(git_worktree_ref "$WT" 2>/dev/null) || current_git_ref=
   if [ -z "$current_git_dir" ] || [ -z "$current_git_dir_identity" ] \
     || [ "$current_git_dir" != "$RECORDED_WORKTREE_GIT_DIR" ] \
     || [ "$current_git_dir_identity" != "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ]; then
     echo "error: recorded direct account recovery worktree '$WT' no longer has its exact Git-dir identity; refusing endpoint creation" >&2
     return 1
   fi
-  if [ -z "$current_git_ref" ] || [ "$current_git_ref" != "$RECORDED_WORKTREE_GIT_REF" ]; then
-    echo "error: recorded direct account recovery worktree '$WT' changed branch identity; refusing endpoint creation" >&2
-    return 1
+  current_git_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
+  current_git_head=
+  if [ -n "$RECORDED_WORKTREE_GIT_REF" ]; then
+    if [ "$current_git_ref" != "$RECORDED_WORKTREE_GIT_REF" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed branch identity; refusing endpoint creation" >&2
+      return 1
+    fi
+  else
+    if [ -n "$current_git_ref" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed detached HEAD identity; refusing endpoint creation" >&2
+      return 1
+    fi
+    current_git_head=$(git_worktree_head "$WT" 2>/dev/null) || current_git_head=
+    if [ -z "$current_git_head" ] || [ "$current_git_head" != "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed detached HEAD identity; refusing endpoint creation" >&2
+      return 1
+    fi
   fi
   WORKTREE_GIT_DIR=$current_git_dir
   WORKTREE_GIT_DIR_IDENTITY=$current_git_dir_identity
   WORKTREE_GIT_REF=$current_git_ref
+  WORKTREE_GIT_HEAD=$current_git_head
+}
+
+validate_direct_launch_worktree_identity() {
+  local current_git_dir current_git_dir_identity
+  current_git_dir=$(git_worktree_dir_real "$WT" 2>/dev/null) || current_git_dir=
+  current_git_dir_identity=$(git_directory_identity "$current_git_dir" 2>/dev/null) || current_git_dir_identity=
+  if [ -z "$current_git_dir" ] || [ -z "$current_git_dir_identity" ] \
+    || [ "$current_git_dir" != "$WORKTREE_GIT_DIR" ] \
+    || [ "$current_git_dir_identity" != "$WORKTREE_GIT_DIR_IDENTITY" ]; then
+    echo "error: direct account worktree '$WT' changed exact Git-dir identity before metadata install" >&2
+    return 1
+  fi
 }
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -2173,7 +2326,7 @@ elif [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] && [ "$KIND" = secondmate ]; then
     echo "error: cannot canonicalize direct account worktree for $ID" >&2
     exit 1
   }
-  capture_worktree_git_identity "$WT" || {
+  capture_worktree_git_physical_identity "$WT" || {
     echo "error: cannot record exact direct account worktree identity for $ID" >&2
     exit 1
   }
@@ -2229,6 +2382,9 @@ fi
 W="fm-$ID"
 SPAWN_CWD=$PROJ_ABS
 [ "$RECOVERY_ACCOUNT" != 1 ] || SPAWN_CWD=$WT
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  validate_direct_recovery_worktree_identity || exit 1
+fi
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -2436,7 +2592,7 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] && [ 
     echo "error: cannot canonicalize direct account worktree for $ID" >&2
     exit 1
   }
-  capture_worktree_git_identity "$WT" || {
+  capture_worktree_git_physical_identity "$WT" || {
     echo "error: cannot record exact direct account worktree identity for $ID" >&2
     exit 1
   }
@@ -2606,6 +2762,18 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   fi
 fi
 
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    validate_direct_recovery_worktree_identity || exit 1
+  else
+    validate_direct_launch_worktree_identity || exit 1
+    capture_worktree_git_final_state "$WT" || {
+      echo "error: cannot record authoritative direct account worktree Git state for $ID" >&2
+      exit 1
+    }
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 lifecycle_lock_valid=0
@@ -2648,7 +2816,8 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "worktree=$WT"
   [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || echo "worktree_git_dir=$WORKTREE_GIT_DIR"
   [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || echo "worktree_git_dir_identity=$WORKTREE_GIT_DIR_IDENTITY"
-  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || echo "worktree_git_ref=$WORKTREE_GIT_REF"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_REF" ] || echo "worktree_git_ref=$WORKTREE_GIT_REF"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_HEAD" ] || echo "worktree_git_head=$WORKTREE_GIT_HEAD"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
   echo "kind=$KIND"

@@ -64,7 +64,8 @@ test_seven_ordered_principles() {
   assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
   assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
   assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
-  assert_grep "Before adding any bypass, record that target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale for every bypass"
+  assert_grep "Before adding a bypass that gates an irreversible or high-stakes action, record the target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale for consequential bypasses"
+  assert_grep "trivial skips are exempt" "$SKILL" "purpose-before-bypass principle must exempt trivial skips from recorded rationale"
   assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
   pass "operating-fundamentals encodes all seven principles in the required order"
 }
@@ -107,7 +108,7 @@ test_crew_steering_contract_and_trigger() {
   assert_grep "preserves mandated safety" "$CREW_SKILL" "crew ownership must preserve legitimate safety stops"
   assert_grep "unsafe or non-isolated worktree placement" "$CREW_SKILL" "crew ownership must retain the worktree safety stop"
   assert_grep "exhausts its capability before following the solve-first escalation bar" "$CREW_SKILL" "crew ownership must preserve legitimate blocker escalation"
-  assert_grep 'Treat `almost there` as unfinished' "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
+  assert_grep "Treat \`almost there\` as unfinished" "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
   assert_grep "real evidence because work is not done until proven" "$CREW_SKILL" "crew steering must require evidence before completion"
   assert_grep "review adversarially rather than rubber-stamping" "$CREW_SKILL" "crew steering must require adversarial review"
   assert_grep "one load-bearing assumption before it acts" "$CREW_SKILL" "crew steering must premise-check before action"

@@ -54,5 +54,5 @@ Before ANY consequential action - a config/system change, an escalation to the c
 What am I actually changing, and what is its target?
 Catch clearly-false premises; do not overcorrect.
 Before classifying any gate, check, blocker, or failure as safe to bypass, establish the operation's target outcome and verify that the failing thing is neither that outcome nor on its critical path.
-Before adding any bypass, record that target outcome and the rationale for the critical-path judgment.
+Before adding a bypass that gates an irreversible or high-stakes action, record the target outcome and the rationale for the critical-path judgment; trivial skips are exempt.
 A failure in the capability the operation exists to deliver is the operation failing, not noise.

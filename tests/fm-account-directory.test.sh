@@ -413,6 +413,9 @@ test_direct_recovery_preserves_recorded_task_context() {
   assert_grep "kind=scout" "$meta" "direct recovery did not preserve scout kind"
   assert_grep "project=$recorded_project" "$meta" "direct recovery changed project identity"
   assert_grep "worktree=$recorded_worktree" "$meta" "direct recovery changed worktree identity"
+  assert_grep "worktree_git_dir=" "$meta" "direct recovery dropped the exact worktree Git-dir"
+  assert_grep "worktree_git_dir_identity=" "$meta" "direct recovery dropped the worktree Git-dir identity"
+  assert_grep "worktree_git_ref=refs/heads/" "$meta" "direct recovery dropped the worktree branch identity"
   assert_grep "harness=codex" "$meta" "direct recovery changed the recorded harness"
   assert_grep "model=gpt-recorded" "$meta" "direct recovery changed the recorded model"
   assert_grep "effort=high" "$meta" "direct recovery changed the recorded effort"
@@ -427,7 +430,7 @@ test_direct_recovery_preserves_recorded_task_context() {
 }
 
 test_direct_recovery_rejects_worktree_from_another_project() {
-  local record id meta unrelated meta_tmp out status
+  local record id meta unrelated meta_tmp out status recorded_git_dir
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 90,85
@@ -447,9 +450,13 @@ test_direct_recovery_rejects_worktree_from_another_project() {
   ' "$meta" > "$meta_tmp"
   mv "$meta_tmp" "$meta"
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
+  recorded_git_dir=$(sed -n 's/^worktree_git_dir=//p' "$meta")
 
-  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" --recover-direct-account 2>&1); then
+  if out=$(GIT_DIR="$recorded_git_dir" GIT_COMMON_DIR="$SPAWN_PROJECT/.git" GIT_WORK_TREE="$unrelated" \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" --recover-direct-account 2>&1); then
     status=0
   else
     status=$?
@@ -458,6 +465,8 @@ test_direct_recovery_rejects_worktree_from_another_project() {
   assert_contains "$out" "does not belong to recorded project" \
     "direct recovery project-identity refusal was not actionable"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "project-identity mismatch created a replacement endpoint"
+  [ ! -s "$QUOTA_LOG" ] || fail "project-identity mismatch read account quota before refusing recovery"
+  [ ! -s "$HERDR_LOG" ] || fail "project-identity mismatch installed a profile hook before refusing recovery"
   pass "direct recovery proves the recorded worktree belongs to the recorded project"
 }
 
@@ -473,6 +482,8 @@ test_direct_recovery_requires_recorded_brief() {
   run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
   rm -f "$SPAWN_HOME/state/.fake-endpoint" "$SPAWN_HOME/data/$id/brief.md"
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
 
   if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" --recover-direct-account 2>&1); then
@@ -484,7 +495,94 @@ test_direct_recovery_requires_recorded_brief() {
   assert_contains "$out" "no brief at $SPAWN_HOME/data/$id/brief.md" \
     "direct recovery missing-brief refusal was not actionable"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "missing direct recovery brief created a replacement endpoint"
+  [ ! -s "$QUOTA_LOG" ] || fail "missing direct recovery brief read account quota before refusing recovery"
+  [ ! -s "$HERDR_LOG" ] || fail "missing direct recovery brief installed a profile hook before refusing recovery"
   pass "direct recovery refuses to launch without the recorded brief"
+}
+
+test_direct_recovery_rejects_changed_worktree_identity() {
+  local record id meta original_worktree wrong_worktree redirected_worktree meta_tmp out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 90,85
+  id=direct-worktree-identity-z7
+  record=$(make_spawn_case direct-worktree-identity codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  original_worktree=$(sed -n 's/^worktree=//p' "$meta")
+  wrong_worktree="$TMP_ROOT/wrong-linked-worktree"
+  git -C "$SPAWN_PROJECT" worktree add --quiet -b wrong-linked-worktree "$wrong_worktree"
+  wrong_worktree=$(cd "$wrong_worktree" && pwd -P)
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-worktree-meta.XXXXXX")
+  awk -v worktree="$wrong_worktree" '
+    /^worktree=/ { print "worktree=" worktree; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery launched in another linked worktree"
+  assert_contains "$out" "no longer has its exact Git-dir identity" \
+    "wrong linked-worktree refusal did not identify the exact Git-dir mismatch"
+  [ ! -s "$QUOTA_LOG" ] || fail "wrong linked worktree read account quota before refusing recovery"
+  [ ! -s "$HERDR_LOG" ] || fail "wrong linked worktree installed a profile hook before refusing recovery"
+
+  redirected_worktree="$(cd "$TMP_ROOT" && pwd -P)/redirected-direct-worktree"
+  ln -s "$original_worktree" "$redirected_worktree"
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-worktree-meta.XXXXXX")
+  awk -v worktree="$redirected_worktree" '
+    /^worktree=/ { print "worktree=" worktree; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery followed a symlinked worktree path"
+  assert_contains "$out" "is redirected or non-canonical" \
+    "symlinked worktree refusal did not identify path redirection"
+  [ ! -s "$QUOTA_LOG" ] || fail "symlinked worktree read account quota before refusing recovery"
+  [ ! -s "$HERDR_LOG" ] || fail "symlinked worktree installed a profile hook before refusing recovery"
+
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-worktree-meta.XXXXXX")
+  awk -v worktree="$original_worktree" '
+    /^worktree=/ { print "worktree=" worktree; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  git -C "$original_worktree" switch --quiet -c diverted-direct-recovery
+  : > "$QUOTA_LOG"
+  : > "$HERDR_LOG"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct recovery launched after the recorded worktree changed branches"
+  assert_contains "$out" "changed branch identity" \
+    "changed-branch refusal did not identify the recorded branch mismatch"
+  [ ! -s "$QUOTA_LOG" ] || fail "changed worktree branch read account quota before refusing recovery"
+  [ ! -s "$HERDR_LOG" ] || fail "changed worktree branch installed a profile hook before refusing recovery"
+  pass "direct recovery rejects wrong, redirected, and branch-changed worktrees"
 }
 
 test_direct_recovery_tracks_retained_replacement_endpoint() {
@@ -614,6 +712,7 @@ test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_recovery_preserves_recorded_task_context
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief
+test_direct_recovery_rejects_changed_worktree_identity
 test_direct_recovery_tracks_retained_replacement_endpoint
 test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch

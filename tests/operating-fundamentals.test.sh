@@ -98,9 +98,36 @@ test_crew_steering_contract_and_trigger() {
     "6. Be direct and early")
   [ "$headings" = "$expected" ] || fail "crew-steering must retain all six captain-standard guardrails"
 
+  assert_grep "name the outcome, constraint, evidence, and next action" "$CREW_SKILL" "crew steering must keep briefs and steers proportional"
+  assert_grep "expected result, authority boundaries, verification, and definition of done" "$CREW_SKILL" "crew briefs must define their result, scope, proof, and completion bar"
+  assert_grep "smallest load-bearing mistake early" "$CREW_SKILL" "live steering must correct the load-bearing mistake early"
+  assert_grep "carry the fix through implementation and proof" "$CREW_SKILL" "live steering must require implementation and proof"
+  assert_grep "preserve the captain's actual goal" "$CREW_SKILL" "crew steering must preserve the captain's actual goal"
+  assert_grep "use the existing owner for detail instead of copying its contract" "$CREW_SKILL" "crew steering must preserve contract ownership"
+  assert_grep "solve and implement the task" "$CREW_SKILL" "crews must own both solution and implementation"
+  assert_grep "never stops solely because work is hard or failing" "$CREW_SKILL" "crews must not treat difficulty as a stopping condition"
+  assert_grep "preserves mandated safety" "$CREW_SKILL" "crew ownership must preserve legitimate safety stops"
+  assert_grep "unsafe or non-isolated worktree placement" "$CREW_SKILL" "crew ownership must retain the worktree safety stop"
+  assert_grep "exhausts its capability before following the solve-first escalation bar" "$CREW_SKILL" "crew ownership must preserve legitimate blocker escalation"
+  assert_grep 'Treat `almost there` as unfinished' "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
+  assert_grep "real evidence because work is not done until proven" "$CREW_SKILL" "crew steering must require evidence before completion"
+  assert_grep "review adversarially rather than rubber-stamping" "$CREW_SKILL" "crew steering must require adversarial review"
+  assert_grep "one load-bearing assumption before it acts" "$CREW_SKILL" "crew steering must premise-check before action"
+  assert_grep "rejecting a shallow-false premise without overcorrecting" "$CREW_SKILL" "premise checking must reject false premises without overreach"
+  assert_grep "captain's technical-decision bias" "$CREW_SKILL" "crew steering must apply the captain's quality bar"
+  assert_grep "reject preserving a leaky component merely to save development cost or sunk work" "$CREW_SKILL" "crew steering must prefer robustness over development cost or sunk work"
+  assert_grep "Reject any quiet reframing of the task into a smaller win" "$CREW_SKILL" "crew steering must reject weakened goals"
+  assert_grep "fixed-goal guardrail" "$CREW_SKILL" "crew steering must retain the fixed-goal authority"
+  assert_grep "specific, un-bloated briefs and steers" "$CREW_SKILL" "crew steering must remain direct"
+  assert_grep "correct a wrong path before it is built" "$CREW_SKILL" "crew steering must correct wrong paths early"
+  assert_grep "concrete result the crew must produce" "$CREW_SKILL" "a steer must end with the required result"
+  assert_grep "evidence that will prove it" "$CREW_SKILL" "a steer must end with required proof"
+  assert_grep "next action it should take" "$CREW_SKILL" "a steer must end with the next action"
+  assert_grep "Do not add motivational padding, duplicate background, or a second copy of an existing procedure" "$CREW_SKILL" "crew steering must avoid padding and duplicate contracts"
+
   section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
   assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crew brief and before live-steering a crew" "section 13 must trigger crew-steering for briefs and live steers"
-  pass "crew-steering retains its six guardrails and conditional trigger"
+  pass "crew-steering retains its behavioral guardrails and conditional trigger"
 }
 
 test_live_surface_freshness_contract() {

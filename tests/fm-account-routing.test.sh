@@ -2722,10 +2722,23 @@ test_continuation_fails_closed_without_original_brief() {
   id=account-continue-nobrief-z22
   rec=$(make_case continue-nobrief claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation precondition spawn failed"
-  rm -f "$CASE_DIR/endpoint-live" "$HOME_DIR/data/$id/brief.md"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "account_pool=claude-crew" \
+    "account_profile=claude-2" \
+    "account_task=$id" \
+    "account_attempt=legacy" \
+    "provider_session_id=sess-$id"
+  rm -f "$HOME_DIR/data/$id/brief.md"
   clear_case_logs
-  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" missing-brief 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation without original brief unexpectedly succeeded"
   assert_not_grep '^new-window ' "$TMUX_LOG" "unsafe continuation created an endpoint"

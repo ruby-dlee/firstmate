@@ -21,6 +21,7 @@ class ProviderConfig:
     shared_entries: tuple[str, ...] = ()
     desktop_identity_file: Path | None = None
     trusted_projects: tuple[Path, ...] = ()
+    herdr_integration: bool = False
 
 
 @dataclass(frozen=True)

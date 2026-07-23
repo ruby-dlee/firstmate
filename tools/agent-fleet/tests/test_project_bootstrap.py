@@ -1367,6 +1367,105 @@ def test_provision_rejects_hook_source_before_reading_it(
     assert not profile.home.exists()
 
 
+def test_claude_herdr_integration_installs_release_owned_hook_and_verifies_exact(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    provider = registry.require_provider("claude")
+    providers = dict(registry.providers)
+    providers["claude"] = replace(provider, herdr_integration=True)
+    registry = replace(registry, providers=providers)
+    profile = registry.require_profile("claude-1")
+
+    provision_profile(registry, profile)
+
+    script_path = provision_module.herdr_hook_path(profile)
+    assert script_path == profile.home / "hooks" / "herdr-agent-state.sh"
+    assert script_path.read_text(encoding="utf-8") == (
+        provision_module.HERDR_HOOK_SCRIPTS["claude"]
+    )
+    settings = json.loads((profile.home / "settings.json").read_text(encoding="utf-8"))
+    session_groups = settings["hooks"]["SessionStart"]
+    herdr_commands = [
+        entry["command"]
+        for group in session_groups
+        for entry in group["hooks"]
+        if "herdr-agent-state" in entry["command"]
+    ]
+    assert herdr_commands == [f"bash '{script_path}' session"]
+    # The agent-fleet-owned SessionStart group is untouched, alongside it.
+    assert any(
+        "hook session-start" in entry["command"]
+        for group in session_groups
+        for entry in group["hooks"]
+    )
+
+    health = profile_hook_health(registry, profile)
+    assert health["herdr_session_hook"] is True
+    assert health["agent_fleet_session_hook"] is True
+
+    verification = provision_module.verify_provisioned_profile(registry, profile.id)
+    assert verification["status"] == "verified"
+    assert verification["mismatches"] == []
+
+
+def test_codex_herdr_integration_installs_release_owned_hook_and_verifies_exact(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    provider = registry.require_provider("codex")
+    providers = dict(registry.providers)
+    providers["codex"] = replace(provider, herdr_integration=True)
+    registry = replace(registry, providers=providers)
+    profile = registry.require_profile("codex-1")
+
+    provision_profile(registry, profile)
+
+    script_path = provision_module.herdr_hook_path(profile)
+    assert script_path == profile.home / "herdr-agent-state.sh"
+    assert script_path.read_text(encoding="utf-8") == (
+        provision_module.HERDR_HOOK_SCRIPTS["codex"]
+    )
+    hooks = json.loads((profile.home / "hooks.json").read_text(encoding="utf-8"))
+    herdr_commands = [
+        entry["command"]
+        for group in hooks["hooks"]["SessionStart"]
+        for entry in group["hooks"]
+        if "herdr-agent-state" in entry["command"]
+    ]
+    assert herdr_commands == [f"bash '{script_path}' session"]
+
+    health = profile_hook_health(registry, profile)
+    assert health["herdr_session_hook"] is True
+
+    verification = provision_module.verify_provisioned_profile(registry, profile.id)
+    assert verification["status"] == "verified"
+    assert verification["mismatches"] == []
+
+
+def test_herdr_integration_default_off_keeps_hooks_source_ban_and_no_herdr_hook(
+    fleet: tuple[object, Path],
+) -> None:
+    _, config = fleet
+    registry = load_registry(config)
+    profile = registry.require_profile("claude-1")
+
+    provision_profile(registry, profile)
+
+    assert not provision_module.herdr_hook_path(profile).exists()
+    health = profile_hook_health(registry, profile)
+    assert health["herdr_session_hook"] is False
+    # hooks_source itself stays fully banned regardless of herdr_integration.
+    provider = registry.require_provider("claude")
+    assert provider.hooks_source is None
+    providers = dict(registry.providers)
+    providers["claude"] = replace(provider, hooks_source=Path.cwd(), herdr_integration=True)
+    with pytest.raises(ValueError, match="hooks_source must be absent"):
+        provision_profile(replace(registry, providers=providers), profile)
+
+
 def test_codex_launch_refuses_profile_plugin_enablement(
     fleet: tuple[object, Path],
 ) -> None:

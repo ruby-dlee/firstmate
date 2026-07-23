@@ -519,6 +519,9 @@ def load_registry(path: Path | None = None) -> Registry:
             isinstance(entry, str) and entry for entry in trusted_projects_raw
         ):
             raise ValueError(f"providers.{provider}.trusted_projects must contain path strings")
+        herdr_integration_raw = item.get("herdr_integration", False)
+        if not isinstance(herdr_integration_raw, bool):
+            raise ValueError(f"providers.{provider}.herdr_integration must be true or false")
         providers[provider] = ProviderConfig(
             provider,
             expand_path(binary_raw),
@@ -531,6 +534,7 @@ def load_registry(path: Path | None = None) -> Registry:
                 else None
             ),
             tuple(expand_lexical_path(entry) for entry in trusted_projects_raw),
+            herdr_integration_raw,
         )
 
     profiles_raw = raw.get("profiles", {})
@@ -882,6 +886,7 @@ def save_registry(registry: Registry, path: Path | None = None) -> Path:
                     if provider_config.hooks_source
                     else []
                 ),
+                *(["herdr_integration = true"] if provider_config.herdr_integration else []),
                 *(
                     [
                         "desktop_identity_file = "

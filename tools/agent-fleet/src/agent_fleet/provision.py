@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .herdr_hook_assets import HERDR_HOOK_RELATIVE_PATH, HERDR_HOOK_SCRIPTS
 from .models import SHARED_WORKFLOW_ENTRIES, Profile, ProviderConfig, Registry
 from .paths import ensure_private_dir
 from .projects import (
@@ -271,21 +272,51 @@ def _declared_source_hooks(source: Path | None) -> dict[str, Any]:
     return {}
 
 
+def herdr_hook_path(profile: Profile) -> Path:
+    return profile.home / HERDR_HOOK_RELATIVE_PATH[profile.provider]
+
+
+def _herdr_session_group(profile: Profile) -> dict[str, Any]:
+    # Matches herdr's own `herdr integration install <provider>` output
+    # exactly (verified against a live install): claude's group carries a
+    # "*" matcher, codex's carries none. This is a second, independent
+    # SessionStart group appended alongside agent-fleet's own - Claude/Codex
+    # hook schemas already support multiple matcher-grouped entries per
+    # event, so this does not touch or replace the agent-fleet-owned group.
+    group: dict[str, Any] = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": f"bash '{herdr_hook_path(profile)}' session",
+                "timeout": 10,
+            }
+        ],
+    }
+    if profile.provider == "claude":
+        group = {"matcher": "*", **group}
+    return group
+
+
 def _managed_hooks(
     source: Path | None,
     session_command: str,
     turn_end_command: str | None,
+    herdr_profile: Profile | None,
 ) -> dict[str, Any]:
     hooks = _declared_source_hooks(source)
     groups = hooks.setdefault("SessionStart", [])
     groups.append(_agent_fleet_session_group(session_command))
+    if herdr_profile is not None:
+        groups.append(_herdr_session_group(herdr_profile))
     if turn_end_command is not None:
         hooks.setdefault("Stop", []).append(_agent_fleet_turn_end_group(turn_end_command))
     return hooks
 
 
-def _codex_hook_payload(source: Path | None, command: str) -> dict[str, Any]:
-    return {"hooks": _managed_hooks(source, command, None)}
+def _codex_hook_payload(
+    source: Path | None, command: str, herdr_profile: Profile | None = None
+) -> dict[str, Any]:
+    return {"hooks": _managed_hooks(source, command, None, herdr_profile)}
 
 
 def _claude_hook_payload(
@@ -293,8 +324,11 @@ def _claude_hook_payload(
     source: Path | None,
     session_command: str,
     turn_end_command: str,
+    herdr_profile: Profile | None = None,
 ) -> dict[str, Any]:
-    return {"hooks": _managed_hooks(source, session_command, turn_end_command)}
+    return {
+        "hooks": _managed_hooks(source, session_command, turn_end_command, herdr_profile)
+    }
 
 
 def _hook_marker_payload(
@@ -356,12 +390,22 @@ def _hook_marker_matches(
     )
 
 
+def _install_herdr_hook_script(profile: Profile, provider: ProviderConfig) -> None:
+    if not provider.herdr_integration:
+        return
+    atomic_write_bytes(
+        herdr_hook_path(profile),
+        HERDR_HOOK_SCRIPTS[profile.provider].encode(),
+    )
+
+
 def _install_claude_hooks(
     registry: Registry, profile: Profile, provider: ProviderConfig
 ) -> None:
     session_command, agent_fleet_binary = _verified_session_hook(registry)
     turn_end_command = session_command.replace(" hook session-start", " hook turn-end")
     source_hash = _source_hash(provider.hooks_source)
+    herdr_profile = profile if provider.herdr_integration else None
     path = profile.home / "settings.json"
     existing = _read_owned_json_object(path)
     payload = _claude_hook_payload(
@@ -369,9 +413,11 @@ def _install_claude_hooks(
         provider.hooks_source,
         session_command,
         turn_end_command,
+        herdr_profile,
     )
     if source_hash != _source_hash(provider.hooks_source):
         raise ValueError("Claude hook source changed during provisioning")
+    _install_herdr_hook_script(profile, provider)
     atomic_write_json(path, payload)
     atomic_write_json(
         profile.home / HOOK_MARKER_FILE,
@@ -392,9 +438,11 @@ def _install_codex_hooks(
 ) -> None:
     session_command, agent_fleet_binary = _verified_session_hook(registry)
     source_hash = _source_hash(provider.hooks_source)
-    payload = _codex_hook_payload(provider.hooks_source, session_command)
+    herdr_profile = profile if provider.herdr_integration else None
+    payload = _codex_hook_payload(provider.hooks_source, session_command, herdr_profile)
     if source_hash != _source_hash(provider.hooks_source):
         raise ValueError("Codex hook source changed during provisioning")
+    _install_herdr_hook_script(profile, provider)
     path = profile.home / "hooks.json"
     atomic_write_json(path, payload)
     atomic_write_json(
@@ -434,6 +482,7 @@ def claude_hooks_ready(registry: Registry, profile: Profile) -> bool:
             provider.hooks_source,
             expected_command,
             turn_end_command,
+            profile if provider.herdr_integration else None,
         )
     except (OSError, ValueError):
         return False
@@ -465,7 +514,11 @@ def codex_hooks_ready(registry: Registry, profile: Profile) -> bool:
         ):
             return False
         payload = _read_owned_json_object(profile.home / "hooks.json")
-        expected = _codex_hook_payload(provider.hooks_source, expected_command)
+        expected = _codex_hook_payload(
+            provider.hooks_source,
+            expected_command,
+            profile if provider.herdr_integration else None,
+        )
     except (OSError, ValueError):
         return False
     expected_hash = _hook_payload_hash(expected["hooks"])
@@ -781,10 +834,11 @@ def provision_plan(registry: Registry, profile_id: str) -> dict[str, Any]:
         if profile.provider == "claude"
         else None
     )
+    herdr_profile = profile if provider.herdr_integration else None
     hook_payload = (
-        _claude_hook_payload({}, None, session_command, str(turn_end_command))
+        _claude_hook_payload({}, None, session_command, str(turn_end_command), herdr_profile)
         if profile.provider == "claude"
-        else _codex_hook_payload(None, session_command)
+        else _codex_hook_payload(None, session_command, herdr_profile)
     )
     payloads: dict[str, bytes] = {
         HOOK_MARKER_FILE: _canonical_json_bytes(
@@ -823,6 +877,10 @@ def provision_plan(registry: Registry, profile_id: str) -> dict[str, Any]:
     else:
         payloads["hooks.json"] = _canonical_json_bytes(hook_payload)
         payloads["config.toml"] = CODEX_MANAGED_CONFIG_TEXT.encode()
+    if herdr_profile is not None:
+        payloads[HERDR_HOOK_RELATIVE_PATH[profile.provider]] = HERDR_HOOK_SCRIPTS[
+            profile.provider
+        ].encode()
     entries: list[dict[str, Any]] = [
         {"relative_path": ".", "type": "dir", "mode": "0700"},
         {"relative_path": "hooks", "type": "dir", "mode": "0700"},

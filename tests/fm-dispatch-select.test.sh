@@ -309,8 +309,8 @@ SH
   pass "dispatch pins its parser and input tools without ambient PATH resolution"
 }
 
-test_account_pool_summary_owns_provider_quota_choice() {
-  local fakebin af_log quota_marker out pooled
+test_account_pool_defers_selection_to_direct_spawn() {
+  local fakebin af_log quota_marker out pooled err
   fakebin=$(fm_fakebin "$TMP_ROOT/agent-fleet-pools")
   af_log="$TMP_ROOT/agent-fleet-pools/calls.log"
   quota_marker="$TMP_ROOT/agent-fleet-pools/quota-called"
@@ -323,13 +323,15 @@ SH
   chmod +x "$fakebin/quota-axi"
   pooled='[{"harness":"claude","model":"sonnet","account_pool":"claude-crew"},{"harness":"codex","model":"gpt-5","account_pool":"codex-crew"}]'
   out=$(FM_FAKE_AF_LOG="$af_log" FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
-    FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled")
-  [ "$out" = '{"harness":"codex","model":"gpt-5","account_pool":"codex-crew"}' ] \
-    || fail "Agent Fleet pool headroom should choose codex, got: $out"
-  assert_grep 'pool status --pool claude-crew --provider claude' "$af_log" "claude pool summary was not queried"
-  assert_grep 'pool status --pool codex-crew --provider codex' "$af_log" "codex pool summary was not queried"
+    FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled" \
+    2>"$TMP_ROOT/agent-fleet-pools/error.log")
+  err=$(cat "$TMP_ROOT/agent-fleet-pools/error.log")
+  [ "$out" = '{"harness":"claude","model":"sonnet","account_pool":"claude-crew"}' ] \
+    || fail "pooled dispatch did not preserve ordered direct-routing activation: $out"
+  [ ! -e "$af_log" ] || fail "new pooled dispatch queried Agent Fleet: $(cat "$af_log")"
   [ ! -e "$quota_marker" ] || fail "account_pool selection consulted default-account quota-axi"
-  pass "account_pool quota-balanced selection consumes only Agent Fleet pool summaries"
+  assert_contains "$err" 'deferring account selection to spawn' "pooled dispatch did not explain direct selection ownership"
+  pass "account_pool dispatch defers account choice to direct spawn selection"
 }
 
 test_degraded_pool_summary_is_diagnostic_only() {
@@ -412,7 +414,7 @@ test_fully_pooled_dispatch_ignores_overridden_ambient_mode() {
   out=$(FM_ACCOUNT_ROUTING=malformed FM_DISPATCH_AGENT_FLEET="$fakebin/agent-fleet" \
     "$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced "$pooled") \
     || fail "fully pooled dispatch parsed overridden ambient routing policy"
-  [ "$out" = '{"harness":"codex","account_pool":"codex-crew"}' ] \
+  [ "$out" = '{"harness":"claude","account_pool":"claude-crew"}' ] \
     || fail "fully pooled dispatch returned the wrong selection: $out"
 
   mixed='[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex"}]'
@@ -526,6 +528,12 @@ SH
   pass "pool-summary failures degrade safely while every pinned quota-balanced candidate is rejected"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = account-directory-cutover ]; then
+  test_account_pool_defers_selection_to_direct_spawn
+  test_fully_pooled_dispatch_ignores_overridden_ambient_mode
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-13 ]; then
   test_enforced_quota_balancing_rejects_poolless_candidates
   test_fully_pooled_dispatch_ignores_overridden_ambient_mode
@@ -540,17 +548,10 @@ test_bad_quota_json_falls_back_to_first
 test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_backward_compatible_first_selection
-test_account_pool_summary_owns_provider_quota_choice
-test_degraded_pool_summary_is_diagnostic_only
-test_account_pool_query_timeout_falls_back
-test_slow_valid_pool_status_uses_selection_class_timeout
-test_invalid_pool_status_timeout_is_rejected
+test_account_pool_defers_selection_to_direct_spawn
 test_dispatch_ignores_hostile_path_jq_and_dirname
 test_enforced_quota_balancing_rejects_poolless_candidates
 test_fully_pooled_dispatch_ignores_overridden_ambient_mode
-test_agent_fleet_binary_precedence_matches_routing
-test_production_dispatch_override_is_never_executed
 test_account_fields_survive_direct_selection
-test_pooled_failures_degrade_without_default_account_quota
 
 echo "# all fm-dispatch-select tests passed"

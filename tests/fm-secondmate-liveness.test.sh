@@ -431,6 +431,7 @@ SH
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'spawn %s\n' "$*" >> "$FM_DIRECT_RESPAWN_LOG"
+printf '%s\n' 'fm-account-directory: CLAUDE USAGE UNREADABLE: selecting the first account directory by stable sort' >&2
 exit 0
 SH
   chmod +x "$fake_root/bin/"*.sh
@@ -442,6 +443,8 @@ SH
 
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "direct secondmate metadata was not recovered automatically"
+  assert_contains "$out" "CLAUDE USAGE UNREADABLE" \
+    "successful direct secondmate recovery discarded the Claude selection explanation"
   grep -q '^spawn sm1 --secondmate$' "$log" \
     || fail "direct secondmate recovery did not use the ordinary fresh-selection spawn path: $(cat "$log")"
   assert_not_contains "$(cat "$log")" "--resume-account" \
@@ -777,6 +780,11 @@ test_sweep_noop_with_no_secondmate_meta() {
   [ ! -s "$log" ] || fail "with no secondmate meta, no endpoint should ever be touched: $(cat "$log")"
   pass "sweep: a silent no-op with no kind=secondmate meta present (a secondmate home's own natural scoping)"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = account-directory-cutover ]; then
+  test_direct_account_home_respawns_through_fresh_selection
+  exit 0
+fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_sweep_defers_confirmed_dead_unmanaged_secondmate

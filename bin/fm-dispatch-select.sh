@@ -11,15 +11,11 @@
 # contract:
 #   - Any candidate carrying account_profile is invalid because pinned profiles
 #     are direct per-spawn overrides, never inputs to quota-balanced selection.
-#   - A candidate set carrying account_pool uses the deferred legacy Agent Fleet
-#     `pool status` summaries pending remove-fleet-routing-deadcode. Every
-#     candidate must then carry account_pool and use claude/codex. Only a
-#     non-degraded, quota-fresh provider summary backed by at least one freshly
-#     proven eligible profile is available. The best adjusted headroom wins;
-#     exact ties use the first array element. Stale or otherwise degraded
-#     summaries are diagnostics only. Agent Fleet trouble degrades to the first
-#     element and never falls through to default-account quota-axi data; spawn
-#     treats the winning pool only as direct account-directory activation.
+#   - A candidate set carrying account_pool uses the first array element and
+#     passes the pool only as a compatibility activation input. Spawn performs
+#     the real direct account-directory selection. New dispatch never calls
+#     Agent Fleet. The unreachable pool-summary implementation remains only for
+#     deferred removal under remove-fleet-routing-deadcode.
 #   - Enforced account routing rejects quota-balanced candidates without pools.
 #     Off and observe retain the legacy no-pool quota-axi path.
 #   - Per candidate vendor it takes the minimum percentRemaining across that
@@ -40,8 +36,8 @@
 #
 # quota-balanced uses quota-axi --json unless --quota-json supplies a fixture.
 # FM_DISPATCH_QUOTA_AXI overrides the quota command.
-# FM_DISPATCH_AGENT_FLEET and FM_AGENT_FLEET_BIN are test/lab-only. Production
-# uses the fixed passwd-home ~/.local/bin/agent-fleet front door.
+# FM_DISPATCH_AGENT_FLEET and FM_AGENT_FLEET_BIN belong only to the unreachable
+# legacy pool-summary implementation pending remove-fleet-routing-deadcode.
 # FM_DISPATCH_STALE_CLEAR_MARGIN overrides the default 20 point stale margin.
 set -u
 
@@ -86,18 +82,6 @@ usage() {
 log() {
   printf 'fm-dispatch-select: %s\n' "$*" >&2
 }
-
-if [ -n "${FM_DISPATCH_AGENT_FLEET_TIMEOUT:-}" ]; then
-  AGENT_FLEET_TIMEOUT=$FM_DISPATCH_AGENT_FLEET_TIMEOUT
-  case "$AGENT_FLEET_TIMEOUT" in
-    ''|*[!0-9]*|0)
-      echo "error: FM_DISPATCH_AGENT_FLEET_TIMEOUT must be a positive integer" >&2
-      exit 2
-      ;;
-  esac
-else
-  AGENT_FLEET_TIMEOUT=$(fm_account_selection_timeout) || exit 2
-fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -220,6 +204,30 @@ if [ "$routing_mode" = enforce ]; then
   fi
 fi
 if [ "$pooled_count" -gt 0 ]; then
+  if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
+    log "account_pool quota-balanced candidates must all name claude/codex pools; using first profile"
+    first_profile
+    exit 0
+  fi
+  log "account_pool is a direct-routing compatibility input; using the first profile and deferring account selection to spawn"
+  first_profile
+  exit 0
+fi
+
+# Legacy Agent Fleet pool summaries are unreachable and retained only until
+# remove-fleet-routing-deadcode removes the wider selection and lease machinery.
+if [ "$pooled_count" -gt 0 ]; then
+  if [ -n "${FM_DISPATCH_AGENT_FLEET_TIMEOUT:-}" ]; then
+    AGENT_FLEET_TIMEOUT=$FM_DISPATCH_AGENT_FLEET_TIMEOUT
+    case "$AGENT_FLEET_TIMEOUT" in
+      ''|*[!0-9]*|0)
+        echo "error: FM_DISPATCH_AGENT_FLEET_TIMEOUT must be a positive integer" >&2
+        exit 2
+        ;;
+    esac
+  else
+    AGENT_FLEET_TIMEOUT=$(fm_account_selection_timeout) || exit 2
+  fi
   if [ "$pooled_count" -ne "$profile_count" ] || ! printf '%s\n' "$profiles_json" | "$FM_DISPATCH_JQ_BIN" -e 'all(.[]; (.account_pool | length) > 0 and (.harness == "claude" or .harness == "codex"))' >/dev/null 2>&1; then
     log "account_pool quota-balanced candidates must all name claude/codex pools; using first profile"
     first_profile

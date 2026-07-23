@@ -263,6 +263,17 @@ secondmate_sync() {
   return 0
 }
 
+relay_direct_selection_diagnostics() {
+  local id=$1 output=$2 line
+  while IFS= read -r line; do
+    case "$line" in
+      fm-account-directory:*|fm-spawn:\ *direct*)
+        echo "SECONDMATE_LIVENESS: secondmate $id: $line"
+        ;;
+    esac
+  done < <(printf '%s\n' "$output")
+}
+
 secondmate_liveness_sweep() {
   # Idempotent secondmate liveness guarantee - SESSION START ONLY. A
   # secondmate agent that has exited leaves its backend endpoint alive as a
@@ -378,6 +389,9 @@ secondmate_liveness_sweep() {
         fi
         if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
           "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
+          if [ -n "$account_home" ] && [ "$rollback_pending" != pending ] && [ -z "$account_profile" ]; then
+            relay_direct_selection_diagnostics "$id" "$out"
+          fi
           spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawned"
         elif [ "$rollback_pending" = pending ] && { [ ! -f "$meta" ] || [ "$(fm_meta_get "$meta" account_rollback_cleanup)" != pending ]; }; then
           if fm_account_lifecycle_lock_owned "$lifecycle_lock"; then
@@ -409,6 +423,9 @@ secondmate_liveness_sweep() {
           fi
           if retry_out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
             "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
+            if [ -n "$retry_home" ] && [ -z "$retry_profile" ]; then
+              relay_direct_selection_diagnostics "$id" "$retry_out"
+            fi
             spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
           else
             spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
@@ -627,7 +644,7 @@ account_routing_preflight() {
 }
 
 account_routing_dependency_preflight() {
-  local needs_direct=$ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS needs_agent_fleet=0 dispatch meta
+  local needs_direct=$ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS needs_agent_fleet=0 dispatch meta direct_perl
   dispatch="$CONFIG/crew-dispatch.json"
   if [ -f "$dispatch" ]; then
     if [ "$CREW_DISPATCH_ROUTING_VALID" = 1 ]; then
@@ -637,6 +654,16 @@ account_routing_dependency_preflight() {
       needs_direct=1
     fi
   fi
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    if grep -q '^account_home=.' "$meta" 2>/dev/null; then
+      needs_direct=1
+    fi
+    if grep -q '^account_profile=' "$meta" 2>/dev/null \
+      || grep -qx 'account_rollback_cleanup=pending' "$meta" 2>/dev/null; then
+      needs_agent_fleet=1
+    fi
+  done
   if [ "$needs_direct" = 1 ] && ! command -v jq >/dev/null 2>&1; then
     echo "MISSING: jq (install: $(install_cmd jq))"
     BOOTSTRAP_JQ_REPORTED=1
@@ -644,15 +671,14 @@ account_routing_dependency_preflight() {
   if [ "$needs_direct" = 1 ] && ! command -v herdr >/dev/null 2>&1; then
     missing_tool_diagnostic herdr
   fi
-  for meta in "$STATE"/*.meta; do
-    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
-    if ! grep -q '^account_profile=' "$meta" 2>/dev/null \
-      && ! grep -qx 'account_rollback_cleanup=pending' "$meta" 2>/dev/null; then
-      continue
-    fi
-    needs_agent_fleet=1
-    break
-  done
+  direct_perl=/usr/bin/perl
+  if [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = firstmate-account-directory-test-lab-v1 ] \
+    && [ -n "${FM_ACCOUNT_DIRECTORY_PERL_BIN:-}" ]; then
+    direct_perl=$FM_ACCOUNT_DIRECTORY_PERL_BIN
+  fi
+  if [ "$needs_direct" = 1 ] && [ ! -x "$direct_perl" ]; then
+    missing_tool_diagnostic perl
+  fi
   [ "$needs_agent_fleet" = 0 ] || fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
 }
 

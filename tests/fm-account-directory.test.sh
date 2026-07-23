@@ -30,6 +30,10 @@ printf '%s\t%s\n' "$CODEX_HOME" "$XDG_CACHE_HOME" >> "$FM_FAKE_QUOTA_LOG"
 remaining=$(cat "$CODEX_HOME/test-remaining")
 mkdir -p "$(dirname "$cache_file")"
 printf '{"cached":true}\n' > "$cache_file"
+if [ "$remaining" = hang ]; then
+  sleep 30
+  exit 0
+fi
 if [ "$remaining" = none ]; then
   printf '%s\n' '{"providers":[{"provider":"codex","state":{"status":"auth_required"},"windows":[]}]}'
   exit 1
@@ -135,6 +139,20 @@ test_codex_fails_when_no_account_has_a_fresh_window() {
   assert_contains "$out" "no healthy Codex account has a freshly readable usage window" \
     "Codex all-unhealthy failure was not actionable"
   pass "Codex refuses selection when every discovered account lacks fresh readable usage"
+}
+
+test_codex_timeout_skips_wedged_account() {
+  local out err
+  reset_accounts
+  set_remaining 1 hang
+  set_remaining 2 90,85
+  out=$(FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS=1 \
+    run_selector select codex 2>"$TMP_ROOT/codex-timeout.err")
+  err=$(cat "$TMP_ROOT/codex-timeout.err")
+  [ "$out" = "$ACCOUNT_ROOT/codex/2" ] || fail "wedged Codex account prevented selection of a later healthy account: $out"
+  assert_contains "$err" "codex account $ACCOUNT_ROOT/codex/1 skipped: quota read timed out after 1s" \
+    "Codex timeout was not classified as an unreadable account"
+  pass "Codex bounds each usage read and continues to later healthy accounts"
 }
 
 test_claude_uses_stable_first_without_treating_usage_as_health() {
@@ -342,7 +360,12 @@ test_stale_secondmate_without_direct_cutover_is_refused() {
   printf '%s\n' '# Firstmate' > "$home/AGENTS.md"
   printf '%s\n' charter > "$home/data/charter.md"
   printf '%s\n' 'fm_account_resolve_mode() {' '  :' '}' > "$home/bin/fm-account-routing-lib.sh"
-  printf '%s\n' 'ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0)' > "$home/bin/fm-spawn.sh"
+  printf '%s\n' \
+    'ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0)' \
+    '"$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS"' \
+    > "$home/bin/fm-spawn.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$home/bin/fm-account-directory.sh"
+  chmod +x "$home/bin/fm-account-directory.sh"
 
   if out=$(run_direct_spawn "$primary" "$home" "$TMP_ROOT/stale-secondmate-launch.log" \
     "$id" "$home" --harness codex --secondmate 2>&1); then
@@ -385,6 +408,7 @@ make_spawn_fakebin "$FAKEBIN"
 test_codex_picks_highest_fresh_minimum_and_skips_no_window
 test_codex_rechecks_health_on_every_selection
 test_codex_fails_when_no_account_has_a_fresh_window
+test_codex_timeout_skips_wedged_account
 test_claude_uses_stable_first_without_treating_usage_as_health
 test_default_root_uses_passwd_home_not_ambient_home
 test_prepare_installs_and_verifies_per_account_herdr_hooks

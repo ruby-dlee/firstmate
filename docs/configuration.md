@@ -279,9 +279,9 @@ Backend tool availability uses the adapter's own executable resolver, so bootstr
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
 For an eligible pre-cutover task, Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
-Bootstrap reports missing `jq` or Herdr whenever local routing mode or dispatch configuration can activate direct account-directory launches.
-It reports missing Agent Fleet only when legacy task metadata still carries `account_profile=` and may need managed recovery.
-Observe mode retains its advisory legacy behavior, and off mode never invokes either account mechanism.
+Bootstrap reports missing `jq`, fixed system Perl, or Herdr whenever local routing mode, dispatch configuration, or existing `account_home=` metadata can activate direct account-directory launches.
+It reports missing Agent Fleet only when legacy task metadata still carries `account_profile=` or pending rollback cleanup and may need managed recovery.
+Observe and enforce modes both use direct account-directory routing for new launches; off mode leaves new launches on the provider's default identity while still allowing recorded direct generations to recover through fresh selection.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.

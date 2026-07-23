@@ -6,6 +6,7 @@
 #   fm-account-directory.sh prepare <claude|codex>
 #
 # This header is the single owner of the direct account-directory contract.
+# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
 # Account homes are discovered under the current passwd user's
 # .local/share/agent-fleet/accounts/<vendor>/ tree without fixed counts.
 # Codex selection removes that account's quota-axi window cache immediately
@@ -26,7 +27,7 @@
 #
 # Credential state is read-only.
 # This script never logs in, imports credentials, or invokes a provider model.
-# Test-only command, root, and passwd-home overrides require
+# Test-only command, root, passwd-home, Perl, and timeout overrides require
 # FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1.
 set -u
 
@@ -44,16 +45,25 @@ test_lab_enabled() {
   [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = "$TEST_LAB_TOKEN" ]
 }
 
+system_perl() {
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PERL_BIN:-}" ]; then
+    printf '%s\n' "$FM_ACCOUNT_DIRECTORY_PERL_BIN"
+  else
+    printf '%s\n' /usr/bin/perl
+  fi
+}
+
 passwd_home() {
-  local home
+  local home perl_bin
   if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PASSWD_HOME:-}" ]; then
     home=$FM_ACCOUNT_DIRECTORY_PASSWD_HOME
   else
-    [ -x /usr/bin/env ] && [ -x /usr/bin/perl ] || {
+    perl_bin=$(system_perl) || return 1
+    [ -x /usr/bin/env ] && [ -x "$perl_bin" ] || {
       echo "error: /usr/bin/env and /usr/bin/perl are required to resolve the current passwd home" >&2
       return 1
     }
-    home=$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/perl -e '
+    home=$(/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$perl_bin" -e '
       my @p = getpwuid($<);
       exit 1 unless @p && defined $p[7] && $p[7] =~ m{^/};
       exit 1 if $p[7] =~ /[\x00-\x1f\x7f]/;
@@ -125,6 +135,59 @@ herdr_command() {
   }
 }
 
+quota_timeout_seconds() {
+  local timeout=15
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS:-}" ]; then
+    timeout=$FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS
+  fi
+  case "$timeout" in
+    ''|*[!0-9]*|0)
+      echo "error: Codex quota timeout must be a positive integer" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$timeout"
+}
+
+run_bounded() {
+  local timeout=$1 perl_bin
+  shift
+  perl_bin=$(system_perl) || return 1
+  [ -x "$perl_bin" ] || return 127
+  PERL5LIB= PERL5OPT= "$perl_bin" -e '
+    use POSIX qw(setpgid WNOHANG);
+    my ($timeout, @command) = @ARGV;
+    my $pid = fork();
+    exit 125 unless defined $pid;
+    if ($pid == 0) {
+      setpgid(0, 0);
+      exec {$command[0]} @command;
+      exit 127;
+    }
+    setpgid($pid, $pid);
+    my $deadline = time() + $timeout;
+    while (1) {
+      my $waited = waitpid($pid, WNOHANG);
+      if ($waited == $pid) {
+        my $status = $?;
+        exit(($status & 127) ? 128 + ($status & 127) : ($status >> 8));
+      }
+      exit 125 if $waited == -1;
+      if (time() >= $deadline) {
+        kill "TERM", -$pid;
+        for (1 .. 4) {
+          select undef, undef, undef, 0.05;
+          exit 124 if waitpid($pid, WNOHANG) == $pid;
+        }
+        kill "KILL", -$pid;
+        waitpid($pid, 0);
+        exit 124;
+      }
+      select undef, undef, undef, 0.05;
+    }
+  ' "$timeout" "$@"
+}
+
 valid_account_home() { # <vendor-dir> <candidate>
   local vendor_dir=$1 candidate=$2 name
   [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
@@ -158,7 +221,8 @@ first_account_home() { # <vendor>
 }
 
 fresh_codex_usage_json() { # <account-home> <quota-command>
-  local account_home=$1 quota_bin=$2 cache_home cache_file environment_name
+  local account_home=$1 quota_bin=$2 cache_home cache_file environment_name timeout status
+  timeout=$(quota_timeout_seconds) || return 1
   cache_home=$account_home/.agent-fleet-quota-cache
   cache_file=$cache_home/quota-axi/quotas.json
   if { [ -e "$cache_home" ] || [ -L "$cache_home" ]; } \
@@ -186,7 +250,15 @@ fresh_codex_usage_json() { # <account-home> <quota-command>
     CODEX_HOME=$account_home
     XDG_CACHE_HOME=$cache_home
     export CODEX_HOME XDG_CACHE_HOME
-    "$quota_bin" --provider codex --json 2>/dev/null
+    if run_bounded "$timeout" "$quota_bin" --provider codex --json 2>/dev/null; then
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$status" -eq 124 ]; then
+      log "codex account $account_home skipped: quota read timed out after ${timeout}s"
+    fi
+    return "$status"
   )
 }
 

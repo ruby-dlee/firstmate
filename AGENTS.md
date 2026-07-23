@@ -207,8 +207,9 @@ That refusal is the consultation backstop, so the rules are never silently skipp
 The requirement is gated only on the file's presence; when the file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness` as before.
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
-`quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; its legacy Agent Fleet pool-summary branch and the inactive new-lease fixtures are deferred to follow-up task `remove-fleet-routing-deadcode`, while every real new launch uses direct account-directory selection.
-When candidates carry account pools, the selector may use the legacy pool summaries only to choose a dispatch profile; pass its selected pool to spawn as a compatibility activation input, never as an account choice or lease request.
+`quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; every real new launch uses direct account-directory selection.
+When candidates carry account pools, the selector chooses the ordered first profile and passes its pool to spawn only as a compatibility activation input, never as an account choice or lease request.
+The now-unreachable Agent Fleet pool-summary implementation and inactive new-lease fixtures are legacy code deferred to follow-up task `remove-fleet-routing-deadcode`.
 Quota trouble must never block dispatch.
 
 Precedence, highest first:
@@ -255,7 +256,8 @@ Reconcile reality with your records before doing anything else, working from the
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
 6. For meta with no window, or an endpoint the digest reported dead, reconcile by kind.
-   If meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id>` so the metadata signal triggers fresh direct account-directory selection.
+   If ordinary crewmate meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id> <recorded-project>`; if secondmate meta records it, use `bin/fm-spawn.sh <id> --secondmate`.
+   In either case, the metadata signal triggers fresh direct account-directory selection.
    If meta records `account_profile=`, first try the exact sticky session with `bin/fm-spawn.sh <id> --resume-account`; when that session/profile is unavailable, use `--continue-account` for the task-owned provider-neutral handoff after re-verifying live and repository state, with `bin/fm-account-continuation.sh` owning the fail-closed packet contract.
    For ordinary crewmates, check the recorded backend metadata first; use `treehouse status` for treehouse-backed tasks, and the recorded `orca_worktree_id=`/`terminal=` for Orca tasks.
    For an unmanaged `kind=secondmate`, load `secondmate-provisioning`; its "Recovery" section owns the explicit routing decision and respawn procedure.

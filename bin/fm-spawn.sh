@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca respawn, or a secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
@@ -1482,7 +1483,8 @@ secondmate_home_supports_direct_account_routing() {
     && [ ! -L "$home/bin/fm-account-directory.sh" ] \
     && [ -x "$home/bin/fm-account-directory.sh" ] \
     && [ -f "$home/bin/fm-spawn.sh" ] \
-    && grep -Fq '"$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS"' "$home/bin/fm-spawn.sh"
+    && grep -Fqx '# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2' "$home/bin/fm-account-directory.sh" \
+    && grep -Fqx '# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2' "$home/bin/fm-spawn.sh"
 }
 
 secondmate_routing_config_inherited() {

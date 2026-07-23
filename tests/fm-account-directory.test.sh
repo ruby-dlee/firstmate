@@ -207,9 +207,24 @@ case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
+  display-message)
+    case " $* " in
+      *" -t "*) [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1 ;;
+    esac
+    printf 'firstmate\n'
+    exit 0
+    ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window) exit 0 ;;
+  has-session|new-session) exit 0 ;;
+  new-window)
+    touch "${FM_FAKE_ENDPOINT_FILE:?}"
+    printf '@1\n'
+    exit 0
+    ;;
+  kill-window)
+    rm -f "${FM_FAKE_ENDPOINT_FILE:?}"
+    exit 0
+    ;;
   send-keys)
     prev=
     for argument in "$@"; do
@@ -241,7 +256,8 @@ run_direct_spawn() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
-    FM_FAKE_LAUNCH_LOG="$launch_log" PATH="$FAKEBIN:$PATH" \
+    FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
+    PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
@@ -343,6 +359,67 @@ test_observe_spawn_uses_direct_directory_without_agent_fleet() {
   pass "observe mode uses direct account-directory routing without Agent Fleet"
 }
 
+test_direct_recovery_preserves_recorded_task_context() {
+  local record id out meta launch project_name generation recorded_project recorded_worktree meta_tmp
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 95,90
+  set_remaining 2 30,20
+  id=direct-recovery-z4
+  record=$(make_spawn_case direct-recovery codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --harness codex --model gpt-recorded --effort high \
+    --account-pool legacy-codex-pool --scout >/dev/null 2>&1
+  meta=$SPAWN_HOME/state/$id.meta
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  recorded_project=$(sed -n 's/^project=//p' "$meta")
+  recorded_worktree=$(sed -n 's/^worktree=//p' "$meta")
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-recovery-meta.XXXXXX")
+  awk '
+    /^mode=/ { print "mode=direct-PR"; next }
+    /^yolo=/ { print "yolo=on"; next }
+    { print }
+    END { print "dispatch_profile_required=1" }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  project_name=$(basename "$SPAWN_PROJECT")
+  printf '%s\n' "- $project_name [local-only] - changed policy (added 2026-07-23)" > "$SPAWN_HOME/data/projects.md"
+  printf '%s\n' '{"version":1,"rules":[],"default":{"harness":"claude"}}' > "$SPAWN_HOME/config/crew-dispatch.json"
+  set_remaining 1 20,15
+  set_remaining 2 90,85
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1)
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$out" "selected direct codex account home $ACCOUNT_ROOT/codex/2" \
+    "direct recovery did not select a fresh account directory"
+  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/2' codex" \
+    "direct recovery did not launch with the freshly selected account"
+  assert_contains "$launch" "--model 'gpt-recorded'" \
+    "direct recovery did not preserve the recorded model"
+  assert_contains "$launch" "model_reasoning_effort=\"high\"" \
+    "direct recovery did not preserve the recorded effort"
+  assert_not_contains "$launch" "treehouse get" \
+    "direct recovery reconstructed or replaced the recorded worktree"
+  assert_grep "kind=scout" "$meta" "direct recovery did not preserve scout kind"
+  assert_grep "project=$recorded_project" "$meta" "direct recovery changed project identity"
+  assert_grep "worktree=$recorded_worktree" "$meta" "direct recovery changed worktree identity"
+  assert_grep "harness=codex" "$meta" "direct recovery changed the recorded harness"
+  assert_grep "model=gpt-recorded" "$meta" "direct recovery changed the recorded model"
+  assert_grep "effort=high" "$meta" "direct recovery changed the recorded effort"
+  assert_grep "mode=direct-PR" "$meta" "direct recovery re-resolved the recorded delivery mode"
+  assert_grep "yolo=on" "$meta" "direct recovery re-resolved the recorded yolo setting"
+  assert_grep "report_required=1" "$meta" "direct recovery dropped the report requirement"
+  assert_grep "generation_id=$generation" "$meta" "direct recovery replaced the task generation identity"
+  assert_grep "dispatch_profile_required=1" "$meta" "direct recovery dropped dispatch-profile metadata"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" "direct recovery did not update account_home"
+  [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "direct recovery invoked Agent Fleet"
+  pass "direct recovery preserves recorded task context while refreshing account selection"
+}
+
 test_stale_secondmate_without_direct_cutover_is_refused() {
   local primary home id out status
   reset_accounts
@@ -415,6 +492,7 @@ test_prepare_installs_and_verifies_per_account_herdr_hooks
 test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
 test_observe_spawn_uses_direct_directory_without_agent_fleet
+test_direct_recovery_preserves_recorded_task_context
 test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 

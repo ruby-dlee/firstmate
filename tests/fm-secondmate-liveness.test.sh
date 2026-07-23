@@ -445,13 +445,56 @@ SH
     "direct secondmate metadata was not recovered automatically"
   assert_contains "$out" "CLAUDE USAGE UNREADABLE" \
     "successful direct secondmate recovery discarded the Claude selection explanation"
-  grep -q '^spawn sm1 --secondmate$' "$log" \
-    || fail "direct secondmate recovery did not use the ordinary fresh-selection spawn path: $(cat "$log")"
+  grep -q '^spawn sm1 --recover-direct-account$' "$log" \
+    || fail "direct secondmate recovery did not use the metadata-preserving fresh-selection path: $(cat "$log")"
   assert_not_contains "$(cat "$log")" "--resume-account" \
     "direct secondmate recovery entered legacy Agent Fleet resume"
   assert_not_contains "$(cat "$log")" "--no-account-routing" \
     "direct secondmate recovery disabled fresh account selection"
   pass "direct secondmate metadata relaunches through fresh account-directory selection"
+}
+
+test_failed_direct_recovery_relays_bounded_actionable_diagnostics() {
+  local w fb tmuxfb log out fake_root relayed
+  w=$(new_world sweep-direct-account-failure)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  printf '%s\n' 'account_home=/accounts/codex/1' >> "$w/home/state/sm1.meta"
+  fake_root="$w/fake-root"
+  mkdir -p "$fake_root/bin"
+  cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'spawn %s\n' "$*" >> "$FM_DIRECT_RESPAWN_LOG"
+printf '%s\n' 'fm-spawn: recorded direct account metadata activates fresh account-directory selection for this respawn' >&2
+for i in $(seq 1 12); do
+  printf 'fm-account-directory: selection diagnostic %s\n' "$i" >&2
+done
+printf '%s\n' 'error: final actionable backend failure' >&2
+exit 1
+SH
+  chmod +x "$fake_root/bin/"*.sh
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_DIRECT_RESPAWN_LOG="$log")
+
+  assert_contains "$out" "recorded direct account metadata activates fresh account-directory selection" \
+    "failed direct recovery discarded its activation diagnostic"
+  assert_contains "$out" "fm-account-directory: selection diagnostic 1" \
+    "failed direct recovery discarded its selection diagnostics"
+  relayed=$(printf '%s\n' "$out" | grep -Ec 'SECONDMATE_LIVENESS: secondmate sm1: (fm-spawn:|fm-account-directory:)')
+  [ "$relayed" -eq 8 ] || fail "failed direct recovery relayed $relayed diagnostics instead of the bounded maximum of 8"
+  assert_contains "$out" "respawn failed: error: final actionable backend failure" \
+    "failed direct recovery did not summarize its final actionable error"
+  assert_not_contains "$out" "respawn failed: fm-spawn:" \
+    "failed direct recovery summarized the first activation line instead of the final error"
+  grep -q '^spawn sm1 --recover-direct-account$' "$log" \
+    || fail "failed direct recovery did not use the metadata-preserving mode: $(cat "$log")"
+  pass "failed direct recovery relays bounded diagnostics and the final actionable error"
 }
 
 test_pending_rollback_recovery_bypasses_session_gate_and_retries() {
@@ -783,6 +826,7 @@ test_sweep_noop_with_no_secondmate_meta() {
 
 if [ "${FM_TEST_FOCUSED:-}" = account-directory-cutover ]; then
   test_direct_account_home_respawns_through_fresh_selection
+  test_failed_direct_recovery_relays_bounded_actionable_diagnostics
   exit 0
 fi
 
@@ -811,6 +855,7 @@ test_sweep_defers_confirmed_dead_unmanaged_secondmate
 test_sweep_rechecks_liveness_after_lifecycle_lock
 test_unmanaged_respawn_requires_explicit_operator_bypass
 test_direct_account_home_respawns_through_fresh_selection
+test_failed_direct_recovery_relays_bounded_actionable_diagnostics
 test_pending_rollback_recovery_bypasses_session_gate_and_retries
 test_sweep_parent_skips_release_after_spawn_handoff
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock

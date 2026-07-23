@@ -264,14 +264,28 @@ secondmate_sync() {
 }
 
 relay_direct_selection_diagnostics() {
-  local id=$1 output=$2 line
+  local id=$1 output=$2 line count=0
   while IFS= read -r line; do
     case "$line" in
       fm-account-directory:*|fm-spawn:\ *direct*)
-        echo "SECONDMATE_LIVENESS: secondmate $id: $line"
+        [ "$count" -lt 8 ] || continue
+        printf 'SECONDMATE_LIVENESS: secondmate %s: %.512s\n' "$id" "$line"
+        count=$((count + 1))
         ;;
     esac
   done < <(printf '%s\n' "$output")
+}
+
+last_actionable_spawn_error() {
+  local output=$1 line last= fallback=
+  while IFS= read -r line; do
+    [ -z "$line" ] || fallback=$line
+    case "$line" in
+      error:*) last=$line ;;
+    esac
+  done < <(printf '%s\n' "$output")
+  [ -n "$last" ] || last=$fallback
+  printf '%.512s\n' "$last"
 }
 
 secondmate_liveness_sweep() {
@@ -307,9 +321,9 @@ secondmate_liveness_sweep() {
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
   local meta id window harness backend target verdict out account_profile account_home rollback_pending
-  local retry_profile retry_home retry_out
+  local retry_profile retry_home retry_out direct_recovery retry_direct
   local lifecycle_lock recheck spawn_message
-  local -a resume_args retry_args
+  local -a spawn_args retry_args
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -377,19 +391,21 @@ secondmate_liveness_sweep() {
           continue
         fi
         fm_backend_kill "$backend" "$target" "$(fm_meta_get "$meta" zellij_tab_id)" "fm-$id" "$(fm_meta_get "$meta" tmux_session_target)" 2>/dev/null || true
-        resume_args=()
+        spawn_args=()
+        direct_recovery=0
         if [ "$rollback_pending" = pending ] || [ -n "$account_profile" ]; then
-          resume_args+=(--resume-account)
+          spawn_args+=(--secondmate --resume-account)
         elif [ -n "$account_home" ]; then
-          :
+          spawn_args+=(--recover-direct-account)
+          direct_recovery=1
         else
           fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn deferred: unmanaged generation requires an explicit operator --no-account-routing decision"
           continue
         fi
         if out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
-          "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${resume_args[@]+"${resume_args[@]}"} 2>&1); then
-          if [ -n "$account_home" ] && [ "$rollback_pending" != pending ] && [ -z "$account_profile" ]; then
+          "$FM_ROOT/bin/fm-spawn.sh" "$id" "${spawn_args[@]}" 2>&1); then
+          if [ "$direct_recovery" = 1 ]; then
             relay_direct_selection_diagnostics "$id" "$out"
           fi
           spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawned"
@@ -406,10 +422,12 @@ secondmate_liveness_sweep() {
           [ ! -f "$meta" ] || retry_profile=$(fm_meta_get "$meta" account_profile)
           [ ! -f "$meta" ] || retry_home=$(fm_meta_get "$meta" account_home)
           retry_args=()
+          retry_direct=0
           if [ -n "$retry_profile" ]; then
-            retry_args+=(--resume-account)
+            retry_args+=(--secondmate --resume-account)
           elif [ -n "$retry_home" ]; then
-            :
+            retry_args+=(--recover-direct-account)
+            retry_direct=1
           else
             fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || true
             echo "SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: restored unmanaged generation requires an explicit operator --no-account-routing decision"
@@ -422,16 +440,26 @@ secondmate_liveness_sweep() {
             continue
           fi
           if retry_out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lifecycle_lock" FM_SPAWN_NO_GUARD=1 \
-            "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate ${retry_args[@]+"${retry_args[@]}"} 2>&1); then
-            if [ -n "$retry_home" ] && [ -z "$retry_profile" ]; then
+            "$FM_ROOT/bin/fm-spawn.sh" "$id" "${retry_args[@]}" 2>&1); then
+            if [ "$retry_direct" = 1 ]; then
               relay_direct_selection_diagnostics "$id" "$retry_out"
             fi
             spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled and respawned"
           else
-            spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
+            if [ "$retry_direct" = 1 ]; then
+              relay_direct_selection_diagnostics "$id" "$retry_out"
+              spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(last_actionable_spawn_error "$retry_out")"
+            else
+              spawn_message="SECONDMATE_LIVENESS: secondmate $id: rollback reconciled; respawn deferred: $(first_line "$retry_out")"
+            fi
           fi
         else
-          spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
+          if [ "$direct_recovery" = 1 ]; then
+            relay_direct_selection_diagnostics "$id" "$out"
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(last_actionable_spawn_error "$out")"
+          else
+            spawn_message="SECONDMATE_LIVENESS: secondmate $id: respawn failed: $(first_line "$out")"
+          fi
         fi
         if fm_account_lifecycle_lock_owned "$lifecycle_lock" \
           && ! fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1; then

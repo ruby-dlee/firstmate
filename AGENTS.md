@@ -256,8 +256,8 @@ Reconcile reality with your records before doing anything else, working from the
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
 6. For meta with no window, or an endpoint the digest reported dead, reconcile by kind.
-   If ordinary crewmate meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id> <recorded-project>`; if secondmate meta records it, use `bin/fm-spawn.sh <id> --secondmate`.
-   In either case, the metadata signal triggers fresh direct account-directory selection.
+   If meta records `account_home=`, relaunch with `bin/fm-spawn.sh <id> --recover-direct-account`.
+   That mode reloads the recorded task context and performs fresh direct account-directory selection.
    If meta records `account_profile=`, first try the exact sticky session with `bin/fm-spawn.sh <id> --resume-account`; when that session/profile is unavailable, use `--continue-account` for the task-owned provider-neutral handoff after re-verifying live and repository state, with `bin/fm-account-continuation.sh` owning the fail-closed packet contract.
    For ordinary crewmates, check the recorded backend metadata first; use `treehouse status` for treehouse-backed tasks, and the recorded `orca_worktree_id=`/`terminal=` for Orca tasks.
    For an unmanaged `kind=secondmate`, load `secondmate-provisioning`; its "Recovery" section owns the explicit routing decision and respawn procedure.
@@ -434,11 +434,12 @@ bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harn
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --account-pool codex-crew   # compatibility flag activating direct account-directory selection
 bin/fm-spawn.sh <id> projects/<repo> --harness claude --account-profile claude-2   # compatibility flag activating direct account-directory selection
+bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving direct account recovery with fresh selection
 bin/fm-spawn.sh <id> --resume-account             # sticky legacy managed recovery; never a fresh prompt
 bin/fm-spawn.sh <id> --continue-account           # fresh legacy managed session from verified task-owned continuation state
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|cmux>   # explicit new-task runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
-bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch or recover a persistent secondmate in its home
+bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch a persistent secondmate in its home
 bin/fm-spawn.sh <id1>=projects/<repo1> <id2>=projects/<repo2> [--scout]   # batch: one call, several tasks
 ```
 

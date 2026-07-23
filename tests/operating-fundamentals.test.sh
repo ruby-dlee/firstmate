@@ -64,9 +64,7 @@ test_seven_ordered_principles() {
   assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
   assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
   assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
-  assert_grep "consequential bypass that gates an irreversible or high-stakes action" "$SKILL" "purpose-before-bypass principle must scope written rationale to consequential bypasses"
-  assert_grep "record that target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale"
-  assert_grep "trivial skips do not require this written record" "$SKILL" "purpose-before-bypass principle must exempt trivial skips from written rationale"
+  assert_grep "Before adding any bypass, record that target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale for every bypass"
   assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
   pass "operating-fundamentals encodes all seven principles in the required order"
 }

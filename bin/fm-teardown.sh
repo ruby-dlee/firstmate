@@ -150,6 +150,13 @@ fi
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 SECONDMATE_ENDPOINT_QUIESCED=0
+DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
+DIRECT_SPAWN_BACKUP=$(fm_meta_get "$META" direct_spawn_backup)
+DIRECT_SPAWN_ARTIFACTS=$(fm_meta_get "$META" direct_spawn_artifacts)
+case "$DIRECT_SPAWN_CLEANUP" in
+  ''|pending) ;;
+  *) echo "error: invalid direct_spawn_cleanup metadata for $ID" >&2; exit 1 ;;
+esac
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -1216,10 +1223,35 @@ quiesce_completion_report_endpoint() {
   return 1
 }
 
+quiesce_retained_direct_spawn_endpoint() {
+  local endpoint_status zellij_tab
+  zellij_tab=$(meta_value "$META" zellij_tab_id)
+  if [ -n "$T" ]; then
+    if [ -n "$PROBE_HOME" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$PROBE_HOME" FM_ROOT="$PROBE_HOME" fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" ) 2>/dev/null || true
+    else
+      fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
+    fi
+  fi
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME" "$(meta_value "$META" tmux_session_target)"; then
+    return 0
+  else
+    endpoint_status=$?
+  fi
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "error: retained direct-spawn endpoint state for $ID is unknown; retaining its worktree and metadata" >&2
+  else
+    echo "error: retained direct-spawn endpoint for $ID is still alive; retaining its worktree and metadata" >&2
+  fi
+  return 1
+}
+
 report_gated_safety_refusal() {
   [ "$REPORT_GATED" = 1 ] || return 0
   echo "The completion-report endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
 }
+
+[ "$DIRECT_SPAWN_CLEANUP" != pending ] || quiesce_retained_direct_spawn_endpoint || exit 1
 
 if [ "$REPORT_GATED" = 1 ]; then
   quiesce_completion_report_endpoint || exit 1
@@ -1316,6 +1348,40 @@ fi
 
 if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ] && [ "$SECONDMATE_ENDPOINT_QUIESCED" = 0 ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
+fi
+if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
+  case "$DIRECT_SPAWN_BACKUP" in
+    ".$ID.meta.rollback."*) ;;
+    *) echo "error: invalid direct spawn metadata backup for $ID; retaining cleanup state" >&2; exit 1 ;;
+  esac
+  direct_spawn_backup_path="$STATE/$DIRECT_SPAWN_BACKUP"
+  [ -f "$direct_spawn_backup_path" ] && [ ! -L "$direct_spawn_backup_path" ] || {
+    echo "error: direct spawn metadata backup is unavailable for $ID; retaining cleanup state" >&2
+    exit 1
+  }
+  [ -n "$DIRECT_SPAWN_ARTIFACTS" ] || {
+    echo "error: direct spawn artifact backup is unavailable for $ID; retaining cleanup state" >&2
+    exit 1
+  }
+  direct_spawn_restore_lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 \
+    || ! fm_account_meta_merge_extensions "$META" "$direct_spawn_backup_path" \
+    || ! fm_account_safe_file_destination "$META" \
+    || ! mv "$direct_spawn_backup_path" "$META"; then
+    fm_account_meta_lock_release "$direct_spawn_restore_lock" >/dev/null 2>&1 || true
+    echo "error: failed to restore prior task state for $ID; retaining direct spawn cleanup metadata" >&2
+    exit 1
+  fi
+  if ! rm -rf "$STATE/$DIRECT_SPAWN_ARTIFACTS"; then
+    fm_account_meta_lock_release "$direct_spawn_restore_lock" >/dev/null 2>&1 || true
+    echo "error: failed to remove restored direct spawn artifact backup for $ID" >&2
+    exit 1
+  fi
+  fm_account_meta_lock_release "$direct_spawn_restore_lock" || exit 1
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
+  echo "cleaned failed direct spawn for $ID and restored the prior task generation"
+  exit 0
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT

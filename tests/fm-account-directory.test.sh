@@ -11,6 +11,7 @@ ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
+TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
 
 mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
 
@@ -247,7 +248,16 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+[ "${1:-}" = return ] || exit 0
+[ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
+target=${@: -1}
+git worktree remove --force "$target"
+SH
+  chmod +x "$fakebin/treehouse"
   cat > "$fakebin/forbidden-agent-fleet" <<'SH'
 #!/usr/bin/env bash
 printf 'called\n' >> "$FM_FAKE_AGENT_FLEET_LOG"
@@ -260,13 +270,15 @@ run_direct_spawn() {
   local home=$1 worktree=$2 launch_log=$3
   shift 3
   : > "$launch_log"
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
+    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" \
+    FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
@@ -383,11 +395,11 @@ test_direct_spawn_and_recovery_support_detached_worktree() {
   run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
   meta="$SPAWN_HOME/state/$id.meta"
-  assert_grep "worktree_git_head=$expected_head" "$meta" \
-    "detached direct spawn did not record its authoritative HEAD"
-  if grep -q '^worktree_git_ref=.' "$meta"; then
-    fail "detached direct spawn recorded a branch identity"
-  fi
+  assert_grep "worktree_git_ref=refs/heads/fm/$id" "$meta" \
+    "detached direct spawn did not record its authoritative task branch"
+  assert_grep "worktree_git_setup_head=$expected_head" "$meta" \
+    "detached direct spawn did not retain its exact pre-setup HEAD"
+  git -C "$SPAWN_WORKTREE" switch --quiet -c "fm/$id"
 
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
   out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
@@ -397,9 +409,12 @@ test_direct_spawn_and_recovery_support_detached_worktree() {
     "direct recovery rejected an intentionally detached worktree"
   assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/1' codex" \
     "detached direct recovery did not launch with direct account routing"
-  assert_grep "worktree_git_head=$expected_head" "$meta" \
-    "detached direct recovery changed its authoritative HEAD"
-  pass "direct routing records and recovers intentionally detached worktrees"
+  assert_grep "worktree_git_ref=refs/heads/fm/$id" "$meta" \
+    "direct recovery did not preserve the authoritative task branch"
+  if grep -q '^worktree_git_setup_' "$meta"; then
+    fail "direct recovery did not adopt the completed task-branch transition"
+  fi
+  pass "direct routing safely adopts the required detached-to-task-branch transition"
 }
 
 test_direct_recovery_preserves_recorded_task_context() {
@@ -756,6 +771,114 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   pass "new direct spawn tracks retained endpoint and worktree state"
 }
 
+test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
+  local record id out status recorded_worktree
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-new-rollback-z9
+  record=$(make_spawn_case direct-new-rollback codex "$id")
+  read_spawn_case "$record"
+  recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
+  : > "$TREEHOUSE_LOG"
+  : > "/tmp/fm-$id"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "new direct rollback fixture unexpectedly succeeded"
+  if ! grep -Fq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
+    fail "failed new direct spawn did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
+  fi
+  [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"
+  [ ! -e "$SPAWN_HOME/state/$id.meta" ] || fail "successful direct rollback left task metadata"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "successful direct rollback left its endpoint"
+  rm -f "/tmp/fm-$id"
+  pass "failed new direct spawn removes its endpoint and returns its worktree"
+}
+
+test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
+  local record id out status meta
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-new-return-fail-z9
+  record=$(make_spawn_case direct-new-return-fail codex "$id")
+  read_spawn_case "$record"
+  : > "$TREEHOUSE_LOG"
+  : > "/tmp/fm-$id"
+
+  if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "direct return-failure fixture unexpectedly succeeded"
+  meta="$SPAWN_HOME/state/$id.meta"
+  [ -d "$SPAWN_WORKTREE" ] || fail "direct return failure lost the retained worktree"
+  assert_grep "direct_spawn_cleanup=pending" "$meta" \
+    "direct return failure did not record pending cleanup"
+  assert_grep "rollback_pending=1" "$meta" \
+    "direct return failure did not fail closed"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "direct return failure retained an already-removed endpoint"
+  rm -f "/tmp/fm-$id"
+  pass "direct spawn persists cleanup state when worktree return cannot be confirmed"
+}
+
+test_direct_secondmate_recovery_adopts_proven_primary_fast_forward() {
+  local primary home id first_head target_head meta out
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-secondmate-sync-z9
+  primary="$TMP_ROOT/direct-secondmate-primary"
+  home="$TMP_ROOT/direct-secondmate-home"
+  mkdir -p "$primary"
+  cp -R "$ROOT/bin" "$primary/bin"
+  cp "$ROOT/AGENTS.md" "$primary/AGENTS.md"
+  printf '%s\n' 'data/' 'state/' 'config/' 'projects/' '.fm-secondmate-home' > "$primary/.gitignore"
+  git -C "$primary" init --quiet -b main
+  git -C "$primary" add AGENTS.md bin .gitignore
+  git -C "$primary" -c user.name=fmtest -c user.email=fmtest@example.invalid \
+    commit --quiet -m initial
+  git -C "$primary" worktree add --quiet --detach "$home" HEAD
+  mkdir -p "$primary/data/$id" "$primary/state" "$primary/config" "$primary/projects"
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
+  printf '%s\n' codex > "$primary/config/crew-harness"
+  printf '%s\n' enforce > "$primary/config/account-routing-mode"
+  printf '%s\n' "$id" > "$home/.fm-secondmate-home"
+  printf '%s\n' "charter for $id" > "$home/data/charter.md"
+  touch "$primary/state/.last-watcher-beat"
+
+  FM_TEST_ROOT_OVERRIDE="$primary" \
+    run_direct_spawn "$primary" "$home" "$TMP_ROOT/direct-secondmate-launch.log" \
+      "$id" "$home" --harness codex --secondmate >/dev/null 2>&1
+  meta="$primary/state/$id.meta"
+  first_head=$(git -C "$home" rev-parse HEAD)
+  assert_grep "worktree_git_head=$first_head" "$meta" \
+    "direct secondmate spawn did not record its detached HEAD"
+
+  printf '%s\n' advanced > "$primary/revision-marker"
+  git -C "$primary" add revision-marker
+  git -C "$primary" -c user.name=fmtest -c user.email=fmtest@example.invalid \
+    commit --quiet -m advance
+  target_head=$(git -C "$primary" rev-parse HEAD)
+  rm -f "$primary/state/.fake-endpoint"
+
+  out=$(FM_TEST_ROOT_OVERRIDE="$primary" \
+    run_direct_spawn "$primary" "$home" "$TMP_ROOT/direct-secondmate-launch.log" \
+      "$id" --recover-direct-account 2>&1)
+  assert_contains "$out" "spawned $id harness=codex kind=secondmate" \
+    "direct secondmate recovery did not launch after the proven fast-forward"
+  [ "$(git -C "$home" rev-parse HEAD)" = "$target_head" ] \
+    || fail "direct secondmate recovery did not advance to the primary target"
+  assert_grep "worktree_git_head=$target_head" "$meta" \
+    "direct secondmate recovery did not adopt the proven synchronized HEAD"
+  pass "direct secondmate recovery adopts a proven primary fast-forward"
+}
+
 test_stale_secondmate_without_direct_cutover_is_refused() {
   local primary home id out status
   reset_accounts
@@ -818,6 +941,14 @@ test_routing_off_keeps_default_provider_launch() {
 
 make_spawn_fakebin "$FAKEBIN"
 
+if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
+  test_direct_spawn_and_recovery_support_detached_worktree
+  test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+  test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
+  test_direct_secondmate_recovery_adopts_proven_primary_fast_forward
+  exit 0
+fi
+
 test_codex_picks_highest_fresh_minimum_and_skips_no_window
 test_codex_rechecks_health_on_every_selection
 test_codex_fails_when_no_account_has_a_fresh_window
@@ -836,6 +967,9 @@ test_direct_recovery_rejects_changed_worktree_identity
 test_direct_recovery_rechecks_identity_after_account_prepare
 test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
+test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
+test_direct_secondmate_recovery_adopts_proven_primary_fast_forward
 test_stale_secondmate_without_direct_cutover_is_refused
 test_routing_off_keeps_default_provider_launch
 

@@ -103,7 +103,7 @@ state/               volatile runtime signals; gitignored
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=, generation_id=, report_required=
-  Direct account launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD.
+  Direct account launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD. Ship and scout metadata may temporarily carry worktree_git_setup_ref= and worktree_git_setup_head= while the brief's required `fm/<id>` branch transition is pending; recovery accepts only that exact setup state or the authoritative `fm/<id>` ref and removes the setup fields after adoption.
   Direct recovery validates the canonical worktree path, exact physical Git-dir identity, and authoritative final state before account preparation and again immediately before endpoint creation; any drift fails closed without launching.
   If endpoint removal after a failed new direct spawn cannot be confirmed, direct_spawn_cleanup=pending and rollback_pending=1 retain the endpoint and worktree identity for explicit teardown.
   Legacy managed recovery retains account_pool=, account_profile=, account_task=, account_attempt=, and provider_session_id= (docs/configuration.md "Agent Fleet account routing").

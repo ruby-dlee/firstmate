@@ -1203,7 +1203,7 @@ fm_account_restore_artifacts() {
   if [ -n "$tasktmp" ]; then
     [ "$tasktmp" = "/tmp/fm-$task" ] || return 1
     if [ -e "$backup/tasktmp-existed" ]; then
-      [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
+      [ -e "$backup/gotmp-existed" ] || [ ! -d "$tasktmp" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
     else
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp" || return 1
     fi

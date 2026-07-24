@@ -35,8 +35,8 @@
 #          distinct from the endpoint pane-presence check): outcomes distinguish
 #          no-op, successful respawn, explicit-routing deferral, skipped
 #          recovery, and failed recovery. A confirmed-dead unmanaged generation
-#          is deferred until an operator chooses whether to preserve unmanaged
-#          routing or convert it to managed routing. Session-start scope only;
+#          is deferred until an operator chooses whether to preserve
+#          unmanaged routing or convert it to managed routing. Session-start scope only;
 #          see AGENTS.md "Session start" and docs/tmux-backend.md /
 #          docs/herdr-backend.md "Agent liveness probe" for the empirical basis.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
@@ -603,6 +603,7 @@ EOF
 
 BOOTSTRAP_JQ_REPORTED=0
 ACCOUNT_ROUTING_MODE=off
+ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS=0
 ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=0
 CREW_DISPATCH_ROUTING_VALID=unknown
 
@@ -614,26 +615,48 @@ account_routing_preflight() {
     mode_error=${mode#error: }
     echo "ACCOUNT_ROUTING: invalid routing policy - $mode_error"
   fi
+  [ "$ACCOUNT_ROUTING_MODE" = off ] || ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS=1
   [ "$ACCOUNT_ROUTING_MODE" != enforce ] || ACCOUNT_ROUTING_NEEDS_AGENT_FLEET=1
 }
 
 account_routing_dependency_preflight() {
-  local needs_agent_fleet=$ACCOUNT_ROUTING_NEEDS_AGENT_FLEET dispatch
+  local needs_direct=$ACCOUNT_ROUTING_NEEDS_DIRECT_TOOLS needs_agent_fleet=$ACCOUNT_ROUTING_NEEDS_AGENT_FLEET dispatch meta direct_perl
   dispatch="$CONFIG/crew-dispatch.json"
   if [ -f "$dispatch" ]; then
     if [ "$CREW_DISPATCH_ROUTING_VALID" = 1 ]; then
-      jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_agent_fleet=1
+      jq -e '.. | objects | select(has("account_pool") or has("account_profile"))' "$dispatch" >/dev/null 2>&1 && needs_direct=1
     elif [ "$CREW_DISPATCH_ROUTING_VALID" = unknown ] \
       && grep -Eq '"account_(pool|profile)"[[:space:]]*:' "$dispatch" 2>/dev/null; then
-      needs_agent_fleet=1
+      needs_direct=1
     fi
   fi
-  [ "$needs_agent_fleet" = 1 ] || return 0
-  fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
-  if ! command -v jq >/dev/null 2>&1; then
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    if grep -q '^account_home=.' "$meta" 2>/dev/null \
+      && ! grep -qx 'kind=secondmate' "$meta" 2>/dev/null; then
+      needs_direct=1
+    fi
+    if grep -q '^account_profile=' "$meta" 2>/dev/null \
+      || grep -qx 'account_rollback_cleanup=pending' "$meta" 2>/dev/null; then
+      needs_agent_fleet=1
+    fi
+  done
+  if [ "$needs_direct" = 1 ] && ! command -v jq >/dev/null 2>&1; then
     echo "MISSING: jq (install: $(install_cmd jq))"
     BOOTSTRAP_JQ_REPORTED=1
   fi
+  if [ "$needs_direct" = 1 ] && ! command -v herdr >/dev/null 2>&1; then
+    missing_tool_diagnostic herdr
+  fi
+  direct_perl=/usr/bin/perl
+  if [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = firstmate-account-directory-test-lab-v1 ] \
+    && [ -n "${FM_ACCOUNT_DIRECTORY_PERL_BIN:-}" ]; then
+    direct_perl=$FM_ACCOUNT_DIRECTORY_PERL_BIN
+  fi
+  if [ "$needs_direct" = 1 ] && [ ! -x "$direct_perl" ]; then
+    missing_tool_diagnostic perl
+  fi
+  [ "$needs_agent_fleet" = 0 ] || fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
 }
 
 crew_dispatch_validate() {

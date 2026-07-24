@@ -47,7 +47,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 - **Two task shapes** - ship tasks deliver a change; scout tasks investigate, plan, reproduce, or audit and leave a report.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
 - **Optional secondmates** - opt in to persistent domain supervisors that run from isolated firstmate homes with their own `FM_HOME`, state, projects, and session lock, supervising project clones or a project-less firstmate-repo domain, kept on the primary firstmate version by guarded local fast-forwards and checked for live agent processes at session start.
-- **Optional multi-account routing** - route Claude and Codex crews through explicit or pooled [Agent Fleet](tools/agent-fleet/) profiles while preserving sticky recovery and provider-neutral continuation.
+- **Optional multi-account routing** - select Claude and Codex account directories directly for new ship and scout crews, while retaining [Agent Fleet](tools/agent-fleet/) for secondmates and legacy recovery.
 - **Durable completion reports** - every new ship and scout task publishes a detailed, visual, searchable report to one machine-global stack through fail-closed teardown.
 - **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; verified primary harnesses also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post up to three public-safe completion follow-ups within seven days for genuine milestones and the final outcome without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
@@ -157,7 +157,7 @@ Setup guides for tmux (the default) and the new-task-capable herdr, zellij, and 
 You chat with the first mate.
 It routes each request to a crewmate in its own session endpoint and git worktree, supervises the fleet with a zero-token event-driven watcher, and brings you finished PRs, approved local merges, or investigation reports.
 Optional secondmates extend this to persistent domain supervisors, dispatch profiles let you steer which harness handles which task, and an opt-in X mode lets the same fleet answer public mentions.
-Optional Agent Fleet routing distributes Claude and Codex work across account profiles, while the completion report stack keeps the result independent of any account or Firstmate home.
+Optional account routing selects Claude and Codex account directories directly for new ship and scout crews, while the completion report stack keeps the result independent of any account or Firstmate home.
 `codex-app` is not a runtime backend yet; [docs/codex-app-backend.md](docs/codex-app-backend.md) owns the Codex App boundary.
 
 Full architecture - the supervision engine, worktree isolation, secondmates, dispatch and account routing, completion reports, project modes, optional X mode, fleet sync, and self-update - is in [docs/architecture.md](docs/architecture.md).

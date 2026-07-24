@@ -24,12 +24,13 @@ TMP_ROOT=$(fm_test_tmproot fm-bootstrap-tests)
 export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
 
 # Hermetic runtime-backend detection. These cases pin the backend per-home via
-# config/backend; the dev shell's ambient runtime markers ($TMUX inside tmux,
-# HERDR_ENV inside herdr, CMUX_* inside a cmux terminal) must not leak into
-# fm_backend_name and flip a default-backend case onto a non-tmux backend. Unset
-# them once so the suite resolves the tmux reference backend unless a case says
-# otherwise - the same hermeticity discipline as pinning PATH via BASE_PATH.
-unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
+# config/backend; the dev shell's explicit FM_BACKEND and ambient runtime
+# markers ($TMUX inside tmux, HERDR_ENV inside herdr, CMUX_* inside a cmux
+# terminal) must not leak into fm_backend_name and override a case. Unset them
+# once so the suite resolves the configured backend, or the tmux reference
+# backend when no case says otherwise - the same hermeticity discipline as
+# pinning PATH via BASE_PATH.
+unset FM_BACKEND TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
   CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID 2>/dev/null || true
 
 # A fake toolchain where every required tool is present and gh is authenticated.
@@ -764,8 +765,9 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "enforce mode did not report manual Agent Fleet installation"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "enforce mode did not retain the secondmate Agent Fleet dependency"
   assert_contains "$out" 'MISSING: jq (install: brew install jq  # or the platform' "enforce mode did not report missing jq"
+  assert_contains "$out" 'MISSING_MANUAL: herdr' "enforce mode did not report the direct hook installer"
 
   case_dir="$TMP_ROOT/account-routing-dispatch"
   mkdir -p "$case_dir/home/config"
@@ -777,7 +779,7 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" 'MISSING_MANUAL: agent-fleet (instructions: https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing)' "account-routed dispatch profile did not report manual Agent Fleet installation"
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "account-routed dispatch profile still required Agent Fleet"
   assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
 
   case_dir="$TMP_ROOT/account-routing-observe"
@@ -785,12 +787,75 @@ SH
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
   printf '%s\n' observe > "$case_dir/home/config/account-routing-mode"
   fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/herdr"
+  rm -f "$fakebin/agent-fleet"
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    BASH_ENV="$bash_env" FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "observe mode treated Agent Fleet as a new-launch dependency"
+  assert_contains "$out" 'MISSING: jq' "observe mode did not report the direct selector dependency"
+  assert_contains "$out" 'MISSING_MANUAL: herdr' "observe mode did not report the direct hook installer"
+  case_dir="$TMP_ROOT/account-routing-legacy-recovery"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' 'account_profile=codex-1' > "$case_dir/home/state/legacy.meta"
+  fakebin=$(make_fake_toolchain "$case_dir")
   rm -f "$fakebin/agent-fleet"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_not_contains "$out" 'MISSING: agent-fleet' "observe-only mode treated optional Agent Fleet as required"
-  assert_not_contains "$out" 'MISSING: jq' "observe-only mode treated advisory JSON parsing as required"
-  pass "bootstrap reports dependencies only when configuration can enforce routing"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "legacy managed metadata no longer reported its recovery dependency"
+
+  case_dir="$TMP_ROOT/account-routing-pending-rollback"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' 'account_rollback_cleanup=pending' > "$case_dir/home/state/legacy.meta"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/agent-fleet"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "pending rollback metadata no longer reported its cleanup dependency"
+
+  case_dir="$TMP_ROOT/account-routing-direct-metadata"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' off > "$case_dir/home/config/account-routing-mode"
+  printf '%s\n' 'account_home=/accounts/codex/1' > "$case_dir/home/state/direct.meta"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/herdr"
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_ACCOUNT_DIRECTORY_PERL_BIN="$case_dir/missing-perl" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: jq' "direct metadata did not retain the selector dependency when routing was off"
+  assert_contains "$out" 'MISSING_MANUAL: herdr' "direct metadata did not retain the hook dependency when routing was off"
+  assert_contains "$out" 'MISSING_MANUAL: perl' "direct metadata did not preflight the fixed passwd-home resolver"
+  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "direct metadata incorrectly restored the legacy recovery dependency"
+  pass "bootstrap requires direct launch tools for crews and Agent Fleet for enforced secondmates or legacy recovery"
 }
 
 test_agent_fleet_install_requires_manual_release() {
@@ -871,6 +936,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-35 ]; then
   test_herdr_detach_dependencies_have_manual_guidance
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-directory-cutover ]; then
+  test_account_routing_dependency_preflight
   exit 0
 fi
 

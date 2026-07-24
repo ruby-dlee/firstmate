@@ -15,12 +15,10 @@
 # FM_ACCOUNT_ROUTING and executable overrides are accepted only when the
 # unmistakable FM_ACCOUNT_ROUTING_TEST_LAB opt-in is active.
 # Valid modes are off, observe, and enforce.
-# Off does not invoke Agent Fleet.
-# Observe performs only `choose --dry-run`, never creates a lease, never wraps
-# the provider launch, and never writes managed account metadata.
-# Enforce atomically reserves one profile after endpoint and worktree setup,
-# immediately before provider launch, and fails closed on every Agent Fleet or
-# validation error.
+# New observe and enforce launches use bin/fm-account-directory.sh and do not
+# invoke Agent Fleet.
+# Agent Fleet selection and lease helpers remain as legacy recovery support and
+# isolated dead-code fixtures pending remove-fleet-routing-deadcode.
 #
 # FM_AGENT_FLEET_BIN may name a deterministic fake only in tests/labs.
 # Production always opens the current passwd user's fixed regular front door at
@@ -1012,7 +1010,7 @@ fm_account_safe_lineage_value() {
 
 fm_account_meta_key_owned() {  # <key>
   case "$1" in
-    window|worktree|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
     *) return 1 ;;
   esac
 }

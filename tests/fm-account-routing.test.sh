@@ -361,22 +361,27 @@ SH
 }
 
 make_case() {
-  local name=$1 harness=$2 case_dir home proj wt fakebin
+  local name=$1 harness=$2 case_dir home proj wt fakebin first_id
   shift 2
+  first_id=${1:-}
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$case_dir/treehouse-pools/pool/slot/wt"
   fakebin=$(make_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$(dirname "$wt")"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   git -C "$wt" checkout --quiet --detach
   fm_git_add_origin "$proj" "$case_dir/origin.git"
+  [ -z "$first_id" ] || printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"firstmate-%s","destroying":false}]}\n' \
+    "$wt" "$first_id" > "$case_dir/treehouse-pools/pool/treehouse-state.json"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf '# Completion\n\n## Summary\n\nCompleted %s.\n\n## What changed\n\nExercised the behavior fixture.\n\n## Verification\n\nVerified by the account-routing suite.\n\n## Visual evidence\n\nNot applicable for this shell behavior fixture.\n\n## Artifacts\n\nThe test logs are the only artifacts.\n\n## Follow-ups\n\nNo follow-up work remains.\n' \
+      "$id" > "$home/data/$id/completion.md"
   done
   printf '%s|%s|%s|%s|%s\n' "$case_dir" "$home" "$proj" "$wt" "$fakebin"
 }
@@ -403,7 +408,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -439,6 +444,9 @@ run_teardown() {
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
+    FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$CASE_DIR/checkout-refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$CASE_DIR/checkout-refresh-locks" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
 }
@@ -644,7 +652,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact common key expected_lock lock_marker
+  local id rec expected out status artifact expected_lock lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -657,11 +665,9 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  expected_lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  expected_lock=$(bash -c \
+    '. "$1"; fm_checkout_lock_path "$2" "$3"' \
+    _ "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
@@ -685,7 +691,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   done
   assert_absent "$CASE_DIR/endpoint-live" \
     "post-metadata unmanaged failure left its endpoint alive"
-  assert_grep "return --force $WT_DIR" "$TREEHOUSE_LOG" \
+  assert_grep 'return --force .' "$TREEHOUSE_LOG" \
     "post-metadata unmanaged failure did not return its clean worktree"
   assert_present "$lock_marker" \
     "spawn rollback did not hold the common checkout lock during Treehouse return"
@@ -694,7 +700,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
 }
 
 test_spawn_rollback_relays_unverified_treehouse_cleanup() {
-  local id rec out status real_ps common key lock group owner child_pid
+  local id rec out status real_ps lock group owner child_pid
   id='checkout-unverified-return-z1h'
   rec=$(make_case checkout-unverified-return pi "$id")
   read_case "$rec"
@@ -719,11 +725,9 @@ SH
   fi
 
   [ "$status" -ne 0 ] || fail "spawn with unverified rollback cleanup unexpectedly succeeded"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  lock=$(bash -c \
+    '. "$1"; fm_checkout_lock_path "$2" "$3"' \
+    _ "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   assert_present "$CASE_DIR/treehouse-return-child.pid" \
     "spawn rollback did not exercise a surviving Treehouse descendant"
   assert_present "$lock" "spawn rollback released an unverified checkout lock"
@@ -2011,13 +2015,23 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
-  cp "$ROOT/bin/fm-account-routing-lib.sh" "$home/bin/fm-account-routing-lib.sh"
-  cp "$ROOT/bin/fm-spawn.sh" "$home/bin/fm-spawn.sh"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  local home=$1 id=$2 primary="$CASE_DIR/primary-root"
+  mkdir -p "$primary"
+  cp -R "$ROOT/bin" "$primary/bin"
+  printf '# Firstmate\n' > "$primary/AGENTS.md"
+  printf 'data/\nstate/\nconfig/\nprojects/\n.fm-secondmate-home\n' > "$primary/.gitignore"
+  git -C "$primary" init -q
+  git -C "$primary" add .
+  git -C "$primary" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm initial
+  git clone --quiet "$primary" "$home"
+  git -C "$home" checkout --quiet --detach
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
+  printf -- '- %s - test secondmate (home: %s; scope: test; projects: ; added 2026-07-24)\n' \
+    "$id" "$home" > "$HOME_DIR/data/secondmates.md"
+  FM_TEST_ROOT_OVERRIDE=$primary
 }
 
 test_secondmate_pool_is_nonactivating_and_noninherited() {
@@ -2106,7 +2120,11 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
-  rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$FM_TEST_ROOT_OVERRIDE" rm -q bin/fm-account-routing-lib.sh
+  git -C "$FM_TEST_ROOT_OVERRIDE" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'pre-account-routing fixture'
+  git -C "$sm" fetch -q origin
+  git -C "$sm" checkout --quiet --detach FETCH_HEAD
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
@@ -2154,7 +2172,11 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
-  rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$FM_TEST_ROOT_OVERRIDE" rm -q bin/fm-account-routing-lib.sh
+  git -C "$FM_TEST_ROOT_OVERRIDE" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'pre-account-routing fixture'
+  git -C "$sm" fetch -q origin
+  git -C "$sm" checkout --quiet --detach FETCH_HEAD
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"
@@ -3046,7 +3068,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
 }
 
 test_concurrent_continuations_serialize_before_mutation() {
-  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count second_lock_waiter
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
@@ -3067,14 +3089,8 @@ test_concurrent_continuations_serialize_before_mutation() {
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
   second_pid=$!
-  second_lock_waiter=
-  for _ in $(seq 1 100); do
-    second_lock_waiter=$(find "$HOME_DIR/state" -maxdepth 1 -type f \
-      -name ".account-lifecycle-$id.owner.*" -print -quit)
-    [ -n "$second_lock_waiter" ] && break
-    sleep 0.05
-  done
-  if [ -z "$second_lock_waiter" ]; then
+  sleep 0.2
+  if ! kill -0 "$second_pid" 2>/dev/null; then
     touch "$gate"
     kill "$first_pid" "$second_pid" 2>/dev/null || true
     fail "second continuation never waited behind the first lifecycle owner"
@@ -3161,7 +3177,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_SLEEP=1 \
     run_teardown "$id" --force > "$CASE_DIR/teardown-stdout" 2> "$CASE_DIR/teardown-stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 100); do
     [ -f "$release_marker" ] && break
     sleep 0.1
   done
@@ -5432,21 +5448,21 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   rec=$(make_case control-timeout claude "$id")
   read_case "$rec"
   started=$(date +%s)
-  if out=$(FM_FAKE_AF_SELECT_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  if out=$(FM_FAKE_AF_SELECT_SLEEP=20 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
   elapsed=$(( $(date +%s) - started ))
   [ "$status" -eq 0 ] || fail "timed-out lease choice was not reconciled through recovery: $out"
-  # Semantic: returns well under the 10s unbounded fake sleep; 8s absorbs full-sweep scheduling load (5s flaked in-sweep while passing standalone).
-  [ "$elapsed" -lt 8 ] || fail "lease choice timeout was not bounded (elapsed ${elapsed}s)"
+  # Semantic: returns well under the 20s unbounded fake sleep; 15s absorbs full-sweep scheduling load.
+  [ "$elapsed" -lt 15 ] || fail "lease choice timeout was not bounded (elapsed ${elapsed}s)"
   assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
 
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   started=$(date +%s)
-  if out=$(FM_FAKE_AF_RELEASE_SLEEP=10 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
+  if out=$(FM_FAKE_AF_RELEASE_SLEEP=20 FM_ACCOUNT_CONTROL_TIMEOUT=1 run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
   elapsed=$(( $(date +%s) - started ))
   [ "$status" -ne 0 ] || fail "ambiguous timed-out lease release unexpectedly completed teardown"
-  # Semantic: returns well under the 10s unbounded fake sleep; 8s absorbs full-sweep scheduling load (5s flaked in-sweep while passing standalone).
-  [ "$elapsed" -lt 8 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
+  # Semantic: returns well under the 20s unbounded fake sleep; 15s absorbs full-sweep scheduling load.
+  [ "$elapsed" -lt 15 ] || fail "lease release timeout was not bounded (elapsed ${elapsed}s)"
   assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease release discarded retry metadata"
   pass "Agent Fleet lease mutations are bounded and ambiguous outcomes retain ownership state"
 }

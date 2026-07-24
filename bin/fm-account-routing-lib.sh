@@ -29,7 +29,12 @@
 # them when the selection-specific override is unset. Other control calls keep
 # the 10s FM_ACCOUNT_CONTROL_TIMEOUT default.
 
-FM_ACCOUNT_ROUTING_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ACCOUNT_ROUTING_LIB_SOURCE=${BASH_SOURCE[0]}
+case "$FM_ACCOUNT_ROUTING_LIB_SOURCE" in
+  */*) FM_ACCOUNT_ROUTING_LIB_DIR="$(cd "${FM_ACCOUNT_ROUTING_LIB_SOURCE%/*}" && pwd)" ;;
+  *) FM_ACCOUNT_ROUTING_LIB_DIR="$(pwd)" ;;
+esac
+unset FM_ACCOUNT_ROUTING_LIB_SOURCE
 # shellcheck source=bin/fm-checkout-lock-lib.sh
 . "$FM_ACCOUNT_ROUTING_LIB_DIR/fm-checkout-lock-lib.sh"
 

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Shared durable wake queue and portable lock helpers.
 
-FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_WAKE_LIB_SOURCE=${BASH_SOURCE[0]}
+case "$FM_WAKE_LIB_SOURCE" in
+  */*) FM_WAKE_LIB_DIR="$(cd "${FM_WAKE_LIB_SOURCE%/*}" && pwd)" ;;
+  *) FM_WAKE_LIB_DIR="$(pwd)" ;;
+esac
+unset FM_WAKE_LIB_SOURCE
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"

@@ -682,9 +682,9 @@ run_sync_project_bounded() (
     echo "$project: skipped: refresh lock ownership cannot be proved"
     return 0
   }
-  export FM_PROCESS_TREE_GUARD_FILE="$lock_owner_dir/process-group"
   trap 'fm_lock_release "$checkout_lock"' EXIT
-  if fm_run_bounded "$FLEET_SYNC_TIMEOUT" \
+  if FM_PROCESS_TREE_GUARD_FILE="$lock_owner_dir/process-group" \
+    fm_run_bounded "$FLEET_SYNC_TIMEOUT" \
       env FM_FLEET_SYNC_BOUNDED_CHILD=1 \
       FM_FLEET_SYNC_LOCK_PATH="$checkout_lock" \
       FM_FLEET_SYNC_LOCK_OWNER_DIR="$lock_owner_dir" \

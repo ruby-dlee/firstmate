@@ -3065,11 +3065,11 @@ EOF
       fi
       WORKTREE_CREATED=1
     fi
-    [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-      && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL" || {
-        echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
-        exit 1
-      }
+    if [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+      || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL"; then
+      echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
+      exit 1
+    fi
     T="$ORCA_TERMINAL"
     ENDPOINT_CREATED=1
     ;;
@@ -3560,11 +3560,11 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 if [ "$BACKEND" = orca ]; then
-  [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-    && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T" || {
-      echo "error: Orca terminal authority changed before launch for $ID" >&2
-      exit 1
-    }
+  if [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+    || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T"; then
+    echo "error: Orca terminal authority changed before launch for $ID" >&2
+    exit 1
+  fi
   validate_orca_abort_worktree_identity || {
     echo "error: Orca worktree authority changed before launch for $ID" >&2
     exit 1

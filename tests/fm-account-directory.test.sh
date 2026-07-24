@@ -70,7 +70,7 @@ case "${3:-}" in
   *) exit 67 ;;
 esac
 if [ -n "${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" ]; then
-  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" switch --quiet --detach || exit 68
+  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" switch --quiet -c drifted-account-prepare || exit 68
 fi
 SH
 chmod +x "$FAKEBIN/herdr"
@@ -252,10 +252,19 @@ SH
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+if [ "${1:-}" = get ]; then
+  git -C "${FM_FAKE_PANE_PATH:?}" switch --quiet --detach
+  printf '%s\n' "$FM_FAKE_PANE_PATH"
+fi
 [ "${1:-}" = return ] || exit 0
 [ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
 target=${@: -1}
-git worktree remove --force "$target"
+if [ "$target" = . ]; then
+  target=${FM_FAKE_PANE_PATH:?}
+fi
+common=$(git -C "$target" rev-parse --git-common-dir) || exit 72
+case "$common" in /*) ;; *) common="$target/$common" ;; esac
+git --git-dir="$common" worktree remove --force "$target"
 SH
   chmod +x "$fakebin/treehouse"
   cat > "$fakebin/forbidden-agent-fleet" <<'SH'
@@ -279,6 +288,7 @@ run_direct_spawn() {
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
@@ -297,7 +307,7 @@ make_spawn_case() {
   project="$case_dir/project"
   worktree="$case_dir/worktree"
   launch_log="$case_dir/launch.log"
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$home/treehouse-pools"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
   touch "$home/state/.last-watcher-beat"
@@ -322,8 +332,10 @@ test_spawn_uses_direct_codex_home_without_agent_fleet() {
   read_spawn_case "$record"
   printf '%s\n' enforce > "$SPAWN_HOME/config/account-routing-mode"
 
-  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" "$SPAWN_PROJECT" 2>&1)
+  if ! out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" 2>&1); then
+    fail "direct Codex spawn failed before launch"$'\n'"$out"
+  fi
   launch=$(cat "$SPAWN_LAUNCH_LOG")
   meta=$SPAWN_HOME/state/$id.meta
   assert_contains "$out" "selected direct codex account home $ACCOUNT_ROOT/codex/2" \
@@ -541,7 +553,7 @@ test_direct_recovery_rejects_worktree_from_another_project() {
     status=$?
   fi
   [ "$status" -ne 0 ] || fail "direct recovery launched in a worktree from another project"
-  assert_contains "$out" "does not belong to recorded project" \
+  assert_contains "$out" "redirected or unprovable Git metadata" \
     "direct recovery project-identity refusal was not actionable"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "project-identity mismatch created a replacement endpoint"
   [ ! -s "$QUOTA_LOG" ] || fail "project-identity mismatch read account quota before refusing recovery"
@@ -816,7 +828,7 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
     status=$?
   fi
   [ "$status" -ne 0 ] || fail "new direct rollback fixture unexpectedly succeeded"
-  if ! grep -Fq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
+  if ! grep -Fq "return --force ." "$TREEHOUSE_LOG"; then
     fail "failed new direct spawn did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
   fi
   [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"

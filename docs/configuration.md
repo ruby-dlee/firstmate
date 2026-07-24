@@ -167,25 +167,40 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 
 ## Agent Fleet account routing
 
-Firstmate can route Claude and Codex launches through the machine-global `agent-fleet` CLI without reading profile homes, credentials, quota caches, or Agent Fleet state directly.
-Agent Fleet's public, provider-neutral source and installation instructions live under [`tools/agent-fleet`](../tools/agent-fleet/README.md); the sealed cutover installs a regular native front door at the current passwd user's `~/.local/bin/agent-fleet` before enabling routing.
-Account routing is default-off, so an unchanged installation makes no Agent Fleet calls, does not wrap the provider launch, and adds no managed account-routing fields to task metadata.
-Routing never retrofits live task metadata or migrates existing sessions; the selected runtime backend, including Herdr, remains the observation and attachment layer rather than an account authority.
+Firstmate routes new observe and enforce Claude and Codex ship/scout launches directly through account profile directories.
+The exact discovery, fresh-usage, health, fallback, and Herdr-hook mechanics are owned by `bin/fm-account-directory.sh`'s header and help output.
+The selected provider command receives `CLAUDE_CONFIG_DIR=<home>` or `CODEX_HOME=<home>`, and task metadata records the non-secret `account_home=<home>` for observability.
+New ship/scout launches never ask Agent Fleet to enable a profile, establish identity, install a bundle, or acquire a lease.
+They invoke Herdr's own integration installer against the selected profile directory and verify its per-profile hook file before launching.
+Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates, logs in, or invokes a model.
+
+Codex health and usage are genuinely readable per account.
+Every selection performs a fresh per-account quota read instead of trusting a prior cache, and a Codex directory with no fresh general usage window is skipped.
+This means an account re-authenticated immediately before spawn is eligible on that spawn.
+Claude's config-directory-specific macOS Keychain credential is not currently distinguishable through non-interactive quota reads.
+Claude therefore treats missing quota as unreadable rather than unhealthy, chooses the first real profile directory in stable sort order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
+
+Account routing remains default-off.
+An unchanged installation does not select an account directory, does not alter the provider launch, and adds no account field to task metadata.
 The production mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, emergency `--no-account-routing` disables it for that spawn, the single value in local `config/account-routing-mode`, then `off`.
 The emergency bypass is printed loudly and persisted as `account_routing_emergency_bypass=1` in task metadata.
 Ambient `FM_ACCOUNT_ROUTING=off` cannot override the authoritative config.
 The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
-`observe` asks Agent Fleet for a read-only, non-leasing dry-run decision against the explicit task worktree, reports the non-secret pool/provider/profile choice, does not wrap the provider launch, and writes no managed account-routing fields even when Agent Fleet is unavailable.
-`enforce` is a certified-Herdr-only production path.
-It rejects tmux, zellij, cmux, and Orca before Fleet selection, lease acquisition, worktree creation, or endpoint creation because those backends cannot prove that the pane shell was sanitized before startup.
-On Herdr it prepares the isolated runtime endpoint and worktree, passes that exact worktree to selection, recovery, execution, and resume, atomically reserves a profile immediately before provider binding, wraps the existing backend-neutral provider command with `agent-fleet exec`, and fails closed on selection, validation, or launch errors.
-Without an explicit pool, enforced Claude and Codex tasks use the dynamic pools `claude-crew` and `codex-crew` respectively.
-`--account-profile <profile>` pins one dynamic profile, using the supplied `--account-pool` when present and the reserved `explicit` pool otherwise.
-Firstmate's direct spawn flags and `config/secondmate-account-pool` accept non-secret pool and profile aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
+`observe` and `enforce` both activate direct account-directory selection for a new Claude or Codex ship/scout launch on any supported runtime backend.
+Neither mode invokes Agent Fleet selection or leases for a new ship/scout launch.
+The existing `--account-pool`, `--account-profile`, and dispatch-profile fields remain compatibility activation inputs for those crewmates while the inactive-code removal is handled separately.
+Their legacy aliases do not constrain the new usage-based account choice.
+Secondmate integration is deferred: secondmate launches retain their pre-cutover Agent Fleet selection and lease behavior, including `config/secondmate-account-pool`.
+Firstmate's spawn flags and `config/secondmate-account-pool` continue to accept aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
 Account email addresses and filesystem paths are invalid in every input surface.
-Managed task metadata records `account_pool=`, `account_profile=`, a home-namespaced and generation-unique `account_task=`, `account_attempt=`, and the real `provider_session_id=` learned from Agent Fleet's SessionStart mapping.
-Spawn requires that generation's SessionStart mapping before reporting success, while the watcher can reconcile older managed metadata through `bin/fm-account-session-sync.sh --all`.
+Direct ship/scout task metadata records only `account_home=` from this account mechanism.
+It never creates `account_pool=`, `account_profile=`, `account_task=`, `account_attempt=`, or `provider_session_id=`.
+
+Existing ship/scout tasks that already carry `account_profile=` metadata remain legacy Agent Fleet managed generations.
+That compatibility path is recovery-only for ordinary crewmates and is not used for any new ship/scout task.
+Secondmate launches continue to create and recover legacy Agent Fleet managed generations until their dedicated direct-account integration is designed.
+Bootstrap requires Agent Fleet for enforced secondmate routing and when legacy `account_profile=` or pending rollback metadata exists, while new direct ship/scout routing requires `jq`, `quota-axi`, and Herdr's integration installer instead.
 Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a higher monotonic `session_event_seq` from a SessionStart accepted after its local launch gate before committing the recovered lease.
 Wall-clock `updated_at` remains diagnostic only and never decides launch freshness.
 Schema-1 mappings remain readable as virtual sequence zero; the next same-binding SessionStart atomically migrates them to schema 2 / sequence 1, while a changed binding is rejected without modifying the legacy record.
@@ -195,20 +210,15 @@ Continuation verifies a bounded repository identity before replacement and fails
 Continuation inherits the predecessor pool only when the provider is unchanged; a provider change with no explicit pool or profile resolves the target provider's standard pool.
 If predecessor lease or session cleanup fails after that binding, the replacement stays committed with retry metadata, and rerunning the same `--continue-account` command completes cleanup without creating another endpoint or account attempt.
 If pre-bind rollback cleanup fails, metadata records `account_rollback_cleanup=pending` plus an exact predecessor backup when applicable, and recovery or teardown retries that failed attempt before restoring or recycling task state.
-Bootstrap uses that managed recovery path for a confidently dead secondmate, but deliberately defers an unmanaged generation until an operator makes the explicit routing decision owned by the `secondmate-provisioning` skill's "Recovery" section.
+Bootstrap uses the managed recovery path for a confidently dead secondmate carrying `account_profile=` and deliberately defers an unmanaged generation until an operator makes the explicit routing decision owned by the `secondmate-provisioning` skill's "Recovery" section.
 Teardown kills the recorded endpoint and releases the Agent Fleet lease and session mapping only after the backend confirms absence; a live or unknown endpoint state retains metadata and storage for retry.
 Off and observe mode support the tmux, Herdr, zellij, and cmux session backends.
-Production enforce mode supports only a Herdr server carrying Firstmate's live process-bound schema-v2 closed-shell certificate, including the exact SHA-256 and opened-file identity of its content-addressed worker helper and managed terminal configuration.
-A manually started, restored, pre-upgrade, or post-update stale Herdr server is not certified and routed spawn refuses it; stop that server only after proving the session idle, then let Firstmate launch it on the next spawn.
-Test labs retain fake backends behind their explicit opt-in so backend-neutral routing behavior remains covered without weakening production.
-`config/secondmate-account-pool` optionally selects the primary's dynamic pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
-An explicit per-spawn account pool or profile overrides that secondmate pool, and an explicit profile without a pool uses only the reserved `explicit` pool.
+`config/secondmate-account-pool` selects the Agent Fleet pool for secondmate launches when routing is already enabled; it does not activate routing by itself and is deliberately not inherited into the secondmate home.
+An explicit per-spawn account pool or profile overrides that secondmate pool.
 `config/account-routing-mode` is inherited, so a secondmate can apply the same off/observe/enforce policy to its own crewmates while resolving its own pools from dispatch profiles or the standard provider defaults.
-Production does not resolve Agent Fleet from ambient `PATH` and never executes `FM_AGENT_FLEET_BIN` or `FM_DISPATCH_AGENT_FLEET` overrides.
-Spawn/control operations fail closed on such an override.
-Quota-balanced dispatch remains advisory: it surfaces the refusal and falls back to the first ordered candidate, preserving that candidate's `account_pool`; the later spawn still enforces that pool through the fixed production front door, so this fallback cannot become a default-account launch.
-It verifies the fixed passwd-home `~/.local/bin/agent-fleet` as a physical current-user/root-owned non-writable regular executable with safe ancestry and reuses that exact path for selection, execution, recovery, and cleanup.
-Environment mode and executable overrides exist only behind the unmistakable `FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1` test/lab opt-in.
+The legacy secondmate and recovery implementation resolves Agent Fleet through its sealed production front door and keeps its environment overrides behind `FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1`.
+Its remaining crew-dispatch pool-summary branch and isolated new-crewmate fixture path are deferred to follow-up task `remove-fleet-routing-deadcode`; neither is a real new ship/scout launch path.
+The direct account-directory module has a separate unmistakable `FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1` opt-in for deterministic filesystem, quota, and installer fixtures.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -225,27 +235,28 @@ This section is the single owner of the canonical schema and its per-field seman
     {
       "when": "<natural-language condition describing a kind of task>",
       "use": [
-        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>", "account_pool": "<optional Agent Fleet pool>", "account_profile": "<optional pinned profile>" }
+        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>", "account_pool": "<optional compatibility activation alias>", "account_profile": "<optional compatibility activation alias>" }
       ],
       "select": "<optional strategy>",
       "why": "<optional rationale that helps firstmate choose>"
     }
   ],
-  "default": { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>", "account_pool": "<optional Agent Fleet pool>", "account_profile": "<optional pinned profile>" }
+  "default": { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>", "account_pool": "<optional compatibility activation alias>", "account_profile": "<optional compatibility activation alias>" }
 }
 ```
 
 Per rule, `when` and `use` are required.
 `use` may be a single profile object or an ordered array of profile objects; the single-object form stays fully backward-compatible, and every profile needs `harness`.
 `use.model`, `use.effort`, `use.account_pool`, `use.account_profile`, and `why` are optional.
-Account pool and profile fields are valid only for `claude` and `codex`, and selecting either field makes that spawn enforce account routing even when the global mode is off or observe.
+Account pool and profile fields are valid only for `claude` and `codex`, and selecting either field activates direct account-directory routing even when the global mode is off or observe.
 `select` is optional and currently supports `quota-balanced`.
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback.
 `default` is optional.
 An omitted model or effort means the selected harness uses its own default for that axis.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 `quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
-Any quota-balanced candidate carrying `account_profile` is invalid because a pinned profile is a direct per-spawn override; pool-aware candidates must all carry `account_pool`, and the selector compares only Agent Fleet `pool status` summaries before passing the winning pool to atomic selection.
+Any quota-balanced candidate carrying `account_profile` remains invalid for compatibility, and pool-aware candidates must all carry `account_pool`.
+The winning profile's account field activates the later per-account direct selection; its legacy alias does not pin an account directory.
 When account routing is `enforce`, every quota-balanced candidate must carry `account_pool`; `off` and `observe` retain the legacy poolless `quota-axi` compatibility path.
 That pool-aware path never falls through to `quota-axi` default-account data, preventing one quota source from choosing a provider while a different account source chooses the concrete profile.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
@@ -270,7 +281,9 @@ Backend tool availability uses the adapter's own executable resolver, so bootstr
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
 For an eligible pre-cutover task, Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
-Bootstrap reports missing Agent Fleet and `jq` whenever local routing mode or dispatch configuration can enforce routing; observe mode degrades to the legacy launch when either is unavailable, and off mode never invokes them.
+Bootstrap reports missing `jq`, fixed system Perl, or Herdr whenever local routing mode, dispatch configuration, or existing ship/scout `account_home=` metadata can activate direct account-directory launches.
+It reports missing Agent Fleet when enforced secondmate routing is configured or legacy task metadata still carries `account_profile=` or pending rollback cleanup and may need managed recovery.
+Observe and enforce modes both use direct account-directory routing for new ship/scout launches; off mode leaves them on the provider's default identity while still allowing recorded direct generations to recover through fresh selection.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.

@@ -4,6 +4,7 @@
 # credential, real endpoint, global config, or live worker is touched.
 set -u
 export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
+export FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST=firstmate-remove-fleet-routing-deadcode-fixture-v1
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -1648,11 +1649,14 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   printf 'claude-captains\n' > "$HOME_DIR/config/secondmate-account-pool"
 
-  out=$(FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  out=$(FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST='' \
+    FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "enforced secondmate spawn should succeed (exit $status): $out"
   assert_regex "lease choose --pool claude-captains --task .*-$id-.* --provider claude" "$AF_LOG" "secondmate did not use its primary-owned account pool"
   assert_grep 'account_pool=claude-captains' "$HOME_DIR/state/$id.meta" "secondmate meta lost its account pool"
+  assert_not_grep '^account_home=' "$HOME_DIR/state/$id.meta" "secondmate entered direct account-directory routing"
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
@@ -2718,10 +2722,23 @@ test_continuation_fails_closed_without_original_brief() {
   id=account-continue-nobrief-z22
   rec=$(make_case continue-nobrief claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation precondition spawn failed"
-  rm -f "$CASE_DIR/endpoint-live" "$HOME_DIR/data/$id/brief.md"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=claude" \
+    "kind=ship" \
+    "account_pool=claude-crew" \
+    "account_profile=claude-2" \
+    "account_task=$id" \
+    "account_attempt=legacy" \
+    "provider_session_id=sess-$id"
+  rm -f "$HOME_DIR/data/$id/brief.md"
   clear_case_logs
-  out=$(run_spawn "$id" --continue-account --account-profile claude-3)
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
+    FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    "$CONTINUATION" "$id" missing-brief 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation without original brief unexpectedly succeeded"
   assert_not_grep '^new-window ' "$TMUX_LOG" "unsafe continuation created an endpoint"
@@ -4705,13 +4722,7 @@ test_agent_fleet_contract_is_validated_before_routing() {
   [ "$status" -ne 0 ] || fail "incompatible Agent Fleet contract unexpectedly enforced routing"
   assert_not_grep 'lease (choose|acquire)' "$AF_LOG" "incompatible Agent Fleet contract mutated a lease"
   assert_contains "$out" "unsupported Agent Fleet contract version 1" "contract mismatch was not actionable"
-
-  clear_case_logs
-  if out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_CONTRACT_VERSION=1 run_spawn "$id" "$PROJ_DIR"); then status=0; else status=$?; fi
-  [ "$status" -eq 0 ] || fail "observe mode should degrade on an incompatible Agent Fleet contract"
-  assert_not_grep ' choose ' "$AF_LOG" "incompatible observe contract still queried selection"
-  assert_contains "$out" "observe contract unavailable" "observe contract fallback was not surfaced"
-  pass "Agent Fleet contract v2 is required before observation or enforcement"
+  pass "Agent Fleet contract v2 is required before legacy fixture enforcement"
 }
 
 test_agent_fleet_entrypoint_is_physically_pinned_per_operation() {
@@ -5013,60 +5024,6 @@ SH
   [ ! -e "$marker" ] \
     || fail "hostile shell startup or exported-function injection executed before Fleet"
   pass "production Fleet control, selection, recovery, and workers close authority environment before startup"
-}
-
-test_production_enforce_refuses_hostile_uncertified_parent_shell() {
-  local id rec marker hook fake_ps trace out status startup_out
-  id=uncertified-hostile-shell
-  rec=$(make_case uncertified-hostile-shell claude "$id")
-  read_case "$rec"
-  marker="$CASE_DIR/hostile-parent-ps4-ran"
-  hook="$CASE_DIR/hostile-parent-bash-env"
-  fake_ps="$CASE_DIR/hostile-parent-ps"
-  trace="$CASE_DIR/hostile-parent-trace"
-  # shellcheck disable=SC2016  # The variable expands when Bash sources the hook.
-  printf '%s\n' ': > "$FM_HOSTILE_PARENT_MARKER"' > "$hook"
-  cat > "$fake_ps" <<'SH'
-#!/bin/sh
-printf '%s\n' 'Fri Jul 18 08:00:00 2026'
-SH
-  chmod +x "$fake_ps"
-
-  # shellcheck disable=SC2016  # Dollar expressions belong to the nested shell.
-  if startup_out=$(/usr/bin/env SHELLOPTS=xtrace \
-    PS4=HOSTILE_PARENT_XTRACE: BASH_ENV="$hook" \
-    FM_HOSTILE_PARENT_MARKER="$marker" \
-    /bin/bash --noprofile --norc -c '
-      exec 2>"$9"
-      exec /usr/bin/env -u FM_ACCOUNT_ROUTING_TEST_LAB \
-        FM_ROOT_OVERRIDE= FM_HOME="$1" \
-        FM_STATE_OVERRIDE="$1/state" FM_DATA_OVERRIDE="$1/data" \
-        FM_PROJECTS_OVERRIDE="$1/projects" FM_CONFIG_OVERRIDE="$1/config" \
-        FM_SPAWN_NO_GUARD=1 FM_FAKE_TMUX_LOG="$4" \
-        FM_FAKE_ENDPOINT_FILE="$5" FM_FAKE_TMUX_LABEL_FILE="$6" \
-        FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
-        FM_TEST_ACCOUNT_PS_BIN="${10}" \
-        TMUX=fake,1,0 PATH="$3:$PATH" \
-        "$7" "$8" "$2" --backend tmux --account-pool claude-crew
-    ' _ "$HOME_DIR" "$PROJ_DIR" "$FAKEBIN_DIR" "$TMUX_LOG" \
-      "$CASE_DIR/endpoint-live" "$CASE_DIR/tmux-label" "$SPAWN" "$id" \
-      "$trace" "$fake_ps" 2>&1); then
-    status=0
-  else
-    status=$?
-  fi
-  out="$startup_out$(cat "$trace")"
-
-  [ "$status" -ne 0 ] || fail "hostile uncertified tmux parent reached enforced routing"
-  [ -e "$marker" ] || fail "hostile parent-shell fixture never executed its inherited startup hook"
-  assert_contains "$out" "HOSTILE_PARENT_XTRACE:set -eu" \
-    "hostile parent-shell fixture never imported SHELLOPTS=xtrace/PS4 into fm-spawn"
-  assert_contains "$out" "requires backend=herdr with a process-bound closed-shell certificate" \
-    "uncertified hostile parent-shell refusal was not actionable"
-  [ ! -s "$AF_LOG" ] || fail "uncertified hostile parent shell reached Agent Fleet: $(cat "$AF_LOG")"
-  [ ! -s "$TMUX_LOG" ] || fail "uncertified hostile parent shell created a tmux endpoint"
-  assert_absent "$HOME_DIR/state/$id.meta" "uncertified hostile parent shell persisted managed metadata"
-  pass "production enforce refuses a genuinely hostile parent shell before Fleet, lease, or endpoint mutation"
 }
 
 test_agent_fleet_lifecycle_calls_are_bounded() {
@@ -5512,6 +5469,11 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
+  run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
@@ -5742,7 +5704,6 @@ if [ "${FM_TEST_FOCUSED:-}" = signal-handoff ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = gate-e-workspace ]; then
-  run_isolated_test test_observe_is_dry_run_only
   run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
   run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
@@ -5762,7 +5723,6 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = production-fleet-environment ]; then
   run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
-  run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
   exit 0
 fi
 
@@ -5770,7 +5730,6 @@ run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
 run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
 run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
 run_isolated_test test_completion_contract_ignores_raw_html_headings
-run_isolated_test test_observe_is_dry_run_only
 run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
 run_isolated_test test_explicit_profile_uses_explicit_pool
 run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
@@ -5820,7 +5779,6 @@ run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
 run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
 run_isolated_test test_failed_secondmate_rollback_preserves_home_for_relaunch
 run_isolated_test test_failed_secondmate_respawn_rollback_restores_prior_state
-run_isolated_test test_observe_invalid_response_remains_advisory
 run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
 run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
 run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
@@ -5874,7 +5832,6 @@ run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation
 run_isolated_test test_agent_fleet_validation_ignores_ambient_system_tool_shadows
 run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
 run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
-run_isolated_test test_production_enforce_refuses_hostile_uncertified_parent_shell
 run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
 run_isolated_test test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible
 run_isolated_test test_unsuccessful_lease_mutations_always_reconcile

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca respawn, or a secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
+#        fm-spawn.sh <task-id> --recover-direct-account
 #        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
@@ -49,27 +51,30 @@
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
 #   Account routing is independently default-off. Its precedence and off/observe/
-#   enforce behavior are owned by fm-account-routing-lib.sh. --account-pool asks
-#   Agent Fleet to atomically select one concrete profile; --account-profile pins
-#   a concrete profile (and optionally validates it belongs to --account-pool).
-#   Either explicit account flag enforces routing for this spawn even when the
-#   global mode is off/observe. --no-account-routing is the emergency per-spawn
-#   opt-out and cannot be combined with either account flag. Enforced routing is
-#   supported only for claude/codex and fails closed; it never silently launches
-#   the default account. The resolved profile wraps the provider command before
-#   it is submitted to the selected backend, so every backend receives the same
-#   launch string.
-#   config/secondmate-account-pool is the primary's durable, non-inherited pool
-#   for secondmate AGENTS. An explicit account flag overrides it. A secondmate's
-#   own crewmates use inherited crew dispatch/routing policy, not this pool.
-#   --resume-account is an internal recovery path. It requires existing sticky
-#   account/profile/session metadata plus Agent Fleet's matching SessionStart
-#   mapping, reuses the recorded worktree/home, and executes `agent-fleet resume
-#   --task`; any missing or mismatched recovery truth blocks before pane creation.
-#   --continue-account is the provider-neutral recovery path. It verifies a dead
-#   endpoint and current repository state, builds a task-owned continuation packet,
-#   launches a fresh provider session through a new namespaced Agent Fleet attempt,
-#   and releases the predecessor only after the new SessionStart mapping is bound.
+#   enforce resolution is owned by fm-account-routing-lib.sh. Direct account-
+#   directory launch currently covers ship/scout crewmates only; secondmate
+#   integration is deferred and retains legacy Agent Fleet routing.
+#   For a NEW routed Claude or Codex ship/scout, fm-account-directory.sh discovers
+#   the current user's account homes, chooses one through its direct per-vendor
+#   usage contract, installs that profile's Herdr hook, and prefixes the provider
+#   command with CLAUDE_CONFIG_DIR or CODEX_HOME.
+#   Existing --account-pool and --account-profile inputs remain compatibility
+#   activation signals for new direct launches; their aliases do not constrain
+#   the direct usage choice. --no-account-routing remains the emergency per-spawn
+#   opt-out and cannot be combined with either account flag. Off launches retain
+#   their existing default-identity behavior.
+#   config/secondmate-account-pool remains the primary's durable, non-inherited
+#   Agent Fleet selection input for secondmate agents when routing is enabled. A
+#   secondmate's own crewmates use inherited crew dispatch/routing policy, not
+#   this setting.
+#   --resume-account and --continue-account are legacy recovery paths only for
+#   existing account_profile metadata. They retain the sealed Agent Fleet
+#   session/lease behavior needed to recover those already-managed generations;
+#   ship/scout launches never create that metadata.
+#   --recover-direct-account is the ship/scout account_home recovery path. It reloads kind,
+#   project, worktree, harness, backend, model, effort, mode, yolo, and report
+#   requirements from metadata, selects a fresh account directory, and creates
+#   only a replacement endpoint in the recorded worktree.
 #   A --secondmate spawn also propagates the primary's declared inheritable config
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
@@ -158,10 +163,164 @@ spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmat
   fi
 }
 
+git_repository_probe() (
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
+  unset GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_IMPLICIT_WORK_TREE GIT_PREFIX
+  unset GIT_SUPER_PREFIX GIT_INTERNAL_SUPER_PREFIX GIT_INDEX_FILE
+  unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+  unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL
+  command git "$@"
+)
+
+git_common_dir_real() {
+  local repo=$1 common
+  (
+    cd "$repo" 2>/dev/null || exit 1
+    common=$(git_repository_probe rev-parse --git-common-dir 2>/dev/null) || exit 1
+    cd "$common" 2>/dev/null || exit 1
+    pwd -P
+  )
+}
+
+git_worktree_dir_real() {
+  local repo=$1 git_dir
+  (
+    cd "$repo" 2>/dev/null || exit 1
+    git_dir=$(git_repository_probe rev-parse --git-dir 2>/dev/null) || exit 1
+    cd "$git_dir" 2>/dev/null || exit 1
+    pwd -P
+  )
+}
+
+git_directory_identity() {
+  # shellcheck disable=SC2016 # JavaScript source is intentionally single-quoted.
+  node -e '
+const fs = require("fs");
+const stat = fs.lstatSync(process.argv[1], { bigint: true });
+if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+process.stdout.write(`${stat.dev}:${stat.ino}`);
+' "$1"
+}
+
+git_worktree_ref() {
+  git_repository_probe -C "$1" symbolic-ref -q HEAD 2>/dev/null
+}
+
+git_worktree_head() {
+  git_repository_probe -C "$1" rev-parse --verify 'HEAD^{commit}' 2>/dev/null
+}
+
+capture_worktree_git_physical_identity() {
+  local worktree=$1
+  WORKTREE_GIT_DIR=$(git_worktree_dir_real "$worktree" 2>/dev/null) || return 1
+  WORKTREE_GIT_DIR_IDENTITY=$(git_directory_identity "$WORKTREE_GIT_DIR" 2>/dev/null) || return 1
+  [ -n "$WORKTREE_GIT_DIR" ] && [ -n "$WORKTREE_GIT_DIR_IDENTITY" ]
+}
+
+capture_direct_launch_authoritative_state() {
+  local current_ref current_head expected_ref
+  current_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
+  current_head=$(git_worktree_head "$WT" 2>/dev/null) || return 1
+  expected_ref="refs/heads/fm/$ID"
+  WORKTREE_GIT_REF=$expected_ref
+  WORKTREE_GIT_HEAD=
+  WORKTREE_GIT_SETUP_REF=
+  WORKTREE_GIT_SETUP_HEAD=
+  if [ "$current_ref" != "$expected_ref" ]; then
+    WORKTREE_GIT_SETUP_REF=$current_ref
+    WORKTREE_GIT_SETUP_HEAD=$current_head
+  fi
+}
+
+validate_direct_recovery_physical_identity() {
+  local worktree_real worktree_literal current_git_dir current_git_dir_identity
+  worktree_real=$(cd "$WT" 2>/dev/null && pwd -P) || worktree_real=
+  worktree_literal=${WT%/}
+  if [ -z "$worktree_real" ] || [ "$worktree_literal" != "$worktree_real" ]; then
+    echo "error: recorded direct account recovery worktree '$WT' is redirected or non-canonical; refusing endpoint creation" >&2
+    return 1
+  fi
+  current_git_dir=$(git_worktree_dir_real "$WT" 2>/dev/null) || current_git_dir=
+  current_git_dir_identity=$(git_directory_identity "$current_git_dir" 2>/dev/null) || current_git_dir_identity=
+  if [ -z "$current_git_dir" ] || [ -z "$current_git_dir_identity" ] \
+    || [ "$current_git_dir" != "$RECORDED_WORKTREE_GIT_DIR" ] \
+    || [ "$current_git_dir_identity" != "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ]; then
+    echo "error: recorded direct account recovery worktree '$WT' no longer has its exact Git-dir identity; refusing endpoint creation" >&2
+    return 1
+  fi
+  WORKTREE_GIT_DIR=$current_git_dir
+  WORKTREE_GIT_DIR_IDENTITY=$current_git_dir_identity
+}
+
+validate_direct_recovery_worktree_identity() {
+  local current_git_ref current_git_head
+  validate_direct_recovery_physical_identity || return 1
+  current_git_ref=$(git_worktree_ref "$WT" 2>/dev/null || true)
+  current_git_head=$(git_worktree_head "$WT" 2>/dev/null) || current_git_head=
+  if [ -n "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ]; then
+    if [ "$current_git_ref" = "$RECORDED_WORKTREE_GIT_REF" ]; then
+      WORKTREE_GIT_REF=$current_git_ref
+      WORKTREE_GIT_HEAD=
+      WORKTREE_GIT_SETUP_REF=
+      WORKTREE_GIT_SETUP_HEAD=
+      return 0
+    fi
+    if [ "$current_git_ref" != "$RECORDED_WORKTREE_GIT_SETUP_REF" ] \
+      || [ -z "$current_git_head" ] \
+      || [ "$current_git_head" != "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed branch identity; refusing endpoint creation" >&2
+      return 1
+    fi
+    WORKTREE_GIT_REF=$RECORDED_WORKTREE_GIT_REF
+    WORKTREE_GIT_HEAD=
+    WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
+    WORKTREE_GIT_SETUP_HEAD=$RECORDED_WORKTREE_GIT_SETUP_HEAD
+    return 0
+  fi
+  if [ -n "$RECORDED_WORKTREE_GIT_REF" ]; then
+    if [ "$current_git_ref" != "$RECORDED_WORKTREE_GIT_REF" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed branch identity; refusing endpoint creation" >&2
+      return 1
+    fi
+    WORKTREE_GIT_REF=$current_git_ref
+    WORKTREE_GIT_HEAD=
+  else
+    if [ -n "$current_git_ref" ] || [ -z "$current_git_head" ] \
+      || [ "$current_git_head" != "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' changed detached HEAD identity; refusing endpoint creation" >&2
+      return 1
+    fi
+    WORKTREE_GIT_REF=
+    WORKTREE_GIT_HEAD=$current_git_head
+  fi
+  WORKTREE_GIT_SETUP_REF=
+  WORKTREE_GIT_SETUP_HEAD=
+}
+
+validate_direct_launch_worktree_identity() {
+  local current_git_dir current_git_dir_identity
+  current_git_dir=$(git_worktree_dir_real "$WT" 2>/dev/null) || current_git_dir=
+  current_git_dir_identity=$(git_directory_identity "$current_git_dir" 2>/dev/null) || current_git_dir_identity=
+  if [ -z "$current_git_dir" ] || [ -z "$current_git_dir_identity" ] \
+    || [ "$current_git_dir" != "$WORKTREE_GIT_DIR" ] \
+    || [ "$current_git_dir_identity" != "$WORKTREE_GIT_DIR_IDENTITY" ]; then
+    echo "error: direct account worktree '$WT' changed exact Git-dir identity before metadata install" >&2
+    return 1
+  fi
+}
+
+direct_worktree_return_confirmed() {
+  local project=$1 worktree=$2 listed
+  [ ! -e "$worktree" ] && [ ! -L "$worktree" ] && return 0
+  listed=$(git_repository_probe -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 1
+  ! printf '%s\n' "$listed" | grep -Fqx "worktree $worktree"
+}
+
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
 KIND=ship
+KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
@@ -171,6 +330,7 @@ ACCOUNT_PROFILE=
 NO_ACCOUNT_ROUTING=0
 RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
+DIRECT_ACCOUNT_RECOVERY=0
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 CONTINUATION_PROMPT_DIR_ID=
@@ -202,8 +362,8 @@ for a in "$@"; do
     continue
   fi
   case "$a" in
-    --scout) KIND=scout ;;
-    --secondmate) KIND=secondmate ;;
+    --scout) KIND=scout; KIND_SET=1 ;;
+    --secondmate) KIND=secondmate; KIND_SET=1 ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
     --model) want_value=model ;;
@@ -219,6 +379,7 @@ for a in "$@"; do
     --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
     --resume-account) RESUME_ACCOUNT=1 ;;
     --continue-account) CONTINUE_ACCOUNT=1 ;;
+    --recover-direct-account) DIRECT_ACCOUNT_RECOVERY=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -236,6 +397,19 @@ fi
 [ "$RESUME_ACCOUNT" = 0 ] || [ "$NO_ACCOUNT_ROUTING" = 0 ] || { echo "error: --resume-account cannot disable account routing" >&2; exit 1; }
 [ "$CONTINUE_ACCOUNT" = 0 ] || [ "$NO_ACCOUNT_ROUTING" = 0 ] || { echo "error: --continue-account cannot disable account routing" >&2; exit 1; }
 [ "$RESUME_ACCOUNT" = 0 ] || [ "$CONTINUE_ACCOUNT" = 0 ] || { echo "error: --resume-account and --continue-account are mutually exclusive" >&2; exit 1; }
+if [ $((RESUME_ACCOUNT + CONTINUE_ACCOUNT + DIRECT_ACCOUNT_RECOVERY)) -gt 1 ]; then
+  echo "error: --resume-account, --continue-account, and --recover-direct-account are mutually exclusive" >&2
+  exit 1
+fi
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  if [ "$KIND_SET" = 1 ] || [ "$HARNESS_SET" = 1 ] || [ "$MODEL_SET" = 1 ] \
+    || [ "$EFFORT_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
+    || [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ] \
+    || [ "$NO_ACCOUNT_ROUTING" = 1 ]; then
+    echo "error: --recover-direct-account accepts only a task id; task context comes from metadata" >&2
+    exit 1
+  fi
+fi
 [ -z "$ACCOUNT_POOL" ] || fm_account_valid_id "$ACCOUNT_POOL" || { echo "error: invalid --account-pool '$ACCOUNT_POOL'" >&2; exit 1; }
 [ -z "$ACCOUNT_PROFILE" ] || fm_account_valid_id "$ACCOUNT_PROFILE" || { echo "error: invalid --account-profile '$ACCOUNT_PROFILE'" >&2; exit 1; }
 case "$EFFORT" in
@@ -244,7 +418,7 @@ case "$EFFORT" in
 esac
 
 RECOVERY_ACCOUNT=0
-[ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] || RECOVERY_ACCOUNT=1
+[ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] || RECOVERY_ACCOUNT=1
 RESUME_META=
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
@@ -310,10 +484,146 @@ spawn_refuse_report_required_orca() {
   fi
 }
 
+reconcile_failed_direct_recovery() {
+  local task=$1 meta="$STATE/$1.meta" lock marker generation backend target tmux_session_target tab kind home tasktmp
+  local backup_name backup_token backup backup_snapshot artifacts_name artifacts_token artifacts endpoint_state tmp current_backup_snapshot
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  marker=$(fm_account_meta_value "$meta" direct_recovery_cleanup)
+  if [ "$marker" != pending ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: invalid retained direct recovery state for $task" >&2
+    return 1
+  fi
+  generation=$(fm_account_meta_value "$meta" generation_id)
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  tmux_session_target=$(fm_account_meta_value "$meta" tmux_session_target)
+  tab=$(fm_account_meta_value "$meta" zellij_tab_id)
+  kind=$(fm_account_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  home=$(fm_account_meta_value "$meta" home)
+  tasktmp=$(fm_account_meta_value "$meta" tasktmp)
+  backup_name=$(fm_account_meta_value "$meta" direct_recovery_backup)
+  artifacts_name=$(fm_account_meta_value "$meta" direct_recovery_artifacts)
+  case "$backup_name" in
+    ".$task.meta.rollback."*) ;;
+    *)
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      echo "error: unsafe retained direct recovery backup for $task" >&2
+      return 1
+      ;;
+  esac
+  backup_token=${backup_name#".$task.meta.rollback."}
+  if ! fm_account_valid_id "$backup_token"; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: unsafe retained direct recovery backup for $task" >&2
+    return 1
+  fi
+  case "$artifacts_name" in
+    ".$task.artifacts.rollback."*) ;;
+    *)
+      fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+      echo "error: unsafe retained direct recovery artifacts for $task" >&2
+      return 1
+      ;;
+  esac
+  artifacts_token=${artifacts_name#".$task.artifacts.rollback."}
+  if ! fm_account_valid_id "$artifacts_token"; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: unsafe retained direct recovery artifacts for $task" >&2
+    return 1
+  fi
+  backup="$STATE/$backup_name"
+  artifacts="$STATE/$artifacts_name"
+  backup_snapshot=$(spawn_preflight_read_meta "$backup") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery backup is missing or unsafe for $task" >&2
+    return 1
+  }
+  if [ ! -d "$artifacts" ] || [ -L "$artifacts" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery artifacts are missing or unsafe for $task" >&2
+    return 1
+  fi
+  if [ "$tasktmp" != "/tmp/fm-$task" ] || [ -z "$generation" ] || [ -z "$target" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery metadata is incomplete for $task" >&2
+    return 1
+  fi
+  fm_account_meta_lock_release "$lock" || return 1
+  lock=
+
+  spawn_managed_endpoint_kill "$backend" "$target" "$tab" "fm-$task" "$kind" "$home" "$tmux_session_target" 2>/dev/null || true
+  endpoint_state=$(spawn_managed_endpoint_state "$backend" "$target" "fm-$task" "$kind" "$home" "$tmux_session_target" 2>/dev/null)
+  case "$endpoint_state" in
+    absent) ;;
+    present)
+      echo "error: retained direct recovery endpoint is still alive for $task" >&2
+      return 1
+      ;;
+    *)
+      echo "error: retained direct recovery endpoint state is unknown for $task" >&2
+      return 1
+      ;;
+  esac
+
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  current_backup_snapshot=$(spawn_preflight_read_meta "$backup" 2>/dev/null) || current_backup_snapshot=
+  if [ ! -f "$meta" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_cleanup)" != pending ] \
+    || [ "$(fm_account_meta_value "$meta" generation_id)" != "$generation" ] \
+    || [ "$(fm_backend_of_meta "$meta")" != "$backend" ] \
+    || [ "$(fm_backend_target_of_meta "$meta")" != "$target" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_backup)" != "$backup_name" ] \
+    || [ "$(fm_account_meta_value "$meta" direct_recovery_artifacts)" != "$artifacts_name" ] \
+    || [ "$current_backup_snapshot" != "$backup_snapshot" ] \
+    || [ ! -d "$artifacts" ] || [ -L "$artifacts" ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery generation changed before cleanup for $task" >&2
+    return 1
+  fi
+  if ! fm_account_restore_artifacts "$STATE" "$task" "$artifacts_name" "$tasktmp" 1; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery artifacts could not be restored for $task" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$STATE/.$task.meta.direct-recovery-restore.XXXXXX") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! printf '%s\n' "$backup_snapshot" > "$tmp" \
+    || ! fm_account_meta_merge_extensions "$meta" "$tmp" \
+    || ! fm_account_safe_file_destination "$meta" \
+    || ! mv "$tmp" "$meta"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    echo "error: retained direct recovery metadata could not be restored for $task" >&2
+    return 1
+  fi
+  rm -f "$backup" || echo "warning: retained direct recovery backup remains for $task" >&2
+  rm -rf "$artifacts" || echo "warning: retained direct recovery artifacts remain for $task" >&2
+  fm_account_meta_lock_release "$lock" || return 1
+  SPAWN_META_SNAPSHOT=$(spawn_preflight_read_meta "$meta") || return 1
+  SPAWN_META_PRESENT=1
+  echo "fm-spawn: cleaned retained direct recovery endpoint for $task" >&2
+}
+
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
   case "$SPAWN_PREFLIGHT_ID" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "${#POS[@]}" -ne 1 ]; then
+    echo "error: --recover-direct-account accepts exactly one task id" >&2
+    exit 1
+  fi
   spawn_preflight_load_meta 1 || exit 1
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    KIND=$(spawn_preflight_meta_value kind)
+    [ -n "$KIND" ] || KIND=ship
+    case "$KIND" in
+      ship|scout) ;;
+      *) echo "error: --recover-direct-account supports only recorded ship or scout tasks" >&2; exit 1 ;;
+    esac
+  fi
   recorded_backend=$(spawn_preflight_meta_value backend)
   [ -n "$recorded_backend" ] || recorded_backend=tmux
   if [ "$BACKEND_SET" = 1 ] && [ "$BACKEND_ARG" != "$recorded_backend" ]; then
@@ -346,7 +656,7 @@ fi
 if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 1 ]; then
   spawn_refuse_report_required_orca || exit 1
 fi
-if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ]; then
+if [ "$BACKEND" = orca ] && { [ "$RECOVERY_ACCOUNT" = 0 ] || [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; }; then
   fm_backend_orca_runtime_check || exit 1
 fi
 if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 0 ]; then
@@ -426,6 +736,18 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   # replacement generation instead of rejecting that generation as stale.
   SPAWN_META_SNAPSHOT=$current_spawn_meta
   rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
+  direct_recovery_cleanup=$(fm_account_meta_value "$RESUME_META" direct_recovery_cleanup)
+  if [ -n "$direct_recovery_cleanup" ]; then
+    [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || {
+      echo "error: retained direct recovery state exists for ${POS[0]}; use --recover-direct-account" >&2
+      exit 1
+    }
+    [ "$direct_recovery_cleanup" = pending ] || {
+      echo "error: invalid retained direct recovery state for ${POS[0]}" >&2
+      exit 1
+    }
+    reconcile_failed_direct_recovery "${POS[0]}" || exit 1
+  fi
   if [ "$(fm_account_meta_value "$RESUME_META" account_rollback_cleanup)" = pending ]; then
     rollback_id=${POS[0]}
     rollback_account_task=$(fm_account_meta_value "$RESUME_META" account_task)
@@ -524,7 +846,7 @@ fi
 # recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
 # window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
 # so the default path's meta stays byte-identical.
-if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 1 ]; then
+if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 1 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ]; then
   echo "error: managed account recovery is not implemented for backend=orca" >&2
   exit 1
 fi
@@ -557,6 +879,16 @@ ACCOUNT_NATIVE_LAUNCH_SCRIPT=
 ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
+DIRECT_ACCOUNT_ROUTING=0
+DIRECT_ACCOUNT_HOME=
+DIRECT_ACCOUNT_RESPAWN=0
+DIRECT_ACCOUNT_PREPARE_DEFERRED=0
+WORKTREE_GIT_DIR=
+WORKTREE_GIT_DIR_IDENTITY=
+WORKTREE_GIT_REF=
+WORKTREE_GIT_HEAD=
+WORKTREE_GIT_SETUP_REF=
+WORKTREE_GIT_SETUP_HEAD=
 CONFIG_INHERIT_REPORT_TMP=
 ORIGINAL_STATUS_PRESENT=-1
 ORIGINAL_TURN_ENDED_PRESENT=-1
@@ -680,6 +1012,154 @@ persist_failed_account_rollback() {
   META_INSTALLED=1
 }
 
+persist_failed_direct_recovery() {
+  local meta="$STATE/$ID.meta" tmp backup_name artifacts_name retained_window retained_tmux_session account_home
+  [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ] || return 1
+  [ -n "$EXISTING_ARTIFACT_BACKUP" ] && [ -d "$EXISTING_ARTIFACT_BACKUP" ] || return 1
+  backup_name=${META_BACKUP##*/}
+  artifacts_name=${EXISTING_ARTIFACT_BACKUP##*/}
+  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+  retained_tmux_session=
+  if [ "${BACKEND:-tmux}" = tmux ]; then
+    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+    retained_window=$retained_tmux_session
+  fi
+  account_home=${DIRECT_ACCOUNT_HOME:-${RECORDED_ACCOUNT_HOME:-}}
+  tmp=$(mktemp "$STATE/.$ID.meta.direct-recovery-pending.XXXXXX") || return 1
+  {
+    echo "window=$retained_window"
+    echo "worktree=${WT:-${RECORDED_WORKTREE:-}}"
+    echo "worktree_git_dir=${WORKTREE_GIT_DIR:-${RECORDED_WORKTREE_GIT_DIR:-}}"
+    echo "worktree_git_dir_identity=${WORKTREE_GIT_DIR_IDENTITY:-${RECORDED_WORKTREE_GIT_DIR_IDENTITY:-}}"
+    [ -z "${WORKTREE_GIT_REF:-${RECORDED_WORKTREE_GIT_REF:-}}" ] || echo "worktree_git_ref=${WORKTREE_GIT_REF:-${RECORDED_WORKTREE_GIT_REF:-}}"
+    [ -z "${WORKTREE_GIT_HEAD:-${RECORDED_WORKTREE_GIT_HEAD:-}}" ] || echo "worktree_git_head=${WORKTREE_GIT_HEAD:-${RECORDED_WORKTREE_GIT_HEAD:-}}"
+    [ -z "${WORKTREE_GIT_SETUP_REF:-}" ] || echo "worktree_git_setup_ref=$WORKTREE_GIT_SETUP_REF"
+    [ -z "${WORKTREE_GIT_SETUP_HEAD:-}" ] || echo "worktree_git_setup_head=$WORKTREE_GIT_SETUP_HEAD"
+    echo "project=${PROJ_ABS:-${RECORDED_PROJECT:-}}"
+    echo "harness=${HARNESS:-${RECORDED_HARNESS:-}}"
+    echo "kind=${KIND:-${RECORDED_KIND:-ship}}"
+    echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
+    echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
+    echo "tasktmp=${TASK_TMP:-${RECORDED_TASKTMP:-/tmp/fm-$ID}}"
+    echo "model=${RECORDED_MODEL:-${MODEL:-default}}"
+    echo "effort=${RECORDED_EFFORT:-${EFFORT:-default}}"
+    echo "generation_id=${RECORDED_GENERATION:-${SPAWN_GENERATION_ID:-}}"
+    [ "${RECORDED_REPORT_REQUIRED_SET:-0}" != 1 ] || echo "report_required=${RECORDED_REPORT_REQUIRED:-}"
+    [ -z "$account_home" ] || echo "account_home=$account_home"
+    [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+    [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+    [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+    [ "${BACKEND:-tmux}" != herdr ] || {
+      echo "herdr_session=${HERDR_SES:-}"
+      echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+      echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+      echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+    }
+    [ "${BACKEND:-tmux}" != zellij ] || {
+      echo "zellij_session=${ZELLIJ_SES:-}"
+      echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+      echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+    }
+    [ "${BACKEND:-tmux}" != orca ] || {
+      echo "orca_worktree_id=${ORCA_WORKTREE_ID:-}"
+      echo "terminal=${ORCA_TERMINAL:-${T:-}}"
+    }
+    [ "${BACKEND:-tmux}" != cmux ] || {
+      echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+      echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+    }
+    echo "direct_recovery_cleanup=pending"
+    echo "direct_recovery_backup=$backup_name"
+    echo "direct_recovery_artifacts=$artifacts_name"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
+persist_failed_direct_spawn() {
+  local meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo backup_name artifacts_name preserve_extensions=0
+  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+  retained_tmux_session=
+  retained_mode=${MODE:-}
+  retained_yolo=${YOLO:-off}
+  [ -n "$retained_mode" ] || retained_mode=no-mistakes
+  if [ "${BACKEND:-tmux}" = tmux ]; then
+    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+    retained_window=$retained_tmux_session
+  fi
+  if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    if [ -z "${WORKTREE_GIT_DIR:-}" ] || [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ]; then
+      capture_worktree_git_physical_identity "$WT" >/dev/null 2>&1 || true
+    fi
+    if [ -z "${WORKTREE_GIT_REF:-}" ] && [ -z "${WORKTREE_GIT_HEAD:-}" ]; then
+      capture_direct_launch_authoritative_state >/dev/null 2>&1 || true
+    fi
+  fi
+  tmp=$(mktemp "$STATE/.$ID.meta.direct-spawn-pending.XXXXXX") || return 1
+  if [ "$META_INSTALLED" = 1 ] && [ -f "$meta" ] \
+    && [ "$(fm_account_meta_value "$meta" generation_id)" = "$SPAWN_GENERATION_ID" ]; then
+    awk '!/^direct_spawn_cleanup=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    [ ! -f "$meta" ] || preserve_extensions=1
+    {
+      echo "window=$retained_window"
+      echo "worktree=${WT:-}"
+      [ -z "${WORKTREE_GIT_DIR:-}" ] || echo "worktree_git_dir=$WORKTREE_GIT_DIR"
+      [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ] || echo "worktree_git_dir_identity=$WORKTREE_GIT_DIR_IDENTITY"
+      [ -z "${WORKTREE_GIT_REF:-}" ] || echo "worktree_git_ref=$WORKTREE_GIT_REF"
+      [ -z "${WORKTREE_GIT_HEAD:-}" ] || echo "worktree_git_head=$WORKTREE_GIT_HEAD"
+      [ -z "${WORKTREE_GIT_SETUP_REF:-}" ] || echo "worktree_git_setup_ref=$WORKTREE_GIT_SETUP_REF"
+      [ -z "${WORKTREE_GIT_SETUP_HEAD:-}" ] || echo "worktree_git_setup_head=$WORKTREE_GIT_SETUP_HEAD"
+      echo "project=${PROJ_ABS:-}"
+      echo "harness=${HARNESS:-}"
+      echo "kind=${KIND:-ship}"
+      echo "mode=$retained_mode"
+      echo "yolo=$retained_yolo"
+      echo "tasktmp=${TASK_TMP:-/tmp/fm-$ID}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      echo "generation_id=${SPAWN_GENERATION_ID:-}"
+      echo "report_required=1"
+      [ -z "${DIRECT_ACCOUNT_HOME:-}" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
+      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+      [ "${BACKEND:-tmux}" != herdr ] || {
+        echo "herdr_session=${HERDR_SES:-}"
+        echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+        echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+        echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != zellij ] || {
+        echo "zellij_session=${ZELLIJ_SES:-}"
+        echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+        echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+      }
+      [ "${BACKEND:-tmux}" != cmux ] || {
+        echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+        echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+      }
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if [ "$preserve_extensions" = 1 ]; then
+    fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
+    backup_name=${META_BACKUP##*/}
+    printf 'direct_spawn_backup=%s\n' "$backup_name" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if [ -n "$EXISTING_ARTIFACT_BACKUP" ] && [ -d "$EXISTING_ARTIFACT_BACKUP" ]; then
+    artifacts_name=${EXISTING_ARTIFACT_BACKUP##*/}
+    printf 'direct_spawn_artifacts=%s\n' "$artifacts_name" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  fm_account_safe_file_destination "$meta" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  META_INSTALLED=1
+}
+
 clear_account_rollback_markers() {
   local meta="$STATE/$ID.meta" tmp
   tmp=$(mktemp "$STATE/.$ID.meta.rollback-commit.XXXXXX") || return 1
@@ -759,7 +1239,9 @@ spawn_abort_cleanup() {
       fi
     fi
   fi
-  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] \
+    && { [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] || [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ]; } \
+    && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
     spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
     endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
     case "$endpoint_state" in
@@ -777,6 +1259,104 @@ spawn_abort_cleanup() {
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
   cleanup_continuation_launch_transport
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_direct_recovery || echo "warning: failed to persist retained direct recovery state for ${ID:-unknown}" >&2
+    else
+      echo "warning: failed to acquire metadata lock while preserving retained direct recovery for ${ID:-unknown}" >&2
+    fi
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
+    && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 0 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      persist_failed_direct_spawn || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
+    else
+      echo "warning: failed to acquire metadata lock while preserving retained direct spawn for ${ID:-unknown}" >&2
+    fi
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 1 ]; then
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ]; then
+      artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+      if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-/tmp/fm-$ID}" 1; then
+        if [ "$META_INSTALLED" = 1 ] && [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
+          if fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
+            && fm_account_safe_file_destination "$STATE/$ID.meta" \
+            && mv "$META_BACKUP" "$STATE/$ID.meta"; then
+            META_BACKUP=
+          else
+            echo "warning: failed to restore direct recovery metadata for ${ID:-unknown}" >&2
+          fi
+        elif [ -n "$META_BACKUP" ]; then
+          rm -f "$META_BACKUP"
+          META_BACKUP=
+        fi
+        [ -z "$EXISTING_ARTIFACT_BACKUP" ] || rm -rf "$EXISTING_ARTIFACT_BACKUP"
+        EXISTING_ARTIFACT_BACKUP=
+      else
+        echo "warning: failed to restore direct recovery artifacts for ${ID:-unknown}" >&2
+      fi
+    else
+      echo "warning: failed to acquire metadata lock while restoring direct recovery for ${ID:-unknown}" >&2
+    fi
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
+    && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
+    if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+      rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+      if ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
+        direct_worktree_return_confirmed "$PROJ_ABS" "$WT" || worktree_clean=0
+      else
+        worktree_clean=0
+      fi
+      [ "$worktree_clean" = 1 ] || echo "warning: failed to return direct spawn worktree for ${ID:-unknown}; retaining cleanup metadata" >&2
+    fi
+    if [ -z "$rollback_lock" ]; then
+      rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
+    fi
+    if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ]; then
+      if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
+        artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+        if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-/tmp/fm-$ID}" 1 \
+          && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
+          && fm_account_safe_file_destination "$STATE/$ID.meta" \
+          && mv "$META_BACKUP" "$STATE/$ID.meta"; then
+          META_BACKUP=
+          discard_existing_artifact_backup
+          restored_existing_meta=1
+        else
+          worktree_clean=0
+          echo "warning: failed to restore prior task state after direct spawn rollback for ${ID:-unknown}" >&2
+        fi
+      else
+        if [ "$META_INSTALLED" = 1 ] \
+          && [ "$(fm_meta_get "$STATE/$ID.meta" generation_id)" = "${SPAWN_GENERATION_ID:-}" ]; then
+          rm -f "$STATE/$ID.meta" || worktree_clean=0
+        fi
+        [ "$ORIGINAL_STATUS_PRESENT" != 0 ] || rm -f "$STATE/$ID.status"
+        [ "$ORIGINAL_TURN_ENDED_PRESENT" != 0 ] || rm -f "$STATE/$ID.turn-ended"
+        [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
+        [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
+        [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+      fi
+    fi
+    if [ "$worktree_clean" != 1 ]; then
+      if [ -n "$rollback_lock" ]; then
+        persist_failed_direct_spawn || echo "warning: failed to persist direct spawn cleanup state for ${ID:-unknown}" >&2
+      else
+        echo "warning: failed to acquire metadata lock while preserving direct spawn cleanup for ${ID:-unknown}" >&2
+      fi
+    fi
+  fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$ACCOUNT_LEASE_CREATED" = 1 ] || fm_account_mutation_owned; then
       release_status=0
@@ -986,75 +1566,192 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   fi
   KIND=$RECORDED_KIND
   RECORDED_HARNESS=$(fm_meta_get "$RESUME_META" harness)
-  RECORDED_PROFILE=$(fm_meta_get "$RESUME_META" account_profile)
-  RECORDED_POOL=$(fm_meta_get "$RESUME_META" account_pool)
-  RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
-  RECORDED_ACCOUNT_TASK=$(fm_meta_get "$RESUME_META" account_task)
-  RECORDED_ATTEMPT=$(fm_meta_get "$RESUME_META" account_attempt)
   RECORDED_PROJECT=$(fm_meta_get "$RESUME_META" project)
   RECORDED_WORKTREE=$(fm_meta_get "$RESUME_META" worktree)
-  [ -n "$RECORDED_ACCOUNT_TASK" ] || RECORDED_ACCOUNT_TASK=$ID
-  [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
   [ -n "$RECORDED_HARNESS" ] || { echo "error: managed recovery metadata has no harness for $ID" >&2; exit 1; }
-  [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
-  [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
-  if [ "$RESUME_ACCOUNT" = 1 ]; then
-    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
-    RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
-    [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
-    if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
-      echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    RECORDED_ACCOUNT_HOME=$(fm_meta_get "$RESUME_META" account_home)
+    RECORDED_MODEL=$(fm_meta_get "$RESUME_META" model)
+    RECORDED_EFFORT=$(fm_meta_get "$RESUME_META" effort)
+    RECORDED_MODE=$(fm_meta_get "$RESUME_META" mode)
+    RECORDED_YOLO=$(fm_meta_get "$RESUME_META" yolo)
+    RECORDED_WORKTREE_GIT_DIR=$(fm_meta_get "$RESUME_META" worktree_git_dir)
+    RECORDED_WORKTREE_GIT_DIR_IDENTITY=$(fm_meta_get "$RESUME_META" worktree_git_dir_identity)
+    RECORDED_WORKTREE_GIT_REF=$(fm_meta_get "$RESUME_META" worktree_git_ref)
+    RECORDED_WORKTREE_GIT_HEAD=$(fm_meta_get "$RESUME_META" worktree_git_head)
+    RECORDED_WORKTREE_GIT_SETUP_REF=$(fm_meta_get "$RESUME_META" worktree_git_setup_ref)
+    RECORDED_WORKTREE_GIT_SETUP_HEAD=$(fm_meta_get "$RESUME_META" worktree_git_setup_head)
+    RECORDED_GENERATION=$(fm_meta_get "$RESUME_META" generation_id)
+    RECORDED_TASKTMP=$(fm_meta_get "$RESUME_META" tasktmp)
+    RECORDED_REPORT_REQUIRED=
+    RECORDED_REPORT_REQUIRED_SET=0
+    if grep -q '^report_required=' "$RESUME_META"; then
+      RECORDED_REPORT_REQUIRED_SET=1
+      RECORDED_REPORT_REQUIRED=$(fm_meta_get "$RESUME_META" report_required)
+    fi
+    case "$RECORDED_KIND" in
+      ship|scout) ;;
+      *) echo "error: direct account recovery metadata has invalid kind '$RECORDED_KIND' for $ID" >&2; exit 1 ;;
+    esac
+    case "$RECORDED_HARNESS" in
+      claude|codex) ;;
+      *) echo "error: direct account recovery metadata has unsupported harness '$RECORDED_HARNESS' for $ID" >&2; exit 1 ;;
+    esac
+    [ -z "$(fm_meta_get "$RESUME_META" direct_spawn_cleanup)" ] || {
+      echo "error: failed direct spawn cleanup is pending for $ID; tear down the retained endpoint and worktree before recovery" >&2
+      exit 1
+    }
+    [ -z "$(fm_meta_get "$RESUME_META" rollback_pending)" ] || {
+      echo "error: rollback cleanup is pending for $ID; tear down the retained task state before recovery" >&2
+      exit 1
+    }
+    [ -n "$RECORDED_ACCOUNT_HOME" ] || { echo "error: direct account recovery metadata has no account_home for $ID" >&2; exit 1; }
+    [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] || { echo "error: direct account recovery cannot replace legacy account_profile metadata for $ID" >&2; exit 1; }
+    [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] || { echo "error: direct account recovery cannot bypass pending legacy rollback cleanup for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_PROJECT" ] || { echo "error: direct account recovery metadata has no project for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_WORKTREE" ] || { echo "error: direct account recovery metadata has no worktree for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_WORKTREE_GIT_DIR" ] || { echo "error: direct account recovery metadata has no exact worktree Git-dir for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ] || { echo "error: direct account recovery metadata has no worktree Git-dir identity for $ID" >&2; exit 1; }
+    if [ -n "$RECORDED_WORKTREE_GIT_REF" ] && [ -n "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: direct account recovery metadata has conflicting branch and detached HEAD identities for $ID" >&2
       exit 1
     fi
-    if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
-      echo "error: --resume-account pool override '$ACCOUNT_POOL' does not match recorded pool '$RECORDED_POOL'" >&2
+    if [ -z "$RECORDED_WORKTREE_GIT_REF" ] && [ -z "$RECORDED_WORKTREE_GIT_HEAD" ]; then
+      echo "error: direct account recovery metadata has no authoritative worktree Git state for $ID" >&2
       exit 1
     fi
-    if [ "$ACCOUNT_PROFILE_SET" = 1 ] && [ "$ACCOUNT_PROFILE" != "$RECORDED_PROFILE" ]; then
-      echo "error: --resume-account profile override '$ACCOUNT_PROFILE' does not match recorded profile '$RECORDED_PROFILE'" >&2
+    if [ -n "$RECORDED_WORKTREE_GIT_SETUP_REF" ] && [ -z "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ]; then
+      echo "error: direct account recovery metadata has an incomplete branch-setup identity for $ID" >&2
       exit 1
     fi
+    if [ -n "$RECORDED_WORKTREE_GIT_SETUP_HEAD" ] \
+      && { [ -z "$RECORDED_WORKTREE_GIT_REF" ] || [ -n "$RECORDED_WORKTREE_GIT_HEAD" ]; }; then
+      echo "error: direct account recovery metadata has an invalid branch-setup transition for $ID" >&2
+      exit 1
+    fi
+    [ -n "$RECORDED_MODE" ] || { echo "error: direct account recovery metadata has no mode for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_YOLO" ] || { echo "error: direct account recovery metadata has no yolo setting for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_GENERATION" ] || { echo "error: direct account recovery metadata has no generation_id for $ID" >&2; exit 1; }
+    [ "$RECORDED_TASKTMP" = "/tmp/fm-$ID" ] || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
+    RECORDED_META_WORKTREE_GIT_REF=$RECORDED_WORKTREE_GIT_REF
+    RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
+    RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
+    RECORDED_META_WORKTREE_GIT_SETUP_HEAD=$RECORDED_WORKTREE_GIT_SETUP_HEAD
     HARNESS_ARG=$RECORDED_HARNESS
-    ACCOUNT_POOL=$RECORDED_POOL
-    ACCOUNT_PROFILE=$RECORDED_PROFILE
-    ACCOUNT_POOL_SET=1
-    ACCOUNT_PROFILE_SET=1
-    ACCOUNT_TASK=$RECORDED_ACCOUNT_TASK
-    ACCOUNT_ATTEMPT=$RECORDED_ATTEMPT
+    HARNESS_SET=1
+    MODEL=$RECORDED_MODEL
+    EFFORT=$RECORDED_EFFORT
+    [ "$MODEL" = default ] && MODEL=
+    [ "$EFFORT" = default ] && EFFORT=
+    ARG3=$HARNESS_ARG
+    DIRECT_ACCOUNT_RESPAWN=1
+    PROJ=$RECORDED_PROJECT
   else
-    [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
-    if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
-      if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
-        ACCOUNT_POOL=$RECORDED_POOL
-      else
-        ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS_ARG") || {
-          echo "error: no default account pool for continuation harness '$HARNESS_ARG'" >&2
-          exit 1
-        }
+    RECORDED_PROFILE=$(fm_meta_get "$RESUME_META" account_profile)
+    RECORDED_POOL=$(fm_meta_get "$RESUME_META" account_pool)
+    RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+    RECORDED_ACCOUNT_TASK=$(fm_meta_get "$RESUME_META" account_task)
+    RECORDED_ATTEMPT=$(fm_meta_get "$RESUME_META" account_attempt)
+    [ -n "$RECORDED_ACCOUNT_TASK" ] || RECORDED_ACCOUNT_TASK=$ID
+    [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
+    [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
+    [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
+    if [ "$RESUME_ACCOUNT" = 1 ]; then
+      FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
+      RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
+      [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
+      if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
+        echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+        exit 1
       fi
+      if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
+        echo "error: --resume-account pool override '$ACCOUNT_POOL' does not match recorded pool '$RECORDED_POOL'" >&2
+        exit 1
+      fi
+      if [ "$ACCOUNT_PROFILE_SET" = 1 ] && [ "$ACCOUNT_PROFILE" != "$RECORDED_PROFILE" ]; then
+        echo "error: --resume-account profile override '$ACCOUNT_PROFILE' does not match recorded profile '$RECORDED_PROFILE'" >&2
+        exit 1
+      fi
+      HARNESS_ARG=$RECORDED_HARNESS
+      ACCOUNT_POOL=$RECORDED_POOL
+      ACCOUNT_PROFILE=$RECORDED_PROFILE
       ACCOUNT_POOL_SET=1
+      ACCOUNT_PROFILE_SET=1
+      ACCOUNT_TASK=$RECORDED_ACCOUNT_TASK
+      ACCOUNT_ATTEMPT=$RECORDED_ATTEMPT
+    else
+      [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
+      if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
+        if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+          ACCOUNT_POOL=$RECORDED_POOL
+        else
+          ACCOUNT_POOL=$(fm_account_default_pool "$HARNESS_ARG") || {
+            echo "error: no default account pool for continuation harness '$HARNESS_ARG'" >&2
+            exit 1
+          }
+        fi
+        ACCOUNT_POOL_SET=1
+      fi
+      ACCOUNT_PREDECESSOR_TASK=$RECORDED_ACCOUNT_TASK
+      ACCOUNT_PREDECESSOR_ATTEMPT=$RECORDED_ATTEMPT
+      ACCOUNT_PREDECESSOR_PROVIDER=$RECORDED_HARNESS
+      ACCOUNT_PREDECESSOR_PROFILE=$RECORDED_PROFILE
+      ACCOUNT_PREDECESSOR_POOL=$RECORDED_POOL
+      ACCOUNT_PREDECESSOR_SESSION=$RECORDED_SESSION
     fi
-    ACCOUNT_PREDECESSOR_TASK=$RECORDED_ACCOUNT_TASK
-    ACCOUNT_PREDECESSOR_ATTEMPT=$RECORDED_ATTEMPT
-    ACCOUNT_PREDECESSOR_PROVIDER=$RECORDED_HARNESS
-    ACCOUNT_PREDECESSOR_PROFILE=$RECORDED_PROFILE
-    ACCOUNT_PREDECESSOR_POOL=$RECORDED_POOL
-    ACCOUNT_PREDECESSOR_SESSION=$RECORDED_SESSION
-  fi
-  HARNESS_SET=1
-  ARG3=$HARNESS_ARG
-  if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
-    [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
-    [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
-  fi
-  [ "$MODEL" = default ] && MODEL=
-  [ "$EFFORT" = default ] && EFFORT=
-  if [ "$KIND" = secondmate ]; then
-    FIRSTMATE_HOME=$(fm_meta_get "$RESUME_META" home)
-  else
-    PROJ=$(fm_meta_get "$RESUME_META" project)
+    HARNESS_SET=1
+    ARG3=$HARNESS_ARG
+    if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+      [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
+      [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
+    fi
+    [ "$MODEL" = default ] && MODEL=
+    [ "$EFFORT" = default ] && EFFORT=
+    if [ "$KIND" = secondmate ]; then
+      FIRSTMATE_HOME=$(fm_meta_get "$RESUME_META" home)
+    else
+      PROJ=$(fm_meta_get "$RESUME_META" project)
+    fi
   fi
 fi
+
+direct_recovery_context_matches() {
+  [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || return 0
+  [ -f "$RESUME_META" ] \
+    && [ "$(fm_meta_get "$RESUME_META" kind)" = "$RECORDED_KIND" ] \
+    && [ "$(fm_meta_get "$RESUME_META" harness)" = "$RECORDED_HARNESS" ] \
+    && [ "$(fm_meta_get "$RESUME_META" project)" = "$RECORDED_PROJECT" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree)" = "$RECORDED_WORKTREE" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_dir)" = "$RECORDED_WORKTREE_GIT_DIR" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_dir_identity)" = "$RECORDED_WORKTREE_GIT_DIR_IDENTITY" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_ref)" = "$RECORDED_META_WORKTREE_GIT_REF" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_head)" = "$RECORDED_META_WORKTREE_GIT_HEAD" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_setup_ref)" = "$RECORDED_META_WORKTREE_GIT_SETUP_REF" ] \
+    && [ "$(fm_meta_get "$RESUME_META" worktree_git_setup_head)" = "$RECORDED_META_WORKTREE_GIT_SETUP_HEAD" ] \
+    && [ "$(fm_backend_of_meta "$RESUME_META")" = "$BACKEND" ] \
+    && [ "$(fm_meta_get "$RESUME_META" model)" = "$RECORDED_MODEL" ] \
+    && [ "$(fm_meta_get "$RESUME_META" effort)" = "$RECORDED_EFFORT" ] \
+    && [ "$(fm_meta_get "$RESUME_META" mode)" = "$RECORDED_MODE" ] \
+    && [ "$(fm_meta_get "$RESUME_META" yolo)" = "$RECORDED_YOLO" ] \
+    && [ "$(fm_meta_get "$RESUME_META" account_home)" = "$RECORDED_ACCOUNT_HOME" ] \
+    && [ "$(fm_meta_get "$RESUME_META" generation_id)" = "$RECORDED_GENERATION" ] \
+    && [ "$(fm_meta_get "$RESUME_META" tasktmp)" = "$RECORDED_TASKTMP" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" direct_recovery_cleanup)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" direct_spawn_cleanup)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] \
+    && [ -z "$(fm_meta_get "$RESUME_META" rollback_pending)" ] \
+    || return 1
+  if [ "$RECORDED_REPORT_REQUIRED_SET" = 1 ]; then
+    grep -q '^report_required=' "$RESUME_META" \
+      && [ "$(fm_meta_get "$RESUME_META" report_required)" = "$RECORDED_REPORT_REQUIRED" ]
+  else
+    if grep -q '^report_required=' "$RESUME_META"; then
+      return 1
+    fi
+  fi
+}
+
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
 
 # The verified launch command per adapter. The knowledge half of each adapter
@@ -1163,6 +1860,14 @@ ACCOUNT_EXPLICIT=0
 if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
   ACCOUNT_EXPLICIT=1
 fi
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  ACCOUNT_EXPLICIT=1
+elif [ "$KIND" != secondmate ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$NO_ACCOUNT_ROUTING" = 0 ] \
+  && [ "$SPAWN_META_PRESENT" = 1 ] \
+  && [ -n "$(spawn_preflight_meta_value account_home)" ]; then
+  echo "error: direct account metadata already exists for ${POS[0]}; use --recover-direct-account to preserve its recorded task context" >&2
+  exit 1
+fi
 if [ "$KIND" = secondmate ]; then
   ACCOUNT_PRIMARY_MODE=$(fm_account_resolve_mode "$CONFIG" 0 0) || exit 1
 fi
@@ -1170,7 +1875,8 @@ ACCOUNT_EFFECTIVE_MODE=$(fm_account_resolve_mode "$CONFIG" "$ACCOUNT_EXPLICIT" "
 if [ "$NO_ACCOUNT_ROUTING" = 1 ]; then
   echo "WARNING: emergency --no-account-routing bypass is active for ${POS[0]:-unknown}; this spawn will use the provider's default identity and will be recorded in task metadata" >&2
 fi
-if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] && [ "$ACCOUNT_EFFECTIVE_MODE" != off ] \
+  && [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ] && [ "$KIND" = secondmate ]; then
   if SM_ACCOUNT_POOL=$(fm_account_secondmate_pool "$CONFIG"); then
     ACCOUNT_POOL=$SM_ACCOUNT_POOL
   else
@@ -1181,8 +1887,12 @@ fi
 case "$HARNESS" in
   claude|codex) ;;
   *)
-    if [ "$ACCOUNT_EXPLICIT" = 1 ]; then
+    if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
       echo "error: --account-pool/--account-profile requires a claude or codex harness, not '$HARNESS'" >&2
+      exit 1
+    fi
+    if [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
+      echo "error: recorded direct account routing requires a claude or codex harness, not '$HARNESS'" >&2
       exit 1
     fi
     if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
@@ -1192,6 +1902,35 @@ case "$HARNESS" in
     ACCOUNT_EFFECTIVE_MODE=off
     ;;
 esac
+if { [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
+    || { [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$KIND" != secondmate ]; }; } \
+  && [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && fm_account_test_lab_enabled \
+    && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] \
+    && [ "${FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST:-}" = firstmate-remove-fleet-routing-deadcode-fixture-v1 ]; then
+    :
+  else
+    [ "$RAW_LAUNCH" != 1 ] || {
+      echo "error: direct account-directory routing does not accept raw launch commands" >&2
+      exit 1
+    }
+    DIRECT_ACCOUNT_ROUTING=1
+    if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
+      echo "fm-spawn: --account-pool/--account-profile now activate direct account-directory selection for new launches; the legacy alias does not pin the selected account" >&2
+    elif [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
+      echo "fm-spawn: recorded direct account metadata activates fresh account-directory selection for this respawn" >&2
+    fi
+    if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+      DIRECT_ACCOUNT_PREPARE_DEFERRED=1
+    else
+      DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+      echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+    fi
+    # Every Agent Fleet branch below is guarded by enforce. New direct crewmate
+    # launches deliberately rejoin the ordinary unmanaged spawn path after selection.
+    ACCOUNT_EFFECTIVE_MODE=off
+  fi
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
   if [ -n "$ACCOUNT_PROFILE" ]; then
     ACCOUNT_POOL=explicit
@@ -1219,7 +1958,9 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$RESUME_ACCOUNT" != 1 ]; then
   ACCOUNT_ATTEMPT=$(fm_account_attempt_id "$FM_HOME" "$ID") || exit 1
   ACCOUNT_TASK=$(fm_account_task_key "$FM_HOME" "$ID" "$ACCOUNT_ATTEMPT") || exit 1
 fi
-if [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  SPAWN_GENERATION_ID=$RECORDED_GENERATION
+elif [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
   SPAWN_GENERATION_ID="account:$ACCOUNT_TASK:$ACCOUNT_ATTEMPT"
 else
   SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
@@ -1277,7 +2018,7 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
     present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
     *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
   esac
-  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
     META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
     cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
     snapshot_existing_artifacts || exit 1
@@ -1595,7 +2336,7 @@ if [ "$KIND" = secondmate ]; then
 else
   BRIEF="$DATA/$ID/brief.md"
 fi
-if [ "$RECOVERY_ACCOUNT" != 1 ]; then
+if [ "$RESUME_ACCOUNT" != 1 ]; then
   [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 fi
 if [ "$KIND" = ship ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
@@ -1638,7 +2379,7 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     wt_real=
   fi
   proj_real=$PROJ_ABS_REAL
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
+  wt_top=$(git_repository_probe -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
   wt_top_real=
   if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
     wt_top_real=
@@ -1648,6 +2389,37 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     exit 1
   fi
 }
+
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  validate_spawn_worktree "recorded direct account recovery" "$RECORDED_TARGET"
+  recorded_project_common=$(git_common_dir_real "$PROJ_ABS" 2>/dev/null || true)
+  recorded_worktree_common=$(git_common_dir_real "$WT" 2>/dev/null || true)
+  if [ -z "$recorded_project_common" ] || [ -z "$recorded_worktree_common" ] \
+    || [ "$recorded_project_common" != "$recorded_worktree_common" ]; then
+    echo "error: recorded direct account recovery worktree '$WT' does not belong to recorded project '$PROJ_ABS'; refusing endpoint creation" >&2
+    exit 1
+  fi
+  validate_direct_recovery_worktree_identity || exit 1
+fi
+
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  direct_recovery_context_matches || {
+    echo "error: direct account task generation changed before recovery mutation for $ID" >&2
+    exit 1
+  }
+  META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
+  cp -p "$RESUME_META" "$META_BACKUP" || exit 1
+  snapshot_existing_artifacts || exit 1
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
+fi
+
+if [ "$DIRECT_ACCOUNT_PREPARE_DEFERRED" = 1 ]; then
+  DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+  echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+  DIRECT_ACCOUNT_PREPARE_DEFERRED=0
+fi
 
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   CONTINUATION_RESULT=$(FM_ACCOUNT_CONTINUATION_EMIT_PROMPT_B64=1 \
@@ -1693,6 +2465,9 @@ fi
 W="fm-$ID"
 SPAWN_CWD=$PROJ_ABS
 [ "$RECOVERY_ACCOUNT" != 1 ] || SPAWN_CWD=$WT
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  validate_direct_recovery_worktree_identity || exit 1
+fi
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -1777,31 +2552,47 @@ EOF
     ENDPOINT_CREATED=1
     ;;
   orca)
-    set +e
-    ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
-    ORCA_WT_STATUS=$?
-    set -e
-    if [ "$ORCA_WT_STATUS" -ne 0 ]; then
-      if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
-        if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-          ORCA_ABORT_CLEANUP=1
-        fi
-      fi
-      exit 1
-    fi
-    parse_orca_worktree_result "$ORCA_WT_RAW" || true
-    ORCA_ABORT_CLEANUP=1
-    if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
-      echo "error: orca did not return a worktree id/path for $W" >&2
-      exit 1
-    fi
-    validate_spawn_worktree "orca worktree create" "$W"
-    if [ -z "$ORCA_TERMINAL" ]; then
+    if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+      ORCA_WORKTREE_ID=$(fm_meta_get "$RESUME_META" orca_worktree_id)
+      [ -n "$ORCA_WORKTREE_ID" ] || {
+        echo "error: direct account recovery metadata has no Orca worktree id for $ID" >&2
+        exit 1
+      }
+      ORCA_RECORDED_WORKTREE=$(fm_backend_orca_worktree_path "$ORCA_WORKTREE_ID") || exit 1
+      [ "$(real_path_or_raw "$ORCA_RECORDED_WORKTREE")" = "$(real_path_or_raw "$WT")" ] || {
+        echo "error: recorded Orca worktree identity no longer matches $WT for $ID" >&2
+        exit 1
+      }
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+      T="$ORCA_TERMINAL"
+      ENDPOINT_CREATED=1
+    else
+      set +e
+      ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
+      ORCA_WT_STATUS=$?
+      set -e
+      if [ "$ORCA_WT_STATUS" -ne 0 ]; then
+        if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
+          if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
+            ORCA_ABORT_CLEANUP=1
+          fi
+        fi
+        exit 1
+      fi
+      parse_orca_worktree_result "$ORCA_WT_RAW" || true
+      ORCA_ABORT_CLEANUP=1
+      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
+        echo "error: orca did not return a worktree id/path for $W" >&2
+        exit 1
+      fi
+      validate_spawn_worktree "orca worktree create" "$W"
+      if [ -z "$ORCA_TERMINAL" ]; then
+        ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+      fi
+      T="$ORCA_TERMINAL"
+      ENDPOINT_CREATED=1
+      WORKTREE_CREATED=1
     fi
-    T="$ORCA_TERMINAL"
-    ENDPOINT_CREATED=1
-    WORKTREE_CREATED=1
     ;;
 esac
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
@@ -1879,6 +2670,17 @@ if [ -z "$WT" ] && [ "$BACKEND" = orca ]; then
   WT="$PROJ_ABS"
 fi
 
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] && [ "$KIND" != secondmate ]; then
+  WT=$(cd "$WT" 2>/dev/null && pwd -P) || {
+    echo "error: cannot canonicalize direct account worktree for $ID" >&2
+    exit 1
+  }
+  capture_worktree_git_physical_identity "$WT" || {
+    echo "error: cannot record exact direct account worktree identity for $ID" >&2
+    exit 1
+  }
+fi
+
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
@@ -1896,7 +2698,7 @@ STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
 exclude_path() {
   local rel=$1 EXCL
-  EXCL=$(git -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
+  EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
   [ -n "$EXCL" ] || return 0
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
@@ -1998,7 +2800,10 @@ fi
 # branch on them. Mode governs ship tasks; a scout's deliverable is a report, not a
 # merge, so scout teardown ignores mode.
 SECONDMATE_PROJECTS=
-if [ "$KIND" = secondmate ]; then
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  MODE=$RECORDED_MODE
+  YOLO=$RECORDED_YOLO
+elif [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
   SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
@@ -2042,6 +2847,18 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   fi
 fi
 
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    validate_direct_recovery_worktree_identity || exit 1
+  else
+    validate_direct_launch_worktree_identity || exit 1
+    capture_direct_launch_authoritative_state || {
+      echo "error: cannot record authoritative direct account worktree Git state for $ID" >&2
+      exit 1
+    }
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 lifecycle_lock_valid=0
@@ -2067,7 +2884,12 @@ if [ "$lifecycle_lock_valid" != 1 ]; then
   exit 1
 fi
 META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  direct_recovery_context_matches || {
+    echo "error: direct account task generation changed before metadata install for $ID" >&2
+    exit 1
+  }
+elif [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
     echo "error: managed task generation changed before metadata install for $ID" >&2
     exit 1
@@ -2077,6 +2899,12 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
 {
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || echo "worktree_git_dir=$WORKTREE_GIT_DIR"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || echo "worktree_git_dir_identity=$WORKTREE_GIT_DIR_IDENTITY"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_REF" ] || echo "worktree_git_ref=$WORKTREE_GIT_REF"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_HEAD" ] || echo "worktree_git_head=$WORKTREE_GIT_HEAD"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_SETUP_REF" ] || echo "worktree_git_setup_ref=$WORKTREE_GIT_SETUP_REF"
+  [ "$DIRECT_ACCOUNT_ROUTING" != 1 ] || [ -z "$WORKTREE_GIT_SETUP_HEAD" ] || echo "worktree_git_setup_head=$WORKTREE_GIT_SETUP_HEAD"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
@@ -2087,6 +2915,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
+  [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
       RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)
@@ -2196,6 +3025,12 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   esac
 fi
 AGENT_COMMAND=$HARNESS
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+  case "$HARNESS" in
+    claude) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+    codex) AGENT_COMMAND="CODEX_HOME=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+  esac
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   if [ "$RESUME_ACCOUNT" = 1 ]; then
     rm -rf "$STATE/.$ID.account-native-launch" "$STATE/.$ID.account-native-ready" "$STATE/.$ID.account-native-go" || exit 1
@@ -2324,4 +3159,6 @@ discard_existing_artifact_backup
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
 
-echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+account_summary=
+[ -z "$DIRECT_ACCOUNT_HOME" ] || account_summary=" account_home=$DIRECT_ACCOUNT_HOME"
+echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT$account_summary"

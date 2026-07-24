@@ -628,7 +628,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
     FM_FAKE_TMUX_GATE_SEND_MARKER="$marker" \
     FM_FAKE_TMUX_GATE_SEND_RELEASE="$release" \
     FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
-    run_spawn "$id" "$PROJ_DIR" > "$out_file" &
+    run_spawn "$id" "$PROJ_DIR" > "$out_file" 2>&1 &
   spawn_pid=$!
   for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
   [ -f "$marker" ] \

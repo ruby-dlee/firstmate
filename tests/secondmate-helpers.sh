@@ -70,9 +70,9 @@ SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
-printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
 case "${1:-}" in
   get)
+    printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
     # Durable lease: print only the worktree path to stdout (banners to stderr),
     # and record the lease holder so tests can assert it is set and later cleared.
     shift
@@ -94,6 +94,12 @@ case "${1:-}" in
     exit 0
     ;;
   return)
+    if [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
+      [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
+      lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
+      kill -0 "$lock_pid" 2>/dev/null || exit 92
+      [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] || touch "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
+    fi
     shift
     target=
     while [ $# -gt 0 ]; do
@@ -103,6 +109,10 @@ case "${1:-}" in
       esac
       shift
     done
+    case "$target" in
+      .|/dev/fd/*) target=$(cd "$target" && pwd -P) || exit 18 ;;
+    esac
+    printf 'treehouse return --force %s\n' "$target" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
     [ -z "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-}" ] || exit 17
     [ -n "${FM_FAKE_TREEHOUSE_LEASE_FILE:-}" ] && rm -f "$FM_FAKE_TREEHOUSE_LEASE_FILE"
     [ -n "$target" ] && rm -rf -- "$target"

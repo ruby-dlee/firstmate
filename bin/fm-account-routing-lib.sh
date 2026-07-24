@@ -29,6 +29,10 @@
 # them when the selection-specific override is unset. Other control calls keep
 # the 10s FM_ACCOUNT_CONTROL_TIMEOUT default.
 
+FM_ACCOUNT_ROUTING_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-checkout-lock-lib.sh
+. "$FM_ACCOUNT_ROUTING_LIB_DIR/fm-checkout-lock-lib.sh"
+
 # Security-sensitive control-plane helpers never resolve utilities through the
 # caller's PATH. Test/lab mode may still supply fake timeout runners, but path,
 # ownership, process, hashing, and passwd-home checks use only fixed system
@@ -956,6 +960,95 @@ fm_account_lifecycle_lock_acquire() {  # <state-dir> <task>
   fm_account_lock_acquire "$1" "$2" account-lifecycle "account lifecycle" "${FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS:-10}"
 }
 
+fm_account_stable_path_key() {
+  fm_checkout_stable_path_key "$1" "$2" 1 24
+}
+
+fm_secondmate_home_lifecycle_lock_acquire() {
+  local state_base=$1 home=$2 key
+  key=$(fm_account_stable_path_key "$home" directory) || {
+    echo "error: secondmate home lifecycle target is unsafe or its lock identity is unavailable: $home" >&2
+    return 1
+  }
+  fm_account_lock_acquire "$state_base/secondmate-home-lifecycle" "home-$key" \
+    secondmate-home-lifecycle "secondmate home lifecycle" "${FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS:-10}"
+}
+
+fm_secondmate_registry_lock_acquire() {
+  local state_base=$1 registry=$2 key
+  key=$(fm_account_stable_path_key "$registry" file) || {
+    echo "error: secondmate registry lock identity is unavailable: $registry" >&2
+    return 1
+  }
+  fm_account_lock_acquire "$state_base/secondmate-registry" "registry-$key" \
+    secondmate-registry "secondmate registry" "${FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS:-10}"
+}
+
+fm_secondmate_registry_query() {
+  local registry=$1 mode=${2:-validate} expected_id=${3:-} key=${4:-}
+  fm_account_system_perl -MErrno=ENOENT -e '
+    my ($registry, $mode, $expected_id, $key) = @ARGV;
+    if (!lstat($registry)) {
+      exit 0 if $! == ENOENT && ($mode eq q{validate} || $mode eq q{list});
+      exit 1;
+    }
+    exit 1 if -l _ || !-f _ || !-r _;
+    open my $fh, q{<}, $registry or exit 1;
+    my @entries;
+    my $line_number = 0;
+    while (my $line = <$fh>) {
+      ++$line_number;
+      next if $line =~ /^\s*$/ || $line =~ /^#/;
+      exit 1 if $line !~ /^- /;
+      chomp $line;
+      my ($id, $summary, $home, $scope, $projects, $added) =
+        $line =~ /^- ([A-Za-z0-9][A-Za-z0-9._-]*) - (.+) \(home: ([^;]+); scope: ([^;]+); projects: ([^;]*); added ([0-9]{4}-[0-9]{2}-[0-9]{2})\)$/;
+      exit 1 if !defined($id) || $summary eq q{} || $scope eq q{};
+      exit 1 if $home !~ m{^/} || $home =~ /[\0\t\r\n]/ || $home =~ m{(?:^|/)\.\.?($|/)};
+      exit 1 if $projects ne q{} && $projects !~ /^[A-Za-z0-9][A-Za-z0-9._-]*(?:, [A-Za-z0-9][A-Za-z0-9._-]*)*$/;
+      my $current = q{};
+      for my $component (grep { $_ ne q{} } split m{/+}, $home) {
+        $current .= q{/} . $component;
+        lstat($current) or exit 1;
+        exit 1 if -l _;
+      }
+      exit 1 if !-d $home;
+      my @identity = stat($home);
+      exit 1 if !@identity;
+      push @entries, [$id, $home, $projects, "$identity[0]:$identity[1]"];
+    }
+    my (%ids, %homes);
+    for my $index (0 .. $#entries) {
+      my $entry = $entries[$index];
+      exit 1 if $ids{$entry->[0]}++ || exists $homes{$entry->[3]};
+      $homes{$entry->[3]} = $entry->[0];
+      for my $prior_index (0 .. $index - 1) {
+        my $prior = $entries[$prior_index];
+        exit 1 if index($entry->[1], $prior->[1] . q{/}) == 0;
+        exit 1 if index($prior->[1], $entry->[1] . q{/}) == 0;
+      }
+    }
+    if ($mode eq q{validate}) {
+      exit 0;
+    }
+    if ($mode eq q{list}) {
+      for my $entry (@entries) {
+        print join(qq{\t}, $entry->[0], $entry->[1], $entry->[2]), qq{\n};
+      }
+      exit 0;
+    }
+    my @matches = grep { $_->[0] eq $expected_id } @entries;
+    exit 1 if @matches != 1;
+    if ($key eq q{home}) {
+      print $matches[0]->[1];
+    } elsif ($key eq q{projects}) {
+      print $matches[0]->[2];
+    } else {
+      exit 1;
+    }
+  ' "$registry" "$mode" "$expected_id" "$key"
+}
+
 fm_account_lifecycle_lock_owned() {  # <lock-path>
   fm_account_reclaim_guard_owned "$1"
 }
@@ -1010,7 +1103,7 @@ fm_account_safe_lineage_value() {
 
 fm_account_meta_key_owned() {  # <key>
   case "$1" in
-    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|orca_cleanup_pending|orca_cleanup_phase|orca_terminal_proof|orca_repo_id|orca_expected_task|orca_provider_task|orca_discovery_label|orca_provider_scope|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -17,9 +17,10 @@
 # auto-detection (report.md's Open Question #2: start with a dedicated
 # background session for predictability, unlike tmux's/herdr's ambient-session
 # reuse); see report.md's "Zellij Backend" section and docs/zellij-backend.md
-# for its empirical basis. P4 added Orca lifecycle support with Orca owning
-# both the task worktree and terminal endpoint; new report-required tasks now
-# refuse Orca, while eligible pre-cutover tasks may still respawn there.
+# for its empirical basis. P4 added an Orca lifecycle design with Orca owning
+# both the task worktree and terminal endpoint. New report-required tasks refuse
+# Orca, and legacy lifecycle mutation now also fails closed until provider
+# authority is empirically verified.
 # P5 adds bin/backends/cmux.sh, also
 # EXPERIMENTAL and spawn-capable, behind `--backend cmux`/`FM_BACKEND=cmux`/
 # `config/backend`, and behind runtime auto-detection when firstmate itself is
@@ -36,8 +37,8 @@
 # `backend=tmux` for a default-backend task, so existing and newly spawned
 # default-path metas stay byte-identical. Only a task spawned on a non-tmux
 # spawn-capable backend, currently experimental herdr, zellij, or cmux,
-# carries an explicit `backend=` line; an eligible legacy Orca respawn also
-# carries `backend=orca`.
+# carries an explicit `backend=` line; retained legacy Orca metadata carries
+# `backend=orca`.
 #
 # Event-source framing (herdr-addendum "Events as the core abstraction"): a
 # backend's supervision surface is conceptually an EVENT SOURCE - it produces
@@ -310,7 +311,8 @@ fm_backend_validate_spawn() {  # <name>
 #   - jq, for the JSON-emitting experimental adapters (herdr, zellij, cmux) whose
 #     spawn/liveness paths parse the backend's JSON output (see each adapter's
 #     tool check, e.g. fm_backend_herdr_tool_check);
-#   - nohup and perl, for Herdr's portable detached setsid server launcher;
+#   - nohup for Herdr's portable detached setsid server launcher, which also
+#     consumes the universal Perl runtime;
 #   - the treehouse worktree provider for every session-provider-only backend
 #     (tmux, herdr, zellij, cmux); orca owns its own task worktree and terminal,
 #     so it drops both treehouse and any other backend's session CLI.
@@ -319,7 +321,7 @@ fm_backend_validate_spawn() {  # <name>
 fm_backend_required_tools() {  # <backend>
   case "$1" in
     tmux)   printf '%s' 'tmux treehouse' ;;
-    herdr)  printf '%s' 'herdr jq nohup perl treehouse' ;;
+    herdr)  printf '%s' 'herdr jq nohup treehouse' ;;
     zellij) printf '%s' 'zellij jq treehouse' ;;
     cmux)   printf '%s' 'cmux jq treehouse' ;;
     orca)   printf '%s' 'orca' ;;
@@ -363,6 +365,7 @@ fm_backend_target_of_meta() {  # <meta-file>
   if [ "$backend" = orca ]; then
     terminal=$(fm_meta_get "$meta" terminal)
     [ -n "$terminal" ] && { printf '%s' "$terminal"; return 0; }
+    return 0
   elif [ "$backend" = tmux ]; then
     tmux_window_id=$(fm_meta_get "$meta" tmux_window_id)
     [ -n "$tmux_window_id" ] && { printf '%s' "$tmux_window_id"; return 0; }
@@ -607,12 +610,42 @@ fm_backend_remove_worktree() {  # <backend> <worktree-id>
   esac
 }
 
+fm_backend_remove_worktree_bound() {  # <backend> <worktree-id> <expected-path> <boundary-token>
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    orca) fm_backend_orca_remove_worktree_bound "$@" ;;
+    *) echo "error: backend '$backend' does not own task worktrees" >&2; return 1 ;;
+  esac
+}
+
 fm_backend_worktree_path() {  # <backend> <worktree-id>
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
     orca) fm_backend_orca_worktree_path "$@" ;;
+    *) echo "error: backend '$backend' does not own task worktrees" >&2; return 1 ;;
+  esac
+}
+
+fm_backend_quiesce_terminal() {  # <backend> <terminal-id> [expected-worktree-id] [expected-label]
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    orca) fm_backend_orca_quiesce_terminal "$@" ;;
+    *) echo "error: backend '$backend' has no authoritative terminal-quiescence operation" >&2; return 1 ;;
+  esac
+}
+
+fm_backend_quiesce_worktree_terminals() {  # <backend> <worktree-id> <expected-label>
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    orca) fm_backend_orca_quiesce_worktree_terminals "$@" ;;
     *) echo "error: backend '$backend' does not own task worktrees" >&2; return 1 ;;
   esac
 }
@@ -733,6 +766,11 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
   local workspace surface workspaces workspace_record title_record title_count expected_title resolved_workspace
   session=
   [ -n "$target" ] || { printf 'unknown'; return 0; }
+  if [ "$backend" = orca ]; then
+    fm_backend_source orca >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+    fm_backend_orca_terminal_state "$target" "$recorded_scoped_target" "$expected_label"
+    return 0
+  fi
   if fm_backend_target_exists "$backend" "$target" "$expected_label" "$recorded_scoped_target" 2>/dev/null; then
     printf 'present'
     return 0

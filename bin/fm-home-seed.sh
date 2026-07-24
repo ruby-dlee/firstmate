@@ -4,11 +4,18 @@
 # Usage:
 #   fm-home-seed.sh <id> <home|-> {<project>...|--no-projects}
 #       Provision <home> as an isolated firstmate home. If <home> is "-", acquire
-#       a fresh firstmate worktree via "treehouse get --lease", which durably
-#       leases the worktree under the secondmate <id> so the home survives with
-#       no live process and is never recycled until the lease is released with
-#       "treehouse return". Projects are cloned
-#       from the active home into the secondmate home's projects/ directory.
+#       a fresh firstmate worktree through the shared locked, bounded
+#       "treehouse get --lease" entrypoint, which durably leases the worktree
+#       under the secondmate <id> so the home survives with no live process and
+#       is never recycled until the lease is released with "treehouse return".
+#       The acquired home is accepted only when its HEAD
+#       belongs to the Firstmate repository, is clean, and matches the live
+#       upstream default-branch tip. An unsafe or unverifiable acquired home is
+#       retained without force-return so its unlanded work remains untouched.
+#       An explicit home must pass the same live-tip proof after its safe
+#       fast-forward, and a failed proof aborts the transactional seed.
+#       Projects are cloned from the active home into the secondmate home's
+#       projects/ directory.
 #       That project list is non-exclusive provisioning data. Pass --no-projects
 #       instead of a project list to seed a project-less home for a domain whose
 #       subject is the firstmate repo itself; it is mutually exclusive with a
@@ -20,8 +27,10 @@
 #       data/secondmates.md is updated.
 #       Seeding is transactional: on validation, clone, init, or registry failure,
 #       generated briefs, new homes, new project clones, and registry edits are
-#       rolled back. Treehouse-acquired homes are returned only when the rollback
-#       target is safe; a failed return warns because the lease may still be held.
+#       rolled back. Clean Treehouse-acquired homes are returned only when the
+#       rollback target, repository identity, and expected detached tip are
+#       re-proven, and the return holds the common checkout mutation lock; a
+#       failed return warns because the lease may still be held.
 #       Set FM_SECONDMATE_CHARTER='<charter>' to seed from inline charter text
 #       when no filled charter brief exists. Set FM_SECONDMATE_SCOPE='<scope>'
 #       to override the registry routing scope. Otherwise the registry summary
@@ -36,8 +45,14 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
+CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh}"
 REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
+# shellcheck source=bin/fm-checkout-lock-lib.sh
+. "$SCRIPT_DIR/fm-checkout-lock-lib.sh"
+CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
@@ -228,76 +243,10 @@ registry_id_conflict_for_assignment() {
 }
 
 validate_registry() {
-  local tmp line id registered_home home_key duplicate_homes duplicate_ids overlaps
-  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-firstmates.XXXXXX")
-  if [ -f "$REG" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        "- "*)
-          id=${line#- }
-          id=${id%% *}
-          registered_home=$(printf '%s\n' "$line" | registry_home_for_line)
-          [ -n "$registered_home" ] || continue
-          home_key=$(resolved_path "$registered_home")
-          printf '%s\t%s\n' "$home_key" "$id" >> "$tmp"
-          ;;
-      esac
-    done < "$REG"
-  fi
-  duplicate_homes=$(awk -F '\t' '
-    {
-      if (($1 in owner) && owner[$1] != $2) {
-        print $1 ": " owner[$1] ", " $2
-        bad=1
-      } else {
-        owner[$1]=$2
-      }
-    }
-    END { exit bad ? 1 : 0 }
-  ' "$tmp" 2>/dev/null) || {
-    rm -f "$tmp"
-    printf 'error: duplicate secondmate home assignment:\n%s\n' "$duplicate_homes" >&2
+  fm_secondmate_registry_query "$REG" validate || {
+    echo "error: secondmate registry is malformed, duplicated, redirected, or uninspectable: $REG" >&2
     return 1
   }
-  duplicate_ids=$(awk -F '\t' '
-    {
-      if ($2 in home) {
-        print $2 ": " home[$2] ", " $1
-        bad=1
-      } else {
-        home[$2]=$1
-      }
-    }
-    END { exit bad ? 1 : 0 }
-  ' "$tmp" 2>/dev/null) || {
-    rm -f "$tmp"
-    printf 'error: duplicate secondmate id assignment:\n%s\n' "$duplicate_ids" >&2
-    return 1
-  }
-  overlaps=$(awk -F '\t' '
-    function ancestor(a, b) { return a != b && index(b, a "/") == 1 }
-    {
-      for (i = 1; i <= count; i++) {
-        if (ancestor($1, path[i])) {
-          print $1 " (" $2 ") contains " path[i] " (" id[i] ")"
-          bad=1
-        } else if (ancestor(path[i], $1)) {
-          print path[i] " (" id[i] ") contains " $1 " (" $2 ")"
-          bad=1
-        }
-      }
-      count++
-      path[count]=$1
-      id[count]=$2
-    }
-    END { exit bad ? 1 : 0 }
-  ' "$tmp" 2>/dev/null) || {
-    rm -f "$tmp"
-    printf 'error: overlapping secondmate home assignment:\n%s\n' "$overlaps" >&2
-    return 1
-  }
-  rm -f "$tmp"
-  return 0
 }
 
 join_projects() {
@@ -473,7 +422,7 @@ acquire_treehouse_home() {
   # live process and is skipped by later get/prune, so the home survives restarts
   # until teardown or rollback returns it. treehouse prints only the worktree path
   # to stdout (banners go to stderr), so command substitution captures the path.
-  home=$(cd "$FM_ROOT" && treehouse get --lease --lease-holder "$id") || {
+  home=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$FM_ROOT" "$id") || {
     echo "error: treehouse get --lease failed to lease a firstmate home" >&2
     return 1
   }
@@ -584,6 +533,8 @@ SEED_ROLLBACK_ACTIVE=0
 SEED_COMMITTED=0
 SEED_HOME=
 SEED_HOME_ACQUIRED=0
+SEED_HOME_RETAINED=0
+SEED_HOME_EXPECTED_TIP=
 SEED_HOME_CREATED=0
 SEED_HOME_BACKED_UP=0
 SEED_BACKUP_DIR=
@@ -595,6 +546,8 @@ SEED_PARENT_BRIEF_DIR_CREATED=0
 SEED_SUB_REG_EXISTED=0
 SEED_CHARTER_EXISTED=0
 SEED_MARKER_EXISTED=0
+SEED_HOME_LIFECYCLE_LOCK=
+SEED_PARENT_HOME_LIFECYCLE_LOCK=
 
 restore_seed_file() {
   local existed=$1 backup=$2 path=$3
@@ -643,11 +596,16 @@ seed_rollback_target() {
 seed_return_treehouse_home() {
   local home=$1 abs_home
   abs_home=$(seed_rollback_target "$home" "treehouse-acquired home") || return 0
+  if [ -z "$SEED_HOME_EXPECTED_TIP" ] \
+    || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$abs_home" "$FM_ROOT" "$SEED_HOME_EXPECTED_TIP"; then
+    echo "warning: retaining unsafe treehouse-acquired home $abs_home because repository identity and its expected detached tip could not be re-proven" >&2
+    return 0
+  fi
   if ! command -v treehouse >/dev/null 2>&1; then
     echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; treehouse command not found" >&2
     return 0
   fi
-  ( cd "$FM_ROOT" && treehouse return --force "$abs_home" >/dev/null ) || {
+  fm_checkout_treehouse_return "$abs_home" "$CHECKOUT_LOCK_ROOT" "$FM_ROOT" >/dev/null || {
     echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; lease may still be held" >&2
     return 0
   }
@@ -702,7 +660,11 @@ seed_rollback() {
 
   if [ -n "${SEED_HOME:-}" ] && [ "$SEED_HOME" != "/" ]; then
     if [ "$SEED_HOME_ACQUIRED" = 1 ]; then
-      seed_return_treehouse_home "$SEED_HOME"
+      if [ "$SEED_HOME_RETAINED" = 1 ]; then
+        echo "warning: retaining unsafe treehouse-acquired home $SEED_HOME for manual recovery" >&2
+      else
+        seed_return_treehouse_home "$SEED_HOME"
+      fi
     elif [ "$SEED_HOME_CREATED" = 1 ]; then
       seed_remove_created_home "$SEED_HOME"
     else
@@ -721,9 +683,24 @@ seed_rollback() {
   fi
 
   if [ -n "${SEED_BACKUP_DIR:-}" ]; then
-    restore_seed_file "$SEED_PARENT_REG_EXISTED" "$SEED_BACKUP_DIR/parent-secondmates.md" "$REG"
     rm -rf -- "$SEED_BACKUP_DIR" 2>/dev/null || true
   fi
+}
+
+seed_release_locks() {
+  if [ -n "${SEED_HOME_LIFECYCLE_LOCK:-}" ]; then
+    fm_account_lifecycle_lock_release "$SEED_HOME_LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+    SEED_HOME_LIFECYCLE_LOCK=
+  fi
+  if [ -n "${SEED_PARENT_HOME_LIFECYCLE_LOCK:-}" ]; then
+    fm_account_lifecycle_lock_release "$SEED_PARENT_HOME_LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+    SEED_PARENT_HOME_LIFECYCLE_LOCK=
+  fi
+}
+
+seed_exit_cleanup() {
+  seed_rollback
+  seed_release_locks
 }
 
 registry_line_for_project() {
@@ -796,22 +773,59 @@ initialize_no_mistakes_project() {
 }
 
 write_registry() {
-  local id=$1 home=$2 projects_csv=$3 brief=$4 scope summary tmp today
+  local id=$1 home=$2 projects_csv=$3 brief=$4 scope summary tmp today registry_lock status=1
   mkdir -p "$DATA"
   [ -d "$DATA" ] && [ ! -L "$DATA" ] || return 1
   scope=$(registry_scope_for_brief "$brief")
   summary=$(registry_summary_for_brief "$brief")
   today=$(date +%F)
-  if [ -L "$REG" ] || { [ -e "$REG" ] && [ ! -f "$REG" ]; }; then return 1; fi
-  tmp=$(mktemp "$DATA/.secondmates.XXXXXX") || return 1
+  registry_lock=$(fm_secondmate_registry_lock_acquire "$CHECKOUT_LOCK_ROOT" "$REG") || return 1
+  if [ -L "$REG" ] || { [ -e "$REG" ] && [ ! -f "$REG" ]; }; then
+    fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  validate_registry || {
+    fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  validate_home_assignment "$id" "$home" || {
+    fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  tmp=$(mktemp "$DATA/.secondmates.XXXXXX") || {
+    fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+    return 1
+  }
   if [ -f "$REG" ]; then
-    grep -vE "^- $id( |$)" "$REG" > "$tmp" || true
+    python3 - "$REG" "$tmp" "$id" <<'PY' || {
+import sys
+
+source, destination, expected = sys.argv[1:]
+with open(source, encoding="utf-8") as stream, open(destination, "w", encoding="utf-8") as output:
+    for line in stream:
+        if line.startswith("- "):
+            item = line[2:].split(None, 1)[0] if line[2:].strip() else ""
+            if item == expected:
+                continue
+        output.write(line)
+PY
+      rm -f "$tmp"
+      fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+      return 1
+    }
   else
     : > "$tmp"
   fi
   printf -- '- %s - %s (home: %s; scope: %s; projects: %s; added %s)\n' "$id" "$summary" "$home" "$scope" "$projects_csv" "$today" >> "$tmp"
-  if [ -L "$REG" ] || { [ -e "$REG" ] && [ ! -f "$REG" ]; }; then rm -f "$tmp"; return 1; fi
-  mv "$tmp" "$REG"
+  if ! { [ ! -L "$REG" ] && { [ ! -e "$REG" ] || [ -f "$REG" ]; }; }; then
+    rm -f "$tmp"
+  elif mv "$tmp" "$REG"; then
+    status=0
+  else
+    rm -f "$tmp"
+  fi
+  fm_account_lifecycle_lock_release "$registry_lock" >/dev/null 2>&1 || true
+  return "$status"
 }
 
 refuse_populated_projectless_home() {
@@ -902,8 +916,9 @@ seed_home() {
   SEED_COMMITTED=0
   SEED_HOME=
   SEED_HOME_ACQUIRED=0
+  SEED_HOME_RETAINED=0
+  SEED_HOME_EXPECTED_TIP=
   SEED_HOME_CREATED=0
-  SEED_HOME_ACQUIRED=0
   SEED_HOME_BACKED_UP=0
   SEED_BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-home-seed.XXXXXX")
   SEED_CREATED_PROJECTS_FILE="$SEED_BACKUP_DIR/created-projects"
@@ -915,24 +930,51 @@ seed_home() {
   SEED_SUB_REG_EXISTED=0
   SEED_CHARTER_EXISTED=0
   SEED_MARKER_EXISTED=0
-  trap seed_rollback EXIT
-  if [ -f "$REG" ]; then
-    SEED_PARENT_REG_EXISTED=1
-    cp "$REG" "$SEED_BACKUP_DIR/parent-secondmates.md"
+  trap seed_exit_cleanup EXIT
+  SEED_PARENT_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FM_HOME") || return 1
+  fm_checkout_trusted_dir "$FM_HOME" >/dev/null || {
+    echo "error: active firstmate home was removed or redirected while seed waited for lifecycle ownership" >&2
+    return 1
+  }
+  if [ -e "$FM_HOME/data/charter.md" ]; then
+    [ -f "$FM_HOME/$SUB_HOME_MARKER" ] && [ ! -L "$FM_HOME/$SUB_HOME_MARKER" ] || {
+      echo "error: active secondmate home changed while seed waited for lifecycle ownership" >&2
+      return 1
+    }
   fi
 
   if [ "$requested_home" = "-" ]; then
     SEED_HOME_ACQUIRED=1
     home=$(acquire_treehouse_home "$id")
     SEED_HOME="$home"
+    SEED_HOME_RETAINED=1
+    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home") || return 1
+    freshness_status=0
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$home" "$FM_ROOT" || freshness_status=$?
+    if [ "$freshness_status" -ne 0 ]; then
+      echo "error: refusing secondmate home acquired from a stale or unverifiable upstream default" >&2
+      return 1
+    fi
+    SEED_HOME_EXPECTED_TIP=$(git -C "$home" rev-parse HEAD) || return 1
+    SEED_HOME_RETAINED=0
     home=$(verify_firstmate_home "$home")
   else
     requested_abs=$(abs_path_for_new "$requested_home")
     refuse_active_home_path "$requested_abs" || return 1
+    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$requested_abs") || return 1
     validate_home_assignment "$id" "$requested_abs" || return 1
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$FM_ROOT" >/dev/null 2>&1 || true
     SEED_HOME="$requested_abs"
     [ -e "$requested_abs" ] || SEED_HOME_CREATED=1
     home=$(ensure_home "$id" "$requested_abs")
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$home" || {
+      echo "error: refusing explicit secondmate home whose default branch cannot be refreshed safely" >&2
+      return 1
+    }
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-home "$home" "$FM_ROOT" || {
+      echo "error: refusing explicit secondmate home whose live default-tip freshness cannot be proved" >&2
+      return 1
+    }
   fi
   SEED_HOME="$home"
   validate_registry_home_text "$home" || return 1
@@ -1007,11 +1049,11 @@ seed_home() {
 
   projects_csv=$(join_projects "$@")
   printf '%s\n' "$id" > "$home/$SUB_HOME_MARKER"
-  write_registry "$id" "$home" "$projects_csv" "$SEED_PARENT_BRIEF"
-  validate_registry
+  write_registry "$id" "$home" "$projects_csv" "$SEED_PARENT_BRIEF" || return 1
   SEED_COMMITTED=1
-  trap - EXIT
   rm -rf -- "$SEED_BACKUP_DIR"
+  seed_release_locks
+  trap - EXIT
   printf 'home=%s\n' "$home"
 }
 

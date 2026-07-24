@@ -10,7 +10,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
 | `fm-autocompact.sh`      | Bridge Claude context compaction through a durable anchor and session-start recovery |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
-| `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
+| `fm-checkout-refresh.sh` | Discover worktree seed checkouts, react to live upstream-default changes, surface untracked skill drafts, enforce the timed backstop, and manage the home-scoped scheduler |
+| `fm-fleet-sync.sh`       | Serialize live-default-proven project refreshes with safe fast-forwards, `STUCK:` reports, branch pruning, and orphaned-lock recovery |
 | `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
 | `fm-fleet-view.sh`       | Render the fleet snapshot as a human Markdown view                                   |
 | `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
@@ -61,6 +62,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
+| `fm-checkout-lock-lib.sh` | Shared common-Git-directory lock identity and ownership for checkout mutation       |
+| `fm-process-tree-lib.sh` | Shared bounded command runner that terminates and reaps complete process trees         |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, then assert watcher liveness                  |

@@ -13,6 +13,30 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-safety)
 export FM_BACKEND=tmux
 
+make_live_default_firstmate_worktree() {
+  local destination=$1 name=$2 remote remote_abs head source
+  remote="$TMP_ROOT/remotes/$name.git"
+  source="$TMP_ROOT/sources/$name"
+  mkdir -p "$TMP_ROOT/remotes"
+  git clone --quiet --bare "$ROOT" "$remote"
+  head=$(git -C "$ROOT" rev-parse HEAD)
+  git -C "$remote" update-ref refs/heads/main "$head"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
+  remote_abs=$(cd "$remote" && pwd -P)
+  mkdir -p "$TMP_ROOT/sources"
+  git clone --quiet "file://$remote_abs" "$source"
+  git -C "$source" worktree add --quiet --detach "$destination" main
+  printf '%s\n' "$source"
+}
+
+write_secondmate_registration() {
+  local home=$1 id=$2 target=$3 target_abs
+  mkdir -p "$home/data"
+  target_abs=$(cd "$target" && pwd -P) || return 1
+  printf -- '- %s - test domain (home: %s; scope: test domain; projects: ; added 2026-07-23)\n' \
+    "$id" "$target_abs" > "$home/data/secondmates.md"
+}
+
 
 test_fm_home_parameterization() {
   local brief home_one home_two out
@@ -117,7 +141,7 @@ EOF
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null 2>"$err"; then
     fail "registry validation accepted two secondmates with the same home"
   fi
-  grep -F 'duplicate secondmate home assignment' "$err" >/dev/null \
+  grep -F 'secondmate registry is malformed, duplicated, redirected, or uninspectable' "$err" >/dev/null \
     || fail "registry validation did not explain duplicate home assignment"
   pass "home seed validation rejects duplicate home routes"
 }
@@ -139,7 +163,7 @@ EOF
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null 2>"$err"; then
     fail "registry validation accepted two homes for the same secondmate id"
   fi
-  grep -F 'duplicate secondmate id assignment' "$err" >/dev/null \
+  grep -F 'secondmate registry is malformed, duplicated, redirected, or uninspectable' "$err" >/dev/null \
     || fail "registry validation did not explain duplicate id assignment"
   pass "home seed validation rejects duplicate id routes"
 }
@@ -161,26 +185,44 @@ EOF
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null 2>"$err"; then
     fail "registry validation accepted nested secondmate homes"
   fi
-  grep -F 'overlapping secondmate home assignment' "$err" >/dev/null \
+  grep -F 'secondmate registry is malformed, duplicated, redirected, or uninspectable' "$err" >/dev/null \
     || fail "registry validation did not explain nested home assignment"
   pass "home seed validation rejects nested home routes"
 }
 
+test_home_seed_validate_rejects_partial_registry_rows() {
+  local home registered err
+  home="$TMP_ROOT/partial-registry-home"
+  registered="$TMP_ROOT/partial-registry-target"
+  err="$TMP_ROOT/partial-registry.err"
+  mkdir -p "$home/data" "$registered"
+  printf '%s\n' "- partial - incomplete (home: $registered; scope: partial; added 2026-07-23)" \
+    > "$home/data/secondmates.md"
+
+  if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null 2>"$err"; then
+    fail "registry validation accepted an entry with a missing projects field"
+  fi
+  assert_grep 'secondmate registry is malformed, duplicated, redirected, or uninspectable' "$err" \
+    "partial registry row was not surfaced"
+  pass "home seed validation rejects partial registry rows"
+}
+
 test_home_seed_uses_treehouse_acquired_home() {
-  local home acquired acquired_abs fakebin log lease out
+  local home acquired acquired_abs fakebin log lease out source
   home="$TMP_ROOT/dash-home"
   acquired="$TMP_ROOT/dash-acquired-home"
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-alpha.git"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
-  git clone --quiet "$ROOT" "$acquired"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-firstmate)
   fakebin=$(make_fake_tmux "$TMP_ROOT/dash-fake")
   log="$TMP_ROOT/dash-fake/tmux.log"
   lease="$TMP_ROOT/dash-fake/lease"
 
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
     FM_FAKE_TREEHOUSE_LEASE_FILE="$lease" \
+    FM_ROOT_OVERRIDE="$source" \
     FM_SECONDMATE_CHARTER='dash acquired scope' FM_SECONDMATE_SCOPE='dash acquired scope' \
     "$ROOT/bin/fm-home-seed.sh" dash - alpha) \
     || fail "seed failed for a treehouse-acquired home"
@@ -196,8 +238,164 @@ test_home_seed_uses_treehouse_acquired_home() {
   pass "home seeding durably leases treehouse-acquired dash homes under the secondmate id"
 }
 
+test_home_seed_acquisition_honors_shared_checkout_lock() {
+  local home acquired fakebin log err source common key lock_root lock state_root
+  home="$TMP_ROOT/dash-lock-home"
+  acquired="$TMP_ROOT/dash-lock-acquired-home"
+  err="$TMP_ROOT/dash-lock.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-lock-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-lock-firstmate)
+  fakebin=$(make_fake_tmux "$TMP_ROOT/dash-lock-fake")
+  log="$TMP_ROOT/dash-lock-fake/tmux.log"
+  state_root="$TMP_ROOT/dash-lock-state"
+  lock_root="$TMP_ROOT/dash-lock-locks"
+  common=$(git -C "$source" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$source/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  lock="$lock_root/$key.lock"
+  mkdir -p "$lock" "$state_root"
+  printf '%s\n' "$$" > "$lock/pid"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" \
+    FM_FAKE_TMUX_LOG="$log" FM_ROOT_OVERRIDE="$source" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$state_root" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_SECONDMATE_CHARTER='dash lock scope' FM_SECONDMATE_SCOPE='dash lock scope' \
+    "$ROOT/bin/fm-home-seed.sh" dash-lock - alpha >/dev/null 2>"$err"; then
+    fail "secondmate acquisition bypassed the shared checkout lock"
+  fi
+
+  grep -F "Treehouse acquisition already running for $source (pid $$)" "$err" >/dev/null \
+    || fail "secondmate acquisition did not surface shared-lock contention"
+  if [ -f "$log" ] && grep -F 'treehouse get' "$log" >/dev/null; then
+    fail "secondmate acquisition invoked Treehouse while the shared lock was held"
+  fi
+  pass "secondmate acquisition uses the common locked entrypoint"
+}
+
+test_home_seed_rejects_stale_treehouse_acquired_home() {
+  local home acquired acquired_abs fakebin log err source before
+  home="$TMP_ROOT/dash-stale-home"
+  acquired="$TMP_ROOT/dash-stale-acquired-home"
+  err="$TMP_ROOT/dash-stale.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-stale-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-stale-firstmate)
+  before=$(git -C "$acquired" rev-parse HEAD)
+  printf '%s\n' upstream > "$source/upstream.txt"
+  git -C "$source" add upstream.txt
+  git -C "$source" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm upstream
+  git -C "$source" push -q origin main
+  acquired_abs=$(cd "$acquired" && pwd -P)
+  fakebin=$(make_fake_tmux "$TMP_ROOT/dash-stale-fake")
+  log="$TMP_ROOT/dash-stale-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
+    FM_ROOT_OVERRIDE="$source" \
+    FM_SECONDMATE_CHARTER='dash stale scope' FM_SECONDMATE_SCOPE='dash stale scope' \
+    "$ROOT/bin/fm-home-seed.sh" dash-stale - alpha >/dev/null 2>"$err"; then
+    fail "seed accepted a stale Treehouse-acquired secondmate home"
+  fi
+
+  grep -F 'acquired worktree is stale' "$err" >/dev/null \
+    || fail "stale secondmate-home refusal did not identify the upstream mismatch"
+  grep -F 'retaining unsafe treehouse-acquired home' "$err" >/dev/null \
+    || fail "stale secondmate-home refusal did not surface retain-only cleanup"
+  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
+    && fail "stale secondmate-home refusal force-returned an unverifiable lease"
+  [ -d "$acquired" ] || fail "stale secondmate-home refusal removed the acquired worktree"
+  [ "$(git -C "$acquired" rev-parse HEAD)" = "$before" ] \
+    || fail "stale secondmate-home refusal changed the acquired tip"
+  if [ -f "$home/data/secondmates.md" ] && grep -F -- '- dash-stale ' "$home/data/secondmates.md" >/dev/null; then
+    fail "stale secondmate-home refusal wrote a registry route"
+  fi
+  pass "stale secondmate acquisitions remain leased without destructive rollback"
+}
+
+test_home_seed_retains_dirty_treehouse_acquired_home() {
+  local home acquired acquired_abs fakebin log err source draft
+  home="$TMP_ROOT/dash-dirty-home"
+  acquired="$TMP_ROOT/dash-dirty-acquired-home"
+  err="$TMP_ROOT/dash-dirty.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-dirty-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-dirty-firstmate)
+  acquired_abs=$(cd "$acquired" && pwd -P)
+  draft="$acquired/.agents/skills/unlanded/SKILL.md"
+  mkdir -p "$(dirname "$draft")"
+  printf '%s\n' '# unlanded secondmate work' > "$draft"
+  rm "$acquired/AGENTS.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/dash-dirty-fake")
+  log="$TMP_ROOT/dash-dirty-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
+    FM_ROOT_OVERRIDE="$source" \
+    FM_SECONDMATE_CHARTER='dash dirty scope' FM_SECONDMATE_SCOPE='dash dirty scope' \
+    "$ROOT/bin/fm-home-seed.sh" dash-dirty - alpha >/dev/null 2>"$err"; then
+    fail "seed accepted a dirty Treehouse-acquired secondmate home"
+  fi
+
+  grep -F 'acquired worktree is dirty' "$err" >/dev/null \
+    || fail "dirty secondmate-home refusal did not identify the unlanded work"
+  grep -F 'retaining unsafe treehouse-acquired home' "$err" >/dev/null \
+    || fail "dirty secondmate-home refusal did not surface retain-only cleanup"
+  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
+    && fail "dirty secondmate-home refusal used destructive Treehouse return"
+  [ -d "$acquired" ] || fail "dirty secondmate-home refusal removed the acquired worktree"
+  grep -Fq '# unlanded secondmate work' "$draft" \
+    || fail "dirty secondmate-home refusal changed its draft"
+  [ ! -e "$acquired/AGENTS.md" ] \
+    || fail "dirty secondmate-home refusal restored or rewrote its tracked deletion"
+  if [ -f "$home/data/secondmates.md" ] && grep -F -- '- dash-dirty ' "$home/data/secondmates.md" >/dev/null; then
+    fail "dirty secondmate-home refusal wrote a registry route"
+  fi
+  pass "dirty secondmate acquisitions are retained untouched for recovery"
+}
+
+test_home_seed_retains_repository_mismatch_acquisition() {
+  local home expected_acquired acquired expected_source fakebin log err acquired_abs
+  home="$TMP_ROOT/dash-mismatch-home"
+  expected_acquired="$TMP_ROOT/dash-mismatch-expected-worktree"
+  acquired="$TMP_ROOT/dash-mismatch-acquired-home"
+  err="$TMP_ROOT/dash-mismatch.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-mismatch-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  expected_source=$(make_live_default_firstmate_worktree "$expected_acquired" dash-mismatch-expected)
+  make_live_default_firstmate_worktree "$acquired" dash-mismatch-unrelated >/dev/null
+  acquired_abs=$(cd "$acquired" && pwd -P)
+  fakebin=$(make_fake_tmux "$TMP_ROOT/dash-mismatch-fake")
+  log="$TMP_ROOT/dash-mismatch-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
+    FM_ROOT_OVERRIDE="$expected_source" \
+    FM_SECONDMATE_CHARTER='dash mismatch scope' FM_SECONDMATE_SCOPE='dash mismatch scope' \
+    "$ROOT/bin/fm-home-seed.sh" dash-mismatch - alpha >/dev/null 2>"$err"; then
+    fail "seed accepted an acquired home from an unrelated repository"
+  fi
+
+  grep -F 'acquired worktree repository mismatch' "$err" >/dev/null \
+    || fail "repository-mismatch acquisition was not diagnosed"
+  grep -F 'retaining unsafe treehouse-acquired home' "$err" >/dev/null \
+    || fail "repository-mismatch acquisition did not surface retain-only cleanup"
+  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
+    && fail "repository-mismatch acquisition was force-returned"
+  [ -d "$acquired" ] || fail "repository-mismatch acquisition was removed"
+  pass "repository-mismatch secondmate acquisitions remain durably retained"
+}
+
 test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
-  local home acquired acquired_abs fakebin log err
+  local home acquired acquired_abs fakebin log err source common key lock_root expected_lock lock_marker
   home="$TMP_ROOT/dash-fail-home"
   acquired="$TMP_ROOT/dash-fail-acquired-home"
   err="$TMP_ROOT/dash-fail.err"
@@ -205,13 +403,23 @@ test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-fail-alpha.git"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
-  git clone --quiet "$ROOT" "$acquired"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-fail-firstmate)
   acquired_abs=$(cd "$acquired" && pwd -P)
+  common=$(git -C "$acquired" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$acquired/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  lock_root="$TMP_ROOT/dash-fail-locks"
+  expected_lock="$lock_root/$key.lock"
+  lock_marker="$TMP_ROOT/dash-fail-return-held-lock"
   printf 'other\n' > "$acquired/.fm-secondmate-home"
   fakebin=$(make_fake_tmux "$TMP_ROOT/dash-fail-fake")
   log="$TMP_ROOT/dash-fail-fake/tmux.log"
 
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_EXPECT_CHECKOUT_LOCK="$expected_lock" FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
+    FM_ROOT_OVERRIDE="$source" \
     FM_SECONDMATE_CHARTER='dash acquired scope' FM_SECONDMATE_SCOPE='dash acquired scope' \
     "$ROOT/bin/fm-home-seed.sh" dash - alpha >/dev/null 2>"$err"; then
     fail "seed reused an acquired home marked for another secondmate"
@@ -219,6 +427,8 @@ test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
   grep -F 'already marked for other' "$err" >/dev/null || fail "seed did not explain acquired marked-home rejection"
   grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
     || fail "failed acquired seed did not return the home through treehouse"
+  [ -f "$lock_marker" ] \
+    || fail "secondmate rollback did not hold the common checkout lock during Treehouse return"
   if [ -f "$home/data/secondmates.md" ] && grep -F -- '- dash ' "$home/data/secondmates.md" >/dev/null; then
     fail "failed acquired seed left a registry route"
   fi
@@ -226,7 +436,7 @@ test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
 }
 
 test_home_seed_warns_when_acquired_home_return_fails() {
-  local home acquired acquired_abs fakebin log err lease
+  local home acquired acquired_abs fakebin log err lease source
   home="$TMP_ROOT/dash-return-fail-home"
   acquired="$TMP_ROOT/dash-return-fail-acquired-home"
   err="$TMP_ROOT/dash-return-fail.err"
@@ -234,7 +444,7 @@ test_home_seed_warns_when_acquired_home_return_fails() {
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-return-fail-alpha.git"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
-  git clone --quiet "$ROOT" "$acquired"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-return-fail-firstmate)
   acquired_abs=$(cd "$acquired" && pwd -P)
   printf 'other\n' > "$acquired/.fm-secondmate-home"
   fakebin=$(make_fake_tmux "$TMP_ROOT/dash-return-fail-fake")
@@ -243,6 +453,7 @@ test_home_seed_warns_when_acquired_home_return_fails() {
 
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" FM_FAKE_TMUX_LOG="$log" \
     FM_FAKE_TREEHOUSE_LEASE_FILE="$lease" FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
+    FM_ROOT_OVERRIDE="$source" \
     FM_SECONDMATE_CHARTER='dash acquired scope' FM_SECONDMATE_SCOPE='dash acquired scope' \
     "$ROOT/bin/fm-home-seed.sh" dash - alpha >/dev/null 2>"$err"; then
     fail "seed reused an acquired home after return failure setup"
@@ -435,6 +646,131 @@ test_home_seed_no_projects_end_to_end() {
   proj_val=$(grep '^projects=' "$meta" | head -1 | cut -d= -f2-)
   [ -z "$proj_val" ] || fail "project-less spawn recorded a non-empty projects meta: '$proj_val'"
   pass "home seeding scaffolds, registers, and spawns a project-less home end to end"
+}
+
+test_home_seed_serializes_with_home_retirement() {
+  local home sub registry_sub state holder_pid waited status
+  home="$TMP_ROOT/seed-retirement-home"
+  sub="$TMP_ROOT/seed-retirement-subhome"
+  state="$TMP_ROOT/seed-retirement-state"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    lock=$(fm_secondmate_home_lifecycle_lock_acquire "$2/locks" "$3") || exit 1
+    : > "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    fm_account_lifecycle_lock_release "$lock"
+  ' _ "$ROOT" "$state" "$sub" "$TMP_ROOT/seed-retirement-ready" "$TMP_ROOT/seed-retirement-release" &
+  holder_pid=$!
+  waited=0
+  while [ ! -f "$TMP_ROOT/seed-retirement-ready" ] && [ "$waited" -lt 200 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -f "$TMP_ROOT/seed-retirement-ready" ] || {
+    : > "$TMP_ROOT/seed-retirement-release"
+    wait "$holder_pid" || true
+    fail "home lifecycle lock holder did not start"
+  }
+  set +e
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='serialized firstmate domain' \
+    FM_SECONDMATE_SCOPE='serialized firstmate work' \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$state" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    "$ROOT/bin/fm-home-seed.sh" serialized "$sub" --no-projects \
+      > "$TMP_ROOT/seed-retirement.out" 2> "$TMP_ROOT/seed-retirement.err"
+  status=$?
+  set -e
+  : > "$TMP_ROOT/seed-retirement-release"
+  wait "$holder_pid" || fail "home lifecycle lock holder failed to release"
+  [ "$status" -ne 0 ] || fail "home seed ignored concurrent retirement ownership"
+  assert_contains "$(cat "$TMP_ROOT/seed-retirement.err")" "secondmate home lifecycle lock" \
+    "home seed lifecycle contention was not surfaced"
+  assert_absent "$sub" "blocked home seed created a retiring home"
+  if [ -f "$home/data/secondmates.md" ]; then
+    assert_no_grep '^- serialized ' "$home/data/secondmates.md" \
+      "blocked home seed registered a retiring home"
+  fi
+  registry_sub="$TMP_ROOT/seed-registry-subhome"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    lock=$(fm_secondmate_registry_lock_acquire "$2/locks" "$3") || exit 1
+    : > "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    fm_account_lifecycle_lock_release "$lock"
+  ' _ "$ROOT" "$state" "$home/data/secondmates.md" \
+    "$TMP_ROOT/seed-registry-ready" "$TMP_ROOT/seed-registry-release" &
+  holder_pid=$!
+  waited=0
+  while [ ! -f "$TMP_ROOT/seed-registry-ready" ] && [ "$waited" -lt 200 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -f "$TMP_ROOT/seed-registry-ready" ] || {
+    : > "$TMP_ROOT/seed-registry-release"
+    wait "$holder_pid" || true
+    fail "registry lifecycle lock holder did not start"
+  }
+  set +e
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='serialized registry domain' \
+    FM_SECONDMATE_SCOPE='serialized registry work' \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$state" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    "$ROOT/bin/fm-home-seed.sh" registrylocked "$registry_sub" --no-projects \
+      > "$TMP_ROOT/seed-registry.out" 2> "$TMP_ROOT/seed-registry.err"
+  status=$?
+  set -e
+  : > "$TMP_ROOT/seed-registry-release"
+  wait "$holder_pid" || fail "registry lifecycle lock holder failed to release"
+  [ "$status" -ne 0 ] || fail "home seed ignored concurrent registry ownership"
+  assert_absent "$registry_sub" "registry-locked seed retained a partially provisioned home"
+  if [ -f "$home/data/secondmates.md" ]; then
+    assert_no_grep '^- registrylocked ' "$home/data/secondmates.md" \
+      "registry-locked seed overwrote the shared registry"
+  fi
+  pass "secondmate home seeding serializes with retirement and registry updates"
+}
+
+test_home_seed_requires_parent_lifecycle_authority() {
+  local home sub state holder_pid waited status
+  home="$TMP_ROOT/parent-seed-lock-home"
+  sub="$TMP_ROOT/parent-seed-lock-subhome"
+  state="$TMP_ROOT/parent-seed-lock-state"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  bash -c '
+    . "$1/bin/fm-account-routing-lib.sh"
+    lock=$(fm_secondmate_home_lifecycle_lock_acquire "$2/locks" "$3") || exit 1
+    : > "$4"
+    while [ ! -f "$5" ]; do sleep 0.05; done
+    fm_account_lifecycle_lock_release "$lock"
+  ' _ "$ROOT" "$state" "$home" "$TMP_ROOT/parent-seed-lock-ready" "$TMP_ROOT/parent-seed-lock-release" &
+  holder_pid=$!
+  waited=0
+  while [ ! -f "$TMP_ROOT/parent-seed-lock-ready" ] && [ "$waited" -lt 200 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -f "$TMP_ROOT/parent-seed-lock-ready" ] || {
+    : > "$TMP_ROOT/parent-seed-lock-release"
+    wait "$holder_pid" || true
+    fail "parent home lifecycle lock holder did not start"
+  }
+  set +e
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='nested seed domain' \
+    FM_SECONDMATE_SCOPE='nested seed work' \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$state" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    "$ROOT/bin/fm-home-seed.sh" nested-seed "$sub" --no-projects \
+      > "$TMP_ROOT/parent-seed-lock.out" 2> "$TMP_ROOT/parent-seed-lock.err"
+  status=$?
+  set -e
+  : > "$TMP_ROOT/parent-seed-lock-release"
+  wait "$holder_pid" || fail "parent home lifecycle lock holder failed to release"
+  [ "$status" -ne 0 ] || fail "nested seed bypassed parent home lifecycle authority"
+  assert_absent "$sub" "parent-locked seed created a child home"
+  assert_grep 'secondmate home lifecycle lock' "$TMP_ROOT/parent-seed-lock.err" \
+    "parent home lock contention was not surfaced"
+  pass "nested home seeding requires parent lifecycle authority"
 }
 
 test_home_seed_refuses_projectful_reused_charter_for_projectless_home() {
@@ -1135,6 +1471,7 @@ SH
   log="$TMP_ROOT/spawn-validate-fake/tmux.log"
   err="$TMP_ROOT/spawn-validate.err"
 
+  write_secondmate_registration "$home" domain "$subhome"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$subhome" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted an unseeded home"
@@ -1146,6 +1483,7 @@ SH
   grep -F 'new-window' "$log" >/dev/null && fail "spawn created a window before validation"
 
   printf 'other\n' > "$wronghome/.fm-secondmate-home"
+  write_secondmate_registration "$home" domain "$wronghome"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$wronghome" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a home marked for another secondmate"
@@ -1154,6 +1492,7 @@ SH
 
   printf 'domain\n' > "$marker_only/.fm-secondmate-home"
   printf 'charter\n' > "$marker_only/data/charter.md"
+  write_secondmate_registration "$home" domain "$marker_only"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$marker_only" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a marked home missing AGENTS.md"
@@ -1168,12 +1507,14 @@ SH
   grep -F 'not a firstmate home (missing bin/)' "$err" >/dev/null || fail "spawn did not explain missing bin"
 
   printf 'domain\n' > "$home/.fm-secondmate-home"
+  write_secondmate_registration "$home" domain "$home"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$home" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted the active home"
   fi
   grep -F 'secondmate home cannot be the active firstmate home' "$err" >/dev/null || fail "spawn did not reject active home"
 
+  write_secondmate_registration "$home" domain "$ROOT"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$ROOT" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted the firstmate repo root"
@@ -1182,6 +1523,7 @@ SH
 
   printf 'domain\n' > "$active_descendant/.fm-secondmate-home"
   printf 'charter\n' > "$active_descendant/data/charter.md"
+  write_secondmate_registration "$home" domain "$active_descendant"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$active_descendant" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a home inside the active firstmate home"
@@ -1190,6 +1532,7 @@ SH
 
   printf 'domain\n' > "$active_ancestor/.fm-secondmate-home"
   printf 'charter\n' > "$active_ancestor/data/charter.md"
+  write_secondmate_registration "$ancestor_active_home" domain "$active_ancestor"
   if PATH="$fakebin:$PATH" FM_HOME="$ancestor_active_home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$active_ancestor" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a home containing the active firstmate home"
@@ -1198,6 +1541,7 @@ SH
 
   printf 'domain\n' > "$root_descendant/.fm-secondmate-home"
   printf 'charter\n' > "$root_descendant/data/charter.md"
+  write_secondmate_registration "$home" domain "$root_descendant"
   if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fakeroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$root_descendant" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a home inside the firstmate repo"
@@ -1206,6 +1550,7 @@ SH
 
   printf 'domain\n' > "$root_ancestor/.fm-secondmate-home"
   printf 'charter\n' > "$root_ancestor/data/charter.md"
+  write_secondmate_registration "$home" domain "$root_ancestor"
   if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$root_inside" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
     "$ROOT/bin/fm-spawn.sh" domain "$root_ancestor" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted a home containing the firstmate repo"
@@ -1235,6 +1580,7 @@ test_secondmate_spawn_refuses_operational_dirs_outside_subhome() {
     if [ "$opdir" = data ]; then
       printf 'charter\n' > "$sink/charter.md"
     fi
+    write_secondmate_registration "$home" domain "$subhome"
     : > "$log"
     if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-opdir-fake/pane.txt" \
       "$ROOT/bin/fm-spawn.sh" domain "$subhome" codex --secondmate >/dev/null 2>"$err"; then
@@ -1245,6 +1591,70 @@ test_secondmate_spawn_refuses_operational_dirs_outside_subhome() {
     grep -F 'new-window' "$log" >/dev/null && fail "spawn created a window before unsafe $opdir directory validation"
   done
   pass "secondmate spawn refuses operational directories outside the subhome"
+}
+
+test_secondmate_spawn_requires_exact_registration_and_target_home_lock() {
+  local home target other state_base fakebin log err ready release holder_pid status
+  home="$TMP_ROOT/spawn-registration-home"
+  target="$TMP_ROOT/spawn-registration-target"
+  other="$TMP_ROOT/spawn-registration-other"
+  state_base="$TMP_ROOT/spawn-registration-locks"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/spawn-registration-fake")
+  log="$TMP_ROOT/spawn-registration-fake/tmux.log"
+  err="$TMP_ROOT/spawn-registration.err"
+  ready="$TMP_ROOT/spawn-registration.ready"
+  release="$TMP_ROOT/spawn-registration.release"
+  mkdir -p "$home/data" "$home/state" "$target" "$other"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_CHECKOUT_REFRESH_STATE_BASE="$state_base" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-registration-fake/pane.txt" \
+    "$ROOT/bin/fm-spawn.sh" domain "$target" codex --secondmate >/dev/null 2>"$err"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "secondmate spawn accepted an unregistered explicit home"
+  grep -F 'registry is malformed, missing, or does not uniquely register domain' "$err" >/dev/null \
+    || fail "unregistered explicit home refusal did not identify registry authority"
+
+  write_secondmate_registration "$home" domain "$other"
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_CHECKOUT_REFRESH_STATE_BASE="$state_base" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-registration-fake/pane.txt" \
+    "$ROOT/bin/fm-spawn.sh" domain "$target" codex --secondmate >/dev/null 2>"$err"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "secondmate spawn accepted a home different from its registration"
+  grep -F 'does not match the exact registration' "$err" >/dev/null \
+    || fail "explicit registration drift was not surfaced"
+
+  write_secondmate_registration "$home" domain "$target"
+  FM_HOLDER_ROOT="$ROOT" FM_HOLDER_STATE="$state_base" FM_HOLDER_HOME="$target" \
+    FM_HOLDER_READY="$ready" FM_HOLDER_RELEASE="$release" \
+    bash -c '
+      set -eu
+      . "$FM_HOLDER_ROOT/bin/fm-checkout-lock-lib.sh"
+      . "$FM_HOLDER_ROOT/bin/fm-account-routing-lib.sh"
+      lock=$(fm_secondmate_home_lifecycle_lock_acquire "$FM_HOLDER_STATE/locks" "$FM_HOLDER_HOME")
+      : > "$FM_HOLDER_READY"
+      while [ ! -f "$FM_HOLDER_RELEASE" ]; do sleep 0.05; done
+      fm_account_lifecycle_lock_release "$lock"
+    ' &
+  holder_pid=$!
+  while [ ! -f "$ready" ]; do sleep 0.05; done
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_CHECKOUT_REFRESH_STATE_BASE="$state_base" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-registration-fake/pane.txt" \
+    "$ROOT/bin/fm-spawn.sh" domain "$target" codex --secondmate >/dev/null 2>"$err"
+  status=$?
+  set -e
+  : > "$release"
+  wait "$holder_pid"
+  [ "$status" -ne 0 ] || fail "secondmate spawn bypassed the declared target home lock"
+  grep -F 'secondmate home lifecycle lock' "$err" >/dev/null \
+    || fail "target home lifecycle lock contention was not surfaced"
+  grep -F 'new-window' "$log" >/dev/null && fail "target home lock contention reached endpoint launch"
+  pass "secondmate spawn proves registration and owns the target home lock"
 }
 
 test_fm_send_refuses_bare_window_without_home_meta() {
@@ -1385,8 +1795,8 @@ EOF
   pass "secondmate teardown raw-removes plain-clone homes"
 }
 
-test_secondmate_force_teardown_discards_child_work() {
-  local home subhome childproj childwt fakebin log
+test_secondmate_force_teardown_retains_unlanded_child_work() {
+  local home subhome childproj childwt fakebin log err rc
   home="$TMP_ROOT/force-teardown-home"
   subhome="$TMP_ROOT/force-teardown-subhome"
   childproj="$subhome/projects/alpha"
@@ -1417,20 +1827,24 @@ yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/force-teardown-fake")
   log="$TMP_ROOT/force-teardown-fake/tmux.log"
+  err="$TMP_ROOT/force-teardown-fake/teardown.err"
+  printf '%s\n' retained > "$childwt/untracked-child.txt"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-teardown-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>&1; then
     fail "teardown allowed a secondmate with in-flight child work"
   fi
+  set +e
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-teardown-fake/pane.txt" \
-    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>/dev/null \
-    || fail "force teardown failed to discard child work"
-  [ ! -d "$subhome" ] || fail "force teardown did not remove the retired secondmate home"
-  [ ! -d "$childwt" ] || fail "force teardown did not remove child worktree"
-  [ ! -e "$home/state/domain.meta" ] || fail "teardown did not clear parent meta"
-  grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null && fail "force teardown did not remove secondmate registry route"
-  grep -F 'kill-window -t firstmate:fm-child' "$log" >/dev/null || fail "force teardown did not kill child window"
-  grep -F 'kill-window -t firstmate:fm-domain' "$log" >/dev/null || fail "force teardown did not kill parent window"
-  pass "secondmate force teardown discards child work"
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "force teardown discarded unlanded child work"
+  assert_present "$subhome" "force teardown removed the parent home"
+  assert_present "$childwt/untracked-child.txt" "force teardown discarded untracked child work"
+  assert_present "$home/state/domain.meta" "force teardown removed parent retry metadata"
+  assert_present "$subhome/state/child.meta" "force teardown removed child retry metadata"
+  assert_grep '- domain ' "$home/data/secondmates.md" "force teardown removed the parent registry route"
+  pass "secondmate force teardown retains unlanded child work"
 }
 
 test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
@@ -2098,13 +2512,52 @@ EOF
   pass "fm-backlog-handoff refuses Done items under whitespace section headings and unsafe homes"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = checkout-freshness ]; then
+  test_home_seed_rejects_stale_treehouse_acquired_home
+  test_home_seed_retains_dirty_treehouse_acquired_home
+  test_home_seed_retains_repository_mismatch_acquisition
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
+  test_home_seed_acquisition_honors_shared_checkout_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-8 ]; then
+  test_home_seed_returns_treehouse_acquired_home_on_assignment_failure
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-races ]; then
+  test_home_seed_serializes_with_home_retirement
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-secondmate-authority ]; then
+  test_home_seed_validate_rejects_partial_registry_rows
+  test_home_seed_requires_parent_lifecycle_authority
+  test_secondmate_force_teardown_retains_unlanded_child_work
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-durable-secondmate ]; then
+  test_secondmate_spawn_requires_exact_registration_and_target_home_lock
+  exit 0
+fi
+
 test_fm_home_parameterization
 test_lock_status_is_per_home
 test_seed_allows_overlapping_clones_and_drops_owner
 test_home_seed_validate_rejects_duplicate_homes
 test_home_seed_validate_rejects_duplicate_ids
 test_home_seed_validate_rejects_nested_homes
+test_home_seed_validate_rejects_partial_registry_rows
 test_home_seed_uses_treehouse_acquired_home
+test_home_seed_acquisition_honors_shared_checkout_lock
+test_home_seed_rejects_stale_treehouse_acquired_home
+test_home_seed_retains_dirty_treehouse_acquired_home
+test_home_seed_retains_repository_mismatch_acquisition
 test_home_seed_returns_treehouse_acquired_home_on_assignment_failure
 test_home_seed_warns_when_acquired_home_return_fails
 test_home_seed_does_not_return_unsafe_acquired_home
@@ -2113,6 +2566,8 @@ test_home_seed_refuses_missing_filled_charter
 test_home_seed_refuses_placeholder_charter
 test_home_seed_refuses_empty_charter_fields
 test_home_seed_no_projects_end_to_end
+test_home_seed_serializes_with_home_retirement
+test_home_seed_requires_parent_lifecycle_authority
 test_home_seed_refuses_projectful_reused_charter_for_projectless_home
 test_home_seed_refuses_projectless_conversion_of_populated_home
 test_home_seed_refuses_projectless_home_with_uninspectable_projects
@@ -2137,11 +2592,12 @@ test_home_seed_refuses_operational_dirs_outside_subhome
 test_home_seed_refuses_symlinked_leaf_files
 test_secondmate_spawn_requires_seeded_matching_home
 test_secondmate_spawn_refuses_operational_dirs_outside_subhome
+test_secondmate_spawn_requires_exact_registration_and_target_home_lock
 test_fm_send_refuses_bare_window_without_home_meta
 test_secondmate_teardown_retires_empty_home
 test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
-test_secondmate_force_teardown_discards_child_work
+test_secondmate_force_teardown_retains_unlanded_child_work
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home

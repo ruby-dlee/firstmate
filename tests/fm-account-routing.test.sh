@@ -5,6 +5,8 @@
 set -u
 export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
 export FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST=firstmate-remove-fleet-routing-deadcode-fixture-v1
+export FM_ORCA_TEST_LAB=firstmate-orca-test-lab-v1
+export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -122,6 +124,20 @@ case "${1:-}" in
     exit 0
     ;;
   send-keys)
+    if [ -n "${FM_FAKE_TMUX_GATE_SEND_MATCH:-}" ]; then
+      case "$*" in
+        *"$FM_FAKE_TMUX_GATE_SEND_MATCH"*)
+          [ -z "${FM_FAKE_TMUX_GATE_SEND_MARKER:-}" ] || touch "$FM_FAKE_TMUX_GATE_SEND_MARKER"
+          while [ -n "${FM_FAKE_TMUX_GATE_SEND_RELEASE:-}" ] \
+            && [ ! -f "$FM_FAKE_TMUX_GATE_SEND_RELEASE" ]; do
+            sleep 0.05
+          done
+          ;;
+      esac
+    fi
+    if [ -n "${FM_FAKE_TMUX_FAIL_SEND_MATCH:-}" ]; then
+      case "$*" in *"$FM_FAKE_TMUX_FAIL_SEND_MATCH"*) exit 72 ;; esac
+    fi
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
       prev=
       for arg in "$@"; do
@@ -177,6 +193,23 @@ SH
 [ -z "${FM_FAKE_TREEHOUSE_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'treehouse %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 [ -z "${FM_FAKE_TREEHOUSE_SLEEP:-}" ] || sleep "$FM_FAKE_TREEHOUSE_SLEEP"
+if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
+  [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
+  lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
+  kill -0 "$lock_pid" 2>/dev/null || exit 92
+  [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] || touch "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
+fi
+if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" ]; then
+  [ -z "${FM_FAKE_TREEHOUSE_RETURN_MARKER:-}" ] || : > "$FM_FAKE_TREEHOUSE_RETURN_MARKER"
+  (
+    trap '' HUP TERM
+    while :; do sleep 0.1; done
+  ) &
+  printf '%s\n' "$!" > "$FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE"
+fi
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
+fi
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
@@ -338,6 +371,8 @@ make_case() {
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
+  git -C "$wt" checkout --quiet --detach
+  fm_git_add_origin "$proj" "$case_dir/origin.git"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
@@ -374,7 +409,21 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
+    FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
+    FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
+    FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
+    FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
+    FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE="${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" \
+    FM_FAKE_TREEHOUSE_RETURN_MARKER="${FM_FAKE_TREEHOUSE_RETURN_MARKER:-}" \
+    FM_TEST_REAL_PS="${FM_TEST_REAL_PS:-}" \
+    FM_TREEHOUSE_ACQUIRE_TIMEOUT="${FM_TREEHOUSE_ACQUIRE_TIMEOUT:-60}" \
     FM_FAKE_ORCA_LOG="$ORCA_LOG" \
+    FM_FAKE_TMUX_FAIL_SEND_MATCH="${FM_FAKE_TMUX_FAIL_SEND_MATCH:-}" \
+    FM_FAKE_TMUX_GATE_SEND_MATCH="${FM_FAKE_TMUX_GATE_SEND_MATCH:-}" \
+    FM_FAKE_TMUX_GATE_SEND_MARKER="${FM_FAKE_TMUX_GATE_SEND_MARKER:-}" \
+    FM_FAKE_TMUX_GATE_SEND_RELEASE="${FM_FAKE_TMUX_GATE_SEND_RELEASE:-}" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$CASE_DIR/checkout-refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$CASE_DIR/checkout-refresh-locks" \
     FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_FAKE_AF_RESUME_ARM="$CASE_DIR/resume-arm" FM_FAKE_AF_SESSION_REFRESHED="$CASE_DIR/session-refreshed" \
     FM_FAKE_AF_RESUME_READY="$HOME_DIR/state/.$id.account-native-ready" FM_FAKE_AF_RESUME_GO="$HOME_DIR/state/.$id.account-native-go" \
@@ -449,6 +498,301 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$HOME_DIR/data/$id/brief.md" "upgraded brief omitted the completion-report sections"
   assert_contains "$out" "spawned $id" "default-off spawn did not complete"
   pass "routing off makes no Agent Fleet call and preserves launch/meta bytes"
+}
+
+test_failed_freshness_proof_rolls_back_unmanaged_resources() {
+  local id rec out status default_branch
+  id=checkout-freshness-rollback-z1a
+  rec=$(make_case checkout-freshness-rollback claude "$id")
+  read_case "$rec"
+  default_branch=$(git -C "$PROJ_DIR" branch --show-current)
+  printf '%s\n' upstream > "$PROJ_DIR/upstream.txt"
+  git -C "$PROJ_DIR" add upstream.txt
+  git -C "$PROJ_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm upstream
+  git -C "$PROJ_DIR" push -q -u origin "$default_branch"
+
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "stale acquired worktree passed the spawn freshness proof"
+  assert_contains "$out" "acquired worktree is stale" \
+    "failed freshness proof did not identify the stale acquired worktree"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "failed unmanaged freshness proof created an endpoint before verification"
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
+    "failed unmanaged freshness proof force-returned an unverified acquired worktree"
+  assert_contains "$out" "retained unsafe acquired worktree" \
+    "failed unmanaged freshness proof did not surface retain-only cleanup"
+  assert_absent "$CASE_DIR/endpoint-live" \
+    "failed unmanaged freshness proof left its endpoint alive"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "failed unmanaged freshness proof published task metadata"
+  pass "failed freshness proofs unwind endpoints and retain unverified worktrees"
+}
+
+test_local_only_spawn_uses_local_default_tip() {
+  local id rec out status
+  id=checkout-local-only-z1b
+  rec=$(make_case checkout-local-only claude "$id")
+  read_case "$rec"
+  git -C "$PROJ_DIR" remote remove origin
+  printf '%s\n' '- project [local-only] - local project (added 2026-07-23)' \
+    > "$HOME_DIR/data/projects.md"
+
+  out=$(run_spawn "$id" "$PROJ_DIR")
+  status=$?
+
+  [ "$status" -eq 0 ] || fail "remote-free local-only spawn failed its local freshness proof: $out"
+  assert_contains "$out" "spawned $id" "remote-free local-only spawn did not complete"
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
+    "successful remote-free local-only spawn returned its acquired worktree"
+  pass "remote-free local-only spawns prove the local default tip"
+}
+
+test_dirty_acquisition_is_retained_without_force_return() {
+  local id rec draft out status
+  id=checkout-dirty-retain-z1c
+  rec=$(make_case checkout-dirty-retain claude "$id")
+  read_case "$rec"
+  draft="$WT_DIR/.agents/skills/unlanded/SKILL.md"
+  mkdir -p "$(dirname "$draft")"
+  printf '%s\n' '# unlanded work' > "$draft"
+
+  if out=$(run_spawn "$id" "$PROJ_DIR"); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "spawn accepted a dirty acquired pool worktree"
+  assert_contains "$out" "acquired worktree is dirty" \
+    "dirty acquisition refusal did not identify the retained worktree"
+  assert_contains "$out" "retained unsafe acquired worktree" \
+    "dirty acquisition cleanup did not surface its retain-only action"
+  assert_grep 'get --lease --lease-holder firstmate-checkout-dirty-retain-z1c' "$TREEHOUSE_LOG" \
+    "dirty acquisition was not durably leased before verification"
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
+    "dirty acquisition was returned through the destructive Treehouse path"
+  grep -Fq '# unlanded work' "$draft" || fail "dirty acquisition cleanup changed its draft"
+  assert_absent "$CASE_DIR/endpoint-live" \
+    "dirty acquisition refusal left its prepared endpoint alive"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "dirty acquisition refusal published task metadata"
+  pass "dirty pool acquisitions are diagnosed and retained untouched"
+}
+
+test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation() {
+  local id rec out status
+  id=checkout-acquire-timeout-z1f
+  rec=$(make_case checkout-acquire-timeout claude "$id")
+  read_case "$rec"
+
+  if out=$(FM_FAKE_TREEHOUSE_SLEEP=3 FM_TREEHOUSE_ACQUIRE_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR"); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "hung Treehouse acquisition unexpectedly completed"
+  assert_contains "$out" "Treehouse worktree acquisition timed out after 1s" \
+    "bounded Treehouse acquisition did not surface its distinct timeout"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "timed-out Treehouse acquisition created an endpoint"
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
+    "timed-out Treehouse acquisition returned a path it never acquired"
+  pass "Treehouse acquisition is process-tree bounded before endpoint creation"
+}
+
+test_changed_acquisition_is_retained_during_unmanaged_rollback() {
+  local id rec marker release out_file spawn_pid
+  id=checkout-changed-rollback-z1g
+  rec=$(make_case checkout-changed-rollback pi "$id")
+  read_case "$rec"
+  marker="$CASE_DIR/gotmp-send-started"
+  release="$CASE_DIR/gotmp-send-release"
+  out_file="$CASE_DIR/spawn.out"
+
+  FM_FAKE_TMUX_GATE_SEND_MATCH=GOTMPDIR \
+    FM_FAKE_TMUX_GATE_SEND_MARKER="$marker" \
+    FM_FAKE_TMUX_GATE_SEND_RELEASE="$release" \
+    FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
+    run_spawn "$id" "$PROJ_DIR" > "$out_file" &
+  spawn_pid=$!
+  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
+  [ -f "$marker" ] \
+    || { kill "$spawn_pid" 2>/dev/null || true; fail "changed-acquisition test never reached the post-install failure"; }
+  printf '%s\n' retained-commit > "$WT_DIR/retained-commit.txt"
+  git -C "$WT_DIR" add retained-commit.txt
+  git -C "$WT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm retained-commit
+  touch "$release"
+  if wait "$spawn_pid"; then
+    fail "changed-acquisition rollback unexpectedly succeeded"
+  fi
+
+  assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
+    "rollback force-returned an acquired worktree whose detached tip changed"
+  assert_grep 'retained-commit' "$WT_DIR/retained-commit.txt" \
+    "rollback changed work committed after acquisition"
+  assert_grep 'expected detached tip' "$out_file" \
+    "rollback did not diagnose the changed acquired tip"
+  pass "unmanaged rollback retains acquisitions whose detached tip changed"
+}
+
+test_unmanaged_postinstall_failure_restores_prior_state() {
+  local id rec expected out status artifact common key expected_lock lock_marker
+  id=checkout-unmanaged-restore-z1d
+  rec=$(make_case checkout-unmanaged-restore pi "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=pi" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "custom_extension=retain-me"
+  expected="$CASE_DIR/original.meta"
+  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  expected_lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  lock_marker="$CASE_DIR/checkout-return-held-lock"
+  cp "$HOME_DIR/state/$id.meta" "$expected"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
+  done
+
+  if out=$(FM_EXPECT_CHECKOUT_LOCK="$expected_lock" \
+      FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
+      FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "post-metadata unmanaged launch failure unexpectedly succeeded"
+  cmp -s "$HOME_DIR/state/$id.meta" "$expected" \
+    || fail "post-metadata unmanaged failure did not restore prior metadata"
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
+      || fail "post-metadata unmanaged failure did not restore prior $artifact state"
+  done
+  assert_absent "$CASE_DIR/endpoint-live" \
+    "post-metadata unmanaged failure left its endpoint alive"
+  assert_grep "return --force $WT_DIR" "$TREEHOUSE_LOG" \
+    "post-metadata unmanaged failure did not return its clean worktree"
+  assert_present "$lock_marker" \
+    "spawn rollback did not hold the common checkout lock during Treehouse return"
+  [ -n "$out" ] || true
+  pass "unmanaged post-install failures restore prior lifecycle state transactionally"
+}
+
+test_spawn_rollback_relays_unverified_treehouse_cleanup() {
+  local id rec out status real_ps common key lock group owner child_pid
+  id=checkout-unverified-return-z1h
+  rec=$(make_case checkout-unverified-return pi "$id")
+  read_case "$rec"
+  real_ps=$(command -v ps)
+  cat > "$FAKEBIN_DIR/ps" <<'SH'
+#!/usr/bin/env bash
+if [ -f "${FM_FAKE_TREEHOUSE_RETURN_MARKER:-/nonexistent}" ] \
+  && [ "$*" = "-axo pid=,pgid=" ]; then
+  exit 1
+fi
+exec "${FM_TEST_REAL_PS:?}" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/ps"
+
+  if out=$(FM_TEST_REAL_PS="$real_ps" \
+      FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE="$CASE_DIR/treehouse-return-child.pid" \
+      FM_FAKE_TREEHOUSE_RETURN_MARKER="$CASE_DIR/treehouse-return-started" \
+      FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "spawn with unverified rollback cleanup unexpectedly succeeded"
+  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  assert_present "$CASE_DIR/treehouse-return-child.pid" \
+    "spawn rollback did not exercise a surviving Treehouse descendant"
+  assert_present "$lock" "spawn rollback released an unverified checkout lock"
+  assert_present "$lock/process-group" "spawn rollback lost the guarded process-group identity"
+  assert_contains "$out" "bounded command process cleanup could not be verified for anchored group" \
+    "spawn rollback suppressed the bounded supervisor diagnostic"
+  assert_contains "$out" "Treehouse return process cleanup could not be verified" \
+    "spawn rollback suppressed the locked-return cleanup diagnostic"
+  assert_contains "$out" "retained rollback worktree $WT_DIR" \
+    "spawn rollback did not provide actionable retain-only recovery guidance"
+  group=$(cat "$lock/process-group")
+  child_pid=$(cat "$CASE_DIR/treehouse-return-child.pid")
+  kill -0 "$child_pid" 2>/dev/null \
+    || fail "unverified Treehouse descendant exited before retention could be inspected"
+  owner=$(readlink "$lock")
+  kill -KILL -- "-$group" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$group" 2>/dev/null || break
+    sleep 0.02
+  done
+  ! kill -0 "$group" 2>/dev/null || fail "test cleanup could not terminate retained anchored group $group"
+  rm -f "$lock"
+  rm -rf "$owner"
+  pass "spawn rollback relays unverified cleanup and retains guarded resources"
+}
+
+test_unmanaged_rollback_waits_for_metadata_lock() {
+  local id rec marker release out_file spawn_pid held
+  id=checkout-unmanaged-rollback-lock-z1e
+  rec=$(make_case checkout-unmanaged-rollback-lock pi "$id")
+  read_case "$rec"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=pi" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "custom_extension=retain-me"
+  marker="$CASE_DIR/gotmp-send-started"
+  release="$CASE_DIR/gotmp-send-release"
+  out_file="$CASE_DIR/spawn.out"
+
+  FM_FAKE_TMUX_GATE_SEND_MATCH=GOTMPDIR \
+    FM_FAKE_TMUX_GATE_SEND_MARKER="$marker" \
+    FM_FAKE_TMUX_GATE_SEND_RELEASE="$release" \
+    FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
+    run_spawn "$id" "$PROJ_DIR" > "$out_file" &
+  spawn_pid=$!
+  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
+  [ -f "$marker" ] \
+    || { kill "$spawn_pid" 2>/dev/null || true; fail "unmanaged rollback-lock test never reached the post-install failure"; }
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  held=$(fm_account_meta_lock_acquire "$HOME_DIR/state" "$id") \
+    || { kill "$spawn_pid" 2>/dev/null || true; fail "unmanaged rollback-lock test could not acquire the writer lock"; }
+  touch "$release"
+  sleep 0.1
+  printf '%s\n' 'x_request=req-concurrent-rollback' >> "$HOME_DIR/state/$id.meta"
+  fm_account_meta_lock_release "$held" \
+    || { kill "$spawn_pid" 2>/dev/null || true; fail "unmanaged rollback-lock test could not release the writer lock"; }
+  if wait "$spawn_pid"; then
+    fail "unmanaged rollback-lock failure unexpectedly succeeded"
+  fi
+  assert_grep 'custom_extension=retain-me' "$HOME_DIR/state/$id.meta" \
+    "unmanaged rollback lost the prior metadata generation"
+  assert_grep 'x_request=req-concurrent-rollback' "$HOME_DIR/state/$id.meta" \
+    "unmanaged rollback discarded an extension written under the metadata lock"
+  pass "unmanaged rollback serializes generation restoration with metadata writers"
 }
 
 test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic() {
@@ -812,6 +1156,62 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   assert_not_grep 'session remove' "$AF_LOG" "failed resume removed the durable session mapping"
   assert_contains "$out" 'no Agent Fleet provider-session mapping' "missing mapping blocker was not explicit"
   pass "resume uses below-reserve sticky recovery and never deletes mapping on a failed attempt"
+}
+
+test_recovered_secondmate_kind_blocks_unsupported_cmux_backend_early() {
+  local id rec meta replacement out status
+  id=acct-cmux-sm-z9b
+  rec=$(make_case recovered-cmux-secondmate claude "$id")
+  read_case "$rec"
+  mkdir -p "$CASE_DIR/treehouse-pools"
+  out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "recovered cmux secondmate precondition spawn failed: $out"
+  meta="$HOME_DIR/state/$id.meta"
+  replacement="$meta.replacement"
+  sed 's/^kind=.*/kind=secondmate/;/^backend=/d' "$meta" > "$replacement"
+  printf 'backend=cmux\n' >> "$replacement"
+  mv "$replacement" "$meta"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  out=$(run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "metadata-recovered cmux secondmate launched"
+  assert_contains "$out" "backend=cmux does not support --secondmate spawns yet" \
+    "metadata-recovered secondmate missed the cmux backend guard"
+  assert_not_grep 'lease recover\|lease choose\|lease acquire' "$AF_LOG" \
+    "unsupported recovered secondmate reached account mutation"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "unsupported recovered secondmate created an endpoint"
+  pass "metadata kind recovery precedes unsupported secondmate backend checks"
+}
+
+test_managed_recovery_rejects_duplicate_kind_metadata() {
+  local id rec meta replacement out status
+  id=acct-duplicate-kind-z9c
+  rec=$(make_case duplicate-kind-recovery claude "$id")
+  read_case "$rec"
+  mkdir -p "$CASE_DIR/treehouse-pools"
+  out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "duplicate-kind recovery precondition spawn failed: $out"
+  meta="$HOME_DIR/state/$id.meta"
+  replacement="$meta.replacement"
+  sed '/^kind=/d;/^backend=/d' "$meta" > "$replacement"
+  printf '%s\n' 'kind=secondmate' 'kind=ship' 'backend=cmux' >> "$replacement"
+  mv "$replacement" "$meta"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  out=$(run_spawn "$id" --resume-account)
+  status=$?
+  [ "$status" -ne 0 ] || fail "duplicate recovery kind metadata launched"
+  assert_contains "$out" "duplicate kind records" \
+    "duplicate recovery kind metadata was not surfaced"
+  assert_not_grep 'lease recover\|lease choose\|lease acquire' "$AF_LOG" \
+    "duplicate recovery kind metadata reached account mutation"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "duplicate recovery kind metadata created an endpoint"
+  pass "managed recovery requires exactly one canonical kind record"
 }
 
 test_managed_recovery_accepts_inherited_lifecycle_lock() {
@@ -1905,7 +2305,7 @@ test_reservation_occurs_after_worktree_preparation() {
   rec=$(make_case order claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "reservation order spawn failed"
-  treehouse_line=$(grep -n '^tmux send-keys .* treehouse get Enter$' "$LIFECYCLE_LOG" | head -1 | cut -d: -f1)
+  treehouse_line=$(grep -n '^treehouse get --lease --lease-holder firstmate-account-order-z14$' "$LIFECYCLE_LOG" | head -1 | cut -d: -f1)
   lease_line=$(grep -n 'agent-fleet .* lease choose ' "$LIFECYCLE_LOG" | head -1 | cut -d: -f1)
   [ -n "$treehouse_line" ] && [ -n "$lease_line" ] && [ "$lease_line" -gt "$treehouse_line" ] \
     || fail "Agent Fleet reservation did not follow worktree preparation: $(tr '\n' '|' < "$LIFECYCLE_LOG")"
@@ -5399,6 +5799,49 @@ if [ "${FM_TEST_FOCUSED:-}" = stale-reclaim-generation ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = checkout-freshness-cleanup ]; then
+  run_isolated_test test_failed_freshness_proof_rolls_back_unmanaged_resources
+  run_isolated_test test_local_only_spawn_uses_local_default_tip
+  run_isolated_test test_dirty_acquisition_is_retained_without_force_return
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-40 ]; then
+  run_isolated_test test_failed_freshness_proof_rolls_back_unmanaged_resources
+  run_isolated_test test_local_only_spawn_uses_local_default_tip
+  run_isolated_test test_dirty_acquisition_is_retained_without_force_return
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  run_isolated_test test_unmanaged_rollback_waits_for_metadata_lock
+  run_isolated_test test_reservation_occurs_after_worktree_preparation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-durable-secondmate ]; then
+  run_isolated_test test_recovered_secondmate_kind_blocks_unsupported_cmux_backend_early
+  run_isolated_test test_managed_recovery_rejects_duplicate_kind_metadata
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-8 ]; then
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
+  run_isolated_test test_failed_freshness_proof_rolls_back_unmanaged_resources
+  run_isolated_test test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation
+  run_isolated_test test_changed_acquisition_is_retained_during_unmanaged_rollback
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12-ownership ]; then
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  run_isolated_test test_spawn_rollback_relays_unverified_treehouse_cleanup
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = continuation-status-timeout ]; then
   run_isolated_test test_continuation_bounds_no_mistakes_status_snapshot
   exit 0
@@ -5409,8 +5852,64 @@ if [ "${FM_TEST_FOCUSED:-}" = packet-rollback-aba ]; then
   exit 0
 fi
 
+test_secondmate_home_lock_key_fails_closed_without_fixed_hasher() {
+  local home state out status
+  home="$TMP_ROOT/secondmate-lock-key-home"
+  state="$TMP_ROOT/secondmate-lock-key-state"
+  mkdir -p "$home" "$state"
+  set +e
+  out=$(FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    bash -c '
+      . "$1/bin/fm-account-routing-lib.sh"
+      FM_CHECKOUT_SYSTEM_PERL_BIN=
+      fm_secondmate_home_lifecycle_lock_acquire "$2" "$3"
+    ' _ "$ROOT" "$state" "$home" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "secondmate home lock accepted an unavailable fixed hasher"
+  assert_contains "$out" "lock identity is unavailable" \
+    "secondmate home lock hash failure was not surfaced"
+  [ -z "$(find "$state" -mindepth 1 -print -quit)" ] \
+    || fail "secondmate home lock hash failure created a fallback lock"
+  pass "secondmate home lifecycle locks fail closed without fixed hashing"
+}
+
+test_secondmate_home_lock_key_uses_filesystem_identity() {
+  local home dotted case_alias missing_upper missing_lower key dotted_key case_key missing_upper_key missing_lower_key
+  home="$TMP_ROOT/secondmate-lock-identity-home"
+  mkdir -p "$home"
+  dotted="$home/."
+  key=$(bash -c '. "$1/bin/fm-account-routing-lib.sh"; fm_account_stable_path_key "$2" directory' _ "$ROOT" "$home") \
+    || fail "secondmate home identity key was unavailable"
+  dotted_key=$(bash -c '. "$1/bin/fm-account-routing-lib.sh"; fm_account_stable_path_key "$2" directory' _ "$ROOT" "$dotted") \
+    || fail "dotted secondmate home identity key was unavailable"
+  [ "$key" = "$dotted_key" ] || fail "one physical home produced different keys through a dotted alias"
+  case_alias=$(printf '%s\n' "$home" | tr '[:lower:]' '[:upper:]')
+  if [ "$case_alias" != "$home" ] && [ -d "$case_alias" ]; then
+    case_key=$(bash -c '. "$1/bin/fm-account-routing-lib.sh"; fm_account_stable_path_key "$2" directory' _ "$ROOT" "$case_alias") \
+      || fail "case-aliased secondmate home identity key was unavailable"
+    [ "$key" = "$case_key" ] || fail "one physical home produced different keys through a case alias"
+  fi
+  missing_upper="$TMP_ROOT/Missing-Secondmate-Home"
+  missing_lower="$TMP_ROOT/missing-secondmate-home"
+  missing_upper_key=$(bash -c '. "$1/bin/fm-account-routing-lib.sh"; fm_account_stable_path_key "$2" directory' _ "$ROOT" "$missing_upper") \
+    || fail "missing secondmate home identity key was unavailable"
+  missing_lower_key=$(bash -c '. "$1/bin/fm-account-routing-lib.sh"; fm_account_stable_path_key "$2" directory' _ "$ROOT" "$missing_lower") \
+    || fail "case-folded missing secondmate home identity key was unavailable"
+  [ "$missing_upper_key" = "$missing_lower_key" ] \
+    || fail "case aliases for one not-yet-created home produced different lifecycle keys"
+  pass "secondmate home lifecycle keys follow filesystem identity"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = symlink-artifacts ]; then
   run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-races ]; then
+  run_isolated_test test_secondmate_home_lock_key_fails_closed_without_fixed_hasher
+  run_isolated_test test_secondmate_home_lock_key_uses_filesystem_identity
   exit 0
 fi
 
@@ -5728,6 +6227,12 @@ fi
 
 run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
 run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
+run_isolated_test test_failed_freshness_proof_rolls_back_unmanaged_resources
+run_isolated_test test_local_only_spawn_uses_local_default_tip
+run_isolated_test test_dirty_acquisition_is_retained_without_force_return
+run_isolated_test test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation
+run_isolated_test test_changed_acquisition_is_retained_during_unmanaged_rollback
+run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
 run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
 run_isolated_test test_completion_contract_ignores_raw_html_headings
 run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
@@ -5736,6 +6241,8 @@ run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
 run_isolated_test test_pane_failure_happens_before_account_reservation
 run_isolated_test test_batch_partial_failure_releases_only_failed_item
 run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+run_isolated_test test_recovered_secondmate_kind_blocks_unsupported_cmux_backend_early
+run_isolated_test test_managed_recovery_rejects_duplicate_kind_metadata
 run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
 run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
 run_isolated_test test_inherited_lifecycle_lock_rejects_owner_aba
@@ -5826,6 +6333,8 @@ run_isolated_test test_account_lock_owner_controls_reject_symlinks
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
 run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
 run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+run_isolated_test test_secondmate_home_lock_key_fails_closed_without_fixed_hasher
+run_isolated_test test_secondmate_home_lock_key_uses_filesystem_identity
 run_isolated_test test_account_lineage_rejects_parent_swap_during_transaction
 run_isolated_test test_agent_fleet_contract_is_validated_before_routing
 run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation

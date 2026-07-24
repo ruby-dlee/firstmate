@@ -94,6 +94,8 @@ Run `bin/fm-home-seed.sh validate` when checking registry integrity; it refuses 
 
 Seeding is transactional.
 If validation, cloning, no-mistakes initialization, or registry update fails, generated briefs, new homes, new project clones, and registry edits are rolled back.
+Home provisioning, child spawn, and retirement use one canonical home lifecycle lock.
+The lock order is home lifecycle, task lifecycle, then registry; recursive retirement acquires parent homes before child homes and holds each home lock through its final state check, removal, and registry update.
 
 Secondmate project lists may include `no-mistakes` and `direct-PR` projects only.
 `local-only` projects stay with the main firstmate.
@@ -159,11 +161,12 @@ Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or mai
 
 The safety check is the secondmate's own home.
 Teardown refuses while its `state/*.meta` contains in-flight work.
+Teardown recursively proves every registered project clone and nested repository clean, stash-free, bound to the corresponding durable source remote, and landed on a surviving remote branch; tags and in-home remotes never count.
 When safe, teardown kills the direct tmux window, removes the `data/secondmates.md` route, clears the main home metadata, and removes the retired secondmate home.
 Removing a leased home releases its durable treehouse lease via `treehouse return`, so the pool slot is freed for reuse rather than left leased forever.
 A plain-clone home with no pool slot is simply removed.
 If `treehouse return` fails for a leased home, teardown stops with state intact rather than raw-removing the directory and hiding a held lease.
 
-With `--force`, teardown is the explicit discard path.
-It kills child windows, discards child work and state inside the secondmate home, removes the route, releases the lease, and removes the retired secondmate home.
-Never use `--force` unless the captain explicitly said to discard the work.
+With `--force`, teardown may recursively retire child tasks and nested secondmates.
+Every child must first pass the same identity, endpoint-absence, cleanliness, stash, and landed-work proofs; `--force` never authorizes discarding work.
+If any child proof fails, retain the child metadata, worktree, home, and parent registration.

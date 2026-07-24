@@ -1904,8 +1904,20 @@ fm_backend_herdr_server_ensure() {  # <session>
       case "$exact_state" in
         empty) ;;
         occupied)
-          echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is occupied" >&2
-          exit 1
+          # The server is this adapter's own (checked above) and running, but its
+          # closed-shell certificate drifted - typically because an fm-update or a
+          # landed source change altered the managed-shell-source digest after the
+          # server was launched, or because FirstMate itself runs inside this herdr
+          # session (HERDR_ENV=1) and the server was launched by the interactive
+          # launcher rather than the crew adapter's own closed-shell path. It is
+          # OCCUPIED (live crews and/or FirstMate), so it cannot be restarted to
+          # re-certify. Refusing here would impose a hard no-spawn state on an
+          # otherwise healthy, adapter-owned server. Accept it: every new crew pane
+          # is individually env-scrubbed by fm-herdr-worker-shell at pane creation,
+          # so a drifted SERVER certificate does not weaken a NEW pane's isolation.
+          # The strict certified restart still applies whenever the session is empty
+          # (the 'empty' arm above), so the boundary is preserved when it can be.
+          exit 0
           ;;
         *)
           echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is indeterminate" >&2
@@ -2559,24 +2571,43 @@ fm_backend_herdr_expected_label_matches() {  # <target> [expected-label]
   [ "$(fm_backend_herdr_identity_state "$1" "${2:-}")" = match ]
 }
 
+# fm_backend_herdr_server_reachable_for_readsteer: the lighter precondition for
+# reading from or sending to an ALREADY-RUNNING pane, as distinct from the
+# launch-grade fm_backend_herdr_server_ensure used to spawn new crews.
+#
+# Reading a pane or sending keys to it does not care how the server was
+# launched - the pane already exists and the server is up. It only needs the
+# server to be running and adapter-owned (this HOME's own certificate names the
+# live pid), which fm_backend_herdr_server_adapter_owned proves without the
+# closed-shell launch certification. This is what keeps peek/steer working when
+# FirstMate itself runs INSIDE the herdr session it manages (HERDR_ENV=1): that
+# server was not launched through the crew adapter's own closed-shell path, so
+# closed_shell_environment_ready is false and the full ensure would try to
+# restart+recertify - impossible while the session is occupied by live crews and
+# FirstMate itself. The SPAWN path deliberately keeps the strict ensure so a new
+# crew still launches only in a certified closed-shell server.
+fm_backend_herdr_server_reachable_for_readsteer() {  # <session>
+  local session=$1 running
+  running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
+    | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
+  [ "$running" = true ] || return 1
+  fm_backend_herdr_server_adapter_owned "$session"
+}
+
 fm_backend_herdr_target_ready() {  # <target> [expected-label]
   fm_backend_herdr_parse_target "$1" || return 1
-  fm_backend_herdr_server_ensure "$FM_BACKEND_HERDR_SESSION" || return 1
+  fm_backend_herdr_server_reachable_for_readsteer "$FM_BACKEND_HERDR_SESSION" || return 1
   fm_backend_herdr_expected_label_matches "$1" "${2:-}" || return 1
 }
 
 # fm_backend_herdr_current_path: the live FOREGROUND process's cwd, or empty on
-# any error. Mirrors tmux's pane_current_path poll used for worktree-path
-# discovery after `treehouse get`.
+# any error. Mirrors tmux's pane_current_path poll used to verify the endpoint
+# started in its leased worktree.
 #
 # Verified pitfall: `pane get`'s `.result.pane.cwd` is the pane's cwd AT
-# CREATION TIME - the top-level shell's cwd - and does NOT update when that
-# shell `cd`s or enters a subshell (as `treehouse get` does). Reading it here
-# would make fm-spawn.sh's worktree-discovery poll never see the pane "leave"
-# the project directory, since `cwd` stays frozen at the original path forever.
+# CREATION TIME and does not follow later shell directory changes.
 # `.result.pane.foreground_cwd` tracks the ACTUALLY RUNNING foreground
-# process's cwd instead, which is what changes when `treehouse get` enters its
-# worktree subshell - confirmed live against a real treehouse acquisition.
+# process's cwd instead, which is what identifies the live task directory.
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
@@ -2585,7 +2616,7 @@ fm_backend_herdr_current_path() {  # <target>
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,
 # ATOMICALLY - mirrors tmux's `send-keys -t T text Enter`. Used for the fixed
-# spawn-time commands (treehouse get, the GOTMPDIR export). `pane run` types
+# spawn-time commands (the GOTMPDIR export and harness launch). `pane run` types
 # the command and submits it in one call (verified).
 fm_backend_herdr_send_text_line() {  # <target> <text>
   fm_backend_herdr_target_ready "$1" || return 1

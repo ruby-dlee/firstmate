@@ -11,6 +11,8 @@
 #     instead of a quiet skip.
 # The pre-existing fast-forward / already-current / local-only / no-origin paths
 # must be unchanged, and bootstrap must relay the new outcomes as FLEET_SYNC lines.
+# Every origin-backed path must use the live upstream default and the shared
+# canonical repository lock, including callers outside checkout-refresh.
 #
 # It also pins the orphaned .git/packed-refs.lock recovery in the fetch step
 # (fetch_with_packed_refs_lock_guard, backed by bin/fm-lock-lib.sh's shared
@@ -81,13 +83,25 @@ advance_origin() {
   git -C "$work" push -q origin main
 }
 
+switch_origin_default() {
+  local home=$1 name=$2 work remote
+  work="$home/work-$name"
+  remote="$home/remotes/$name.git"
+  git -C "$work" checkout -q -b trunk
+  commit_file "$work" trunk.txt trunk default-trunk
+  git -C "$work" push -q -u origin trunk
+  git -C "$remote" symbolic-ref HEAD refs/heads/trunk
+}
+
 head_sha() { git -C "$1" rev-parse HEAD; }
 
 # run_sync <home> [args...]: run fleet-sync against an isolated home, stdout only.
 run_sync() {
   local home=$1
   shift
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-fleet-sync.sh" "$@" 2>/dev/null
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
+    "$ROOT/bin/fm-fleet-sync.sh" "$@" 2>/dev/null
 }
 
 # --- packed-refs.lock fixtures ----------------------------------------------
@@ -191,10 +205,136 @@ run_sync_guarded() {
   realgit=$(command -v git)
   PATH="$fakebin:$PATH" REAL_GIT_FOR_TEST="$realgit" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     "$ROOT/bin/fm-fleet-sync.sh" "$@" >"$outf" 2>"$errf"
 }
 
 # --- tests ------------------------------------------------------------------
+
+test_status_failure_is_never_treated_as_clean() {
+  local home clone fakebin out err before
+  home=$(new_home)
+  clone=$(build_pair "$home" status-unreadable)
+  advance_origin "$home" status-unreadable C1
+  before=$(head_sha "$clone")
+  fakebin="$home/fakebin"
+  out="$home/status-unreadable.out"
+  err="$home/status-unreadable.err"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  if [ "$argument" = status ]; then
+    exit 74
+  fi
+done
+exec "${REAL_GIT_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$fakebin/git"
+  run_sync_guarded "$home" "$fakebin" "$out" "$err" "$clone"
+  assert_contains "$(cat "$out")" "working tree cleanliness cannot be inspected" \
+    "status failure was not surfaced"
+  [ "$(head_sha "$clone")" = "$before" ] \
+    || fail "status failure was treated as clean and advanced the checkout"
+  pass "unreadable git status cannot produce a clean refresh"
+}
+
+test_direct_and_batch_sync_reject_nested_repository_paths() {
+  local home clone nested out before status batch_home batch_nested batch_out batch_before batch_status
+  home=$(new_home)
+  clone=$(build_pair "$home" nested-direct)
+  advance_origin "$home" nested-direct C1
+  nested="$clone/child"
+  mkdir -p "$nested"
+  before=$(head_sha "$clone")
+
+  out=$(run_sync "$home" "$nested")
+  status=$?
+
+  assert_contains "$out" "target must be an exact canonical Git repository root" \
+    "direct fleet sync accepted a nested repository path"
+  [ "$status" -ne 0 ] || fail "direct fleet sync reported success for a nested repository path"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "direct nested target mutated its enclosing repository"
+
+  batch_home=$(new_home)
+  fm_git_init_commit "$batch_home/projects"
+  batch_nested="$batch_home/projects/child"
+  mkdir -p "$batch_nested"
+  batch_before=$(head_sha "$batch_home/projects")
+
+  batch_out=$(run_sync "$batch_home")
+  batch_status=$?
+
+  assert_contains "$batch_out" "target must be an exact canonical Git repository root" \
+    "batch fleet sync accepted a nested repository path"
+  [ "$batch_status" -ne 0 ] || fail "batch fleet sync reported success for a nested repository path"
+  [ "$(head_sha "$batch_home/projects")" = "$batch_before" ] \
+    || fail "batch nested target mutated its enclosing repository"
+  pass "direct and batch sync reject nested repository paths"
+}
+
+test_direct_and_batch_sync_reject_symlink_repository_paths() {
+  local home clone alias ancestor alias_parent out before status batch_home batch_clone batch_alias batch_out batch_before batch_status projects_target projects_link
+  home=$(new_home)
+  clone=$(build_pair "$home" symlink-direct)
+  advance_origin "$home" symlink-direct C1
+  alias="$home/symlink-direct"
+  ln -s "$clone" "$alias"
+  before=$(head_sha "$clone")
+
+  out=$(run_sync "$home" "$alias")
+  status=$?
+
+  assert_contains "$out" "target must be an exact canonical Git repository root" \
+    "direct fleet sync accepted a symlink repository path"
+  [ "$status" -ne 0 ] || fail "direct fleet sync reported success for a symlink repository path"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "direct symlink target mutated its repository"
+
+  ancestor="$home/ancestor-link"
+  alias_parent=$(dirname "$clone")
+  ln -s "$alias_parent" "$ancestor"
+  set +e
+  out=$(run_sync "$home" "$ancestor/$(basename "$clone")/")
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "direct fleet sync accepted a symlinked ancestor with a trailing slash"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "ancestor-symlinked direct target mutated its repository"
+
+  batch_home=$(new_home)
+  batch_clone=$(build_pair "$batch_home" symlink-batch-target)
+  advance_origin "$batch_home" symlink-batch-target C1
+  mv "$batch_clone" "$batch_home/symlink-batch-target"
+  batch_clone="$batch_home/symlink-batch-target"
+  batch_alias="$batch_home/projects/symlink-batch"
+  ln -s "$batch_clone" "$batch_alias"
+  batch_before=$(head_sha "$batch_clone")
+
+  set +e
+  batch_out=$(run_sync "$batch_home")
+  batch_status=$?
+  set -e
+
+  assert_contains "$batch_out" "target must be an exact canonical Git repository root" \
+    "batch fleet sync accepted a symlinked projects entry"
+  [ "$batch_status" -ne 0 ] || fail "batch fleet sync reported success for a symlinked projects entry"
+  [ "$(head_sha "$batch_clone")" = "$batch_before" ] \
+    || fail "batch symlink target mutated its external repository"
+
+  projects_target="$batch_home/projects-target"
+  projects_link="$batch_home/projects-root-link"
+  mkdir -p "$projects_target"
+  ln -s "$projects_target" "$projects_link"
+  set +e
+  batch_out=$(FM_HOME="$batch_home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_PROJECTS_OVERRIDE="$projects_link/" \
+    "$ROOT/bin/fm-fleet-sync.sh" 2>&1)
+  batch_status=$?
+  set -e
+  [ "$batch_status" -ne 0 ] || fail "batch fleet sync accepted a symlinked projects root"
+  assert_contains "$batch_out" "projects root contains an unsafe" \
+    "symlinked projects root refusal was unclear"
+  pass "direct and batch sync reject leaf, ancestor, and projects-root symlinks"
+}
 
 test_detached_clean_ancestor_recovers() {
   local home clone out before after
@@ -259,20 +399,26 @@ test_detached_clean_ancestor_with_diverged_local_default_is_stuck_untouched() {
 }
 
 test_dirty_is_stuck_untouched() {
-  local home clone out before
+  local home clone out before draft
   home=$(new_home)
   clone=$(build_pair "$home" gamma)
   advance_origin "$home" gamma C1
   before=$(head_sha "$clone")
   printf 'uncommitted edit\n' >> "$clone/file.txt"
+  draft="$clone/.agents/skills/local-draft/SKILL.md"
+  mkdir -p "$(dirname "$draft")"
+  printf '%s\n' '# local draft' > "$draft"
 
   out=$(run_sync "$home" "$clone")
 
   assert_contains "$out" "gamma: STUCK:" "dirty clone reports STUCK"
   assert_contains "$out" "uncommitted changes" "STUCK names the dirty state"
+  assert_contains "$out" "1 untracked, 1 under repository skill directories" \
+    "STUCK quantifies untracked skill drafts"
   assert_contains "$out" "1 commits behind origin/main" "STUCK quantifies how far behind"
   [ "$(head_sha "$clone")" = "$before" ] || fail "dirty clone HEAD was moved"
   grep -q "uncommitted edit" "$clone/file.txt" || fail "dirty working-tree change was discarded"
+  grep -q "# local draft" "$draft" || fail "untracked skill draft was discarded"
   pass "dirty working tree is reported STUCK and left untouched"
 }
 
@@ -325,6 +471,129 @@ test_on_default_clean_behind_fast_forwards() {
   pass "on-default clean behind clone still fast-forwards"
 }
 
+test_live_default_probe_overrides_stale_origin_head() {
+  local home clone out before stale
+  home=$(new_home)
+  clone=$(build_pair "$home" live-default)
+  advance_origin "$home" live-default C1
+  switch_origin_default "$home" live-default
+  before=$(head_sha "$clone")
+  stale=$(git -C "$clone" symbolic-ref --short refs/remotes/origin/HEAD)
+  [ "$stale" = "origin/main" ] || fail "live-default fixture did not retain stale origin/HEAD"
+
+  out=$(run_sync "$home" "$clone")
+
+  assert_contains "$out" "live-default: STUCK: on branch main" \
+    "direct fleet sync did not use the live upstream default"
+  assert_contains "$out" "commits behind origin/trunk" \
+    "live-default warning did not identify the authoritative branch"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "former default branch was fast-forwarded"
+  [ "$(git -C "$clone" branch --show-current)" = "main" ] || fail "former default checkout was switched"
+  [ "$(git -C "$clone" symbolic-ref --short refs/remotes/origin/HEAD)" = "origin/main" ] \
+    || fail "fixture's stale origin/HEAD unexpectedly changed"
+  pass "direct sync proves the live upstream default and leaves the former default untouched"
+}
+
+test_direct_sync_honors_shared_checkout_lock() {
+  local home clone before common key lock_root lock out
+  home=$(new_home)
+  clone=$(build_pair "$home" shared-lock)
+  advance_origin "$home" shared-lock C1
+  before=$(head_sha "$clone")
+  common=$(git -C "$clone" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  lock_root="$home/checkout-locks"
+  lock="$lock_root/$key.lock"
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+
+  out=$(FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-fleet-sync.sh" "$clone" 2>/dev/null)
+
+  assert_contains "$out" "$clone: skipped: refresh already running (pid $$)" \
+    "direct fleet sync bypassed the shared checkout lock"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "direct sync mutated a contended checkout"
+  rm -rf "$lock"
+  pass "direct sync serializes through the shared canonical checkout lock"
+}
+
+test_direct_sync_timeout_terminates_descendants() {
+  local home clone fakebin real_git out status parent_pid child_pid common key lock_root lock
+  home=$(new_home)
+  clone=$(build_pair "$home" direct-timeout)
+  advance_origin "$home" direct-timeout C1
+  fakebin="$home/direct-timeout-fakebin"
+  real_git=$(command -v git)
+  mkdir -p "$fakebin"
+  common=$(git -C "$clone" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  lock_root="$home/checkout-refresh-state/locks"
+  lock="$lock_root/$key.lock"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+is_fetch=0
+for arg in "$@"; do
+  [ "$arg" = fetch ] && is_fetch=1
+done
+if [ "$is_fetch" -eq 1 ]; then
+  if { [ -e "$FM_TEST_EXPECT_LOCK" ] || [ -L "$FM_TEST_EXPECT_LOCK" ]; } \
+    && lock_pid=$(cat "$FM_TEST_EXPECT_LOCK/pid" 2>/dev/null) \
+    && kill -0 "$lock_pid" 2>/dev/null; then
+    : > "$FM_TEST_LOCK_BEFORE_MUTATION"
+  fi
+  trap '
+    if [ -e "$FM_TEST_EXPECT_LOCK" ] || [ -L "$FM_TEST_EXPECT_LOCK" ]; then
+      : > "$FM_TEST_LOCK_DURING_CLEANUP"
+    fi
+  ' TERM
+  printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_PARENT:?}"
+  (
+    trap '' TERM
+    printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_CHILD:?}"
+    while :; do sleep 0.1; done
+  ) &
+  while :; do wait || true; done
+fi
+exec "${FM_TEST_REAL_GIT:?}" "$@"
+SH
+  chmod +x "$fakebin/git"
+
+  set +e
+  out=$(FM_TEST_REAL_GIT="$real_git" \
+    FM_TEST_FETCH_PARENT="$home/direct-fetch-parent.pid" \
+    FM_TEST_FETCH_CHILD="$home/direct-fetch-child.pid" \
+    FM_TEST_EXPECT_LOCK="$lock" \
+    FM_TEST_LOCK_BEFORE_MUTATION="$home/lock-before-mutation" \
+    FM_TEST_LOCK_DURING_CLEANUP="$home/lock-during-cleanup" \
+    FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=1 \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-fleet-sync.sh" "$clone" 2>&1)
+  status=$?
+  set -e
+
+  [ "$status" -eq 0 ] || fail "direct bounded fleet sync failed unexpectedly: $out"
+  assert_contains "$out" "direct-timeout: skipped: refresh timed out after 1s" \
+    "direct fleet sync did not surface its process-tree timeout"
+  parent_pid=$(cat "$home/direct-fetch-parent.pid")
+  child_pid=$(cat "$home/direct-fetch-child.pid")
+  if kill -0 "$parent_pid" 2>/dev/null || kill -0 "$child_pid" 2>/dev/null; then
+    fail "direct fleet sync returned while a fetch descendant was still alive"
+  fi
+  assert_present "$home/lock-before-mutation" \
+    "direct fleet sync started mutation before the supervising process acquired the checkout lock"
+  assert_present "$home/lock-during-cleanup" \
+    "direct fleet sync released the checkout lock before descendant cleanup"
+  assert_absent "$lock" "direct fleet sync retained its checkout lock after verified cleanup"
+  pass "direct fleet sync bounds and reaps its mutation process tree"
+}
+
 test_already_current_unchanged() {
   local home clone out before
   home=$(new_home)
@@ -368,6 +637,26 @@ test_local_only_skipped() {
   assert_contains "$out" "iota: skipped: local-only project" "local-only clone is skipped as before"
   assert_not_contains "$out" "STUCK" "local-only skip is not escalated to STUCK"
   pass "local-only clone is skipped (benign), not flagged STUCK"
+}
+
+test_external_path_honors_basename_delivery_mode() {
+  local home clone external out before remote
+  home=$(new_home)
+  clone=$(build_pair "$home" external-mode)
+  remote=$(git -C "$clone" remote get-url origin)
+  external="$home/outside/external-mode"
+  mkdir -p "$(dirname "$external")"
+  git clone --quiet "$remote" "$external"
+  advance_origin "$home" external-mode C1
+  mkdir -p "$home/data"
+  printf -- '- external-mode [local-only] - test project (added 2026-07-23)\n' > "$home/data/projects.md"
+  before=$(head_sha "$external")
+
+  out=$(run_sync "$home" "$external")
+
+  assert_contains "$out" "skipped: local-only project" "external clone ignored the basename registry mode"
+  [ "$(head_sha "$external")" = "$before" ] || fail "external local-only clone was advanced"
+  pass "external clone paths honor the basename project delivery mode"
 }
 
 test_single_project_by_bare_name_resolves() {
@@ -432,6 +721,34 @@ test_single_project_unresolvable_name_still_skips() {
 
   assert_contains "$out" "skipped: not a directory" "an unresolvable name still hits the existing not-a-directory skip"
   pass "single-project form leaves a genuinely bad name unresolved"
+}
+
+test_parent_relative_exact_root_and_lock_identity_failure() {
+  local home clone caller out before status
+  home=$(new_home)
+  clone=$(build_pair "$home" parent-relative)
+  advance_origin "$home" parent-relative C1
+  caller="$home/caller"
+  mkdir -p "$caller"
+  out=$(
+    cd "$caller" || exit 1
+    run_sync "$home" ../projects/parent-relative
+  )
+  assert_contains "$out" "parent-relative: synced" \
+    "parent-relative exact repository root was rejected"
+  [ "$(head_sha "$clone")" = "$(git -C "$clone" rev-parse origin/main)" ] \
+    || fail "parent-relative fleet sync did not reach origin/main"
+
+  before=$(head_sha "$clone")
+  set +e
+  FM_CHECKOUT_TEST_DISABLE_SYSTEM_PERL=1 bash -c \
+    '. "$1"; fm_checkout_lock_path "$2" "$3" >/dev/null' \
+    _ "$ROOT/bin/fm-checkout-lock-lib.sh" "$clone" "$home/locks"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "checkout lock identity succeeded without its fixed identity tool"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "lock identity failure mutated the checkout"
+  pass "parent-relative roots work and lock identity failures fail closed"
 }
 
 test_whole_fleet_form() {
@@ -603,6 +920,65 @@ test_non_signature_fetch_failure_is_not_retried() {
   pass "a non-packed-refs.lock fetch failure keeps today's behavior (no retry)"
 }
 
+test_expected_origin_is_rechecked_inside_mutation_lock() {
+  local home clone original replacement before out
+  home=$(new_home)
+  clone=$(build_pair "$home" origin-lock-proof)
+  replacement=$(build_pair "$home" origin-lock-replacement)
+  original=$(git -C "$clone" remote get-url origin)
+  before=$(head_sha "$clone")
+  out=$(FM_FLEET_SYNC_EXPECTED_ORIGIN_KIND=origin \
+    FM_FLEET_SYNC_EXPECTED_ORIGIN_VALUE="$original" \
+    FM_FLEET_SYNC_TEST=1 \
+    FM_FLEET_SYNC_TEST_DRIFT_ORIGIN_TO="$(git -C "$replacement" remote get-url origin)" \
+    run_sync "$home" "$clone")
+  assert_contains "$out" "checkout repository or origin identity drifted before mutation" \
+    "origin drift under the checkout lock was not surfaced"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "origin drift under lock mutated the checkout"
+  pass "expected origin is rechecked under the checkout mutation lock"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
+  test_live_default_probe_overrides_stale_origin_head
+  test_direct_sync_honors_shared_checkout_lock
+  test_direct_sync_timeout_terminates_descendants
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12-ownership ]; then
+  test_direct_sync_honors_shared_checkout_lock
+  test_direct_sync_timeout_terminates_descendants
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-safety ]; then
+  test_status_failure_is_never_treated_as_clean
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-followups ]; then
+  test_direct_and_batch_sync_reject_nested_repository_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-symlinks ]; then
+  test_direct_and_batch_sync_reject_symlink_repository_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-authority ]; then
+  test_parent_relative_exact_root_and_lock_identity_failure
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-durable-identity ]; then
+  test_expected_origin_is_rechecked_inside_mutation_lock
+  exit 0
+fi
+
+test_status_failure_is_never_treated_as_clean
+test_direct_and_batch_sync_reject_nested_repository_paths
+test_direct_and_batch_sync_reject_symlink_repository_paths
 test_detached_clean_ancestor_recovers
 test_detached_unique_commit_is_stuck_untouched
 test_detached_clean_ancestor_with_diverged_local_default_is_stuck_untouched
@@ -610,14 +986,19 @@ test_dirty_is_stuck_untouched
 test_non_default_branch_is_stuck_untouched
 test_diverged_is_stuck_untouched
 test_on_default_clean_behind_fast_forwards
+test_live_default_probe_overrides_stale_origin_head
+test_direct_sync_honors_shared_checkout_lock
+test_direct_sync_timeout_terminates_descendants
 test_already_current_unchanged
 test_no_origin_skipped
 test_local_only_skipped
+test_external_path_honors_basename_delivery_mode
 test_single_project_by_bare_name_resolves
 test_single_project_by_bare_name_ignores_cwd_shadow
 test_single_project_by_projects_relative_name_resolves
 test_single_project_by_projects_relative_name_ignores_cwd_shadow
 test_single_project_unresolvable_name_still_skips
+test_parent_relative_exact_root_and_lock_identity_failure
 test_whole_fleet_form
 test_bootstrap_relays_recovered_and_stuck
 test_orphaned_stale_packed_refs_lock_recovers
@@ -625,3 +1006,4 @@ test_live_packed_refs_lock_is_never_removed
 test_live_git_cwd_in_clone_dir_blocks_removal
 test_transient_packed_refs_lock_self_clears
 test_non_signature_fetch_failure_is_not_retried
+test_expected_origin_is_rechecked_inside_mutation_lock

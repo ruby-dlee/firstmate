@@ -80,15 +80,15 @@ Herdr is experimental and can be selected explicitly or by runtime auto-detectio
 Herdr's container shape is workspace-per-home plus tab-per-task: the primary home uses workspace label `firstmate`, secondmate homes use `2ndmate-<secondmate-id>`, and recovery/list-live scopes to the current `FM_HOME`'s workspace.
 Zellij is experimental and selected only explicitly: treehouse remains its worktree provider too, and its full verification - the resolved "gaps to verify" list from the original design report, the unconditional-exit-0 CLI quirk and its mitigation, the focus-steal-on-new-tab finding, the home-scoped tab-title collision fix, and known gaps - is recorded in `docs/zellij-backend.md`.
 Zellij's container shape is simpler than herdr's: one shared `firstmate` session, one tab per task, with no per-home workspace split; visible tab titles are scoped by the active home label plus a short hash of the resolved `FM_ROOT` path.
-Orca is experimental and selected only explicitly for eligible pre-cutover tasks: Orca owns both worktree and terminal lifecycle, records `orca_worktree_id=` and `terminal=`, and removes worktrees through `orca worktree rm` only after the usual firstmate teardown checks pass.
-New tasks refuse Orca; [docs/orca-backend.md](orca-backend.md#eligibility) owns the rationale and exact legacy eligibility rule.
+Orca is experimental and legacy-recovery-only. Existing terminal supervision remains explicit, while respawn and destructive teardown fail closed until the provider exposes empirically verified task/worktree/terminal authority and complete terminal inventory.
+New tasks refuse Orca; [docs/orca-backend.md](orca-backend.md#eligibility) owns the rationale, supervision boundary, and re-enablement criteria.
 cmux is experimental, GUI-first, macOS-only, and can be selected explicitly or by runtime auto-detection from its primary `CMUX_WORKSPACE_ID` marker plus documented fallback signals: treehouse remains its worktree provider (cmux is a session provider only, like herdr/zellij), and its full verification - the socket access setup requirement with Automation mode recommended, the read-screen-fails-on-a-fresh-surface finding, the close-surface-refuses-on-the-last-surface finding, the source-verified runtime marker and fallback behavior, and known gaps - is recorded in `docs/cmux-backend.md`.
 cmux's container shape is one workspace per task with one surface, no per-home container split; workspace titles are scoped by the active home label plus a short hash of the resolved `FM_ROOT` path, and `--secondmate` spawns are refused, mirroring Orca.
 Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectable as a runtime backend.
 
 ## Worktrees, not branches in your checkout
 
-Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for new tmux, herdr, zellij, and cmux tasks, while an eligible legacy Orca respawn creates its own worktree.
+Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for new tmux, herdr, zellij, and cmux tasks.
 For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
@@ -153,7 +153,7 @@ Secondmates are idle by default: after startup recovery reconciles only work alr
 When called with `FM_HOME=<this-firstmate-home>` or when `FM_HOME` is already set to the active firstmate home, metadata-routed `fm-send.sh` requests to a live `kind=secondmate` are prefixed with the from-firstmate marker from `bin/fm-marker-lib.sh`, so the secondmate returns terse answers through status lines and detailed answers through docs plus status pointers instead of replying only in its own chat.
 Explicit backend-target sends and direct human typing stay unmarked, so captain intervention in a secondmate pane remains conversational.
 After seeding a secondmate, `fm-backlog-handoff.sh` validates the fleet-specific handoff, then atomically delegates already-judged in-scope queued item moves to `tasks-axi mv` so the domain queue starts in the right place.
-Idle secondmate panes are healthy; teardown is explicit and refuses while the secondmate home has in-flight work unless the captain has approved discard with `--force`.
+Idle secondmate panes are healthy; teardown is explicit, proves the home identity and landed state before quiescing its endpoint, repeats those checks at the locked removal boundary, and uses `--force` only to recursively retire children that independently pass every safety proof.
 
 Secondmate homes converge conservatively to the primary's version and declared inheritable configuration at launch and during locked session start.
 The [`secondmate-provisioning` skill](../.agents/skills/secondmate-provisioning/SKILL.md) owns the full guarded sync, propagation, nudge, and mid-session configuration-push contract.
@@ -229,13 +229,24 @@ Generalizable firstmate knowledge goes to shared tracked docs through the normal
 
 ## Local clones stay fresh
 
-The locked session-start bootstrap step, PR-based teardown, and merged-PR wake handling refresh remote-backed project clones when the clone is safe to move.
-Wake-time refreshes can target a single clone by project name, so the primary home also catches up when a secondmate reports a merge from its own home.
+The installed checkout-refresh owner polls tracked upstream default-branch tips independently of Firstmate tasks and reacts to changes from any contributor.
+A 15-minute full-refresh backstop bounds drift when a signal is missed, while the locked session-start sweep, PR-based teardown, and merged-PR wake handling remain additional refresh paths.
+The covered set includes exact Git roots for the active home's project clones, Treehouse backing checkouts, configured paths, and matching-origin top-level clones such as a parallel checkout under `$HOME`.
+Uninspectable active-home projects, unreadable or unenumerable scan roots and repository origins, invalid checkout-refresh configuration, malformed or unreadable Treehouse state, changed or missing prior checkout identities, unsafe alert state, and failed skill inventories invalidate coverage health until discovery and hygiene inspection complete.
+Treehouse skips dirty pool entries and fetches origin when Firstmate requests a durable task lease.
+Firstmate verifies each task lease and every leased or explicit secondmate home is clean, belongs to the requested repository, and matches the upstream tip before creating an endpoint, seeding, or launching.
+Remote-free local-only acquisitions use the requested repository's local default tip, while stale, dirty, changed, or unverifiable acquisitions are diagnosed and remain leased without destructive return.
+Rollback returns a task lease only after re-proving its repository identity, cleanliness, and expected detached tip.
 Clean default-branch clones fast-forward to `origin/<default>`, and a clean detached HEAD that holds no unique commits is re-attached to the default branch before the same fast-forward path runs.
+Registered local-only and remote-free clones are inspected without fetching and must be clean, on their local default branch, and at that branch's proven tip.
+The shared mutation path holds one canonical repository lock for refresh, Treehouse acquisition, and every process-tree-bounded Treehouse return, and proves the fetched default ref against the live upstream `HEAD`, while teardown requires its locked pre-fetch and post-fetch probes to agree, so scheduler, preflight, teardown, and merged-PR wake callers neither race nor trust stale `origin/HEAD`.
+Every signal probe also surfaces a new or growing inventory of non-ignored untracked files under repository skill directories in covered seed checkouts and Treehouse pool worktrees, while each full safe refresh quantifies all non-ignored untracked files in any dirty-checkout alarm.
+That early hygiene signal prevents local skill drafts from silently accumulating until an upstream commit claims the same paths.
 Dirty clones, non-default branches, detached HEADs with unique commits, diverged defaults, and default branches checked out in another worktree are reported as `STUCK:` with their behind count and left untouched.
+Gone local branches are retained unless remote reachability or default-branch content positively proves their work landed.
 Fetches blocked by an orphaned `.git/packed-refs.lock` use bounded retries and remove the lock only when the shared staleness proof can prove it abandoned; [configuration.md](configuration.md#toolchain) owns the recovery details and tuning knobs.
 Local-only projects, clones without an origin remote, and fetch failures remain benign skips.
-The refresh also prunes local branches whose remote is gone and that no worktree still needs.
+The session-start refresh may prune local branches whose remote is gone and that no worktree still needs; the independent cadence and spawn preflight disable pruning.
 
 ## Self-updates stay safe
 

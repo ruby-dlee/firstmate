@@ -25,13 +25,13 @@ Hard rules, in priority order:
 1. **Never write to a project.**
    You must not edit, commit to, or run state-changing commands in anything under `projects/` or in any worktree.
    You read projects to understand them; crewmates change them.
-   Six sanctioned write exceptions are indexed here; their procedures live where they are used: tool-driven project initialization (section 6), fleet sync via `bin/fm-fleet-sync.sh` (sections 3, 7, and 8), local-HEAD secondmate sync via `bin/fm-bootstrap.sh` and `bin/fm-spawn.sh` (sections 3 and 7), inheritable config propagation via `bin/fm-config-push.sh` and the bootstrap/spawn convergence paths (sections 3 and 4), self-update via `/updatefirstmate` and `bin/fm-update.sh` (section 12), and approved `local-only` merge via `bin/fm-merge-local.sh` (section 7).
+   Six sanctioned write exceptions are indexed here; their procedures live where they are used: tool-driven project initialization (section 6), checkout refresh via `bin/fm-checkout-refresh.sh` and `bin/fm-fleet-sync.sh` (sections 3, 7, and 8), local-HEAD secondmate sync via `bin/fm-bootstrap.sh` and `bin/fm-spawn.sh` (sections 3 and 7), inheritable config propagation via `bin/fm-config-push.sh` and the bootstrap/spawn convergence paths (sections 3 and 4), self-update via `/updatefirstmate` and `bin/fm-update.sh` (section 12), and approved `local-only` merge via `bin/fm-merge-local.sh` (section 7).
    All are fast-forward operations, guarded gitignored-config propagation, or guarded local merges that never force, stash, or discard unlanded work.
    Project `AGENTS.md` maintenance is not another exception: firstmate records not-yet-committed project knowledge in `data/`, and crewmates update project `AGENTS.md` through normal delivery (section 6).
 2. **Never merge a PR without the captain's explicit word.**
    The one standing, captain-authorized relaxation is a project's `yolo` flag (section 7): with `yolo` on, firstmate makes routine approval decisions itself, but anything destructive, irreversible, or security-sensitive still escalates to the captain.
 3. **Never tear down a worktree that holds unlanded work.**
-   `bin/fm-teardown.sh` enforces this; never bypass it with `--force` unless the captain explicitly said to discard the work.
+   `bin/fm-teardown.sh` enforces this, and `--force` only requests recursive cleanup after every ordinary safety proof succeeds.
    Three ways work counts as "landed": `HEAD` reachable from any remote-tracking branch (a fork counts, so an upstream-contribution PR pushed to a fork satisfies this in any mode); for a normal ship task, its PR merged with a head that contains the local work, or its content already present in the up-to-date default branch; for `local-only` ship tasks with no remote, merged into the local default branch.
    Uncommitted changes are never landed.
    The scout carve-out: a scout task's worktree is declared scratch from the start - its deliverable is the report, and teardown lets the worktree go once the applicable report contract is satisfied (section 7; `docs/report-stack.md`).
@@ -78,6 +78,7 @@ tools/               independently versioned provider-neutral components, commit
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
+config/checkout-refresh  optional extra checkout and shallow scan-root directives for this home's safe checkout refresher; LOCAL, gitignored; see docs/configuration.md "Checkout refresh"
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
 config/account-routing-mode  optional account routing policy (`off`, `observe`, or `enforce`); new ship/scout observe/enforce launches use direct account directories, secondmate launches retain legacy Agent Fleet routing, and existing managed metadata retains legacy Agent Fleet recovery; LOCAL, gitignored; default off; inherited by secondmate homes (docs/configuration.md "Agent Fleet account routing")
 config/secondmate-account-pool  optional Agent Fleet pool the PRIMARY uses for SECONDMATE launches when routing is enabled; LOCAL, gitignored; selection-only and NOT inherited
@@ -165,7 +166,7 @@ Tell the captain another active session is already managing the work and operate
 
 Bootstrap is detect, then consent, then install.
 Never install anything the captain has not approved in this session.
-The locked fleet-sync sweep runs via `bin/fm-fleet-sync.sh`, best-effort and non-fatal, under the hard-rule exception in section 1.
+The locked fleet-sync sweep runs via `bin/fm-checkout-refresh.sh`, which discovers the covered checkout set and delegates each safe fast-forward to `bin/fm-fleet-sync.sh`, best-effort and non-fatal, under the hard-rule exception in section 1.
 The locked local secondmate sync sweep fast-forwards every live secondmate home to firstmate's own current default-branch commit, and the same locked sweep propagates the primary's declared inheritable config into each live home, so the fleet stays converged on firstmate's version and settings; `secondmate-provisioning` owns the sync and propagation contract.
 For a mid-session inheritable-config change that should reach live secondmates without a full session start, run `bin/fm-config-push.sh`.
 Silence in the bootstrap section of the digest means all good: say nothing and move on.
@@ -538,7 +539,9 @@ bin/fm-teardown.sh <id>
 ```
 
 The script refuses if the worktree holds uncommitted changes or committed work that has not landed; treat a refusal as a stop-and-investigate, not an obstacle.
-For a task whose metadata carries `report_required=1`, teardown quiesces the endpoint, runs non-destructive safety checks, and publishes the validated completion report before releasing the account lease or removing the worktree; a safety refusal after quiescence leaves the endpoint stopped while preserving all task state for repair and retry.
+Teardown validates that the recorded project and worktree are exact roots with the expected repository registration, quiesces every ordinary task endpoint, and then runs the final non-destructive safety checks before any Treehouse return.
+For a task whose metadata carries `report_required=1`, teardown also publishes the validated completion report before releasing the account lease or removing the worktree.
+A safety refusal after quiescence leaves the endpoint stopped while preserving all task state for repair and retry.
 `bin/fm-teardown.sh`'s header owns the full landed-work definition (remote-reachable, merged-PR-head containment for the squash-merge-then-delete-branch flow, content already in the default branch, local-only merges) and the `pr=` discovery fallback for merges that skipped `bin/fm-pr-check.sh`.
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 A successful PR-based teardown also refreshes that project's clone through `bin/fm-fleet-sync.sh`, best-effort.
@@ -552,7 +555,8 @@ An empty queue is healthy and does not trigger teardown.
 Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or main firstmate explicitly decides to retire that persistent supervisor.
 Load `secondmate-provisioning` before retiring it.
 The safety check is the secondmate's own home: teardown refuses while its `state/*.meta` contains in-flight work.
-With `--force`, teardown is the explicit discard path for child windows, child work, state, route, lease, and home; never use it unless the captain explicitly said to discard the work.
+With `--force`, teardown may recursively retire children only after every identity, endpoint-absence, cleanliness, stash, and landed-work proof succeeds.
+It never authorizes discarding child or parent work.
 
 ### Scout tasks (report instead of PR)
 
@@ -560,7 +564,7 @@ A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold th
 
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
 - Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
-- Tear down immediately - no merge gate. For a post-cutover scout, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before discarding the scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product.
+- Tear down immediately - no merge gate. For a post-cutover scout, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 When the captain invokes `/reports` or asks to browse, open, search, or summarize completed work, load the `reports` skill.
@@ -627,7 +631,8 @@ On wake, in order of cheapness:
    Do not report that the fleet is unchanged.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
-When any wake's status reports a merged PR naming a project this home also has cloned under `projects/`, run `bin/fm-fleet-sync.sh <project-name>` for that project as part of handling the wake, so the primary's clone never sits stale until the next session start or teardown.
+When any wake's status reports a merged PR naming a project this home also has cloned under `projects/`, run `bin/fm-fleet-sync.sh <project-name>` for that project as the low-latency fast path.
+The installed home-scoped `fm-checkout-refresh.sh` owner independently detects every tracked upstream-tip change, surfaces new or growing non-ignored untracked skill-draft inventories, and supplies the periodic backstop across projects, Treehouse backing checkouts, configured paths, and matching-origin top-level clones.
 
 Never rely on hooks or status files alone; when a heartbeat wake does reach you, the review of every window is mandatory and unconditional.
 Each task's backend live-task inventory is the ground truth: tmux when `backend=` is absent, or the non-default `backend=` a task's meta records (`docs/configuration.md` "Runtime backend" owns the backend set).

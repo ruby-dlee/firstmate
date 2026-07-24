@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
-# pre-cutover Orca respawn, or a secondmate in its isolated firstmate home.
+# pre-cutover Orca direct recovery with empirically verified provider authority,
+# or a secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #        fm-spawn.sh <task-id> --recover-direct-account
@@ -19,10 +20,10 @@
 #   fm_backend_detect, with cmux fallback details in docs/cmux-backend.md),
 #   then tmux.
 #   New-task spawn-capable backends are the reference tmux adapter and
-#   experimental herdr, zellij, and cmux. Orca is available only to respawn a
-#   pre-cutover task whose meta has no report_required marker; it owns both the
-#   task worktree and terminal, so an eligible Orca respawn does not run
-#   treehouse get. cmux is a session provider only, exactly like herdr/zellij,
+#   experimental herdr, zellij, and cmux. Orca's legacy respawn design owns both
+#   the task worktree and terminal, but currently fails closed before provider
+#   mutation because its lifecycle authority is unverified. cmux is a session
+#   provider only, exactly like herdr/zellij,
 #   so it does. An auto-detected herdr or cmux spawn prints a loud stderr notice;
 #   auto-detected tmux stays silent; zellij and orca are never auto-detected.
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
@@ -82,10 +83,19 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
-#   Before a secondmate launch, the home is locally fast-forwarded to the primary
-#   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Before a secondmate launch, the home must fast-forward safely to the primary
+#   default-branch commit and independently match the live default tip.
+#   Any unproven freshness state refuses launch.
+#   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
+#   surface dirty pool entries, and durably lease one available worktree before
+#   creating the endpoint. They refuse to create that endpoint unless the leased
+#   path is a clean isolated worktree from the requested repository whose HEAD
+#   matches its live upstream or local default-branch tip. Dirty acquisitions
+#   remain under their durable lease for manual recovery. Other pre-commit
+#   failures close the prepared endpoint, restore prior task state, and return
+#   only a worktree whose repository identity, cleanliness, and expected detached
+#   tip are re-proven before and after owned hook cleanup, with the return held
+#   under the common checkout mutation lock.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -126,7 +136,11 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh}"
 SUB_HOME_MARKER=".fm-secondmate-home"
+# shellcheck source=bin/fm-checkout-lock-lib.sh
+. "$SCRIPT_DIR/fm-checkout-lock-lib.sh"
+CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
@@ -422,6 +436,8 @@ RECOVERY_ACCOUNT=0
 RESUME_META=
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
+SECONDMATE_HOME_LIFECYCLE_LOCK=
+SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_INHERITED_PID=
 LIFECYCLE_LOCK_INHERITED_START=
 SPAWN_META_PRESENT=0
@@ -429,6 +445,15 @@ SPAWN_META_SNAPSHOT=
 SPAWN_PREFLIGHT_ID=${POS[0]:-}
 spawn_idpart=${SPAWN_PREFLIGHT_ID%%=*}
 SPAWN_PREFLIGHT_BATCH=0
+
+release_secondmate_home_lifecycle_locks() {
+  [ -z "${SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK:-}" ] \
+    || fm_account_lifecycle_lock_release "$SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  [ -z "${SECONDMATE_HOME_LIFECYCLE_LOCK:-}" ] \
+    || fm_account_lifecycle_lock_release "$SECONDMATE_HOME_LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK=
+  SECONDMATE_HOME_LIFECYCLE_LOCK=
+}
 if [ -n "$SPAWN_PREFLIGHT_ID" ] && [ "$SPAWN_PREFLIGHT_ID" != "$spawn_idpart" ] \
   && case "$spawn_idpart" in */*) false ;; *) true ;; esac; then
   SPAWN_PREFLIGHT_BATCH=1
@@ -439,7 +464,7 @@ spawn_preflight_read_meta() {  # <meta>
 }
 
 spawn_preflight_load_meta() {  # <required:0|1>
-  local required=$1
+  local required=$1 cleanup_count cleanup_value
   RESUME_META="$STATE/$SPAWN_PREFLIGHT_ID.meta"
   if [ -e "$STATE" ] || [ -L "$STATE" ]; then
     [ -d "$STATE" ] && [ ! -L "$STATE" ] || {
@@ -459,6 +484,16 @@ spawn_preflight_load_meta() {  # <required:0|1>
       return 1
     }
     SPAWN_META_PRESENT=1
+    cleanup_count=$(printf '%s\n' "$SPAWN_META_SNAPSHOT" | grep -c '^orca_cleanup_pending=' || true)
+    if [ "$cleanup_count" -ne 0 ]; then
+      cleanup_value=$(spawn_preflight_meta_value orca_cleanup_pending)
+      if [ "$cleanup_count" -eq 1 ] && [ "$cleanup_value" = 1 ]; then
+        echo "error: Orca cleanup is pending for $SPAWN_PREFLIGHT_ID; run fm-teardown.sh $SPAWN_PREFLIGHT_ID before retrying spawn" >&2
+      else
+        echo "error: invalid Orca cleanup metadata for $SPAWN_PREFLIGHT_ID; refusing spawn" >&2
+      fi
+      return 1
+    fi
   elif [ "$required" = 1 ]; then
     echo "error: no metadata for managed recovery at $RESUME_META" >&2
     return 1
@@ -469,19 +504,48 @@ spawn_preflight_meta_value() {  # <key>
   printf '%s\n' "$SPAWN_META_SNAPSHOT" | sed -n "s/^$1=//p" | tail -1
 }
 
+spawn_preflight_kind_value() {
+  local parsed count value
+  parsed=$(printf '%s\n' "$SPAWN_META_SNAPSHOT" | awk '
+    index($0, "kind=") == 1 {
+      count++
+      value = substr($0, 6)
+    }
+    END {
+      printf "%d\t%s\n", count + 0, value
+    }
+  ') || return 1
+  count=${parsed%%$'\t'*}
+  value=${parsed#*$'\t'}
+  case "$count:$value" in
+    0:) printf '%s\n' ship ;;
+    1:ship|1:scout|1:secondmate) printf '%s\n' "$value" ;;
+    1:*)
+      echo "error: managed recovery metadata has invalid kind '$value' for $SPAWN_PREFLIGHT_ID" >&2
+      return 1
+      ;;
+    *)
+      echo "error: managed recovery metadata has duplicate kind records for $SPAWN_PREFLIGHT_ID" >&2
+      return 1
+      ;;
+  esac
+}
+
 spawn_refuse_report_required_orca() {
-  local report_required=1
-  if [ "$SPAWN_META_PRESENT" = 1 ]; then
-    if printf '%s\n' "$SPAWN_META_SNAPSHOT" | grep -q '^report_required='; then
-      [ "$(spawn_preflight_meta_value report_required)" = 1 ] || report_required=0
-    else
-      report_required=0
-    fi
-  fi
-  if [ "$report_required" = 1 ]; then
+  local report_count
+  if [ "$SPAWN_META_PRESENT" != 1 ]; then
     echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
     return 1
   fi
+  report_count=$(printf '%s\n' "$SPAWN_META_SNAPSHOT" | grep -c '^report_required=' || true)
+  [ "$report_count" -eq 0 ] || {
+    if [ "$report_count" -eq 1 ] && [ "$(spawn_preflight_meta_value report_required)" = 1 ]; then
+      echo "error: backend=orca cannot host new report-required tasks: Orca has no reliable endpoint-absence proof, so report-gated teardown could never complete; spawn report-required work on tmux, herdr, zellij, or cmux" >&2
+    else
+      echo "error: invalid report_required metadata for $SPAWN_PREFLIGHT_ID; legacy Orca recovery requires the marker to be absent" >&2
+    fi
+    return 1
+  }
 }
 
 reconcile_failed_direct_recovery() {
@@ -608,6 +672,24 @@ reconcile_failed_direct_recovery() {
   echo "fm-spawn: cleaned retained direct recovery endpoint for $task" >&2
 }
 
+spawn_refuse_existing_orca_provider_identity() {
+  [ "$SPAWN_META_PRESENT" != 1 ] || [ "$(spawn_preflight_meta_value backend)" != orca ] || {
+    echo "error: existing Orca provider identity for $SPAWN_PREFLIGHT_ID must be cleared by teardown before respawn" >&2
+    return 1
+  }
+}
+
+spawn_refuse_unsupported_secondmate_backend() {
+  [ "$KIND" != secondmate ] || [ "$BACKEND" != orca ] || {
+    echo "error: backend=orca does not support --secondmate spawns yet" >&2
+    return 1
+  }
+  [ "$KIND" != secondmate ] || [ "$BACKEND" != cmux ] || {
+    echo "error: backend=cmux does not support --secondmate spawns yet" >&2
+    return 1
+  }
+}
+
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: account recovery requires a task id" >&2; exit 1; }
   case "$SPAWN_PREFLIGHT_ID" in *=*) echo "error: account recovery does not support batch syntax" >&2; exit 1 ;; esac
@@ -616,9 +698,13 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     exit 1
   fi
   spawn_preflight_load_meta 1 || exit 1
+  recorded_kind=$(spawn_preflight_kind_value) || exit 1
+  if [ "$KIND" != ship ] && [ "$KIND" != "$recorded_kind" ]; then
+    echo "error: account recovery kind '$KIND' does not match recorded kind '$recorded_kind'" >&2
+    exit 1
+  fi
+  KIND=$recorded_kind
   if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-    KIND=$(spawn_preflight_meta_value kind)
-    [ -n "$KIND" ] || KIND=ship
     case "$KIND" in
       ship|scout) ;;
       *) echo "error: --recover-direct-account supports only recorded ship or scout tasks" >&2; exit 1 ;;
@@ -641,20 +727,14 @@ else
 fi
 fm_backend_validate_spawn "$BACKEND" || exit 1
 fm_backend_source "$BACKEND" || exit 1
-if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
-  echo "error: backend=orca does not support --secondmate spawns yet" >&2
-  exit 1
-fi
-if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
-  echo "error: backend=cmux does not support --secondmate spawns yet" >&2
-  exit 1
-fi
+spawn_refuse_unsupported_secondmate_backend || exit 1
 if [ "$BACKEND" = orca ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] \
   && { [ -e "$STATE/$SPAWN_PREFLIGHT_ID.meta" ] || [ -L "$STATE/$SPAWN_PREFLIGHT_ID.meta" ]; }; then
   spawn_preflight_load_meta 0 || exit 1
 fi
 if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_META_PRESENT" = 1 ]; then
   spawn_refuse_report_required_orca || exit 1
+  [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || spawn_refuse_existing_orca_provider_identity || exit 1
 fi
 if [ "$BACKEND" = orca ] && { [ "$RECOVERY_ACCOUNT" = 0 ] || [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; }; then
   fm_backend_orca_runtime_check || exit 1
@@ -664,6 +744,25 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ] && [ "$SPAWN_
 fi
 if [ "$BACKEND" = orca ] && [ "$SPAWN_PREFLIGHT_BATCH" = 0 ]; then
   spawn_refuse_report_required_orca || exit 1
+  [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || spawn_refuse_existing_orca_provider_identity || exit 1
+fi
+
+if [ "$SPAWN_PREFLIGHT_BATCH" = 0 ]; then
+  SECONDMATE_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FM_HOME") || exit 1
+  trap 'release_secondmate_home_lifecycle_locks' EXIT
+  fm_checkout_trusted_dir "$FM_HOME" >/dev/null || {
+    echo "error: active firstmate home was removed or redirected while spawn waited for lifecycle ownership" >&2
+    exit 1
+  }
+  if [ -e "$FM_HOME/$SUB_HOME_MARKER" ] || [ -L "$FM_HOME/$SUB_HOME_MARKER" ]; then
+    [ -f "$FM_HOME/$SUB_HOME_MARKER" ] && [ ! -L "$FM_HOME/$SUB_HOME_MARKER" ] || {
+      echo "error: unsafe secondmate home marker at $FM_HOME/$SUB_HOME_MARKER" >&2
+      exit 1
+    }
+  elif [ -f "$FM_HOME/data/charter.md" ]; then
+    echo "error: secondmate home changed while spawn waited for lifecycle ownership" >&2
+    exit 1
+  fi
 fi
 
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
@@ -712,7 +811,7 @@ if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
     exit 1
   fi
   LIFECYCLE_LOCK_OWNED=1
-  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true; release_secondmate_home_lifecycle_locks' EXIT
   # The handoff replaces the lock inode while live ownership prevents reclaim until this child releases the replacement.
   if ! fm_account_lifecycle_lock_owned "$LIFECYCLE_LOCK"; then
     echo "error: inherited account lifecycle lock ownership handoff failed for $inherited_lock_id" >&2
@@ -726,7 +825,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "${POS[0]}") || exit 1
     LIFECYCLE_LOCK_OWNED=1
   fi
-  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true' EXIT
+  trap '[ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true; release_secondmate_home_lifecycle_locks' EXIT
   current_spawn_meta=$(spawn_preflight_read_meta "$RESUME_META") || {
     echo "error: unsafe metadata for managed recovery at $RESUME_META" >&2
     exit 1
@@ -735,6 +834,11 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   # serializes recovery, refresh it so a waiter validates the committed
   # replacement generation instead of rejecting that generation as stale.
   SPAWN_META_SNAPSHOT=$current_spawn_meta
+  current_recorded_kind=$(spawn_preflight_kind_value) || exit 1
+  [ "$current_recorded_kind" = "$KIND" ] || {
+    echo "error: managed recovery kind changed before launch for ${POS[0]}" >&2
+    exit 1
+  }
   rm -rf "$STATE/.${POS[0]}.account-native-launch" "$STATE/.${POS[0]}.account-native-ready" "$STATE/.${POS[0]}.account-native-go" || exit 1
   direct_recovery_cleanup=$(fm_account_meta_value "$RESUME_META" direct_recovery_cleanup)
   if [ -n "$direct_recovery_cleanup" ]; then
@@ -853,6 +957,11 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+ORCA_TERMINAL_PROOF=
+ORCA_REPO_ID=
+ORCA_EXPECTED_TASK=
+ORCA_PROVIDER_TASK=
+ID=
 ACCOUNT_LEASE_CREATED=0
 FM_ACCOUNT_MUTATION_ACQUIRED=0
 ACCOUNT_SPAWN_COMMITTED=0
@@ -870,6 +979,8 @@ ACCOUNT_PREDECESSOR_SESSION=
 CONTINUATION_PACKET=
 ENDPOINT_CREATED=0
 WORKTREE_CREATED=0
+WORKTREE_RETAIN_ON_ABORT=0
+WORKTREE_EXPECTED_TIP=
 META_INSTALLED=0
 META_BACKUP=
 EXISTING_ARTIFACT_BACKUP=
@@ -922,18 +1033,131 @@ discard_existing_artifact_backup() {
 parse_orca_worktree_result() {
   local raw=$1 rest
   ORCA_WORKTREE_ID=${raw%%$'\t'*}
-  if [ "$raw" = "$ORCA_WORKTREE_ID" ]; then
-    WT=
-    ORCA_TERMINAL=
-    return 1
-  fi
+  [ "$raw" != "$ORCA_WORKTREE_ID" ] || return 1
   rest=${raw#*$'\t'}
   WT=${rest%%$'\t'*}
-  if [ "$rest" != "$WT" ]; then
-    ORCA_TERMINAL=${rest#*$'\t'}
-  else
-    ORCA_TERMINAL=
-  fi
+  [ "$rest" != "$WT" ] || return 1
+  rest=${rest#*$'\t'}
+  ORCA_TERMINAL=${rest%%$'\t'*}
+  [ "$rest" != "$ORCA_TERMINAL" ] || return 1
+  rest=${rest#*$'\t'}
+  ORCA_TERMINAL_PROOF=${rest%%$'\t'*}
+  [ "$rest" != "$ORCA_TERMINAL_PROOF" ] || return 1
+  rest=${rest#*$'\t'}
+  ORCA_REPO_ID=$rest
+  case "$ORCA_REPO_ID" in *$'\t'*) return 1 ;; esac
+  ORCA_PROVIDER_TASK=
+}
+
+persist_orca_cleanup_quarantine() {
+  local phase=$1
+  mkdir -p "$STATE" || return 1
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
+  python3 - "$STATE" "$STATE/$ID.meta" "$phase" \
+    "${W:-fm-$ID}" "${WT:-}" "${PROJ_ABS:-}" "${HARNESS:-}" "${KIND:-ship}" \
+    "${MODE:-no-mistakes}" "${YOLO:-off}" "${TASK_TMP:-}" "${MODEL:-default}" \
+    "${EFFORT:-default}" "${ORCA_WORKTREE_ID:-}" "${ORCA_TERMINAL:-}" \
+    "${ORCA_TERMINAL_PROOF:-unproven}" "${ORCA_REPO_ID:-}" "fm-$ID" \
+    "repo-path:${PROJ_ABS:-}" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+
+(state, metadata, phase, window, worktree, project, harness, kind, mode, yolo,
+ tasktmp, model, effort, worktree_id, terminal, proof, repo_id, expected_task,
+ provider_scope) = sys.argv[1:]
+values = [
+    ("window", window),
+    ("worktree", worktree),
+    ("project", project),
+    ("harness", harness),
+    ("kind", kind),
+    ("mode", mode),
+    ("yolo", yolo),
+    ("tasktmp", tasktmp),
+    ("model", model),
+    ("effort", effort),
+    ("backend", "orca"),
+]
+if worktree_id:
+    values.append(("orca_worktree_id", worktree_id))
+if terminal:
+    values.append(("terminal", terminal))
+values.extend([
+    ("orca_cleanup_pending", "1"),
+    ("orca_cleanup_phase", phase),
+    ("orca_terminal_proof", proof),
+    ("orca_repo_id", repo_id),
+    ("orca_expected_task", expected_task),
+    ("orca_discovery_label", expected_task),
+    ("orca_provider_scope", provider_scope),
+])
+owned = {
+    "window", "worktree", "project", "harness", "kind", "mode", "yolo",
+    "tasktmp", "model", "effort", "backend", "orca_worktree_id", "terminal",
+    "orca_cleanup_pending", "orca_cleanup_phase", "orca_terminal_proof",
+    "orca_repo_id", "orca_expected_task", "orca_discovery_label",
+    "orca_provider_scope",
+}
+for key, value in values:
+    if any(character in value for character in "\0\r\n"):
+        raise SystemExit(1)
+state_metadata = os.lstat(state)
+if not stat.S_ISDIR(state_metadata.st_mode) or stat.S_ISLNK(state_metadata.st_mode):
+    raise SystemExit(1)
+preserved = []
+retained = {}
+try:
+    metadata_state = os.lstat(metadata)
+except FileNotFoundError:
+    metadata_state = None
+if metadata_state is not None:
+    if not stat.S_ISREG(metadata_state.st_mode) or stat.S_ISLNK(metadata_state.st_mode):
+        raise SystemExit(1)
+    with open(metadata, encoding="utf-8") as stream:
+        for line in stream:
+            key = line.split("=", 1)[0]
+            if key not in owned:
+                preserved.append(line)
+            elif "=" in line:
+                retained[key] = line.rstrip("\n").split("=", 1)[1]
+values = [
+    (key, retained.get(key, value) if value == "" else value)
+    for key, value in values
+]
+for key, value in values:
+    if any(character in value for character in "\0\r\n"):
+        raise SystemExit(1)
+descriptor, temporary = tempfile.mkstemp(prefix=".orca-quarantine.", dir=state)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.writelines(preserved)
+        for key, value in values:
+            output.write(f"{key}={value}\n")
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        destination = os.lstat(metadata)
+    except FileNotFoundError:
+        destination = None
+    if destination is not None and (
+        not stat.S_ISREG(destination.st_mode) or stat.S_ISLNK(destination.st_mode)
+    ):
+        raise OSError("unsafe quarantine destination")
+    os.replace(temporary, metadata)
+    directory = os.open(state, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
 }
 
 persist_failed_account_rollback() {
@@ -1190,8 +1414,95 @@ cleanup_continuation_launch_transport() {
   CONTINUATION_PROMPT_CONTENT_ID=
 }
 
+spawn_return_created_worktree() {
+  local return_output return_status
+  [ "$WORKTREE_CREATED" = 1 ] || return 0
+  [ "${BACKEND:-tmux}" != orca ] || return 0
+  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
+    echo "warning: retained unsafe acquired worktree $WT for manual recovery" >&2
+    return 1
+  fi
+  if [ -z "$WORKTREE_EXPECTED_TIP" ] \
+    || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
+    echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
+    return 1
+  fi
+  rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+  if ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
+    echo "warning: retained acquired worktree $WT because post-cleanup repository safety could not be re-proven" >&2
+    return 1
+  fi
+  if return_output=$(fm_checkout_treehouse_return "$WT" "$CHECKOUT_LOCK_ROOT" "$PROJ_ABS" 2>&1); then
+    [ -z "$return_output" ] || printf '%s\n' "$return_output" >&2
+    return 0
+  else
+    return_status=$?
+  fi
+  [ -z "$return_output" ] || printf '%s\n' "$return_output" >&2
+  case "$return_status:$return_output" in
+    "$FM_CHECKOUT_PROCESS_CLEANUP_FAILURE_STATUS:"*"Treehouse return process cleanup could not be verified"*)
+      echo "warning: retained rollback worktree $WT because Treehouse return process cleanup is unverified; inspect the reported anchored process group, terminate only its remaining processes, and retry cleanup" >&2
+      ;;
+  esac
+  return "$return_status"
+}
+
+spawn_restore_unmanaged_state_locked() {
+  local meta="$STATE/$ID.meta" current_generation artifact_backup_name
+  [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] || return 0
+  if [ -n "$EXISTING_ARTIFACT_BACKUP" ]; then
+    artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
+    fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "/tmp/fm-$ID" 1 || return 1
+  fi
+  if [ -n "$META_BACKUP" ]; then
+    [ -f "$META_BACKUP" ] && [ -f "$meta" ] || return 1
+    current_generation=$(fm_meta_get "$meta" generation_id)
+    if [ "$META_INSTALLED" = 1 ]; then
+      [ "$current_generation" = "$SPAWN_GENERATION_ID" ] || return 1
+    elif [ "${BACKEND:-tmux}" = orca ] \
+      && [ "$(fm_meta_get "$meta" orca_cleanup_pending)" = 1 ] \
+      && [ "$(fm_meta_get "$meta" orca_expected_task)" = "fm-$ID" ] \
+      && { [ -z "$(fm_meta_get "$meta" orca_worktree_id)" ] \
+        || [ "$(fm_meta_get "$meta" orca_worktree_id)" = "${ORCA_WORKTREE_ID:-}" ]; } \
+      && { [ -z "$(fm_meta_get "$meta" terminal)" ] \
+        || [ "$(fm_meta_get "$meta" terminal)" = "${ORCA_TERMINAL:-}" ]; }; then
+      :
+    else
+      cmp -s "$meta" "$META_BACKUP" || return 1
+    fi
+    fm_account_meta_merge_extensions "$meta" "$META_BACKUP" || return 1
+    fm_account_safe_file_destination "$meta" || return 1
+    mv "$META_BACKUP" "$meta" || return 1
+    META_BACKUP=
+  elif [ "$META_INSTALLED" = 1 ] && [ -e "$meta" ]; then
+    current_generation=$(fm_meta_get "$meta" generation_id)
+    [ "$current_generation" = "$SPAWN_GENERATION_ID" ] || return 1
+    rm -f "$meta" || return 1
+  fi
+  discard_existing_artifact_backup
+}
+
+spawn_restore_unmanaged_state() {
+  local lock=${1:-} lock_owned=0 status
+  [ -n "${ID:-}" ] || return 0
+  if [ -z "$lock" ]; then
+    lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
+    lock_owned=1
+  fi
+  if spawn_restore_unmanaged_state_locked; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$lock_owned" = 1 ]; then
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || status=1
+  fi
+  return "$status"
+}
+
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name orca_meta_tmp release_status
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
   # This is an EXIT trap whose job is to attempt every independent cleanup
   # action and then return the original spawn status. The parent script runs
@@ -1207,39 +1518,54 @@ spawn_abort_cleanup() {
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
     if [ -n "${ORCA_TERMINAL:-}" ]; then
-      fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
-    fi
-    if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-      if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-        mkdir -p "$STATE" 2>/dev/null || true
-        if [ -d "$STATE" ] && [ ! -L "$STATE" ]; then
-          orca_meta_tmp=$(mktemp "$STATE/.${ID:-unknown}.meta.orca-cleanup.XXXXXX" 2>/dev/null) || orca_meta_tmp=
-        fi
-        if [ -n "${orca_meta_tmp:-}" ]; then
-          {
-            echo "window=${W:-fm-${ID:-unknown}}"
-            echo "worktree=${WT:-}"
-            echo "project=${PROJ_ABS:-}"
-            echo "harness=${HARNESS:-}"
-            echo "kind=${KIND:-ship}"
-            echo "mode=${MODE:-no-mistakes}"
-            echo "yolo=${YOLO:-off}"
-            echo "tasktmp=${TASK_TMP:-}"
-            echo "model=${MODEL:-default}"
-            echo "effort=${EFFORT:-default}"
-            echo "backend=orca"
-            echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-            [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-          } > "$orca_meta_tmp" 2>/dev/null || true
-          if fm_account_safe_file_destination "$STATE/${ID:-unknown}.meta"; then
-            mv "$orca_meta_tmp" "$STATE/${ID:-unknown}.meta" 2>/dev/null || true
-          fi
-          [ ! -e "$orca_meta_tmp" ] || rm -f "$orca_meta_tmp"
-        fi
+      if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+        case "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "fm-${ID:-unknown}")" in
+          present|absent) ;;
+          *) orca_cleanup_failed=1 ;;
+        esac
+      else
+        orca_cleanup_failed=1
       fi
+    elif [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      case "$(fm_backend_orca_worktree_terminal_state "$ORCA_WORKTREE_ID" "fm-${ID:-unknown}")" in
+        present|absent) ;;
+        *) orca_cleanup_failed=1 ;;
+      esac
+    else
+      orca_cleanup_failed=1
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ] && [ "$orca_cleanup_failed" = 0 ]; then
+      validate_orca_abort_worktree_identity || orca_cleanup_failed=1
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ] && [ "$orca_cleanup_failed" = 0 ]; then
+      fm_backend_orca_quiesce_worktree_terminals "$ORCA_WORKTREE_ID" "fm-${ID:-unknown}" "${ORCA_TERMINAL:-}" || orca_cleanup_failed=1
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ] && [ "$orca_cleanup_failed" = 0 ]; then
+      validate_orca_abort_worktree_identity || orca_cleanup_failed=1
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ] && [ "$orca_cleanup_failed" = 0 ]; then
+      orca_boundary_token=$(fm_checkout_tree_boundary_token "$WT") || orca_cleanup_failed=1
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ] && [ "$orca_cleanup_failed" = 0 ]; then
+      fm_backend_remove_worktree_bound \
+        orca "$ORCA_WORKTREE_ID" "$WT" "$orca_boundary_token" || orca_cleanup_failed=1
+    fi
+    if [ "$orca_cleanup_failed" = 0 ]; then
+      spawn_restore_unmanaged_state "$rollback_lock" || {
+        state_clean=0
+        echo "warning: failed to restore prior task state after Orca abort cleanup for ${ID:-unknown}" >&2
+      }
+    fi
+    if [ "$orca_cleanup_failed" = 1 ]; then
+      endpoint_gone=0
+      worktree_clean=0
+      echo "warning: retaining Orca cleanup metadata for ${ID:-unknown} because endpoint absence or worktree removal is unproven" >&2
+      persist_orca_cleanup_quarantine spawn-abort || \
+        echo "warning: failed to update the pre-armed Orca cleanup quarantine for ${ID:-unknown}" >&2
     fi
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] \
+    && [ "${BACKEND:-tmux}" != orca ] \
     && { [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] || [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ]; } \
     && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
     spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
@@ -1248,13 +1574,24 @@ spawn_abort_cleanup() {
       absent) ;;
       present)
         endpoint_gone=0
-        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint is still alive" >&2
+        echo "warning: retaining failed spawn resources for ${ID:-unknown} because the endpoint is still alive" >&2
         ;;
       *)
         endpoint_gone=0
-        echo "warning: retaining managed state for ${ID:-unknown} because the failed spawn endpoint state is unknown" >&2
+        echo "warning: retaining failed spawn resources for ${ID:-unknown} because the endpoint state is unknown" >&2
         ;;
     esac
+  fi
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
+    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ]; then
+    spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
+    if [ "$state_clean" = 1 ]; then
+      spawn_return_created_worktree || worktree_clean=0
+    else
+      worktree_clean=0
+      echo "warning: retained failed spawn resources for ${ID:-unknown} because prior task state could not be restored" >&2
+    fi
+    [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2
   fi
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
   cleanup_continuation_launch_transport
@@ -1371,14 +1708,9 @@ spawn_abort_cleanup() {
         fm_account_lineage_append "$DATA" "$ID" rolled-back "$ACCOUNT_ATTEMPT" "$ACCOUNT_TASK" "$HARNESS" "$ACCOUNT_POOL" "$ACCOUNT_PROFILE" pending "$ACCOUNT_PREDECESSOR_TASK" >/dev/null 2>&1 || true
       fi
     fi
-    if [ "$account_clean" = 1 ] && { [ "$WORKTREE_CREATED" = 1 ] || [ "$ORCA_ABORT_CLEANUP" = 1 ]; }; then
-      if [ "${BACKEND:-tmux}" = orca ]; then
-        [ -z "${ORCA_WORKTREE_ID:-}" ] || fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || worktree_clean=0
-      elif [ -n "${WT:-}" ] && [ -d "$WT" ]; then
-        rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-        ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 || worktree_clean=0
-      fi
-      [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}; retaining unmanaged cleanup metadata" >&2
+    if [ "$account_clean" = 1 ]; then
+      spawn_return_created_worktree || worktree_clean=0
+      [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2
     fi
     if [ -z "$rollback_lock" ]; then
       if rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}"); then
@@ -1453,6 +1785,7 @@ spawn_abort_cleanup() {
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
   [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
+  release_secondmate_home_lifecycle_locks
   LIFECYCLE_LOCK=
   LIFECYCLE_LOCK_OWNED=0
   return "$status"
@@ -1500,12 +1833,68 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
       if FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair%%=*}" "${pair#*=}" ${shared_args[@]+"${shared_args[@]}"}; then :; else echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2; rc=1; fi
     fi
   done
+  trap - EXIT
   exit "$rc"
 fi
 ID=${POS[0]}
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
+SECONDMATE_PROJECTS=
+
+if [ "$KIND" = secondmate ]; then
+  case "${POS[1]:-}" in
+    ''|claude|codex|opencode|pi|grok)
+      ARG3=${POS[1]:-}
+      ;;
+    *' '*)
+      if [ "${#POS[@]}" -gt 2 ] || [ -d "${POS[1]}" ]; then
+        FIRSTMATE_HOME=${POS[1]}
+        ARG3=${POS[2]:-}
+      else
+        ARG3=${POS[1]}
+      fi
+      ;;
+    *)
+      FIRSTMATE_HOME=${POS[1]}
+      ARG3=${POS[2]:-}
+      ;;
+  esac
+  if [ -z "$FIRSTMATE_HOME" ] && [ "$SPAWN_META_PRESENT" = 1 ]; then
+    FIRSTMATE_HOME=$(spawn_preflight_meta_value home)
+  fi
+  REGISTERED_SECONDMATE_HOME=$(fm_secondmate_registry_query "$DATA/secondmates.md" query "$ID" home) || {
+    echo "error: secondmate registry is malformed, missing, or does not uniquely register $ID" >&2
+    exit 1
+  }
+  SECONDMATE_PROJECTS=$(fm_secondmate_registry_query "$DATA/secondmates.md" query "$ID" projects) || {
+    echo "error: secondmate project registration is unprovable for $ID" >&2
+    exit 1
+  }
+  REGISTERED_SECONDMATE_HOME=$(fm_checkout_trusted_dir "$REGISTERED_SECONDMATE_HOME") || {
+    echo "error: registered secondmate home is unavailable or redirected for $ID" >&2
+    exit 1
+  }
+  if [ -n "$FIRSTMATE_HOME" ]; then
+    FIRSTMATE_HOME=$(fm_checkout_trusted_dir "$FIRSTMATE_HOME") || {
+      echo "error: requested secondmate home is unavailable or redirected for $ID" >&2
+      exit 1
+    }
+    [ "$FIRSTMATE_HOME" = "$REGISTERED_SECONDMATE_HOME" ] || {
+      echo "error: requested secondmate home does not match the exact registration for $ID" >&2
+      exit 1
+    }
+  else
+    FIRSTMATE_HOME=$REGISTERED_SECONDMATE_HOME
+  fi
+  ACTIVE_HOME_CANONICAL=$(fm_checkout_trusted_dir "$FM_HOME") || exit 1
+  if [ "$FIRSTMATE_HOME" != "$ACTIVE_HOME_CANONICAL" ]; then
+    SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FIRSTMATE_HOME") || exit 1
+  fi
+else
+  PROJ=${POS[1]:-}
+  ARG3=${POS[2]:-}
+fi
 
 if [ -z "$LIFECYCLE_LOCK" ]; then
   LIFECYCLE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
@@ -1534,29 +1923,6 @@ if [ -e "$STATE/$ID.pi-ext.ts" ] || [ -L "$STATE/$ID.pi-ext.ts" ]; then ORIGINAL
 if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token" ]; then ORIGINAL_GROK_TOKEN_PRESENT=1; else ORIGINAL_GROK_TOKEN_PRESENT=0; fi
 if [ -e "/tmp/fm-$ID" ] || [ -L "/tmp/fm-$ID" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
 
-if [ "$KIND" = secondmate ]; then
-  case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
-      ARG3=${POS[1]:-}
-      ;;
-    *' '*)
-      if [ "${#POS[@]}" -gt 2 ] || [ -d "${POS[1]}" ]; then
-        FIRSTMATE_HOME=${POS[1]}
-        ARG3=${POS[2]:-}
-      else
-        ARG3=${POS[1]}
-      fi
-      ;;
-    *)
-      FIRSTMATE_HOME=${POS[1]}
-      ARG3=${POS[2]:-}
-      ;;
-  esac
-else
-  PROJ=${POS[1]:-}
-  ARG3=${POS[2]:-}
-fi
-
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
   [ -n "$RECORDED_KIND" ] || RECORDED_KIND=ship
@@ -1565,6 +1931,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     exit 1
   fi
   KIND=$RECORDED_KIND
+  spawn_refuse_unsupported_secondmate_backend || exit 1
   RECORDED_HARNESS=$(fm_meta_get "$RESUME_META" harness)
   RECORDED_PROJECT=$(fm_meta_get "$RESUME_META" project)
   RECORDED_WORKTREE=$(fm_meta_get "$RESUME_META" worktree)
@@ -1708,7 +2075,15 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ "$MODEL" = default ] && MODEL=
     [ "$EFFORT" = default ] && EFFORT=
     if [ "$KIND" = secondmate ]; then
-      FIRSTMATE_HOME=$(fm_meta_get "$RESUME_META" home)
+      RECORDED_SECONDMATE_HOME=$(fm_meta_get "$RESUME_META" home)
+      RECORDED_SECONDMATE_HOME=$(fm_checkout_trusted_dir "$RECORDED_SECONDMATE_HOME") || {
+        echo "error: managed recovery secondmate home is unavailable or redirected for $ID" >&2
+        exit 1
+      }
+      [ "$RECORDED_SECONDMATE_HOME" = "$FIRSTMATE_HOME" ] || {
+        echo "error: managed recovery secondmate home does not match registration for $ID" >&2
+        exit 1
+      }
     else
       PROJ=$(fm_meta_get "$RESUME_META" project)
     fi
@@ -2018,26 +2393,18 @@ if [ "$RECOVERY_ACCOUNT" = 0 ] && [ -f "$STATE/$ID.meta" ]; then
     present) echo "error: endpoint is already alive for $ID; refusing duplicate spawn" >&2; exit 1 ;;
     *) echo "error: endpoint state is unknown for $ID; refusing duplicate spawn" >&2; exit 1 ;;
   esac
-  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
-    META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
-    cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
+  META_BACKUP=$(mktemp "$STATE/.$ID.meta.rollback.XXXXXX") || exit 1
+  cp -p "$STATE/$ID.meta" "$META_BACKUP" || exit 1
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     snapshot_existing_artifacts || exit 1
   fi
 fi
+if [ "$ACCOUNT_EFFECTIVE_MODE" != enforce ]; then
+  snapshot_existing_artifacts || exit 1
+fi
 
 secondmate_registry_value() {
-  local id=$1 key=$2 reg line value
-  reg="$DATA/secondmates.md"
-  [ -f "$reg" ] || return 1
-  line=$(grep -E "^- $id( |$)" "$reg" | tail -1 || true)
-  [ -n "$line" ] || return 1
-  case "$key" in
-    home) value=$(printf '%s\n' "$line" | sed -n 's/^[^(]*(home: \([^;)]*\);.*/\1/p') ;;
-    projects) value=$(printf '%s\n' "$line" | sed -n 's/^[^(]*(home: [^;)]*; scope: [^;)]*; projects: \([^;)]*\); added .*/\1/p') ;;
-    *) return 1 ;;
-  esac
-  [ -n "$value" ] || return 1
-  printf '%s\n' "$value"
+  fm_secondmate_registry_query "$DATA/secondmates.md" query "$1" "$2"
 }
 
 shell_quote() {
@@ -2227,16 +2594,24 @@ validate_firstmate_operational_dirs() {
 }
 
 if [ "$KIND" = secondmate ]; then
-  if [ -z "$FIRSTMATE_HOME" ] && [ -f "$STATE/$ID.meta" ]; then
-    FIRSTMATE_HOME=$(grep '^home=' "$STATE/$ID.meta" | cut -d= -f2- || true)
-  fi
-  if [ -z "$FIRSTMATE_HOME" ]; then
-    FIRSTMATE_HOME=$(secondmate_registry_value "$ID" home || true)
-  fi
-fi
-
-if [ "$KIND" = secondmate ]; then
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
+  CURRENT_REGISTERED_SECONDMATE_HOME=$(secondmate_registry_value "$ID" home) || {
+    echo "error: secondmate registration became unprovable for $ID" >&2
+    exit 1
+  }
+  CURRENT_REGISTERED_SECONDMATE_HOME=$(fm_checkout_trusted_dir "$CURRENT_REGISTERED_SECONDMATE_HOME") || exit 1
+  [ "$CURRENT_REGISTERED_SECONDMATE_HOME" = "$FIRSTMATE_HOME" ] || {
+    echo "error: secondmate registration changed while spawn waited for lifecycle ownership" >&2
+    exit 1
+  }
+  CURRENT_SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects) || {
+    echo "error: secondmate project registration became unprovable for $ID" >&2
+    exit 1
+  }
+  [ "$CURRENT_SECONDMATE_PROJECTS" = "$SECONDMATE_PROJECTS" ] || {
+    echo "error: secondmate project registration changed while spawn waited for lifecycle ownership" >&2
+    exit 1
+  }
   PROJ_ABS=$(validate_firstmate_home_for_spawn "$ID" "$FIRSTMATE_HOME")
   WT="$PROJ_ABS"
 else
@@ -2268,26 +2643,24 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
 fi
 
 if [ "$KIND" = secondmate ]; then
-  # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
-  # PRIMARY checkout's current default-branch commit, so a freshly spawned or
-  # recovery-respawned secondmate always runs the primary's version (AGENTS.md
-  # spawn section). Purely local - no fetch: the home is a worktree of this same
-  # repo and already holds the commit. ff-only and guarded; a dirty, diverged, or
-  # wrong-branch home is left untouched and launches as-is. The agent re-reads
-  # AGENTS.md fresh on launch, so no nudge is needed here.
-  if sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
-    sm_ff_out=$(ff_target "$PROJ_ABS" "secondmate $ID" "$sm_primary_head" yes yes 2>&1 || true)
-    case "$sm_ff_out" in
-      *': skipped:'*)
-        sm_ff_line=$(first_line "$sm_ff_out")
-        sm_ff_prefix="secondmate $ID: skipped: "
-        sm_ff_reason=${sm_ff_line#"$sm_ff_prefix"}
-        echo "warning: secondmate $ID sync skipped before launch: $sm_ff_reason" >&2
-        ;;
-    esac
-  else
-    echo "warning: secondmate $ID sync skipped before launch: primary default-branch commit cannot be resolved" >&2
+  sm_primary_head=$(primary_head_commit "$FM_ROOT") || {
+    echo "error: refusing secondmate launch because the primary default-branch commit cannot be resolved" >&2
+    exit 1
+  }
+  if ! sm_ff_out=$(ff_target "$PROJ_ABS" "secondmate $ID" "$sm_primary_head" yes yes 2>&1); then
+    echo "error: refusing secondmate launch because its home cannot fast-forward safely: $(first_line "$sm_ff_out")" >&2
+    exit 1
   fi
+  case "$sm_ff_out" in
+    *': skipped:'*)
+      echo "error: refusing secondmate launch because its home freshness is unresolved: $(first_line "$sm_ff_out")" >&2
+      exit 1
+      ;;
+  esac
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-home "$PROJ_ABS" "$FM_ROOT" || {
+    echo "error: refusing secondmate launch because its live default-tip freshness cannot be proved" >&2
+    exit 1
+  }
   # Inheritable-config propagation: push the primary's declared LOCAL config into
   # this secondmate home's config/, so the secondmate's OWN crewmates and backlog
   # backend inherit the primary's settings. config/ is gitignored, so this is a
@@ -2364,6 +2737,22 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+# Refresh the checkout that will seed Treehouse before creating an endpoint.
+# A dirty, off-default, or diverged checkout stays untouched and warns here, but
+# does not make the acquisition unsafe: Treehouse fetches origin independently
+# and resets the selected clean pool worktree from that remote-tracking ref.
+# The post-acquisition verification below is the fail-closed freshness proof.
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
+  if CHECKOUT_PREFLIGHT_OUT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$PROJ_ABS" 2>&1); then
+    CHECKOUT_PREFLIGHT_STATUS=0
+  else
+    CHECKOUT_PREFLIGHT_STATUS=$?
+  fi
+  if [ "$CHECKOUT_PREFLIGHT_STATUS" -ne 0 ]; then
+    echo "warning: checkout refresh could not advance $PROJ_ABS before worktree acquisition: $(first_line "$CHECKOUT_PREFLIGHT_OUT")" >&2
+  fi
+fi
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -2373,7 +2762,7 @@ real_path_or_raw() {  # <path>
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real wt_common proj_common provider_path provider_real
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -2388,6 +2777,45 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
+  fm_checkout_validate_git_metadata "$wt_real" >/dev/null || {
+    echo "error: $source returned redirected or unprovable Git metadata at $wt_real" >&2
+    exit 1
+  }
+  fm_checkout_validate_git_metadata "$proj_real" >/dev/null || {
+    echo "error: project Git metadata is unprovable at $proj_real" >&2
+    exit 1
+  }
+  wt_common=$(fm_checkout_git_common_dir "$wt_real") || exit 1
+  proj_common=$(fm_checkout_git_common_dir "$proj_real") || exit 1
+  [ "$wt_common" = "$proj_common" ] || {
+    echo "error: $source returned a worktree from an unrelated repository" >&2
+    exit 1
+  }
+  if [ "$BACKEND" = orca ]; then
+    fm_backend_orca_authority_capabilities_check || exit 1
+    provider_path=$(fm_backend_orca_worktree_path "$ORCA_WORKTREE_ID") || exit 1
+    provider_real=$(fm_checkout_trusted_dir "$provider_path") || exit 1
+    [ "$provider_real" = "$wt_real" ] || {
+      echo "error: Orca worktree identity does not match its returned path" >&2
+      exit 1
+    }
+  fi
+}
+
+validate_orca_abort_worktree_identity() {
+  local wt_root project_root wt_common project_common provider_path provider_root
+  [ -n "${ORCA_WORKTREE_ID:-}" ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ] || return 1
+  wt_root=$(fm_checkout_trusted_dir "$WT") || return 1
+  project_root=$(fm_checkout_trusted_dir "$PROJ_ABS") || return 1
+  [ "$wt_root" != "$project_root" ] || return 1
+  fm_checkout_validate_git_metadata "$wt_root" >/dev/null || return 1
+  fm_checkout_validate_git_metadata "$project_root" >/dev/null || return 1
+  wt_common=$(fm_checkout_git_common_dir "$wt_root") || return 1
+  project_common=$(fm_checkout_git_common_dir "$project_root") || return 1
+  [ "$wt_common" = "$project_common" ] || return 1
+  provider_path=$(fm_backend_orca_worktree_path "$ORCA_WORKTREE_ID") || return 1
+  provider_root=$(fm_checkout_trusted_dir "$provider_path") || return 1
+  [ "$provider_root" = "$wt_root" ]
 }
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -2400,6 +2828,38 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
     exit 1
   fi
   validate_direct_recovery_worktree_identity || exit 1
+fi
+
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" pool-preflight "$PROJ_ABS" || {
+    echo "error: refusing Treehouse acquisition because pool safety could not be inspected for $PROJ_ABS" >&2
+    exit 1
+  }
+  acquire_status=0
+  WT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$PROJ_ABS" "firstmate-$ID") || acquire_status=$?
+  if [ "$acquire_status" -ne 0 ]; then
+    if [ "$acquire_status" -eq 124 ]; then
+      echo "error: refusing to spawn $ID after the bounded Treehouse acquisition timed out" >&2
+    else
+      echo "error: treehouse get --lease failed to acquire a task worktree for $ID" >&2
+    fi
+    exit 1
+  fi
+  [ -n "$WT" ] || {
+    echo "error: treehouse get --lease did not report a task worktree for $ID" >&2
+    exit 1
+  }
+  WORKTREE_CREATED=1
+  WORKTREE_RETAIN_ON_ABORT=1
+  validate_spawn_worktree "treehouse get --lease" "$PROJ_ABS"
+  freshness_status=0
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$WT" "$PROJ_ABS" || freshness_status=$?
+  if [ "$freshness_status" -ne 0 ]; then
+    echo "error: refusing to launch fm-$ID from a leased worktree whose repository identity, cleanliness, or default-tip freshness could not be proved" >&2
+    exit 1
+  fi
+  WORKTREE_EXPECTED_TIP=$(git -C "$WT" rev-parse HEAD) || exit 1
+  WORKTREE_RETAIN_ON_ABORT=0
 fi
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -2463,8 +2923,7 @@ finally:
 fi
 
 W="fm-$ID"
-SPAWN_CWD=$PROJ_ABS
-[ "$RECOVERY_ACCOUNT" != 1 ] || SPAWN_CWD=$WT
+SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   validate_direct_recovery_worktree_identity || exit 1
 fi
@@ -2474,10 +2933,10 @@ case "$BACKEND" in
     T="$SES:$W"
     # #134 robustness (tmux): fm_backend_tmux_create_task captures a stable window
     # id and pins the window name (automatic-rename/allow-rename off) so a captain's
-    # non-default tmux config cannot rename the window away from fm-<id> once
-    # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
-    # rename-critical worktree-detection steps below; the persisted window= handle
-    # stays $T (the name form), which is safe now that rename is disabled.
+    # non-default tmux config cannot rename the window away from fm-<id>.
+    # WT_TARGET carries that stable id for spawn-time commands below; the
+    # persisted window= handle stays $T (the name form), which is safe now that
+    # rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_CWD") || exit 1
     ENDPOINT_CREATED=1
     WT_TARGET="$WID"
@@ -2564,45 +3023,64 @@ EOF
         exit 1
       }
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
-      T="$ORCA_TERMINAL"
-      ENDPOINT_CREATED=1
+      ORCA_TERMINAL_PROOF=recorded
     else
+      ORCA_EXPECTED_TASK="fm-$ID"
+      ORCA_TERMINAL_PROOF=unproven
+      persist_orca_cleanup_quarantine spawn-preparing || {
+        echo "error: cannot durably arm Orca cleanup quarantine for $ID" >&2
+        exit 1
+      }
+      ORCA_ABORT_CLEANUP=1
       set +e
       ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
       ORCA_WT_STATUS=$?
       set -e
       if [ "$ORCA_WT_STATUS" -ne 0 ]; then
         if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
-          if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-            ORCA_ABORT_CLEANUP=1
-          fi
+          parse_orca_worktree_result "$ORCA_WT_RAW" || true
+          persist_orca_cleanup_quarantine spawn-abort || {
+            echo "error: cannot durably record partial Orca create authority for $ID" >&2
+          }
         fi
         exit 1
       fi
       parse_orca_worktree_result "$ORCA_WT_RAW" || true
-      ORCA_ABORT_CLEANUP=1
-      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
-        echo "error: orca did not return a worktree id/path for $W" >&2
+      persist_orca_cleanup_quarantine spawn-abort || {
+        echo "error: cannot durably record Orca create authority for $ID" >&2
+        exit 1
+      }
+      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ] || [ "$ORCA_PROVIDER_TASK" != "$ORCA_EXPECTED_TASK" ]; then
+        echo "error: orca did not return matching worktree id, path, and task authority for $W" >&2
         exit 1
       fi
       validate_spawn_worktree "orca worktree create" "$W"
       if [ -z "$ORCA_TERMINAL" ]; then
         ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+        ORCA_TERMINAL_PROOF=recorded
+        persist_orca_cleanup_quarantine spawn-abort || {
+          echo "error: cannot durably record the Orca terminal authority for $ID" >&2
+          exit 1
+        }
       fi
-      T="$ORCA_TERMINAL"
-      ENDPOINT_CREATED=1
       WORKTREE_CREATED=1
     fi
+    [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" = present ] \
+      && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL" || {
+        echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
+        exit 1
+      }
+    T="$ORCA_TERMINAL"
+    ENDPOINT_CREATED=1
     ;;
 esac
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   persist_failed_account_rollback_short || exit 1
 fi
-# #134 robustness: only tmux needs a worktree-detection target distinct from $T -
-# its rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
+# #134 robustness: only tmux needs a command target distinct from $T - its
+# rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
 # Every other backend addresses its pane/surface by the id already in $T, so default
-# WT_TARGET to $T for them (and for any future backend) - the shared treehouse-get +
-# worktree-detection steps below must never reference an unbound WT_TARGET under set -u.
+# WT_TARGET to $T for them (and for any future backend).
 : "${WT_TARGET:=$T}"
 spawn_send_text_line() {  # <target> <text>
   case "$BACKEND" in
@@ -2640,31 +3118,18 @@ spawn_send_key() {  # <target> <key>
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
-
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-  # Target the stable window id, not the name: if the name is ever lost (e.g. an
-  # automatic-rename slips through), display-message -t <bad-name> falls back to the
-  # active client's window, which would misread firstmate's OWN pane path as the
-  # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
+  WT_REAL=$(real_path_or_raw "$WT")
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
+    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" = "$WT_REAL" ]; then
       break
     fi
     sleep 1
   done
-  if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+  if [ -z "${p:-}" ] || [ "$(real_path_or_raw "$p")" != "$WT_REAL" ]; then
+    echo "error: task endpoint did not start in leased worktree $WT within 60s; inspect window $T" >&2
     exit 1
   fi
-
-  validate_spawn_worktree "treehouse get" "$T"
-  WORKTREE_CREATED=1
 fi
 if [ -z "$WT" ] && [ "$BACKEND" = orca ]; then
   WT="$PROJ_ABS"
@@ -2799,14 +3264,12 @@ fi
 # Recorded in meta so fm-teardown's safety check and the validate/merge stages can
 # branch on them. Mode governs ship tasks; a scout's deliverable is a report, not a
 # merge, so scout teardown ignores mode.
-SECONDMATE_PROJECTS=
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   MODE=$RECORDED_MODE
   YOLO=$RECORDED_YOLO
 elif [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
-  SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
 else
   PROJ_NAME=$(basename "$PROJ_ABS")
   read -r MODE YOLO <<EOF
@@ -2975,6 +3438,10 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   if [ "$BACKEND" = orca ]; then
     echo "orca_worktree_id=$ORCA_WORKTREE_ID"
     echo "terminal=$ORCA_TERMINAL"
+    echo "orca_repo_id=$ORCA_REPO_ID"
+    echo "orca_expected_task=$ORCA_EXPECTED_TASK"
+    echo "orca_discovery_label=$ORCA_EXPECTED_TASK"
+    echo "orca_provider_scope=repo-path:$PROJ_ABS"
   fi
   if [ "$BACKEND" = cmux ]; then
     echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
@@ -3092,6 +3559,17 @@ fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
+if [ "$BACKEND" = orca ]; then
+  [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" = present ] \
+    && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T" || {
+      echo "error: Orca terminal authority changed before launch for $ID" >&2
+      exit 1
+    }
+  validate_orca_abort_worktree_identity || {
+    echo "error: Orca worktree authority changed before launch for $ID" >&2
+    exit 1
+  }
+fi
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
@@ -3156,8 +3634,14 @@ CONTINUATION_PROMPT_FILE=
 META_BACKUP=
 discard_existing_artifact_backup
 [ "$LIFECYCLE_LOCK_OWNED" != 1 ] || [ -z "$LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
+if [ -n "$SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK" ]; then
+  fm_account_lifecycle_lock_release "$SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK" || exit 1
+  SECONDMATE_TARGET_HOME_LIFECYCLE_LOCK=
+fi
+[ -z "$SECONDMATE_HOME_LIFECYCLE_LOCK" ] || fm_account_lifecycle_lock_release "$SECONDMATE_HOME_LIFECYCLE_LOCK" || exit 1
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
+SECONDMATE_HOME_LIFECYCLE_LOCK=
 
 account_summary=
 [ -z "$DIRECT_ACCOUNT_HOME" ] || account_summary=" account_home=$DIRECT_ACCOUNT_HOME"

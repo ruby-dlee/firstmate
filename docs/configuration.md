@@ -25,7 +25,7 @@ The file format is unchanged in both modes; tasks-axi and manual edits produce t
 
 The runtime session-provider backend controls where task windows/endpoints are created, captured, sent to, watched, and killed.
 `tmux` is the verified reference backend (see [`docs/tmux-backend.md`](tmux-backend.md)); `herdr`, `zellij`, and `cmux` are experimental new-task spawn backends, while `orca` is retained only for eligible pre-cutover task recovery (see [`docs/herdr-backend.md`](herdr-backend.md), [`docs/zellij-backend.md`](zellij-backend.md), [`docs/orca-backend.md`](orca-backend.md), and [`docs/cmux-backend.md`](cmux-backend.md)).
-Treehouse remains the worktree provider for tmux, herdr, zellij, and cmux, since herdr, zellij, and cmux are session providers only; eligible legacy Orca recoveries use Orca for both the task worktree and terminal endpoint.
+Treehouse remains the worktree provider for tmux, herdr, zellij, and cmux, since herdr, zellij, and cmux are session providers only. Orca metadata may describe legacy Orca-owned worktrees and terminals, but lifecycle mutation is disabled until the authority capability documented in `docs/orca-backend.md` is empirically verified.
 New spawns choose the backend in this order: an explicit `--backend` flag firstmate passes when it spawns a task, then `FM_BACKEND`, then the first non-empty line of local gitignored `config/backend`, then runtime auto-detection from `$TMUX`, `HERDR_ENV=1`, or cmux runtime signals, then default `tmux`.
 If more than one runtime marker is present, detection resolves innermost-first: `$TMUX` is checked before `HERDR_ENV=1`, which is checked before cmux's primary `CMUX_WORKSPACE_ID` marker and its documented fallback signals - tmux or herdr started from inside a cmux terminal is the innermost, currently-executing layer, while cmux itself (a terminal application, not a nestable multiplexer) is always checked last.
 See [`docs/cmux-backend.md`](cmux-backend.md#runtime-auto-detection) for why cmux can be selected when `CMUX_WORKSPACE_ID` is absent.
@@ -34,7 +34,7 @@ Zellij is never auto-detected; select it through local `config/backend`, `FM_BAC
 Orca is also never auto-detected and may be selected only under the [`docs/orca-backend.md`](orca-backend.md#eligibility) eligibility contract.
 Any value other than `tmux`, `herdr`, `zellij`, `orca`, or `cmux` is rejected until another adapter is implemented and verified.
 `fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, and `cmux` for new ship and scout tasks; `backend=cmux` still refuses `--secondmate` until its secondmate launch semantics are designed.
-Every new task refuses `backend=orca` before any owned mutation, and Orca also refuses `--secondmate`; the Orca guide owns the rationale and exact legacy eligibility rule.
+Every new task refuses `backend=orca` before any owned mutation, legacy respawn and destructive teardown currently fail closed on unavailable authority capability, and Orca also refuses `--secondmate`; the Orca guide owns the rationale and re-enablement contract.
 `codex-app` is not an accepted runtime backend yet; [`docs/codex-app-backend.md`](codex-app-backend.md) owns the Codex App boundary.
 The session-start secondmate liveness sweep uses a deeper `fm_backend_agent_alive` probe where verified.
 Today that probe can classify tmux and herdr secondmate endpoints as `alive`, `dead`, or `unknown`; zellij, Orca, and cmux report `unknown` until their own agent-process classifiers are verified.
@@ -45,7 +45,7 @@ A backend spawn refusal from a missing dependency, version gate, or unauthentica
 Task meta records `backend=` only for a non-default backend; an absent `backend=` means `tmux`, preserving existing default-path meta files.
 A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
 A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
-An eligible legacy Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
+A legacy Orca task may additionally record `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
 A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
 Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.
 A selector containing `:` is passed through as an explicit backend endpoint escape hatch.
@@ -267,19 +267,96 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Checkout refresh
+
+`bin/fm-checkout-refresh.sh` keeps worktree seed checkouts current independently of Firstmate's own PR lifecycle.
+Its header owns the exact discovery, configuration-file, cadence, state, and command contracts.
+The default covered set is every clone under the active home's `projects/`, every backing checkout referenced by a Treehouse pool under `~/.treehouse`, and every top-level clone under `$HOME` whose `origin` URL matches one of those tracked checkouts.
+Matching by origin discovers parallel clones such as `~/relvino` without embedding a captain-specific path in shared code.
+Optional `path` and shallow `scan` directives in the gitignored `config/checkout-refresh` file extend that set.
+Every declared checkout and matching-origin scan result must resolve to its exact canonical Git worktree root, so nested directories can never redirect refresh to an enclosing repository.
+Every scan root must also be readable, searchable, and successfully enumerable rather than treating an unreadable directory as empty.
+A symlinked or unreadable configuration file, an unknown or malformed directive, or an invalid or unenumerable declared path or scan root makes coverage unhealthy.
+An exact Git repository found during a scan must have inspectable remote metadata even when it does not match the currently tracked origins.
+The owner persists the canonical path and actual origin identity of every covered checkout plus the identity of each discovered external clone, and retains each prior identity until it is inspectable and unchanged.
+
+Each `FM_HOME` owns a distinct background identity and state directory, so primary and secondmate homes can cover their own projects without displacing one another.
+Checkout-level owner locks are held by the shared `fm-fleet-sync.sh` mutation path, Treehouse acquisition, and every authorized Treehouse return, so home-scoped services, spawn, secondmate seeding, teardown, and merged-PR wake handling serialize overlapping checkouts safely.
+Each Treehouse return is process-tree bounded by `FM_TREEHOUSE_RETURN_TIMEOUT`, which defaults to 60 seconds, and the common checkout lock is released only after that process tree is gone.
+Each background owner probes every covered checkout's remote default-branch tip every 60 seconds.
+Any upstream-tip change triggers `fm-fleet-sync.sh` immediately, regardless of who pushed or merged it.
+Every `fm-fleet-sync.sh` invocation repeats the live upstream-default probe after fetching and proves that the fetched ref matches the live tip instead of trusting a checkout's possibly stale `origin/HEAD`.
+Each shared checkout mutation is process-tree bounded by `FM_CHECKOUT_REFRESH_SYNC_TIMEOUT`, including direct teardown and merged-PR wake calls.
+Teardown holds that same checkout lock while its landed-content fallback probes, fetches, re-probes, and compares the live default, and it retains the worktree unless both live branch identity and tip remain unchanged.
+If the upstream default branch changes, a checkout still on the old branch is reported as `STUCK:` and left unchanged under the fast-forward-only posture.
+A full safe refresh runs at least every 15 minutes even when no change signal is observed, so transient network failures, a missed probe, or lost local state cannot create unbounded drift.
+The owner advances a checkout's successful cadence and tip state only after a benign inspection result, and any failed or unsafe alert-state write keeps coverage unhealthy and forces the next run to reinspect before the backstop.
+Every probe also inventories non-ignored untracked files in covered seed checkouts and Treehouse pool worktrees under `.agents/skills`, `.claude/skills`, `.codex/skills`, and `skills`.
+Gitignored files are intentional local material and remain outside this collision guard.
+A new or growing inventory produces a durable `HYGIENE:` alert immediately, while forced session-start and spawn-preflight checks repeat any unresolved alert for an operator.
+An inventory read failure preserves the prior hygiene alert and marks the latest coverage result unhealthy until a complete scan succeeds.
+Unreadable active-home project directories, unreadable or malformed Treehouse state, or a covered checkout that becomes uninspectable during either refresh pass surface an actionable diagnostic and mark the latest coverage result unhealthy.
+The ordinary safe-refresh warning separately quantifies every non-ignored untracked file and the subset under those skill directories, so other untracked accumulation is bounded by the same 15-minute backstop.
+These checks inspect paths only and never delete, move, stash, reset, or edit a draft.
+The signal interval and backstop are configurable through `FM_CHECKOUT_REFRESH_INTERVAL` and `FM_CHECKOUT_REFRESH_BACKSTOP`.
+Every cadence and spawn-preflight refresh disables gone-branch pruning and retains `fm-fleet-sync.sh`'s fail-safe behavior: a dirty, diverged, or non-default checkout is left untouched and recorded as an alert.
+Registered `local-only` checkouts and repositories without `origin` are fully inspected against their proven local `main` or `master` tip without fetching, including when a local-only checkout still has a remote configured.
+The forced session-start mode prunes a gone branch only when its tip is reachable from a surviving remote ref or its content is already present in the live default branch.
+An unproven branch is retained and surfaced as `STUCK:`.
+
+Treehouse v2.0 already excludes dirty pool entries, fetches `origin`, and resets only an available clean detached worktree to the freshest default ref.
+Firstmate surfaces matching dirty pool entries, acquires the selected path with `treehouse get --lease`, and verifies the durable lease before creating its endpoint.
+That synchronous acquisition holds the common-Git-directory mutation lock and is process-tree bounded by `FM_TREEHOUSE_ACQUIRE_TIMEOUT`, which defaults to 60 seconds.
+The accepted lease must be clean, belong to the requested repository, have the same origin identity, and match the live upstream default-branch tip.
+Remote-free `local-only` acquisitions use the same repository and cleanliness proof, with the requested checkout's local `main` or `master` tip as their freshness authority.
+Treehouse-acquired secondmate homes receive the same proof before seeding.
+They use the same locked, bounded acquisition entrypoint as ordinary task worktrees.
+Explicit secondmate homes are refreshed and must independently match the same live upstream or local default tip before seeding and again before launch.
+A stale, dirty, or uninspectable acquisition remains durably leased without forced return and is surfaced for manual recovery.
+If an unmanaged spawn fails after publishing metadata or task artifacts, it restores the prior task generation before returning only a worktree whose repository identity, cleanliness, and expected detached tip are re-proven.
+That makes the acquisition proof explicit even if the background owner was offline.
+Orca is an explicit legacy-recovery-only exception because this change creates no new Orca tasks or acquisitions.
+
+### Limitations / deferred
+
+- A checkout without `origin` still uses the local default-tip proof without first proving that its registered project mode is explicitly `local-only`.
+- Home-scoped refresh owners still enumerate the shared user-level Treehouse root without filtering pool entries by owning `FM_HOME`.
+- Secondmate home acquisition still relies on Treehouse's dirty-entry skip and does not run Firstmate's `pool-preflight` before requesting its durable lease.
+- The rare SIGKILL lock-to-guard handoff race, exact wrapped-exit-code fidelity, and setup-failure diagnostic precision remain deferred under `clone-refresh-followup-edges`; current fail-safe behavior may retain or refuse work or require retry, but must not claim healthy coverage or discard unlanded work.
+
+The consolidated `clone-refresh-followup-edges` follow-up should tighten explicit local-only mode proof, add home-filtered pool ownership, apply pool preflight to secondmate acquisition, and close the three process-ownership edges above.
+These are bounded completeness limitations: coverage health fails closed when Treehouse enumeration cannot be proved, and rollback retains any worktree whose repository identity and expected detached tip cannot be re-proven, so the deferred formalization does not create a false healthy-coverage signal or a destructive data-loss path.
+
+On macOS, bootstrap reports `MISSING: checkout-refresh` until that home's per-user LaunchAgent is installed.
+After the captain approves the background owner, install it with:
+
+```sh
+bin/fm-bootstrap.sh install checkout-refresh
+```
+
+The locked session-start sweep still runs the same broad discovery and a forced refresh, so the service has an operator-visible backstop.
+The LaunchAgent is intentionally independent of the Firstmate watcher and continues polling when no fleet task or Firstmate session is active.
+Only the LaunchAgent's scheduled invocation advances its heartbeat, while foreground session and manual runs update coverage health without refreshing scheduler liveness.
+The heartbeat proves scheduler liveness only, while `ensure` independently requires the latest coverage result to be healthy.
+Its definition persists the configured Treehouse root, refresh interval, and backstop, and health validation rejects any installed value that no longer matches the current configuration.
+Health validation also binds the loaded job's effective arguments, interval, RunAtLoad state, explicit environment, and complete inherited/default environment surface to that definition before accepting its coverage record.
+Inherited launchd variables use a narrow harmless allowlist; undeclared variables, including alternate Git configuration roots and URL-rewrite controls, make the loaded identity untrusted rather than allowing fresh-looking health records to stand in for proven coverage.
+macOS launchd is the primary fleet scheduler in this release.
+Scheduler installation and health checks dispatch through an adapter seam, while a future Linux cron or systemd adapter remains explicit follow-up work rather than silently claiming coverage today.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
 It installs automatically supported tools only after you say go; manual-only tools remain for you to install from the printed instructions.
 Required tools come in two parts: a universal toolchain every home needs regardless of backend, and a per-backend delta that follows the runtime backend actually resolved for this home.
-The universal toolchain is node, python3, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi.
+The universal toolchain is node, python3, git, gh with GitHub auth via `gh auth login`, Perl, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
 In that list, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-balanced dispatch.
 The per-backend delta is required only for the backend resolved from `FM_BACKEND`, then `config/backend`, then runtime auto-detection, then default `tmux`, so a home is never told to install a tool an inactive backend or feature would need.
-That delta is owned in code by `fm_backend_required_tools` in `bin/fm-backend.sh`: the resolved backend's own session-provider CLI (`tmux`, `herdr`, `zellij`, `orca`, or `cmux`), `jq` for the JSON-emitting experimental adapters (`herdr`, `zellij`, `cmux`) whose spawn and liveness paths parse the backend's JSON output, `nohup` and `perl` for Herdr's portable detached `setsid` server launcher, and the `treehouse` worktree provider for every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`).
+That delta is owned in code by `fm_backend_required_tools` in `bin/fm-backend.sh`: the resolved backend's own session-provider CLI (`tmux`, `herdr`, `zellij`, `orca`, or `cmux`), `jq` for the JSON-emitting experimental adapters (`herdr`, `zellij`, `cmux`) whose spawn and liveness paths parse the backend's JSON output, `nohup` for Herdr's portable detached `setsid` server launcher, and the `treehouse` worktree provider for every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`).
 Backend tool availability uses the adapter's own executable resolver, so bootstrap and spawn agree on supported non-`PATH` locations such as cmux's bundled CLI.
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
-For an eligible pre-cutover task, Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
+Legacy Orca metadata refers to an Orca-owned task worktree and terminal endpoint (see "Runtime backend" above). Existing read-only supervision requires the `orca` CLI, while lifecycle mutation remains unavailable until the authority capability gate is backed by real provider evidence.
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
 Bootstrap reports missing `jq`, fixed system Perl, or Herdr whenever local routing mode, dispatch configuration, or existing ship/scout `account_home=` metadata can activate direct account-directory launches.
 It reports missing Agent Fleet when enforced secondmate routing is configured or legacy task metadata still carries `account_profile=` or pending rollback cleanup and may need managed recovery.
@@ -291,10 +368,11 @@ An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm 
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still degrades to the first profile at runtime when quota data is unavailable.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
-The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
+The locked session-start bootstrap step also runs a best-effort covered-checkout refresh through `fm-checkout-refresh.sh`, which delegates individual safe updates to `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
+Checkout discovery and configuration diagnostics use the same relay so an omitted configured clone cannot remain silent.
 Normal completed runs keep local-only and no-origin skips silent.
-If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.sh` output before the aggregate timeout skip so no finished result is lost.
+If bootstrap kills a timed-out refresh, it replays any completed checkout-refresh output before the aggregate timeout skip so no finished result is lost.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.
 On that signature only, `fm-fleet-sync.sh` retries the fetch with a bounded wait for the lock to self-clear, then removes the lock and retries once more only when it can prove the lock stale, exactly like the `fm-teardown.sh` `index.lock` recovery.
 It never removes a live lock, leaves any other failure shape untouched, and prints every wait, retry, and removal to stderr plus a one-line `recovered:` summary to stdout on success so that this session-start relay still surfaces the recovery.
@@ -307,9 +385,10 @@ It uses the same live secondmate discovery and propagation helper as bootstrap, 
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
-### Herdr detached launcher prerequisites
+### Portable process-control prerequisites
 
-Bootstrap requires `nohup` and `perl` to be discoverable on `PATH` as availability gates, while the production Herdr adapter executes only the fixed system binaries documented in [herdr-backend.md](herdr-backend.md#control-plane-and-filesystem-hardening).
+Bootstrap requires `perl` on every backend because checkout refresh and account control use it to bound and reap complete process trees.
+Herdr additionally requires `nohup`, while its production adapter executes only the fixed system binaries documented in [herdr-backend.md](herdr-backend.md#control-plane-and-filesystem-hardening).
 Both commands ship with macOS and are commonly supplied by the platform's coreutils and Perl packages on other Unix-like systems.
 If bootstrap reports either command missing, restore or install the corresponding platform package, confirm it with `command -v nohup` or `command -v perl`, and rerun bootstrap.
 Bootstrap treats these as manual prerequisites because package names and command exposure differ across supported platforms.
@@ -469,6 +548,13 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive unchanged wedge or permission-s
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
+FM_CHECKOUT_REFRESH_INTERVAL=60       # seconds between background upstream-tip probes
+FM_CHECKOUT_REFRESH_BACKSTOP=900      # maximum seconds between full safe refresh attempts
+FM_CHECKOUT_REFRESH_PROBE_TIMEOUT=15  # seconds allowed for one upstream-tip probe
+FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=60   # seconds allowed for one checkout refresh
+FM_TREEHOUSE_ACQUIRE_TIMEOUT=60       # seconds allowed for one durable task-worktree acquisition
+FM_TREEHOUSE_RETURN_TIMEOUT=60        # seconds allowed for one Treehouse worktree return
+# FM_TREEHOUSE_ROOT is unset by default; setting it empty is malformed, while a non-empty value overrides ~/.treehouse
 FM_STALE_WORKTREE_LOCK_AGE_SECS=30       # min mtime age before fm-teardown.sh treats a leftover worktree git index.lock as provably stale
 FM_TREEHOUSE_RETURN_LOCK_RETRIES=3        # retries after a treehouse return fails on the transient git index.lock signature
 FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=1 # seconds fm-teardown.sh waits before each retry after that signature

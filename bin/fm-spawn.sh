@@ -896,6 +896,7 @@ ORIGINAL_CHECK_PRESENT=-1
 ORIGINAL_PI_EXT_PRESENT=-1
 ORIGINAL_GROK_TOKEN_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
+BROWSER_PREPARED=0
 
 snapshot_existing_artifacts() {
   local backup name source tasktmp="/tmp/fm-$ID"
@@ -1258,6 +1259,11 @@ spawn_abort_cleanup() {
   fi
   [ -z "${ACCOUNT_NATIVE_LAUNCH_DIR:-}" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR"
   cleanup_continuation_launch_transport
+  if [ "${BROWSER_PREPARED:-0}" = 1 ] && [ "$endpoint_gone" = 1 ] \
+    && [ -f "$STATE/${ID:-unknown}.meta" ]; then
+    "$SCRIPT_DIR/fm-browser.sh" reap "$ID" "$STATE/$ID.meta" >/dev/null 2>&1 \
+      || echo "warning: failed to reap browser automation for failed spawn ${ID:-unknown}; startup sweep will retry" >&2
+  fi
   [ -z "${CONFIG_INHERIT_REPORT_TMP:-}" ] || rm -f "$CONFIG_INHERIT_REPORT_TMP"
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" = 1 ] && [ "$endpoint_gone" = 0 ]; then
     if [ -z "$rollback_lock" ]; then
@@ -2914,6 +2920,8 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  echo "browser_session=fm-$ID"
+  echo "browser_channel=canary"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
@@ -2997,6 +3005,12 @@ META_INSTALLED=1
 [ -z "$META_WRITE_LOCK" ] || fm_account_meta_lock_release "$META_WRITE_LOCK"
 META_WRITE_LOCK=
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+
+BROWSER_BIN=$("$SCRIPT_DIR/fm-browser.sh" prepare "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP" "$STATE/$ID.meta") || exit 1
+BROWSER_PREPARED=1
+if ! "$SCRIPT_DIR/fm-browser.sh" check >/dev/null 2>&1; then
+  echo "fm-spawn: browser automation for $ID is disabled until Google Chrome Canary is installed; stable Chrome is intentionally blocked" >&2
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
@@ -3093,6 +3107,7 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+spawn_send_text_line "$T" "export PATH=$(shell_quote "$BROWSER_BIN"):\$PATH"
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3

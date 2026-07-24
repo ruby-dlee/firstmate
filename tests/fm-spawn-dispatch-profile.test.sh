@@ -12,6 +12,12 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+export FM_BROWSER_TEST_LAB=firstmate-browser-test-lab-v1
+export FM_BROWSER_STATE_ROOT="$TMP_ROOT/browser-state"
+export FM_BROWSER_CANARY_EXECUTABLE="$TMP_ROOT/Google Chrome Canary"
+mkdir -p "$FM_BROWSER_STATE_ROOT"
+: > "$FM_BROWSER_CANARY_EXECUTABLE"
+chmod +x "$FM_BROWSER_CANARY_EXECUTABLE"
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -42,7 +48,7 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  fm_fake_exit0 "$fakebin" treehouse chrome-devtools-axi
   printf '%s\n' "$fakebin"
 }
 
@@ -103,6 +109,8 @@ assert_meta_profile() {
   assert_grep "harness=$harness" "$meta" "meta missing harness=$harness"
   assert_grep "model=$model" "$meta" "meta missing model=$model"
   assert_grep "effort=$effort" "$meta" "meta missing effort=$effort"
+  assert_grep "browser_session=fm-$(basename "$meta" .meta)" "$meta" "meta missing task-scoped browser session"
+  assert_grep "browser_channel=canary" "$meta" "meta missing pinned browser channel"
 }
 
 test_no_profile_keeps_claude_launch_unchanged() {

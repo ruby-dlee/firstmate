@@ -22,6 +22,12 @@ set -u
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 TMP_ROOT=$(fm_test_tmproot fm-bootstrap-tests)
 export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
+export FM_BROWSER_TEST_LAB=firstmate-browser-test-lab-v1
+export FM_BROWSER_STATE_ROOT="$TMP_ROOT/browser-state"
+export FM_BROWSER_CANARY_EXECUTABLE="$TMP_ROOT/Google Chrome Canary"
+mkdir -p "$FM_BROWSER_STATE_ROOT"
+: > "$FM_BROWSER_CANARY_EXECUTABLE"
+chmod +x "$FM_BROWSER_CANARY_EXECUTABLE"
 
 # Hermetic runtime-backend detection. These cases pin the backend per-home via
 # config/backend; the dev shell's explicit FM_BACKEND and ambient runtime
@@ -320,6 +326,21 @@ older no-mistakes patch reports an upgrade^no-mistakes version v1.31.1 (fake)^mi
 unparseable no-mistakes version reports an upgrade^no-mistakes development build^missing
 ROWS
   pass "bootstrap enforces no-mistakes minimum version"
+}
+
+test_browser_canary_is_a_manual_dependency() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/browser-canary-missing"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_BROWSER_CANARY_EXECUTABLE="$case_dir/missing-canary" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" \
+    "MISSING_MANUAL: chrome-canary (instructions: https://www.google.com/chrome/canary/)" \
+    "bootstrap did not fail browser automation closed when Canary was unavailable"
+  pass "bootstrap: dedicated Chrome Canary is a loud manual browser dependency"
 }
 
 test_git_is_required_with_supported_install_instruction() {
@@ -946,6 +967,7 @@ fi
 
 test_bootstrap_reporting
 test_no_mistakes_min_version
+test_browser_canary_is_a_manual_dependency
 test_git_is_required_with_supported_install_instruction
 test_orca_backend_gates_orca_tool_only_when_selected
 test_session_provider_backends_do_not_require_tmux

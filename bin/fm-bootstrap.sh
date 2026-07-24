@@ -11,6 +11,7 @@
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "CREW_DISPATCH: active config/crew-dispatch.json" plus indented rules,
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
+#                 "BROWSER_SWEEP: orphaned session fm-<id>: reaped|refused unsafe reap",
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
@@ -66,9 +67,10 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (report_retention_ensure, secondmate_sync,
-#          secondmate_liveness_sweep, x_mode_setup, fleet_sync) while still
+#          secondmate_liveness_sweep, browser_sweep, x_mode_setup, fleet_sync)
+#          while still
 #          printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -440,6 +442,7 @@ manual_install_url() {
     herdr) echo "https://herdr.dev" ;;
     nohup|perl) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#herdr-detached-launcher-prerequisites" ;;
     agent-fleet) echo "https://github.com/ruby-dlee/firstmate/blob/main/docs/configuration.md#agent-fleet-account-routing" ;;
+    chrome-canary) echo "https://www.google.com/chrome/canary/" ;;
     *) return 1 ;;
   esac
 }
@@ -797,6 +800,10 @@ done
 for t in $COMMON_TOOLS; do
   command -v "$t" >/dev/null || missing_tool_diagnostic "$t"
 done
+if command -v chrome-devtools-axi >/dev/null 2>&1 \
+  && ! "$SCRIPT_DIR/fm-browser.sh" check >/dev/null 2>&1; then
+  missing_tool_diagnostic chrome-canary
+fi
 # The treehouse lease-support upgrade check is only relevant when the resolved
 # backend actually requires treehouse (every backend except orca, which owns its
 # own worktrees); an orca home must not be told to upgrade a provider it never uses.
@@ -836,6 +843,7 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   report_retention_ensure
   secondmate_sync
   secondmate_liveness_sweep
+  "$SCRIPT_DIR/fm-browser.sh" sweep
   x_mode_setup
   fleet_sync
 fi

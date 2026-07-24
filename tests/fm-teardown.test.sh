@@ -529,6 +529,84 @@ run_teardown() {
     "$TEARDOWN" task-x1 "$@"
 }
 
+start_fake_browser_for_teardown() {
+  local case_dir=$1 browser_root canary
+  local task_tmp="$case_dir/task-tmp" meta="$case_dir/state/task-x1.meta" wrapper_dir pid
+  browser_root="$case_dir/browser-state"
+  canary="$case_dir/Google Chrome Canary"
+  mkdir -p "$browser_root" "$task_tmp"
+  : > "$canary"
+  chmod +x "$canary"
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$case_dir/fake-headless-chrome.js" <<'JS'
+setInterval(() => {}, 1000);
+JS
+  cat > "$case_dir/chrome-devtools-axi-bridge.js" <<'JS'
+const fs = require("fs");
+const { spawn } = require("child_process");
+const child = spawn(process.execPath, [process.env.FM_FAKE_HEADLESS], { stdio: "ignore" });
+fs.writeFileSync(process.env.FM_FAKE_HEADLESS_PID, String(child.pid));
+setInterval(() => {}, 1000);
+JS
+  cat > "$case_dir/launch-browser.js" <<'JS'
+const fs = require("fs");
+const { spawn } = require("child_process");
+const sessionDir = process.argv[2];
+const bridge = spawn(process.execPath, [process.env.FM_FAKE_BRIDGE], {
+  detached: true,
+  stdio: "ignore",
+  env: {
+    ...process.env,
+    FM_FAKE_HEADLESS_PID: `${sessionDir}/headless.pid`,
+  },
+});
+bridge.unref();
+fs.writeFileSync(`${sessionDir}/bridge.pid`, JSON.stringify({ pid: bridge.pid, port: 9556 }));
+process.stdout.write(String(bridge.pid));
+JS
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+  printf '%s\n' 'browser_session=fm-task-x1' 'browser_channel=canary' >> "$meta"
+  wrapper_dir=$(FM_BROWSER_TEST_LAB=firstmate-browser-test-lab-v1 \
+    FM_BROWSER_STATE_ROOT="$browser_root" FM_BROWSER_CANARY_EXECUTABLE="$canary" \
+    PATH="$case_dir/fakebin:$PATH" \
+    "$ROOT/bin/fm-browser.sh" prepare task-x1 generation-task-x1 "$task_tmp" "$meta")
+  FM_FAKE_BRIDGE="$case_dir/chrome-devtools-axi-bridge.js" \
+    FM_FAKE_HEADLESS="$case_dir/fake-headless-chrome.js" \
+    node "$case_dir/launch-browser.js" "$browser_root/sessions/fm-task-x1" >/dev/null
+  FM_BROWSER_TEST_LAB=firstmate-browser-test-lab-v1 \
+    FM_BROWSER_STATE_ROOT="$browser_root" FM_BROWSER_CANARY_EXECUTABLE="$canary" \
+    "$wrapper_dir/chrome-devtools-axi" --help >/dev/null
+  pid=$(sed -nE 's/^\{"pid":([0-9]+),"port":[0-9]+\}$/\1/p' \
+    "$browser_root/sessions/fm-task-x1/bridge.pid")
+  printf '%s\n' "$pid"
+}
+
+test_teardown_reaps_owned_browser_group() {
+  local case_dir browser_root canary bridge_pid headless_pid before after
+  case_dir=$(make_case browser-reap)
+  write_meta "$case_dir" local-only ship
+  browser_root="$case_dir/browser-state"
+  canary="$case_dir/Google Chrome Canary"
+  bridge_pid=$(start_fake_browser_for_teardown "$case_dir")
+  headless_pid=$(cat "$browser_root/sessions/fm-task-x1/headless.pid")
+  before=$(ps -p "$bridge_pid,$headless_pid" -o pid=,ppid=,pgid=,command= 2>/dev/null)
+
+  FM_BROWSER_TEST_LAB=firstmate-browser-test-lab-v1 \
+    FM_BROWSER_STATE_ROOT="$browser_root" FM_BROWSER_CANARY_EXECUTABLE="$canary" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+
+  kill -0 "$bridge_pid" 2>/dev/null && fail "teardown left the owned browser bridge alive"
+  kill -0 "$headless_pid" 2>/dev/null && fail "teardown left the owned browser child alive"
+  after=$(ps -p "$bridge_pid,$headless_pid" -o pid=,ppid=,pgid=,command= 2>/dev/null || true)
+  [ -z "$after" ] || fail "teardown process listing still contains owned browser processes: $after"
+  assert_absent "$browser_root/sessions/fm-task-x1" "teardown left owned browser state"
+  printf 'teardown browser evidence before:\n%s\nteardown browser evidence after: <none>\n' "$before"
+  pass "teardown reaps the crew's owned bridge and browser process group"
+}
+
 test_local_only_fork_remote_allows() {
   local case_dir rc
   case_dir=$(make_case fork-allow)
@@ -2163,6 +2241,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = browser-reap ]; then
+  test_teardown_reaps_owned_browser_group
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = managed-force-release ]; then
   test_managed_force_teardown_releases_lease_and_session
   exit 0
@@ -2197,6 +2280,7 @@ if [ "${FM_TEST_FOCUSED:-}" = legacy-pr-generation ]; then
 fi
 
 test_local_only_fork_remote_allows
+test_teardown_reaps_owned_browser_group
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses

@@ -1072,6 +1072,17 @@ validate_firstmate_home_children_removal() {
   done
 }
 
+reap_browser_for_meta() { # <task-id> <meta>
+  local task=$1 meta=$2 session
+  session=$(meta_value "$meta" browser_session)
+  [ -n "$session" ] || return 0
+  [ "$session" = "fm-$task" ] || {
+    echo "error: invalid browser session metadata for $task: $session" >&2
+    return 1
+  }
+  "$SCRIPT_DIR/fm-browser.sh" reap "$task" "$meta"
+}
+
 cleanup_firstmate_home_children() {
   local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_account_lock child_endpoint_home
   sub_state="$home/state"
@@ -1118,6 +1129,7 @@ cleanup_firstmate_home_children() {
         ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" "$(meta_value "$child_meta" tmux_session_target)" ) 2>/dev/null || true
       fi
     fi
+    reap_browser_for_meta "$child_id" "$child_meta" || return 1
     if [ "$child_kind" = secondmate ]; then
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home"
@@ -1168,6 +1180,7 @@ if [ "$KIND" = secondmate ]; then
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
     quiesce_secondmate_endpoint || exit 1
+    reap_browser_for_meta "$ID" "$META" || exit 1
   fi
 fi
 
@@ -1251,10 +1264,14 @@ report_gated_safety_refusal() {
   echo "The completion-report endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
 }
 
-[ "$DIRECT_SPAWN_CLEANUP" != pending ] || quiesce_retained_direct_spawn_endpoint || exit 1
+if [ "$DIRECT_SPAWN_CLEANUP" = pending ]; then
+  quiesce_retained_direct_spawn_endpoint || exit 1
+  reap_browser_for_meta "$ID" "$META" || exit 1
+fi
 
 if [ "$REPORT_GATED" = 1 ]; then
   quiesce_completion_report_endpoint || exit 1
+  reap_browser_for_meta "$ID" "$META" || exit 1
 fi
 
 if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
@@ -1349,6 +1366,7 @@ fi
 if [ "$MANAGED_ACCOUNT" = 0 ] && [ "$BACKEND" != orca ] && [ "$SECONDMATE_ENDPOINT_QUIESCED" = 0 ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" "$(meta_value "$META" tmux_session_target)" 2>/dev/null || true
 fi
+reap_browser_for_meta "$ID" "$META" || exit 1
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
   case "$DIRECT_SPAWN_BACKUP" in
     ".$ID.meta.rollback."*) ;;

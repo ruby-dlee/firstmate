@@ -22,6 +22,9 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
+# Teardown also refuses while direct_recovery_cleanup=pending so a failed direct
+# recovery keeps the retained endpoint and worktree identity needed for retry.
+# Rerun direct recovery to reconcile that state before attempting teardown.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge on the captain's approval) as a fallback
 # for the common case where there is no remote at all.

@@ -2158,6 +2158,35 @@ SH
   pass "retained direct-spawn teardown requires confirmed endpoint quiescence"
 }
 
+test_retained_direct_recovery_refuses_teardown() {
+  local case_dir backup artifacts rc
+  case_dir=$(make_case retained-direct-recovery)
+  write_meta "$case_dir" local-only ship
+  backup="$case_dir/state/.task-x1.meta.rollback.recovery"
+  artifacts="$case_dir/state/.task-x1.artifacts.rollback.recovery"
+  printf '%s\n' 'prior generation' > "$backup"
+  mkdir -p "$artifacts"
+  printf '%s\n' 'prior artifact' > "$artifacts/status"
+  printf '%s\n' \
+    'direct_recovery_cleanup=pending' \
+    "direct_recovery_backup=${backup##*/}" \
+    "direct_recovery_artifacts=${artifacts##*/}" >> "$case_dir/state/task-x1.meta"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "retained direct-recovery teardown should refuse pending cleanup"
+  assert_grep 'direct recovery cleanup is pending for task-x1' "$case_dir/stderr" \
+    "retained direct-recovery teardown did not explain the cleanup blocker"
+  assert_present "$case_dir/wt/.git" "retained direct-recovery teardown recycled the worktree"
+  assert_present "$case_dir/state/task-x1.meta" "retained direct-recovery teardown erased cleanup metadata"
+  assert_present "$backup" "retained direct-recovery teardown erased the metadata backup"
+  assert_present "$artifacts/status" "retained direct-recovery teardown erased artifact backups"
+  pass "retained direct-recovery teardown preserves rollback state"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   test_teardown_refuses_unsafe_tasktmp_metadata
   exit 0
@@ -2190,6 +2219,11 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-cleanup ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-cleanup ]; then
+  test_retained_direct_recovery_refuses_teardown
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = legacy-pr-generation ]; then
   test_pr_check_backfills_legacy_generation_and_records_state
   test_pr_check_backfills_legacy_generation_before_race_check
@@ -2218,6 +2252,7 @@ test_required_report_revalidates_after_quiescence
 test_teardown_refuses_unsafe_tasktmp_metadata
 test_teardown_rejects_malformed_report_requirement
 test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+test_retained_direct_recovery_refuses_teardown
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

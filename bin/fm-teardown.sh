@@ -153,9 +153,18 @@ SECONDMATE_ENDPOINT_QUIESCED=0
 DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
 DIRECT_SPAWN_BACKUP=$(fm_meta_get "$META" direct_spawn_backup)
 DIRECT_SPAWN_ARTIFACTS=$(fm_meta_get "$META" direct_spawn_artifacts)
+DIRECT_RECOVERY_CLEANUP=$(fm_meta_get "$META" direct_recovery_cleanup)
 case "$DIRECT_SPAWN_CLEANUP" in
   ''|pending) ;;
   *) echo "error: invalid direct_spawn_cleanup metadata for $ID" >&2; exit 1 ;;
+esac
+case "$DIRECT_RECOVERY_CLEANUP" in
+  '') ;;
+  pending)
+    echo "error: direct recovery cleanup is pending for $ID; retry recovery before teardown" >&2
+    exit 1
+    ;;
+  *) echo "error: invalid direct_recovery_cleanup metadata for $ID" >&2; exit 1 ;;
 esac
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)

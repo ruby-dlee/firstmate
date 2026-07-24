@@ -1590,6 +1590,7 @@ spawn_abort_cleanup() {
     else
       worktree_clean=0
       echo "warning: retained failed spawn resources for ${ID:-unknown} because prior task state could not be restored" >&2
+      [ "$WORKTREE_RETAIN_ON_ABORT" != 1 ] || spawn_return_created_worktree
     fi
     [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2
   fi

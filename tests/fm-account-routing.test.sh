@@ -646,7 +646,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
     "rollback force-returned an acquired worktree whose detached tip changed"
   assert_grep 'retained-commit' "$WT_DIR/retained-commit.txt" \
     "rollback changed work committed after acquisition"
-  assert_grep 'expected detached tip' "$out_file" \
+  assert_grep 'retained acquired worktree' "$out_file" \
     "rollback did not diagnose the changed acquired tip"
   pass "unmanaged rollback retains acquisitions whose detached tip changed"
 }

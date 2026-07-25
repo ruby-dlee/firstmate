@@ -644,7 +644,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact common key expected_lock lock_marker
+  local id rec expected out status artifact expected_lock lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -657,11 +657,10 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  expected_lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  expected_lock=$(bash -c '
+    . "$1"
+    fm_checkout_lock_path "$2" "$3"
+  ' _ "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
@@ -685,7 +684,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   done
   assert_absent "$CASE_DIR/endpoint-live" \
     "post-metadata unmanaged failure left its endpoint alive"
-  assert_grep "return --force $WT_DIR" "$TREEHOUSE_LOG" \
+  assert_grep 'return --force .' "$TREEHOUSE_LOG" \
     "post-metadata unmanaged failure did not return its clean worktree"
   assert_present "$lock_marker" \
     "spawn rollback did not hold the common checkout lock during Treehouse return"

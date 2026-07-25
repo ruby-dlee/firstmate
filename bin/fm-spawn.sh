@@ -1431,12 +1431,18 @@ cleanup_continuation_launch_transport() {
 }
 
 spawn_return_created_worktree() {
-  local return_output return_status
+  local return_output return_status current_tip
   [ "$WORKTREE_CREATED" = 1 ] || return 0
   [ "${BACKEND:-tmux}" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
     echo "warning: retained unsafe acquired worktree $WT because repository identity or its expected detached tip could not be re-proven; inspect it manually" >&2
+    return 1
+  fi
+  current_tip=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || current_tip=
+  if [ -n "$WORKTREE_EXPECTED_TIP" ] && [ "$current_tip" != "$WORKTREE_EXPECTED_TIP" ]; then
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP" || true
+    echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
     return 1
   fi
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"

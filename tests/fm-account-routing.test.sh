@@ -203,9 +203,18 @@ if [ "${1:-}" = return ] \
   && { [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ] || [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; }; then
   checkout_lock=${FM_EXPECT_CHECKOUT_LOCK:-}
   if [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
-    checkout_locks=("$FM_EXPECT_CHECKOUT_LOCK_ROOT"/*.lock)
-    [ "${#checkout_locks[@]}" -eq 1 ] && [ -L "${checkout_locks[0]}" ] || exit 91
-    checkout_lock=${checkout_locks[0]}
+    guard=${FM_PROCESS_TREE_GUARD_FILE:-}
+    [ -f "$guard" ] || exit 91
+    owner=${guard%/process-group}
+    case "$owner" in "$FM_EXPECT_CHECKOUT_LOCK_ROOT"/*.lock.owner.*) ;; *) exit 91 ;; esac
+    checkout_lock=
+    for candidate in "$FM_EXPECT_CHECKOUT_LOCK_ROOT"/*.lock; do
+      [ -L "$candidate" ] || continue
+      [ "$(readlink "$candidate")" = "$owner" ] || continue
+      checkout_lock=$candidate
+      break
+    done
+    [ -n "$checkout_lock" ] || exit 91
   fi
   [ -e "$checkout_lock" ] || [ -L "$checkout_lock" ] || exit 91
   lock_pid=$(cat "$checkout_lock/pid" 2>/dev/null || true)

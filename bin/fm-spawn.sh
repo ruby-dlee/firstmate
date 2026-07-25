@@ -1464,6 +1464,17 @@ spawn_return_created_worktree() {
   return "$return_status"
 }
 
+spawn_diagnose_created_worktree_drift() {
+  local diagnostic
+  [ "$WORKTREE_CREATED" = 1 ] || return 0
+  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  [ -n "$WORKTREE_EXPECTED_TIP" ] || return 0
+  diagnostic=$("$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable \
+    "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP" 2>&1) && return 0
+  [ -z "$diagnostic" ] || printf '%s\n' "$diagnostic" >&2
+  return 1
+}
+
 spawn_restore_unmanaged_state_locked() {
   local meta="$STATE/$ID.meta" current_generation artifact_backup_name
   [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] || return 0
@@ -1597,6 +1608,7 @@ spawn_abort_cleanup() {
         ;;
     esac
   fi
+  [ "$endpoint_gone" = 1 ] || spawn_diagnose_created_worktree_drift || true
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
     && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
     && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then

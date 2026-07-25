@@ -662,7 +662,7 @@ test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation() {
 }
 
 test_changed_acquisition_is_retained_during_unmanaged_rollback() {
-  local id rec marker release out_file spawn_pid
+  local id rec marker release out_file spawn_pid drift_diagnostics
   id='checkout-changed-rollback-z1g'
   rec=$(make_case checkout-changed-rollback pi "$id")
   read_case "$rec"
@@ -694,6 +694,9 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
     "rollback changed work committed after acquisition"
   assert_grep 'expected detached tip' "$out_file" \
     "rollback did not diagnose the changed acquired tip"
+  drift_diagnostics=$(grep -c 'acquired worktree changed from expected detached tip' "$out_file")
+  [ "$drift_diagnostics" -eq 1 ] \
+    || fail "rollback diagnosed the changed acquired tip $drift_diagnostics times instead of once"
   pass "unmanaged rollback retains acquisitions whose detached tip changed"
 }
 

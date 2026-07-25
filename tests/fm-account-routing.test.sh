@@ -440,7 +440,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_PRIMARY_ROOT:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -2063,17 +2063,17 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2 home_abs primary
-  primary="$CASE_DIR/primary-home"
-  git clone --quiet --no-hardlinks "$ROOT" "$primary"
-  git -C "$primary" branch --force main HEAD
-  git -C "$primary" checkout --quiet main
-  git -C "$primary" remote remove origin
-  git clone --quiet --no-hardlinks "$primary" "$home"
-  git -C "$home" checkout --quiet --detach "$(git -C "$primary" rev-parse main)"
-  FM_TEST_ROOT_OVERRIDE=$primary
+  local home=$1 id=$2 home_abs primary_root source_head
+  primary_root="$CASE_DIR/primary-root"
+  source_head=$(git -C "$ROOT" rev-parse HEAD)
+  git clone --quiet --no-hardlinks "$ROOT" "$primary_root"
+  git -C "$primary_root" branch --force main "$source_head"
+  git -C "$primary_root" checkout --quiet --detach main
+  git clone --quiet --no-hardlinks "$primary_root" "$home"
+  git -C "$home" checkout --quiet --detach main
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
   home_abs=$(cd "$home" && pwd -P)
+  FM_TEST_PRIMARY_ROOT=$primary_root
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
   printf -- '- %s - account routing fixture (home: %s; scope: account routing; projects: ; added 2026-07-25)\n' \
@@ -6072,6 +6072,7 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
+  run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
   run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
   exit 0
 fi

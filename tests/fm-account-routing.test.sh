@@ -3120,6 +3120,7 @@ test_missing_endpoint_target_retains_managed_lease() {
   grep -Ev '^(window|tmux_window_id)=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
   clear_case_logs
+  seed_fake_teardown_authority "$id"
 
   out=$(run_teardown "$id" --force 2>&1)
   status=$?
@@ -6128,6 +6129,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = unknown-continuation ]; then
   run_isolated_test test_continuation_refuses_unknown_endpoint_state
+  run_isolated_test test_missing_endpoint_target_retains_managed_lease
   exit 0
 fi
 

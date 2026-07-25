@@ -126,8 +126,11 @@ enable_dispatch_profile() {
 
 make_seeded_secondmate_home() {
   local home=$1 id=$2 registry=$3 home_real
-  git clone --quiet --branch main "$ROOT" "$home"
+  git clone --quiet --no-checkout "$ROOT" "$home"
+  git -C "$home" checkout --quiet -b main "$("$FM_TEST_REAL_GIT" -C "$ROOT" rev-parse HEAD)"
+  git -C "$home" update-ref refs/remotes/origin/main HEAD
   git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  git -C "$home" branch --set-upstream-to=origin/main main >/dev/null
   mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
@@ -136,11 +139,20 @@ make_seeded_secondmate_home() {
     "$id" "$home_real" > "$registry"
 }
 
+make_primary_home() {
+  local home=$1
+  git clone --quiet --no-checkout "$ROOT" "$home"
+  git -C "$home" checkout --quiet -b main "$("$FM_TEST_REAL_GIT" -C "$ROOT" rev-parse HEAD)"
+  git -C "$home" update-ref refs/remotes/origin/main HEAD
+  git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  git -C "$home" branch --set-upstream-to=origin/main main >/dev/null
+}
+
 run_spawn() {
   local home=$1 wt=$2 fakebin=$3 launchlog=$4
   shift 4
   : > "$launchlog"
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
@@ -422,15 +434,18 @@ test_batch_forwards_shared_profile_flags() {
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
-  local rec id sm out status
+  local rec id primary sm out status
   id=profile-secondmate-z16
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
+  primary="$CASE_DIR/primary-home"
   sm="$CASE_DIR/secondmate-home"
+  make_primary_home "$primary"
   make_seeded_secondmate_home "$sm" "$id" "$HOME_DIR/data/secondmates.md"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(FM_TEST_ROOT_OVERRIDE="$primary" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
   expect_code 0 "$status" \
     "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"$'\n'"$out"

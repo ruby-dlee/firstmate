@@ -193,8 +193,10 @@ SH
 [ -z "${FM_FAKE_TREEHOUSE_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'treehouse %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 [ -z "${FM_FAKE_TREEHOUSE_SLEEP:-}" ] || sleep "$FM_FAKE_TREEHOUSE_SLEEP"
-if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
-  [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
+if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ]; then
+  [ -n "${FM_PROCESS_TREE_GUARD_FILE:-}" ] || exit 91
+  [ "${FM_PROCESS_TREE_GUARD_FILE##*/}" = process-group ] || exit 92
+  [ -f "$FM_PROCESS_TREE_GUARD_FILE" ] || exit 93
   [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] \
     || printf '%s\n' "$*" > "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
 fi
@@ -408,7 +410,6 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
-    FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
@@ -643,7 +644,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact expected_lock lock_marker
+  local id rec expected out status artifact lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -656,18 +657,13 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  expected_lock=$(bash -c '
-    . "$1"
-    fm_checkout_lock_path "$2" "$3"
-  ' _ "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
-  if out=$(FM_EXPECT_CHECKOUT_LOCK="$expected_lock" \
-      FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
+  if out=$(FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
       FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
     status=0
   else

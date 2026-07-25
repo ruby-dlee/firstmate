@@ -1601,7 +1601,7 @@ spawn_abort_cleanup() {
     && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
     && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then
     spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
-    if [ "$state_clean" = 1 ]; then
+    if [ "$state_clean" = 1 ] || [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0

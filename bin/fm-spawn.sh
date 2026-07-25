@@ -1506,7 +1506,7 @@ spawn_restore_unmanaged_state() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp rollback_tip restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
   # This is an EXIT trap whose job is to attempt every independent cleanup
   # action and then return the original spawn status. The parent script runs
@@ -1594,6 +1594,12 @@ spawn_abort_cleanup() {
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0
+      if [ -n "${WORKTREE_EXPECTED_TIP:-}" ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+        rollback_tip=$(git -C "$WT" rev-parse HEAD 2>/dev/null || true)
+        if [ -n "$rollback_tip" ] && [ "$rollback_tip" != "$WORKTREE_EXPECTED_TIP" ]; then
+          echo "warning: retained acquired worktree $WT because its expected detached tip changed" >&2
+        fi
+      fi
       if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
         echo "warning: retained unsafe acquired worktree $WT for manual recovery" >&2
       fi

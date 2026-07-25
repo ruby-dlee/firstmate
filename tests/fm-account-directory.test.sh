@@ -144,9 +144,27 @@ test_codex_fails_when_no_account_has_a_fresh_window() {
   out=$(run_selector select codex 2>&1)
   status=$?
   expect_code 1 "$status" "Codex selection with no healthy accounts should fail closed"
-  assert_contains "$out" "no healthy Codex account has a freshly readable usage window" \
+  assert_contains "$out" "CAPACITY_UNAVAILABLE: no unused Codex account has a freshly readable positive usage window" \
     "Codex all-unhealthy failure was not actionable"
   pass "Codex refuses selection when every discovered account lacks fresh readable usage"
+}
+
+test_codex_excludes_exhausted_accounts_and_zero_capacity() {
+  local out status
+  reset_accounts
+  set_remaining 1 90,85
+  set_remaining 2 0,0
+
+  out=$(run_selector select codex "$ACCOUNT_ROOT/codex/1" 2>&1)
+  status=$?
+  expect_code 1 "$status" "Codex selection should fail when the only unused account has zero capacity"
+  assert_contains "$out" "codex account $ACCOUNT_ROOT/codex/1 skipped: exhausted by this task" \
+    "Codex selection did not visibly exclude the task's exhausted account"
+  assert_contains "$out" "codex account $ACCOUNT_ROOT/codex/2 skipped: fresh remaining score=0 has no capacity" \
+    "Codex selection treated a zero-capacity account as healthy"
+  assert_contains "$out" "CAPACITY_UNAVAILABLE:" \
+    "Codex all-capacity-exhausted failure lacked the stable rescue marker"
+  pass "Codex excludes task-exhausted accounts and refuses zero-capacity alternatives"
 }
 
 test_codex_timeout_skips_wedged_account() {
@@ -502,6 +520,67 @@ test_direct_recovery_preserves_recorded_task_context() {
   assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" "direct recovery did not update account_home"
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "direct recovery invoked Agent Fleet"
   pass "direct recovery preserves recorded task context while refreshing account selection"
+}
+
+test_capacity_recovery_selects_a_different_account() {
+  local record id meta launch git_dir git_dir_identity git_ref
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 95,90
+  set_remaining 2 50,45
+  id=capacity-different-z4
+  record=$(make_spawn_case capacity-different codex "$id")
+  read_spawn_case "$record"
+  meta="$SPAWN_HOME/state/$id.meta"
+  git_dir=$(git -C "$SPAWN_WORKTREE" rev-parse --absolute-git-dir)
+  # shellcheck disable=SC2016 # JavaScript source is intentionally single-quoted.
+  git_dir_identity=$(node -e '
+const fs = require("fs");
+const stat = fs.lstatSync(process.argv[1], { bigint: true });
+process.stdout.write(`${stat.dev}:${stat.ino}`);
+' "$git_dir")
+  git_ref=$(git -C "$SPAWN_WORKTREE" symbolic-ref -q HEAD)
+  fm_write_meta "$meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$SPAWN_WORKTREE" \
+    "worktree_git_dir=$git_dir" \
+    "worktree_git_dir_identity=$git_dir_identity" \
+    "worktree_git_ref=$git_ref" \
+    "project=$SPAWN_PROJECT" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=direct-PR" \
+    "yolo=off" \
+    "tasktmp=/tmp/fm-$id" \
+    "model=default" \
+    "effort=default" \
+    "generation_id=spawn:capacity-different" \
+    "report_required=1" \
+    "account_home=$ACCOUNT_ROOT/codex/1"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/1" "$meta" \
+    "capacity recovery fixture did not start on the highest-capacity account"
+  printf '%s\n' \
+    "capacity_rescue_exhausted_account=$ACCOUNT_ROOT/codex/1" \
+    'capacity_rescue_attempts=1' \
+    "capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=codex|account=$ACCOUNT_ROOT/codex/1|failure=codex-model-capacity" \
+    >> "$meta"
+
+  export FM_CAPACITY_RESCUE_RECOVERY=account-exhaustion-v1
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account >/dev/null 2>&1
+  unset FM_CAPACITY_RESCUE_RECOVERY
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/2' codex" \
+    "automatic capacity recovery returned to the exhausted account instead of the different alternative"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" \
+    "automatic capacity recovery did not record the different replacement account"
+  assert_grep "capacity_rescue_exhausted_account=$ACCOUNT_ROOT/codex/1" "$meta" \
+    "direct recovery dropped the exhausted-account audit extension"
+  assert_grep 'capacity_rescue_attempts=1' "$meta" \
+    "direct recovery dropped the bounded rescue counter"
+  assert_grep 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z' "$meta" \
+    "direct recovery dropped the per-attempt audit extension"
+  pass "automatic capacity recovery always selects a different non-exhausted account"
 }
 
 test_direct_recovery_rejects_secondmate_metadata() {
@@ -951,6 +1030,7 @@ make_spawn_fakebin "$FAKEBIN"
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
+  test_capacity_recovery_selects_a_different_account
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
@@ -958,9 +1038,22 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = capacity-rescue ]; then
+  test_codex_picks_highest_fresh_minimum_and_skips_no_window
+  test_codex_rechecks_health_on_every_selection
+  test_codex_fails_when_no_account_has_a_fresh_window
+  test_codex_excludes_exhausted_accounts_and_zero_capacity
+  test_codex_timeout_skips_wedged_account
+  test_claude_uses_stable_first_without_treating_usage_as_health
+  test_prepare_installs_and_verifies_per_account_herdr_hooks
+  test_capacity_recovery_selects_a_different_account
+  exit 0
+fi
+
 test_codex_picks_highest_fresh_minimum_and_skips_no_window
 test_codex_rechecks_health_on_every_selection
 test_codex_fails_when_no_account_has_a_fresh_window
+test_codex_excludes_exhausted_accounts_and_zero_capacity
 test_codex_timeout_skips_wedged_account
 test_claude_uses_stable_first_without_treating_usage_as_health
 test_default_root_uses_passwd_home_not_ambient_home
@@ -970,6 +1063,7 @@ test_spawn_uses_direct_claude_fallback_and_hook
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
+test_capacity_recovery_selects_a_different_account
 test_direct_recovery_rejects_secondmate_metadata
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief

@@ -157,7 +157,7 @@ test_classifier_primitives() {
 }
 
 test_provider_capacity_failure_classifier() {
-  local claude_line claude_dialog codex ordinary
+  local claude_line claude_dialog claude_auth codex ordinary
   codex=$(cat <<'EOF'
 • Ran bin/fm-lint.sh
   └ all checks passed
@@ -190,6 +190,10 @@ EOF
   [ "$(provider_capacity_failure_kind claude "$claude_dialog")" = claude-usage-limit-dialog ] \
     || fail "real captured Claude usage-limit dialog did not classify"
 
+  claude_auth=$'Claude Code\n\nNot logged in - Please run /login'
+  [ "$(provider_credential_failure_kind claude "$claude_auth")" = claude-not-logged-in ] \
+    || fail "real captured Claude not-logged-in chrome did not classify"
+
   ordinary=$'The provider documentation mentions usage limits, model capacity, and reset windows.\nThe prior log said Selected model is at capacity. Please try a different model.\nWe should test what happens if you\'ve hit your session limit and need to wait.'
   ! provider_capacity_failure_kind codex "$ordinary" >/dev/null \
     || fail "ordinary prose mentioning Codex capacity false-matched provider chrome"
@@ -197,7 +201,12 @@ EOF
     || fail "ordinary prose mentioning Claude limits false-matched provider chrome"
   ! provider_capacity_failure_kind unknown "$codex" >/dev/null \
     || fail "unknown harness guessed a Codex capacity failure"
-  pass "provider capacity classifier matches real harness chrome and rejects ordinary limit prose"
+  ! provider_credential_failure_kind codex "$claude_auth" >/dev/null \
+    || fail "Codex guessed a Claude credential failure"
+  ! provider_credential_failure_kind claude \
+    'The pane said Not logged in - Please run /login while documenting authentication.' >/dev/null \
+    || fail "ordinary prose mentioning Claude login false-matched credential chrome"
+  pass "provider failure classifiers match real harness chrome and reject ordinary prose"
 }
 
 write_capacity_rescue_meta() {  # <meta> <window> <account-home> [attempts]
@@ -405,6 +414,58 @@ test_capacity_rescue_interrupted_attempt_never_respawns() {
   assert_grep 'capacity_rescue_stopped=interrupted-attempt' "$meta" \
     "interrupted attempt did not persist its no-respawn stop"
   pass "a result-less attempt is found without a live pane and stops without respawn or endpoint guess"
+}
+
+test_claude_credentials_stop_without_consuming_rescue_attempt() {
+  local dir state meta fake_spawn account
+  dir=$(make_case claude-credentials); state="$dir/state"
+  meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
+  account="$dir/accounts/claude/1"
+  mkdir -p "$account"
+  fm_write_meta "$meta" \
+    "window=sess:fm-task" \
+    "harness=claude" \
+    "kind=ship" \
+    "account_home=$account" \
+    "generation_id=spawn:test-generation"
+  make_capacity_spawn_fake "$fake_spawn"
+
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
+    export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
+    export FM_FAKE_CAPACITY_META="$meta"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/claude/2"
+    export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
+    export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
+    # shellcheck disable=SC1090
+    . "$WATCH"
+    fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
+    fm_backend_target_state() { printf 'absent'; }
+    capacity_rescue_task "sess:fm-task" task claude claude-not-logged-in
+    [ "$CAPACITY_RESCUE_OUTCOME" = blocked ] \
+      || fail "Claude credential failure did not stop blocked: $CAPACITY_RESCUE_OUTCOME"
+    [ "$CAPACITY_RESCUE_REASON" = credentials ] \
+      || fail "Claude credential failure reported the wrong reason: $CAPACITY_RESCUE_REASON"
+    capacity_rescue_task "sess:fm-task" task claude claude-not-logged-in
+    [ "$CAPACITY_RESCUE_OUTCOME" = already-stopped ] \
+      || fail "Claude credential failure retried after its durable stop"
+  )
+
+  [ ! -e "$dir/spawn.log" ] || [ ! -s "$dir/spawn.log" ] \
+    || fail "Claude credential failure rotated to another account"
+  [ ! -e "$dir/kill.log" ] || [ ! -s "$dir/kill.log" ] \
+    || fail "Claude credential failure removed its endpoint"
+  [ "$(grep -Fc 'blocked [key=capacity-rescue]:' "$state/task.status" || true)" = 1 ] \
+    || fail "Claude credential failure did not emit exactly one blocked status"
+  ! grep -q '^capacity_rescue_attempts=' "$meta" \
+    || fail "Claude credential failure consumed the capacity rescue attempt budget"
+  ! grep -q '^capacity_rescue_exhausted_account=' "$meta" \
+    || fail "Claude credential failure recorded the account as capacity-exhausted"
+  assert_grep 'capacity_rescue_stopped=credentials' "$meta" \
+    "Claude credential failure did not persist its no-retry stop"
+  pass "Claude credential failure blocks once without rotation or rescue accounting"
 }
 
 test_managed_tmux_window_id_reverse_mapping() {
@@ -1760,6 +1821,7 @@ if [ "${FM_TEST_FOCUSED:-}" = capacity-rescue ]; then
   test_capacity_rescue_no_capacity_stops_once
   test_capacity_rescue_attempt_cap_stops_without_spawn
   test_capacity_rescue_interrupted_attempt_never_respawns
+  test_claude_credentials_stop_without_consuming_rescue_attempt
   exit 0
 fi
 
@@ -1772,6 +1834,7 @@ test_capacity_rescue_records_attempt_and_changes_account
 test_capacity_rescue_no_capacity_stops_once
 test_capacity_rescue_attempt_cap_stops_without_spawn
 test_capacity_rescue_interrupted_attempt_never_respawns
+test_claude_credentials_stop_without_consuming_rescue_attempt
 test_managed_tmux_window_id_reverse_mapping
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier

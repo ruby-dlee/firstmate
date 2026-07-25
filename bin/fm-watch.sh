@@ -694,6 +694,14 @@ capacity_rescue_task() {  # <window> <task> <harness> <failure-kind>
     CAPACITY_RESCUE_REASON=missing-direct-account-metadata
     return 0
   fi
+  if [ "$failure_kind" = claude-not-logged-in ]; then
+    capacity_rescue_meta_stop "$task" credentials || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue blocked on Claude credentials: run /login for the configured account directories" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=credentials
+    return 0
+  fi
   attempts=$(fm_meta_get "$meta" capacity_rescue_attempts)
   case "$attempts" in
     '') attempts=0 ;;
@@ -1434,11 +1442,33 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     capacity_failure=
+    credential_failure=
     case "$kind" in
       ship|scout)
+        credential_failure=$(provider_credential_failure_kind "$(window_harness "$w")" "$tail40" || true)
         capacity_failure=$(provider_capacity_failure_kind "$(window_harness "$w")" "$tail40" || true)
         ;;
     esac
+    if [ -n "$credential_failure" ]; then
+      capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$credential_failure" || true
+      case "$CAPACITY_RESCUE_OUTCOME" in
+        already-stopped)
+          triage_log "account rescue remains stopped: $task ($CAPACITY_RESCUE_REASON)"
+          continue
+          ;;
+        blocked)
+          reason="signal: $STATE/$task.status (automatic account rescue stopped: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append signal "$task.status" "$reason" || exit 1
+          mark_surfaced "$STATE/$task.status"
+          wake "$reason"
+          ;;
+        *)
+          reason="stale: $w (provider credential failure detected but automatic rescue was deferred: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append stale "$w" "$reason" || exit 1
+          wake "$reason"
+          ;;
+      esac
+    fi
     if [ -n "$capacity_failure" ]; then
       capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$capacity_failure" || true
       case "$CAPACITY_RESCUE_OUTCOME" in

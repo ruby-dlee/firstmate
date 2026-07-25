@@ -375,14 +375,9 @@ root_device = opened.st_dev
 # Descendant validation is point-in-time. Reopen each queued relative path
 # from the retained root, validating every component descriptor-relatively,
 # then release its descriptor immediately after listing it. Only the root
-# remains bound across exec.
-pending = [
-    (name,)
-    for name in sorted(os.listdir(descriptor), reverse=True)
-    if stat.S_ISDIR(
-        os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode
-    )
-]
+# remains bound across exec. Start with the root so every descendant is queued
+# by this one descriptor-relative validation path.
+pending = [()]
 while pending:
     relative = pending.pop()
     directory_fd = descriptor

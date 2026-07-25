@@ -714,8 +714,9 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  lock_root="$CASE_DIR/checkout-refresh-locks"
-  mkdir -p "$lock_root"
+  mkdir -p "$CASE_DIR/checkout-refresh-locks"
+  ln -s checkout-refresh-locks "$CASE_DIR/checkout-refresh-lock-alias"
+  lock_root="$CASE_DIR/checkout-refresh-lock-alias"
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do

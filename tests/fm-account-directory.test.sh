@@ -796,13 +796,14 @@ test_direct_recovery_rechecks_identity_after_account_prepare() {
   : > "$QUOTA_LOG"
   : > "$HERDR_LOG"
 
-  if out=$(FM_FAKE_HERDR_DRIFT_WORKTREE="$SPAWN_WORKTREE" \
-    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+  export FM_FAKE_HERDR_DRIFT_WORKTREE="$SPAWN_WORKTREE"
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" --recover-direct-account 2>&1); then
     status=0
   else
     status=$?
   fi
+  unset FM_FAKE_HERDR_DRIFT_WORKTREE
   [ "$status" -ne 0 ] || fail "direct recovery ignored worktree identity drift during account preparation"
   assert_contains "$out" "changed branch identity" \
     "post-prepare identity drift refusal was not actionable"

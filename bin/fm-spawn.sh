@@ -2798,7 +2798,11 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     exit 1
   fi
   fm_checkout_validate_git_metadata "$wt_real" >/dev/null || {
-    echo "error: $source returned redirected or unprovable Git metadata at $wt_real" >&2
+    if [ "$source" = "recorded direct account recovery" ]; then
+      echo "error: recorded direct account recovery worktree '$WT' does not belong to recorded project '$PROJ_ABS' because its Git metadata is redirected or unprovable; refusing endpoint creation" >&2
+    else
+      echo "error: $source returned redirected or unprovable Git metadata at $wt_real" >&2
+    fi
     exit 1
   }
   fm_checkout_validate_git_metadata "$proj_real" >/dev/null || {
@@ -2896,7 +2900,11 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
 fi
 
 if [ "$DIRECT_ACCOUNT_PREPARE_DEFERRED" = 1 ]; then
-  DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS" "${DIRECT_ACCOUNT_EXCLUDES[@]}") || exit 1
+  if [ "${FM_CAPACITY_RESCUE_RECOVERY:-}" = account-exhaustion-v1 ]; then
+    DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS" "${DIRECT_ACCOUNT_EXCLUDES[@]}") || exit 1
+  else
+    DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+  fi
   echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
   DIRECT_ACCOUNT_PREPARE_DEFERRED=0
 fi

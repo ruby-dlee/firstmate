@@ -368,7 +368,7 @@ make_case() {
   proj="$case_dir/project"
   wt="$case_dir/wt"
   fakebin=$(make_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$case_dir/treehouse-pools"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   git -C "$wt" checkout --quiet --detach

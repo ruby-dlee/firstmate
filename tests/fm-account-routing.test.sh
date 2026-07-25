@@ -478,6 +478,7 @@ run_teardown() {
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
+    FM_REPORT_STACK_ROOT="$CASE_DIR/report-stack" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
 }
@@ -510,10 +511,45 @@ clear_case_logs() {
   rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/resume-arm.native-dir" "$CASE_DIR/session-refreshed"
 }
 
-write_teardown_completion_report() {
-  local id=$1
-  printf '# Completion\n\n## Summary\n\nRollback cleanup is ready.\n\n## What changed\n\nRecorded cleanup state.\n\n## Verification\n\nCleanup assertions follow.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nNone.\n\n## Follow-ups\n\nNone.\n' \
-    > "$HOME_DIR/data/$id/completion.md"
+seed_fake_teardown_authority() {
+  local id=$1 state
+  state="$(dirname "$(dirname "$WT_DIR")")/treehouse-state.json"
+  cat > "$HOME_DIR/data/$id/completion.md" <<EOF
+# Completion
+
+## Summary
+Teardown fixture for $id.
+## What changed
+The fixture completed its simulated work.
+## Verification
+The teardown behavior test verifies cleanup.
+## Visual evidence
+No visual evidence is applicable.
+## Artifacts
+The test owns only temporary artifacts.
+## Follow-ups
+No follow-up work remains.
+EOF
+  python3 - "$state" "$WT_DIR" "firstmate-$id" <<'PY'
+import json
+import sys
+
+state_path, worktree, holder = sys.argv[1:]
+with open(state_path, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "path": worktree,
+                    "leased": True,
+                    "lease_holder": holder,
+                    "destroying": False,
+                }
+            ]
+        },
+        stream,
+    )
+PY
 }
 
 use_named_fake_tmux_target() {
@@ -2578,7 +2614,7 @@ test_failed_cleanup_persists_retryable_metadata() {
   assert_not_grep 'return --force' "$TREEHOUSE_LOG" "failed cleanup recycled its retained worktree"
 
   clear_case_logs
-  write_teardown_completion_report "$id"
+  seed_fake_teardown_authority "$id"
   run_teardown "$id" --force >/dev/null || fail "teardown could not retry failed Agent Fleet cleanup"
   assert_grep "lease release --task $task --force" "$AF_LOG" "teardown did not retry the failed lease release"
   assert_grep "session remove --task $task" "$AF_LOG" "teardown did not retry the failed session cleanup"
@@ -2602,7 +2638,7 @@ test_unknown_spawn_endpoint_retains_lease_for_retry() {
   assert_contains "$out" "endpoint state is unknown" "unknown endpoint retention was not reported"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
-  write_teardown_completion_report "$id"
+  seed_fake_teardown_authority "$id"
   run_teardown "$id" --force >/dev/null || fail "unknown endpoint retry state could not be torn down after absence was confirmed"
   pass "spawn rollback retains leases while endpoint state is unknown"
 }
@@ -2627,7 +2663,7 @@ test_rollback_retry_rechecks_live_endpoint_before_release() {
   assert_contains "$out" "endpoint is still alive" "live rollback retry blocker was unclear"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
-  write_teardown_completion_report "$id"
+  seed_fake_teardown_authority "$id"
   run_teardown "$id" --force >/dev/null || fail "live rollback retry state could not be torn down after endpoint removal"
   pass "rollback cleanup retries prove the retained endpoint is dead"
 }
@@ -3226,7 +3262,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
-  write_teardown_completion_report "$id"
+  seed_fake_teardown_authority "$id"
   release_marker="$CASE_DIR/lease-released"
   FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_RETURN_SLEEP=1 \
     run_teardown "$id" --force > "$CASE_DIR/teardown-stdout" 2> "$CASE_DIR/teardown-stderr" &
@@ -5812,7 +5848,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
 
   clear_case_logs
-  write_teardown_completion_report "$id"
+  seed_fake_teardown_authority "$id"
   run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"
   assert_grep "lease release --task $old_task" "$AF_LOG" "fresh teardown did not release the restored predecessor"
   pass "teardown stops and revalidates after rollback restores predecessor state"
@@ -5883,6 +5919,13 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = unmanaged-postinstall-sequence ]; then
   run_isolated_test test_changed_acquisition_is_retained_during_unmanaged_rollback
   run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = teardown-retry ]; then
+  run_isolated_test test_failed_cleanup_persists_retryable_metadata
+  run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
+  run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
   exit 0
 fi
 

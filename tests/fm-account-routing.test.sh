@@ -2067,6 +2067,7 @@ make_seeded_secondmate_home() {
   primary_root="$CASE_DIR/primary-root"
   source_head=$(git -C "$ROOT" rev-parse HEAD)
   git clone --quiet --no-hardlinks "$ROOT" "$primary_root"
+  git -C "$primary_root" remote remove origin
   git -C "$primary_root" branch --force main "$source_head"
   git -C "$primary_root" checkout --quiet --detach main
   git clone --quiet --no-hardlinks "$primary_root" "$home"

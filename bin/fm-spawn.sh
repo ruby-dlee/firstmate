@@ -1435,11 +1435,17 @@ spawn_return_created_worktree() {
   [ "$WORKTREE_CREATED" = 1 ] || return 0
   [ "${BACKEND:-tmux}" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  current_tip=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || current_tip=
+  if [ -n "$WORKTREE_EXPECTED_TIP" ] && [ -n "$current_tip" ] \
+    && [ "$current_tip" != "$WORKTREE_EXPECTED_TIP" ]; then
+    echo "error: acquired worktree changed from expected detached tip $WORKTREE_EXPECTED_TIP to $current_tip; retain it for manual recovery" >&2
+    echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
+    return 1
+  fi
   if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
     echo "warning: retained unsafe acquired worktree $WT because repository identity or its expected detached tip could not be re-proven; inspect it manually" >&2
     return 1
   fi
-  current_tip=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || current_tip=
   if [ -n "$WORKTREE_EXPECTED_TIP" ] && [ "$current_tip" != "$WORKTREE_EXPECTED_TIP" ]; then
     echo "error: acquired worktree changed from expected detached tip $WORKTREE_EXPECTED_TIP to $current_tip; retain it for manual recovery" >&2
     echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2

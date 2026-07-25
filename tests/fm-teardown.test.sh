@@ -1854,7 +1854,7 @@ test_managed_teardown_retains_lease_when_endpoint_state_is_unknown() {
 #!/usr/bin/env bash
 case "${1:-}" in
   display-message) exit 1 ;;
-  list-panes) echo 'permission denied' >&2; exit 74 ;;
+  list-windows) echo 'permission denied' >&2; exit 74 ;;
   kill-window) exit 74 ;;
 esac
 exit 0

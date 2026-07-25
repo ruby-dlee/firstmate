@@ -13,7 +13,7 @@ QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
 
-mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
+mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude" "$TMP_ROOT/treehouse"
 
 cat > "$FAKEBIN/quota-axi" <<'SH'
 #!/usr/bin/env bash
@@ -314,6 +314,7 @@ run_direct_spawn() {
     T="${T:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" \
+    FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
@@ -353,7 +354,7 @@ EOF
 }
 
 test_spawn_uses_direct_codex_home_without_agent_fleet() {
-  local record id out launch meta
+  local record id out status launch meta
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 30,20
@@ -363,8 +364,13 @@ test_spawn_uses_direct_codex_home_without_agent_fleet() {
   read_spawn_case "$record"
   printf '%s\n' enforce > "$SPAWN_HOME/config/account-routing-mode"
 
-  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" "$SPAWN_PROJECT" 2>&1)
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ] || fail "direct Codex spawn failed before launch: $out"
   launch=$(cat "$SPAWN_LAUNCH_LOG")
   meta=$SPAWN_HOME/state/$id.meta
   assert_contains "$out" "selected direct codex account home $ACCOUNT_ROOT/codex/2" \

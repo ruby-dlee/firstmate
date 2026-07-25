@@ -2,17 +2,20 @@
 # Tests for the destructive Treehouse-return boundary walk in
 # bin/fm-checkout-lock-lib.sh (fm_checkout_treehouse_return_locked).
 #
-# The walk exists to prove that `treehouse return --force` cannot ESCAPE the
-# worktree it is pointed at. It must refuse a redirected target - a symlinked
-# path component, a non-directory, a mount point, a cross-device child - and it
-# must NOT refuse a tree merely because ordinary symlinks live inside it.
+# The walk validates that `treehouse return --force` starts from an acceptable
+# worktree boundary. It must refuse a redirected target - a symlinked path
+# component, a non-directory, a mount point, a cross-device child - and it must
+# NOT refuse a tree merely because ordinary symlinks live inside it. The root
+# descriptor remains open across exec so the return stays bound to that root.
+# Descendant validation is point-in-time: descendant descriptors are released
+# after their subtrees are checked instead of being inherited by Treehouse.
 #
 # That distinction is the regression this file pins. The walk originally
 # refused on ANY symlink entry anywhere in the tree, which made every repo
 # whose own committed layout uses symlinks permanently un-reapable: relvino
 # carries 177 of them in every worktree (its CLAUDE.md -> AGENTS.md convention
 # and its symlinked skills), so no crew there could ever be torn down. A
-# symlink ENTRY cannot redirect this operation - it is inspected with
+# symlink ENTRY cannot redirect this validation walk - it is inspected with
 # follow_symlinks=False, it is not a directory so it is never queued for
 # descent, and each descent opens with O_NOFOLLOW and re-proves identity,
 # single-device, and non-mount. Only a symlinked ANCESTOR redirects, and that
@@ -67,11 +70,14 @@ make_case() {  # <name> -> prints "<case_dir> <project> <worktree>"
   printf '%s %s %s' "$case_dir" "$project" "$worktree"
 }
 
-run_boundary() {  # <project> <target> [cd-dir] -> exit status
-  local project=$1 target=$2 cd_dir=${3:-$1} fakebin status
+run_boundary() {  # <project> <target> [cd-dir] [fd-limit] -> exit status
+  local project=$1 target=$2 cd_dir=${3:-$1} fd_limit=${4:-} fakebin status
   fakebin=$(fm_fakebin "$(dirname "$project")/fake")
   fm_fake_exit0 "$fakebin" treehouse
   (
+    if [ -n "$fd_limit" ]; then
+      ulimit -n "$fd_limit" || exit 71
+    fi
     cd "$cd_dir" || exit 70
     PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$target" "$project"
   ) >/dev/null 2>&1
@@ -158,9 +164,57 @@ EOF
   pass "a project/cwd mismatch is refused"
 }
 
+test_realistically_large_and_deep_tree_respects_fd_limit() {
+  local rec case_dir project worktree fakebin status
+  rec=$(make_case realistically-large-tree)
+  read -r case_dir project worktree <<EOF
+$rec
+EOF
+  : "$case_dir"
+  if ! python3 - "$worktree" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+for index in range(42001):
+    os.mkdir(os.path.join(root, f"directory-{index:05d}"))
+deep = os.path.join(root, "deep")
+os.mkdir(deep)
+for _ in range(130):
+    deep = os.path.join(deep, "d")
+    os.mkdir(deep)
+PY
+  then
+    fail "could not generate the greater-than-42,000-directory capacity fixture"
+  fi
+  fakebin=$(fm_fakebin "$case_dir/fake")
+  cat > "$fakebin/treehouse" <<'SH'
+#!/bin/sh
+root_descriptor=${FM_TREEHOUSE_RETURN_ROOT_FD:-}
+[ -n "$root_descriptor" ] || exit 91
+[ "$FM_TREEHOUSE_RETURN_BOUNDARY_FDS" = "$root_descriptor" ] || exit 92
+[ -d "/dev/fd/$root_descriptor" ] || exit 93
+for candidate in /dev/fd/*; do
+  [ -d "$candidate" ] || continue
+  [ "${candidate##*/}" = "$root_descriptor" ] || exit 94
+done
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  (
+    ulimit -n 128 || exit 71
+    cd "$project" || exit 70
+    PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$worktree" "$project"
+  ) >/dev/null 2>&1
+  status=$?
+  expect_code 0 "$status" "a worktree with more than 42,000 directories and depth beyond the descriptor limit must return"
+  pass "a real greater-than-42,000-directory fixture keeps only its root descriptor across exec"
+}
+
 extract_boundary_program
 test_in_tree_symlinks_are_accepted
 test_symlink_escaping_the_tree_is_still_not_followed
 test_symlinked_ancestor_is_refused
 test_non_directory_target_is_refused
 test_project_cwd_mismatch_is_refused
+test_realistically_large_and_deep_tree_respects_fd_limit

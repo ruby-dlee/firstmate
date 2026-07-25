@@ -4443,6 +4443,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-13-network ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-return-root-swap ]; then
+  test_treehouse_return_stays_bound_to_validated_root
+  exit 0
+fi
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present

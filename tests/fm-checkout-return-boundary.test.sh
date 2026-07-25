@@ -164,21 +164,29 @@ EOF
   pass "a project/cwd mismatch is refused"
 }
 
-test_realistically_large_tree_respects_fd_limit() {
+test_realistically_large_and_deep_tree_respects_fd_limit() {
   local rec case_dir project worktree fakebin status
   rec=$(make_case realistically-large-tree)
   read -r case_dir project worktree <<EOF
 $rec
 EOF
   : "$case_dir"
-  python3 - "$worktree" <<'PY'
+  if ! python3 - "$worktree" <<'PY'
 import os
 import sys
 
 root = sys.argv[1]
-for index in range(42001):
+for index in range(41701):
     os.mkdir(os.path.join(root, f"directory-{index:05d}"))
+deep = os.path.join(root, "deep")
+os.mkdir(deep)
+for _ in range(300):
+    deep = os.path.join(deep, "d")
+    os.mkdir(deep)
 PY
+  then
+    fail "could not generate the 42,002-directory capacity fixture"
+  fi
   fakebin=$(fm_fakebin "$case_dir/fake")
   cat > "$fakebin/treehouse" <<'SH'
 #!/bin/sh
@@ -186,17 +194,21 @@ root_descriptor=${FM_TREEHOUSE_RETURN_ROOT_FD:-}
 [ -n "$root_descriptor" ] || exit 91
 [ "$FM_TREEHOUSE_RETURN_BOUNDARY_FDS" = "$root_descriptor" ] || exit 92
 [ -d "/dev/fd/$root_descriptor" ] || exit 93
+for candidate in /dev/fd/*; do
+  [ -d "$candidate" ] || continue
+  [ "${candidate##*/}" = "$root_descriptor" ] || exit 94
+done
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
   (
-    ulimit -n 256 || exit 71
+    ulimit -n 128 || exit 71
     cd "$project" || exit 70
     PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$worktree" "$project"
   ) >/dev/null 2>&1
   status=$?
-  expect_code 0 "$status" "a 42,001-directory worktree must return within a 256-descriptor limit"
-  pass "a real 42,001-directory fixture keeps only its root descriptor across exec"
+  expect_code 0 "$status" "a 42,002-directory worktree deeper than the descriptor limit must return"
+  pass "a real 42,002-directory deep fixture keeps only its root descriptor across exec"
 }
 
 extract_boundary_program
@@ -205,4 +217,4 @@ test_symlink_escaping_the_tree_is_still_not_followed
 test_symlinked_ancestor_is_refused
 test_non_directory_target_is_refused
 test_project_cwd_mismatch_is_refused
-test_realistically_large_tree_respects_fd_limit
+test_realistically_large_and_deep_tree_respects_fd_limit

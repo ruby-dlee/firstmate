@@ -372,51 +372,52 @@ parent_metadata = os.stat(parent)
 if opened.st_dev != parent_metadata.st_dev or os.path.ismount(target):
     raise SystemExit(74)
 root_device = opened.st_dev
-# Keep only the descriptors on the active depth-first path. Each child stays
-# anchored through validation of its own subtree, then closes before the next
-# sibling. This preserves descriptor-relative O_NOFOLLOW descent without
-# inheriting one descriptor for every directory in the worktree.
-pending = [(descriptor, target, sorted(os.listdir(descriptor), reverse=True))]
+# Descendant validation is point-in-time. Reopen each queued relative path
+# from the retained root, validating every component descriptor-relatively,
+# then release its descriptor immediately after listing it. Only the root
+# remains bound across exec.
+pending = [
+    (name,)
+    for name in sorted(os.listdir(descriptor), reverse=True)
+    if stat.S_ISDIR(
+        os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode
+    )
+]
 while pending:
-    directory_fd, path, names = pending[-1]
-    if not names:
-        pending.pop()
+    relative = pending.pop()
+    directory_fd = descriptor
+    path = target
+    try:
+        for name in relative:
+            item = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(item.st_mode):
+                raise SystemExit(74)
+            child = os.open(name, flags, dir_fd=directory_fd)
+            if directory_fd != descriptor:
+                os.close(directory_fd)
+            directory_fd = child
+            os.set_inheritable(directory_fd, False)
+            child_opened = os.fstat(directory_fd)
+            path = os.path.join(path, name)
+            if (
+                (item.st_dev, item.st_ino)
+                != (child_opened.st_dev, child_opened.st_ino)
+                or child_opened.st_dev != root_device
+                or os.path.ismount(path)
+            ):
+                raise SystemExit(74)
+        for name in sorted(os.listdir(directory_fd), reverse=True):
+            item = os.stat(
+                name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            # A symlink INSIDE the tree is skipped, never refused and never
+            # descended. Every directory is reopened with O_NOFOLLOW and
+            # re-proves dev/ino, single-device, and non-mount before use.
+            if stat.S_ISDIR(item.st_mode):
+                pending.append(relative + (name,))
+    finally:
         if directory_fd != descriptor:
             os.close(directory_fd)
-        continue
-    name = names.pop()
-    item = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    # A symlink INSIDE the tree is skipped, never refused and never
-    # descended. Refusing outright made this boundary reject any repository
-    # whose own committed layout uses symlinks - relvino puts 177 in every
-    # worktree (its CLAUDE.md -> AGENTS.md convention and symlinked skills),
-    # so no crew there could ever be reaped. A symlink entry cannot redirect
-    # this validation walk outside the tree: it is inspected with
-    # follow_symlinks=False, it is not a directory so it is never queued,
-    # and every descent below
-    # opens with O_NOFOLLOW and re-proves dev/ino, single-device, and
-    # non-mount. The path-component loop above still refuses a symlinked
-    # ANCESTOR, while the retained root descriptor binds the later return.
-    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
-        continue
-    child_path = os.path.join(path, name)
-    child = os.open(name, flags, dir_fd=directory_fd)
-    try:
-        # Only the validated root may cross exec. Make that invariant explicit
-        # instead of depending on the interpreter default for newly opened FDs.
-        os.set_inheritable(child, False)
-        child_opened = os.fstat(child)
-        if (
-            (item.st_dev, item.st_ino) != (child_opened.st_dev, child_opened.st_ino)
-            or child_opened.st_dev != root_device
-            or os.path.ismount(child_path)
-        ):
-            raise SystemExit(74)
-        child_names = sorted(os.listdir(child), reverse=True)
-    except BaseException:
-        os.close(child)
-        raise
-    pending.append((child, child_path, child_names))
 os.set_inheritable(descriptor, True)
 os.environ["FM_TREEHOUSE_RETURN_ROOT_FD"] = str(descriptor)
 os.environ["FM_TREEHOUSE_RETURN_BOUNDARY_FDS"] = str(descriptor)

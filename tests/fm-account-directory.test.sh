@@ -256,6 +256,10 @@ printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
 [ "${1:-}" = return ] || exit 0
 [ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
 target=${@: -1}
+# Git does not consistently accept removal of its process current directory as
+# "." across platforms. This fixture tests spawn rollback, while the boundary
+# tests separately prove that Treehouse receives the descriptor-bound ".".
+[ "$target" != . ] || target=${FM_FAKE_TREEHOUSE_PATH:?}
 git worktree remove --force "$target"
 SH
   chmod +x "$fakebin/treehouse"

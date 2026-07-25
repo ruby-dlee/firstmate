@@ -387,9 +387,8 @@ while pending:
             item = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if not stat.S_ISDIR(item.st_mode):
                 raise SystemExit(74)
+            parent_fd = directory_fd
             child = os.open(name, flags, dir_fd=directory_fd)
-            if directory_fd != descriptor:
-                os.close(directory_fd)
             directory_fd = child
             os.set_inheritable(directory_fd, False)
             child_opened = os.fstat(directory_fd)
@@ -401,6 +400,8 @@ while pending:
                 or os.path.ismount(path)
             ):
                 raise SystemExit(74)
+            if parent_fd != descriptor:
+                os.close(parent_fd)
         for name in sorted(os.listdir(directory_fd), reverse=True):
             item = os.stat(
                 name, dir_fd=directory_fd, follow_symlinks=False

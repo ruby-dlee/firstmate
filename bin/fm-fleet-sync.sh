@@ -682,6 +682,7 @@ run_sync_project_bounded() (
     echo "$project: skipped: refresh lock ownership cannot be proved"
     return 0
   }
+  # shellcheck disable=SC2031 # This whole function is a subshell; the value is intentionally local to it.
   export FM_PROCESS_TREE_GUARD_FILE="$lock_owner_dir/process-group"
   trap 'fm_lock_release "$checkout_lock"' EXIT
   if fm_run_bounded "$FLEET_SYNC_TIMEOUT" \

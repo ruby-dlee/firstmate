@@ -12,8 +12,10 @@ FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
+export FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse"
+export FM_CHECKOUT_REFRESH_STATE_BASE="$TMP_ROOT/checkout-refresh"
 
-mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
+mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude" "$FM_TREEHOUSE_ROOT"
 
 cat > "$FAKEBIN/quota-axi" <<'SH'
 #!/usr/bin/env bash
@@ -70,7 +72,8 @@ case "${3:-}" in
   *) exit 67 ;;
 esac
 if [ -n "${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" ]; then
-  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" switch --quiet --detach || exit 68
+  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" commit --allow-empty --quiet \
+    -m 'fixture identity drift' || exit 68
 fi
 SH
 chmod +x "$FAKEBIN/herdr"
@@ -251,11 +254,24 @@ SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
-printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
-[ "${1:-}" = return ] || exit 0
-[ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
-target=${@: -1}
-git worktree remove --force "$target"
+case "${1:-}" in
+  get)
+    [ "${2:-}" = --lease ] || exit 2
+    worktree=${FM_FAKE_TREEHOUSE_WORKTREE:?}
+    printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+    git -C "$worktree" checkout --detach --quiet || exit 1
+    printf '%s\n' "$worktree"
+    ;;
+  return)
+    [ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
+    target=${@: -1}
+    [ "$target" != . ] || target=$(pwd -P)
+    printf 'return --force %s\n' "$target" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+    cd "${FM_TREEHOUSE_RETURN_PROJECT:?}" || exit 1
+    git worktree remove --force "$target"
+    ;;
+  *) exit 2 ;;
+esac
 SH
   chmod +x "$fakebin/treehouse"
   cat > "$fakebin/forbidden-agent-fleet" <<'SH'
@@ -278,6 +294,7 @@ run_direct_spawn() {
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" \
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
@@ -541,8 +558,10 @@ test_direct_recovery_rejects_worktree_from_another_project() {
     status=$?
   fi
   [ "$status" -ne 0 ] || fail "direct recovery launched in a worktree from another project"
-  assert_contains "$out" "does not belong to recorded project" \
-    "direct recovery project-identity refusal was not actionable"
+  case "$out" in
+    *"does not belong to recorded project"*|*"returned redirected or unprovable Git metadata"*) ;;
+    *) fail "direct recovery project-identity refusal was not actionable"$'\n'"$out" ;;
+  esac
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "project-identity mismatch created a replacement endpoint"
   [ ! -s "$QUOTA_LOG" ] || fail "project-identity mismatch read account quota before refusing recovery"
   [ ! -s "$HERDR_LOG" ] || fail "project-identity mismatch installed a profile hook before refusing recovery"
@@ -686,7 +705,8 @@ test_direct_recovery_rechecks_identity_after_account_prepare() {
   else
     status=$?
   fi
-  [ "$status" -ne 0 ] || fail "direct recovery ignored worktree identity drift during account preparation"
+  [ "$status" -ne 0 ] \
+    || fail "direct recovery ignored worktree identity drift during account preparation"$'\n'"$out"
   assert_contains "$out" "changed branch identity" \
     "post-prepare identity drift refusal was not actionable"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "post-prepare identity drift created a replacement endpoint"

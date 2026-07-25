@@ -502,7 +502,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
 
 test_failed_freshness_proof_rolls_back_unmanaged_resources() {
   local id rec out status default_branch
-  id=checkout-freshness-rollback-z1a
+  id='checkout-freshness-rollback-z1a'
   rec=$(make_case checkout-freshness-rollback claude "$id")
   read_case "$rec"
   default_branch=$(git -C "$PROJ_DIR" branch --show-current)
@@ -536,7 +536,7 @@ test_failed_freshness_proof_rolls_back_unmanaged_resources() {
 
 test_local_only_spawn_uses_local_default_tip() {
   local id rec out status
-  id=checkout-local-only-z1b
+  id='checkout-local-only-z1b'
   rec=$(make_case checkout-local-only claude "$id")
   read_case "$rec"
   git -C "$PROJ_DIR" remote remove origin
@@ -555,7 +555,7 @@ test_local_only_spawn_uses_local_default_tip() {
 
 test_dirty_acquisition_is_retained_without_force_return() {
   local id rec draft out status
-  id=checkout-dirty-retain-z1c
+  id='checkout-dirty-retain-z1c'
   rec=$(make_case checkout-dirty-retain claude "$id")
   read_case "$rec"
   draft="$WT_DIR/.agents/skills/unlanded/SKILL.md"
@@ -587,7 +587,7 @@ test_dirty_acquisition_is_retained_without_force_return() {
 
 test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation() {
   local id rec out status
-  id=checkout-acquire-timeout-z1f
+  id='checkout-acquire-timeout-z1f'
   rec=$(make_case checkout-acquire-timeout claude "$id")
   read_case "$rec"
 
@@ -609,7 +609,7 @@ test_treehouse_acquisition_timeout_is_bounded_before_endpoint_creation() {
 
 test_changed_acquisition_is_retained_during_unmanaged_rollback() {
   local id rec marker release out_file spawn_pid
-  id=checkout-changed-rollback-z1g
+  id='checkout-changed-rollback-z1g'
   rec=$(make_case checkout-changed-rollback pi "$id")
   read_case "$rec"
   marker="$CASE_DIR/gotmp-send-started"
@@ -645,7 +645,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
   local id rec expected out status artifact common key expected_lock lock_marker
-  id=checkout-unmanaged-restore-z1d
+  id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
   fm_write_meta "$HOME_DIR/state/$id.meta" \
@@ -695,7 +695,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
 
 test_spawn_rollback_relays_unverified_treehouse_cleanup() {
   local id rec out status real_ps common key lock group owner child_pid
-  id=checkout-unverified-return-z1h
+  id='checkout-unverified-return-z1h'
   rec=$(make_case checkout-unverified-return pi "$id")
   read_case "$rec"
   real_ps=$(command -v ps)
@@ -752,7 +752,7 @@ SH
 
 test_unmanaged_rollback_waits_for_metadata_lock() {
   local id rec marker release out_file spawn_pid held
-  id=checkout-unmanaged-rollback-lock-z1e
+  id='checkout-unmanaged-rollback-lock-z1e'
   rec=$(make_case checkout-unmanaged-rollback-lock pi "$id")
   read_case "$rec"
   fm_write_meta "$HOME_DIR/state/$id.meta" \

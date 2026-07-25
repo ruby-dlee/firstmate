@@ -1439,12 +1439,12 @@ spawn_return_created_worktree() {
     echo "warning: retained unsafe acquired worktree $WT because repository identity or its expected detached tip could not be re-proven; inspect it manually" >&2
     return 1
   fi
+  rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   if [ -z "$WORKTREE_EXPECTED_TIP" ] \
     || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
     echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
     return 1
   fi
-  rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   if ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
     echo "warning: retained acquired worktree $WT because post-cleanup repository safety could not be re-proven" >&2
     return 1
@@ -1462,17 +1462,6 @@ spawn_return_created_worktree() {
       ;;
   esac
   return "$return_status"
-}
-
-spawn_diagnose_created_worktree_drift() {
-  local diagnostic
-  [ "$WORKTREE_CREATED" = 1 ] || return 0
-  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
-  [ -n "$WORKTREE_EXPECTED_TIP" ] || return 0
-  diagnostic=$("$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable \
-    "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP" 2>&1) && return 0
-  [ -z "$diagnostic" ] || printf '%s\n' "$diagnostic" >&2
-  return 1
 }
 
 spawn_restore_unmanaged_state_locked() {
@@ -1608,7 +1597,6 @@ spawn_abort_cleanup() {
         ;;
     esac
   fi
-  spawn_diagnose_created_worktree_drift || WORKTREE_RETAIN_ON_ABORT=1
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
     && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
     && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then

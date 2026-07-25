@@ -453,7 +453,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
-    FM_EXPECT_CHECKOUT_LOCK_ROOT="${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" \
+    FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
@@ -708,7 +708,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact lock_root lock_marker
+  local id rec expected out status artifact common key expected_lock lock_root lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -723,13 +723,18 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   expected="$CASE_DIR/original.meta"
   lock_root="$CASE_DIR/checkout-refresh-locks"
   mkdir -p "$lock_root"
+  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
+  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
+  common=$(cd "$common" && pwd -P)
+  key=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].lower().encode()).hexdigest()[:24])' "$common")
+  expected_lock="$lock_root/$key.lock"
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
-  if out=$(FM_EXPECT_CHECKOUT_LOCK_ROOT="$lock_root" \
+  if out=$(FM_EXPECT_CHECKOUT_LOCK="$expected_lock" \
       FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
       FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
     status=0
@@ -5878,6 +5883,17 @@ run_isolated_test() {
 
 if [ "${FM_TEST_FOCUSED:-}" = stale-reclaim-generation ]; then
   run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = unmanaged-postinstall ]; then
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = unmanaged-postinstall-sequence ]; then
+  run_isolated_test test_changed_acquisition_is_retained_during_unmanaged_rollback
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
   exit 0
 fi
 

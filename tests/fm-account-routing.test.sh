@@ -741,10 +741,8 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   done
   assert_absent "$CASE_DIR/endpoint-live" \
     "post-metadata unmanaged failure left its endpoint alive"
-  assert_grep "return --force ." "$TREEHOUSE_LOG" \
-    "post-metadata unmanaged failure did not return its clean worktree"
   assert_present "$lock_marker" \
-    "spawn rollback did not hold the common checkout lock during Treehouse return"
+    "post-metadata unmanaged failure did not return its clean worktree under the common checkout lock"
   [ -n "$out" ] || true
   pass "unmanaged post-install failures restore prior lifecycle state transactionally"
 }

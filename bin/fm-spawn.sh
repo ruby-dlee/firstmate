@@ -323,13 +323,6 @@ validate_direct_launch_worktree_identity() {
   fi
 }
 
-direct_worktree_return_confirmed() {
-  local project=$1 worktree=$2 listed
-  [ ! -e "$worktree" ] && [ ! -L "$worktree" ] && return 0
-  listed=$(git_repository_probe -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 1
-  ! printf '%s\n' "$listed" | grep -Fqx "worktree $worktree"
-}
-
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -978,6 +971,7 @@ ACCOUNT_PREDECESSOR_POOL=
 ACCOUNT_PREDECESSOR_SESSION=
 CONTINUATION_PACKET=
 ENDPOINT_CREATED=0
+T=
 WORKTREE_CREATED=0
 WORKTREE_RETAIN_ON_ABORT=0
 WORKTREE_EXPECTED_TIP=
@@ -1306,16 +1300,20 @@ persist_failed_direct_recovery() {
   META_INSTALLED=1
 }
 
-persist_failed_direct_spawn() {
-  local meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo backup_name artifacts_name preserve_extensions=0
-  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+persist_failed_direct_spawn() {  # <endpoint-created:0|1>
+  local endpoint_created=$1 meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo backup_name artifacts_name preserve_extensions=0
+  case "$endpoint_created" in 0|1) ;; *) return 1 ;; esac
+  retained_window=
   retained_tmux_session=
   retained_mode=${MODE:-}
   retained_yolo=${YOLO:-off}
   [ -n "$retained_mode" ] || retained_mode=no-mistakes
-  if [ "${BACKEND:-tmux}" = tmux ]; then
-    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
-    retained_window=$retained_tmux_session
+  if [ "$endpoint_created" = 1 ]; then
+    retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+    if [ "${BACKEND:-tmux}" = tmux ]; then
+      retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+      retained_window=$retained_tmux_session
+    fi
   fi
   if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
     if [ -z "${WORKTREE_GIT_DIR:-}" ] || [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ]; then
@@ -1328,7 +1326,15 @@ persist_failed_direct_spawn() {
   tmp=$(mktemp "$STATE/.$ID.meta.direct-spawn-pending.XXXXXX") || return 1
   if [ "$META_INSTALLED" = 1 ] && [ -f "$meta" ] \
     && [ "$(fm_account_meta_value "$meta" generation_id)" = "$SPAWN_GENERATION_ID" ]; then
-    awk '!/^direct_spawn_cleanup=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ "$endpoint_created" = 1 ]; then
+      awk '!/^direct_spawn_cleanup=/ && !/^direct_spawn_endpoint=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+      awk '
+        !/^(window|tmux_window_id|tmux_session_target|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|cmux_workspace_id|cmux_surface_id)=/ &&
+        !/^direct_spawn_cleanup=/ && !/^direct_spawn_endpoint=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/
+      ' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+      printf 'window=\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
   else
     [ ! -f "$meta" ] || preserve_extensions=1
     {
@@ -1352,20 +1358,20 @@ persist_failed_direct_spawn() {
       echo "report_required=1"
       [ -z "${DIRECT_ACCOUNT_HOME:-}" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
-      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
-      [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
-      [ "${BACKEND:-tmux}" != herdr ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != herdr ] || {
         echo "herdr_session=${HERDR_SES:-}"
         echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
         echo "herdr_tab_id=${HERDR_TAB_ID:-}"
         echo "herdr_pane_id=${HERDR_PANE_ID:-}"
       }
-      [ "${BACKEND:-tmux}" != zellij ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != zellij ] || {
         echo "zellij_session=${ZELLIJ_SES:-}"
         echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
         echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
       }
-      [ "${BACKEND:-tmux}" != cmux ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != cmux ] || {
         echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
         echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
       }
@@ -1374,6 +1380,7 @@ persist_failed_direct_spawn() {
   if [ "$preserve_extensions" = 1 ]; then
     fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
   fi
+  [ "$endpoint_created" != 0 ] || printf 'direct_spawn_endpoint=not-created\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
   printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
   if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
     backup_name=${META_BACKUP##*/}
@@ -1570,7 +1577,6 @@ spawn_abort_cleanup() {
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] \
     && [ "${BACKEND:-tmux}" != orca ] \
-    && { [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] || [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ]; } \
     && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
     spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
     endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
@@ -1587,12 +1593,15 @@ spawn_abort_cleanup() {
     esac
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
-    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ]; then
+    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
+    && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then
     spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
     if [ "$state_clean" = 1 ]; then
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0
+      WORKTREE_RETAIN_ON_ABORT=1
+      spawn_return_created_worktree || true
       echo "warning: retained failed spawn resources for ${ID:-unknown} because prior task state could not be restored" >&2
     fi
     [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2
@@ -1616,7 +1625,7 @@ spawn_abort_cleanup() {
       rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
     fi
     if [ -n "$rollback_lock" ]; then
-      persist_failed_direct_spawn || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
+      persist_failed_direct_spawn 1 || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
     else
       echo "warning: failed to acquire metadata lock while preserving retained direct spawn for ${ID:-unknown}" >&2
     fi
@@ -1652,12 +1661,7 @@ spawn_abort_cleanup() {
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
     && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
-      rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-      if ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
-        direct_worktree_return_confirmed "$PROJ_ABS" "$WT" || worktree_clean=0
-      else
-        worktree_clean=0
-      fi
+      spawn_return_created_worktree || worktree_clean=0
       [ "$worktree_clean" = 1 ] || echo "warning: failed to return direct spawn worktree for ${ID:-unknown}; retaining cleanup metadata" >&2
     fi
     if [ -z "$rollback_lock" ]; then
@@ -1692,7 +1696,7 @@ spawn_abort_cleanup() {
     fi
     if [ "$worktree_clean" != 1 ]; then
       if [ -n "$rollback_lock" ]; then
-        persist_failed_direct_spawn || echo "warning: failed to persist direct spawn cleanup state for ${ID:-unknown}" >&2
+        persist_failed_direct_spawn "$ENDPOINT_CREATED" || echo "warning: failed to persist direct spawn cleanup state for ${ID:-unknown}" >&2
       else
         echo "warning: failed to acquire metadata lock while preserving direct spawn cleanup for ${ID:-unknown}" >&2
       fi
@@ -3428,11 +3432,11 @@ EOF
       fi
       WORKTREE_CREATED=1
     fi
-    [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-      && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL" || {
-        echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
-        exit 1
-      }
+    if [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+      || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL"; then
+      echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
+      exit 1
+    fi
     T="$ORCA_TERMINAL"
     ENDPOINT_CREATED=1
     ;;
@@ -3653,11 +3657,11 @@ fi
 # every child process (go build, go test, ...) inherit them. Sent before the launch
 # command so the env is set when the agent starts; the brief sleep lets it land.
 if [ "$BACKEND" = orca ]; then
-  [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-    && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T" || {
-      echo "error: Orca terminal authority changed before launch for $ID" >&2
-      exit 1
-    }
+  if [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+    || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T"; then
+    echo "error: Orca terminal authority changed before launch for $ID" >&2
+    exit 1
+  fi
   validate_orca_abort_worktree_identity || {
     echo "error: Orca worktree authority changed before launch for $ID" >&2
     exit 1

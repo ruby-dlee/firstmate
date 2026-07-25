@@ -181,7 +181,13 @@ SH
 #!/usr/bin/env bash
 state="$(dirname "$0")/.tmux-live"
 case "${1:-}" in
-  display-message) [ -f "$state" ]; exit $? ;;
+  display-message)
+    [ -f "$state" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1; exit 0 ;;
   kill-window) rm -f "$state"; exit 0 ;;
 esac

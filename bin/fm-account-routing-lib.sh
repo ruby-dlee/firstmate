@@ -986,6 +986,7 @@ fm_secondmate_registry_lock_acquire() {
 
 fm_secondmate_registry_query() {
   local registry=$1 mode=${2:-validate} expected_id=${3:-} key=${4:-}
+  # shellcheck disable=SC2016  # Dollar expressions belong to the fixed Perl program.
   fm_account_system_perl -MErrno=ENOENT -e '
     my ($registry, $mode, $expected_id, $key) = @ARGV;
     if (!lstat($registry)) {

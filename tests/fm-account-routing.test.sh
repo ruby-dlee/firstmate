@@ -467,7 +467,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE="${FM_TEST_SPAWN_ROOT:-${FM_TEST_ROOT_OVERRIDE:-}}" FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_SPAWN_ROOT:-${FM_TEST_PRIMARY_ROOT:-${FM_TEST_ROOT_OVERRIDE:-}}}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -2133,6 +2133,7 @@ make_seeded_secondmate_home() {
   printf -- '- %s - account routing fixture (home: %s; scope: account routing fixture; projects: ; added 2026-07-27)\n' \
     "$id" "$home_abs" > "$HOME_DIR/data/secondmates.md"
   FM_TEST_SPAWN_ROOT=$primary
+  FM_TEST_PRIMARY_ROOT=$primary
   FM_TEST_ROOT_OVERRIDE=$primary
 }
 
@@ -6136,6 +6137,7 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
+  run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
   run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
   exit 0
 fi

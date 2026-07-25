@@ -736,7 +736,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact common key expected_lock lock_root lock_marker
+  local id rec expected out status artifact expected_lock lock_root lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -751,11 +751,10 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   expected="$CASE_DIR/original.meta"
   lock_root="$CASE_DIR/checkout-refresh-locks"
   mkdir -p "$lock_root"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].lower().encode()).hexdigest()[:24])' "$common")
-  expected_lock="$lock_root/$key.lock"
+  expected_lock=$(bash -c \
+    '. "$1"; fm_checkout_lock_path "$2" "$3"' \
+    fm-account-routing-lock "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$lock_root") \
+    || fail "could not derive the common checkout lock through the production helper"
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do

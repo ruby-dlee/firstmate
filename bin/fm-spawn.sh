@@ -1587,7 +1587,8 @@ spawn_abort_cleanup() {
     esac
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
-    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ]; then
+    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
+    && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then
     spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
     if [ "$state_clean" = 1 ]; then
       spawn_return_created_worktree || worktree_clean=0
@@ -1652,8 +1653,7 @@ spawn_abort_cleanup() {
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
     && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
-      rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-      if ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
+      if spawn_return_created_worktree; then
         direct_worktree_return_confirmed "$PROJ_ABS" "$WT" || worktree_clean=0
       else
         worktree_clean=0

@@ -268,9 +268,13 @@ case "${1:-}" in
     [ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 71
     target=${@: -1}
     [ "$target" != . ] || target=$(pwd -P)
-    printf 'return --force %s\n' "$target" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+    [ "$target" = "${FM_FAKE_TREEHOUSE_WORKTREE:?}" ] || exit 72
     cd "${FM_TREEHOUSE_RETURN_PROJECT:?}" || exit 1
-    git worktree remove --force "$target"
+    git worktree remove --force "$target" || exit 1
+    git worktree prune || exit 1
+    [ ! -e "$target" ] || rm -rf -- "$target"
+    [ ! -e "$target" ] || exit 1
+    printf 'return --force %s\n' "$target" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
     ;;
   *) exit 2 ;;
 esac

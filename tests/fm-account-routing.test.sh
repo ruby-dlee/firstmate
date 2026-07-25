@@ -29,6 +29,12 @@ assert_regex() {
   grep -Eq "$pattern" "$file" 2>/dev/null || fail "$label"
 }
 
+checkout_lock_path_for_test() {
+  FM_CHECKOUT_LOCK_LIB_LOADED=0 bash -c \
+    '. "$1"; fm_checkout_lock_path "$2" "$3"' \
+    bash "$ROOT/bin/fm-checkout-lock-lib.sh" "$1" "$2"
+}
+
 write_continuation_ancestor_swap_hook() {
   mkdir -p "$1"
   cat > "$1/sitecustomize.py" <<'PY'
@@ -645,7 +651,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact common key expected_lock lock_marker
+  local id rec expected out status artifact expected_lock lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -658,12 +664,8 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | tr '[:upper:]' '[:lower:]' \
-    | shasum -a 256 | awk '{print substr($1,1,24)}')
-  expected_lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  expected_lock=$(checkout_lock_path_for_test \
+    "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
@@ -696,7 +698,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
 }
 
 test_spawn_rollback_relays_unverified_treehouse_cleanup() {
-  local id rec out status real_ps common key lock group owner child_pid
+  local id rec out status real_ps lock group owner child_pid
   id='checkout-unverified-return-z1h'
   rec=$(make_case checkout-unverified-return pi "$id")
   read_case "$rec"
@@ -721,11 +723,7 @@ SH
   fi
 
   [ "$status" -ne 0 ] || fail "spawn with unverified rollback cleanup unexpectedly succeeded"
-  common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
+  lock=$(checkout_lock_path_for_test "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   assert_present "$CASE_DIR/treehouse-return-child.pid" \
     "spawn rollback did not exercise a surviving Treehouse descendant"
   assert_present "$lock" "spawn rollback released an unverified checkout lock"

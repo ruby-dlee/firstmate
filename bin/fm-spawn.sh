@@ -1608,7 +1608,7 @@ spawn_abort_cleanup() {
         ;;
     esac
   fi
-  [ "$endpoint_gone" = 1 ] || spawn_diagnose_created_worktree_drift || true
+  spawn_diagnose_created_worktree_drift || WORKTREE_RETAIN_ON_ABORT=1
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
     && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
     && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then

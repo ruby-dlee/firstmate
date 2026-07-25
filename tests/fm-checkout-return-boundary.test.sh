@@ -165,7 +165,7 @@ EOF
 }
 
 test_realistically_large_tree_respects_fd_limit() {
-  local rec case_dir project worktree status
+  local rec case_dir project worktree fakebin status
   rec=$(make_case realistically-large-tree)
   read -r case_dir project worktree <<EOF
 $rec
@@ -179,9 +179,24 @@ root = sys.argv[1]
 for index in range(42001):
     os.mkdir(os.path.join(root, f"directory-{index:05d}"))
 PY
-  status=$(run_boundary "$project" "$worktree" "$project" 256)
+  fakebin=$(fm_fakebin "$case_dir/fake")
+  cat > "$fakebin/treehouse" <<'SH'
+#!/bin/sh
+root_descriptor=${FM_TREEHOUSE_RETURN_ROOT_FD:-}
+[ -n "$root_descriptor" ] || exit 91
+[ "$FM_TREEHOUSE_RETURN_BOUNDARY_FDS" = "$root_descriptor" ] || exit 92
+[ -d "/dev/fd/$root_descriptor" ] || exit 93
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  (
+    ulimit -n 256 || exit 71
+    cd "$project" || exit 70
+    PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$worktree" "$project"
+  ) >/dev/null 2>&1
+  status=$?
   expect_code 0 "$status" "a 42,001-directory worktree must return within a 256-descriptor limit"
-  pass "a real 42,001-directory fixture does not exhaust descriptors"
+  pass "a real 42,001-directory fixture keeps only its root descriptor across exec"
 }
 
 extract_boundary_program

@@ -402,6 +402,9 @@ while pending:
     child_path = os.path.join(path, name)
     child = os.open(name, flags, dir_fd=directory_fd)
     try:
+        # Only the validated root may cross exec. Make that invariant explicit
+        # instead of depending on the interpreter default for newly opened FDs.
+        os.set_inheritable(child, False)
         child_opened = os.fstat(child)
         if (
             (item.st_dev, item.st_ino) != (child_opened.st_dev, child_opened.st_ino)

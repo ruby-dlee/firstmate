@@ -72,7 +72,9 @@ case "${3:-}" in
   *) exit 67 ;;
 esac
 if [ -n "${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" ]; then
-  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" commit --allow-empty --quiet \
+  git -C "$FM_FAKE_HERDR_DRIFT_WORKTREE" \
+    -c user.name='Firstmate Test' -c user.email='firstmate-test@example.invalid' \
+    commit --allow-empty --quiet \
     -m 'fixture identity drift' || exit 68
 fi
 SH

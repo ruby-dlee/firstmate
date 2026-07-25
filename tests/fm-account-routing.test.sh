@@ -220,7 +220,14 @@ if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
       *) candidate_owner=$(dirname "$candidate")/$candidate_owner ;;
     esac
     candidate_owner=$(cd "$candidate_owner" 2>/dev/null && pwd -P) || continue
-    [ "$candidate_owner" = "$lock_owner" ] || continue
+    candidate_owner_parent=$(cd "$(dirname "$candidate_owner")" 2>/dev/null && pwd -P) || continue
+    [ "$candidate_owner_parent" = "$expected_lock_root" ] || continue
+    case "$(basename "$candidate_owner")" in
+      *.lock.owner.*) ;;
+      *) continue ;;
+    esac
+    lock_pid=$(cat "$candidate_owner/pid" 2>/dev/null || true)
+    kill -0 "$lock_pid" 2>/dev/null || continue
     lock_link=$candidate
     break
   done

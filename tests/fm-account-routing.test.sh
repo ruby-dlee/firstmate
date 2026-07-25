@@ -199,9 +199,16 @@ SH
 [ -z "${FM_FAKE_TREEHOUSE_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'treehouse %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 [ -z "${FM_FAKE_TREEHOUSE_SLEEP:-}" ] || sleep "$FM_FAKE_TREEHOUSE_SLEEP"
-if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
-  [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
-  lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
+if [ "${1:-}" = return ] \
+  && { [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ] || [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; }; then
+  checkout_lock=${FM_EXPECT_CHECKOUT_LOCK:-}
+  if [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
+    checkout_locks=("$FM_EXPECT_CHECKOUT_LOCK_ROOT"/*.lock)
+    [ "${#checkout_locks[@]}" -eq 1 ] && [ -L "${checkout_locks[0]}" ] || exit 91
+    checkout_lock=${checkout_locks[0]}
+  fi
+  [ -e "$checkout_lock" ] || [ -L "$checkout_lock" ] || exit 91
+  lock_pid=$(cat "$checkout_lock/pid" 2>/dev/null || true)
   case "$lock_pid" in ''|*[!0-9]*) exit 92 ;; esac
   [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] \
     || printf '%s\n' "$*" > "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
@@ -417,6 +424,7 @@ run_spawn() {
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
     FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
+    FM_EXPECT_CHECKOUT_LOCK_ROOT="${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" \
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
@@ -651,7 +659,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact expected_lock lock_marker
+  local id rec expected out status artifact lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -664,15 +672,13 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
     "mode=no-mistakes" \
     "custom_extension=retain-me"
   expected="$CASE_DIR/original.meta"
-  expected_lock=$(checkout_lock_path_for_test \
-    "$WT_DIR" "$CASE_DIR/checkout-refresh-locks")
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
-  if out=$(FM_EXPECT_CHECKOUT_LOCK="$expected_lock" \
+  if out=$(FM_EXPECT_CHECKOUT_LOCK_ROOT="$CASE_DIR/checkout-refresh-locks" \
       FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
       FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
     status=0

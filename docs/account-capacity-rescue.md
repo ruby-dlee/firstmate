@@ -54,6 +54,11 @@ Codex requires the warning glyph and full anchored sentence.
 Claude requires either the result glyph and reset sentence or every line of the complete choice dialog.
 An unknown harness never inherits another harness's signatures.
 
+The watcher separately recognizes Claude's anchored `Not logged in - Please run /login` TUI line as a credential failure.
+That guard does not rotate accounts, remove the endpoint, consume an attempt, or mark the current account exhausted.
+It records `capacity_rescue_stopped=credentials`, appends the single keyed blocked status, and leaves the endpoint available for the required `/login`.
+Ordinary prose that mentions the login message does not match, and Codex does not inherit the Claude-only guard.
+
 ## Rescue transaction
 
 `bin/fm-watch.sh` runs the capacity classifier immediately after each bounded pane capture, before ordinary busy or stale classification.
@@ -94,6 +99,7 @@ The watcher reconciles that condition from task metadata even when endpoint remo
 
 The selector emits the stable internal prefix `CAPACITY_UNAVAILABLE:` when no unused eligible account remains.
 That result, the attempt cap, an unprovable endpoint removal, malformed recovery metadata, a same-account replacement, and a generic recovery failure all set `capacity_rescue_stopped=`, append one keyed `blocked [key=capacity-rescue]:` status, and stop automatic retries.
+The Claude credential guard reaches the same durable single-blocked stop without starting a rescue transaction.
 Later polls recognize the durable stop marker and absorb the unchanged provider chrome without another endpoint removal, account scan, spawn, or blocked status.
 
 The lifecycle lock serializes capacity rescue with spawn and teardown.

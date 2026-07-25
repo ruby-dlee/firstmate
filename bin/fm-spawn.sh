@@ -1600,14 +1600,8 @@ spawn_abort_cleanup() {
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
     && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
     && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then
-    if [ "$WORKTREE_CREATED" = 1 ] && [ "$WORKTREE_RETAIN_ON_ABORT" != 1 ] \
-      && { [ -z "$WORKTREE_EXPECTED_TIP" ] \
-        || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; }; then
-      WORKTREE_RETAIN_ON_ABORT=1
-      echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
-    fi
     spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
-    if [ "$state_clean" = 1 ] || [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
+    if [ "$state_clean" = 1 ]; then
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0

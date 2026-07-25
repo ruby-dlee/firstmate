@@ -197,7 +197,8 @@ if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
   [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
   lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
   kill -0 "$lock_pid" 2>/dev/null || exit 92
-  [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] || touch "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
+  [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] \
+    || printf '%s\n' "$*" > "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
 fi
 if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" ]; then
   [ -z "${FM_FAKE_TREEHOUSE_RETURN_MARKER:-}" ] || : > "$FM_FAKE_TREEHOUSE_RETURN_MARKER"
@@ -684,10 +685,10 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   done
   assert_absent "$CASE_DIR/endpoint-live" \
     "post-metadata unmanaged failure left its endpoint alive"
-  assert_grep 'return --force .' "$TREEHOUSE_LOG" \
-    "post-metadata unmanaged failure did not return its clean worktree"
   assert_present "$lock_marker" \
     "spawn rollback did not hold the common checkout lock during Treehouse return"
+  assert_grep 'return --force .' "$lock_marker" \
+    "post-metadata unmanaged failure did not return its clean worktree"
   [ -n "$out" ] || true
   pass "unmanaged post-install failures restore prior lifecycle state transactionally"
 }
@@ -5903,6 +5904,11 @@ test_secondmate_home_lock_key_uses_filesystem_identity() {
 
 if [ "${FM_TEST_FOCUSED:-}" = symlink-artifacts ]; then
   run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = unmanaged-postinstall-rollback ]; then
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
   exit 0
 fi
 

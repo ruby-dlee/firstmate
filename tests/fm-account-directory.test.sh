@@ -7,6 +7,7 @@ set -u
 
 SELECTOR="$ROOT/bin/fm-account-directory.sh"
 TMP_ROOT=$(fm_test_tmproot fm-account-directory-tests)
+TMP_ROOT=$(cd "$(dirname "$TMP_ROOT")" && pwd -P)/$(basename "$TMP_ROOT")
 ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
@@ -537,6 +538,7 @@ test_capacity_recovery_selects_a_different_account() {
   id=capacity-different-z4
   record=$(make_spawn_case capacity-different codex "$id")
   read_spawn_case "$record"
+  git -C "$SPAWN_WORKTREE" switch --quiet -c "fm/$id"
   meta="$SPAWN_HOME/state/$id.meta"
   git_dir=$(git -C "$SPAWN_WORKTREE" rev-parse --absolute-git-dir)
   # shellcheck disable=SC2016 # JavaScript source is intentionally single-quoted.
@@ -934,7 +936,7 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
     status=$?
   fi
   [ "$status" -ne 0 ] || fail "new direct rollback fixture unexpectedly succeeded"
-  if ! grep -Fxq "return --force ." "$TREEHOUSE_LOG"; then
+  if ! grep -Fxq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
     fail "failed new direct spawn did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
   fi
   [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"

@@ -1820,6 +1820,7 @@ if not stat.S_ISDIR(os.lstat(base).st_mode):
 print(base)
 PY
   ) || return 1
+  [ -e "$base/fm-$ID" ] || [ -L "$base/fm-$ID" ] || return 0
   removal_tree_operation "$base/fm-$ID" "task temp root" remove
 }
 

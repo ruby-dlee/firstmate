@@ -36,6 +36,9 @@ fm_git_identity fmtest fmtest@example.invalid
 . "$ROOT/bin/fm-backend.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-tests)
+export FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse"
+export FM_CHECKOUT_REFRESH_STATE_BASE="$TMP_ROOT/checkout-refresh"
+mkdir -p "$FM_TREEHOUSE_ROOT"
 
 # fm_backend_detect's cmux fallback (bundle id + process ancestry,
 # docs/cmux-backend.md "Runtime auto-detection") consults uname, lsappinfo,
@@ -967,6 +970,31 @@ test_peek_conformance_old_vs_new() {
 
 # --- old vs new: fm-spawn.sh --------------------------------------------------
 
+install_spawn_treehouse_fake() {  # <fakebin> <worktree>
+  local fakebin=$1 worktree=$2
+  printf '%s\n' "$worktree" > "$fakebin/treehouse-worktree"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  get)
+    [ "${2:-}" = --lease ] || exit 2
+    IFS= read -r worktree < "$(dirname "$0")/treehouse-worktree"
+    git -C "$worktree" checkout --detach --quiet || exit 1
+    printf '%s\n' "$worktree"
+    ;;
+  return)
+    worktree=$(pwd -P) || exit 1
+    project=${FM_TREEHOUSE_RETURN_PROJECT:?}
+    cd "$project" || exit 1
+    git worktree remove --force "$worktree"
+    ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/treehouse"
+}
+
 make_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir
   local dir=$1 wt=$2 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -983,7 +1011,7 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  install_spawn_treehouse_fake "$fb" "$wt"
   printf '%s\n' "$fb"
 }
 
@@ -1053,7 +1081,7 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  install_spawn_treehouse_fake "$fb" "$wt"
   printf '%s\n' "$fb"
 }
 

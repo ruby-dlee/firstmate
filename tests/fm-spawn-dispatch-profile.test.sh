@@ -12,9 +12,39 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+FM_TEST_REAL_GIT=$(command -v git)
+export FM_TEST_REAL_GIT
+export FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse"
+export FM_CHECKOUT_REFRESH_STATE_BASE="$TMP_ROOT/checkout-refresh"
+mkdir -p "$FM_TREEHOUSE_ROOT"
+
+install_spawn_treehouse_fake() {
+  local fakebin=$1 worktree=$2
+  printf '%s\n' "$worktree" > "$fakebin/treehouse-worktree"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  get)
+    [ "${2:-}" = --lease ] || exit 2
+    IFS= read -r worktree < "$(dirname "$0")/treehouse-worktree"
+    git -C "$worktree" checkout --detach --quiet || exit 1
+    printf '%s\n' "$worktree"
+    ;;
+  return)
+    worktree=$(pwd -P) || exit 1
+    project=${FM_TREEHOUSE_RETURN_PROJECT:?}
+    cd "$project" || exit 1
+    git worktree remove --force "$worktree"
+    ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/treehouse"
+}
 
 make_spawn_fakebin() {
-  local dir=$1 fakebin
+  local dir=$1 worktree=$2 fakebin
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -42,7 +72,29 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  install_spawn_treehouse_fake "$fakebin" "$worktree"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+set -u
+case " $* " in
+  *" ls-remote --symref origin HEAD "*)
+    repository=.
+    while [ $# -gt 0 ]; do
+      if [ "$1" = -C ]; then
+        shift
+        repository=${1:?}
+      fi
+      shift
+    done
+    remote_head=$("$FM_TEST_REAL_GIT" -C "$repository" \
+      symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || exit 1
+    remote_tip=$("$FM_TEST_REAL_GIT" -C "$repository" rev-parse "$remote_head") || exit 1
+    printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "${remote_head#origin/}" "$remote_tip"
+    ;;
+  *) exec "$FM_TEST_REAL_GIT" "$@" ;;
+esac
+SH
+  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -54,7 +106,7 @@ make_spawn_case() {
   proj="$case_dir/project"
   wt="$case_dir/wt"
   launchlog="$case_dir/launch.log"
-  fakebin=$(make_spawn_fakebin "$case_dir/fake")
+  fakebin=$(make_spawn_fakebin "$case_dir/fake" "$wt")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
@@ -73,11 +125,15 @@ enable_dispatch_profile() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  local home=$1 id=$2 registry=$3 home_real
+  git clone --quiet --branch main "$ROOT" "$home"
+  git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
+  home_real=$(cd "$home" && pwd -P)
+  printf -- '- %s - test secondmate (home: %s; scope: dispatch profile test; projects: ; added 2026-07-25)\n' \
+    "$id" "$home_real" > "$registry"
 }
 
 run_spawn() {
@@ -372,11 +428,12 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_seeded_secondmate_home "$sm" "$id" "$HOME_DIR/data/secondmates.md"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
-  expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
+  expect_code 0 "$status" \
+    "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"$'\n'"$out"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default

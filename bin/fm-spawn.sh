@@ -1436,7 +1436,7 @@ spawn_return_created_worktree() {
   [ "${BACKEND:-tmux}" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
-    echo "warning: retained unsafe acquired worktree $WT for manual recovery" >&2
+    echo "warning: retained unsafe acquired worktree $WT because repository identity or its expected detached tip could not be re-proven; inspect it manually" >&2
     return 1
   fi
   if [ -z "$WORKTREE_EXPECTED_TIP" ] \

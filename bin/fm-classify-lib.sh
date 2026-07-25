@@ -105,6 +105,18 @@ provider_capacity_failure_kind() {  # <harness> <tail40>
   return 1
 }
 
+provider_credential_failure_kind() {  # <harness> <tail40>
+  local harness=$1 tail40=$2 prompt_tail
+  [ "$harness" = claude ] || return 1
+  prompt_tail=$(printf '%s\n' "$tail40" | tail -18)
+  if printf '%s\n' "$prompt_tail" \
+    | grep -Eq '^[[:space:]]*Not logged in - Please run /login[[:space:]]*$'; then
+    printf 'claude-not-logged-in'
+    return 0
+  fi
+  return 1
+}
+
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {
   local f=$1

@@ -202,7 +202,7 @@ SH
 if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
   [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
   lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
-  kill -0 "$lock_pid" 2>/dev/null || exit 92
+  case "$lock_pid" in ''|*[!0-9]*) exit 92 ;; esac
   [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] \
     || printf '%s\n' "$*" > "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
 fi

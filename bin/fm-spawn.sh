@@ -76,6 +76,10 @@
 #   project, worktree, harness, backend, model, effort, mode, yolo, and report
 #   requirements from metadata, selects a fresh account directory, and creates
 #   only a replacement endpoint in the recorded worktree.
+#   The watcher sets FM_CAPACITY_RESCUE_RECOVERY=account-exhaustion-v1 for an
+#   automatic exhaustion handoff. That scoped mode excludes the recorded account
+#   plus every capacity_rescue_exhausted_account= extension in task metadata, so
+#   a rescue can never bounce straight back onto a known-exhausted account.
 #   A --secondmate spawn also propagates the primary's declared inheritable config
 #   into the secondmate home's config/, so the secondmate's OWN crewmates,
 #   dispatch profiles, and backlog backend inherit the primary's settings
@@ -986,6 +990,7 @@ ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
 DIRECT_ACCOUNT_ROUTING=0
 DIRECT_ACCOUNT_HOME=
+DIRECT_ACCOUNT_EXCLUDES=()
 # Environment delivered natively by `herdr agent start --env KEY=VALUE` (one
 # repeated flag per entry). Empty for every other backend, which has no native
 # env channel and keeps using command-scoped shell prefixes instead.
@@ -1981,6 +1986,13 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       exit 1
     }
     [ -n "$RECORDED_ACCOUNT_HOME" ] || { echo "error: direct account recovery metadata has no account_home for $ID" >&2; exit 1; }
+    if [ "${FM_CAPACITY_RESCUE_RECOVERY:-}" = account-exhaustion-v1 ]; then
+      while IFS= read -r exhausted_account; do
+        [ -n "$exhausted_account" ] || continue
+        DIRECT_ACCOUNT_EXCLUDES+=("$exhausted_account")
+      done < <(sed -n 's/^capacity_rescue_exhausted_account=//p' "$RESUME_META")
+      DIRECT_ACCOUNT_EXCLUDES+=("$RECORDED_ACCOUNT_HOME")
+    fi
     [ -z "$(fm_meta_get "$RESUME_META" account_profile)" ] || { echo "error: direct account recovery cannot replace legacy account_profile metadata for $ID" >&2; exit 1; }
     [ -z "$(fm_meta_get "$RESUME_META" account_rollback_cleanup)" ] || { echo "error: direct account recovery cannot bypass pending legacy rollback cleanup for $ID" >&2; exit 1; }
     [ -n "$RECORDED_PROJECT" ] || { echo "error: direct account recovery metadata has no project for $ID" >&2; exit 1; }
@@ -2884,7 +2896,7 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
 fi
 
 if [ "$DIRECT_ACCOUNT_PREPARE_DEFERRED" = 1 ]; then
-  DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+  DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS" "${DIRECT_ACCOUNT_EXCLUDES[@]}") || exit 1
   echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
   DIRECT_ACCOUNT_PREPARE_DEFERRED=0
 fi

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Select and prepare direct Claude or Codex account-directory launches.
 # Usage:
-#   fm-account-directory.sh select <claude|codex>
+#   fm-account-directory.sh select <claude|codex> [excluded-account-home...]
 #   fm-account-directory.sh install-herdr-hook <claude|codex> <account-home>
-#   fm-account-directory.sh prepare <claude|codex>
+#   fm-account-directory.sh prepare <claude|codex> [excluded-account-home...]
 #
 # This header is the single owner of the direct account-directory contract.
 # FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
@@ -12,13 +12,15 @@
 # Codex selection removes that account's quota-axi window cache immediately
 # before every read, sets CODEX_HOME plus the account-isolated XDG_CACHE_HOME,
 # accepts only a fresh result with at least one numeric five_hour or weekly
-# window, and picks the account with the highest minimum remaining percentage.
+# window, skips excluded and zero-capacity accounts, and picks the remaining
+# account with the highest minimum remaining percentage.
 # A Codex account with no such freshly readable window is skipped as unhealthy.
 # Claude quota is not currently distinguishable per config directory because
 # quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS
 # Keychain credential.
 # Claude therefore never treats a missing usage window as account failure and
-# selects the first real account directory in stable bytewise sort order.
+# selects the first non-excluded real account directory in stable bytewise sort
+# order.
 # Selection prints only the chosen absolute account home on stdout and logs
 # health, fallback, and choice diagnostics on stderr.
 # prepare selects the account and idempotently runs Herdr's own integration
@@ -203,8 +205,18 @@ valid_account_home() { # <vendor-dir> <candidate>
   esac
 }
 
-first_account_home() { # <vendor>
+account_home_is_excluded() { # <candidate> [excluded-account-home...]
+  local candidate=$1 excluded
+  shift
+  for excluded in "$@"; do
+    [ "$candidate" != "$excluded" ] || return 0
+  done
+  return 1
+}
+
+first_account_home() { # <vendor> [excluded-account-home...]
   local vendor=$1 root vendor_dir candidate
+  shift
   root=$(account_root) || return 1
   vendor_dir=$root/$vendor
   [ -d "$vendor_dir" ] && [ ! -L "$vendor_dir" ] || {
@@ -215,10 +227,14 @@ first_account_home() { # <vendor>
   export LC_ALL
   for candidate in "$vendor_dir"/*; do
     valid_account_home "$vendor_dir" "$candidate" || continue
+    if account_home_is_excluded "$candidate" "$@"; then
+      log "$vendor account $candidate skipped: exhausted by this task"
+      continue
+    fi
     printf '%s\n' "$candidate"
     return 0
   done
-  echo "error: no account directories found for $vendor under $vendor_dir" >&2
+  echo "CAPACITY_UNAVAILABLE: no unused $vendor account directories remain under $vendor_dir" >&2
   return 1
 }
 
@@ -279,7 +295,7 @@ $1
 EOF
 }
 
-select_codex() {
+select_codex() { # [excluded-account-home...]
   local root vendor_dir quota_bin candidate usage score
   local best_home='' best_score=''
   root=$(account_root) || return 1
@@ -297,10 +313,18 @@ select_codex() {
   export LC_ALL
   for candidate in "$vendor_dir"/*; do
     valid_account_home "$vendor_dir" "$candidate" || continue
+    if account_home_is_excluded "$candidate" "$@"; then
+      log "codex account $candidate skipped: exhausted by this task"
+      continue
+    fi
     usage=$(fresh_codex_usage_json "$candidate" "$quota_bin") || usage=
     score=$(codex_score "$usage") || score=
     if [ -z "$score" ]; then
       log "codex account $candidate skipped: no freshly readable usage window"
+      continue
+    fi
+    if ! awk -v candidate_score="$score" 'BEGIN { exit !(candidate_score > 0) }'; then
+      log "codex account $candidate skipped: fresh remaining score=$score has no capacity"
       continue
     fi
     log "codex account $candidate fresh remaining score=$score"
@@ -311,26 +335,28 @@ select_codex() {
     fi
   done
   [ -n "$best_home" ] || {
-    echo "error: no healthy Codex account has a freshly readable usage window" >&2
+    echo "CAPACITY_UNAVAILABLE: no unused Codex account has a freshly readable positive usage window" >&2
     return 1
   }
   log "selected codex account $best_home with fresh remaining score=$best_score"
   printf '%s\n' "$best_home"
 }
 
-select_claude() {
+select_claude() { # [excluded-account-home...]
   local selected
-  selected=$(first_account_home claude) || return 1
+  selected=$(first_account_home claude "$@") || return 1
   log "CLAUDE USAGE UNREADABLE: quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS Keychain credential today; selecting the first account directory by stable sort: $selected"
   printf '%s\n' "$selected"
 }
 
-select_account() { # <vendor>
-  case "$1" in
-    codex) select_codex ;;
-    claude) select_claude ;;
+select_account() { # <vendor> [excluded-account-home...]
+  local vendor=$1
+  shift
+  case "$vendor" in
+    codex) select_codex "$@" ;;
+    claude) select_claude "$@" ;;
     *)
-      echo "error: direct account-directory selection supports only claude or codex, not '$1'" >&2
+      echo "error: direct account-directory selection supports only claude or codex, not '$vendor'" >&2
       return 1
       ;;
   esac
@@ -378,17 +404,21 @@ case "${1:-}" in
     exit 0
     ;;
   select)
-    [ "$#" -eq 2 ] || { usage; exit 2; }
-    select_account "$2"
+    [ "$#" -ge 2 ] || { usage; exit 2; }
+    vendor=$2
+    shift 2
+    select_account "$vendor" "$@"
     ;;
   install-herdr-hook)
     [ "$#" -eq 3 ] || { usage; exit 2; }
     install_herdr_hook "$2" "$3"
     ;;
   prepare)
-    [ "$#" -eq 2 ] || { usage; exit 2; }
-    selected_home=$(select_account "$2") || exit 1
-    install_herdr_hook "$2" "$selected_home" || exit 1
+    [ "$#" -ge 2 ] || { usage; exit 2; }
+    vendor=$2
+    shift 2
+    selected_home=$(select_account "$vendor" "$@") || exit 1
+    install_herdr_hook "$vendor" "$selected_home" || exit 1
     printf '%s\n' "$selected_home"
     ;;
   *)

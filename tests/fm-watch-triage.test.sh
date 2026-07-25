@@ -156,6 +156,257 @@ test_classifier_primitives() {
   pass "classifier primitives: last line, captain-relevance, window->task, FM_CAPTAIN_RE override"
 }
 
+test_provider_capacity_failure_classifier() {
+  local claude_line claude_dialog codex ordinary
+  codex=$(cat <<'EOF'
+• Ran bin/fm-lint.sh
+  └ all checks passed
+
+⚠ Selected model is at capacity. Please try a different model.
+
+› Explain this codebase
+  gpt-5.6-sol xhigh · /tmp/project
+EOF
+)
+  [ "$(provider_capacity_failure_kind codex "$codex")" = codex-model-capacity ] \
+    || fail "real captured Codex capacity chrome did not classify"
+
+  # Bash 3.2 misparses a parenthesis inside a here-document nested in command
+  # substitution, so preserve this captured pane literally with ANSI-C quoting.
+  claude_line=$'  Write(src/pages/templates/McpTemplatePreviewPage.tsx)\n  ⎿  Wrote 103 lines\n  ⎿  You\'ve hit your session limit · resets 5pm (America/New_York)\n\n✻ Brewed for 23m 1s'
+  [ "$(provider_capacity_failure_kind claude "$claude_line")" = claude-session-limit ] \
+    || fail "real captured Claude session-limit result did not classify"
+
+  claude_dialog=$(cat <<'EOF'
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+
+   Enter to confirm · Esc to cancel
+EOF
+)
+  [ "$(provider_capacity_failure_kind claude "$claude_dialog")" = claude-usage-limit-dialog ] \
+    || fail "real captured Claude usage-limit dialog did not classify"
+
+  ordinary=$'The provider documentation mentions usage limits, model capacity, and reset windows.\nThe prior log said Selected model is at capacity. Please try a different model.\nWe should test what happens if you\'ve hit your session limit and need to wait.'
+  ! provider_capacity_failure_kind codex "$ordinary" >/dev/null \
+    || fail "ordinary prose mentioning Codex capacity false-matched provider chrome"
+  ! provider_capacity_failure_kind claude "$ordinary" >/dev/null \
+    || fail "ordinary prose mentioning Claude limits false-matched provider chrome"
+  ! provider_capacity_failure_kind unknown "$codex" >/dev/null \
+    || fail "unknown harness guessed a Codex capacity failure"
+  pass "provider capacity classifier matches real harness chrome and rejects ordinary limit prose"
+}
+
+write_capacity_rescue_meta() {  # <meta> <window> <account-home> [attempts]
+  local meta=$1 window=$2 account_home=$3 attempts=${4:-}
+  fm_write_meta "$meta" \
+    "window=$window" \
+    "harness=codex" \
+    "kind=ship" \
+    "account_home=$account_home" \
+    "generation_id=spawn:test-generation"
+  [ -z "$attempts" ] || printf 'capacity_rescue_attempts=%s\n' "$attempts" >> "$meta"
+}
+
+make_capacity_spawn_fake() {  # <path>
+  local path=$1
+  cat > "$path" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${FM_CAPACITY_RESCUE_RECOVERY:-}" >> "$FM_FAKE_CAPACITY_SPAWN_LOG"
+rm -f "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}"
+if [ "${FM_FAKE_CAPACITY_SPAWN_RESULT:-success}" = no-capacity ]; then
+  echo "CAPACITY_UNAVAILABLE: no unused Codex account has a freshly readable positive usage window" >&2
+  exit 1
+fi
+tmp=$(mktemp "${FM_FAKE_CAPACITY_META}.replacement.XXXXXX") || exit 1
+awk '!/^account_home=/' "$FM_FAKE_CAPACITY_META" > "$tmp" || exit 1
+printf 'account_home=%s\n' "$FM_FAKE_CAPACITY_NEW_ACCOUNT" >> "$tmp"
+mv "$tmp" "$FM_FAKE_CAPACITY_META"
+SH
+  chmod +x "$path"
+}
+
+test_capacity_rescue_records_attempt_and_changes_account() {
+  local dir state meta fake_spawn old_account new_account
+  dir=$(make_case capacity-rescue-success); state="$dir/state"
+  meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
+  old_account="$dir/accounts/codex/1"; new_account="$dir/accounts/codex/2"
+  mkdir -p "$old_account" "$new_account"
+  write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account"
+  make_capacity_spawn_fake "$fake_spawn"
+
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
+    export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
+    export FM_FAKE_CAPACITY_META="$meta"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$new_account"
+    export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
+    export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
+    # shellcheck disable=SC1090
+    . "$WATCH"
+    fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
+    fm_backend_target_state() { printf 'absent'; }
+    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    [ "$CAPACITY_RESCUE_OUTCOME" = rescued ] \
+      || fail "successful capacity handoff did not report rescued: $CAPACITY_RESCUE_OUTCOME"
+  )
+
+  [ "$(wc -l < "$dir/spawn.log" | tr -d ' ')" = 1 ] \
+    || fail "successful capacity handoff did not invoke exactly one replacement spawn"
+  assert_grep $'task\t--recover-direct-account\taccount-exhaustion-v1' "$dir/spawn.log" \
+    "capacity handoff did not reuse guarded direct-account recovery mode"
+  assert_grep 'capacity_rescue_attempts=1' "$meta" \
+    "successful capacity handoff did not record its bounded attempt count"
+  grep -E "^capacity_rescue_attempt_1=.*\\|harness=codex\\|account=$old_account\\|failure=codex-model-capacity$" "$meta" >/dev/null \
+    || fail "successful capacity handoff did not record an auditable attempt"
+  assert_grep "capacity_rescue_exhausted_account=$old_account" "$meta" \
+    "successful capacity handoff did not remember the exhausted account"
+  assert_grep "capacity_rescue_result_1=rescued|account=$new_account" "$meta" \
+    "successful capacity handoff did not record its replacement account"
+  assert_grep "account_home=$new_account" "$meta" \
+    "successful capacity handoff did not bind the replacement account"
+  [ ! -e "$state/.account-lifecycle-task.lock" ] \
+    || fail "successful capacity handoff leaked the task lifecycle lock"
+  pass "capacity rescue serializes one handoff and records old/new accounts plus attempt audit"
+}
+
+test_capacity_rescue_no_capacity_stops_once() {
+  local dir state meta fake_spawn old_account
+  dir=$(make_case capacity-rescue-empty); state="$dir/state"
+  meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
+  old_account="$dir/accounts/codex/1"
+  mkdir -p "$old_account"
+  write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account"
+  make_capacity_spawn_fake "$fake_spawn"
+
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
+    export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
+    export FM_FAKE_CAPACITY_META="$meta"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
+    export FM_FAKE_CAPACITY_SPAWN_RESULT=no-capacity
+    export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
+    # shellcheck disable=SC1090
+    . "$WATCH"
+    fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
+    fm_backend_target_state() { printf 'absent'; }
+    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    [ "$CAPACITY_RESCUE_OUTCOME" = blocked ] \
+      || fail "no-capacity handoff did not stop blocked: $CAPACITY_RESCUE_OUTCOME"
+    [ "$CAPACITY_RESCUE_REASON" = no-capacity ] \
+      || fail "no-capacity handoff reported the wrong reason: $CAPACITY_RESCUE_REASON"
+    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    [ "$CAPACITY_RESCUE_OUTCOME" = already-stopped ] \
+      || fail "stopped no-capacity task tried to rescue again: $CAPACITY_RESCUE_OUTCOME"
+  )
+
+  [ "$(wc -l < "$dir/spawn.log" | tr -d ' ')" = 1 ] \
+    || fail "no-capacity task thrashed replacement spawn instead of stopping once"
+  [ "$(wc -l < "$dir/kill.log" | tr -d ' ')" = 1 ] \
+    || fail "no-capacity task repeatedly removed its endpoint"
+  [ "$(grep -Fc 'blocked [key=capacity-rescue]:' "$state/task.status" || true)" = 1 ] \
+    || fail "no-capacity task did not emit exactly one blocked status"
+  assert_grep 'capacity_rescue_attempts=1' "$meta" \
+    "no-capacity stop did not retain the attempted handoff count"
+  assert_grep 'capacity_rescue_result_1=no-capacity' "$meta" \
+    "no-capacity stop did not record the failed attempt result"
+  assert_grep 'capacity_rescue_stopped=no-capacity' "$meta" \
+    "no-capacity stop did not arm the durable no-retry marker"
+  pass "no capacity anywhere records one blocked stop and never retries"
+}
+
+test_capacity_rescue_attempt_cap_stops_without_spawn() {
+  local dir state meta fake_spawn old_account
+  dir=$(make_case capacity-rescue-cap); state="$dir/state"
+  meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
+  old_account="$dir/accounts/codex/1"
+  mkdir -p "$old_account"
+  write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account" 1
+  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=codex|account=%s|failure=codex-model-capacity\n' \
+    "$old_account" >> "$meta"
+  printf 'capacity_rescue_result_1=rescued|account=%s\n' "$old_account" >> "$meta"
+  make_capacity_spawn_fake "$fake_spawn"
+
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CAPACITY_RESCUE_MAX_ATTEMPTS=1
+    export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
+    export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
+    export FM_FAKE_CAPACITY_META="$meta"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
+    export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
+    # shellcheck disable=SC1090
+    . "$WATCH"
+    fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
+    fm_backend_target_state() { printf 'absent'; }
+    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    [ "$CAPACITY_RESCUE_OUTCOME" = blocked ] \
+      || fail "attempt-capped task did not stop blocked: $CAPACITY_RESCUE_OUTCOME"
+    [ "$CAPACITY_RESCUE_REASON" = max-attempts ] \
+      || fail "attempt-capped task reported the wrong reason: $CAPACITY_RESCUE_REASON"
+  )
+
+  [ ! -e "$dir/spawn.log" ] || [ ! -s "$dir/spawn.log" ] \
+    || fail "attempt-capped task launched another replacement agent"
+  assert_grep 'capacity_rescue_attempts=1' "$meta" \
+    "attempt cap changed the completed attempt count"
+  assert_grep 'capacity_rescue_stopped=max-attempts' "$meta" \
+    "attempt cap did not record its durable stop reason"
+  pass "capacity rescue enforces the per-task attempt cap without another spawn"
+}
+
+test_capacity_rescue_interrupted_attempt_never_respawns() {
+  local dir state meta fake_spawn old_account first second
+  dir=$(make_case capacity-rescue-interrupted); state="$dir/state"
+  meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
+  old_account="$dir/accounts/codex/1"
+  mkdir -p "$old_account"
+  write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account" 1
+  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=codex|account=%s|failure=codex-model-capacity\n' \
+    "$old_account" >> "$meta"
+  make_capacity_spawn_fake "$fake_spawn"
+
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
+    export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
+    export FM_FAKE_CAPACITY_META="$meta"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
+    export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
+    # shellcheck disable=SC1090
+    . "$WATCH"
+    first=$(capacity_rescue_reconcile_terminal_attempt)
+    [ "$first" = $'task\tinterrupted-attempt' ] \
+      || fail "dead-endpoint reconciliation reported the wrong interrupted attempt: $first"
+    second=$(capacity_rescue_reconcile_terminal_attempt || true)
+    [ -z "$second" ] \
+      || fail "interrupted attempt reconciled more than once: $second"
+  )
+
+  [ ! -e "$dir/spawn.log" ] || [ ! -s "$dir/spawn.log" ] \
+    || fail "interrupted attempt launched another replacement agent"
+  [ ! -e "$dir/kill.log" ] || [ ! -s "$dir/kill.log" ] \
+    || fail "interrupted attempt guessed which endpoint generation to remove"
+  [ "$(grep -Fc 'blocked [key=capacity-rescue]:' "$state/task.status" || true)" = 1 ] \
+    || fail "interrupted attempt did not emit exactly one blocked status"
+  assert_grep 'capacity_rescue_stopped=interrupted-attempt' "$meta" \
+    "interrupted attempt did not persist its no-respawn stop"
+  pass "a result-less attempt is found without a live pane and stops without respawn or endpoint guess"
+}
+
 test_managed_tmux_window_id_reverse_mapping() {
   local dir state
   dir=$(make_case managed-tmux-reverse-map); state="$dir/state"
@@ -1503,10 +1754,24 @@ if [ "${FM_TEST_FOCUSED:-}" = permission-prompts ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = capacity-rescue ]; then
+  test_provider_capacity_failure_classifier
+  test_capacity_rescue_records_attempt_and_changes_account
+  test_capacity_rescue_no_capacity_stops_once
+  test_capacity_rescue_attempt_cap_stops_without_spawn
+  test_capacity_rescue_interrupted_attempt_never_respawns
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
+test_provider_capacity_failure_classifier
+test_capacity_rescue_records_attempt_and_changes_account
+test_capacity_rescue_no_capacity_stops_once
+test_capacity_rescue_attempt_cap_stops_without_spawn
+test_capacity_rescue_interrupted_attempt_never_respawns
 test_managed_tmux_window_id_reverse_mapping
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier

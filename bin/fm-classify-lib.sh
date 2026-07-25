@@ -64,6 +64,47 @@ FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 # this is the one owner of the verb literal, overridable via FM_CLASSIFY_RESOLVE_VERB.
 FM_CLASSIFY_RESOLVE_VERB_DEFAULT='resolved'
 
+# Classify a provider-owned capacity failure from the bounded pane capture of a
+# known harness. Prints a stable failure token and returns 0 on a verified shape;
+# prints nothing and returns 1 otherwise.
+#
+# These match complete TUI chrome, not capacity-like prose. Codex requires its
+# standalone warning glyph and exact line. Claude requires either its tool-result
+# glyph plus exact session-limit sentence or the complete usage-limit choice
+# dialog. This prevents a task discussing "usage limits", quoting one sentence,
+# or printing ordinary API rate-limit output from being mistaken for an exhausted
+# harness account. Empirical captures and versions are recorded in
+# docs/account-capacity-rescue.md.
+provider_capacity_failure_kind() {  # <harness> <tail40>
+  local harness=$1 tail40=$2 prompt_tail
+  prompt_tail=$(printf '%s\n' "$tail40" | tail -18)
+  case "$harness" in
+    codex)
+      if printf '%s\n' "$prompt_tail" \
+        | grep -Eq '^[[:space:]]*⚠[[:space:]]+Selected model is at capacity\. Please try a different model\.[[:space:]]*$'; then
+        printf 'codex-model-capacity'
+        return 0
+      fi
+      ;;
+    claude)
+      if printf '%s\n' "$prompt_tail" \
+        | grep -Eq "^[[:space:]]*⎿.*You've hit your session limit · resets .+[[:space:]]*$"; then
+        printf 'claude-session-limit'
+        return 0
+      fi
+      if printf '%s\n' "$prompt_tail" | grep -Fq 'What do you want to do?' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq '1\. Stop and wait for limit to reset[[:space:]]*$' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq '2\. Switch to usage credits[[:space:]]*$' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq '3\. Switch to Team plan[[:space:]]*$' \
+        && printf '%s\n' "$prompt_tail" | grep -Eq 'Enter to confirm.*Esc to cancel'; then
+        printf 'claude-usage-limit-dialog'
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {
   local f=$1

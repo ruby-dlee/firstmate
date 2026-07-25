@@ -220,14 +220,7 @@ if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
       *) candidate_owner=$(dirname "$candidate")/$candidate_owner ;;
     esac
     candidate_owner=$(cd "$candidate_owner" 2>/dev/null && pwd -P) || continue
-    candidate_owner_parent=$(cd "$(dirname "$candidate_owner")" 2>/dev/null && pwd -P) || continue
-    [ "$candidate_owner_parent" = "$expected_lock_root" ] || continue
-    case "$(basename "$candidate_owner")" in
-      *.lock.owner.*) ;;
-      *) continue ;;
-    esac
-    lock_pid=$(cat "$candidate_owner/pid" 2>/dev/null || true)
-    kill -0 "$lock_pid" 2>/dev/null || continue
+    [ "$candidate_owner" = "$lock_owner" ] || continue
     lock_link=$candidate
     break
   done
@@ -480,7 +473,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
-    FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
+    FM_EXPECT_CHECKOUT_LOCK_ROOT="${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" \
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
@@ -736,7 +729,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
 }
 
 test_unmanaged_postinstall_failure_restores_prior_state() {
-  local id rec expected out status artifact expected_lock lock_root lock_marker
+  local id rec expected out status artifact lock_root lock_marker
   id='checkout-unmanaged-restore-z1d'
   rec=$(make_case checkout-unmanaged-restore pi "$id")
   read_case "$rec"
@@ -751,17 +744,13 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   expected="$CASE_DIR/original.meta"
   lock_root="$CASE_DIR/checkout-refresh-locks"
   mkdir -p "$lock_root"
-  expected_lock=$(bash -c \
-    '. "$1"; fm_checkout_lock_path "$2" "$3"' \
-    fm-account-routing-lock "$ROOT/bin/fm-checkout-lock-lib.sh" "$WT_DIR" "$lock_root") \
-    || fail "could not derive the common checkout lock through the production helper"
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
   for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
-  if out=$(FM_EXPECT_CHECKOUT_LOCK="$expected_lock" \
+  if out=$(FM_EXPECT_CHECKOUT_LOCK_ROOT="$lock_root" \
       FM_EXPECT_CHECKOUT_LOCK_MARKER="$lock_marker" \
       FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR run_spawn "$id" "$PROJ_DIR"); then
     status=0

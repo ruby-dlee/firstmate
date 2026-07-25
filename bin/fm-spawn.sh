@@ -1441,7 +1441,7 @@ spawn_return_created_worktree() {
   fi
   current_tip=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || current_tip=
   if [ -n "$WORKTREE_EXPECTED_TIP" ] && [ "$current_tip" != "$WORKTREE_EXPECTED_TIP" ]; then
-    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP" || true
+    echo "error: acquired worktree changed from expected detached tip $WORKTREE_EXPECTED_TIP to $current_tip; retain it for manual recovery" >&2
     echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
     return 1
   fi

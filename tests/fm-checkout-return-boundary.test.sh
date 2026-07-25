@@ -176,16 +176,16 @@ import os
 import sys
 
 root = sys.argv[1]
-for index in range(41701):
+for index in range(42001):
     os.mkdir(os.path.join(root, f"directory-{index:05d}"))
 deep = os.path.join(root, "deep")
 os.mkdir(deep)
-for _ in range(300):
+for _ in range(130):
     deep = os.path.join(deep, "d")
     os.mkdir(deep)
 PY
   then
-    fail "could not generate the 42,002-directory capacity fixture"
+    fail "could not generate the greater-than-42,000-directory capacity fixture"
   fi
   fakebin=$(fm_fakebin "$case_dir/fake")
   cat > "$fakebin/treehouse" <<'SH'
@@ -207,8 +207,8 @@ SH
     PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$worktree" "$project"
   ) >/dev/null 2>&1
   status=$?
-  expect_code 0 "$status" "a 42,002-directory worktree deeper than the descriptor limit must return"
-  pass "a real 42,002-directory deep fixture keeps only its root descriptor across exec"
+  expect_code 0 "$status" "a worktree with more than 42,000 directories and depth beyond the descriptor limit must return"
+  pass "a real greater-than-42,000-directory fixture keeps only its root descriptor across exec"
 }
 
 extract_boundary_program

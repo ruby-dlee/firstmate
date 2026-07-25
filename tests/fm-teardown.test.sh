@@ -3853,6 +3853,43 @@ SH
   pass "the retained root descriptor binds Treehouse across pathname replacement"
 }
 
+test_treehouse_return_validates_more_than_42000_directories() {
+  local case_dir marker rc
+  case_dir=$(make_case treehouse-return-directory-capacity)
+  write_meta "$case_dir" local-only ship
+  marker="$case_dir/treehouse-return-reached"
+  python3 - "$case_dir/wt" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+for index in range(42001):
+    os.mkdir(os.path.join(root, f"capacity-{index:05d}"))
+PY
+  add_fork_with_pushed_branch "$case_dir"
+  rm -f "$case_dir/fakebin/.tmux-live"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = return ] && [ "$2" = --force ] && [ "$3" = "." ] || exit 91
+root_descriptor=${FM_TREEHOUSE_RETURN_ROOT_FD:-}
+[ -n "$root_descriptor" ] || exit 92
+[ "$FM_TREEHOUSE_RETURN_BOUNDARY_FDS" = "$root_descriptor" ] || exit 93
+[ -d "/dev/fd/$root_descriptor" ] || exit 94
+: > "$FM_TREEHOUSE_CAPACITY_MARKER"
+exit 17
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  set +e
+  FM_TREEHOUSE_CAPACITY_MARKER="$marker" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "failed large Treehouse return should retain the worktree"
+  assert_present "$marker" \
+    "Treehouse validation exhausted descriptors before traversing 42,001 directories"
+  pass "Treehouse return validates more than 42,000 directories without retaining descendant descriptors"
+}
+
 test_teardown_distinguishes_dead_and_live_harness_processes() {
   local dead_case live_case rc
   dead_case=$(make_case dead-harness-endpoint)
@@ -4448,6 +4485,11 @@ if [ "${FM_TEST_FOCUSED:-}" = treehouse-return-root-swap ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-return-directory-capacity ]; then
+  test_treehouse_return_validates_more_than_42000_directories
+  exit 0
+fi
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -4500,6 +4542,7 @@ test_secondmate_retirement_rejects_in_home_remote_object_storage
 test_secondmate_retirement_rejects_source_common_dir_in_home
 test_teardown_removal_roots_fail_closed
 test_treehouse_return_stays_bound_to_validated_root
+test_treehouse_return_validates_more_than_42000_directories
 test_teardown_distinguishes_dead_and_live_harness_processes
 test_secondmate_retirement_retains_reflog_and_rewritten_history
 test_secondmate_retirement_rejects_http_proxy_and_object_redirects

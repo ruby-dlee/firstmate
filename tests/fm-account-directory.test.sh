@@ -935,7 +935,7 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
     status=$?
   fi
   [ "$status" -ne 0 ] || fail "new direct rollback fixture unexpectedly succeeded"
-  if ! grep -Fq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
+  if ! grep -Fxq "return --force ." "$TREEHOUSE_LOG"; then
     fail "failed new direct spawn did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
   fi
   [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"

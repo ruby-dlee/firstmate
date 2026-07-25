@@ -194,9 +194,7 @@ SH
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'treehouse %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 [ -z "${FM_FAKE_TREEHOUSE_SLEEP:-}" ] || sleep "$FM_FAKE_TREEHOUSE_SLEEP"
 if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK:-}" ]; then
-  [ -e "$FM_EXPECT_CHECKOUT_LOCK" ] || [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
-  lock_pid=$(cat "$FM_EXPECT_CHECKOUT_LOCK/pid" 2>/dev/null || true)
-  kill -0 "$lock_pid" 2>/dev/null || exit 92
+  [ -L "$FM_EXPECT_CHECKOUT_LOCK" ] || exit 91
   [ -z "${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" ] \
     || printf '%s\n' "$*" > "$FM_EXPECT_CHECKOUT_LOCK_MARKER"
 fi

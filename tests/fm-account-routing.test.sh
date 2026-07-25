@@ -3200,7 +3200,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
 }
 
 test_concurrent_continuations_serialize_before_mutation() {
-  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count second_lock_waiter
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
@@ -3230,7 +3230,7 @@ test_concurrent_continuations_serialize_before_mutation() {
   if [ ! -f "$second_lock_waiter" ]; then
     touch "$gate"
     kill "$first_pid" "$second_pid" 2>/dev/null || true
-    fail "second continuation never waited behind the first lifecycle owner"
+    fail "second continuation never waited behind the first lifecycle owner: $(cat "$CASE_DIR/second.out")"
   fi
   touch "$gate"
   wait "$first_pid"

@@ -730,6 +730,7 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   id=direct-retained-endpoint-z7
   record=$(make_spawn_case direct-retained-endpoint codex "$id")
   read_spawn_case "$record"
+  rm -rf "/tmp/fm-$id"
 
   run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
@@ -833,7 +834,8 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   read_spawn_case "$record"
   recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
   : > "$TREEHOUSE_LOG"
-  : > "/tmp/fm-$id"
+  mkdir -p "/tmp/fm-$id"
+  : > "/tmp/fm-$id/gotmp"
 
   if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
@@ -848,7 +850,7 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"
   [ ! -e "$SPAWN_HOME/state/$id.meta" ] || fail "successful direct rollback left task metadata"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "successful direct rollback left its endpoint"
-  rm -f "/tmp/fm-$id"
+  rm -rf "/tmp/fm-$id"
   pass "failed new direct spawn removes its endpoint and returns its worktree"
 }
 
@@ -860,7 +862,8 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   record=$(make_spawn_case direct-new-return-fail codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
-  : > "/tmp/fm-$id"
+  mkdir -p "/tmp/fm-$id"
+  : > "/tmp/fm-$id/gotmp"
 
   if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
@@ -877,7 +880,7 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   assert_grep "rollback_pending=1" "$meta" \
     "direct return failure did not fail closed"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "direct return failure retained an already-removed endpoint"
-  rm -f "/tmp/fm-$id"
+  rm -rf "/tmp/fm-$id"
   pass "direct spawn persists cleanup state when worktree return cannot be confirmed"
 }
 

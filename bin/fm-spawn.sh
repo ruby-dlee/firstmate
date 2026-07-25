@@ -1594,6 +1594,9 @@ spawn_abort_cleanup() {
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0
+      if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+        echo "warning: retained unsafe acquired worktree $WT for manual recovery" >&2
+      fi
       echo "warning: retained failed spawn resources for ${ID:-unknown} because prior task state could not be restored" >&2
     fi
     [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2

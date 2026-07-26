@@ -58,7 +58,7 @@ fm_backend_orca_authority_capabilities_check() {
   return 1
 }
 
-fm_backend_orca_json_get() {  # <field> ; fields: worktree-id worktree-path terminal-handle terminal-title worktree-terminal-handle repo-id
+fm_backend_orca_json_get() {  # <field> ; fields: worktree-id worktree-path worktree-name terminal-handle terminal-title worktree-terminal-handle repo-id
   # Terminal handles are accepted only from verified terminal result shapes:
   # result.terminal or a root terminal object with .handle. Undocumented
   # result.id and result.worktree.terminal shapes are ignored until a real Orca
@@ -88,6 +88,7 @@ function handle(obj) {
 let v = "";
 if (field === "worktree-id") v = wt.id || wt.worktreeId || r.worktreeId || "";
 if (field === "worktree-path") v = wt.path || (wt.git && wt.git.path) || r.path || "";
+if (field === "worktree-name") v = scalar(wt.name) || scalar(wt.title) || scalar(r.worktreeName) || "";
 if (field === "terminal-handle") v = handle(explicitTerm || r) || "";
 if (field === "terminal-title") v = scalar((explicitTerm || r).title) || scalar((explicitTerm || r).name) || "";
 if (field === "worktree-terminal-handle") v = handle(explicitTerm) || "";
@@ -141,7 +142,7 @@ fm_backend_orca_repo_ensure() {  # <project-path>
 }
 
 fm_backend_orca_worktree_create() {  # <project-path> <name>
-  local project=$1 name=$2 repo_id out wt_id wt_path terminal status proof
+  local project=$1 name=$2 repo_id out wt_id wt_path wt_name terminal status proof
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
   if out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json); then
     status=0
@@ -151,10 +152,11 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
   wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id 2>/dev/null || true)
   terminal=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-terminal-handle 2>/dev/null || true)
   wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path 2>/dev/null || true)
+  wt_name=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-name 2>/dev/null || true)
   proof=unproven
   [ -z "$terminal" ] || proof=recorded
-  printf '%s\t%s\t%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal" "$proof" "$repo_id"
-  if [ "$status" -ne 0 ] || [ -z "$wt_id" ] || [ -z "$wt_path" ]; then
+  printf '%s\t%s\t%s\t%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal" "$proof" "$repo_id" "$wt_name"
+  if [ "$status" -ne 0 ] || [ -z "$wt_id" ] || [ -z "$wt_path" ] || [ -z "$wt_name" ]; then
     echo "error: orca worktree create returned incomplete or unsuccessful authority for $name" >&2
     return 2
   fi

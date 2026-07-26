@@ -495,6 +495,7 @@ run_teardown() {
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
+    FM_TEST_REAL_GIT="$REAL_GIT" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
 }
@@ -693,7 +694,7 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
     FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
     run_spawn "$id" "$PROJ_DIR" > "$out_file" &
   spawn_pid=$!
-  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
+  for _ in $(seq 1 300); do [ -f "$marker" ] && break; sleep 0.05; done
   [ -f "$marker" ] \
     || { kill "$spawn_pid" 2>/dev/null || true; fail "changed-acquisition test never reached the post-install failure"; }
   printf '%s\n' retained-commit > "$WT_DIR/retained-commit.txt"

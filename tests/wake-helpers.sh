@@ -246,7 +246,8 @@ SH
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
   while [ "$i" -lt "$limit" ]; do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    # kill -0 also succeeds for an exited child that is waiting to be reaped.
+    if ! is_live_non_zombie "$pid"; then
       wait "$pid"
       return "$?"
     fi

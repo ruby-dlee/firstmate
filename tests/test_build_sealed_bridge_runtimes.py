@@ -1227,7 +1227,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
         hardlink = self.root / "front-hardlink"
         os.link(front, hardlink)
         rejected = subprocess.run(
-            [str(hardlink), "ok"], check=False, capture_output=True, text=True
+            [str(front), "ok"], check=False, capture_output=True, text=True
         )
         self.assertEqual(rejected.returncode, 126)
 

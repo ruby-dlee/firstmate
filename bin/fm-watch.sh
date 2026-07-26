@@ -923,13 +923,15 @@ while :; do
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
 
-  prune_reports_if_due
+  if [ "${FM_WATCH_CHECKPOINT:-0}" != 1 ]; then
+    prune_reports_if_due
 
-  # A managed provider's SessionStart hook may race the initial spawn return.
-  # Reconcile only metas still missing provider_session_id; failures stay
-  # silent and retry here, while recovery itself requires the mapping and
-  # fails closed.
-  sync_account_sessions_if_due
+    # A managed provider's SessionStart hook may race the initial spawn return.
+    # Reconcile only metas still missing provider_session_id; failures stay
+    # silent and retry here, while recovery itself requires the mapping and
+    # fails closed.
+    sync_account_sessions_if_due
+  fi
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.

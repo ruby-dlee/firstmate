@@ -541,9 +541,11 @@ test_terminal_state_classifies_closed_live_and_ambiguous_orca() {
 test_remove_worktree_refuses_empty_id() {
   local out status
   orca_case remove-empty
+  set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_remove_worktree ""' "$ROOT" 2>&1 )
   status=$?
+  set -e
   [ "$status" -ne 0 ] || fail "remove_worktree should fail when the Orca worktree id is empty"
   assert_contains "$out" "missing Orca worktree id" "remove_worktree did not explain the missing id"
   [ ! -s "$LOG" ] || fail "remove_worktree should not call Orca with an empty id"
@@ -555,9 +557,11 @@ test_remove_worktree_rejects_orca_error_json() {
   orca_case remove-error-json
   token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   printf '{"ok":false,"error":{"code":"worktree_not_found","message":"worktree not found"}}\n' > "$RESP/1.out"
+  set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_remove_worktree_bound wt-gone /tmp/orca-wt "$1"' "$ROOT" "$token" 2>&1 )
   status=$?
+  set -e
   [ "$status" -ne 0 ] || fail "bound remove_worktree should fail on Orca ok:false JSON"
   assert_contains "$out" "worktree not found" "bound remove_worktree should surface the Orca removal error"
   assert_contains "$(cat "$LOG")" $'--expected-path\x1f/tmp/orca-wt' \

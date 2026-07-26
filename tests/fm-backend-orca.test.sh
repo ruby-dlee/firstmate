@@ -198,13 +198,14 @@ SH
 }
 
 initialize_secondmate_home_repo() {
-  local home=$1 source=$2
+  local home=$1 source=$2 source_branch
+  source_branch=$(git -C "$source" symbolic-ref --short HEAD)
   git -C "$home" init -q
   git -C "$home" remote add origin "$source"
-  git -C "$home" fetch -q origin main
-  git -C "$home" symbolic-ref HEAD refs/heads/main
-  git -C "$home" update-ref refs/heads/main refs/remotes/origin/main
-  git -C "$home" read-tree refs/remotes/origin/main
+  git -C "$home" fetch -q origin "$source_branch"
+  git -C "$home" symbolic-ref HEAD "refs/heads/$source_branch"
+  git -C "$home" update-ref "refs/heads/$source_branch" "refs/remotes/origin/$source_branch"
+  git -C "$home" read-tree "refs/remotes/origin/$source_branch"
   cp "$source/README.md" "$home/README.md"
   printf '%s\n' '.fm-secondmate-home' 'projects/' 'state/' >> "$home/.git/info/exclude"
 }

@@ -20,6 +20,12 @@
 # Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
 # Slash commands, and codex `$...` skill invocations resolved through harness
 # meta, get a longer pre-Enter settle so completion popups do not swallow Enter.
+# Before that shared settle path, a bare installed-skill token is refused when
+# its `/` or `$` prefix conflicts with the resolved harness form recorded in
+# .agents/skills/harness-adapters/SKILL.md. Refusal is deliberate: silently
+# rewriting would hide a supervisor caller bug. Ordinary slash commands,
+# `$`-prefixed prose, multi-token messages, keys, and unknown-harness explicit
+# targets keep their existing behavior.
 #
 # From-firstmate marker: when the resolved target is a task selector whose meta
 # records kind=secondmate, the text is prefixed with the from-firstmate marker
@@ -93,6 +99,60 @@ fm_send_count_colons() {  # <string>
   local s=$1 no_colons
   no_colons=${s//:/}
   printf '%s' $(( ${#s} - ${#no_colons} ))
+}
+
+fm_send_bare_skill_name() {  # <message>
+  local message=$1 name root
+  case "$message" in
+    /*|\$*) ;;
+    *) return 1 ;;
+  esac
+  case "$message" in
+    *[[:space:]]*) return 1 ;;
+  esac
+  name=${message:1}
+  case "$name" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  case "$name" in
+    no-mistakes)
+      printf '%s' "$name"
+      return 0
+      ;;
+  esac
+  for root in \
+    "$FM_HOME/.agents/skills" \
+    "$FM_ROOT/.agents/skills" \
+    "$FM_ROOT/skills" \
+    "${HOME:-}/.agents/skills" \
+    "${HOME:-}/.claude/skills" \
+    "${HOME:-}/.codex/skills"; do
+    [ -n "$root" ] || continue
+    [ -d "$root/$name" ] || continue
+    printf '%s' "$name"
+    return 0
+  done
+  return 1
+}
+
+fm_send_validate_skill_form() {  # <harness> <message>
+  local harness=$1 message=$2 skill expected corrected
+  skill=$(fm_send_bare_skill_name "$message") || return 0
+  case "$harness" in
+    claude|grok) expected=/ ;;
+    codex) expected='$' ;;
+    opencode|pi)
+      echo "error: refusing bare skill invocation '$message' for harness '$harness'; it has no verified bare skill form, so send natural language such as 'Run the $skill skill.'" >&2
+      return 1
+      ;;
+    *) return 0 ;;
+  esac
+  case "$message" in
+    "$expected"*) return 0 ;;
+  esac
+  corrected=$expected$skill
+  echo "error: refusing bare skill invocation '$message' for harness '$harness'; use '$corrected'" >&2
+  return 1
 }
 
 fm_send_resolve_target() {  # <raw-target>
@@ -188,6 +248,11 @@ shift
 
 fm_backend_validate "$TARGET_BACKEND" || exit 1
 
+if [ "${1:-}" != "--key" ]; then
+  MESSAGE=$*
+  fm_send_validate_skill_form "$TARGET_HARNESS" "$MESSAGE" || exit 1
+fi
+
 # Classify a from-firstmate -> secondmate request. Only a task selector resolved
 # through this home's meta whose authoritative kind is secondmate is marked: the
 # secondmate then routes its reply via the status path (see fm-marker-lib.sh).
@@ -198,10 +263,10 @@ if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ "$(fm_meta_get "$TARG
   MARK_FROM_FIRSTMATE=1
 fi
 
-# Resolve the target's harness from its meta (recorded by fm-spawn), used only to
-# scope the codex `$<skill>` popup-settle below. A task selector carries
-# meta; an explicit backend-target escape hatch has none, so its harness is
-# unknown and treated as non-codex (the safe default that keeps the fast path).
+# The target's harness came from its meta (recorded by fm-spawn), and scopes both
+# the bare-skill form guard above and the codex `$<skill>` popup-settle below.
+# A task selector carries meta; an explicit backend-target escape hatch has none,
+# so its harness is unknown and retains the existing unguarded fast path.
 # The target's BACKEND comes from selector meta, from matching an explicit target
 # back to recorded meta, or from strict explicit-target shape validation.
 # Do not add a separate passive liveness preflight here. Active send paths own
@@ -257,7 +322,6 @@ if [ "${1:-}" = "--key" ]; then
     fi
   fi
 else
-  MESSAGE=$*
   if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
   fi

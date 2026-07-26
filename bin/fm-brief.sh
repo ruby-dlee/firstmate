@@ -223,7 +223,18 @@ EOF
 )
 fi
 
+BROWSER_SECTION=$(cat <<'EOF'
+# Browser automation safety
+Never set `CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1` or `CHROME_DEVTOOLS_AXI_HEADED=1`.
+Always set your own `CHROME_DEVTOOLS_AXI_SESSION`.
+When an authenticated dashboard is needed, set `CHROME_DEVTOOLS_AXI_USER_DATA_DIR` to a per-crewmate profile directory; the persistent profile keeps its login cookie across headless runs.
+Never use `open -a "Google Chrome"` or AppleScript that focuses an app.
+If a check genuinely cannot run headlessly, report the exact step that fails instead of falling back to a visible or auto-connected browser.
+EOF
+)
+
 if [ "$KIND" = scout ]; then
+REPORT_HEADINGS=$(fm_completion_report_required_headings)
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -231,6 +242,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 {TASK}
 
 $HERDR_SECTION
+
+$BROWSER_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
@@ -262,7 +275,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
-Use these level-two sections: Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
+Use these exact level-two headings in this order: $REPORT_HEADINGS.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
@@ -364,6 +377,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 {TASK}
 
 $HERDR_SECTION
+
+$BROWSER_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.

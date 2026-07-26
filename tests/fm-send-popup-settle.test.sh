@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-send pre-submit popup-settle selection (the codex `$<skill>` fix).
+# fm-send bare-skill syntax guard and pre-submit popup-settle selection.
 #
 # Some TUIs open a completion popup when the composer's first character triggers
 # it: codex (and others) for a leading `/` slash command, and codex specifically
@@ -23,6 +23,12 @@
 # the TAIL (post-submit) pause. The retried Enter in fm_tmux_submit_core remains the
 # real safety net; this settle is only the optimization that lets the popup clear so
 # the first Enter lands.
+#
+# A bare installed-skill token is refused before typing when its prefix is wrong
+# for the resolved harness. That guard is intentionally separate from settle:
+# matching forms still reach the matrix below, ordinary slash commands and
+# multi-token `$` prose keep their old behavior, and unknown-harness explicit
+# targets remain an escape hatch.
 #
 # Every case below passes a LITERAL `$<skill>` / `$price` message in single quotes
 # on purpose - the whole point is to send an unexpanded `$...` line to the agent -
@@ -109,6 +115,25 @@ first_settle() {  # <expected> <label> <harness|--explicit> <message> [selector-
   pass "fm-send popup-settle: $label -> ${expected}s"
 }
 
+refuse_skill_form() {  # <label> <harness> <message> <expected-correction>
+  local label=$1 harness=$2 msg=$3 correction=$4
+  local dir fb log home err rc
+  dir="$TMP_ROOT/refuse-$RANDOM"; mkdir -p "$dir/state"
+  fb=$(make_stubs "$dir"); log="$dir/sleep.log"; home="$dir"; err="$dir/send.err"
+  mkdir -p "$home/.agents/skills/${msg:1}"
+  fm_write_meta "$home/state/popupcase.meta" "window=sess:win" "harness=$harness"
+  : > "$log"
+  env FM_SEND_SETTLE=0 PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" \
+    "$SEND" popupcase "$msg" >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -ne 0 ] || fail "$label: wrong skill form unexpectedly sent"
+  assert_contains "$(cat "$err")" "refusing bare skill invocation '$msg' for harness '$harness'" \
+    "$label: refusal omitted the wrong token and resolved harness"
+  assert_contains "$(cat "$err")" "$correction" "$label: refusal omitted the correct form"
+  [ ! -s "$log" ] || fail "$label: wrong skill form reached popup-settle or submission"
+  pass "fm-send skill form: $label refused before typing"
+}
+
 # Codex `$<skill>` gets the long settle so its `$` popup clears (the fix).
 first_settle 1.2 'codex $skill -> long settle' codex '$no-mistakes'
 
@@ -116,8 +141,16 @@ first_settle 1.2 'codex $skill -> long settle' codex '$no-mistakes'
 # task id, not only by the legacy `fm-<id>` window label.
 first_settle 1.2 'codex $skill exact task id -> long settle' codex '$no-mistakes' exact
 
-# Same `$` message to claude keeps the fast path: `$` is ordinary text there.
-first_settle 0.3 'claude $-message -> fast path' claude '$no-mistakes'
+# Claude and Grok use slash skill forms.
+first_settle 1.2 'claude /skill -> long settle' claude '/no-mistakes'
+first_settle 1.2 'grok /skill -> long settle' grok '/no-mistakes'
+
+# Known bare skills with the wrong harness form fail before any text is typed.
+refuse_skill_form 'codex rejects claude skill form' codex '/no-mistakes' "use '\$no-mistakes'"
+refuse_skill_form 'claude rejects codex skill form' claude '$no-mistakes' "use '/no-mistakes'"
+refuse_skill_form 'grok rejects codex skill form' grok '$no-mistakes' "use '/no-mistakes'"
+refuse_skill_form 'installed firstmate skill is also guarded' codex '/reports' "use '\$reports'"
+refuse_skill_form 'unverified opencode form uses natural-language fallback' opencode '/no-mistakes' 'Run the no-mistakes skill.'
 
 # `$`-prefixed plain text to claude (a price) must NOT popup-settle - the regression
 # the codex scoping exists to prevent.

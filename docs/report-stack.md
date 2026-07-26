@@ -19,7 +19,9 @@ Expired entries are renamed to deletion tombstones before the index changes, and
 New task metadata carries `report_required=1`.
 A ship task writes `data/<id>/completion.md`, while a scout keeps using `data/<id>/report.md`.
 Both may attach screenshots, diagrams, or other review artifacts under `data/<id>/visuals/`.
-Every post-cutover ship and scout report must use the level-two sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups.
+Every post-cutover ship and scout report must use the sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups in that order.
+All six section headings must use one common top structural level: either level one, or level two beneath an optional level-one report title.
+The brief scaffold requests the level-two form so reports are consistent, while publication accepts the level-one form because heading depth is formatting rather than substance.
 Every required section must contain substantive body content, with an explicit `None.` accepted when the section has nothing to report.
 Within a real required section, meaningful fenced transcript or literal-code lines count as body content, but an empty fence body, whitespace, a bare Markdown blockquote or list marker, or Unicode control and format characters alone do not.
 Fence delimiters never count as body content, and heading-like lines inside a fence never satisfy a required section heading.

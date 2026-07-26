@@ -105,6 +105,7 @@ This preserves launch success instead of passing a known-bad value.
 
 Send the validation skill using the target harness's skill invocation form.
 Natural language is acceptable if uncertain.
+`fm-send` refuses a bare installed-skill token whose prefix conflicts with the resolved harness, and names the correct form instead of silently rewriting a caller bug.
 
 - claude: `/<skill>`, for example `/no-mistakes`.
 - codex: `$<skill>`, for example `$no-mistakes`; `/<skill>` is claude-only and codex rejects it as "Unrecognized command".

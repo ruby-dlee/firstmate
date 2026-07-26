@@ -109,12 +109,14 @@ test_ship_completion_report_contract() {
   brief="$home/data/$id/brief.md"
   assert_grep "# Completion report" "$brief" "ship brief has no completion-report contract"
   assert_grep "data/$id/completion.md" "$brief" "ship brief has no durable report path"
-  assert_grep "six sections, each as a LEVEL-TWO markdown heading spelled exactly" "$brief" \
-    "ship brief does not require exact level-two report headings"
+  assert_grep "six exact level-two headings in this order" "$brief" \
+    "ship brief does not require ordered exact level-two report headings"
   assert_grep "\`## Summary\`, \`## What changed\`, \`## Verification\`, \`## Visual evidence\`, \`## Artifacts\`, \`## Follow-ups\`" "$brief" \
     "ship brief has no exact review-oriented report schema"
-  assert_grep "a level-one \`# Summary\` fails" "$brief" \
-    "ship brief does not reject completion sections at the wrong heading level"
+  assert_grep "publication also accepts a report that consistently uses the level-one equivalents" "$brief" \
+    "ship brief does not describe the accepted level-one compatibility form"
+  assert_grep "do not mix heading levels" "$brief" \
+    "ship brief does not forbid structurally mixed report sections"
   assert_grep "When a section genuinely does not apply, say so in a sentence under the heading rather than omitting the heading." "$brief" \
     "ship brief permits inapplicable report sections to be omitted"
   assert_grep "data/$id/visuals/" "$brief" "ship brief has no visual evidence path"
@@ -132,9 +134,38 @@ test_scout_completion_report_contract() {
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_grep "data/$id/report.md" "$brief" "scout brief has no durable report path"
-  assert_grep "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" "$brief" \
-    "scout brief does not name every enforced report section"
+  assert_grep "\`## Summary\`, \`## What changed\`, \`## Verification\`, \`## Visual evidence\`, \`## Artifacts\`, \`## Follow-ups\`" "$brief" \
+    "scout brief does not name every enforced report heading concretely"
   pass "fm-brief.sh: scout tasks receive the enforced completion-report schema"
+}
+
+test_browser_automation_safety_contract() {
+  local home kind id brief
+  home="$TMP_ROOT/browser-safety-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    id="brief-browser-safety-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_grep "# Browser automation safety" "$brief" "$kind brief omitted browser safety"
+    assert_grep "Never set \`CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1\` or \`CHROME_DEVTOOLS_AXI_HEADED=1\`." "$brief" \
+      "$kind brief omitted both independent visible-browser hazards"
+    assert_grep "Always set your own \`CHROME_DEVTOOLS_AXI_SESSION\`." "$brief" \
+      "$kind brief omitted per-crewmate browser session isolation"
+    assert_grep "\`CHROME_DEVTOOLS_AXI_USER_DATA_DIR\` to a per-crewmate profile directory" "$brief" \
+      "$kind brief omitted persistent authenticated-profile isolation"
+    assert_grep "persistent profile keeps its login cookie across headless runs" "$brief" \
+      "$kind brief omitted authenticated headless reuse"
+    assert_grep "Never use \`open -a \"Google Chrome\"\` or AppleScript that focuses an app." "$brief" \
+      "$kind brief omitted focus-hijack commands"
+    assert_grep "report the exact step that fails instead of falling back" "$brief" \
+      "$kind brief omitted fail-closed headless reporting"
+  done
+  pass "fm-brief.sh: ship and scout briefs always carry browser-isolation safety"
 }
 
 test_promoted_scout_receives_completion_contract() {
@@ -147,7 +178,7 @@ test_promoted_scout_receives_completion_contract() {
   out=$(FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" "$id") \
     || fail "scout promotion failed"
   assert_grep 'kind=ship' "$home/state/$id.meta" "scout promotion did not update task kind"
-  assert_contains "$out" "Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups" \
+  assert_contains "$out" "\`## Summary\`, \`## What changed\`, \`## Verification\`, \`## Visual evidence\`, \`## Artifacts\`, \`## Follow-ups\`" \
     "promoted scout did not receive the ship completion-report schema"
   expected_report="$data/$id/completion.md"
   assert_contains "$out" "$expected_report" "promoted scout did not receive the authoritative completion-report path"
@@ -454,6 +485,7 @@ test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_ship_completion_report_contract
 test_scout_completion_report_contract
+test_browser_automation_safety_contract
 test_promoted_scout_receives_completion_contract
 test_promote_serializes_with_account_session_updates
 test_promote_locks_lifecycle_before_metadata_and_rechecks_kind

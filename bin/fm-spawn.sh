@@ -2729,9 +2729,14 @@ if [ "$KIND" = secondmate ]; then
     echo "error: refusing secondmate launch for $PROJ_ABS: the primary's $ACCOUNT_PRIMARY_MODE routing mode is not authoritative in the home. Run bin/fm-config-push.sh and retry." >&2
     exit 1
   fi
+  if git -C "$PROJ_ABS" ls-files --error-unmatch bin/fm-account-routing-lib.sh >/dev/null 2>&1 \
+    && [ ! -f "$PROJ_ABS/bin/fm-account-routing-lib.sh" ]; then
+    echo "error: refusing secondmate $ID launch for home $PROJ_ABS: its dirty working tree is missing tracked Agent Fleet routing support. Restore or otherwise reconcile the home and retry." >&2
+    exit 1
+  fi
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
-      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      echo "error: refusing account-routed secondmate $ID launch for home $PROJ_ABS: the home lacks Agent Fleet routing support, which indicates an unreconciled revision or dirty working tree. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
       exit 1
     fi
   elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then

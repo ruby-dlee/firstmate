@@ -1622,6 +1622,25 @@ test_task_tmp_removal_pins_ancestors_during_swap() {
   pass "task temp removal pins every ancestor during deletion"
 }
 
+test_task_tmp_partial_removal_fails_closed() {
+  local id generation state target
+  id=account-tasktmp-partial-z9f
+  generation=spawn:a555555555555555
+  state="$TMP_ROOT/tasktmp-partial/state"
+  target="$state/.task-tmp/fm-$id-a555555555555555"
+  mkdir -p "$target"
+  printf 'vanish\n' > "$target/disappearing"
+  printf 'retain\n' > "$target/retained"
+  STATE=$state
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  if FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY=disappearing \
+    fm_account_safe_remove_task_tmp "$id" "$target" "$generation" >/dev/null 2>&1; then
+    fail "partial task temp removal reported success"
+  fi
+  assert_present "$target/retained" "partial task temp removal discarded the remaining root"
+  pass "partial task temp removal fails closed"
+}
+
 test_preinstall_managed_failure_restores_artifact_snapshot() {
   local id rec expected out status artifact
   id=account-preinstall-rollback-z9f
@@ -6536,6 +6555,7 @@ if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
   run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
   run_isolated_test test_task_tmp_removal_refuses_symlinked_parent
   run_isolated_test test_task_tmp_removal_pins_ancestors_during_swap
+  run_isolated_test test_task_tmp_partial_removal_fails_closed
   run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
   exit 0
 fi

@@ -21,7 +21,16 @@ flags |= os.O_NOFOLLOW
 
 
 def remove_tree(directory_fd, device):
-    for entry in sorted(os.listdir(directory_fd)):
+    entries = sorted(os.listdir(directory_fd))
+    disappearing = os.environ.get("FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY")
+    if (
+        os.environ.get("FM_ACCOUNT_ROUTING_TEST_LAB")
+        == "firstmate-account-routing-test-lab-v1"
+        and disappearing in entries
+    ):
+        os.unlink(disappearing, dir_fd=directory_fd)
+        del os.environ["FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY"]
+    for entry in entries:
         metadata = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
         if metadata.st_dev != device:
             raise OSError(f"filesystem boundary at {entry}")
@@ -59,12 +68,15 @@ def remove_tree(directory_fd, device):
 try:
     parent_fd = os.open(os.path.sep, flags)
     try:
-        for component in parent.split(os.path.sep):
-            if not component:
-                continue
-            next_fd = os.open(component, flags, dir_fd=parent_fd)
-            os.close(parent_fd)
-            parent_fd = next_fd
+        try:
+            for component in parent.split(os.path.sep):
+                if not component:
+                    continue
+                next_fd = os.open(component, flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+        except FileNotFoundError:
+            raise SystemExit(0)
         if (
             os.environ.get("FM_ACCOUNT_ROUTING_TEST_LAB")
             == "firstmate-account-routing-test-lab-v1"
@@ -79,10 +91,13 @@ try:
                 os.environ["FM_SAFE_TASK_TMP_SWAP_ANCESTOR"],
                 target_is_directory=True,
             )
-        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise OSError("task temp root is not a real directory")
-        root_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("task temp root is not a real directory")
+            root_fd = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise SystemExit(0)
         try:
             opened = os.fstat(root_fd)
             if identity(opened) != identity(metadata):
@@ -94,8 +109,6 @@ try:
             os.rmdir(name, dir_fd=parent_fd)
         finally:
             os.close(root_fd)
-    except FileNotFoundError:
-        raise SystemExit(0)
     finally:
         os.close(parent_fd)
 except OSError as error:

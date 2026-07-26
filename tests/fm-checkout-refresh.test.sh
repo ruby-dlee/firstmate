@@ -646,8 +646,18 @@ test_bootstrap_relays_hygiene_alerts() {
   draft="$project/.agents/skills/bootstrap-draft/SKILL.md"
   mkdir -p "$(dirname "$draft")"
   printf '%s\n' '# bootstrap draft' > "$draft"
+  run_refresh run-once >/dev/null
   config_backup=$(mktemp "$TMP_ROOT/checkout-refresh-config.XXXXXX")
+  : > "$FM_TEST_HOME/config/checkout-refresh"
   cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
+
+  out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
+    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "FLEET_SYNC: $project: HYGIENE: 1 untracked skill-draft files" \
+    "session-start bootstrap did not relay the unresolved hygiene alert"
+
   printf '%s\n' 'unexpected directive' >> "$FM_TEST_HOME/config/checkout-refresh"
 
   out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
@@ -656,8 +666,6 @@ test_bootstrap_relays_hygiene_alerts() {
     "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
   mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
 
-  assert_contains "$out" "FLEET_SYNC: $project: HYGIENE: 1 untracked skill-draft files" \
-    "session-start bootstrap did not relay the unresolved hygiene alert"
   assert_contains "$out" "FLEET_SYNC: checkout-refresh: skipped: unknown config directive 'unexpected'" \
     "session-start bootstrap swallowed checkout discovery diagnostics"
 
@@ -675,6 +683,7 @@ test_bootstrap_relays_hygiene_alerts() {
   grep -Fq '# bootstrap draft' "$draft" || fail "bootstrap refresh changed the draft"
   rm -rf "$project/.agents"
   run_refresh run-once >/dev/null
+  rm -f "$FM_TEST_HOME/config/checkout-refresh"
   pass "session-start bootstrap relays hygiene and discovery diagnostics"
 }
 

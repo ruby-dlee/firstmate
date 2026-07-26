@@ -1224,6 +1224,23 @@ SH
   cat > "$fake" <<'SH'
 #!/usr/bin/env bash
 set -u
+targets_default=false
+[ "${HERDR_SESSION:-}" = default ] && targets_default=true
+arguments=("$@")
+for ((index=0; index<${#arguments[@]}; index++)); do
+  case "${arguments[$index]}" in
+    --session=default) targets_default=true ;;
+    --session)
+      [ "${arguments[$((index + 1))]:-}" = default ] && targets_default=true
+      ;;
+  esac
+done
+if [ "$targets_default" = true ]; then
+  printf -v offending_command '%q ' "$@"
+  printf 'fake Herdr command targeting default is forbidden: %s\n' \
+    "${offending_command% }" >&2
+  exit 72
+fi
 {
   printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
   for argument in "$@"; do printf '\x1f%s' "$argument"; done

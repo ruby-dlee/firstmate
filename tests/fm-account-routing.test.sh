@@ -2042,13 +2042,15 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
-  cp "$ROOT/bin/fm-account-routing-lib.sh" "$home/bin/fm-account-routing-lib.sh"
-  cp "$ROOT/bin/fm-spawn.sh" "$home/bin/fm-spawn.sh"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  local home=$1 id=$2 home_abs
+  git clone --quiet --no-hardlinks "$ROOT" "$home"
+  git -C "$home" checkout --quiet --detach "$(git -C "$ROOT" rev-parse main)"
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
+  home_abs=$(cd "$home" && pwd -P)
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
+  printf -- '- %s - account routing fixture (home: %s; scope: account routing; projects: ; added 2026-07-25)\n' \
+    "$id" "$home_abs" > "$HOME_DIR/data/secondmates.md"
 }
 
 test_secondmate_pool_is_nonactivating_and_noninherited() {
@@ -2142,9 +2144,8 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
-  assert_contains "$out" "secondmate-home" "capability refusal omitted the offending secondmate home"
-  assert_contains "$out" "lacks Agent Fleet routing support" "capability refusal omitted its reason"
-  assert_contains "$out" "run bin/fm-config-push.sh" "capability refusal omitted the manual reconciliation step"
+  assert_contains "$out" "$id" "capability refusal omitted the offending secondmate"
+  assert_contains "$out" "dirty working tree" "capability refusal did not stop at the freshness gate"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }
@@ -2188,9 +2189,9 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   rm -f "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"
-  assert_contains "$out" "lacks Agent Fleet routing support" "off capability gap was not warned"
-  assert_regex '^new-window ' "$TMUX_LOG" "off capability warning blocked launch"
+  [ "$status" -ne 0 ] || fail "off secondmate launched from a dirty, capability-drifted home"
+  assert_contains "$out" "dirty working tree" "off capability drift did not stop at the freshness gate"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "off capability drift created an endpoint"
   pass "secondmate launches require authoritative routing policy in every mode"
 }
 

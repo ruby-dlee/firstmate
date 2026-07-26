@@ -3,6 +3,7 @@
 # Usage:
 #   fm-account-directory.sh select <claude|codex>
 #   fm-account-directory.sh check-credential <claude|codex> <account-home>
+#   fm-account-directory.sh provider-command claude
 #   fm-account-directory.sh install-herdr-hook <claude|codex> <account-home>
 #   fm-account-directory.sh prepare <claude|codex>
 #
@@ -15,11 +16,61 @@
 # accepts only a fresh result with at least one numeric five_hour or weekly
 # window, and picks the account with the highest minimum remaining percentage.
 # A Codex account with no such freshly readable window is skipped as unhealthy.
-# Claude quota is not currently distinguishable per config directory because
-# quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS
-# Keychain credential.
-# Claude therefore never treats a missing usage window as account failure and
-# selects the first real account directory in stable bytewise sort order.
+# Claude authentication is checked with this script's
+# `check-credential claude` command.
+# That is the one authoritative definition of a usable Claude account directory
+# for selection and spawn preflight.
+# The check clears ambient provider credentials, sets CLAUDE_CONFIG_DIR, and
+# invokes the same passwd-home launcher that a direct crew launch receives:
+# ~/.local/bin/claude.
+# Using the stable launcher symlink survives native Claude Code upgrades and
+# avoids PATH wrappers that unset CLAUDE_CONFIG_DIR.
+# A usable directory must make `claude auth status` return valid JSON with
+# loggedIn=true before the bounded check expires.
+# Claude selection skips unusable directories and chooses the first usable
+# directory in stable bytewise sort order.
+# Claude quota is still not distinguishable per config directory, so selection
+# never treats a missing usage window as account failure.
+#
+# macOS credential mechanism, verified 2026-07-26 with Claude Code 2.1.220:
+# a custom config directory stores OAuth JSON in the login Keychain service
+# `Claude Code-credentials-<first 8 hex of sha256 of the literal path>`.
+# The incident's broken account homes had service entries whose account
+# attribute was the passwd username; a newly authenticated working custom home
+# used account `unknown`.
+# Both item shapes had the same ACL, and `/usr/bin/security ... -w` could read
+# both without prompting, so application ACL or versioned-binary ancestry was
+# not the failure.
+# The real CLI accepted every broken item's access token through the transient
+# CLAUDE_CODE_OAUTH_TOKEN environment, proving the stored payloads were valid;
+# it could not discover those same payloads through its native Keychain lookup.
+# Updating a stale item during interactive login left its old account attribute
+# in place, which explains why that process worked until the next spawn.
+#
+# `claude setup-token` was also evaluated.
+# Claude Code honors its one-year, inference-only token through
+# CLAUDE_CODE_OAUTH_TOKEN, but the command prints rather than stores the secret.
+# Firstmate does not select that route because persisting and injecting the
+# secret would add a second credential store and could expose it through launch
+# arguments, environment capture, or account-home files.
+# A clean native `claude auth login` is the selected durable mechanism because
+# Claude owns storage and refresh, and Firstmate never handles the secret.
+#
+# Set up a new Claude account home from scratch:
+#   account_home="$HOME/.local/share/agent-fleet/accounts/claude/<name>"
+#   install -d -m 700 "$account_home"
+#   CLAUDE_CONFIG_DIR="$account_home" "$HOME/.local/bin/claude" auth login
+#   bin/fm-account-directory.sh check-credential claude "$account_home"
+# Repair an existing home whose stale Keychain item has the wrong account
+# attribute by resetting only that literal config directory's service first:
+#   suffix="$(printf '%s' "$account_home" | shasum -a 256 | cut -c1-8)"
+#   service="Claude Code-credentials-$suffix"
+#   while security find-generic-password -s "$service" >/dev/null 2>&1; do
+#     security delete-generic-password -s "$service" >/dev/null || break
+#   done
+#   CLAUDE_CONFIG_DIR="$account_home" "$HOME/.local/bin/claude" auth login
+#   bin/fm-account-directory.sh check-credential claude "$account_home"
+#
 # Selection prints only the chosen absolute account home on stdout and logs
 # health, fallback, and choice diagnostics on stderr.
 # prepare selects the account, verifies a usable credential before endpoint
@@ -27,7 +78,7 @@
 # with CODEX_HOME or CLAUDE_CONFIG_DIR set to the chosen home.
 # Codex uses a cheap read-only auth.json credential-material check.
 # Claude has no sufficient on-disk credential marker on macOS, so it uses the
-# CLI's local `auth status --json` check, bounded to two seconds and never making
+# CLI's local `auth status --json` check, bounded to 15 seconds and never making
 # a model call.
 # A failed check names the selected account home and prints the exact scoped
 # provider login command a human can run.
@@ -42,7 +93,7 @@ set -u
 TEST_LAB_TOKEN=firstmate-account-directory-test-lab-v1
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//' >&2
 }
 
 log() {
@@ -164,6 +215,20 @@ quota_timeout_seconds() {
   printf '%s\n' "$timeout"
 }
 
+claude_auth_timeout_seconds() {
+  local timeout=15
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_CLAUDE_AUTH_TIMEOUT_SECONDS:-}" ]; then
+    timeout=$FM_ACCOUNT_DIRECTORY_CLAUDE_AUTH_TIMEOUT_SECONDS
+  fi
+  case "$timeout" in
+    ''|*[!0-9]*|0)
+      echo "error: Claude auth timeout must be a positive integer" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$timeout"
+}
+
 run_bounded() {
   local timeout=$1 perl_bin
   shift
@@ -217,8 +282,8 @@ valid_account_home() { # <vendor-dir> <candidate>
   esac
 }
 
-provider_binary() { # <vendor> <account-home>
-  local vendor=$1 account_home=$2 override manifest binary install_path home perl_bin
+provider_binary() { # <vendor> [account-home]
+  local vendor=$1 account_home=${2:-} override manifest binary install_path home perl_bin
   if test_lab_enabled; then
     case "$vendor" in
       claude) override=${FM_ACCOUNT_DIRECTORY_CLAUDE_BIN:-} ;;
@@ -234,6 +299,27 @@ provider_binary() { # <vendor> <account-home>
       return 0
     fi
   fi
+  home=$(passwd_home) || return 1
+  install_path=$home/.local/bin/$vendor
+  if [ "$vendor" = claude ]; then
+    case "$install_path" in
+      *$'\n'*|*$'\r'*)
+        echo "error: Claude launcher path contains a line break" >&2
+        return 1
+        ;;
+      /*) ;;
+      *)
+        echo "error: Claude launcher path must be absolute: $install_path" >&2
+        return 1
+        ;;
+    esac
+    [ -f "$install_path" ] && [ -x "$install_path" ] || {
+      echo "error: Claude's stable native launcher is not executable: $install_path" >&2
+      return 1
+    }
+    printf '%s\n' "$install_path"
+    return 0
+  fi
   manifest=$account_home/.agent-fleet-provider-binary.json
   if [ -f "$manifest" ] && [ ! -L "$manifest" ]; then
     binary=$(jq -er '.binary.resolved_path | select(type == "string" and startswith("/"))' "$manifest" 2>/dev/null) || binary=
@@ -242,8 +328,6 @@ provider_binary() { # <vendor> <account-home>
       return 0
     fi
   fi
-  home=$(passwd_home) || return 1
-  install_path=$home/.local/bin/$vendor
   perl_bin=$(system_perl) || return 1
   # shellcheck disable=SC2016 # Perl source is intentionally single-quoted.
   binary=$("$perl_bin" -MCwd=realpath -e '
@@ -286,12 +370,39 @@ check_codex_credential() { # <account-home>
   fi
 }
 
+fresh_claude_auth_json() { # <account-home> <provider-binary>
+  local account_home=$1 provider_bin=$2 timeout status environment_name
+  timeout=$(claude_auth_timeout_seconds) || return 1
+  (
+    while IFS='=' read -r environment_name _; do
+      case "$environment_name" in
+        ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|\
+        CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_OAUTH_REFRESH_TOKEN|\
+        CLAUDE_CODE_OAUTH_SCOPES|CLAUDE_CODE_USE_BEDROCK|\
+        CLAUDE_CODE_USE_FOUNDRY|CLAUDE_CODE_USE_VERTEX)
+          unset "$environment_name"
+          ;;
+      esac
+    done < <(/usr/bin/env)
+    CLAUDE_CONFIG_DIR=$account_home
+    export CLAUDE_CONFIG_DIR
+    if run_bounded "$timeout" "$provider_bin" auth status --json 2>/dev/null; then
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$status" -eq 124 ]; then
+      log "claude account $account_home unusable: auth check timed out after ${timeout}s"
+    fi
+    return "$status"
+  )
+}
+
 check_claude_credential() { # <account-home>
   local account_home=$1 provider_bin status_json login
   provider_bin=$(provider_binary claude "$account_home") || return 1
   login=$(credential_login_command claude "$account_home" "$provider_bin")
-  status_json=$(run_bounded 2 /usr/bin/env CLAUDE_CONFIG_DIR="$account_home" \
-    "$provider_bin" auth status --json 2>/dev/null) || status_json=
+  status_json=$(fresh_claude_auth_json "$account_home" "$provider_bin") || status_json=
   if ! jq -e '.loggedIn == true' >/dev/null 2>&1 <<EOF
 $status_json
 EOF
@@ -435,10 +546,25 @@ select_codex() {
 }
 
 select_claude() {
-  local selected
-  selected=$(first_account_home claude) || return 1
-  log "CLAUDE USAGE UNREADABLE: quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS Keychain credential today; selecting the first account directory by stable sort: $selected"
-  printf '%s\n' "$selected"
+  local root vendor_dir candidate
+  root=$(account_root) || return 1
+  vendor_dir=$root/claude
+  [ -d "$vendor_dir" ] && [ ! -L "$vendor_dir" ] || {
+    echo "error: no account-directory root for claude at $vendor_dir" >&2
+    return 1
+  }
+  LC_ALL=C
+  export LC_ALL
+  for candidate in "$vendor_dir"/*; do
+    valid_account_home "$vendor_dir" "$candidate" || continue
+    check_credential claude "$candidate" || continue
+    log "claude account $candidate usable: native subscription credential is readable"
+    log "CLAUDE USAGE UNREADABLE: authenticated account $candidate has no config-directory-specific quota read; selecting the first usable account by stable sort"
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  echo "error: no usable Claude account has a readable native subscription credential" >&2
+  return 1
 }
 
 select_account() { # <vendor>
@@ -500,6 +626,14 @@ case "${1:-}" in
   check-credential)
     [ "$#" -eq 3 ] || { usage; exit 2; }
     check_credential "$2" "$3"
+    ;;
+  provider-command)
+    [ "$#" -eq 2 ] || { usage; exit 2; }
+    [ "$2" = claude ] || {
+      echo "error: provider-command currently supports only claude, not '$2'" >&2
+      exit 1
+    }
+    provider_binary claude
     ;;
   install-herdr-hook)
     [ "$#" -eq 3 ] || { usage; exit 2; }

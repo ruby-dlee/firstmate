@@ -319,7 +319,7 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
           agent_state=$(fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
         fi
         case "$agent_state" in
-          dead|alive) last=present ;;
+          dead|alive|unknown) last=present ;;
           *) last=unknown ;;
         esac
         ;;

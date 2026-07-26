@@ -1598,6 +1598,30 @@ test_task_tmp_removal_refuses_symlinked_parent() {
   pass "task temp removal refuses a symlinked parent"
 }
 
+test_task_tmp_removal_pins_ancestors_during_swap() {
+  local id generation root state moved outside target name
+  id=account-tasktmp-swap-z9e
+  generation=spawn:a444444444444444
+  root="$TMP_ROOT/tasktmp-swap"
+  state="$root/state"
+  moved="$root/state-moved"
+  outside="$root/outside"
+  name="fm-$id-a444444444444444"
+  target="$state/.task-tmp/$name"
+  mkdir -p "$target/gotmp" "$outside/.task-tmp/$name/gotmp"
+  printf 'outside\n' > "$outside/.task-tmp/$name/gotmp/sentinel"
+  STATE=$state
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$state" \
+    FM_SAFE_TASK_TMP_SWAP_MOVED="$moved" \
+    FM_SAFE_TASK_TMP_SWAP_OUTSIDE="$outside" \
+    fm_account_safe_remove_task_tmp "$id" "$target" "$generation" \
+    || fail "task temp removal lost its pinned ancestor during swap"
+  assert_absent "$moved/.task-tmp/$name" "task temp removal missed its pinned original directory"
+  assert_present "$outside/.task-tmp/$name/gotmp/sentinel" "task temp removal followed a swapped ancestor"
+  pass "task temp removal pins every ancestor during deletion"
+}
+
 test_preinstall_managed_failure_restores_artifact_snapshot() {
   local id rec expected out status artifact
   id=account-preinstall-rollback-z9f
@@ -6511,6 +6535,7 @@ if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
   run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
   run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
   run_isolated_test test_task_tmp_removal_refuses_symlinked_parent
+  run_isolated_test test_task_tmp_removal_pins_ancestors_during_swap
   run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
   exit 0
 fi

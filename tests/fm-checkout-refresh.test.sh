@@ -325,13 +325,14 @@ test_uninspectable_active_project_invalidates_coverage_health() {
 }
 
 test_nested_active_project_invalidates_coverage_health() {
-  local container projects nested nested_state out status
+  local container projects nested nested_state treehouse out status
   container="$TMP_ROOT/active-project-container"
   fm_git_init_commit "$container"
   projects="$container/projects"
   nested="$projects/nested-directory"
   nested_state="$TMP_ROOT/nested-active-state"
-  mkdir -p "$nested" "$nested_state"
+  treehouse="$TMP_ROOT/nested-active-treehouse"
+  mkdir -p "$nested" "$nested_state" "$treehouse"
   printf '%s\n' preserved-nested-heartbeat > "$nested_state/heartbeat"
 
   set +e
@@ -339,7 +340,7 @@ test_nested_active_project_invalidates_coverage_health() {
     FM_PROJECTS_OVERRIDE="$projects" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$nested_state" \
     FM_CHECKOUT_REFRESH_LOCK_ROOT="$TMP_ROOT/nested-active-locks" \
-    FM_TREEHOUSE_ROOT="$TMP_ROOT/nested-active-treehouse" \
+    FM_TREEHOUSE_ROOT="$treehouse" \
     "$ROOT/bin/fm-checkout-refresh.sh" run-once --force 2>&1)
   status=$?
   set -e

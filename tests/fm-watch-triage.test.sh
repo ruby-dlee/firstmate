@@ -1444,7 +1444,8 @@ SH
   chmod +x "$sync_bin"
 
   set +e
-  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fake_root" FM_STATE_OVERRIDE="$state" \
+  env PATH="$fakebin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_STATE_OVERRIDE="$state" \
     FM_ACCOUNT_SESSION_SYNC_INTERVAL=0 FM_POLL=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 "$WATCH_CHECKPOINT" --seconds 8 > "$out" 2>&1
   status=$?

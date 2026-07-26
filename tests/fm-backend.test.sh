@@ -983,15 +983,24 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  get) printf '%s\n' "$wt" ;;
+esac
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
 run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> -- <spawn args...>
-  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7; shift 7
+  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7 sandbox_root; shift 7
   [ "${1:-}" = -- ] && shift
   : > "$log"
-  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
+  sandbox_root=$(cd "$TMP_ROOT" && pwd -P)
+  mkdir -p "$sandbox_root/home" "$sandbox_root/treehouse"
+  env PATH="$fb:$PATH" HOME="$sandbox_root/home" FM_TREEHOUSE_ROOT="$sandbox_root/treehouse" \
+    FM_ROOT_OVERRIDE="$bin" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
@@ -1053,7 +1062,13 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  get) printf '%s\n' "$wt" ;;
+esac
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -1065,7 +1080,8 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   proj="$link_root/proj"
   wt="$TMP_ROOT/symlink-wt-$label"
   id="spawnsymlink$label"
-  fm_git_worktree "$real_root/proj" "$wt" "fm/$id"
+  fm_git_init_commit "$real_root/proj"
+  git -C "$real_root/proj" worktree add --quiet --detach "$wt"
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
   # /var -> /private/var), so resolve the fakebin's "physical" reply with
   # pwd -P rather than string concatenation - it must match exactly what
@@ -1384,6 +1400,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
   test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn-symlinked-project ]; then
+  test_spawn_symlinked_project_prefix_avoids_false_refusal
   exit 0
 fi
 

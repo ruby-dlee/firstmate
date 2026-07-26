@@ -428,7 +428,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_PRIMARY_ROOT:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -458,11 +458,60 @@ run_spawn() {
 }
 
 run_teardown() {
+  local id=$1 slot pool state report
+  report="$HOME_DIR/data/$id/completion.md"
+  if [ ! -f "$report" ]; then
+    mkdir -p "$(dirname "$report")"
+    cat > "$report" <<'EOF'
+## Summary
+
+Test completion summary.
+## What changed
+
+Test completion changes.
+## Verification
+
+Test completion verification.
+## Visual evidence
+
+No visual evidence applies.
+## Artifacts
+
+Test completion artifacts.
+## Follow-ups
+
+No follow-ups remain.
+EOF
+  fi
+  slot=$(cd "$(dirname "$WT_DIR")" && pwd -P) || fail "could not resolve the Treehouse fixture slot"
+  pool=$(cd "$(dirname "$slot")" && pwd -P) || fail "could not resolve the Treehouse fixture pool"
+  state="$pool/treehouse-state.json"
+  python3 - "$state" "$(cd "$WT_DIR" && pwd -P)" "firstmate-$id" <<'PY'
+import json
+import sys
+
+state, path, holder = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": path,
+                    "leased": True,
+                    "lease_holder": holder,
+                }
+            ]
+        },
+        stream,
+    )
+PY
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
-    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_PATH="$WT_DIR" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
@@ -2042,13 +2091,26 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
+  local home=$1 id=$2 clone_head primary origin
+  origin="$CASE_DIR/firstmate-origin.git"
+  git clone -q --bare --no-hardlinks "$ROOT" "$origin" \
+    || fail "could not create firstmate fixture origin"
+  clone_head=$(git -C "$origin" rev-parse HEAD) || fail "could not resolve the firstmate fixture head"
+  git -C "$origin" update-ref refs/heads/main "$clone_head" \
+    || fail "could not seed the firstmate fixture default branch"
+  git -C "$origin" symbolic-ref HEAD refs/heads/main \
+    || fail "could not set the firstmate fixture default branch"
+  git clone -q --no-hardlinks "$origin" "$home" || fail "could not create secondmate fixture clone"
+  git -C "$home" checkout -q --detach \
+    || fail "could not detach the leased secondmate fixture"
+  primary="$CASE_DIR/primary-home"
+  git clone -q --no-hardlinks "$origin" "$primary" || fail "could not create primary fixture clone"
+  FM_TEST_PRIMARY_ROOT=$primary
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
-  cp "$ROOT/bin/fm-account-routing-lib.sh" "$home/bin/fm-account-routing-lib.sh"
-  cp "$ROOT/bin/fm-spawn.sh" "$home/bin/fm-spawn.sh"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
+  printf -- '- %s - test secondmate (home: %s; scope: test; projects: ; added 2026-07-26)\n' \
+    "$id" "$home" > "$HOME_DIR/data/secondmates.md"
 }
 
 test_secondmate_pool_is_nonactivating_and_noninherited() {
@@ -2138,6 +2200,7 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
   rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
@@ -2186,6 +2249,7 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
   rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"
@@ -3077,7 +3141,8 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
 }
 
 test_concurrent_continuations_serialize_before_mutation() {
-  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count second_lock_waiter
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
+  local held_lease_count held_endpoint_count
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
@@ -3095,21 +3160,21 @@ test_concurrent_continuations_serialize_before_mutation() {
     sleep 0.05
   done
   [ -f "$marker" ] || { kill "$first_pid" 2>/dev/null || true; fail "first continuation never reached endpoint creation"; }
+  held_lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
+  held_endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
   second_pid=$!
-  second_lock_waiter=
-  for _ in $(seq 1 100); do
-    second_lock_waiter=$(find "$HOME_DIR/state" -maxdepth 1 -type f \
-      -name ".account-lifecycle-$id.owner.*" -print -quit)
-    [ -n "$second_lock_waiter" ] && break
-    sleep 0.05
-  done
-  if [ -z "$second_lock_waiter" ]; then
+  sleep 1
+  if ! kill -0 "$second_pid" 2>/dev/null; then
     touch "$gate"
-    kill "$first_pid" "$second_pid" 2>/dev/null || true
-    fail "second continuation never waited behind the first lifecycle owner"
+    kill "$first_pid" 2>/dev/null || true
+    fail "second continuation did not remain blocked behind the first lifecycle owner: $(cat "$CASE_DIR/second.out")"
   fi
+  lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
+  endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
+  [ "$lease_count" -eq "$held_lease_count" ] || fail "blocked continuation mutated lease state"
+  [ "$endpoint_count" -eq "$held_endpoint_count" ] || fail "blocked continuation mutated endpoint state"
   touch "$gate"
   wait "$first_pid"
   first_rc=$?
@@ -3192,7 +3257,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_SLEEP=1 \
     run_teardown "$id" --force > "$CASE_DIR/teardown-stdout" 2> "$CASE_DIR/teardown-stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 100); do
     [ -f "$release_marker" ] && break
     sleep 0.1
   done

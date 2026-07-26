@@ -953,7 +953,6 @@ ORCA_TERMINAL=
 ORCA_TERMINAL_PROOF=
 ORCA_REPO_ID=
 ORCA_EXPECTED_TASK=
-ORCA_PROVIDER_TASK=
 ID=
 ACCOUNT_LEASE_CREATED=0
 FM_ACCOUNT_MUTATION_ACQUIRED=0
@@ -1044,7 +1043,6 @@ parse_orca_worktree_result() {
   rest=${rest#*$'\t'}
   ORCA_REPO_ID=$rest
   case "$ORCA_REPO_ID" in *$'\t'*) return 1 ;; esac
-  ORCA_PROVIDER_TASK=
 }
 
 persist_orca_cleanup_quarantine() {
@@ -3198,6 +3196,10 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
 fi
 AGENT_COMMAND=$HARNESS
 if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+  if [ "$HARNESS" = claude ]; then
+    direct_provider_command=$("$SCRIPT_DIR/fm-account-directory.sh" provider-command claude) || exit 1
+    AGENT_COMMAND=$(shell_quote "$direct_provider_command")
+  fi
   # herdr delivers the account directory NATIVELY, as `agent start --env KEY=VALUE`
   # (HERDR_AGENT_ENV below), instead of as a command-scoped shell prefix. Verified
   # before making the switch: no login profile on this machine sets CODEX_HOME or
@@ -3207,7 +3209,7 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
   case "$HARNESS:$BACKEND" in
     claude:herdr) HERDR_AGENT_ENV+=("CLAUDE_CONFIG_DIR=$DIRECT_ACCOUNT_HOME") ;;
     codex:herdr) HERDR_AGENT_ENV+=("CODEX_HOME=$DIRECT_ACCOUNT_HOME") ;;
-    claude:*) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+    claude:*) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $AGENT_COMMAND" ;;
     codex:*) AGENT_COMMAND="CODEX_HOME=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
   esac
 fi
@@ -3417,8 +3419,8 @@ EOF
         echo "error: cannot durably record Orca create authority for $ID" >&2
         exit 1
       }
-      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ] || [ "$ORCA_PROVIDER_TASK" != "$ORCA_EXPECTED_TASK" ]; then
-        echo "error: orca did not return matching worktree id, path, and task authority for $W" >&2
+      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
+        echo "error: orca did not return matching worktree id and path authority for $W" >&2
         exit 1
       fi
       validate_spawn_worktree "orca worktree create" "$W"

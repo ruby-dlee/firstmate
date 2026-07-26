@@ -11,6 +11,7 @@ ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
+CLAUDE_AUTH_LOG="$TMP_ROOT/claude-auth.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
 
 mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
@@ -79,12 +80,33 @@ fi
 SH
 chmod +x "$FAKEBIN/herdr"
 
+cat > "$FAKEBIN/claude" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = auth ] && [ "${2:-}" = status ] && [ "${3:-}" = --json ] || exit 64
+[ -n "${CLAUDE_CONFIG_DIR:-}" ] || exit 65
+case "${CLAUDE_CODE_OAUTH_TOKEN+x}${CLAUDE_CODE_OAUTH_REFRESH_TOKEN+x}${ANTHROPIC_API_KEY+x}${ANTHROPIC_AUTH_TOKEN+x}" in
+  '') ;;
+  *) exit 66 ;;
+esac
+printf '%s\n' "$CLAUDE_CONFIG_DIR" >> "$FM_FAKE_CLAUDE_AUTH_LOG"
+if [ -f "$CLAUDE_CONFIG_DIR/test-authenticated" ]; then
+  printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
+  exit 0
+fi
+printf '%s\n' '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}'
+exit 1
+SH
+chmod +x "$FAKEBIN/claude"
+
 run_selector() {
   FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
+    FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
     FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
     "$SELECTOR" "$@"
 }
 
@@ -93,6 +115,14 @@ set_remaining() {
   mkdir -p "$ACCOUNT_ROOT/codex/$account/.agent-fleet-quota-cache/quota-axi"
   printf '%s\n' "$remaining" > "$ACCOUNT_ROOT/codex/$account/test-remaining"
   printf '{"stale":true}\n' > "$ACCOUNT_ROOT/codex/$account/.agent-fleet-quota-cache/quota-axi/quotas.json"
+  printf '{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}\n' \
+    > "$ACCOUNT_ROOT/codex/$account/auth.json"
+}
+
+set_claude_authenticated() {
+  local account=$1
+  mkdir -p "$ACCOUNT_ROOT/claude/$account"
+  : > "$ACCOUNT_ROOT/claude/$account/test-authenticated"
 }
 
 reset_accounts() {
@@ -100,6 +130,7 @@ reset_accounts() {
   mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
   : > "$QUOTA_LOG"
   : > "$HERDR_LOG"
+  : > "$CLAUDE_AUTH_LOG"
 }
 
 test_codex_picks_highest_fresh_minimum_and_skips_no_window() {
@@ -163,18 +194,55 @@ test_codex_timeout_skips_wedged_account() {
   pass "Codex bounds each usage read and continues to later healthy accounts"
 }
 
-test_claude_uses_stable_first_without_treating_usage_as_health() {
+test_claude_selects_stable_first_usable_account_without_treating_usage_as_health() {
   local out err
   reset_accounts
-  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  set_claude_authenticated 2
+  set_claude_authenticated 3
   out=$(run_selector select claude 2>"$TMP_ROOT/claude-select.err")
   err=$(cat "$TMP_ROOT/claude-select.err")
-  [ "$out" = "$ACCOUNT_ROOT/claude/1" ] || fail "Claude fallback did not use stable bytewise directory order: $out"
+  [ "$out" = "$ACCOUNT_ROOT/claude/2" ] || fail "Claude selection did not choose the stable first usable account: $out"
+  assert_contains "$err" "selected claude account directory '$ACCOUNT_ROOT/claude/1' has no usable credential" \
+    "Claude selection did not reject the unreadable native credential"
+  assert_contains "$err" "claude account $ACCOUNT_ROOT/claude/2 usable" \
+    "Claude selection did not report the readable native credential"
   assert_contains "$err" "CLAUDE USAGE UNREADABLE" "Claude fallback did not carry the required obvious warning"
-  assert_contains "$err" "config-dir-specific macOS Keychain credential" \
-    "Claude fallback did not explain the keychain/quota-read gap"
+  assert_contains "$err" "first usable account by stable sort" \
+    "Claude fallback did not distinguish authentication health from unreadable quota"
   [ ! -s "$QUOTA_LOG" ] || fail "Claude fallback called quota-axi even though per-directory usage is known unreadable"
-  pass "Claude deterministically selects the first directory and explains why usage is not a health signal"
+  [ "$(wc -l < "$CLAUDE_AUTH_LOG" | tr -d ' ')" = 2 ] || fail "Claude selection did not stop after the first usable account"
+  pass "Claude deterministically selects the first usable account and keeps quota separate from auth health"
+}
+
+test_claude_fails_when_no_account_has_a_readable_native_credential() {
+  local out status
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/1" "$ACCOUNT_ROOT/claude/2"
+  if out=$(run_selector select claude 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  expect_code 1 "$status" "Claude selection with no usable native credential should fail closed"
+  assert_contains "$out" "no usable Claude account has a readable native subscription credential" \
+    "Claude all-unusable failure was not actionable"
+  pass "Claude refuses selection when every native subscription credential is unreadable"
+}
+
+test_claude_check_uses_exact_launcher_and_clears_ambient_credentials() {
+  local out
+  reset_accounts
+  set_claude_authenticated 1
+  out=$(CLAUDE_CODE_OAUTH_TOKEN=hostile CLAUDE_CODE_OAUTH_REFRESH_TOKEN=hostile \
+    ANTHROPIC_API_KEY=hostile ANTHROPIC_AUTH_TOKEN=hostile \
+    run_selector check-credential claude "$ACCOUNT_ROOT/claude/1" 2>&1) \
+    || fail "authoritative Claude check rejected a usable native credential: $out"
+  assert_grep "$ACCOUNT_ROOT/claude/1" "$CLAUDE_AUTH_LOG" \
+    "authoritative Claude check did not invoke the configured exact launcher"
+  [ "$(run_selector provider-command claude)" = "$FAKEBIN/claude" ] \
+    || fail "provider-command did not return the exact launcher used by the auth check"
+  pass "Claude's authoritative check uses the launch binary and ignores ambient credentials"
 }
 
 test_default_root_uses_passwd_home_not_ambient_home() {
@@ -183,19 +251,47 @@ test_default_root_uses_passwd_home_not_ambient_home() {
   hostile_home="$TMP_ROOT/hostile-home"
   expected="$passwd_home/.local/share/agent-fleet/accounts/claude/1"
   mkdir -p "$expected" "$hostile_home/.local/share/agent-fleet/accounts/claude/0"
+  : > "$expected/test-authenticated"
   out=$(HOME="$hostile_home" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_PASSWD_HOME="$passwd_home" \
+    FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
     "$SELECTOR" select claude 2>"$TMP_ROOT/passwd-home.err")
   [ "$out" = "$expected" ] || fail "ambient HOME redirected account discovery away from the passwd home: $out"
   pass "default account discovery ignores ambient HOME and stays under the passwd home"
+}
+
+test_claude_credential_check_ignores_stale_profile_binary_manifest() {
+  local account_home passwd_home stale_binary
+  reset_accounts
+  account_home="$ACCOUNT_ROOT/claude/1"
+  passwd_home="$TMP_ROOT/credential-passwd-home"
+  stale_binary="$TMP_ROOT/stale-claude"
+  set_claude_authenticated 1
+  mkdir -p "$passwd_home/.local/bin"
+  ln -s "$FAKEBIN/claude" "$passwd_home/.local/bin/claude"
+  printf '#!/usr/bin/env bash\nexit 70\n' > "$stale_binary"
+  chmod +x "$stale_binary"
+  printf '{"binary":{"resolved_path":"%s"}}\n' "$stale_binary" \
+    > "$account_home/.agent-fleet-provider-binary.json"
+
+  FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
+    FM_ACCOUNT_DIRECTORY_PASSWD_HOME="$passwd_home" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
+    "$SELECTOR" check-credential claude "$account_home" \
+    || fail "Claude credential check used a stale pinned binary instead of the stable launcher"
+  assert_grep "$account_home" "$CLAUDE_AUTH_LOG" \
+    "Claude credential check did not scope the current provider binary to the selected account"
+  pass "Claude credential preflight ignores stale versioned metadata and uses the upgrade-stable launcher"
 }
 
 test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   local codex_home claude_home
   reset_accounts
   set_remaining 1 90,80
-  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  set_claude_authenticated 1
 
   codex_home=$(run_selector prepare codex 2>"$TMP_ROOT/prepare-codex.err")
   claude_home=$(run_selector prepare claude 2>"$TMP_ROOT/prepare-claude.err")
@@ -204,6 +300,40 @@ test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   assert_grep $'codex\t'"$ACCOUNT_ROOT/codex/1" "$HERDR_LOG" "Herdr installer did not receive CODEX_HOME"
   assert_grep $'claude\t'"$ACCOUNT_ROOT/claude/1" "$HERDR_LOG" "Herdr installer did not receive CLAUDE_CONFIG_DIR"
   pass "prepare uses Herdr's own installer and verifies each selected profile hook"
+}
+
+test_prepare_rejects_missing_credentials_before_hook_install() {
+  local out status codex_home claude_home
+
+  reset_accounts
+  set_remaining 1 90,80
+  codex_home="$ACCOUNT_ROOT/codex/1"
+  rm -f "$codex_home/auth.json"
+  out=$(run_selector prepare codex 2>&1)
+  status=$?
+  expect_code 1 "$status" "Codex prepare without auth.json should fail closed"
+  assert_contains "$out" "selected codex account directory '$codex_home' has no usable on-disk credential" \
+    "Codex credential refusal omitted the selected account directory"
+  assert_contains "$out" "CODEX_HOME='$codex_home'" \
+    "Codex credential refusal omitted the exact scoped login command"
+  [ ! -s "$HERDR_LOG" ] || fail "Codex credential refusal still installed a Herdr hook"
+
+  reset_accounts
+  claude_home="$ACCOUNT_ROOT/claude/1"
+  mkdir -p "$claude_home"
+  out=$(run_selector prepare claude 2>&1)
+  status=$?
+  expect_code 1 "$status" "Claude prepare without a usable login should fail closed"
+  assert_contains "$out" "selected claude account directory '$claude_home' has no usable credential" \
+    "Claude credential refusal omitted the selected account directory"
+  assert_contains "$out" "CLAUDE_CONFIG_DIR='$claude_home'" \
+    "Claude credential refusal omitted the exact scoped login command"
+  assert_contains "$out" "auth login" \
+    "Claude credential refusal omitted the provider login command"
+  assert_grep "$claude_home" "$CLAUDE_AUTH_LOG" \
+    "Claude credential preflight did not query the selected config directory"
+  [ ! -s "$HERDR_LOG" ] || fail "Claude credential refusal still installed a Herdr hook"
+  pass "prepare refuses unauthenticated account directories before hook installation"
 }
 
 make_spawn_fakebin() {
@@ -299,7 +429,9 @@ run_direct_spawn() {
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
+    FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
     FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
     FM_AGENT_FLEET_BIN="$FAKEBIN/forbidden-agent-fleet" \
     FM_FAKE_AGENT_FLEET_LOG="$TMP_ROOT/agent-fleet.log" \
     "$ROOT/bin/fm-spawn.sh" "$@"
@@ -357,11 +489,12 @@ test_spawn_uses_direct_codex_home_without_agent_fleet() {
   pass "new enforced Codex spawn uses CODEX_HOME and never enters Agent Fleet"
 }
 
-test_spawn_uses_direct_claude_fallback_and_hook() {
+test_spawn_uses_direct_claude_launcher_and_hook() {
   local record id out launch meta
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
-  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mkdir -p "$ACCOUNT_ROOT/claude/2"
+  set_claude_authenticated 1
   id=direct-claude-z2
   record=$(make_spawn_case direct-claude claude "$id")
   read_spawn_case "$record"
@@ -371,12 +504,33 @@ test_spawn_uses_direct_claude_fallback_and_hook() {
   launch=$(cat "$SPAWN_LAUNCH_LOG")
   meta=$SPAWN_HOME/state/$id.meta
   assert_contains "$out" "CLAUDE USAGE UNREADABLE" "spawn hid the required Claude quota-read warning"
-  assert_contains "$launch" "CLAUDE_CONFIG_DIR='$ACCOUNT_ROOT/claude/1' claude" \
-    "spawn did not scope Claude to the deterministic first account home"
+  assert_contains "$launch" "CLAUDE_CONFIG_DIR='$ACCOUNT_ROOT/claude/1' '$FAKEBIN/claude'" \
+    "spawn did not scope the exact checked Claude launcher to the selected account home"
   assert_grep "account_home=$ACCOUNT_ROOT/claude/1" "$meta" "Claude spawn metadata omitted account_home"
   [ -f "$ACCOUNT_ROOT/claude/1/hooks/herdr-agent-state.sh" ] || fail "Claude spawn did not install its per-account Herdr hook"
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "new direct Claude spawn invoked Agent Fleet"
-  pass "new account-flagged Claude spawn uses deterministic CLAUDE_CONFIG_DIR with an explicit warning"
+  pass "new account-flagged Claude spawn uses the exact checked launcher and deterministic account home"
+}
+
+test_spawn_refuses_unauthenticated_account_before_endpoint_creation() {
+  local record id out status
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  id=direct-claude-unauth-z2a
+  record=$(make_spawn_case direct-claude-unauth claude "$id")
+  read_spawn_case "$record"
+
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-claude-pool 2>&1)
+  status=$?
+  expect_code 1 "$status" "unauthenticated direct Claude spawn should fail closed"
+  assert_contains "$out" "selected claude account directory '$ACCOUNT_ROOT/claude/1' has no usable credential" \
+    "spawn credential refusal omitted the selected account directory"
+  assert_contains "$out" "auth login" "spawn credential refusal omitted the exact login command"
+  assert_absent "$SPAWN_HOME/state/.fake-endpoint" \
+    "unauthenticated direct Claude spawn created an endpoint"
+  [ ! -s "$SPAWN_LAUNCH_LOG" ] || fail "unauthenticated direct Claude spawn typed a launch command"
+  pass "fm-spawn refuses an unauthenticated direct account before endpoint creation"
 }
 
 test_observe_spawn_uses_direct_directory_without_agent_fleet() {
@@ -954,15 +1108,28 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = credential-preflight ]; then
+  test_claude_credential_check_ignores_stale_profile_binary_manifest
+  test_prepare_installs_and_verifies_per_account_herdr_hooks
+  test_prepare_rejects_missing_credentials_before_hook_install
+  test_spawn_refuses_unauthenticated_account_before_endpoint_creation
+  exit 0
+fi
+
 test_codex_picks_highest_fresh_minimum_and_skips_no_window
 test_codex_rechecks_health_on_every_selection
 test_codex_fails_when_no_account_has_a_fresh_window
 test_codex_timeout_skips_wedged_account
-test_claude_uses_stable_first_without_treating_usage_as_health
+test_claude_selects_stable_first_usable_account_without_treating_usage_as_health
+test_claude_fails_when_no_account_has_a_readable_native_credential
+test_claude_check_uses_exact_launcher_and_clears_ambient_credentials
 test_default_root_uses_passwd_home_not_ambient_home
+test_claude_credential_check_ignores_stale_profile_binary_manifest
 test_prepare_installs_and_verifies_per_account_herdr_hooks
+test_prepare_rejects_missing_credentials_before_hook_install
 test_spawn_uses_direct_codex_home_without_agent_fleet
-test_spawn_uses_direct_claude_fallback_and_hook
+test_spawn_uses_direct_claude_launcher_and_hook
+test_spawn_refuses_unauthenticated_account_before_endpoint_creation
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context

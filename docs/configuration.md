@@ -173,12 +173,14 @@ The selected provider command receives `CLAUDE_CONFIG_DIR=<home>` or `CODEX_HOME
 New ship/scout launches never ask Agent Fleet to enable a profile, establish identity, install a bundle, or acquire a lease.
 They invoke Herdr's own integration installer against the selected profile directory and verify its per-profile hook file before launching.
 Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates, logs in, or invokes a model.
+Before installing that hook or creating an endpoint, the selected directory must pass `fm-account-directory.sh check-credential`; the script header owns the exact usability definition and macOS Claude credential mechanism.
+Failure names the selected directory and prints the exact provider-scoped login command for a human.
 
 Codex health and usage are genuinely readable per account.
 Every selection performs a fresh per-account quota read instead of trusting a prior cache, and a Codex directory with no fresh general usage window is skipped.
 This means an account re-authenticated immediately before spawn is eligible on that spawn.
 Claude's config-directory-specific macOS Keychain credential is not currently distinguishable through non-interactive quota reads.
-Claude therefore treats missing quota as unreadable rather than unhealthy, chooses the first real profile directory in stable sort order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
+Claude therefore skips directories that fail the authoritative credential check, treats missing quota as unreadable rather than unhealthy, chooses the first usable profile directory in stable sort order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining the quota-read gap.
 
 Account routing remains default-off.
 An unchanged installation does not select an account directory, does not alter the provider launch, and adds no account field to task metadata.

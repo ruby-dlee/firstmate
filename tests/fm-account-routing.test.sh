@@ -2043,12 +2043,15 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 
 make_seeded_secondmate_home() {
   local home=$1 id=$2
+  git clone -q --no-hardlinks "$ROOT" "$home" || fail "could not create secondmate fixture clone"
+  git -C "$home" remote set-head origin main \
+    || fail "could not set the secondmate fixture default branch"
+  git -C "$home" checkout -q main || fail "could not align secondmate fixture to the default branch"
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
-  cp "$ROOT/bin/fm-account-routing-lib.sh" "$home/bin/fm-account-routing-lib.sh"
-  cp "$ROOT/bin/fm-spawn.sh" "$home/bin/fm-spawn.sh"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
+  printf -- '- %s - test secondmate (home: %s; scope: test; projects: ; added 2026-07-26)\n' \
+    "$id" "$home" > "$HOME_DIR/data/secondmates.md"
 }
 
 test_secondmate_pool_is_nonactivating_and_noninherited() {
@@ -2138,6 +2141,7 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
   rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
@@ -2186,6 +2190,7 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
   rm -f "$sm/bin/fm-account-routing-lib.sh"
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "off secondmate did not preserve warn-and-launch behavior: $out"

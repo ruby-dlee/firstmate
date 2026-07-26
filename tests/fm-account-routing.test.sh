@@ -5810,6 +5810,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
 
   clear_case_logs
+  write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"
   assert_grep "lease release --task $old_task" "$AF_LOG" "fresh teardown did not release the restored predecessor"
   pass "teardown stops and revalidates after rollback restores predecessor state"
@@ -5996,6 +5997,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tail-safety ]; then
   run_isolated_test test_unsuccessful_recovery_mutation_is_retried
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
   run_isolated_test test_account_timeout_wrapper_uses_hard_kill_fallback
+  run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = teardown-restore ]; then
   run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
   exit 0
 fi

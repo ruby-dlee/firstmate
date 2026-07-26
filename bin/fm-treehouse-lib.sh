@@ -113,12 +113,27 @@ fm_treehouse_prove_task_lease_absent() {  # <recorded-worktree> <expected-holder
   [ -f "$state" ] && [ ! -L "$state" ] || return 1
   python3 - "$state" "$expected_holder" <<'PY'
 import json
+import os
 import sys
 
 state_path, expected_holder = sys.argv[1:]
 try:
     with open(state_path, encoding="utf-8") as stream:
         state = json.load(stream)
+except OSError as error:
+    print(
+        f"error: Treehouse lease absence for {expected_holder} is unprovable: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+except json.JSONDecodeError as error:
+    print(
+        f"error: authoritative Treehouse lease state is corrupt: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+try:
     worktrees = state["worktrees"]
     if not isinstance(worktrees, list):
         raise TypeError("worktrees must be an array")
@@ -129,13 +144,30 @@ try:
         holder = entry.get("lease_holder")
         if not isinstance(leased, bool):
             raise TypeError("leased must be a boolean")
-        if leased and holder == expected_holder:
-            raise ValueError("matching Treehouse lease still exists")
-except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        if leased:
+            path = entry.get("path")
+            if (
+                not isinstance(path, str)
+                or not path.strip()
+                or "\0" in path
+                or not os.path.isabs(path)
+            ):
+                raise TypeError("leased worktree path must be a non-empty absolute string")
+            if not isinstance(holder, str) or not holder.strip():
+                raise TypeError("leased worktree holder must be a non-empty string")
+            if holder == expected_holder:
+                raise ValueError("matching Treehouse lease still exists")
+except ValueError as error:
     print(
         f"error: Treehouse lease absence for {expected_holder} is unprovable: {error}",
         file=sys.stderr,
     )
     raise SystemExit(1)
+except (TypeError, KeyError) as error:
+    print(
+        f"error: authoritative Treehouse lease state is corrupt: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 PY
 }

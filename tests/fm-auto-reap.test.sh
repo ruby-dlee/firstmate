@@ -272,6 +272,40 @@ test_unregistered_treehouse_lease_retains_acquisition_authority() {
   pass "unregistered Treehouse leases retain acquisition authority visibly"
 }
 
+test_malformed_treehouse_leases_retain_acquisition_authority() {
+  local defect fixture project worktree record out rc log id
+  for defect in holder path; do
+    reset_logs
+    id="malformed-$defect"
+    fixture=$(make_treehouse_fixture "$id")
+    project=${fixture%%$'\t'*}
+    worktree=${fixture#*$'\t'}
+    write_dead_acquisition "$id" "$project" "$worktree" direct
+    record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+    git -C "$project" worktree remove --force "$worktree"
+    python3 - "$(dirname "$(dirname "$worktree")")/treehouse-state.json" "$defect" <<'PY'
+import json
+import sys
+
+state_path, defect = sys.argv[1:]
+with open(state_path, encoding="utf-8") as stream:
+    state = json.load(stream)
+state["worktrees"][0]["lease_holder" if defect == "holder" else "path"] = None
+with open(state_path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+    out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+    expect_code 0 "$rc" "malformed Treehouse $defect maintenance"
+    assert_contains "$out" "CORRUPT authoritative Treehouse lease state" "malformed $defect diagnostic"
+    [ -f "$record" ] || fail "malformed Treehouse $defect removed acquisition authority"
+    [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "malformed Treehouse $defect invoked teardown"
+    log=$(cat "$HOME_DIR/state/.auto-reap.log")
+    assert_contains "$log" "CORRUPT authoritative Treehouse lease state retained owner-dead acquisition $id" "malformed $defect log"
+    rm -f "$record"
+  done
+  pass "malformed Treehouse holders and paths retain acquisition authority visibly"
+}
+
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
   local fake_root watch_home state calls out check pid i
   fake_root="$TMP/watch-root"
@@ -369,6 +403,7 @@ test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown
 test_unregistered_treehouse_lease_retains_acquisition_authority
+test_malformed_treehouse_leases_retain_acquisition_authority
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap
 test_local_merge_immediately_auto_reaps
 

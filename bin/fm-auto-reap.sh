@@ -274,7 +274,7 @@ path_age() {
 }
 
 recover_acquisition() {  # <record>
-  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status
+  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
   [ "$(path_age "$record")" -ge "$AUTO_REAP_STALE_SECS" ] || return 0
   AUTO_REAP_ID=${record##*/.worktree-acquire-}
@@ -342,6 +342,11 @@ recover_acquisition() {  # <record>
     fi
     if [ "$find_status" -eq 2 ]; then
       if fm_treehouse_prove_task_lease_absent "$recorded_worktree" "$holder" >/dev/null 2>&1; then
+        absence_status=0
+      else
+        absence_status=$?
+      fi
+      if [ "$absence_status" -eq 0 ]; then
         rm -f "$record"
         fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
         log_result "cleared owner-dead acquisition $id after proving it owns no Treehouse lease"
@@ -349,6 +354,11 @@ recover_acquisition() {  # <record>
         return 0
       fi
       fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      if [ "$absence_status" -eq 2 ]; then
+        log_result "CORRUPT authoritative Treehouse lease state retained owner-dead acquisition $id"
+        refuse "CORRUPT authoritative Treehouse lease state; retained stale acquisition" || true
+        return 0
+      fi
       log_result "retained owner-dead acquisition $id because Treehouse lease absence could not be proven"
       refuse "retained stale acquisition because Treehouse lease absence could not be proven" || true
       return 0

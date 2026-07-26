@@ -876,26 +876,15 @@ handle_push_transition() {  # <backend> <session> <record>
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
   if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    case "$(pause_state_class "$window" "$task")" in
-      paused)
-        # The native Herdr edge used to exempt paused lanes here without entering
-        # the shared stale-pause handler. That left no .paused-<key> marker and
-        # bypassed the bounded re-surface cadence entirely. Commit the handled
-        # edge, then use the same durable pause path as polling.
-        key=$(printf '%s' "$window" | tr ':/.' '___')
-        h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
-        fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-        handle_paused_stale "$window" "$task" "$h"
-        triage_log "absorbed push $to (declared pause, awaiting external): $window"
-        return
-        ;;
-      working)
-        clear_pause_state "$window"
-        ;;
-      *)
-        clear_pause_tracking "$window"
-        ;;
-    esac
+    # The durable status is the trusted gate on this native edge. Commit the
+    # handled transition, then enter the shared pause path so it owns the marker
+    # and bounded re-surface cadence even when no auxiliary crew-state read exists.
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
+    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+    handle_paused_stale "$window" "$task" "$h"
+    triage_log "absorbed push $to (declared pause, awaiting external): $window"
+    return
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || exit 1

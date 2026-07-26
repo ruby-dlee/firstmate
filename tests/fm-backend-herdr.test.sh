@@ -1191,7 +1191,7 @@ SH
 }
 
 test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart() {
-  local dir fb fake source ps_fake case_dir lock_root running pids state log mutation old_pid new_pid out status
+  local dir fb fake source ps_fake default_fleet default_before default_after case_dir lock_root running pids state log mutation old_pid new_pid out status
   # This fixture exercises the legacy certified-lifecycle lab path retained
   # behind FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE:
   # - release-drifted means the running process has a valid adapter-owned
@@ -1205,7 +1205,11 @@ test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart()
   fb="$dir/fakebin"
   fake="$fb/herdr"
   source="$dir/fm-herdr-worker-shell"
+  default_fleet="$dir/default-fleet"
   mkdir -p "$fb"
+  printf '%s\n' '{"workspaces":[{"workspace_id":"captain","tabs":["captain:t1"],"panes":["captain:p1"]}]}' \
+    > "$default_fleet"
+  default_before=$(cat "$default_fleet")
   cp "$ROOT/bin/fm-herdr-worker-shell" "$source"
   chmod 755 "$source"
   ps_fake="$dir/fake-ps"
@@ -1248,7 +1252,7 @@ case "${1:-} ${2:-}" in
   "server --session")
     printf '%s\n' "$$" >> "${FM_FAKE_HERDR_SERVER_PIDS:?}"
     : > "$FM_FAKE_HERDR_RUNNING"
-    exec /bin/sleep 30
+    exec /bin/sleep 120
     ;;
   "workspace create")
     : > "${FM_FAKE_HERDR_MUTATION:?}"
@@ -1284,21 +1288,22 @@ SH
   chmod 700 "$lock_root"
   printf 'empty\n' > "$state"
   : > "$log"
-  /bin/sleep 30 & old_pid=$!
+  /bin/sleep 120 & old_pid=$!
   printf '%s\n' "$old_pid" > "$pids"
   : > "$running"
-  write_legacy_certificate default || fail "could not establish legacy adapter ownership for empty restart"
+  write_legacy_certificate fm-empty \
+    || fail "could not establish legacy adapter ownership for empty restart"
   if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
     FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
     FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
-    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 \
+    FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 HERDR_SESSION=fm-empty \
     /bin/bash --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
-      fm_backend_herdr_server_ensure default || exit 1
-      fm_backend_herdr_server_closed_shell_environment_ready default
+      fm_backend_herdr_server_ensure fm-empty || exit 1
+      fm_backend_herdr_server_closed_shell_environment_ready fm-empty
     ' "$ROOT" 2>&1); then status=0; else status=$?; fi
   if [ "$status" -ne 0 ]; then
     printf '%s\n' "$out" >&2
@@ -1312,8 +1317,8 @@ SH
   if [ "$new_pid" = "$old_pid" ] || ! kill -0 "$new_pid" 2>/dev/null; then
     fail "exact-empty restart did not leave one newly certified server alive"
   fi
-  assert_grep $'\x1fsession\x1fstop\x1fdefault\x1f--json\x1f--session\x1fdefault' "$log" \
-    "empty drift restart did not use the positional exact-default session stop"
+  assert_grep $'\x1fsession\x1fstop\x1ffm-empty\x1f--json\x1f--session\x1ffm-empty' "$log" \
+    "empty drift restart did not use the positional exact lab session stop"
   assert_no_grep $'\x1fserver\x1fstop' "$log" \
     "empty drift restart used a generic server stop"
   assert_no_grep $'\x1fsession\x1fdelete' "$log" \
@@ -1332,7 +1337,7 @@ SH
   chmod 700 "$lock_root"
   printf 'occupied\n' > "$state"
   : > "$log"
-  /bin/sleep 30 & old_pid=$!
+  /bin/sleep 120 & old_pid=$!
   printf '%s\n' "$old_pid" > "$pids"
   : > "$running"
   write_legacy_certificate fm-occupied \
@@ -1378,7 +1383,7 @@ SH
   chmod 700 "$lock_root"
   printf 'indeterminate\n' > "$state"
   : > "$log"
-  /bin/sleep 30 & old_pid=$!
+  /bin/sleep 120 & old_pid=$!
   printf '%s\n' "$old_pid" > "$pids"
   : > "$running"
   write_legacy_certificate fm-indeterminate \
@@ -1407,6 +1412,16 @@ SH
   [ ! -e "$mutation" ] || fail "indeterminate drift refusal reached workspace creation"
   kill "$old_pid" 2>/dev/null || true
   wait "$old_pid" >/dev/null 2>&1 || true
+
+  default_after=$(cat "$default_fleet")
+  [ "$default_after" = "$default_before" ] \
+    || fail "certified lifecycle validation changed the default fleet state"
+  assert_no_grep 'HERDR_SESSION=default' "$dir/empty/log" \
+    "empty lifecycle validation addressed the default Herdr session"
+  assert_no_grep 'HERDR_SESSION=default' "$dir/occupied/log" \
+    "occupied lifecycle validation addressed the default Herdr session"
+  assert_no_grep 'HERDR_SESSION=default' "$dir/indeterminate/log" \
+    "indeterminate lifecycle validation addressed the default Herdr session"
 
   pass "server ensure serializes certificate drift: exact-empty restarts, occupied routes without restart, and indeterminate refuses"
 }

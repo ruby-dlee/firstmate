@@ -580,7 +580,7 @@ use_named_fake_tmux_target() {
 }
 
 test_off_is_byte_compatible_and_never_calls_agent_fleet() {
-  local id rec out status launch expected task_tmp
+  local id rec out status launch expected task_tmp generation token
   id=account-off-z1
   rec=$(make_case off claude "$id")
   read_case "$rec"
@@ -594,8 +594,10 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "routing off wrote account metadata"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "routing off wrote session metadata"
   task_tmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
-  [ "$task_tmp" = "$HOME_DIR/state/.task-tmp/fm-$id" ] \
-    || fail "routing fixture did not namespace its task temp root to this test run"
+  generation=$(sed -n 's/^generation_id=//p' "$HOME_DIR/state/$id.meta")
+  token=${generation##*:}
+  [ "$task_tmp" = "$HOME_DIR/state/.task-tmp/fm-$id-$token" ] \
+    || fail "routing fixture did not namespace its task temp root to this spawn generation"
   assert_present "$task_tmp/gotmp" \
     "routing fixture did not create its run-scoped Go temp root"
   assert_regex '^generation_id=spawn:a[0-9a-f]{15}$' "$HOME_DIR/state/$id.meta" "routing off did not record a stable spawn generation"

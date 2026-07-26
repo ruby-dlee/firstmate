@@ -236,7 +236,34 @@ fm_account_real_directory() {
   [ -d "$1" ] && [ ! -L "$1" ]
 }
 
-fm_account_task_tmp_path() {  # <task-id>
+fm_account_task_tmp_path() {  # <task-id> <generation-id>
+  local task=$1 generation=$2 token state
+  fm_account_valid_id "$task" || return 1
+  case "$generation" in
+    spawn:*|account:*)
+      token=${generation##*:}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  fm_account_valid_id "$token" || return 1
+  if [ -n "${STATE:-}" ]; then
+    state=$STATE
+  elif [ -n "${FM_STATE_OVERRIDE:-}" ]; then
+    state=$FM_STATE_OVERRIDE
+  elif [ -n "${FM_HOME:-}" ]; then
+    state=$FM_HOME/state
+  else
+    return 1
+  fi
+  fm_account_real_directory "$state" || return 1
+  state=$(cd "$state" 2>/dev/null && pwd -P) || return 1
+  [ "$state" != / ] || return 1
+  printf '%s/.task-tmp/fm-%s-%s\n' "${state%/}" "$task" "$token"
+}
+
+fm_account_previous_task_tmp_path() {  # <task-id>
   local task=$1 state
   fm_account_valid_id "$task" || return 1
   if [ -n "${STATE:-}" ]; then
@@ -251,9 +278,6 @@ fm_account_task_tmp_path() {  # <task-id>
   fm_account_real_directory "$state" || return 1
   state=$(cd "$state" 2>/dev/null && pwd -P) || return 1
   [ "$state" != / ] || return 1
-  # The physical task-state directory is the run identity. Nesting the temp
-  # root under it prevents cross-home and cross-test collisions, and makes a
-  # suite's ordinary run-root cleanup own task temp even after an early abort.
   printf '%s/.task-tmp/fm-%s\n' "${state%/}" "$task"
 }
 
@@ -262,10 +286,16 @@ fm_account_legacy_task_tmp_path() {  # <task-id>
   printf '/tmp/fm-%s\n' "$1"
 }
 
-fm_account_task_tmp_is_current() {  # <task-id> <path>
+fm_account_task_tmp_is_current() {  # <task-id> <path> <generation-id>
   local expected
-  expected=$(fm_account_task_tmp_path "$1") || return 1
+  expected=$(fm_account_task_tmp_path "$1" "$3") || return 1
   [ "$2" = "$expected" ]
+}
+
+fm_account_task_tmp_is_previous() {  # <task-id> <path>
+  local previous
+  previous=$(fm_account_previous_task_tmp_path "$1") || return 1
+  [ "$2" = "$previous" ]
 }
 
 fm_account_task_tmp_is_legacy() {  # <task-id> <path>
@@ -274,10 +304,11 @@ fm_account_task_tmp_is_legacy() {  # <task-id> <path>
   [ "$2" = "$legacy" ]
 }
 
-fm_account_task_tmp_is_expected() {  # <task-id> <path>
+fm_account_task_tmp_is_expected() {  # <task-id> <path> <generation-id>
   # Legacy metadata remains recognizable, but callers must use
   # fm_account_task_tmp_is_current before any filesystem mutation.
-  fm_account_task_tmp_is_current "$1" "$2" \
+  fm_account_task_tmp_is_current "$1" "$2" "$3" \
+    || fm_account_task_tmp_is_previous "$1" "$2" \
     || fm_account_task_tmp_is_legacy "$1" "$2"
 }
 
@@ -1240,7 +1271,7 @@ fm_account_meta_value() {  # <meta> <key>
 }
 
 fm_account_restore_artifacts() {
-  local state=$1 task=$2 backup_name=$3 tasktmp=${4:-} retain=${5:-0} backup name source
+  local state=$1 task=$2 backup_name=$3 tasktmp=${4:-} retain=${5:-0} generation=${6:-} backup name source
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   [ -n "$backup_name" ] || return 0
   case "$backup_name" in
@@ -1258,7 +1289,8 @@ fm_account_restore_artifacts() {
     fi
   done
   if [ -n "$tasktmp" ]; then
-    if fm_account_task_tmp_is_current "$task" "$tasktmp"; then
+    if fm_account_task_tmp_is_current "$task" "$tasktmp" "$generation" \
+      || fm_account_task_tmp_is_previous "$task" "$tasktmp"; then
       if [ -e "$backup/tasktmp-existed" ]; then
         [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
       else
@@ -1339,7 +1371,7 @@ fm_account_cleanup_rollback() {  # <meta> <data-dir> <task>
   if [ "$preserve" != 1 ]; then
     fm_account_session_remove "$account_task" || return 1
   fi
-  fm_account_restore_artifacts "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DIRNAME_BIN" "$meta")" "$task" "$artifacts_name" "$tasktmp" 1 || return 1
+  fm_account_restore_artifacts "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DIRNAME_BIN" "$meta")" "$task" "$artifacts_name" "$tasktmp" 1 "$(fm_account_meta_value "$meta" generation_id)" || return 1
   lock=$(fm_account_meta_lock_acquire "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DIRNAME_BIN" "$meta")" "$task") || return 1
   if [ ! -f "$meta" ] \
     || [ "$(fm_account_meta_value "$meta" account_task)" != "$account_task" ] \

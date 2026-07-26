@@ -126,11 +126,6 @@ case "$TEARDOWN_UPSTREAM_TIMEOUT" in
 esac
 ID=$1
 FORCE=${2:-}
-fm_account_task_tmp_path "$ID" >/dev/null || {
-  echo "error: cannot establish a safe task temp path for $ID" >&2
-  exit 1
-}
-
 META="$STATE/$ID.meta"
 
 require_safe_task_metadata() {
@@ -210,7 +205,8 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root;
 # absent for tasks spawned before that change, so tolerate empty.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP"; then
+TASK_GENERATION=$(grep '^generation_id=' "$META" | cut -d= -f2- || true)
+if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP" "$TASK_GENERATION"; then
   echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
   exit 1
 fi
@@ -1831,12 +1827,14 @@ safe_rm_rf_child_worktree() {
 safe_remove_task_tmp() {
   local target=$1 base legacy
   [ -n "$target" ] || return 0
-  fm_account_task_tmp_is_expected "$ID" "$target" || return 1
+  fm_account_task_tmp_is_expected "$ID" "$target" "$TASK_GENERATION" || return 1
   legacy=$(fm_account_legacy_task_tmp_path "$ID") || return 1
   # Legacy compatibility is classification-only. Never inspect or mutate the
   # old process-wide /tmp/fm-<id> location from a current teardown.
   [ "$target" != "$legacy" ] || return 0
-  fm_account_task_tmp_is_current "$ID" "$target" || return 1
+  fm_account_task_tmp_is_current "$ID" "$target" "$TASK_GENERATION" \
+    || fm_account_task_tmp_is_previous "$ID" "$target" \
+    || return 1
   [ -e "$target" ] || [ -L "$target" ] || return 0
   base=${target%/*}
   base=$(python3 - "$base" <<'PY'
@@ -4190,7 +4188,7 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     exit 1
   }
   direct_spawn_restore_lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-  if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 \
+  if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 "$TASK_GENERATION" \
     || ! fm_account_meta_merge_extensions "$META" "$direct_spawn_backup_path" \
     || ! fm_account_safe_file_destination "$META" \
     || ! mv "$direct_spawn_backup_path" "$META"; then

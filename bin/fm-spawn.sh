@@ -602,7 +602,7 @@ reconcile_failed_direct_recovery() {
     echo "error: retained direct recovery artifacts are missing or unsafe for $task" >&2
     return 1
   fi
-  if ! fm_account_task_tmp_is_expected "$task" "$tasktmp" \
+  if ! fm_account_task_tmp_is_expected "$task" "$tasktmp" "$generation" \
     || [ -z "$generation" ] || [ -z "$target" ]; then
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     echo "error: retained direct recovery metadata is incomplete for $task" >&2
@@ -640,7 +640,7 @@ reconcile_failed_direct_recovery() {
     echo "error: retained direct recovery generation changed before cleanup for $task" >&2
     return 1
   fi
-  if ! fm_account_restore_artifacts "$STATE" "$task" "$artifacts_name" "$tasktmp" 1; then
+  if ! fm_account_restore_artifacts "$STATE" "$task" "$artifacts_name" "$tasktmp" 1 "$generation"; then
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     echo "error: retained direct recovery artifacts could not be restored for $task" >&2
     return 1
@@ -865,10 +865,11 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_tab=$(fm_account_meta_value "$RESUME_META" zellij_tab_id)
     rollback_home=$(fm_account_meta_value "$RESUME_META" home)
     rollback_tasktmp=$(fm_account_meta_value "$RESUME_META" tasktmp)
+    rollback_generation=$(fm_account_meta_value "$RESUME_META" generation_id)
     rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
     fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
     rollback_meta_lock=
-    if [ -n "$rollback_tasktmp" ] && ! fm_account_task_tmp_is_expected "$rollback_id" "$rollback_tasktmp"; then
+    if [ -n "$rollback_tasktmp" ] && ! fm_account_task_tmp_is_expected "$rollback_id" "$rollback_tasktmp" "$rollback_generation"; then
       echo "error: unsafe task temp path in rollback metadata for $rollback_id: $rollback_tasktmp" >&2
       exit 1
     fi
@@ -894,9 +895,11 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_profile=$(fm_account_meta_value "$RESUME_META" account_profile)
     if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ] && [ -z "$rollback_backup" ]; then
       rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
-      [ -z "$rollback_tasktmp" ] \
-        || ! fm_account_task_tmp_is_current "$rollback_id" "$rollback_tasktmp" \
-        || rm -rf "$rollback_tasktmp"
+      if [ -n "$rollback_tasktmp" ] \
+        && { fm_account_task_tmp_is_current "$rollback_id" "$rollback_tasktmp" "$rollback_generation" \
+          || fm_account_task_tmp_is_previous "$rollback_id" "$rollback_tasktmp"; }; then
+        rm -rf "$rollback_tasktmp"
+      fi
     fi
     if [ -z "$rollback_profile" ]; then
       if [ -n "$rollback_backup" ]; then
@@ -1467,7 +1470,7 @@ spawn_restore_unmanaged_state_locked() {
   [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] || return 0
   if [ -n "$EXISTING_ARTIFACT_BACKUP" ]; then
     artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-    fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "$SPAWN_TASK_TMP" 1 || return 1
+    fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "$SPAWN_TASK_TMP" 1 "$SPAWN_GENERATION_ID" || return 1
   fi
   if [ -n "$META_BACKUP" ]; then
     [ -f "$META_BACKUP" ] && [ -f "$meta" ] || return 1
@@ -1639,7 +1642,7 @@ spawn_abort_cleanup() {
     fi
     if [ -n "$rollback_lock" ]; then
       artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-      if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1; then
+      if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 "$SPAWN_GENERATION_ID"; then
         if [ "$META_INSTALLED" = 1 ] && [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
           if fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
             && fm_account_safe_file_destination "$STATE/$ID.meta" \
@@ -1673,7 +1676,7 @@ spawn_abort_cleanup() {
     if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-        if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 \
+        if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 "$SPAWN_GENERATION_ID" \
           && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
           && fm_account_safe_file_destination "$STATE/$ID.meta" \
           && mv "$META_BACKUP" "$STATE/$ID.meta"; then
@@ -1735,7 +1738,7 @@ spawn_abort_cleanup() {
         if [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" = "$ACCOUNT_TASK" ] \
           || cmp -s "$STATE/$ID.meta" "$META_BACKUP"; then
           artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-          if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 \
+          if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-}" 1 "$SPAWN_GENERATION_ID" \
             && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
             && fm_account_safe_file_destination "$STATE/$ID.meta" \
             && mv "$META_BACKUP" "$STATE/$ID.meta"; then
@@ -1852,14 +1855,10 @@ mkdir -p "$STATE" || {
   echo "error: cannot establish state directory at $STATE" >&2
   exit 1
 }
-SPAWN_TASK_TMP=$(fm_account_task_tmp_path "$ID") || {
-  echo "error: cannot establish a safe task temp path for $ID" >&2
-  exit 1
-}
 if [ "$SPAWN_META_PRESENT" = 1 ]; then
   EXISTING_TASK_TMP=$(spawn_preflight_meta_value tasktmp)
   if [ -n "$EXISTING_TASK_TMP" ]; then
-    fm_account_task_tmp_is_expected "$ID" "$EXISTING_TASK_TMP" || {
+    fm_account_task_tmp_is_expected "$ID" "$EXISTING_TASK_TMP" "$(spawn_preflight_meta_value generation_id)" || {
       echo "error: existing task metadata has an unsafe tasktmp for $ID" >&2
       exit 1
     }
@@ -1949,8 +1948,6 @@ if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGIN
 if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
 if [ -e "$STATE/$ID.pi-ext.ts" ] || [ -L "$STATE/$ID.pi-ext.ts" ]; then ORIGINAL_PI_EXT_PRESENT=1; else ORIGINAL_PI_EXT_PRESENT=0; fi
 if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token" ]; then ORIGINAL_GROK_TOKEN_PRESENT=1; else ORIGINAL_GROK_TOKEN_PRESENT=0; fi
-if [ -e "$SPAWN_TASK_TMP" ] || [ -L "$SPAWN_TASK_TMP" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
-
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
   [ -n "$RECORDED_KIND" ] || RECORDED_KIND=ship
@@ -2027,7 +2024,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_MODE" ] || { echo "error: direct account recovery metadata has no mode for $ID" >&2; exit 1; }
     [ -n "$RECORDED_YOLO" ] || { echo "error: direct account recovery metadata has no yolo setting for $ID" >&2; exit 1; }
     [ -n "$RECORDED_GENERATION" ] || { echo "error: direct account recovery metadata has no generation_id for $ID" >&2; exit 1; }
-    fm_account_task_tmp_is_expected "$ID" "$RECORDED_TASKTMP" || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
+    fm_account_task_tmp_is_expected "$ID" "$RECORDED_TASKTMP" "$RECORDED_GENERATION" || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
     RECORDED_META_WORKTREE_GIT_REF=$RECORDED_WORKTREE_GIT_REF
     RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
     RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
@@ -2368,6 +2365,15 @@ elif [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
 else
   SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
 fi
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  SPAWN_TASK_TMP=$RECORDED_TASKTMP
+else
+  SPAWN_TASK_TMP=$(fm_account_task_tmp_path "$ID" "$SPAWN_GENERATION_ID") || {
+    echo "error: cannot establish a safe task temp path for $ID" >&2
+    exit 1
+  }
+fi
+if [ -e "$SPAWN_TASK_TMP" ] || [ -L "$SPAWN_TASK_TMP" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then

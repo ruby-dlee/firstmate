@@ -233,6 +233,15 @@ if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" 
   printf '%s\n' "$!" > "$FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE"
 fi
 if [ "${1:-}" = get ]; then
+  lease_holder=
+  previous=
+  for argument in "$@"; do
+    [ "$previous" != --lease-holder ] || lease_holder=$argument
+    previous=$argument
+  done
+  pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
+  printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"%s","destroying":false}]}\n' \
+    "$FM_FAKE_TREEHOUSE_PATH" "$lease_holder" > "$pool/treehouse-state.json"
   printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
 fi
 exit 0

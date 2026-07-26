@@ -594,7 +594,7 @@ FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 ```
 
-`FM_CREW_STATE_GH_TIMEOUT` defaults to 10 seconds, and zero or an invalid value is clamped to that same 10-second default because an indefinitely hung supervision state reader would stall wedge detection.
+`FM_CREW_STATE_GH_TIMEOUT` accepts only strictly positive whole seconds, defaults to 10 seconds, and clamps every numerically zero, negative, whitespace-padded, or unparseable value to that same 10-second default because an indefinitely hung supervision state reader would stall wedge detection.
 
 [`permission-stall-detection.md`](permission-stall-detection.md) records why the watcher uses direct harness-prompt matching but a timeout heuristic for macOS system dialogs.
 

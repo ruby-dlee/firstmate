@@ -18,6 +18,7 @@ SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 TMP_ROOT=$(fm_test_tmproot fm-account-routing-tests)
 REAL_GIT=$(command -v git)
+export FM_TEST_REAL_GIT="$REAL_GIT"
 
 assert_not_grep() {
   local pattern=$1 file=$2 label=$3

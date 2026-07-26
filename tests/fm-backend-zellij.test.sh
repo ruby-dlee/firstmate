@@ -919,8 +919,14 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "worktree=$dir/missing-worktree" \
     "project=$project" \
     "kind=scout"
-  printf '[]\n' > "$dir/responses/1.out"
-  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 fm-zghost
+  printf '[]\n' > "$dir/responses/3.out"
+  zellij_tab_response "$dir" 4 3 fm-zghost
+  printf '[]\n' > "$dir/responses/5.out"
+  printf '[]\n' > "$dir/responses/6.out"
+  printf '[]\n' > "$dir/responses/7.out"
+  printf '[]\n' > "$dir/responses/8.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \

@@ -302,7 +302,7 @@ fi
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} recorded_scoped_target=${5:-}
-  local attempt state agent_state last=unknown
+  local attempt state last=unknown
   [ -n "$target" ] || return 2
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
@@ -312,17 +312,7 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
     fi
     case "$state" in
       absent) return 0 ;;
-      present)
-        if [ -n "$probe_home" ]; then
-          agent_state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        else
-          agent_state=$(fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        fi
-        case "$agent_state" in
-          dead|alive) last=present ;;
-          *) last=unknown ;;
-        esac
-        ;;
+      present) return 1 ;;
       unknown) last=unknown ;;
       *) last=unknown ;;
     esac
@@ -1055,6 +1045,7 @@ validate_teardown_target_identity() {
   local project_root worktree_root project_common worktree_common
   [ "$KIND" != secondmate ] || return 0
   require_safe_task_metadata || return 1
+  [ -e "$WT" ] || [ -L "$WT" ] || return 0
   project_root=$(exact_git_worktree_root "$PROJ") || {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1

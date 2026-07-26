@@ -338,7 +338,7 @@ test_send_refuses_and_admits() {
 # task (HEAD reachable from origin), so a normal teardown genuinely succeeds and a
 # refused one leaves the task untouched (mirrors tests/fm-teardown make_case).
 make_teardown_case() {
-  local name=$1 case_dir fakebin t wt
+  local name=$1 case_dir fakebin wt
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
   cat > "$fakebin/treehouse" <<'SH'

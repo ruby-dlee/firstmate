@@ -495,7 +495,7 @@ test_live_default_probe_overrides_stale_origin_head() {
 }
 
 test_direct_sync_honors_shared_checkout_lock() {
-  local home clone before lock_root lock out holder ready release i
+  local home clone before lock_root lock out holder ready release
   home=$(new_home)
   clone=$(build_pair "$home" shared-lock)
   advance_origin "$home" shared-lock C1
@@ -516,7 +516,7 @@ test_direct_sync_honors_shared_checkout_lock() {
     fm_lock_release "$3"
   ' _ "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-checkout-lock-lib.sh" "$lock" "$ready" "$release" &
   holder=$!
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -f "$ready" ] && break
     kill -0 "$holder" 2>/dev/null || break
     sleep 0.05

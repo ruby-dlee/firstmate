@@ -2042,11 +2042,17 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
+  local home=$1 id=$2 clone_head
   git clone -q --no-hardlinks "$ROOT" "$home" || fail "could not create secondmate fixture clone"
+  if ! git -C "$home" show-ref --verify --quiet refs/remotes/origin/main; then
+    clone_head=$(git -C "$home" rev-parse HEAD) || fail "could not resolve the secondmate fixture head"
+    git -C "$home" update-ref refs/remotes/origin/main "$clone_head" \
+      || fail "could not seed the secondmate fixture default branch"
+  fi
   git -C "$home" remote set-head origin main \
     || fail "could not set the secondmate fixture default branch"
-  git -C "$home" checkout -q main || fail "could not align secondmate fixture to the default branch"
+  git -C "$home" checkout -q -B main refs/remotes/origin/main \
+    || fail "could not align secondmate fixture to the default branch"
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"

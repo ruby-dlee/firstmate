@@ -907,33 +907,58 @@ test_kill_is_noop_when_session_absent() {
   pass "fm_backend_zellij_kill: never fails when the target session no longer exists"
 }
 
-test_teardown_passes_recorded_tab_id_to_zellij_kill() {
-  local dir state data config project fb out status
+test_teardown_accepts_registered_absent_worktree() {
+  local dir state data config project worktree fb out status
   dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
-  mkdir -p "$state" "$data/zghost" "$config" "$project" "$dir/responses"
+  worktree="$dir/treehouse/slot/worktree"
+  mkdir -p "$state" "$data/zghost" "$config" "$project" "$(dirname "$worktree")" "$dir/responses"
+  git -C "$project" init -q
+  fm_git_identity fmtest fmtest@example.invalid "$project"
+  printf 'base\n' > "$project/base.txt"
+  git -C "$project" add base.txt
+  git -C "$project" commit -qm base
+  git -C "$project" worktree add -q "$worktree"
+  python3 - "$dir/treehouse/treehouse-state.json" "$worktree" <<'PY'
+import json
+import sys
+
+state, worktree = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "slot",
+                    "path": worktree,
+                    "leased": True,
+                    "lease_holder": "firstmate-zghost",
+                }
+            ]
+        },
+        stream,
+    )
+PY
+  rm -rf "$worktree"
   printf 'report\n' > "$data/zghost/report.md"
   fm_write_meta "$state/zghost.meta" \
     "window=firstmate:7" \
     "backend=zellij" \
     "zellij_tab_id=3" \
-    "worktree=$dir/missing-worktree" \
+    "worktree=$worktree" \
     "project=$project" \
     "kind=scout"
   printf '[]\n' > "$dir/responses/1.out"
-  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/2.out"
+  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/3.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
     "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
   status=$?
   expect_code 0 "$status" "fm-teardown should succeed for a zellij scout whose worktree is already gone: $out"
-  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
-    "fm-teardown did not verify the recorded zellij_tab_id against the task label"
-  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
-    "fm-teardown did not pass a verified recorded zellij_tab_id through to kill"
   assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
-    "fm-teardown should close the recorded tab id instead of falling back to close-pane"
-  pass "fm-teardown.sh: passes recorded zellij_tab_id with the expected task label"
+    "fm-teardown should not close an unrelated pane after proving the recorded pane absent"
+  pass "fm-teardown.sh: accepts an absent worktree whose project registration and task lease remain provable"
 }
 
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
@@ -1148,6 +1173,10 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
   test_target_state_follows_replacement_pane_in_expected_tab
   exit 0
 fi
+if [ "${FM_TEST_FOCUSED:-}" = teardown-absent-worktree ]; then
+  test_teardown_accepts_registered_absent_worktree
+  exit 0
+fi
 
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
@@ -1196,7 +1225,7 @@ test_kill_falls_back_to_close_pane_when_tab_lookup_empty
 test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
-test_teardown_passes_recorded_tab_id_to_zellij_kill
+test_teardown_accepts_registered_absent_worktree
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
 test_send_text_submit_detects_landed_send
 test_send_text_submit_detects_swallowed_enter

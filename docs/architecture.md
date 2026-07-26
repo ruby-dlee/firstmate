@@ -43,6 +43,7 @@ X-mode-linked tasks wait for their final follow-up, and persistent secondmates a
 Every spawn writes an owner-stamped Treehouse acquisition record before leasing a slot and removes it once task metadata takes authority.
 The watcher recovers a stranded pre-metadata lease only after the record exceeds `FM_AUTO_REAP_STALE_SECS` and the recorded PID plus process start time proves dead or reused, then installs cleanup metadata and runs the same ordinary teardown proof.
 An indeterminate owner, ambiguous lease, uncommitted worktree, unlanded commit, endpoint uncertainty, or teardown error stays on disk and produces an actionable `auto-reap:` wake plus an entry in `state/.auto-reap.log`.
+This Firstmate tooling change requires no web-app auto-deployment and no API or realtime manual operator deployment.
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude and Grok use background-notify cycles, Codex uses bounded foreground checkpoints, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.

@@ -249,7 +249,27 @@ test_dirty_stranded_worktree_is_retained_by_real_teardown() {
   assert_contains "$out" "ordinary teardown refused" "dirty refusal surfaced by auto-reap"
   [ -f "$HOME_DIR/state/dirty-slot.meta" ] || fail "dirty worktree recovery metadata was removed"
   [ -f "$HOME_DIR/state/.worktree-acquire-dirty-slot.pending" ] || fail "dirty acquisition authority was removed"
+  rm -f "$HOME_DIR/state/dirty-slot.meta" "$HOME_DIR/state/.worktree-acquire-dirty-slot.pending"
   pass "ordinary teardown preserves a dirty stranded worktree and its recovery authority"
+}
+
+test_unregistered_treehouse_lease_retains_acquisition_authority() {
+  local fixture project worktree record out rc log
+  reset_logs
+  fixture=$(make_treehouse_fixture hidden-slot)
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition hidden-slot "$project" "$worktree" direct
+  record="$HOME_DIR/state/.worktree-acquire-hidden-slot.pending"
+  git -C "$project" worktree remove --force "$worktree"
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "unregistered Treehouse lease maintenance"
+  assert_contains "$out" "lease absence could not be proven" "uncertain lease retention diagnostic"
+  [ -f "$record" ] || fail "uncertain Treehouse acquisition authority was removed"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "uncertain Treehouse lease invoked teardown"
+  log=$(cat "$HOME_DIR/state/.auto-reap.log")
+  assert_contains "$log" "retained owner-dead acquisition hidden-slot" "uncertain lease retention log"
+  pass "unregistered Treehouse leases retain acquisition authority visibly"
 }
 
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
@@ -348,6 +368,7 @@ test_cross_branch_active_run_refuses_without_guessing_id
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown
+test_unregistered_treehouse_lease_retains_acquisition_authority
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap
 test_local_merge_immediately_auto_reaps
 

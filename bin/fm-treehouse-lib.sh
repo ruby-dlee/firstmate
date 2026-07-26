@@ -103,3 +103,39 @@ EOF
       ;;
   esac
 }
+
+fm_treehouse_prove_task_lease_absent() {  # <recorded-worktree> <expected-holder>
+  local recorded_worktree=$1 expected_holder=$2 slot pool state
+  [ -n "$recorded_worktree" ] || return 1
+  slot=$(dirname "$recorded_worktree")
+  pool=$(fm_checkout_trusted_dir "$(dirname "$slot")") || return 1
+  state="$pool/treehouse-state.json"
+  [ -f "$state" ] && [ ! -L "$state" ] || return 1
+  python3 - "$state" "$expected_holder" <<'PY'
+import json
+import sys
+
+state_path, expected_holder = sys.argv[1:]
+try:
+    with open(state_path, encoding="utf-8") as stream:
+        state = json.load(stream)
+    worktrees = state["worktrees"]
+    if not isinstance(worktrees, list):
+        raise TypeError("worktrees must be an array")
+    for entry in worktrees:
+        if not isinstance(entry, dict):
+            raise TypeError("worktree entry must be an object")
+        leased = entry.get("leased")
+        holder = entry.get("lease_holder")
+        if not isinstance(leased, bool):
+            raise TypeError("leased must be a boolean")
+        if leased and holder == expected_holder:
+            raise ValueError("matching Treehouse lease still exists")
+except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+    print(
+        f"error: Treehouse lease absence for {expected_holder} is unprovable: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}

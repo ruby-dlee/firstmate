@@ -341,10 +341,16 @@ recover_acquisition() {  # <record>
       find_status=$?
     fi
     if [ "$find_status" -eq 2 ]; then
-      rm -f "$record"
+      if fm_treehouse_prove_task_lease_absent "$recorded_worktree" "$holder" >/dev/null 2>&1; then
+        rm -f "$record"
+        fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+        log_result "cleared owner-dead acquisition $id after proving it owns no Treehouse lease"
+        printf 'auto-reap cleared %s: owner is dead and no Treehouse lease exists\n' "$id"
+        return 0
+      fi
       fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-      log_result "cleared owner-dead acquisition $id after proving it owns no Treehouse lease"
-      printf 'auto-reap cleared %s: owner is dead and no Treehouse lease exists\n' "$id"
+      log_result "retained owner-dead acquisition $id because Treehouse lease absence could not be proven"
+      refuse "retained stale acquisition because Treehouse lease absence could not be proven" || true
       return 0
     fi
   fi

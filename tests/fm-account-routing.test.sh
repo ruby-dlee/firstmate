@@ -3302,7 +3302,7 @@ test_continuation_fails_closed_without_original_brief() {
 
 test_session_sync_cannot_recreate_metadata_after_teardown() {
   local id rec release_marker sync_pid teardown_pid sync_rc teardown_rc meta_tmp primary
-  id=account-sync-race-z23
+  id="account-sync-race-z23-$$"
   rec=$(make_case sync-race claude "$id")
   read_case "$rec"
   primary="$CASE_DIR/primary-home"
@@ -3310,7 +3310,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   git -C "$primary" branch --force main HEAD
   git -C "$primary" checkout --quiet main
   git -C "$primary" remote remove origin
-  FM_TEST_ROOT_OVERRIDE=$primary
+  FM_TEST_PRIMARY_ROOT=$primary
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session sync race precondition spawn failed"
   rm -f "$CASE_DIR/endpoint-live"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
@@ -3323,7 +3323,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   teardown_pid=$!
   for _ in $(seq 1 300); do
     [ -f "$release_marker" ] && break
-    sleep 0.1
+    sleep 0.05
   done
   [ -f "$release_marker" ] || {
     kill "$teardown_pid" 2>/dev/null || true
@@ -3343,7 +3343,8 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   wait "$sync_pid"
   sync_rc=$?
   set -e
-  expect_code 0 "$teardown_rc" "session sync race teardown should succeed while holding the metadata lock"
+  expect_code 0 "$teardown_rc" \
+    "session sync race teardown should succeed while holding the metadata lock: $(cat "$CASE_DIR/teardown-stderr")"
   [ "$sync_rc" -ne 0 ] || fail "late SessionStart sync unexpectedly succeeded after teardown"
   assert_absent "$HOME_DIR/state/$id.meta" "late SessionStart sync recreated metadata after teardown"
   assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "session sync race left the metadata lock behind"

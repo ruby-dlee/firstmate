@@ -613,8 +613,8 @@ test_ignored_skill_files_are_outside_the_collision_guard() {
 
   run_refresh verify-worktree "$worktree" "$source" \
     || fail "an ignored skill file made a clean local acquisition fail"
-  out=$(run_refresh preflight "$worktree") \
-    || fail "preflight rejected an acquisition containing only ignored skill material"
+  out=$(run_refresh preflight "$source") \
+    || fail "preflight rejected a source whose acquisition contained only ignored skill material"
   assert_not_contains "$out" "HYGIENE:" \
     "ignored skill material entered the untracked-draft collision inventory"
   grep -Fq '# intentional ignored material' "$draft" \

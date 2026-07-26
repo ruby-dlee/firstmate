@@ -204,7 +204,15 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  get) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -332,13 +340,28 @@ test_send_refuses_and_admits() {
 # task (HEAD reachable from origin), so a normal teardown genuinely succeeds and a
 # refused one leaves the task untouched (mirrors tests/fm-teardown make_case).
 make_teardown_case() {
-  local name=$1 case_dir fakebin t
+  local name=$1 case_dir fakebin
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
-  for t in treehouse tmux; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/$t"
-    chmod +x "$fakebin/$t"
-  done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/treehouse"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+state="$(dirname "$0")/.tmux-live"
+case "${1:-}" in
+  display-message)
+    [ -f "$state" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
+  list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1; exit 0 ;;
+  kill-window) rm -f "$state"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse" "$fakebin/tmux"
+  touch "$fakebin/.tmux-live"
   cat > "$fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -367,8 +390,29 @@ SH
   git -C "$case_dir/wt" commit -q --allow-empty -m "shippable work"
   git -C "$case_dir/wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
+  python3 - "$TMP/treehouse-state.json" "$case_dir/wt" <<'PY'
+import json
+import os
+import sys
+
+state, worktree = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "path": os.path.realpath(worktree),
+                    "leased": True,
+                    "lease_holder": "firstmate-task-x1",
+                }
+            ]
+        },
+        stream,
+    )
+PY
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=fm-task-x1" "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "window=fm-task-x1" "tmux_session_target=firstmate:fm-task-x1" \
+    "worktree=$case_dir/wt" "project=$case_dir/project" \
     "kind=ship" "mode=no-mistakes"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"

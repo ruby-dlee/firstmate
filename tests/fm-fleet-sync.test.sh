@@ -495,7 +495,7 @@ test_live_default_probe_overrides_stale_origin_head() {
 }
 
 test_direct_sync_honors_shared_checkout_lock() {
-  local home clone before common key lock_root lock out
+  local home clone before lock_root lock out holder ready release i
   home=$(new_home)
   clone=$(build_pair "$home" shared-lock)
   advance_origin "$home" shared-lock C1
@@ -505,33 +505,47 @@ test_direct_sync_honors_shared_checkout_lock() {
   . "$ROOT/bin/fm-checkout-lock-lib.sh"
   fm_checkout_lock_prepare "$lock_root" || fail "could not prepare shared checkout lock fixture"
   lock=$(fm_checkout_lock_path "$clone" "$lock_root") || fail "could not resolve shared checkout lock fixture"
-  fm_lock_try_acquire "$lock" || fail "could not acquire shared checkout lock fixture"
+  ready="$home/checkout-lock-ready"
+  release="$home/checkout-lock-release"
+  bash -c '
+    . "$1"
+    . "$2"
+    fm_lock_try_acquire "$3" || exit 1
+    : > "$4"
+    while [ ! -f "$5" ]; do sleep 0.01; done
+    fm_lock_release "$3"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-checkout-lock-lib.sh" "$lock" "$ready" "$release" &
+  holder=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$ready" ] && break
+    kill -0 "$holder" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -f "$ready" ] || { kill "$holder" 2>/dev/null || true; fail "checkout lock holder never published ownership"; }
 
   out=$(FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-fleet-sync.sh" "$clone" 2>/dev/null)
 
-  assert_contains "$out" "$clone: skipped: refresh already running (pid $$)" \
+  assert_contains "$out" "$clone: skipped: refresh already running (pid $holder)" \
     "direct fleet sync bypassed the shared checkout lock"
   [ "$(head_sha "$clone")" = "$before" ] || fail "direct sync mutated a contended checkout"
-  fm_lock_release "$lock"
+  : > "$release"
+  wait "$holder" || fail "checkout lock holder did not release cleanly"
   pass "direct sync serializes through the shared canonical checkout lock"
 }
 
 test_direct_sync_timeout_terminates_descendants() {
-  local home clone fakebin real_git out status parent_pid child_pid common key lock_root lock
+  local home clone fakebin real_git out status parent_pid child_pid lock_root lock
   home=$(new_home)
   clone=$(build_pair "$home" direct-timeout)
   advance_origin "$home" direct-timeout C1
   fakebin="$home/direct-timeout-fakebin"
   real_git=$(command -v git)
   mkdir -p "$fakebin"
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-refresh-state/locks"
-  lock="$lock_root/$key.lock"
+  fm_checkout_lock_prepare "$lock_root" || fail "could not prepare timeout checkout lock fixture"
+  lock=$(fm_checkout_lock_path "$clone" "$lock_root") || fail "could not resolve timeout checkout lock fixture"
   cat > "$fakebin/git" <<'SH'
 #!/usr/bin/env bash
 is_fetch=0
@@ -579,6 +593,8 @@ SH
   [ "$status" -eq 0 ] || fail "direct bounded fleet sync failed unexpectedly: $out"
   assert_contains "$out" "direct-timeout: skipped: refresh timed out after 1s" \
     "direct fleet sync did not surface its process-tree timeout"
+  [ -f "$home/direct-fetch-parent.pid" ] && [ -f "$home/direct-fetch-child.pid" ] \
+    || fail "direct fleet sync did not start the bounded fetch fixture: $out"
   parent_pid=$(cat "$home/direct-fetch-parent.pid")
   child_pid=$(cat "$home/direct-fetch-child.pid")
   if kill -0 "$parent_pid" 2>/dev/null || kill -0 "$child_pid" 2>/dev/null; then

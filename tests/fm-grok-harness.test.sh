@@ -19,9 +19,14 @@ case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
+  display-message)
+    [ ! -f "${FM_STATE_OVERRIDE:-/nonexistent}/.fake-killed" ] || exit 1
+    printf 'firstmate\n'
+    exit 0
+    ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  kill-window) : > "$FM_STATE_OVERRIDE/.fake-killed"; exit 0 ;;
+  has-session|new-session|new-window|send-keys) exit 0 ;;
 esac
 exit 0
 SH
@@ -29,6 +34,11 @@ SH
   fm_fake_exit0 "$fakebin" treehouse gh-axi gh
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  target=${!#}
+  git -C "$target" worktree remove --force "$target"
+  exit $?
+fi
 printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
 SH
   chmod +x "$fakebin/treehouse"
@@ -40,14 +50,16 @@ make_spawn_case() {
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$home/treehouse-pools/project/1/project"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   grok_home="$case_dir/grok"
   id="grok-$name-x1"
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$home/treehouse-pools" "$grok_home"
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$home/treehouse-pools/project/1" "$grok_home"
   printf 'brief\n' > "$home/data/$id/brief.md"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   git -C "$wt" checkout -q --detach
+  printf '{"worktrees":[{"name":"1","path":"%s","leased":true,"lease_holder":"firstmate-%s"}]}\n' \
+    "$wt" "$id" > "$home/treehouse-pools/project/treehouse-state.json"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$grok_home|$id"
 }
@@ -115,7 +127,7 @@ EOF
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
-    GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$TEARDOWN" "$id" --force >/dev/null 2>&1 \
     || fail "grok teardown failed"
 

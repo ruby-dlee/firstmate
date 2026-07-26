@@ -12,6 +12,7 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+REAL_GIT=$(command -v git)
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -47,6 +48,19 @@ SH
 printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
 SH
   chmod +x "$fakebin/treehouse"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_FAKE_LIVE_DEFAULT_BRANCH:-}" ] && [ -n "${FM_FAKE_LIVE_DEFAULT_TIP:-}" ]; then
+  case " $* " in
+    *" ls-remote --symref origin HEAD "*|*" ls-remote --symref origin HEAD")
+      printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$FM_FAKE_LIVE_DEFAULT_BRANCH" "$FM_FAKE_LIVE_DEFAULT_TIP"
+      exit 0
+      ;;
+  esac
+fi
+exec "${FM_TEST_REAL_GIT:?}" "$@"
+SH
+  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -78,11 +92,15 @@ enable_dispatch_profile() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
+  local home=$1 id=$2 branch
+  branch=$(git -C "$ROOT" for-each-ref --format='%(refname:short)' --contains HEAD refs/heads | head -1)
+  git clone --quiet "$ROOT" "$home"
+  git -C "$home" checkout --quiet -B "$branch" origin/main
   mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
+  printf '%s\n' "- $id - test secondmate (home: $(cd "$home" && pwd -P); scope: test; projects: ; added 2026-07-26)" \
+    > "$HOME_DIR/data/secondmates.md"
 }
 
 run_spawn() {
@@ -96,6 +114,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_TREEHOUSE_PATH="${FM_TEST_TREEHOUSE_PATH:-$wt}" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
+    FM_TEST_REAL_GIT="$REAL_GIT" \
     "$SPAWN" "$@" 2>&1
 }
 
@@ -373,17 +392,20 @@ test_batch_forwards_shared_profile_flags() {
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
-  local rec id sm out status
+  local rec id sm out status branch
   id=profile-secondmate-z16
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
+  branch=$(git -C "$ROOT" for-each-ref --format='%(refname:short)' --contains HEAD refs/heads | head -1)
 
-  out=$(FM_TEST_TREEHOUSE_PATH="$sm" run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(FM_TEST_TREEHOUSE_PATH="$sm" FM_FAKE_LIVE_DEFAULT_BRANCH="$branch" \
+    FM_FAKE_LIVE_DEFAULT_TIP="$(git -C "$ROOT" rev-parse origin/main)" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
-  expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
+  expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement: $out"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default

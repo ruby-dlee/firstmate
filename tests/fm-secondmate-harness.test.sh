@@ -38,6 +38,7 @@ set -u
 . "$ROOT/bin/fm-config-inherit-lib.sh"
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+REAL_GIT=$(PATH="$BASE_PATH" command -v git)
 fm_git_identity fmtest fmtest@example.com
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-harness)
 export FM_BACKEND=tmux
@@ -245,6 +246,17 @@ make_noop_tmux() {
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" ls-remote --symref origin HEAD "*|*" ls-remote --symref origin HEAD")
+    printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$FM_FAKE_LIVE_DEFAULT_BRANCH" "$FM_FAKE_LIVE_DEFAULT_TIP"
+    exit 0
+    ;;
+esac
+exec "$FM_TEST_REAL_GIT" "$@"
+SH
+  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -252,11 +264,17 @@ SH
 # seed marker, AGENTS.md, bin/, and a charter to launch). config/ is intentionally
 # left absent so the spawn's propagation is what creates it.
 make_seeded_home() {
-  local home=$1 id=$2
+  local home=$1 id=$2 branch primary
+  branch=$(git -C "$ROOT" for-each-ref --format='%(refname:short)' --contains HEAD refs/heads | head -1)
+  git clone --quiet "$ROOT" "$home"
+  git -C "$home" checkout --quiet -B "$branch" origin/main
   mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
+  primary="${home%/*}/home"
+  mkdir -p "$primary/data"
+  printf '%s\n' "- $id - test secondmate (home: $(cd "$home" && pwd -P); scope: test; projects: ; added 2026-07-26)" \
+    > "$primary/data/secondmates.md"
 }
 
 # spawn_secondmate <world> <id> <home> [explicit-harness]
@@ -265,15 +283,20 @@ make_seeded_home() {
 # detect_own. stderr is discarded (the local-HEAD ff sync harmlessly skips a
 # non-worktree home). Inspect <world>/home/state/<id>.meta and <home>/config after.
 spawn_secondmate() {
-  local world=$1 id=$2 home=$3 harness=${4:-} fakebin
+  local world=$1 id=$2 home=$3 harness=${4:-} fakebin branch
   mkdir -p "$world/home/state" "$world/home/data" "$world/home/treehouse-pools"
+  printf '%s\n' "- $id - test secondmate (home: $(cd "$home" && pwd -P); scope: test; projects: ; added 2026-07-26)" \
+    > "$world/home/data/secondmates.md"
   fakebin=$(make_noop_tmux "$world/tmux-$id")
+  branch=$(git -C "$ROOT" for-each-ref --format='%(refname:short)' --contains HEAD refs/heads | head -1)
   # An empty harness must contribute zero args, not an empty positional; build the
   # arg list explicitly so the optional harness is omitted cleanly.
   local spawn_args=("$id" "$home")
   [ -n "$harness" ] && spawn_args+=("$harness")
   spawn_args+=(--secondmate)
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
+    FM_TEST_REAL_GIT="$REAL_GIT" FM_FAKE_LIVE_DEFAULT_BRANCH="$branch" \
+    FM_FAKE_LIVE_DEFAULT_TIP="$(git -C "$ROOT" rev-parse origin/main)" \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
@@ -442,6 +465,17 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" ls-remote --symref origin HEAD "*|*" ls-remote --symref origin HEAD")
+    printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$FM_FAKE_LIVE_DEFAULT_BRANCH" "$FM_FAKE_LIVE_DEFAULT_TIP"
+    exit 0
+    ;;
+esac
+exec "$FM_TEST_REAL_GIT" "$@"
+SH
+  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -449,12 +483,15 @@ SH
 # Same shape as spawn_secondmate but captures the launch command into <launchlog>
 # and does not discard stderr, so callers can assert on both.
 spawn_secondmate_capture() {
-  local world=$1 id=$2 home=$3 launchlog=$4 fakebin
+  local world=$1 id=$2 home=$3 launchlog=$4 fakebin branch
   shift 4
   mkdir -p "$world/home/state" "$world/home/data"
   fakebin=$(make_launch_capturing_tmux "$world/tmux-$id")
+  branch=$(git -C "$ROOT" for-each-ref --format='%(refname:short)' --contains HEAD refs/heads | head -1)
   : > "$launchlog"
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
+    FM_TEST_REAL_GIT="$REAL_GIT" FM_FAKE_LIVE_DEFAULT_BRANCH="$branch" \
+    FM_FAKE_LIVE_DEFAULT_TIP="$(git -C "$ROOT" rev-parse origin/main)" \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
@@ -656,6 +693,16 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   wt="$w/crew-wt"
   fakebin=$(make_launch_capturing_tmux "$w/tmux-crew")
   fm_git_worktree "$proj" "$wt" "wt-crew"
+  git -C "$wt" checkout --quiet --detach
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'get --help') printf '%s\n' 'Usage: treehouse get [--lease]' ;;
+  get\ --lease*) printf '%s\n' "${FM_FAKE_PANE_PATH:?}" ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   mkdir -p "$home/data/$id" "$home/projects" "$home/state"
   printf 'brief\n' > "$home/data/$id/brief.md"
   : > "$launchlog"
@@ -663,6 +710,8 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   node_bin=$(command -v node) || fail "crew-unaffected: node is required"
   node_dir=$(dirname "$node_bin")
   PATH="$fakebin:$node_dir:$BASE_PATH" TMUX="fake,1,0" CLAUDECODE=1 \
+    FM_TEST_REAL_GIT="$REAL_GIT" FM_FAKE_LIVE_DEFAULT_BRANCH=main \
+    FM_FAKE_LIVE_DEFAULT_TIP="$(git -C "$proj" rev-parse HEAD)" \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \

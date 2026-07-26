@@ -11,6 +11,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-safety)
+ROOT=$(make_refreshable_firstmate_source "$TMP_ROOT/firstmate-source") || fail "could not create refreshable Firstmate source"
 export FM_BACKEND=tmux
 
 make_live_default_firstmate_worktree() {

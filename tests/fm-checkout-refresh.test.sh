@@ -352,7 +352,7 @@ test_nested_active_project_invalidates_coverage_health() {
 }
 
 test_discovery_rejects_nested_configured_and_scanned_paths() {
-  local remote seed outer configured_child scan_root scanned_child scanned_canonical out err
+  local remote seed outer configured_child scan_root scanned_child scanned_canonical out err status
   remote=$(build_origin exact-discovery)
   seed="$FM_TEST_HOME/projects/exact-discovery"
   outer="$TMP_ROOT/exact-discovery-outer"
@@ -370,8 +370,11 @@ test_discovery_rejects_nested_configured_and_scanned_paths() {
     printf 'scan %s\n' "$scan_root"
   } > "$FM_TEST_HOME/config/checkout-refresh"
 
-  run_refresh discover > "$out" 2> "$err" \
-    || fail "exact-root discovery fixture failed"
+  set +e
+  run_refresh discover > "$out" 2> "$err"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "exact-root discovery accepted invalid configured paths"
 
   assert_no_grep "^$configured_child$" "$out" \
     "configured nested directory was emitted as a checkout"
@@ -608,7 +611,7 @@ test_ignored_skill_files_are_outside_the_collision_guard() {
   run_refresh verify-worktree "$worktree" "$source" \
     || fail "an ignored skill file made a clean local acquisition fail"
   out=$(run_refresh preflight "$worktree") \
-    || fail "preflight rejected an acquisition containing only ignored skill material"
+    || fail "preflight rejected an acquisition containing only ignored skill material: $out"
   assert_not_contains "$out" "HYGIENE:" \
     "ignored skill material entered the untracked-draft collision inventory"
   grep -Fq '# intentional ignored material' "$draft" \

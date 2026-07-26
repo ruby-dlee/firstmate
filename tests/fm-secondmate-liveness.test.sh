@@ -316,6 +316,9 @@ add_sm_home() {
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf '# Firstmate\n' > "$home/AGENTS.md"
   printf 'charter\n' > "$home/data/charter.md"
+  mkdir -p "$w/home/data"
+  printf '%s\n' "- $id - test secondmate (home: $(cd "$home" && pwd -P); scope: test; projects: ; added 2026-07-26)" \
+    > "$w/home/data/secondmates.md"
   {
     printf 'window=%s\n' "$window"
     printf 'kind=secondmate\n'
@@ -567,16 +570,20 @@ EOF
 
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
-  cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
+cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" FM_HOME="$FM_MANAGED_PRIMARY_HOME" \
+  FM_STATE_OVERRIDE="$FM_MANAGED_PRIMARY_HOME/state" FM_DATA_OVERRIDE="$FM_MANAGED_PRIMARY_HOME/data" \
+  "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
 status=$?
 cat "$FM_MANAGED_SPAWN_OUT"
 exit "$status"
 SH
   cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
+FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" FM_HOME="$FM_MANAGED_PRIMARY_HOME" \
+  FM_STATE_OVERRIDE="$FM_MANAGED_PRIMARY_HOME/state" FM_DATA_OVERRIDE="$FM_MANAGED_PRIMARY_HOME/data" \
+  exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
 SH
   cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
 #!/usr/bin/env bash
@@ -624,6 +631,7 @@ SH
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
     FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
     FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
+    FM_MANAGED_PRIMARY_HOME="$w/home" \
     FM_MANAGED_WORKSPACE="$workspace" \
     FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \
     FM_MANAGED_SPAWN_OUT="$w/spawn.out")

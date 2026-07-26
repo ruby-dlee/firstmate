@@ -1962,7 +1962,15 @@ case "${1:-}" in
     while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    [ ! -f "$FM_FAKE_ALLOW_KILL" ] || exit 1
+    case "$*" in
+      *'#{session_name}:#{window_name}'*) printf 'firstmate:fm-task-x1\n' ;;
+      *'#{window_name}'*) printf 'fm-task-x1\n' ;;
+      *'#{pane_id}'*) printf '%%1\n' ;;
+    esac
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -1972,7 +1980,7 @@ SH
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 100); do
     [ -f "$kill_started" ] && break
     sleep 0.05
   done
@@ -2022,7 +2030,7 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"

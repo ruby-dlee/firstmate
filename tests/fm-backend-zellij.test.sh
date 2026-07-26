@@ -908,21 +908,33 @@ test_kill_is_noop_when_session_absent() {
 }
 
 test_teardown_passes_recorded_tab_id_to_zellij_kill() {
-  local dir state data config project fb out status
-  dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
-  mkdir -p "$state" "$data/zghost" "$config" "$project" "$dir/responses"
+  local dir state data config project worktree fb out status
+  dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"; worktree="$dir/pool/1/project"
+  mkdir -p "$state" "$data/zghost" "$config" "$project" "$dir/pool/1" "$dir/responses"
+  fm_git_worktree "$project" "$worktree" zghost-worktree
+  printf '{"worktrees":[{"name":"1","path":"%s","leased":true,"lease_holder":"firstmate-zghost"}]}\n' \
+    "$worktree" > "$dir/pool/treehouse-state.json"
   printf 'report\n' > "$data/zghost/report.md"
   fm_write_meta "$state/zghost.meta" \
     "window=firstmate:7" \
     "backend=zellij" \
     "zellij_tab_id=3" \
-    "worktree=$dir/missing-worktree" \
+    "worktree=$worktree" \
     "project=$project" \
     "kind=scout"
   printf '[]\n' > "$dir/responses/1.out"
   printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
   fb=$(make_zellij_fakebin "$dir")
-  out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+  cat > "$fb/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  target=${!#}
+  git -C "$target" worktree remove --force "$target"
+fi
+exit 0
+SH
+  chmod +x "$fb/treehouse"
+  out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" FM_TREEHOUSE_ROOT="$dir" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
     "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
   status=$?

@@ -338,13 +338,27 @@ test_send_refuses_and_admits() {
 # task (HEAD reachable from origin), so a normal teardown genuinely succeeds and a
 # refused one leaves the task untouched (mirrors tests/fm-teardown make_case).
 make_teardown_case() {
-  local name=$1 case_dir fakebin t
+  local name=$1 case_dir fakebin t wt
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
-  for t in treehouse tmux; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/$t"
-    chmod +x "$fakebin/$t"
-  done
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  target=${!#}
+  git -C "$target" worktree remove --force "$target"
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
   cat > "$fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -369,12 +383,17 @@ SH
   rm -rf "$case_dir/_seed"
   git clone -q "$case_dir/origin.git" "$case_dir/project"
   git -C "$case_dir/project" remote set-head origin main 2>/dev/null || true
-  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt" main
-  git -C "$case_dir/wt" commit -q --allow-empty -m "shippable work"
-  git -C "$case_dir/wt" push -q origin fm/task-x1
+  wt="$case_dir/pool/1/project"
+  mkdir -p "$case_dir/pool/1"
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$wt" main
+  git -C "$wt" commit -q --allow-empty -m "shippable work"
+  git -C "$wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
+  printf '{"worktrees":[{"name":"1","path":"%s","leased":true,"lease_holder":"firstmate-task-x1"}]}\n' \
+    "$wt" > "$case_dir/pool/treehouse-state.json"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=fm-task-x1" "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "window=firstmate:fm-task-x1" "tmux_session_target=firstmate:fm-task-x1" \
+    "worktree=$wt" "project=$case_dir/project" \
     "kind=ship" "mode=no-mistakes"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"
@@ -409,7 +428,7 @@ test_teardown_refuses_and_admits() {
   # no-regression: a normal session tears down the landed task.
   case_dir=$(make_teardown_case teardown-ok)
   out=$(run_teardown "$NORMAL_CWD" "$case_dir"); rc=$?
-  expect_code 0 "$rc" "teardown: a normal session must still tear down landed work"
+  expect_code 0 "$rc" "teardown: a normal session must still tear down landed work: $out"
   assert_not_contains "$out" "$ENV_MSG" "teardown: normal teardown must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "teardown: normal teardown must not print the backstop refusal"
   assert_not_contains "$out" "REFUSED" "teardown: normal teardown of landed work must not refuse"

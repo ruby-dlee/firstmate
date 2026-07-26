@@ -189,6 +189,24 @@ SH
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
+# Create a Firstmate source whose advertised default branch is the exact
+# checked-out revision, so explicit-home refresh checks do not depend on the
+# gate worktree's detached HEAD or its older remote default.
+make_refreshable_firstmate_source() {
+  local destination=$1 remote="$1.git"
+  mkdir -p "$destination" || return 1
+  git -C "$ROOT" archive HEAD AGENTS.md .gitignore bin | tar -x -C "$destination" || return 1
+  git -C "$destination" init --quiet -b main || return 1
+  git -C "$destination" add . || return 1
+  git -C "$destination" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit --quiet -m snapshot || return 1
+  git clone --quiet --bare "$destination" "$remote" || return 1
+  git -C "$destination" remote add origin "$remote" || return 1
+  git -C "$destination" update-ref refs/remotes/origin/main HEAD || return 1
+  git -C "$destination" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main || return 1
+  printf '%s\n' "$destination"
+}
+
 # Scaffold a filled secondmate charter brief under <home>/data/<id>/brief.md.
 # Args: home id charter [project...]
 scaffold_secondmate_charter() {

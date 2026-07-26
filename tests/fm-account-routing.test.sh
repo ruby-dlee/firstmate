@@ -17,6 +17,7 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 TMP_ROOT=$(fm_test_tmproot fm-account-routing-tests)
+REAL_GIT=$(command -v git)
 
 assert_not_grep() {
   local pattern=$1 file=$2 label=$3
@@ -187,6 +188,19 @@ case "${1:-}" in
 esac
 exit 0
 SH
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_FAKE_LIVE_DEFAULT_BRANCH:-}" ] && [ -n "${FM_FAKE_LIVE_DEFAULT_TIP:-}" ]; then
+  case " $* " in
+    *" ls-remote --symref origin HEAD "*|*" ls-remote --symref origin HEAD")
+      printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$FM_FAKE_LIVE_DEFAULT_BRANCH" "$FM_FAKE_LIVE_DEFAULT_TIP"
+      exit 0
+      ;;
+  esac
+fi
+exec "$FM_TEST_REAL_GIT" "$@"
+SH
+  chmod +x "$fakebin/git"
   chmod +x "$fakebin/tmux"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
@@ -451,6 +465,9 @@ run_spawn() {
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
+    FM_TEST_REAL_GIT="$REAL_GIT" \
+    FM_FAKE_LIVE_DEFAULT_BRANCH="${FM_FAKE_LIVE_DEFAULT_BRANCH:-}" \
+    FM_FAKE_LIVE_DEFAULT_TIP="${FM_FAKE_LIVE_DEFAULT_TIP:-}" \
     FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE="${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" \
     FM_FAKE_TREEHOUSE_RETURN_MARKER="${FM_FAKE_TREEHOUSE_RETURN_MARKER:-}" \
     FM_TEST_REAL_PS="${FM_TEST_REAL_PS:-}" \

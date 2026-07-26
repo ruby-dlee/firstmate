@@ -5896,6 +5896,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
 
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
+  seed_fake_teardown_authority "$id"
   if out=$(run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "teardown continued after restoring predecessor metadata"
   [ "$(meta_account_task "$id")" = "$old_task" ] || fail "teardown did not preserve restored predecessor metadata"

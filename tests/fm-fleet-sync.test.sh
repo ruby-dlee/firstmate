@@ -31,15 +31,15 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 TMP_ROOT=$(fm_test_tmproot fm-fleet-sync-tests)
-HOME_N=0
 
 # --- fixtures ---------------------------------------------------------------
 
 # new_home: fresh isolated FM_HOME with an empty projects/ dir. Each test gets its
 # own so the whole-fleet form never sees another test's clones.
 new_home() {
-  HOME_N=$((HOME_N + 1))
-  local h="$TMP_ROOT/home-$HOME_N"
+  local h
+  mkdir -p "$TMP_ROOT"
+  h=$(mktemp -d "$TMP_ROOT/home.XXXXXX") || return 1
   mkdir -p "$h/projects"
   printf '%s\n' "$h"
 }

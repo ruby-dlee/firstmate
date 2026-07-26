@@ -193,6 +193,9 @@ SH
 [ -z "${FM_FAKE_TREEHOUSE_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
 [ -z "${FM_FAKE_LIFECYCLE_LOG:-}" ] || printf 'treehouse %s\n' "$*" >> "$FM_FAKE_LIFECYCLE_LOG"
 [ -z "${FM_FAKE_TREEHOUSE_SLEEP:-}" ] || sleep "$FM_FAKE_TREEHOUSE_SLEEP"
+if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" ]; then
+  sleep "$FM_FAKE_TREEHOUSE_RETURN_SLEEP"
+fi
 if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
   # Prove the live lock through the guarded owner exported to the bounded return.
   # Recomputing the private lock hash here made the assertion depend on path-normalization details instead of the lock guarantee.
@@ -447,6 +450,7 @@ run_spawn() {
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
     FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
+    FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE="${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" \
     FM_FAKE_TREEHOUSE_RETURN_MARKER="${FM_FAKE_TREEHOUSE_RETURN_MARKER:-}" \
     FM_TEST_REAL_PS="${FM_TEST_REAL_PS:-}" \
@@ -467,11 +471,12 @@ run_spawn() {
 }
 
 run_teardown() {
-  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
@@ -3204,24 +3209,36 @@ test_continuation_fails_closed_without_original_brief() {
 }
 
 test_session_sync_cannot_recreate_metadata_after_teardown() {
-  local id rec release_marker sync_pid teardown_pid sync_rc teardown_rc meta_tmp
+  local id rec release_marker sync_pid teardown_pid sync_rc teardown_rc meta_tmp primary
   id=account-sync-race-z23
   rec=$(make_case sync-race claude "$id")
   read_case "$rec"
+  primary="$CASE_DIR/primary-home"
+  git clone --quiet --no-hardlinks "$ROOT" "$primary"
+  git -C "$primary" branch --force main HEAD
+  git -C "$primary" checkout --quiet main
+  git -C "$primary" remote remove origin
+  FM_TEST_ROOT_OVERRIDE=$primary
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session sync race precondition spawn failed"
   rm -f "$CASE_DIR/endpoint-live"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
+  write_teardown_completion_report "$id"
   release_marker="$CASE_DIR/lease-released"
-  FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_SLEEP=1 \
+  FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_RETURN_SLEEP=1 \
     run_teardown "$id" --force > "$CASE_DIR/teardown-stdout" 2> "$CASE_DIR/teardown-stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 100); do
     [ -f "$release_marker" ] && break
     sleep 0.1
   done
-  [ -f "$release_marker" ] || { kill "$teardown_pid" 2>/dev/null || true; fail "session sync race never reached managed account cleanup"; }
+  [ -f "$release_marker" ] || {
+    kill "$teardown_pid" 2>/dev/null || true
+    wait "$teardown_pid" 2>/dev/null
+    teardown_rc=$?
+    fail "session sync race never reached managed account cleanup (teardown $teardown_rc; Agent Fleet: $(cat "$AF_LOG"); Treehouse: $(cat "$TREEHOUSE_LOG")): $(cat "$CASE_DIR/teardown-stdout" "$CASE_DIR/teardown-stderr")"
+  }
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" FM_FAKE_AF_LOG="$AF_LOG" \
@@ -6012,6 +6029,11 @@ if [ "${FM_TEST_FOCUSED:-}" = rollback-cleanup-retry ]; then
   run_isolated_test test_failed_cleanup_persists_retryable_metadata
   run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
   run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = session-sync-teardown-race ]; then
+  run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
   exit 0
 fi
 

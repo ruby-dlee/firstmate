@@ -4975,7 +4975,7 @@ SH
 }
 
 test_account_locks_never_reclaim_on_indeterminate_process_probe() {
-  local case_dir state fake_ps ps_env_log kind acquire held owner_pid inode_before inode_after owner_before owner_after status
+  local case_dir state fake_ps ps_env_log kind held owner_pid owner_start inode_before inode_after owner_before owner_after status
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/account-lock-indeterminate-ps"
   state="$case_dir/state"
@@ -5001,14 +5001,12 @@ SH
   chmod +x "$fake_ps"
 
   for kind in meta lifecycle; do
-    if [ "$kind" = meta ]; then
-      acquire=fm_account_meta_lock_acquire
-    else
-      acquire=fm_account_lifecycle_lock_acquire
-    fi
-    held=$($acquire "$state" "indeterminate-$kind") \
-      || fail "could not acquire $kind lock fixture"
-    owner_pid=$(sed -n '1p' "$held")
+    held="$state/.account-$kind-indeterminate-$kind.lock"
+    sleep 30 &
+    owner_pid=$!
+    owner_start=$(fm_account_process_start_time "$owner_pid") \
+      || fail "could not read $kind lock fixture owner identity"
+    printf '%s\n%s\n' "$owner_pid" "$owner_start" > "$held"
     inode_before=$(fm_account_path_inode "$held")
     owner_before=$(cat "$held")
     if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
@@ -5035,7 +5033,9 @@ SH
     owner_after=$(cat "$held")
     [ "$inode_after" = "$inode_before" ] && [ "$owner_after" = "$owner_before" ] \
       || fail "$kind lock identity changed after an indeterminate process probe"
-    fm_account_meta_lock_release "$held" || fail "could not release preserved $kind lock"
+    kill "$owner_pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    rm -f "$held"
   done
   [ -s "$ps_env_log" ] || fail "the pinned ps fixture was never invoked"
   [ "$(sort -u "$ps_env_log")" = '|||' ] \

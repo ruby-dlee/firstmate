@@ -704,6 +704,25 @@ run_teardown_named() {
 test_local_only_fork_remote_allows() {
   local case_dir rc
   case_dir=$(make_case fork-allow)
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+state="$(dirname "$0")/.tmux-live"
+case "${1:-}" in
+  display-message)
+    [ -f "$state" ] || exit 1
+    case "${*: -1}" in
+      *pane_current_command*) printf 'bash\n' ;;
+      *session_name*window_name*) printf 'firstmate\tfm-task-x1\n' ;;
+      *) printf '%%1\n' ;;
+    esac
+    exit 0
+    ;;
+  list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1; exit 0 ;;
+  kill-window) rm -f "$state"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
   write_meta "$case_dir" local-only ship
   wt_commit "$case_dir" "fix the thing"
   add_fork_with_pushed_branch "$case_dir"

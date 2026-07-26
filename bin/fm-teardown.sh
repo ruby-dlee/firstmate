@@ -114,6 +114,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-treehouse-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 TEARDOWN_UPSTREAM_TIMEOUT=${FM_CHECKOUT_REFRESH_PROBE_TIMEOUT:-15}
@@ -978,62 +980,6 @@ exact_git_worktree_root() {
   printf '%s\n' "$canonical"
 }
 
-treehouse_state_for_worktree() {
-  local worktree=$1 slot pool state
-  slot=$(canonical_existing_dir "$(dirname "$worktree")") || return 1
-  pool=$(canonical_existing_dir "$(dirname "$slot")") || return 1
-  state="$pool/treehouse-state.json"
-  [ -f "$state" ] && [ ! -L "$state" ] || return 1
-  printf '%s\n' "$state"
-}
-
-require_treehouse_task_lease() {
-  local worktree=$1 expected_holder=$2 state
-  state=$(treehouse_state_for_worktree "$worktree") || {
-    echo "error: cannot resolve authoritative Treehouse state for $worktree" >&2
-    return 1
-  }
-  python3 - "$state" "$worktree" "$expected_holder" <<'PY'
-import json
-import os
-import sys
-
-state_path, expected_path, expected_holder = sys.argv[1:]
-try:
-    with open(state_path, encoding="utf-8") as stream:
-        state = json.load(stream)
-    worktrees = state["worktrees"]
-    if not isinstance(worktrees, list):
-        raise TypeError("worktrees must be an array")
-    matches = []
-    for entry in worktrees:
-        if not isinstance(entry, dict):
-            continue
-        path = entry.get("path")
-        if not isinstance(path, str) or not path:
-            continue
-        if os.path.realpath(path) == expected_path:
-            matches.append(entry)
-    if len(matches) != 1:
-        raise ValueError("expected exactly one matching worktree entry")
-    entry = matches[0]
-    if entry.get("leased") is not True:
-        raise ValueError("worktree is not durably leased")
-    if entry.get("lease_holder") != expected_holder:
-        raise ValueError(
-            f"lease holder is {entry.get('lease_holder')!r}, expected {expected_holder!r}"
-        )
-    if entry.get("destroying") is True:
-        raise ValueError("worktree is already being destroyed")
-except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-    print(
-        f"error: Treehouse ownership for {expected_path} is unprovable: {error}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-PY
-}
-
 require_treehouse_return_authority() {
   local worktree=$1 project=$2 worktree_root project_root worktree_common project_common
   worktree_root=$(exact_git_worktree_root "$worktree") || return 1
@@ -1048,7 +994,7 @@ require_treehouse_return_authority() {
     echo "error: Treehouse return target $worktree_root is not registered to $project_root" >&2
     return 1
   }
-  require_treehouse_task_lease "$worktree_root" "$3"
+  fm_treehouse_require_task_lease "$worktree_root" "$3"
 }
 
 validate_teardown_target_identity() {
@@ -1083,7 +1029,7 @@ validate_teardown_target_identity() {
     echo "error: teardown worktree is not registered to the recorded project: $worktree_root" >&2
     return 1
   }
-  require_treehouse_task_lease "$worktree_root" "firstmate-$ID"
+  fm_treehouse_require_task_lease "$worktree_root" "firstmate-$ID"
 }
 
 retry_wait_secs_is_valid() {
@@ -3432,7 +3378,7 @@ validate_firstmate_home_for_removal() {
       "secondmate top-level source repository" "$abs_home_path" || return 1
   fi
   if [ -n "$expected_id" ] && firstmate_home_has_treehouse_slot "$abs_home_path" "$expected_source"; then
-    require_treehouse_task_lease "$abs_home_path" "$expected_id" || return 1
+    fm_treehouse_require_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
   validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
   if [ -n "$expected_id" ]; then
@@ -3567,7 +3513,7 @@ validate_firstmate_home_children_removal() {
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       child_proj=$(meta_value "$child_meta" project)
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-      require_treehouse_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
+      fm_treehouse_require_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
       validate_child_worktree_landed_state "$child_meta" "$child_id" "$child_wt" "$child_proj" || return 1
     else
       echo "error: retained child metadata for $child_id because its Treehouse worktree is missing or uninspectable" >&2
@@ -3659,7 +3605,7 @@ cleanup_firstmate_home_children() {
         return 1
       fi
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-      require_treehouse_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
+      fm_treehouse_require_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
     fi
     if managed_account_meta "$child_meta"; then
       child_endpoint_home=$(fm_backend_endpoint_home "$child_backend" "$child_kind" "$home" "$child_home")

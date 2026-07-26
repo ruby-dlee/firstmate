@@ -975,6 +975,8 @@ T=
 WORKTREE_CREATED=0
 WORKTREE_RETAIN_ON_ABORT=0
 WORKTREE_EXPECTED_TIP=
+WORKTREE_ACQUIRE_RECORD=
+WORKTREE_ACQUIRE_OWNER_START=
 META_INSTALLED=0
 META_BACKUP=
 EXISTING_ARTIFACT_BACKUP=
@@ -1425,6 +1427,66 @@ cleanup_continuation_launch_transport() {
   CONTINUATION_PROMPT_CONTENT_ID=
 }
 
+create_worktree_acquisition_record() {
+  local record tmp start
+  start=$(fm_account_process_start_time "$$") || {
+    echo "error: cannot record Treehouse acquisition owner for $ID" >&2
+    return 1
+  }
+  record="$STATE/.worktree-acquire-$ID.pending"
+  [ ! -e "$record" ] && [ ! -L "$record" ] || {
+    echo "error: stale or concurrent Treehouse acquisition record exists for $ID; let auto-reap reconcile it before retrying" >&2
+    return 1
+  }
+  tmp=$(mktemp "$STATE/.worktree-acquire-$ID.XXXXXX") || return 1
+  {
+    printf '%s\n%s\n' "$$" "$start"
+    printf 'id=%s\n' "$ID"
+    printf 'project=%s\n' "$PROJ_ABS"
+    printf 'holder=firstmate-%s\n' "$ID"
+    printf 'kind=%s\nmode=%s\nyolo=%s\n' "$KIND" "$MODE" "$YOLO"
+    printf 'generation_id=%s\nworktree=\n' "$SPAWN_GENERATION_ID"
+  } > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  if ! ln "$tmp" "$record" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "error: could not claim Treehouse acquisition record for $ID" >&2
+    return 1
+  fi
+  rm -f "$tmp"
+  WORKTREE_ACQUIRE_RECORD=$record
+  WORKTREE_ACQUIRE_OWNER_START=$start
+}
+
+record_acquired_worktree() {
+  local tmp
+  [ -n "$WORKTREE_ACQUIRE_RECORD" ] || return 1
+  [ "$(sed -n '1p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$$" ] \
+    && [ "$(sed -n '2p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$WORKTREE_ACQUIRE_OWNER_START" ] || {
+    echo "error: Treehouse acquisition ownership changed for $ID" >&2
+    return 1
+  }
+  tmp=$(mktemp "$STATE/.worktree-acquire-$ID.update.XXXXXX") || return 1
+  if ! sed '/^worktree=/d' "$WORKTREE_ACQUIRE_RECORD" > "$tmp" \
+    || ! printf 'worktree=%s\n' "$WT" >> "$tmp" \
+    || ! mv "$tmp" "$WORKTREE_ACQUIRE_RECORD"; then
+      rm -f "$tmp"
+      return 1
+  fi
+}
+
+clear_worktree_acquisition_record() {
+  [ -n "${WORKTREE_ACQUIRE_RECORD:-}" ] || return 0
+  if [ "$(sed -n '1p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$$" ] \
+    && [ "$(sed -n '2p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$WORKTREE_ACQUIRE_OWNER_START" ]; then
+    rm -f "$WORKTREE_ACQUIRE_RECORD"
+  fi
+  WORKTREE_ACQUIRE_RECORD=
+  WORKTREE_ACQUIRE_OWNER_START=
+}
+
 spawn_return_created_worktree() {
   local return_output return_status
   [ "$WORKTREE_CREATED" = 1 ] || return 0
@@ -1790,6 +1852,14 @@ spawn_abort_cleanup() {
     fi
   fi
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
+  if [ -n "${WORKTREE_ACQUIRE_RECORD:-}" ]; then
+    if [ -f "$STATE/${ID:-unknown}.meta" ] \
+      || { [ "$WORKTREE_CREATED" = 1 ] && [ "$worktree_clean" = 1 ]; }; then
+      clear_worktree_acquisition_record
+    else
+      echo "warning: retained Treehouse acquisition record for ${ID:-unknown}; auto-reap will reconcile any lease after owner death" >&2
+    fi
+  fi
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
   [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
@@ -2634,6 +2704,23 @@ else
   fi
 fi
 
+# Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; AGENTS.md
+# project management and task lifecycle). Resolve it before Treehouse
+# acquisition so the crash-recovery record carries exact teardown authority
+# even if spawn dies before endpoint creation or metadata installation.
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+  MODE=$RECORDED_MODE
+  YOLO=$RECORDED_YOLO
+elif [ "$KIND" = secondmate ]; then
+  MODE=secondmate
+  YOLO=off
+else
+  PROJ_NAME=$(basename "$PROJ_ABS")
+  read -r MODE YOLO <<EOF
+$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
+EOF
+fi
+
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
   RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" "$(fm_meta_get "$RESUME_META" tmux_session_target)" 2>/dev/null)
@@ -2843,6 +2930,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
     echo "error: refusing Treehouse acquisition because pool safety could not be inspected for $PROJ_ABS" >&2
     exit 1
   }
+  create_worktree_acquisition_record || exit 1
   acquire_status=0
   WT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$PROJ_ABS" "firstmate-$ID") || acquire_status=$?
   if [ "$acquire_status" -ne 0 ]; then
@@ -2859,6 +2947,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   }
   WORKTREE_CREATED=1
   WORKTREE_RETAIN_ON_ABORT=1
+  record_acquired_worktree || exit 1
   validate_spawn_worktree "treehouse get --lease" "$PROJ_ABS"
   freshness_status=0
   "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$WT" "$PROJ_ABS" || freshness_status=$?
@@ -3101,23 +3190,6 @@ EOF
       exclude_path '.fm-grok-turnend'
       ;;
   esac
-fi
-
-# Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; AGENTS.md project management and task lifecycle).
-# Recorded in meta so fm-teardown's safety check and the validate/merge stages can
-# branch on them. Mode governs ship tasks; a scout's deliverable is a report, not a
-# merge, so scout teardown ignores mode.
-if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-  MODE=$RECORDED_MODE
-  YOLO=$RECORDED_YOLO
-elif [ "$KIND" = secondmate ]; then
-  MODE=secondmate
-  YOLO=off
-else
-  PROJ_NAME=$(basename "$PROJ_ABS")
-  read -r MODE YOLO <<EOF
-$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
-EOF
 fi
 
 if [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
@@ -3646,6 +3718,7 @@ fi
 fm_account_safe_file_destination "$STATE/$ID.meta" || { echo "error: unsafe task metadata destination at $STATE/$ID.meta" >&2; exit 1; }
 mv "$META_TMP" "$STATE/$ID.meta"
 META_INSTALLED=1
+clear_worktree_acquisition_record
 [ -z "$META_WRITE_LOCK" ] || fm_account_meta_lock_release "$META_WRITE_LOCK"
 META_WRITE_LOCK=
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0

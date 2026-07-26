@@ -4964,8 +4964,8 @@ SH
     || fail "metadata reclaim ownership was not atomically published"
   rm -rf "$lock"
 
-  mkdir -p "$lock/.reclaiming"
-  printf '999999\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
+  mkdir -p "$lock"
+  printf '999999\nstale-reclaimer\n' > "$lock/.reclaiming"
   touch -t 200001010000 "$lock" "$lock/.reclaiming"
   FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
     bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \

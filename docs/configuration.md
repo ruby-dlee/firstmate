@@ -469,9 +469,9 @@ These paths need `jq` to build the JSON payload, but they run before token and n
 
 ## Watcher overrides (config/watcher.env)
 
-Put home-local watcher environment assignments in the optional, gitignored `config/watcher.env`.
+Put home-local watcher environment assignments in the optional, gitignored `config/watcher.env`, or in the corresponding directory selected by `FM_CONFIG_OVERRIDE`.
 `bin/fm-watch.sh` sources this file before reading its cadence settings, so every arm and foreground checkpoint inherits the same values without an inline environment prefix on the protected arm command.
-For example, `FM_PAUSE_RESURFACE_SECS=7200` changes a declared external wait's recheck cadence to two hours.
+For example, `FM_PAUSE_RESURFACE_SECS=7200` changes a declared external wait's normal-watcher recheck cadence to two hours.
 The watcher refuses a symlink or non-regular file at this path.
 Inline assignments on `bin/fm-watch-arm.sh` remain outside the arm hook's blessed command tree; use this file for persistent watcher tuning.
 

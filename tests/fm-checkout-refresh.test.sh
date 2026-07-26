@@ -456,7 +456,7 @@ SH
   out=$(FM_REAL_GIT="$real_git" PATH="$fakebin:$PATH" \
     run_isolated_refresh "$home" "$state" run-once --force 2>&1)
   status=$?
-  set -e
+  set +e
   [ "$status" -ne 0 ] || fail "uninspectable discovered Git identity reported healthy coverage"
   assert_contains "$out" "discovered Git identity cannot be inspected or disproved:" \
     "discovered rev-parse failure was classified as a non-Git directory"
@@ -928,7 +928,9 @@ test_lock_root_failure_invalidates_coverage_before_preparation() {
     FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
     "$ROOT/bin/fm-checkout-refresh.sh" run-once --force 2>&1)
   status=$?
-  set -e
+  # This suite intentionally runs without errexit; do not leak the temporary
+  # failure-capture setting into the remaining fail-closed cases.
+  set +e
 
   [ "$status" -ne 0 ] || fail "unsafe lock-root preparation preserved healthy coverage"
   assert_contains "$out" "unsafe checkout-refresh lock directory: $bad_lock" \
@@ -1546,12 +1548,12 @@ SH
 
   set +e
   out=$(FM_TEST_REAL_GIT="$real_git" FM_TEST_FETCH_PARENT="$TMP_ROOT/fetch-parent.pid" \
-    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=1 \
+    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=5 \
     PATH="$fakebin:$PATH" run_refresh run-once --force 2>&1)
   status=$?
   set -e
   [ "$status" -eq 0 ] || fail "bounded refresh command failed unexpectedly: $out"
-  assert_contains "$out" "refresh timed out after 1s" \
+  assert_contains "$out" "refresh timed out after 5s" \
     "bounded refresh did not report its timeout"
   assert_refresh_state "$STATE_ROOT" unhealthy
   parent_pid=$(cat "$TMP_ROOT/fetch-parent.pid")

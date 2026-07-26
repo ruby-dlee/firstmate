@@ -428,7 +428,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -2042,9 +2042,15 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2 home_abs
-  git clone --quiet --no-hardlinks "$ROOT" "$home"
-  git -C "$home" checkout --quiet --detach "$(git -C "$ROOT" rev-parse main)"
+  local home=$1 id=$2 home_abs primary
+  primary="$CASE_DIR/primary-home"
+  git clone --quiet --no-hardlinks "$ROOT" "$primary"
+  git -C "$primary" branch --force main HEAD
+  git -C "$primary" checkout --quiet main
+  git -C "$primary" remote remove origin
+  git clone --quiet --no-hardlinks "$primary" "$home"
+  git -C "$home" checkout --quiet --detach "$(git -C "$primary" rev-parse main)"
+  FM_TEST_ROOT_OVERRIDE=$primary
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
   home_abs=$(cd "$home" && pwd -P)
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"

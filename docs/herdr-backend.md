@@ -230,9 +230,8 @@ Sanitization therefore happens before Bash can import `BASH_ENV`, `SHELLOPTS=xtr
 
 The detached grandchild durably publishes a private schema-v2 certificate containing the session hash, PID/process-start token, exact content-addressed helper path plus SHA-256 and file identity, and exact managed-config path plus SHA-256 and file identity before it execs the verified Herdr server.
 Certificate, helper, and config verification opens with `O_NOFOLLOW`, hashes through the descriptor, and rechecks descriptor/path identity after the read.
-An enforced spawn accepts Herdr only when those recorded objects still match, the reviewed source helper still has the recorded digest, the config bytes still pin that exact helper, and the certified process identity is live.
-The check runs after server ensure and immediately before any routed tab is created.
-A manual, restored, pre-upgrade, dead, PID-reused, helper-replaced, config-replaced, or post-update server has no valid proof and fails closed.
+The explicit certified-lifecycle test lab accepts Herdr only when those recorded objects still match, the reviewed source helper still has the recorded digest, the config bytes still pin that exact helper, and the certified process identity is live.
+Production native-agent spawning no longer requires this server certificate because `agent start --env` supplies each new agent's environment directly.
 
 Helper, config, certificate, and lifecycle-lock publication use private candidate files.
 Recovery removes only a current-user, exact-mode candidate whose numeric owner PID is proven absent and whose age exceeds the startup stale threshold; foreign, live, malformed, or otherwise indeterminate candidates are never deleted.
@@ -242,11 +241,14 @@ A last-check substitution is preserved in quarantine and the operation fails clo
 These controls defend against other users, ambient shell configuration, accidental Desktop/provider activity, and ordinary release switches.
 They do not claim to defeat a malicious process already running as the same Unix uid: portable shell cannot atomically bind an already-validated executable inode to the later `exec`, and a same-uid attacker can race user-owned paths between checks.
 That residual is explicit; the adapter revalidates immediately before use and keeps the verified install and lock paths private to make normal non-hostile mutation fail closed.
-The regression suite covers hostile `PATH`, Perl/loader variables, unsafe ancestry, hardlinks, cached-leaf mutation, unsafe lock parents, hostile `TMPDIR`, a detached descendant that retains a safe user tool while excluding a writable search directory, inherited `BASH_ENV` plus `SHELLOPTS=xtrace`, exact managed-config shape, certificate liveness, helper/config replacement and source-update drift, guarded helper/config/certificate candidate recovery, last-check substitution quarantine, serialized exact-empty drift restart, occupied/indeterminate refusal before workspace mutation, and refusal of every uncertified production backend before Fleet, lease, or endpoint mutation.
+The regression suite covers hostile `PATH`, Perl/loader variables, unsafe ancestry, hardlinks, cached-leaf mutation, unsafe lock parents, hostile `TMPDIR`, a detached descendant that retains a safe user tool while excluding a writable search directory, inherited `BASH_ENV` plus `SHELLOPTS=xtrace`, exact managed-config shape, certificate liveness, helper/config replacement and source-update drift, guarded helper/config/certificate candidate recovery, last-check substitution quarantine, serialized exact-empty drift restart, occupied drift routing without restart, indeterminate drift refusal before workspace mutation, and refusal of every uncertified legacy-lab backend before Fleet, lease, or endpoint mutation.
 
-`fm_backend_herdr_server_ensure` reuses a server only when its full current-release process/helper/config certificate verifies under the lifecycle lock.
-For an older adapter-owned certificate, it queries the explicitly named session's workspace, tab, and pane collections and stops only that exact session after two complete empty proofs plus repeated process-ownership proof; it then performs the detached launch and current-release recertification before releasing the lock.
-Occupied, unreadable/indeterminate, manual, or uncertified servers are never stopped or routed.
+In production, `fm_backend_herdr_server_ensure` reuses any running server because native `agent start --env` owns new-agent environment isolation independently of the server shell.
+Under the explicit legacy certified-lifecycle lab path, a full current-release process/helper/config certificate is reused under the lifecycle lock.
+For an older adapter-owned certificate, the adapter queries the explicitly named session's workspace, tab, and pane collections.
+An exact-empty session is stopped only after two complete empty proofs plus repeated process-ownership proof, then detached-launched and recertified before the lock is released.
+An occupied session - one reporting any workspace, tab, or pane - is not restarted; routing continues in that same running session and may create the workspace for the native-agent spawn path.
+Unreadable or indeterminate state still refuses before workspace mutation, and manual or uncertified ownership still fails closed.
 This convergence path never uses ambient `herdr server stop`, never deletes session state (including `default`), and never moves Herdr ownership into a captain launcher.
 
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker

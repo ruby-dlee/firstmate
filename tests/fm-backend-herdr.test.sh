@@ -1190,8 +1190,17 @@ SH
   pass "attributed cleanup recovers every nlink1 candidate and exact-lock phase while preserving foreign/occupied states"
 }
 
-test_server_ensure_converges_only_adapter_owned_exact_empty_drift() {
-  local dir fb fake source ps_fake mode case_dir lock_root running pids state log mutation old_pid new_pid out status
+test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart() {
+  local dir fb fake source ps_fake case_dir lock_root running pids state log mutation old_pid new_pid out status
+  # This fixture exercises the legacy certified-lifecycle lab path retained
+  # behind FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE:
+  # - release-drifted means the running process has a valid adapter-owned
+  #   legacy certificate but not the current release's closed-shell certificate;
+  # - occupied means the exact named session reports at least one workspace,
+  #   tab, or pane;
+  # - restarted means that exact session is stopped and a new server is launched;
+  # - routed means container ensure continues in the same running session and
+  #   reaches workspace creation for the native-agent spawn path.
   dir="$TMP_ROOT/herdr-certified-lifecycle"
   fb="$dir/fakebin"
   fake="$fb/herdr"
@@ -1312,47 +1321,94 @@ SH
   [ ! -e "$mutation" ] || fail "server lifecycle decision created a workspace before recertification"
   kill "$new_pid" 2>/dev/null || true
 
-  for mode in occupied indeterminate; do
-    case_dir="$dir/$mode"
-    lock_root="$case_dir/locks"
-    running="$case_dir/running"
-    pids="$case_dir/pids"
-    state="$case_dir/state"
-    log="$case_dir/log"
-    mutation="$case_dir/workspace-created"
-    mkdir -p "$lock_root"
-    chmod 700 "$lock_root"
-    printf '%s\n' "$mode" > "$state"
-    : > "$log"
-    /bin/sleep 30 & old_pid=$!
-    printf '%s\n' "$old_pid" > "$pids"
-    : > "$running"
-    write_legacy_certificate "fm-$mode" || fail "could not establish legacy adapter ownership for $mode refusal"
-    if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
-      FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
-      FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
-      FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
-      FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
-      FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
-      HERDR_SESSION="fm-$mode" \
-      /bin/bash --noprofile --norc -c '
-        . "$0/bin/backends/herdr.sh"
-        fm_backend_herdr_container_ensure "$PWD"
-      ' "$ROOT" "fm-$mode" 2>&1); then status=0; else status=$?; fi
-    [ "$status" -ne 0 ] || fail "$mode release-drifted server was restarted or routed"
-    assert_contains "$out" "$mode" "$mode drift refusal was not explicit"
-    kill -0 "$old_pid" 2>/dev/null || fail "$mode refusal stopped the existing adapter server"
-    assert_no_grep $'\x1fsession\x1fstop' "$log" \
-      "$mode refusal stopped the server before its lifecycle decision"
-    assert_no_grep $'\x1fserver\x1f--session' "$log" \
-      "$mode refusal launched a server before its lifecycle decision"
-    assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
-      "$mode refusal created a workspace before its lifecycle decision"
-    [ ! -e "$mutation" ] || fail "$mode refusal reached workspace creation"
-    kill "$old_pid" 2>/dev/null || true
-    wait "$old_pid" >/dev/null 2>&1 || true
-  done
-  pass "server ensure serializes certificate drift: exact-empty restarts safely; occupied/indeterminate refuse before workspace mutation"
+  case_dir="$dir/occupied"
+  lock_root="$case_dir/locks"
+  running="$case_dir/running"
+  pids="$case_dir/pids"
+  state="$case_dir/state"
+  log="$case_dir/log"
+  mutation="$case_dir/workspace-created"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  printf 'occupied\n' > "$state"
+  : > "$log"
+  /bin/sleep 30 & old_pid=$!
+  printf '%s\n' "$old_pid" > "$pids"
+  : > "$running"
+  write_legacy_certificate fm-occupied \
+    || fail "could not establish release-drifted adapter ownership for occupied routing"
+  if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+    FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    HERDR_SESSION=fm-occupied \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_container_ensure "$PWD"
+    ' "$ROOT" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || {
+    printf '%s\n' "$out" >&2
+    fail "occupied release-drifted server did not continue routing"
+  }
+  assert_contains "$out" $'fm-occupied:w1\tw1:t1' \
+    "occupied release-drifted routing did not return its same-session container"
+  kill -0 "$old_pid" 2>/dev/null \
+    || fail "occupied release-drifted routing restarted the existing adapter server"
+  assert_no_grep $'\x1fsession\x1fstop' "$log" \
+    "occupied release-drifted routing stopped the existing server"
+  assert_no_grep $'\x1fserver\x1f--session' "$log" \
+    "occupied release-drifted routing launched a replacement server"
+  assert_grep $'\x1fworkspace\x1fcreate' "$log" \
+    "occupied release-drifted routing did not reach workspace creation"
+  [ -e "$mutation" ] \
+    || fail "occupied release-drifted routing did not reach workspace creation"
+  kill "$old_pid" 2>/dev/null || true
+  wait "$old_pid" >/dev/null 2>&1 || true
+
+  case_dir="$dir/indeterminate"
+  lock_root="$case_dir/locks"
+  running="$case_dir/running"
+  pids="$case_dir/pids"
+  state="$case_dir/state"
+  log="$case_dir/log"
+  mutation="$case_dir/workspace-created"
+  mkdir -p "$lock_root"
+  chmod 700 "$lock_root"
+  printf 'indeterminate\n' > "$state"
+  : > "$log"
+  /bin/sleep 30 & old_pid=$!
+  printf '%s\n' "$old_pid" > "$pids"
+  : > "$running"
+  write_legacy_certificate fm-indeterminate \
+    || fail "could not establish release-drifted adapter ownership for indeterminate refusal"
+  if out=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_LOG="$log" FM_FAKE_HERDR_RUNNING="$running" \
+    FM_FAKE_HERDR_SERVER_PIDS="$pids" FM_FAKE_HERDR_STATE="$state" \
+    FM_FAKE_HERDR_MUTATION="$mutation" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
+    HERDR_SESSION=fm-indeterminate \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_container_ensure "$PWD"
+    ' "$ROOT" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "indeterminate release-drifted server was routed"
+  assert_contains "$out" "indeterminate" "indeterminate drift refusal was not explicit"
+  kill -0 "$old_pid" 2>/dev/null \
+    || fail "indeterminate drift refusal stopped the existing adapter server"
+  assert_no_grep $'\x1fsession\x1fstop' "$log" \
+    "indeterminate drift refusal stopped the server before its lifecycle decision"
+  assert_no_grep $'\x1fserver\x1f--session' "$log" \
+    "indeterminate drift refusal launched a server before its lifecycle decision"
+  assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
+    "indeterminate drift refusal created a workspace before its lifecycle decision"
+  [ ! -e "$mutation" ] || fail "indeterminate drift refusal reached workspace creation"
+  kill "$old_pid" 2>/dev/null || true
+  wait "$old_pid" >/dev/null 2>&1 || true
+
+  pass "server ensure serializes certificate drift: exact-empty restarts, occupied routes without restart, and indeterminate refuses"
 }
 
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir() {
@@ -3203,7 +3259,7 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 test_send_text_submit_detects_landed_send() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text (literal, no output)
+  # 1: native agent send (literal, no output)
   # 2: agent get - pre-Enter baseline is idle
   # 3: send-keys enter
   # 4: agent get - agent_status working (a real turn started: submitted)
@@ -3213,7 +3269,8 @@ test_send_text_submit_detects_landed_send() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 3 0.01 0.01' "$ROOT" )
   [ "$out" = empty ] || fail "send_text_submit should report empty (submitted) once agent_status reports working, got '$out'"
-  assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-text'$'\x1f''w1:p2'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
+  assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''send'$'\x1f''w1:p2'$'\x1f''hello captain' \
+    "send_text_submit did not address the registered agent with the literal text first"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "send_text_submit should not need a second Enter for a plain message with no popup, sent $enter_count Enter(s)"
   [ "$(grep -c $'\x1f''pane'$'\x1f''read' "$log")" -eq 0 ] || fail "send_text_submit must never read the composer/pane content for confirmation anymore"
@@ -3370,12 +3427,14 @@ test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter() {
 test_send_text_submit_send_failed() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # Native agent send fails, then the recovery/husk pane-send fallback fails.
   printf '1\n' > "$resp/1.exit"
+  printf '1\n' > "$resp/2.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
   [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the literal send itself fails, got '$out'"
-  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when the literal send-text call itself errors"
+  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send and the pane-send fallback both error"
 }
 
 test_send_text_submit_unknown_on_capture_failure() {
@@ -3511,11 +3570,31 @@ EOF
 }
 
 test_repeated_cycles_reuse_one_workspace_no_orphans() {
-  local dir log state fb i raw container seeded wsid ids pane first_ws="" wscount total tabcount created
-  dir="$TMP_ROOT/cycles"; mkdir -p "$dir"; log="$dir/log"; state="$dir/state.json"; : > "$log"
+  local dir log state fb lock_root owner_pid i raw container seeded wsid ids pane first_ws="" wscount total tabcount created
+  dir="$TMP_ROOT/cycles"
+  lock_root="$dir/locks"
+  mkdir -p "$dir" "$lock_root"
+  chmod 700 "$lock_root"
+  log="$dir/log"; state="$dir/state.json"; : > "$log"
   fb=$(make_herdr_statefake "$dir")
+  # fm_backend_herdr_kill now shares the read/steer safety gate: a running
+  # server must be adapter-owned before an existing pane can be addressed.
+  # Model that ownership with a valid legacy certificate bound to this test
+  # process; leaving it absent would make best-effort kill correctly no-op.
+  owner_pid=$$
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" OWNER_PID="$owner_pid" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
+      certificate=$(fm_backend_herdr_server_legacy_env_certificate_path fmtest) || exit 1
+      start=$(fm_backend_herdr_process_start "$OWNER_PID") || exit 1
+      printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+        "$key" "$OWNER_PID" "$start" > "$certificate" || exit 1
+      chmod 600 "$certificate"
+    ' "$ROOT" || fail "could not establish adapter ownership for repeated-cycle teardown"
   for i in 1 2 3; do
     raw=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+      FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /proj' "$ROOT" ) \
       || fail "cycle $i: container_ensure failed"
     container=${raw%%$'\t'*}
@@ -3530,6 +3609,7 @@ test_repeated_cycles_reuse_one_workspace_no_orphans() {
       [ -z "$seeded" ] || fail "cycle $i: a REUSED (adopted) workspace must never report a seeded default tab id, got '$seeded'"
     fi
     ids=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+      FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task "$1" "$2" /proj "$3"' "$ROOT" "$container" "fm-cycle$i" "$seeded" ) \
       || fail "cycle $i: create_task failed"
     read -r _ pane <<EOF
@@ -3537,6 +3617,7 @@ $ids
 EOF
     [ -n "$pane" ] || fail "cycle $i: create_task returned no pane id"
     PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+      FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_kill "$1"' "$ROOT" "fmtest:$pane" \
       || fail "cycle $i: kill failed"
   done
@@ -4074,7 +4155,7 @@ if [ "${FM_TEST_FOCUSED:-}" = published-pair ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = server-cert-lifecycle ]; then
-  test_server_ensure_converges_only_adapter_owned_exact_empty_drift
+  test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart
   exit 0
 fi
 
@@ -4095,7 +4176,7 @@ test_managed_shell_certificate_rejects_release_and_artifact_drift
 test_managed_artifact_candidate_recovery_is_guarded
 test_managed_artifact_recovers_every_published_pair_crash_boundary
 test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
-test_server_ensure_converges_only_adapter_owned_exact_empty_drift
+test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id

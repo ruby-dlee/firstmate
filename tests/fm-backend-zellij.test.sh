@@ -962,9 +962,49 @@ PY
 }
 
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
-  local dir state data config home project fb out status child_title
-  dir="$TMP_ROOT/teardown-zellij-secondmate-child"; state="$dir/state"; data="$dir/data"; config="$dir/config"; home="$dir/secondmate-home"; project="$dir/project"
-  mkdir -p "$state" "$data" "$config" "$home/state" "$home/data" "$home/config" "$home/projects" "$project" "$dir/responses"
+  local dir state data config upstream source home project child_worktree fb out status child_title
+  dir="$TMP_ROOT/teardown-zellij-secondmate-child"; state="$dir/state"; data="$dir/data"; config="$dir/config"; upstream="$dir/upstream.git"; source="$dir/source"; home="$dir/secondmate-home"; project="$dir/project"
+  child_worktree="$dir/treehouse/slot/worktree"
+  mkdir -p "$state" "$data" "$config" "$project" "$(dirname "$child_worktree")" "$dir/responses"
+  git clone -q --no-local --bare "$ROOT" "$upstream"
+  git -C "$upstream" symbolic-ref HEAD refs/heads/main
+  git -C "$upstream" repack -adq
+  git -C "$upstream" prune-packed
+  git clone -q --no-local --single-branch --branch main "$upstream" "$source"
+  git -C "$source" repack -adq
+  git -C "$source" prune-packed
+  git clone -q --no-local --single-branch --branch main "$source" "$home"
+  git -C "$home" remote set-head origin main
+  git -C "$home" repack -adq
+  git -C "$home" prune-packed
+  mkdir -p "$home/state" "$home/data/childz" "$home/config" "$home/projects"
+  git -C "$project" init -q
+  fm_git_identity fmtest fmtest@example.invalid "$project"
+  printf 'base\n' > "$project/base.txt"
+  git -C "$project" add base.txt
+  git -C "$project" commit -qm base
+  git -C "$project" worktree add -q "$child_worktree"
+  python3 - "$dir/treehouse/treehouse-state.json" "$child_worktree" <<'PY'
+import json
+import sys
+
+state, worktree = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "slot",
+                    "path": worktree,
+                    "leased": True,
+                    "lease_holder": "firstmate-childz",
+                }
+            ]
+        },
+        stream,
+    )
+PY
+  printf 'report\n' > "$home/data/childz/report.md"
   printf 'smz\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$state/smz.meta" \
     "window=firstmate:99" \
@@ -974,11 +1014,13 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
     "kind=secondmate" \
     "mode=secondmate" \
     "home=$home"
+  printf -- '- smz - zellij child cleanup (home: %s; scope: test cleanup; projects: ; added 2026-07-26)\n' \
+    "$home" > "$data/secondmates.md"
   fm_write_meta "$home/state/childz.meta" \
     "window=firstmate:7" \
     "backend=zellij" \
     "zellij_tab_id=4" \
-    "worktree=$dir/missing-child-worktree" \
+    "worktree=$child_worktree" \
     "project=$project" \
     "kind=scout"
   child_title=$(zellij_expected_scoped_title fm-childz "$home" "$home")
@@ -990,20 +1032,29 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   for a in "$@"; do printf '\x1f%s' "$a"; done
   printf '\n'
 } >> "$FM_ZELLIJ_LOG"
-if [ "${1:-}" = list-sessions ]; then
+if [[ "$*" == *'action close-tab-by-id'* ]]; then
+  : > "$FM_ZELLIJ_CLOSED"
+elif [ "${1:-}" = list-sessions ]; then
   printf 'firstmate\n'
 elif [[ "$*" == *'action list-panes --json'* ]]; then
-  printf '[{"id":7,"tab_id":4,"is_plugin":false}]\n'
+  if [ -f "$FM_ZELLIJ_CLOSED" ]; then printf '[]\n'; else printf '[{"id":7,"tab_id":4,"is_plugin":false}]\n'; fi
 elif [[ "$*" == *'action list-tabs --json'* ]]; then
-  printf '[{"tab_id":4,"name":"%s"}]\n' "$FM_ZELLIJ_CHILD_TITLE"
+  if [ -f "$FM_ZELLIJ_CLOSED" ]; then printf '[]\n'; else printf '[{"tab_id":4,"name":"%s"}]\n' "$FM_ZELLIJ_CHILD_TITLE"; fi
 fi
 SH
-  chmod +x "$dir/fakebin/zellij"
+  cat > "$dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$dir/fakebin/zellij" "$dir/fakebin/treehouse"
   fb="$dir/fakebin"
-  out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_ROOT_OVERRIDE="$ROOT" \
-    FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_CHILD_TITLE="$child_title" \
-    "$ROOT/bin/fm-teardown.sh" smz --force 2>&1 )
+  out=$( (
+    ulimit -n 4096 2>/dev/null || true
+    PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_ROOT_OVERRIDE="$source" FM_PROJECTS_OVERRIDE="$project" \
+      FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_CHILD_TITLE="$child_title" FM_ZELLIJ_CLOSED="$dir/closed" \
+      "$ROOT/bin/fm-teardown.sh" smz --force
+  ) 2>&1 )
   status=$?
   expect_code 0 "$status" "fm-teardown should force-retire a secondmate with a zellij child: $out"
   assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''4' \
@@ -1175,6 +1226,10 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
 fi
 if [ "${FM_TEST_FOCUSED:-}" = teardown-absent-worktree ]; then
   test_teardown_accepts_registered_absent_worktree
+  exit 0
+fi
+if [ "${FM_TEST_FOCUSED:-}" = teardown-secondmate-zellij ]; then
+  test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
   exit 0
 fi
 

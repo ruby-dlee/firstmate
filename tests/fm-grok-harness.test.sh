@@ -36,6 +36,7 @@ if [ "${1:-}" = get ]; then
     [ "$previous" != --lease-holder ] || lease_holder=$argument
     previous=$argument
   done
+  git -C "${FM_FAKE_TREEHOUSE_PATH:?}" checkout --quiet --detach "$(git rev-parse HEAD)"
   pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
   printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"%s","destroying":false}]}\n' \
     "$FM_FAKE_TREEHOUSE_PATH" "$lease_holder" > "$pool/treehouse-state.json"

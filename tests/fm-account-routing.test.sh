@@ -3216,7 +3216,7 @@ test_continuation_fails_closed_without_original_brief() {
   clear_case_logs
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
     FM_DATA_OVERRIDE="$HOME_DIR/data" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
-    FM_FAKE_TMUX_LOG="$TMUX_LOG" PATH="$FAKEBIN_DIR:$PATH" \
+    FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_TEST_REAL_GIT="$REAL_GIT" PATH="$FAKEBIN_DIR:$PATH" \
     "$CONTINUATION" "$id" missing-brief 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "continuation without original brief unexpectedly succeeded"

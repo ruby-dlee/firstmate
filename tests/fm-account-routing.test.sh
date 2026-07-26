@@ -2096,7 +2096,7 @@ make_seeded_secondmate_home() {
     "$id" "$home_abs" > "$HOME_DIR/data/secondmates.md"
 }
 
-test_secondmate_pool_is_nonactivating_and_noninherited() {
+test_pool_only_secondmate_stays_routing_off() {
   local id rec sm out status
   id=account-secondmate-off-z10
   rec=$(make_case secondmate-off claude)
@@ -2107,14 +2107,14 @@ test_secondmate_pool_is_nonactivating_and_noninherited() {
 
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -eq 0 ] || fail "pool-only secondmate spawn should stay legacy/off (exit $status): $out"
-  [ ! -s "$AF_LOG" ] || fail "secondmate pool activated Agent Fleet while routing was off: $(cat "$AF_LOG")"
-  assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "off secondmate wrote account metadata"
+  [ "$status" -eq 0 ] || fail "pool-only secondmate spawn should keep account routing off (exit $status): $out"
+  [ ! -s "$AF_LOG" ] || fail "pool-only secondmate spawn activated legacy Agent Fleet while routing was off: $(cat "$AF_LOG")"
+  assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "pool-only secondmate spawn entered an account-routing path"
   assert_absent "$sm/config/secondmate-account-pool" "secondmate account pool leaked into the child home"
-  pass "the primary secondmate pool is non-inherited and does not activate routing by itself"
+  pass "a primary secondmate pool stays non-inherited and does not activate routing by itself"
 }
 
-test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
+test_enabled_secondmate_uses_legacy_agent_fleet_not_direct_account_directory() {
   local id rec sm out status
   id=account-secondmate-enforce-z11
   rec=$(make_case secondmate-enforce claude)
@@ -2130,12 +2130,12 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
     run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "enforced secondmate spawn should succeed (exit $status): $out"
-  assert_regex "lease choose --pool claude-captains --task .*-$id-.* --provider claude" "$AF_LOG" "secondmate did not use its primary-owned account pool"
+  assert_regex "lease choose --pool claude-captains --task .*-$id-.* --provider claude" "$AF_LOG" "enabled secondmate routing did not use legacy Agent Fleet"
   assert_grep 'account_pool=claude-captains' "$HOME_DIR/state/$id.meta" "secondmate meta lost its account pool"
-  assert_not_grep '^account_home=' "$HOME_DIR/state/$id.meta" "secondmate entered direct account-directory routing"
+  assert_not_grep '^account_home=' "$HOME_DIR/state/$id.meta" "enabled secondmate routing silently entered the direct account-directory path"
   [ "$(cat "$sm/config/account-routing-mode" 2>/dev/null)" = enforce ] || fail "account routing mode did not inherit into the secondmate home"
   assert_absent "$sm/config/secondmate-account-pool" "primary-only secondmate pool leaked into the child home"
-  pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
+  pass "enabled secondmate routing uses legacy Agent Fleet and never direct account directories"
 }
 
 test_explicit_secondmate_route_preserves_ambient_primary_enforce() {
@@ -6077,7 +6077,8 @@ if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
-  run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+  run_isolated_test test_pool_only_secondmate_stays_routing_off
+  run_isolated_test test_enabled_secondmate_uses_legacy_agent_fleet_not_direct_account_directory
   exit 0
 fi
 
@@ -6374,8 +6375,8 @@ run_isolated_test test_native_resume_migrates_legacy_session_mapping_after_launc
 run_isolated_test test_native_resume_rejects_zero_sequence_on_current_schema
 run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
 run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
-run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
-run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+run_isolated_test test_pool_only_secondmate_stays_routing_off
+run_isolated_test test_enabled_secondmate_uses_legacy_agent_fleet_not_direct_account_directory
 run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
 run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
 run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode

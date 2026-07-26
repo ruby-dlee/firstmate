@@ -32,7 +32,7 @@ BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 # Deterministic, isolated git identity for fixture commits.
 fm_git_identity fmtest fmtest@example.com
 
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-sync)
+fm_test_tmproot_into TMP_ROOT fm-secondmate-sync
 export FM_BACKEND=tmux
 export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 
@@ -405,7 +405,7 @@ case "\$cmd \$sub" in
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
     fi
     ;;
-  "pane send-text"|"pane run"|"pane send-keys")
+  "agent send"|"pane send-text"|"pane run"|"pane send-keys")
     if [ "\$arg" = "${stale#*:}" ]; then
       exit 1
     fi
@@ -529,6 +529,7 @@ test_spawn_fast_forwards_before_launch() {
   printf 'sm\n' > "$w/sm/.fm-secondmate-home"
   mkdir -p "$w/sm/data"
   printf 'charter\n' > "$w/sm/data/charter.md"
+  printf '%s\n' '- sm - sync test (home: '"$w/sm"'; scope: sync test; projects: ; added 2026-07-25)' > "$w/home/data/secondmates.md"
   bump_primary "$w" instr
   c2=$(head_of "$w/main")
   [ "$(head_of "$w/sm")" = "$c1" ] || fail "precondition: home should start behind the primary"
@@ -554,15 +555,16 @@ SH
   pass "T10 spawn fast-forwards a secondmate worktree to the primary's local HEAD before launch"
 }
 
-# --- T11: spawn warns when pre-launch sync is skipped ------------------------
+# --- T11: spawn refuses when pre-launch sync is skipped ----------------------
 test_spawn_warns_when_sync_skipped_before_launch() {
-  local w c1 before fakebin err
+  local w c1 before fakebin err rc=0
   w=$(new_world spawn-skip)
   c1=$(head_of "$w/main")
   git -C "$w/main" worktree add -q --detach "$w/sm" "$c1"
   printf 'sm\n' > "$w/sm/.fm-secondmate-home"
   mkdir -p "$w/sm/data"
   printf 'charter\n' > "$w/sm/data/charter.md"
+  printf '%s\n' '- sm - sync test (home: '"$w/sm"'; scope: sync test; projects: ; added 2026-07-25)' > "$w/home/data/secondmates.md"
   bump_primary "$w" instr
   printf 'uncommitted local edit\n' >> "$w/sm/AGENTS.md"
   before=$(head_of "$w/sm")
@@ -581,14 +583,15 @@ SH
     FM_STATE_OVERRIDE="$w/home/state" FM_DATA_OVERRIDE="$w/home/data" \
     FM_PROJECTS_OVERRIDE="$w/home/projects" FM_CONFIG_OVERRIDE="$w/home/config" \
     FM_SPAWN_NO_GUARD=1 \
-    "$ROOT/bin/fm-spawn.sh" sm "$w/sm" codex --secondmate >/dev/null 2>"$err" || true
+    "$ROOT/bin/fm-spawn.sh" sm "$w/sm" codex --secondmate >/dev/null 2>"$err" || rc=$?
 
+  [ "$rc" -ne 0 ] || fail "spawn launched a secondmate whose home freshness was unresolved"
   assert_contains "$(cat "$err")" \
-    "warning: secondmate sm sync skipped before launch: dirty working tree" \
-    "spawn warning reports the skipped sync reason"
+    "error: refusing secondmate launch because its home freshness is unresolved: secondmate sm: skipped: dirty working tree" \
+    "spawn refusal reports the skipped sync reason"
   [ "$(head_of "$w/sm")" = "$before" ] || fail "dirty spawn home HEAD moved"
   grep -q 'uncommitted local edit' "$w/sm/AGENTS.md" || fail "dirty spawn edit was discarded"
-  pass "T11 spawn warns when pre-launch sync is skipped"
+  pass "T11 spawn refuses when pre-launch sync is skipped"
 }
 
 # --- T12: a freshly seeded home reads clean once the primary ignores the marker -

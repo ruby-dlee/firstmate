@@ -39,21 +39,32 @@ case "${1:-}" in
     ;;
   list-windows)
     if [ -n "${FM_FAKE_TMUX_WINDOW:-}" ]; then
-      printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+      if [ ! -f "$FM_FAKE_TMUX_LOG.killed" ] \
+        || ! grep -Eq ":${FM_FAKE_TMUX_WINDOW}$" "$FM_FAKE_TMUX_LOG.killed"; then
+        printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+      fi
     fi
     exit 0
     ;;
   display-message)
-    target=
+    target= format=
     prev=
     for arg in "$@"; do
       [ "$prev" = -t ] && target=$arg
       prev=$arg
+      format=$arg
     done
     if [ -n "$target" ] && [ -f "$FM_FAKE_TMUX_LOG.killed" ] && grep -qxF "$target" "$FM_FAKE_TMUX_LOG.killed"; then
       exit 1
     fi
-    printf 'firstmate\n'
+    case "$format" in
+      *session_name*window_name*)
+        printf '%s\t%s\n' "${target%%:*}" "${target#*:}"
+        ;;
+      *pane_current_command*) printf 'bash\n' ;;
+      *pane_id*) printf '%%1\n' ;;
+      *) printf 'firstmate\n' ;;
+    esac
     exit 0
     ;;
   list-panes)
@@ -179,13 +190,14 @@ make_firstmate_git_root() {
   local home=$1
   mkdir -p "$home/bin"
   printf '# Firstmate\n' > "$home/AGENTS.md"
+  printf '%s\n' '.fm-secondmate-home' 'config/' 'data/' 'projects/' 'state/' > "$home/.gitignore"
   cat > "$home/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
   chmod +x "$home/bin/fm-guard.sh"
   git -C "$home" init -q
-  git -C "$home" add AGENTS.md bin/fm-guard.sh
+  git -C "$home" add .gitignore AGENTS.md bin/fm-guard.sh
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 

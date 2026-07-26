@@ -27,7 +27,7 @@ set -u
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-lifecycle)
+fm_test_tmproot_into TMP_ROOT fm-secondmate-lifecycle
 export FM_BACKEND=tmux
 
 HOME_DIR="$TMP_ROOT/main home"
@@ -48,6 +48,11 @@ setup_world() {
   fm_git_add_origin "$HOME_DIR/projects/alpha" "$TMP_ROOT/remotes/alpha.git"
   fm_git_add_origin "$HOME_DIR/projects/beta" "$TMP_ROOT/remotes/beta.git"
   fm_git_add_origin "$HOME_DIR/projects/gamma" "$TMP_ROOT/remotes/gamma.git"
+  printf '%s\n' '.no-mistakes-init' '.no-mistakes-doctor' \
+    > "$HOME_DIR/projects/gamma/.gitignore"
+  git -C "$HOME_DIR/projects/gamma" add .gitignore
+  git -C "$HOME_DIR/projects/gamma" commit -qm 'ignore local no-mistakes test state'
+  git -C "$HOME_DIR/projects/gamma" push -q origin main
   cat > "$HOME_DIR/data/projects.md" <<EOF
 - alpha [direct-PR +yolo] - alpha project (added 2026-06-22)
 - beta [direct-PR] - beta project (added 2026-06-22)
@@ -213,7 +218,7 @@ phase_teardown() {
   : > "$LOG"
   teardown_out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-teardown.sh" design 2>&1) \
-    || fail "teardown failed for the empty secondmate home"
+    || fail "teardown failed for the empty secondmate home: $teardown_out"
   printf '%s\n' "$teardown_out" | grep -F 'Backlog:' >/dev/null \
     && fail "secondmate teardown emitted a main-backlog completion reminder"
   assert_absent "$SUB" "teardown did not remove the retired secondmate home"

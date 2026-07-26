@@ -236,6 +236,51 @@ fm_account_real_directory() {
   [ -d "$1" ] && [ ! -L "$1" ]
 }
 
+fm_account_task_tmp_path() {  # <task-id>
+  local task=$1 state
+  fm_account_valid_id "$task" || return 1
+  if [ -n "${STATE:-}" ]; then
+    state=$STATE
+  elif [ -n "${FM_STATE_OVERRIDE:-}" ]; then
+    state=$FM_STATE_OVERRIDE
+  elif [ -n "${FM_HOME:-}" ]; then
+    state=$FM_HOME/state
+  else
+    return 1
+  fi
+  fm_account_real_directory "$state" || return 1
+  state=$(cd "$state" 2>/dev/null && pwd -P) || return 1
+  [ "$state" != / ] || return 1
+  # The physical task-state directory is the run identity. Nesting the temp
+  # root under it prevents cross-home and cross-test collisions, and makes a
+  # suite's ordinary run-root cleanup own task temp even after an early abort.
+  printf '%s/.task-tmp/fm-%s\n' "${state%/}" "$task"
+}
+
+fm_account_legacy_task_tmp_path() {  # <task-id>
+  fm_account_valid_id "$1" || return 1
+  printf '/tmp/fm-%s\n' "$1"
+}
+
+fm_account_task_tmp_is_current() {  # <task-id> <path>
+  local expected
+  expected=$(fm_account_task_tmp_path "$1") || return 1
+  [ "$2" = "$expected" ]
+}
+
+fm_account_task_tmp_is_legacy() {  # <task-id> <path>
+  local legacy
+  legacy=$(fm_account_legacy_task_tmp_path "$1") || return 1
+  [ "$2" = "$legacy" ]
+}
+
+fm_account_task_tmp_is_expected() {  # <task-id> <path>
+  # Legacy metadata remains recognizable, but callers must use
+  # fm_account_task_tmp_is_current before any filesystem mutation.
+  fm_account_task_tmp_is_current "$1" "$2" \
+    || fm_account_task_tmp_is_legacy "$1" "$2"
+}
+
 fm_account_safe_file_destination() {
   [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
 }
@@ -1213,11 +1258,16 @@ fm_account_restore_artifacts() {
     fi
   done
   if [ -n "$tasktmp" ]; then
-    [ "$tasktmp" = "/tmp/fm-$task" ] || return 1
-    if [ -e "$backup/tasktmp-existed" ]; then
-      [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
+    if fm_account_task_tmp_is_current "$task" "$tasktmp"; then
+      if [ -e "$backup/tasktmp-existed" ]; then
+        [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
+      else
+        fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp" || return 1
+      fi
     else
-      fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp" || return 1
+      # A legacy tasktmp is metadata-only compatibility. Never inspect or
+      # mutate the shared /tmp path while restoring task-owned artifacts.
+      fm_account_task_tmp_is_legacy "$task" "$tasktmp" || return 1
     fi
   fi
   [ "$retain" = 1 ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$backup"

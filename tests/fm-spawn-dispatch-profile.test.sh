@@ -11,7 +11,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
-TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+fm_test_tmproot_into TMP_ROOT fm-spawn-dispatch-profile
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -20,7 +20,14 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    if [ -s "${FM_FAKE_TREEHOUSE_CURRENT:-}" ]; then
+      cat "$FM_FAKE_TREEHOUSE_CURRENT"
+    else
+      printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    fi
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
@@ -42,7 +49,60 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  get)
+    shift
+    holder=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --lease-holder) shift; holder=${1:-} ;;
+        --lease-holder=*) holder=${1#--lease-holder=} ;;
+      esac
+      shift
+    done
+    [ -n "$holder" ] || exit 2
+    pool=${FM_FAKE_TREEHOUSE_POOL:?}
+    target="$pool/$holder/project"
+    mkdir -p "$(dirname "$target")"
+    git -C "$PWD" worktree add --quiet --detach "$target" HEAD || exit 1
+    target=$(cd "$target" && pwd -P) || exit 1
+    python3 - "$pool/treehouse-state.json" "$target" "$holder" <<'PY'
+import json
+import os
+import sys
+
+state_path, target, holder = sys.argv[1:]
+os.makedirs(os.path.dirname(state_path), exist_ok=True)
+try:
+    with open(state_path, encoding="utf-8") as stream:
+        state = json.load(stream)
+except FileNotFoundError:
+    state = {"worktrees": []}
+state["worktrees"] = [
+    entry for entry in state.get("worktrees", []) if entry.get("path") != target
+]
+state["worktrees"].append(
+    {
+        "name": holder,
+        "path": target,
+        "leased": True,
+        "lease_holder": holder,
+    }
+)
+with open(state_path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+    printf '%s\n' "$target" > "${FM_FAKE_TREEHOUSE_CURRENT:?}"
+    printf '%s\n' "$target"
+    ;;
+  return) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -55,7 +115,7 @@ make_spawn_case() {
   wt="$case_dir/wt"
   launchlog="$case_dir/launch.log"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$case_dir/treehouse-root"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
@@ -73,20 +133,35 @@ enable_dispatch_profile() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  local home=$1 id=$2 parent_home=$3 default source_origin target
+  default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD)
+  default=${default#origin/}
+  target=$(git -C "$ROOT" rev-parse "refs/heads/$default^{commit}")
+  source_origin=$(git -C "$ROOT" remote get-url origin)
+  git clone --quiet --no-checkout --single-branch --branch "$default" "$ROOT" "$home"
+  git -C "$home" checkout --quiet --detach "$target"
+  git -C "$home" remote set-url origin "$source_origin"
+  git -C "$home" update-ref "refs/remotes/origin/$default" "$target"
+  git -C "$home" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default"
+  mkdir -p "$home/config" "$home/data" "$home/projects" "$home/state"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
+  printf '%s\n' '- '"$id"' - profile test (home: '"$home"'; scope: profile test; projects: ; added 2026-07-25)' \
+    > "$parent_home/data/secondmates.md"
 }
 
 run_spawn() {
-  local home=$1 wt=$2 fakebin=$3 launchlog=$4
+  local home=$1 wt=$2 fakebin=$3 launchlog=$4 case_dir
   shift 4
+  case_dir=${home%/home}
   : > "$launchlog"
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$case_dir/checkout-state" \
+    FM_TREEHOUSE_ROOT="$case_dir/treehouse-root" \
+    FM_FAKE_TREEHOUSE_POOL="$case_dir/treehouse-root/profile" \
+    FM_FAKE_TREEHOUSE_CURRENT="$case_dir/acquired-worktree" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
@@ -113,7 +188,7 @@ test_no_profile_keeps_claude_launch_unchanged() {
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
   status=$?
-  expect_code 0 "$status" "claude spawn without profile flags should succeed"
+  expect_code 0 "$status" "claude spawn without profile flags should succeed: $out"
   assert_contains "$out" "spawned $id harness=claude" "spawn did not report claude"
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
@@ -372,7 +447,7 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_seeded_secondmate_home "$sm" "$id" "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?

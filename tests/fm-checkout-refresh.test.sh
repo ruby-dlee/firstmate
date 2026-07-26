@@ -11,7 +11,7 @@ set -u
 
 fm_git_identity fmtest fmtest@example.invalid
 
-TMP_ROOT=$(fm_test_tmproot fm-checkout-refresh-tests)
+fm_test_tmproot_into TMP_ROOT fm-checkout-refresh-tests
 TEST_HOME="$TMP_ROOT/user"
 FM_TEST_HOME="$TMP_ROOT/fm-home"
 STATE_ROOT="$TMP_ROOT/refresh-state"

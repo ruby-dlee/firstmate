@@ -41,8 +41,10 @@ set -u
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
+FM_TEST_REAL_NODE=$(command -v node) || fail "node is required"
+export FM_TEST_REAL_NODE
 
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-liveness)
+fm_test_tmproot_into TMP_ROOT fm-secondmate-liveness
 
 # --- unit level: fm_backend_tmux_agent_alive --------------------------------
 
@@ -187,7 +189,12 @@ test_agent_alive_dispatcher_routes_and_falls_back() {
 make_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
-  fm_fake_exit0 "$fakebin" node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" gh-axi chrome-devtools-axi lavish-axi
+  cat > "$fakebin/node" <<'SH'
+#!/usr/bin/env bash
+exec "${FM_TEST_REAL_NODE:?}" "$@"
+SH
+  chmod +x "$fakebin/node"
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -299,23 +306,27 @@ SH
 new_world() {
   local name=$1 w
   w="$TMP_ROOT/$name"
-  mkdir -p "$w/home/state" "$w/home/config"
+  mkdir -p "$w/home/state" "$w/home/config" "$w/home/data"
   touch "$w/home/state/.last-watcher-beat"
   printf 'codex\n' > "$w/home/config/crew-harness"
   printf '%s\n' "$w"
 }
 
-# add_sm_home <w> <id> <window>: a plain (non-git) secondmate home - the
-# probe/respawn machinery under test never requires the home to be a real
-# worktree; a non-git home just makes the unrelated fast-forward sweep log a
-# harmless "not a git repo" skip.
+# add_sm_home <w> <id> <window>: a fresh detached secondmate home at the
+# primary default tip, so recovery exercises the same freshness gate as a real
+# secondmate instead of relying on a non-Git legacy fixture.
 add_sm_home() {
   local w=$1 id=$2 window=$3 harness=${4:-claude}
-  local home="$w/$id"
-  mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
+  local home="$w/$id" home_abs
+  git clone --quiet --no-checkout --single-branch --branch main "$ROOT" "$home"
+  git -C "$home" checkout --quiet --detach refs/remotes/origin/main
+  git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
   printf 'charter\n' > "$home/data/charter.md"
+  home_abs=$(cd "$home" && pwd -P)
+  printf '%s\n' "- $id - test secondmate (home: $home_abs; scope: test; projects: test; added 2026-07-25)" \
+    > "$w/home/data/secondmates.md"
   {
     printf 'window=%s\n' "$window"
     printf 'kind=secondmate\n'
@@ -552,7 +563,7 @@ worktree=$workspace
 project=$workspace
 mode=secondmate
 yolo=off
-tasktmp=/tmp/fm-sm1
+tasktmp=$w/home/state/.task-tmp/fm-sm1
 account_pool=claude-crew
 account_profile=claude-2
 account_task=$account_task
@@ -562,9 +573,6 @@ generation_id=account:$account_task:a1234
 EOF
   mkdir -p "$w/home/data/sm1"
   printf 'enforce\n' > "$w/home/config/account-routing-mode"
-  cp "$ROOT/bin/fm-account-routing-lib.sh" "$w/sm1/bin/fm-account-routing-lib.sh"
-  cp "$ROOT/bin/fm-spawn.sh" "$w/sm1/bin/fm-spawn.sh"
-
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'

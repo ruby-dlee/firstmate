@@ -602,7 +602,8 @@ reconcile_failed_direct_recovery() {
     echo "error: retained direct recovery artifacts are missing or unsafe for $task" >&2
     return 1
   fi
-  if [ "$tasktmp" != "/tmp/fm-$task" ] || [ -z "$generation" ] || [ -z "$target" ]; then
+  if ! fm_account_task_tmp_is_expected "$task" "$tasktmp" \
+    || [ -z "$generation" ] || [ -z "$target" ]; then
     fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
     echo "error: retained direct recovery metadata is incomplete for $task" >&2
     return 1
@@ -867,7 +868,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_backup=$(fm_account_meta_value "$RESUME_META" account_rollback_backup)
     fm_account_meta_lock_release "$rollback_meta_lock" || exit 1
     rollback_meta_lock=
-    if [ -n "$rollback_tasktmp" ] && [ "$rollback_tasktmp" != "/tmp/fm-$rollback_id" ]; then
+    if [ -n "$rollback_tasktmp" ] && ! fm_account_task_tmp_is_expected "$rollback_id" "$rollback_tasktmp"; then
       echo "error: unsafe task temp path in rollback metadata for $rollback_id: $rollback_tasktmp" >&2
       exit 1
     fi
@@ -893,7 +894,9 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     rollback_profile=$(fm_account_meta_value "$RESUME_META" account_profile)
     if [ -z "$rollback_profile" ] && [ "$rollback_kind" = secondmate ] && [ -z "$rollback_backup" ]; then
       rm -f "$RESUME_META" "$STATE/$rollback_id.status" "$STATE/$rollback_id.turn-ended" "$STATE/$rollback_id.check.sh" "$STATE/$rollback_id.pi-ext.ts" "$STATE/$rollback_id.grok-turnend-token"
-      [ -z "$rollback_tasktmp" ] || rm -rf "$rollback_tasktmp"
+      [ -z "$rollback_tasktmp" ] \
+        || ! fm_account_task_tmp_is_current "$rollback_id" "$rollback_tasktmp" \
+        || rm -rf "$rollback_tasktmp"
     fi
     if [ -z "$rollback_profile" ]; then
       if [ -n "$rollback_backup" ]; then
@@ -1007,7 +1010,7 @@ ORIGINAL_GROK_TOKEN_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
 
 snapshot_existing_artifacts() {
-  local backup name source tasktmp="/tmp/fm-$ID"
+  local backup name source tasktmp=$SPAWN_TASK_TMP
   backup=$(mktemp -d "$STATE/.$ID.artifacts.rollback.XXXXXX") || return 1
   for name in "$ID.status" "$ID.turn-ended" "$ID.check.sh" "$ID.pi-ext.ts" "$ID.grok-turnend-token"; do
     source="$STATE/$name"
@@ -1262,7 +1265,7 @@ persist_failed_direct_recovery() {
     echo "kind=${KIND:-${RECORDED_KIND:-ship}}"
     echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
     echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
-    echo "tasktmp=${TASK_TMP:-${RECORDED_TASKTMP:-/tmp/fm-$ID}}"
+    echo "tasktmp=${TASK_TMP:-$SPAWN_TASK_TMP}"
     echo "model=${RECORDED_MODEL:-${MODEL:-default}}"
     echo "effort=${RECORDED_EFFORT:-${EFFORT:-default}}"
     echo "generation_id=${RECORDED_GENERATION:-${SPAWN_GENERATION_ID:-}}"
@@ -1351,7 +1354,7 @@ persist_failed_direct_spawn() {  # <endpoint-created:0|1>
       echo "kind=${KIND:-ship}"
       echo "mode=$retained_mode"
       echo "yolo=$retained_yolo"
-      echo "tasktmp=${TASK_TMP:-/tmp/fm-$ID}"
+      echo "tasktmp=${TASK_TMP:-$SPAWN_TASK_TMP}"
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
       echo "generation_id=${SPAWN_GENERATION_ID:-}"
@@ -1464,7 +1467,7 @@ spawn_restore_unmanaged_state_locked() {
   [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] || return 0
   if [ -n "$EXISTING_ARTIFACT_BACKUP" ]; then
     artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-    fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "/tmp/fm-$ID" 1 || return 1
+    fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "$SPAWN_TASK_TMP" 1 || return 1
   fi
   if [ -n "$META_BACKUP" ]; then
     [ -f "$META_BACKUP" ] && [ -f "$meta" ] || return 1
@@ -1636,7 +1639,7 @@ spawn_abort_cleanup() {
     fi
     if [ -n "$rollback_lock" ]; then
       artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-      if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-/tmp/fm-$ID}" 1; then
+      if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1; then
         if [ "$META_INSTALLED" = 1 ] && [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
           if fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
             && fm_account_safe_file_destination "$STATE/$ID.meta" \
@@ -1670,7 +1673,7 @@ spawn_abort_cleanup() {
     if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
-        if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-/tmp/fm-$ID}" 1 \
+        if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 \
           && fm_account_meta_merge_extensions "$STATE/$ID.meta" "$META_BACKUP" \
           && fm_account_safe_file_destination "$STATE/$ID.meta" \
           && mv "$META_BACKUP" "$STATE/$ID.meta"; then
@@ -1845,6 +1848,23 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   exit "$rc"
 fi
 ID=${POS[0]}
+mkdir -p "$STATE" || {
+  echo "error: cannot establish state directory at $STATE" >&2
+  exit 1
+}
+SPAWN_TASK_TMP=$(fm_account_task_tmp_path "$ID") || {
+  echo "error: cannot establish a safe task temp path for $ID" >&2
+  exit 1
+}
+if [ "$SPAWN_META_PRESENT" = 1 ]; then
+  EXISTING_TASK_TMP=$(spawn_preflight_meta_value tasktmp)
+  if [ -n "$EXISTING_TASK_TMP" ]; then
+    fm_account_task_tmp_is_expected "$ID" "$EXISTING_TASK_TMP" || {
+      echo "error: existing task metadata has an unsafe tasktmp for $ID" >&2
+      exit 1
+    }
+  fi
+fi
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -1929,7 +1949,7 @@ if [ -e "$STATE/$ID.turn-ended" ] || [ -L "$STATE/$ID.turn-ended" ]; then ORIGIN
 if [ -e "$STATE/$ID.check.sh" ] || [ -L "$STATE/$ID.check.sh" ]; then ORIGINAL_CHECK_PRESENT=1; else ORIGINAL_CHECK_PRESENT=0; fi
 if [ -e "$STATE/$ID.pi-ext.ts" ] || [ -L "$STATE/$ID.pi-ext.ts" ]; then ORIGINAL_PI_EXT_PRESENT=1; else ORIGINAL_PI_EXT_PRESENT=0; fi
 if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token" ]; then ORIGINAL_GROK_TOKEN_PRESENT=1; else ORIGINAL_GROK_TOKEN_PRESENT=0; fi
-if [ -e "/tmp/fm-$ID" ] || [ -L "/tmp/fm-$ID" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
+if [ -e "$SPAWN_TASK_TMP" ] || [ -L "$SPAWN_TASK_TMP" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
 
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
@@ -2007,7 +2027,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_MODE" ] || { echo "error: direct account recovery metadata has no mode for $ID" >&2; exit 1; }
     [ -n "$RECORDED_YOLO" ] || { echo "error: direct account recovery metadata has no yolo setting for $ID" >&2; exit 1; }
     [ -n "$RECORDED_GENERATION" ] || { echo "error: direct account recovery metadata has no generation_id for $ID" >&2; exit 1; }
-    [ "$RECORDED_TASKTMP" = "/tmp/fm-$ID" ] || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
+    fm_account_task_tmp_is_expected "$ID" "$RECORDED_TASKTMP" || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
     RECORDED_META_WORKTREE_GIT_REF=$RECORDED_WORKTREE_GIT_REF
     RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
     RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
@@ -2981,12 +3001,14 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] && [ 
   }
 fi
 
-# Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
+# Per-task temp root with Go's build temp nested at gotmp/. The physical task
+# state directory is its namespace, so separate homes and test runs cannot
+# share a root even when their human-readable task ids match. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
-# Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
+# Nested (not a bare task-root/gotmp) so other per-task temp can live alongside
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-TASK_TMP="/tmp/fm-$ID"
+TASK_TMP=$SPAWN_TASK_TMP
 mkdir -p "$TASK_TMP/gotmp"
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
 # the pane shell just before the launch line, further down. CREW_PATH rides the same

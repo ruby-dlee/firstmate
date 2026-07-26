@@ -93,6 +93,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
@@ -125,6 +126,10 @@ case "$TEARDOWN_UPSTREAM_TIMEOUT" in
 esac
 ID=$1
 FORCE=${2:-}
+fm_account_task_tmp_path "$ID" >/dev/null || {
+  echo "error: cannot establish a safe task temp path for $ID" >&2
+  exit 1
+}
 
 META="$STATE/$ID.meta"
 
@@ -202,10 +207,10 @@ if [ "$BACKEND" = orca ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
-# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
+# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root;
+# absent for tasks spawned before that change, so tolerate empty.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && [ "$TASK_TMP" != "/tmp/fm-$ID" ]; then
+if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP"; then
   echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
   exit 1
 fi
@@ -1547,19 +1552,17 @@ import sys
 
 home, state_path = sys.argv[1:]
 try:
-    if os.path.islink(state_path):
-        raise OSError("state directory must not be a symlink")
-    metadata = os.stat(state_path)
+    home_root = os.path.realpath(home)
+    state_root = os.path.realpath(state_path)
+    if state_root == home_root or os.path.commonpath((home_root, state_root)) != home_root:
+        raise OSError("state directory resolves outside its secondmate home")
+    metadata = os.stat(state_root)
     permissions = stat.S_IMODE(metadata.st_mode)
     if not stat.S_ISDIR(metadata.st_mode):
         raise NotADirectoryError(state_path)
     if not permissions & 0o444 or not permissions & 0o111:
         raise PermissionError("state directory is unreadable")
-    home_root = os.path.realpath(home)
-    state_root = os.path.realpath(state_path)
-    if state_root != os.path.join(home_root, "state"):
-        raise OSError("state directory resolves outside its secondmate home")
-    with os.scandir(state_path) as entries:
+    with os.scandir(state_root) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
             metadata = entry.stat(follow_symlinks=False)
             if not entry.name.endswith(".meta"):
@@ -1570,7 +1573,7 @@ try:
                 raise PermissionError(f"unreadable child metadata entry: {entry.path}")
             if any(character in entry.path for character in ("\n", "\r")):
                 raise OSError("child metadata path contains unsupported control characters")
-            print(entry.path)
+            print(os.path.join(state_root, entry.name))
 except OSError as error:
     print(
         f"REFUSED: secondmate child state is unprovable at {state_path}: {error}",
@@ -1826,15 +1829,29 @@ safe_rm_rf_child_worktree() {
 }
 
 safe_remove_task_tmp() {
-  local target=$1 base
+  local target=$1 base legacy
   [ -n "$target" ] || return 0
-  [ "$target" = "/tmp/fm-$ID" ] || return 1
-  base=$(python3 - <<'PY'
+  fm_account_task_tmp_is_expected "$ID" "$target" || return 1
+  legacy=$(fm_account_legacy_task_tmp_path "$ID") || return 1
+  # Legacy compatibility is classification-only. Never inspect or mutate the
+  # old process-wide /tmp/fm-<id> location from a current teardown.
+  [ "$target" != "$legacy" ] || return 0
+  fm_account_task_tmp_is_current "$ID" "$target" || return 1
+  [ -e "$target" ] || [ -L "$target" ] || return 0
+  base=${target%/*}
+  base=$(python3 - "$base" <<'PY'
 import os
 import stat
+import sys
 
-base = os.path.realpath("/tmp")
-if base not in ("/tmp", "/private/tmp"):
+raw = sys.argv[1]
+base = os.path.realpath(raw)
+if raw == "/tmp":
+    if base not in ("/tmp", "/private/tmp"):
+        raise SystemExit(1)
+elif raw != base:
+    raise SystemExit(1)
+if not base.startswith(os.path.sep) or base == os.path.sep:
     raise SystemExit(1)
 current = os.path.sep
 for component in base.split(os.path.sep):
@@ -1849,7 +1866,8 @@ if not stat.S_ISDIR(os.lstat(base).st_mode):
 print(base)
 PY
   ) || return 1
-  removal_tree_operation "$base/fm-$ID" "task temp root" remove
+  removal_tree_operation "$base/${target##*/}" "task temp root" remove || return 1
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$base" 2>/dev/null || true
 }
 
 remove_worktree_compatibility_artifacts() {
@@ -1971,6 +1989,10 @@ validate_secondmate_home_landed_state() {
     $0 == "?? .claude/settings.local.json" { next }
     $0 == "?? .opencode/plugins/fm-turn-end.js" { next }
     $0 == "?? .fm-grok-turnend" { next }
+    $0 == "?? config" { next }
+    $0 == "?? data" { next }
+    $0 == "?? projects" { next }
+    $0 == "?? state" { next }
     $0 != "" { print }
   ')
   [ -z "$unsafe" ] || {
@@ -2708,6 +2730,7 @@ EOF
   }
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
+    [ "$ref" != refs/stash ] || continue
     git -C "$repository" cat-file -e "$ref^{object}" 2>/dev/null || {
       echo "REFUSED: $label ref $ref depends on unavailable objects" >&2
       return 1
@@ -3074,8 +3097,29 @@ except OSError:
 PY
 }
 
+secondmate_child_worktree_is_registered() {
+  local home=$1 repository=$2 worktree=$3 child_metas child_meta child_kind child_project child_worktree
+  local canonical_project canonical_worktree matches=0
+  child_metas=$(secondmate_state_metadata "$home") || return 1
+  while IFS= read -r child_meta; do
+    [ -n "$child_meta" ] || continue
+    child_kind=$(meta_value "$child_meta" kind)
+    [ "$child_kind" != secondmate ] || continue
+    child_project=$(meta_value "$child_meta" project)
+    child_worktree=$(meta_value "$child_meta" worktree)
+    canonical_project=$(exact_git_worktree_root "$child_project") || continue
+    canonical_worktree=$(exact_git_worktree_root "$child_worktree") || continue
+    if [ "$canonical_project" = "$repository" ] && [ "$canonical_worktree" = "$worktree" ]; then
+      matches=$((matches + 1))
+    fi
+  done <<EOF
+$child_metas
+EOF
+  [ "$matches" -eq 1 ]
+}
+
 validate_secondmate_repository_worktree_graph() {
-  local repository=$1 retiring_home=$2 repository_container=${3:-$1}
+  local repository=$1 retiring_home=$2 repository_container=${3:-$1} allow_registered_children=${4:-0}
   local common listed records path kind canonical count=0 bare_repository container_git submodule_admin=0
   bare_repository=$(git -C "$repository" rev-parse --is-bare-repository 2>/dev/null) || return 1
   common=$(git -C "$repository" rev-parse --git-common-dir 2>/dev/null) || return 1
@@ -3144,6 +3188,9 @@ validate_secondmate_repository_worktree_graph() {
           :
         elif [ "$submodule_admin" -eq 1 ] && [ "$canonical" = "$common" ]; then
           :
+        elif [ "$allow_registered_children" -eq 1 ] \
+          && secondmate_child_worktree_is_registered "$retiring_home" "$repository" "$canonical"; then
+          :
         else
           echo "REFUSED: secondmate project common Git directory owns another linked worktree at $canonical" >&2
           return 1
@@ -3154,10 +3201,17 @@ validate_secondmate_repository_worktree_graph() {
   done <<EOF
 $records
 EOF
-  [ "$count" -eq 1 ] || {
-    echo "REFUSED: secondmate project linked-worktree ownership is ambiguous at $repository" >&2
-    return 1
-  }
+  if [ "$allow_registered_children" -eq 1 ]; then
+    [ "$count" -ge 1 ] || {
+      echo "REFUSED: secondmate project linked-worktree ownership is ambiguous at $repository" >&2
+      return 1
+    }
+  else
+    [ "$count" -eq 1 ] || {
+      echo "REFUSED: secondmate project linked-worktree ownership is ambiguous at $repository" >&2
+      return 1
+    }
+  fi
 }
 
 validate_secondmate_declared_submodules() {
@@ -3187,7 +3241,7 @@ EOF
 
 validate_secondmate_project_repository_landed_state() {
   local repository=$1 source_repository=$2 retiring_home=$3 repository_container=${4:-$1}
-  local source_container=${5:-$2} dirty refs ref tip reflog_tips
+  local source_container=${5:-$2} allow_registered_children=${6:-0} dirty refs ref tip reflog_tips
   local remote_tips remote_tip landed repository_identity source_identity bare stash_status
   local authority_record authority_kind authority cleanup_status=0
   [ "$(exact_git_repository_root "$repository" "$repository_container")" = "$repository" ] || {
@@ -3203,7 +3257,7 @@ validate_secondmate_project_repository_landed_state() {
     "registered source project repository" || return 1
   git_history_rewrite_state_is_clean "$repository" "secondmate project repository" || return 1
   validate_secondmate_repository_worktree_graph \
-    "$repository" "$retiring_home" "$repository_container" || return 1
+    "$repository" "$retiring_home" "$repository_container" "$allow_registered_children" || return 1
   validate_secondmate_declared_submodules "$repository" "$repository_container" || {
     echo "REFUSED: secondmate project submodule state is uninspectable at $repository" >&2
     return 1
@@ -3306,7 +3360,7 @@ EOF
 
 validate_secondmate_project_clones() {
   local home=$1 registry=$2 expected_id=$3 expected_source=$4 projects_root source_projects_root
-  local expected listed project clone source_clone repositories relative repository source_repository
+  local allow_registered_children=${5:-0} home_root expected listed project clone source_clone repositories relative repository source_repository
   if ! expected=$(fm_secondmate_registry_query "$registry" query "$expected_id" projects); then
     if [ "$registry" = "$PREPARED_REGISTRY_PATH" ] \
         && [ "$expected_id" = "$PREPARED_REGISTRY_ID" ] \
@@ -3320,7 +3374,12 @@ validate_secondmate_project_clones() {
       return 1
     fi
   fi
-  projects_root=$(fm_checkout_trusted_dir "$home/projects") || {
+  home_root=$(canonical_existing_dir "$home") || return 1
+  projects_root=$(cd "$home/projects" 2>/dev/null && pwd -P) || {
+    echo "REFUSED: secondmate projects directory is missing, redirected, or unreadable at $home/projects" >&2
+    return 1
+  }
+  path_is_ancestor_of "$home_root" "$projects_root" || {
     echo "REFUSED: secondmate projects directory is missing, redirected, or unreadable at $home/projects" >&2
     return 1
   }
@@ -3352,8 +3411,8 @@ PY
     echo "REFUSED: secondmate project clones do not exactly match the registration for $expected_id" >&2
     return 1
   }
-  if [ "$expected_source" = "$FM_ROOT" ] && [ -n "${FM_PROJECTS_OVERRIDE:-}" ]; then
-    source_projects_root=$FM_PROJECTS_OVERRIDE
+  if [ "$expected_source" = "$FM_ROOT" ]; then
+    source_projects_root=$PROJECTS
   else
     source_projects_root="$expected_source/projects"
   fi
@@ -3386,7 +3445,7 @@ PY
         }
       fi
       validate_secondmate_project_repository_landed_state \
-        "$repository" "$source_repository" "$home" "$clone" "$source_clone" || return 1
+        "$repository" "$source_repository" "$home" "$clone" "$source_clone" "$allow_registered_children" || return 1
     done <<EOF
 $repositories
 EOF
@@ -3397,7 +3456,7 @@ EOF
 
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} expected_source=${4:-$FM_ROOT} expected_registry=${5:-} expected_project
-  local abs_home_path metadata_home_root marker_id source_authority=${7:-1}
+  local abs_home_path metadata_home_root marker_id source_authority=${7:-1} allow_registered_children=${8:-0}
   expected_project=${6:-$home}
   [ -n "$home" ] && [ -e "$home" ] || {
     echo "REFUSED: missing $label removal target ${home:-<empty>}" >&2
@@ -3437,7 +3496,7 @@ validate_firstmate_home_for_removal() {
   validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
   if [ -n "$expected_id" ]; then
     validate_secondmate_project_clones \
-      "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
+      "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" "$allow_registered_children" || return 1
   fi
   validate_firstmate_operational_dirs_for_removal "$abs_home_path" "$label" || return 1
   secondmate_state_metadata "$abs_home_path" >/dev/null || return 1
@@ -3553,7 +3612,7 @@ validate_firstmate_home_children_removal() {
       child_proj=$(meta_value "$child_meta" project)
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
-      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" >/dev/null || return 1
+      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" 1 1 >/dev/null || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
     elif [ "$child_backend" = orca ]; then
       require_orca_task_metadata_identity "$child_meta" "$child_id" || return 1
@@ -3900,15 +3959,12 @@ if [ "$KIND" = secondmate ]; then
     exit 1
   }
   validate_firstmate_home_for_removal \
-    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 \
+    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 1 \
     >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
-  fi
-  quiesce_secondmate_endpoint || exit 1
-  if [ "$FORCE" = "--force" ]; then
-    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
   else
+    require_empty_secondmate_registry "$HOME_PATH" || exit 1
     SUB_STATE="$HOME_PATH/state"
     CHILD_METAS=$(secondmate_state_metadata "$HOME_PATH") || exit 1
     if [ -n "$CHILD_METAS" ]; then
@@ -3917,6 +3973,10 @@ if [ "$KIND" = secondmate ]; then
       echo "Found $(basename "$child_meta"). Let that home finish, or use --force to retire only after every child is proven landed and quiescent." >&2
       exit 1
     fi
+  fi
+  quiesce_secondmate_endpoint || exit 1
+  if [ "$FORCE" = "--force" ]; then
+    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
   fi
 fi
 
@@ -4065,7 +4125,11 @@ if [ "$MANAGED_ACCOUNT" = 1 ]; then
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH" || exit 1
+  if cleanup_firstmate_home_children "$HOME_PATH"; then
+    :
+  else
+    exit $?
+  fi
 fi
 
 [ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
@@ -4182,7 +4246,7 @@ EOF
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
+# Remove the per-task temp root, including its gotmp, recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"

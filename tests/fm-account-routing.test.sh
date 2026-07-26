@@ -16,7 +16,7 @@ SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
-TMP_ROOT=$(fm_test_tmproot fm-account-routing-tests)
+fm_test_tmproot_into TMP_ROOT fm-account-routing-tests
 
 assert_not_grep() {
   local pattern=$1 file=$2 label=$3
@@ -237,14 +237,37 @@ if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" 
 fi
 if [ "${1:-}" = get ]; then
   lease_holder=
-  previous=
-  for argument in "$@"; do
-    [ "$previous" != --lease-holder ] || lease_holder=$argument
-    previous=$argument
+  prev=
+  for arg in "$@"; do
+    if [ "$prev" = --lease-holder ]; then
+      lease_holder=$arg
+      break
+    fi
+    prev=$arg
   done
-  pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
-  printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"%s","destroying":false}]}\n' \
-    "$FM_FAKE_TREEHOUSE_PATH" "$lease_holder" > "$pool/treehouse-state.json"
+  if [ -n "${FM_FAKE_TREEHOUSE_STATE:-}" ] && [ -n "$lease_holder" ]; then
+    python3 - "$FM_FAKE_TREEHOUSE_STATE" "${FM_FAKE_TREEHOUSE_PATH:?}" "$lease_holder" <<'PY'
+import json
+import os
+import sys
+
+state, path, holder = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": os.path.realpath(path),
+                    "leased": True,
+                    "lease_holder": holder,
+                }
+            ]
+        },
+        stream,
+    )
+PY
+  fi
   printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
 fi
 exit 0
@@ -310,6 +333,7 @@ case "$*" in
     [ -n "$pool" ] || pool=${FM_FAKE_AF_POOL:-claude-crew}
     case "$*" in
       *" lease recover "*)
+        [ -z "${FM_FAKE_AF_RECOVER_MARKER:-}" ] || touch "$FM_FAKE_AF_RECOVER_MARKER"
         [ "${FM_FAKE_AF_RECOVER_FAIL:-0}" != 1 ] || exit "${FM_FAKE_AF_RECOVER_FAIL_STATUS:-42}"
         if [ -n "${FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE:-}" ] && [ ! -e "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE" ]; then
           : > "$FM_FAKE_AF_RECOVER_FAIL_ONCE_FILE"
@@ -320,6 +344,7 @@ case "$*" in
         [ "${FM_FAKE_AF_STALE_REFRESH_ON_RECOVER:-0}" != 1 ] || touch "${FM_FAKE_AF_SESSION_REFRESHED:?}"
         ;;
       *" lease choose "*|*" lease acquire "*)
+        [ -z "${FM_FAKE_AF_SELECT_MARKER:-}" ] || touch "$FM_FAKE_AF_SELECT_MARKER"
         [ -z "${FM_FAKE_AF_CHOOSE_FAIL_STATUS:-}" ] || exit "$FM_FAKE_AF_CHOOSE_FAIL_STATUS"
         [ -z "${FM_FAKE_AF_SELECT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_SELECT_SLEEP"
         [ -z "${FM_FAKE_AF_SELECT_COMPLETED:-}" ] || touch "$FM_FAKE_AF_SELECT_COMPLETED"
@@ -385,6 +410,7 @@ case "$*" in
     printf '{"schema":%s,"task":"%s","profile":"%s","provider":"%s","pool":"%s","workspace":"%s","session_id":"sess-%s","session_event_seq":%s,"updated_at":"%s"}\n' "$session_schema" "$task" "$profile" "$provider" "$pool" "$workspace" "$task" "$session_event_seq" "$updated_at"
     ;;
   *" lease release "*)
+    [ -z "${FM_FAKE_AF_RELEASE_START_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_START_MARKER"
     [ -z "${FM_FAKE_AF_RELEASE_SLEEP:-}" ] || sleep "$FM_FAKE_AF_RELEASE_SLEEP"
     [ -z "${FM_FAKE_AF_RELEASE_COMPLETED:-}" ] || touch "$FM_FAKE_AF_RELEASE_COMPLETED"
     [ -z "${FM_FAKE_AF_RELEASE_MARKER:-}" ] || touch "$FM_FAKE_AF_RELEASE_MARKER"
@@ -475,7 +501,8 @@ run_spawn() {
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_LIFECYCLE_LOG="$LIFECYCLE_LOG" \
     FM_EXPECT_CHECKOUT_LOCK_ROOT="${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" \
     FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
-    FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
+    FM_FAKE_TREEHOUSE_PATH="$WT_DIR" FM_FAKE_TREEHOUSE_STATE="$CASE_DIR/treehouse-root/pool/treehouse-state.json" \
+    FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-root" \
     FM_FAKE_TREEHOUSE_SLEEP="${FM_FAKE_TREEHOUSE_SLEEP:-}" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE="${FM_FAKE_TREEHOUSE_RETURN_CHILD_PID_FILE:-}" \
@@ -501,6 +528,7 @@ run_teardown() {
   FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_REPORT_STACK_ROOT="$CASE_DIR/report-stack" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
@@ -552,7 +580,7 @@ use_named_fake_tmux_target() {
 }
 
 test_off_is_byte_compatible_and_never_calls_agent_fleet() {
-  local id rec out status launch expected
+  local id rec out status launch expected task_tmp
   id=account-off-z1
   rec=$(make_case off claude "$id")
   read_case "$rec"
@@ -565,6 +593,11 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   [ "$launch" = "$expected" ] || fail "routing off changed the launch bytes"
   assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "routing off wrote account metadata"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "routing off wrote session metadata"
+  task_tmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
+  [ "$task_tmp" = "$HOME_DIR/state/.task-tmp/fm-$id" ] \
+    || fail "routing fixture did not namespace its task temp root to this test run"
+  assert_present "$task_tmp/gotmp" \
+    "routing fixture did not create its run-scoped Go temp root"
   assert_regex '^generation_id=spawn:a[0-9a-f]{15}$' "$HOME_DIR/state/$id.meta" "routing off did not record a stable spawn generation"
   assert_grep 'report_required=1' "$HOME_DIR/state/$id.meta" "post-cutover spawn did not activate the report gate"
   assert_grep '# Completion report' "$HOME_DIR/data/$id/brief.md" "post-cutover spawn did not upgrade a legacy unspawned brief"
@@ -704,9 +737,13 @@ test_changed_acquisition_is_retained_during_unmanaged_rollback() {
     FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
     run_spawn "$id" "$PROJ_DIR" > "$out_file" &
   spawn_pid=$!
-  for _ in $(seq 1 600); do [ -f "$marker" ] && break; sleep 0.05; done
+  for _ in $(seq 1 600); do
+    [ -f "$marker" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+  done
   [ -f "$marker" ] \
-    || { kill "$spawn_pid" 2>/dev/null || true; fail "changed-acquisition test never reached the post-install failure"; }
+    || { touch "$release"; wait "$spawn_pid" 2>/dev/null || true; fail "changed-acquisition test never reached the post-install failure"; }
   printf '%s\n' retained-commit > "$WT_DIR/retained-commit.txt"
   git -C "$WT_DIR" add retained-commit.txt
   git -C "$WT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
@@ -801,7 +838,7 @@ SH
   common=$(git -C "$WT_DIR" rev-parse --git-common-dir)
   case "$common" in /*) ;; *) common="$WT_DIR/$common" ;; esac
   common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  key=$(printf '%s' "$common" | tr '[:upper:]' '[:lower:]' | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock="$CASE_DIR/checkout-refresh-locks/$key.lock"
   assert_present "$CASE_DIR/treehouse-return-child.pid" \
     "spawn rollback did not exercise a surviving Treehouse descendant"
@@ -1351,8 +1388,16 @@ test_off_metadata_merge_waits_for_metadata_lock() {
   FM_FAKE_TMUX_NEW_WINDOW_MARKER="$marker" FM_FAKE_TMUX_NEW_WINDOW_GATE="$gate" \
     run_spawn "$id" "$PROJ_DIR" > "$out_file" &
   spawn_pid=$!
-  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
-  [ -f "$marker" ] || { kill "$spawn_pid" 2>/dev/null || true; fail "off metadata-lock test never reached endpoint creation"; }
+  for _ in $(seq 1 600); do
+    [ -f "$marker" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ -f "$marker" ] || {
+    touch "$gate"
+    wait "$spawn_pid" 2>/dev/null || true
+    fail "off metadata-lock test never reached endpoint creation: $(cat "$out_file")"
+  }
   # shellcheck source=bin/fm-account-routing-lib.sh
   . "$ROOT/bin/fm-account-routing-lib.sh"
   held=$(fm_account_meta_lock_acquire "$HOME_DIR/state" "$id") \
@@ -2467,7 +2512,11 @@ SH
     kill -0 "$spawn_pid" 2>/dev/null || break
     sleep 0.05
   done
-  [ -f "$marker" ] || { touch "$gate" "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never persisted provisional managed metadata"; }
+  [ -f "$marker" ] || {
+    touch "$gate" "$installed_gate"
+    wait "$spawn_pid" 2>/dev/null || true
+    fail "spawn never persisted provisional managed metadata: $(cat "$CASE_DIR/spawn-stdout" "$CASE_DIR/spawn-stderr")"
+  }
   meta="$HOME_DIR/state/$id.meta"
   task=$(meta_account_task "$id")
   assert_grep 'account_rollback_cleanup=pending' "$meta" "provisional metadata was not marked for rollback recovery"
@@ -2483,7 +2532,11 @@ SH
     kill -0 "$spawn_pid" 2>/dev/null || break
     sleep 0.05
   done
-  [ -f "$installed_marker" ] || { touch "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never installed endpoint metadata"; }
+  [ -f "$installed_marker" ] || {
+    touch "$installed_gate"
+    wait "$spawn_pid" 2>/dev/null || true
+    fail "spawn never installed endpoint metadata: $(cat "$CASE_DIR/spawn-stdout" "$CASE_DIR/spawn-stderr")"
+  }
   assert_grep 'account_rollback_cleanup=pending' "$meta" "endpoint metadata cleared rollback recovery before launch commit"
   assert_grep 'account_profile=claude-2' "$meta" "endpoint metadata lost the selected account profile"
   assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" \
@@ -3175,8 +3228,9 @@ test_concurrent_continuations_serialize_before_mutation() {
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit FM_FAKE_TMUX_NEW_WINDOW_MARKER="$marker" FM_FAKE_TMUX_NEW_WINDOW_GATE="$gate" \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/first.out" 2>&1 &
   first_pid=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -f "$marker" ] && break
+    kill -0 "$first_pid" 2>/dev/null || break
     sleep 0.05
   done
   [ -f "$marker" ] || { kill "$first_pid" 2>/dev/null || true; fail "first continuation never reached endpoint creation"; }
@@ -3185,14 +3239,16 @@ test_concurrent_continuations_serialize_before_mutation() {
     FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$second_lock_waiter" \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
   second_pid=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -f "$second_lock_waiter" ] && break
+    kill -0 "$second_pid" 2>/dev/null || break
     sleep 0.05
   done
   if [ ! -f "$second_lock_waiter" ]; then
     touch "$gate"
-    kill "$first_pid" "$second_pid" 2>/dev/null || true
-    fail "second continuation never waited behind the first lifecycle owner"
+    wait "$first_pid" 2>/dev/null || true
+    wait "$second_pid" 2>/dev/null || true
+    fail "second continuation never waited behind the first lifecycle owner: first=$(cat "$CASE_DIR/first.out"); second=$(cat "$CASE_DIR/second.out")"
   fi
   touch "$gate"
   wait "$first_pid"
@@ -3285,6 +3341,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   teardown_pid=$!
   for _ in $(seq 1 300); do
     [ -f "$release_marker" ] && break
+    kill -0 "$teardown_pid" 2>/dev/null || break
     sleep 0.1
   done
   [ -f "$release_marker" ] || {
@@ -5099,6 +5156,34 @@ SH
   pass "account metadata stat helpers select GNU stat without probing BSD filesystem stat"
 }
 
+test_darwin_stat_mode_preserves_special_permission_bits() {
+  local case_dir fakebin file output
+  case_dir="$TMP_ROOT/darwin-stat-mode"
+  fakebin="$case_dir/fakebin"
+  file="$case_dir/file"
+  mkdir -p "$fakebin"
+  : > "$file"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Darwin\n'
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -f ] && [ "${2:-}" = %Mp%Lp ] || exit 2
+printf '1777\n'
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat"
+  output=$(bash -c '
+    . "$1"
+    FM_ACCOUNT_SYSTEM_UNAME_BIN=$2/uname
+    FM_ACCOUNT_SYSTEM_STAT_BIN=$2/stat
+    fm_account_path_mode "$3"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$fakebin" "$file") \
+    || fail "Darwin account mode helper failed"
+  [ "$output" = 1777 ] || fail "Darwin account mode helper lost special permission bits: $output"
+  pass "account metadata stat helpers preserve Darwin special permission bits"
+}
+
 test_stale_reclaim_guard_is_owned_before_lock_removal() {
   local case_dir lock output status
   case_dir="$TMP_ROOT/reclaim-guard-ownership"
@@ -5568,6 +5653,7 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
 
   rm -f "$CASE_DIR/endpoint-live"
+  write_completion_report "$id"
   clear_case_logs
   release_completed="$CASE_DIR/release-completed"
   if out=$(FM_FAKE_AF_RELEASE_SLEEP=10 FM_FAKE_AF_RELEASE_COMPLETED="$release_completed" \
@@ -5856,6 +5942,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   [ "$failed_task" != "$old_task" ] || fail "failed continuation did not install its rollback generation"
 
   rm -f "$CASE_DIR/endpoint-live"
+  write_completion_report "$id"
   clear_case_logs
   if out=$(run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "teardown continued after restoring predecessor metadata"
@@ -6380,6 +6467,7 @@ if [ "${FM_TEST_FOCUSED:-}" = production-routing-authority ]; then
   run_isolated_test test_agent_fleet_entrypoint_is_physically_pinned_per_operation
   run_isolated_test test_agent_fleet_validation_ignores_ambient_system_tool_shadows
   run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
+  run_isolated_test test_darwin_stat_mode_preserves_special_permission_bits
   run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
   exit 0
 fi
@@ -6495,6 +6583,7 @@ run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_prob
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
+run_isolated_test test_darwin_stat_mode_preserves_special_permission_bits
 run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
 run_isolated_test test_task_owned_account_artifacts_reject_symlink_paths
 run_isolated_test test_secondmate_home_lock_key_fails_closed_without_fixed_hasher

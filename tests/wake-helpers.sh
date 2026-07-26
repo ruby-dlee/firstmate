@@ -16,7 +16,7 @@
 # direct fm-guard.sh tests use. A per-call FM_ROOT_OVERRIDE still wins where a
 # suite sets its own (e.g. the watcher-lock guard-banner cases).
 if [ -z "${FM_ROOT_OVERRIDE:-}" ]; then
-  FM_ROOT_OVERRIDE="$(fm_test_tmproot fm-wake-tangle-root)"
+  fm_test_tmproot_into FM_ROOT_OVERRIDE fm-wake-tangle-root
   export FM_ROOT_OVERRIDE
 fi
 
@@ -32,13 +32,10 @@ fi
 # that channel, to exercise graceful degradation. Suites that do not source this
 # harness still cannot fire a real notification: the daemon defaults the seam to
 # "discard" whenever it is sourced (its library-mode guard).
-# Create the recorder dir with mktemp directly (not fm_test_tmproot, whose
-# first call installs an EXIT trap that, invoked inside a command-substitution
-# subshell, would delete the dir on subshell exit). Register it for the same
-# cleanup and install the trap in THIS shell if it is the first registration.
-_fm_wedge_rec_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-wedge-rec.XXXXXX")
-if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then trap fm_test_cleanup EXIT; fi
-FM_TEST_CLEANUP_DIRS+=("$_fm_wedge_rec_dir")
+# Create and register the recorder directory in this shell so it shares the
+# suite's run-owned cleanup lifecycle.
+_fm_wedge_rec_dir=
+fm_test_tmproot_into _fm_wedge_rec_dir fm-wedge-rec
 cat > "$_fm_wedge_rec_dir/rec" <<'REC'
 #!/usr/bin/env bash
 printf '%s\t%s\n' "${1:-}" "${2:-}" >> "${FM_WEDGE_ALARM_LOG:-/dev/null}"
@@ -64,6 +61,11 @@ make_case() {
   dir="$TMP_ROOT/$name"
   fakebin="$dir/fakebin"
   mkdir -p "$dir/state" "$fakebin"
+  # Behavioral watcher fixtures should not enter machine-global maintenance
+  # before reaching the signal/stale path they own. Cadence-owner tests remove
+  # their marker explicitly when they need to exercise a due sweep.
+  touch "$dir/state/.last-report-retention" \
+    "$dir/state/.last-account-session-sync"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u

@@ -503,7 +503,8 @@ test_direct_sync_honors_shared_checkout_lock() {
   common=$(git -C "$clone" rev-parse --git-common-dir)
   case "$common" in /*) ;; *) common="$clone/$common" ;; esac
   common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  key=$(printf '%s' "$common" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-locks"
   lock="$lock_root/$key.lock"
   mkdir -p "$lock"
@@ -531,7 +532,8 @@ test_direct_sync_timeout_terminates_descendants() {
   common=$(git -C "$clone" rev-parse --git-common-dir)
   case "$common" in /*) ;; *) common="$clone/$common" ;; esac
   common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  key=$(printf '%s' "$common" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-refresh-state/locks"
   lock="$lock_root/$key.lock"
   cat > "$fakebin/git" <<'SH'

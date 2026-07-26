@@ -106,7 +106,7 @@ test_spawn_contract_and_mkdir_pattern() {
   # shellcheck disable=SC2016  # single quotes are deliberate: literal source string
   grep -F 'echo "tasktmp=$TASK_TMP"' "$SPAWN" >/dev/null \
     || fail "fm-spawn missing: tasktmp= line in meta write"
-  grep -F 'export GOTMPDIR=' "$SPAWN" >/dev/null \
+  grep -E 'export ([^[:space:]]+=[^[:space:]]+[[:space:]]+)*GOTMPDIR=' "$SPAWN" >/dev/null \
     || fail "fm-spawn missing: GOTMPDIR export into pane"
   # Behavioral: the mkdir + meta-write pattern spawn uses must produce a gotmp dir and
   # a meta line whose value the teardown grep (tasktmp=, cut -d= -f2-) reads back whole.

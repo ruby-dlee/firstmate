@@ -27,6 +27,7 @@
 #
 # Usage:
 #   fm-lint.sh                    lint the canonical file set (what both gates run)
+#   fm-lint.sh -x                 lint the canonical file set with sourced files
 #   fm-lint.sh <path>...          lint only the given paths with the same config
 #                                  (developer convenience; the gates never pass args)
 #   fm-lint.sh --required-version print the pinned ShellCheck version and exit
@@ -65,6 +66,10 @@ if [ "$resolved" != "$REQUIRED_SHELLCHECK" ]; then
   printf 'fm-lint.sh: ShellCheck %s required for CI parity, found %s. Install %s.\n' \
     "$REQUIRED_SHELLCHECK" "$resolved" "$REQUIRED_SHELLCHECK" >&2
   exit 1
+fi
+
+if [ "$#" -eq 1 ] && [ "$1" = -x ]; then
+  exec shellcheck --norc -x bin/*.sh bin/backends/*.sh tests/*.sh
 fi
 
 if [ "$#" -gt 0 ]; then

@@ -331,7 +331,7 @@ test_nested_active_project_invalidates_coverage_health() {
   projects="$container/projects"
   nested="$projects/nested-directory"
   nested_state="$TMP_ROOT/nested-active-state"
-  mkdir -p "$nested" "$nested_state"
+  mkdir -p "$nested" "$nested_state" "$TMP_ROOT/nested-active-treehouse"
   printf '%s\n' preserved-nested-heartbeat > "$nested_state/heartbeat"
 
   set +e

@@ -983,7 +983,11 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -994,6 +998,8 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
   env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
+    FM_TREEHOUSE_ROOT="${FM_TREEHOUSE_ROOT:-}" \
+    FM_FAKE_TREEHOUSE_PATH="${FM_FAKE_TREEHOUSE_PATH:-}" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
     "$bin/bin/fm-spawn.sh" "$@"
 }
@@ -1082,10 +1088,10 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   mkdir -p "$data/$id"
   printf 'test brief content\n' > "$data/$id/brief.md"
   state="$TMP_ROOT/symlink-state-$label"; config="$TMP_ROOT/symlink-config-$label"
-  mkdir -p "$state" "$config"
+  mkdir -p "$state" "$config" "$TMP_ROOT/symlink-treehouse-$label"
   log="$TMP_ROOT/symlink-spawn-$label.log"
 
-  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  out=$(FM_FAKE_TREEHOUSE_PATH="$wt" FM_TREEHOUSE_ROOT="$TMP_ROOT/symlink-treehouse-$label" run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
   rc=$?
   expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
   assert_contains "$out" "worktree=$wt" \

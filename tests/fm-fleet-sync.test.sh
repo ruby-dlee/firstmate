@@ -500,14 +500,12 @@ test_direct_sync_honors_shared_checkout_lock() {
   clone=$(build_pair "$home" shared-lock)
   advance_origin "$home" shared-lock C1
   before=$(head_sha "$clone")
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-locks"
-  lock="$lock_root/$key.lock"
-  mkdir -p "$lock"
-  printf '%s\n' "$$" > "$lock/pid"
+  # shellcheck source=bin/fm-checkout-lock-lib.sh
+  . "$ROOT/bin/fm-checkout-lock-lib.sh"
+  fm_checkout_lock_prepare "$lock_root" || fail "could not prepare shared checkout lock fixture"
+  lock=$(fm_checkout_lock_path "$clone" "$lock_root") || fail "could not resolve shared checkout lock fixture"
+  fm_lock_try_acquire "$lock" || fail "could not acquire shared checkout lock fixture"
 
   out=$(FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
@@ -516,7 +514,7 @@ test_direct_sync_honors_shared_checkout_lock() {
   assert_contains "$out" "$clone: skipped: refresh already running (pid $$)" \
     "direct fleet sync bypassed the shared checkout lock"
   [ "$(head_sha "$clone")" = "$before" ] || fail "direct sync mutated a contended checkout"
-  rm -rf "$lock"
+  fm_lock_release "$lock"
   pass "direct sync serializes through the shared canonical checkout lock"
 }
 

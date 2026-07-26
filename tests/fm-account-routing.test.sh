@@ -3125,8 +3125,8 @@ test_concurrent_continuations_serialize_before_mutation() {
   second_pid=$!
   second_lock_waiter=
   for _ in $(seq 1 100); do
-    second_lock_waiter=$(find "$HOME_DIR/state" -maxdepth 1 -type f \
-      -name ".account-lifecycle-$id.owner.*" -print -quit)
+    second_lock_waiter=$(find "$CASE_DIR/checkout-refresh-locks/secondmate-home-lifecycle" \
+      -maxdepth 1 -type f -name '.secondmate-home-lifecycle-*.owner.*' -print -quit)
     [ -n "$second_lock_waiter" ] && break
     sleep 0.05
   done

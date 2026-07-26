@@ -428,7 +428,7 @@ EOF
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_PRIMARY_ROOT:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -2042,17 +2042,21 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2 clone_head
-  git clone -q --no-hardlinks "$ROOT" "$home" || fail "could not create secondmate fixture clone"
-  if ! git -C "$home" show-ref --verify --quiet refs/remotes/origin/main; then
-    clone_head=$(git -C "$home" rev-parse HEAD) || fail "could not resolve the secondmate fixture head"
-    git -C "$home" update-ref refs/remotes/origin/main "$clone_head" \
-      || fail "could not seed the secondmate fixture default branch"
-  fi
-  git -C "$home" remote set-head origin main \
-    || fail "could not set the secondmate fixture default branch"
-  git -C "$home" checkout -q -B main refs/remotes/origin/main \
-    || fail "could not align secondmate fixture to the default branch"
+  local home=$1 id=$2 clone_head primary origin
+  origin="$CASE_DIR/firstmate-origin.git"
+  git clone -q --bare --no-hardlinks "$ROOT" "$origin" \
+    || fail "could not create firstmate fixture origin"
+  clone_head=$(git -C "$origin" rev-parse HEAD) || fail "could not resolve the firstmate fixture head"
+  git -C "$origin" update-ref refs/heads/main "$clone_head" \
+    || fail "could not seed the firstmate fixture default branch"
+  git -C "$origin" symbolic-ref HEAD refs/heads/main \
+    || fail "could not set the firstmate fixture default branch"
+  git clone -q --no-hardlinks "$origin" "$home" || fail "could not create secondmate fixture clone"
+  git -C "$home" checkout -q --detach \
+    || fail "could not detach the leased secondmate fixture"
+  primary="$CASE_DIR/primary-home"
+  git clone -q --no-hardlinks "$origin" "$primary" || fail "could not create primary fixture clone"
+  FM_TEST_PRIMARY_ROOT=$primary
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"

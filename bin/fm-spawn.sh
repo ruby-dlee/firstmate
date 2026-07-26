@@ -3769,10 +3769,7 @@ if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
     echo "error: task generation changed before prior temp cleanup for $ID" >&2
     exit 1
   fi
-  if fm_account_task_tmp_is_current "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" \
-    || fm_account_task_tmp_is_previous "$ID" "$EXISTING_TASK_TMP"; then
-    rm -rf "$EXISTING_TASK_TMP" || exit 1
-  fi
+  fm_account_safe_remove_task_tmp "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || exit 1
   fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
   META_WRITE_LOCK=
 fi

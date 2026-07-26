@@ -312,6 +312,20 @@ fm_account_task_tmp_is_expected() {  # <task-id> <path> <generation-id>
     || fm_account_task_tmp_is_legacy "$1" "$2"
 }
 
+fm_account_safe_remove_task_tmp() {  # <task-id> <path> <generation-id>
+  local task=$1 target=$2 generation=$3 legacy base
+  [ -n "$target" ] || return 0
+  fm_account_task_tmp_is_expected "$task" "$target" "$generation" || return 1
+  legacy=$(fm_account_legacy_task_tmp_path "$task") || return 1
+  [ "$target" != "$legacy" ] || return 0
+  fm_account_task_tmp_is_current "$task" "$target" "$generation" \
+    || fm_account_task_tmp_is_previous "$task" "$target" \
+    || return 1
+  python3 "$FM_ACCOUNT_ROUTING_LIB_DIR/fm-safe-task-tmp.py" "$target" || return 1
+  base=${target%/*}
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$base" 2>/dev/null || true
+}
+
 fm_account_safe_file_destination() {
   [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
 }

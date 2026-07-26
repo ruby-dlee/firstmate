@@ -1824,50 +1824,6 @@ safe_rm_rf_child_worktree() {
   removal_tree_operation "$canonical" "child worktree" remove
 }
 
-safe_remove_task_tmp() {
-  local target=$1 base legacy
-  [ -n "$target" ] || return 0
-  fm_account_task_tmp_is_expected "$ID" "$target" "$TASK_GENERATION" || return 1
-  legacy=$(fm_account_legacy_task_tmp_path "$ID") || return 1
-  # Legacy compatibility is classification-only. Never inspect or mutate the
-  # old process-wide /tmp/fm-<id> location from a current teardown.
-  [ "$target" != "$legacy" ] || return 0
-  fm_account_task_tmp_is_current "$ID" "$target" "$TASK_GENERATION" \
-    || fm_account_task_tmp_is_previous "$ID" "$target" \
-    || return 1
-  [ -e "$target" ] || [ -L "$target" ] || return 0
-  base=${target%/*}
-  base=$(python3 - "$base" <<'PY'
-import os
-import stat
-import sys
-
-raw = sys.argv[1]
-base = os.path.realpath(raw)
-if raw == "/tmp":
-    if base not in ("/tmp", "/private/tmp"):
-        raise SystemExit(1)
-elif raw != base:
-    raise SystemExit(1)
-if not base.startswith(os.path.sep) or base == os.path.sep:
-    raise SystemExit(1)
-current = os.path.sep
-for component in base.split(os.path.sep):
-    if not component:
-        continue
-    current = os.path.join(current, component)
-    metadata = os.lstat(current)
-    if stat.S_ISLNK(metadata.st_mode):
-        raise SystemExit(1)
-if not stat.S_ISDIR(os.lstat(base).st_mode):
-    raise SystemExit(1)
-print(base)
-PY
-  ) || return 1
-  removal_tree_operation "$base/${target##*/}" "task temp root" remove || return 1
-  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$base" 2>/dev/null || true
-}
-
 remove_worktree_compatibility_artifacts() {
   local target=$1 label=$2
   FM_COMPATIBILITY_CLEANUP_LABEL=$label python3 - "$target" <<'PY'
@@ -3942,7 +3898,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-  safe_remove_task_tmp "$TASK_TMP" || exit 1
+  fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$TASK_GENERATION" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   ACCOUNT_DELETE_LOCK=
@@ -4246,7 +4202,7 @@ remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root, including its gotmp, recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
-[ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
+[ -z "$TASK_TMP" ] || fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$TASK_GENERATION" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

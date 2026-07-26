@@ -1580,6 +1580,24 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
   pass "failed managed respawn restores every field from existing unmanaged metadata"
 }
 
+test_task_tmp_removal_refuses_symlinked_parent() {
+  local id generation state outside target
+  id=account-tasktmp-parent-z9d
+  generation=spawn:a333333333333333
+  state="$TMP_ROOT/tasktmp-parent/state"
+  outside="$TMP_ROOT/tasktmp-parent/outside"
+  target="$state/.task-tmp/fm-$id-a333333333333333"
+  mkdir -p "$state" "$outside/${target##*/}"
+  ln -s "$outside" "$state/.task-tmp"
+  STATE=$state
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  if fm_account_safe_remove_task_tmp "$id" "$target" "$generation" >/dev/null 2>&1; then
+    fail "task temp removal followed a symlinked parent"
+  fi
+  assert_present "$outside/${target##*/}" "task temp removal deleted through a symlinked parent"
+  pass "task temp removal refuses a symlinked parent"
+}
+
 test_preinstall_managed_failure_restores_artifact_snapshot() {
   local id rec expected out status artifact
   id=account-preinstall-rollback-z9f
@@ -6492,6 +6510,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
   run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
   run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
+  run_isolated_test test_task_tmp_removal_refuses_symlinked_parent
   run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
   exit 0
 fi

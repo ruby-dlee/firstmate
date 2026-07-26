@@ -1235,6 +1235,11 @@ for ((index=0; index<${#arguments[@]}; index++)); do
       ;;
   esac
 done
+if [ "${arguments[0]:-}" = session ] && [ "${arguments[1]:-}" != list ]; then
+  for ((index=2; index<${#arguments[@]}; index++)); do
+    [ "${arguments[$index]}" = default ] && targets_default=true
+  done
+fi
 if [ "$targets_default" = true ]; then
   printf -v offending_command '%q ' "$@"
   printf 'fake Herdr command targeting default is forbidden: %s\n' \

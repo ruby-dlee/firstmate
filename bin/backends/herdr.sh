@@ -3013,9 +3013,10 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
 # tmux-kill-window's `|| true` contract). Verified: closing a tab's only pane
 # closes the tab too, so a separate tab close is unnecessary.
 fm_backend_herdr_kill() {  # <target> [backend-id] [expected-label]
-  if ! fm_backend_herdr_target_ready "$1" "${3:-}"; then
-    [ -z "${3:-}" ] && return 0
-    return 1
+  if [ -n "${3:-}" ]; then
+    fm_backend_herdr_target_ready "$1" "$3" || return 1
+  else
+    fm_backend_herdr_parse_target "$1" || return 0
   fi
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
 }

@@ -4198,6 +4198,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   test_workspace_ensure_prunes_default_tab
+  test_repeated_cycles_reuse_one_workspace_no_orphans
   exit 0
 fi
 

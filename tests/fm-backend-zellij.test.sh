@@ -962,19 +962,20 @@ PY
 }
 
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
-  local dir state data config upstream source home project child_worktree fb out status child_title
+  local dir state data config upstream source source_branch home project child_worktree fb out status child_title
   dir="$TMP_ROOT/teardown-zellij-secondmate-child"; state="$dir/state"; data="$dir/data"; config="$dir/config"; upstream="$dir/upstream.git"; source="$dir/source"; home="$dir/secondmate-home"; project="$dir/project"
   child_worktree="$dir/treehouse/slot/worktree"
   mkdir -p "$state" "$data" "$config" "$project" "$(dirname "$child_worktree")" "$dir/responses"
+  source_branch=$(git -C "$ROOT" branch --show-current)
   git clone -q --no-local --bare "$ROOT" "$upstream"
-  git -C "$upstream" symbolic-ref HEAD refs/heads/main
+  git -C "$upstream" symbolic-ref HEAD "refs/heads/$source_branch"
   git -C "$upstream" repack -adq
   git -C "$upstream" prune-packed
-  git clone -q --no-local --single-branch --branch main "$upstream" "$source"
+  git clone -q --no-local --single-branch --branch "$source_branch" "$upstream" "$source"
   git -C "$source" repack -adq
   git -C "$source" prune-packed
-  git clone -q --no-local --single-branch --branch main "$source" "$home"
-  git -C "$home" remote set-head origin main
+  git clone -q --no-local --single-branch --branch "$source_branch" "$source" "$home"
+  git -C "$home" remote set-head origin "$source_branch"
   git -C "$home" repack -adq
   git -C "$home" prune-packed
   mkdir -p "$home/state" "$home/data/childz" "$home/config" "$home/projects"

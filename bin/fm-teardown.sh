@@ -1052,9 +1052,30 @@ require_treehouse_return_authority() {
 }
 
 validate_teardown_target_identity() {
-  local project_root worktree_root project_common worktree_common
+  local project_root worktree_root project_common worktree_common project_git
   [ "$KIND" != secondmate ] || return 0
   require_safe_task_metadata || return 1
+  if [ "$BACKEND" != orca ] && [ ! -d "$WT" ]; then
+    project_root=$(canonical_existing_dir "$PROJ") || {
+      echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
+      return 1
+    }
+    [ "$(git -C "$project_root" rev-parse --show-toplevel 2>/dev/null)" = "$project_root" ] || {
+      echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
+      return 1
+    }
+    project_git=$(git -C "$project_root" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+    [ "$project_git" = "$project_root/.git" ] && [ -d "$project_git" ] && [ ! -L "$project_git" ] || {
+      echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
+      return 1
+    }
+    worktree_registered_for_project "$project_root" "$WT" || {
+      echo "error: absent teardown worktree is not registered to the recorded project: ${WT:-<missing>}" >&2
+      return 1
+    }
+    require_treehouse_task_lease "$WT" "firstmate-$ID"
+    return $?
+  fi
   project_root=$(exact_git_worktree_root "$PROJ") || {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1

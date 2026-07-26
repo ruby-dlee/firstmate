@@ -761,7 +761,9 @@ test_whole_fleet_form() {
   current=$(build_pair "$home" fleet-current)
 
   # Whole-fleet form: no project-dir argument.
-  out=$(run_sync "$home")
+  # Batch sync reports each checkout independently.
+  # Do not let a platform-specific aggregate status hide those results when an earlier test enabled errexit.
+  out=$(run_sync "$home" || :)
 
   assert_contains "$out" "fleet-behind: synced" "whole-fleet form syncs a behind clone"
   assert_contains "$out" "fleet-current: already current" "whole-fleet form reports a current clone"

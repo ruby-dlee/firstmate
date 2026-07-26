@@ -967,7 +967,9 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   child_worktree="$dir/treehouse/slot/worktree"
   mkdir -p "$state" "$data" "$config" "$project" "$(dirname "$child_worktree")" "$dir/responses"
   source_branch=$(git -C "$ROOT" branch --show-current)
+  source_branch=${source_branch:-fm-test-source}
   git clone -q --no-local --bare "$ROOT" "$upstream"
+  git -C "$upstream" update-ref "refs/heads/$source_branch" "$(git -C "$upstream" rev-parse HEAD)"
   git -C "$upstream" symbolic-ref HEAD "refs/heads/$source_branch"
   git -C "$upstream" repack -adq
   git -C "$upstream" prune-packed

@@ -1276,7 +1276,8 @@ test_spawn_default_backend_writes_no_meta_field() {
   local proj wt data id state config out
   proj="$TMP_ROOT/nobackend-project"; wt="$TMP_ROOT/nobackend-wt"; data="$TMP_ROOT/nobackend-data"
   id="nobackendz3"
-  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fm_git_init_commit "$proj"
+  git -C "$proj" worktree add --quiet --detach "$wt"
   local fb
   fb=$(make_spawn_fakebin "$TMP_ROOT/nobackend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
@@ -1299,7 +1300,8 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   local proj wt data id state config out fb
   proj="$TMP_ROOT/explicit-backend-project"; wt="$TMP_ROOT/explicit-backend-wt"; data="$TMP_ROOT/explicit-backend-data"
   id="explicitbackendz4"
-  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fm_git_init_commit "$proj"
+  git -C "$proj" worktree add --quiet --detach "$wt"
   fb=$(make_spawn_fakebin "$TMP_ROOT/explicit-backend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
   state="$TMP_ROOT/explicit-backend-state"; config="$TMP_ROOT/explicit-backend-config"
@@ -1323,7 +1325,8 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   local proj wt data id state config out fb
   proj="$TMP_ROOT/nest-project"; wt="$TMP_ROOT/nest-wt"; data="$TMP_ROOT/nest-data"
   id="nestbackendz5"
-  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fm_git_init_commit "$proj"
+  git -C "$proj" worktree add --quiet --detach "$wt"
   fb=$(make_spawn_fakebin "$TMP_ROOT/nest-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
   state="$TMP_ROOT/nest-state"; config="$TMP_ROOT/nest-config"

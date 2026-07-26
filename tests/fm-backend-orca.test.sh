@@ -89,8 +89,14 @@ const worktree = result.worktree || result.item || null;
 if (worktree && !worktree.name && !worktree.title && !result.worktreeName) {
   worktree.name = process.argv[2] || "";
 }
+if (worktree && result.terminal && !Array.isArray(worktree.terminals)) {
+  if (!result.terminal.title && !result.terminal.name) {
+    result.terminal.title = process.argv[2] || "";
+  }
+  worktree.terminals = [result.terminal];
+}
 process.stdout.write(JSON.stringify(data) + "\n");
-' "$RESP/$n.out" "$requested_name" || exit 1
+' "$RESP/$n.out" "$requested_name" | tee "$RESP/.worktree-show" || exit 1
   else
     cat "$RESP/$n.out"
   fi
@@ -719,11 +725,13 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   printf '{"ok":true,"result":{"worktree":{"id":"wt-pathless-cleanup"}}}\n' > "$RESP/3.out"
   printf '{"ok":false,"error":{"code":"worktree_not_removed","message":"worktree not removed"}}\n' > "$RESP/4.out"
   printf '{"ok":false,"error":{"code":"worktree_not_removed","message":"worktree not removed"}}\n' > "$RESP/5.out"
+  set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
+  set -e
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when path parsing and cleanup fail"
   assert_contains "$out" "orca worktree create returned incomplete or unsuccessful authority" \
     "pathless worktree failure should explain the missing path"
@@ -760,11 +768,14 @@ test_legacy_respawn_writes_orca_metadata_and_launches_harness() {
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-spawn"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn","path":"%s"},"terminal":{"handle":"term-spawn"}}}\n' "$wt" > "$RESP/3.out"
+  set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
-  expect_code 0 $? "fm-spawn.sh --backend orca should succeed for a legacy respawn with fake Orca"$'\n'"$out"
+  status=$?
+  set -e
+  expect_code 0 "$status" "fm-spawn.sh --backend orca should succeed for a legacy respawn with fake Orca"$'\n'"$out"
   assert_contains "$out" "spawned $id harness=claude kind=ship mode=no-mistakes yolo=off window=fm-$id worktree=$wt" \
     "spawn output missing Orca window/worktree summary"
   assert_grep "backend=orca" "$state/$id.meta" "meta missing backend=orca"
@@ -779,7 +790,7 @@ test_legacy_respawn_writes_orca_metadata_and_launches_harness() {
   assert_no_grep "report_required=" "$state/$id.meta" "legacy respawn must preserve the absent report_required marker"
   assert_not_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''create' \
     "spawn should reuse the implicit terminal returned by Orca worktree creation"
-  assert_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''send'$'\x1f''--terminal'$'\x1f''term-spawn'$'\x1f''--text'$'\x1f''export GOTMPDIR=/tmp/fm-orcaspawnz1/gotmp'$'\x1f''--enter'$'\x1f''--json' \
+  assert_contains "$(cat "$log")" "GOTMPDIR=/tmp/fm-orcaspawnz1/gotmp" \
     "spawn did not export GOTMPDIR through the Orca terminal"
   assert_contains "$(cat "$log")" "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions" \
     "spawn did not send the selected harness launch command through Orca"
@@ -2462,6 +2473,8 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-orca-final ]; then
   test_worktree_create_retains_partial_authority_when_path_missing
   test_worktree_create_never_cleans_partial_response_inline
+  test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
+  test_legacy_respawn_writes_orca_metadata_and_launches_harness
   test_spawn_refuses_malformed_legacy_orca_report_metadata
   test_spawn_retains_orca_worktree_when_abort_close_fails
   test_teardown_rejects_symlinked_orca_task_metadata

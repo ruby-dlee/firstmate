@@ -1509,10 +1509,12 @@ test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held() {
 }
 
 test_unmanaged_respawn_preserves_report_cutover_state() {
-  local id rec out status
+  local id rec out status prior_task_tmp
   id=account-legacy-respawn-z9b
   rec=$(make_case legacy-respawn claude "$id")
   read_case "$rec"
+  prior_task_tmp="$HOME_DIR/state/.task-tmp/fm-$id-a111111111111111"
+  mkdir -p "$prior_task_tmp/gotmp"
   fm_write_meta "$HOME_DIR/state/$id.meta" \
     "window=firstmate:fm-$id" \
     "worktree=$WT_DIR" \
@@ -1520,6 +1522,8 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
     "harness=claude" \
     "kind=ship" \
     "mode=no-mistakes" \
+    "tasktmp=$prior_task_tmp" \
+    "generation_id=spawn:a111111111111111" \
     "pr=418" \
     "x_request=req-legacy" \
     "custom_extension=preserve-success"
@@ -1530,14 +1534,17 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
   assert_grep 'pr=418' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing PR pointer"
   assert_grep 'x_request=req-legacy' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing X-mode link"
   assert_grep 'custom_extension=preserve-success' "$HOME_DIR/state/$id.meta" "managed respawn dropped extension metadata"
+  assert_absent "$prior_task_tmp" "successful respawn orphaned the prior task temp generation"
   pass "unmanaged respawn preserves a legacy task's report cutover state"
 }
 
 test_failed_managed_respawn_restores_unmanaged_metadata() {
-  local id rec expected out status artifact
+  local id rec expected out status artifact prior_task_tmp
   id=account-unmanaged-rollback-z9c
   rec=$(make_case unmanaged-rollback claude "$id")
   read_case "$rec"
+  prior_task_tmp="$HOME_DIR/state/.task-tmp/fm-$id-a222222222222222"
+  mkdir -p "$prior_task_tmp/gotmp"
   fm_write_meta "$HOME_DIR/state/$id.meta" \
     "window=firstmate:fm-$id" \
     "worktree=$WT_DIR" \
@@ -1545,6 +1552,8 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
     "harness=claude" \
     "kind=ship" \
     "mode=no-mistakes" \
+    "tasktmp=$prior_task_tmp" \
+    "generation_id=spawn:a222222222222222" \
     "pr=417" \
     "custom_extension=preserve-me"
   expected="$CASE_DIR/original.meta"
@@ -1566,6 +1575,7 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
       || fail "failed managed respawn did not restore prior $artifact state"
   done
   assert_grep 'lease release ' "$AF_LOG" "failed managed respawn leaked its acquired reservation"
+  assert_present "$prior_task_tmp/gotmp" "failed respawn destroyed the prior task temp generation"
   [ -n "$out" ] || true
   pass "failed managed respawn restores every field from existing unmanaged metadata"
 }
@@ -6476,6 +6486,13 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = production-fleet-environment ]; then
   run_isolated_test test_production_fleet_environment_is_closed_before_control_and_worker_exec
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
+  run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
+  run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
+  run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
   exit 0
 fi
 

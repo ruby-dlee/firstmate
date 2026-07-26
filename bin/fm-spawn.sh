@@ -1857,12 +1857,16 @@ mkdir -p "$STATE" || {
 }
 if [ "$SPAWN_META_PRESENT" = 1 ]; then
   EXISTING_TASK_TMP=$(spawn_preflight_meta_value tasktmp)
+  EXISTING_TASK_GENERATION=$(spawn_preflight_meta_value generation_id)
   if [ -n "$EXISTING_TASK_TMP" ]; then
-    fm_account_task_tmp_is_expected "$ID" "$EXISTING_TASK_TMP" "$(spawn_preflight_meta_value generation_id)" || {
+    fm_account_task_tmp_is_expected "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || {
       echo "error: existing task metadata has an unsafe tasktmp for $ID" >&2
       exit 1
     }
   fi
+else
+  EXISTING_TASK_TMP=
+  EXISTING_TASK_GENERATION=
 fi
 PROJ=
 ARG3=
@@ -3758,6 +3762,20 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   fi
 fi
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
+if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+    || [ "$(fm_account_meta_value "$STATE/$ID.meta" tasktmp)" != "$TASK_TMP" ]; then
+    echo "error: task generation changed before prior temp cleanup for $ID" >&2
+    exit 1
+  fi
+  if fm_account_task_tmp_is_current "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" \
+    || fm_account_task_tmp_is_previous "$ID" "$EXISTING_TASK_TMP"; then
+    rm -rf "$EXISTING_TASK_TMP" || exit 1
+  fi
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
+fi
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 [ -z "$META_BACKUP" ] || rm -f "$META_BACKUP"

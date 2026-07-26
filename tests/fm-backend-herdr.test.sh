@@ -1339,20 +1339,30 @@ SH
         . "$0/bin/backends/herdr.sh"
         fm_backend_herdr_container_ensure "$PWD"
       ' "$ROOT" "fm-$mode" 2>&1); then status=0; else status=$?; fi
-    [ "$status" -ne 0 ] || fail "$mode release-drifted server was restarted or routed"
-    assert_contains "$out" "$mode" "$mode drift refusal was not explicit"
-    kill -0 "$old_pid" 2>/dev/null || fail "$mode refusal stopped the existing adapter server"
+    if [ "$mode" = occupied ]; then
+      [ "$status" -eq 0 ] || fail "occupied release-drifted adapter server was not reused: $out"
+    else
+      [ "$status" -ne 0 ] || fail "$mode release-drifted server was restarted or routed"
+      assert_contains "$out" "$mode" "$mode drift refusal was not explicit"
+    fi
+    kill -0 "$old_pid" 2>/dev/null || fail "$mode lifecycle decision stopped the existing adapter server"
     assert_no_grep $'\x1fsession\x1fstop' "$log" \
-      "$mode refusal stopped the server before its lifecycle decision"
+      "$mode lifecycle decision stopped the server"
     assert_no_grep $'\x1fserver\x1f--session' "$log" \
-      "$mode refusal launched a server before its lifecycle decision"
-    assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
-      "$mode refusal created a workspace before its lifecycle decision"
-    [ ! -e "$mutation" ] || fail "$mode refusal reached workspace creation"
+      "$mode lifecycle decision launched a replacement server"
+    if [ "$mode" = occupied ]; then
+      assert_grep $'\x1fworkspace\x1fcreate' "$log" \
+        "occupied adapter server did not continue to normal workspace routing"
+      [ -e "$mutation" ] || fail "occupied adapter server did not reach workspace creation"
+    else
+      assert_no_grep $'\x1fworkspace\x1fcreate' "$log" \
+        "$mode refusal created a workspace before its lifecycle decision"
+      [ ! -e "$mutation" ] || fail "$mode refusal reached workspace creation"
+    fi
     kill "$old_pid" 2>/dev/null || true
     wait "$old_pid" >/dev/null 2>&1 || true
   done
-  pass "server ensure serializes certificate drift: exact-empty restarts safely; occupied/indeterminate refuse before workspace mutation"
+  pass "server ensure serializes certificate drift: exact-empty restarts, occupied routes without restart, and indeterminate refuses"
 }
 
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir() {
@@ -3537,7 +3547,7 @@ $ids
 EOF
     [ -n "$pane" ] || fail "cycle $i: create_task returned no pane id"
     PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
-      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_kill "$1"' "$ROOT" "fmtest:$pane" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_kill "$1"' "$ROOT" "fmtest:$pane" \
       || fail "cycle $i: kill failed"
   done
   # exactly one firstmate workspace survives three spawn/teardown cycles
@@ -4080,6 +4090,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   test_workspace_ensure_prunes_default_tab
+  test_repeated_cycles_reuse_one_workspace_no_orphans
   exit 0
 fi
 

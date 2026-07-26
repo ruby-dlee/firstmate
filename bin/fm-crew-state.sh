@@ -66,7 +66,7 @@ LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 GH_TIMEOUT=${FM_CREW_STATE_GH_TIMEOUT:-10}
-case "$GH_TIMEOUT" in ''|*[!0-9]*) GH_TIMEOUT=10 ;; esac
+case "$GH_TIMEOUT" in ''|0|*[!0-9]*) GH_TIMEOUT=10 ;; esac
 # How many of the most recent `no-mistakes runs` rows the cross-branch fallback
 # (nm_runs_status_for_branch, below) scans. Generous enough to still find a
 # branch's own run on a busy multi-crewmate fleet without listing the entire

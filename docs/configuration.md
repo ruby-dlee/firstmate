@@ -594,6 +594,8 @@ FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 ```
 
+`FM_CREW_STATE_GH_TIMEOUT` defaults to 10 seconds, and zero or an invalid value is clamped to that same 10-second default because an indefinitely hung supervision state reader would stall wedge detection.
+
 [`permission-stall-detection.md`](permission-stall-detection.md) records why the watcher uses direct harness-prompt matching but a timeout heuristic for macOS system dialogs.
 
 `fm-teardown.sh` retries only Git's `Unable to create '...index.lock': File exists` return failure up to `FM_TREEHOUSE_RETURN_LOCK_RETRIES` times.

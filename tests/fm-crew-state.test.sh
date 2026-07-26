@@ -740,6 +740,33 @@ test_terminal_passed_fails_closed_when_pr_state_unavailable() {
   pass "terminal passed run fails closed when GitHub state is unavailable"
 }
 
+test_terminal_passed_clamps_zero_gh_timeout_and_fails_closed() {
+  reset_fakes
+  local d timeout_args out
+  d=$(new_case passed-zero-timeout)
+  make_repo_on_branch "$d/wt" fm/feat-dz
+  make_fakebin "$d" >/dev/null
+  cat > "$d/fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+if [ "${2:-}" = gh-axi ]; then
+  printf '%s\n' "$1" > "$FM_FAKE_TIMEOUT_ARGS"
+  exit 124
+fi
+shift
+exec "$@"
+SH
+  chmod +x "$d/fakebin/timeout"
+  timeout_args="$d/timeout-args"
+  fm_write_meta "$d/state/feat-dz.meta" "window=fm:fm-feat-dz" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-dz)"
+  out=$(FM_FAKE_TIMEOUT_ARGS="$timeout_args" FM_CREW_STATE_GH_TIMEOUT=0 run_crew_state "$d" feat-dz)
+  [ "$(cat "$timeout_args")" = 10 ] || fail "zero GitHub timeout did not clamp to ten seconds"
+  assert_contains "$out" "state: done" "timed-out query preserves terminal state"
+  assert_contains "$out" "PR state unavailable (not verified)" "timed-out query fails closed"
+  assert_not_contains "$out" "PR merged/closed" "timed-out query never uses pipeline-inferred PR state"
+  pass "zero GitHub timeout clamps and timed-out queries fail closed"
+}
+
 test_terminal_failed() {
   reset_fakes
   local d; d=$(new_case failed)
@@ -1237,6 +1264,7 @@ test_terminal_passed_verifies_merged_pr
 test_terminal_passed_does_not_claim_open_pr_merged
 test_terminal_passed_reports_closed_without_merge
 test_terminal_passed_fails_closed_when_pr_state_unavailable
+test_terminal_passed_clamps_zero_gh_timeout_and_fails_closed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row

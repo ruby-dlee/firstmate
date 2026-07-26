@@ -3257,7 +3257,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   FM_FAKE_AF_RELEASE_MARKER="$release_marker" FM_FAKE_TREEHOUSE_SLEEP=1 \
     run_teardown "$id" --force > "$CASE_DIR/teardown-stdout" 2> "$CASE_DIR/teardown-stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 100); do
     [ -f "$release_marker" ] && break
     sleep 0.1
   done

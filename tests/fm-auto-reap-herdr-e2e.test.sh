@@ -61,8 +61,9 @@ fi
 
 mkdir -p "$FAKE_ROOT" "$FAKEBIN" "$HOME_DIR/state" "$HOME_DIR/data" "$HOME_DIR/config" "$POOL/1"
 ln -s "$ROOT/bin" "$FAKE_ROOT/bin"
-ln "$ROOT/tests/fixtures/herdr-lab-wrapper.sh" "$FAKEBIN/herdr"
+cp "$ROOT/tests/fixtures/herdr-lab-wrapper.sh" "$FAKEBIN/herdr"
 ln "$ROOT/tests/fixtures/treehouse-return-fixture.sh" "$FAKEBIN/treehouse"
+chmod 700 "$FAKEBIN/herdr"
 
 fm_git_init_commit "$PROJECT"
 git -C "$PROJECT" branch -M main
@@ -96,6 +97,7 @@ export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 export HERDR_LAB_HELPER="$LAB_HELPER"
 export HERDR_LAB_SESSION="$SESSION"
 export HERDR_LAB_REAL_PATH="$ORIGINAL_PATH"
+export HERDR_LAB_WRAPPER_LOG="$TMP_ROOT/herdr-wrapper.log"
 export HERDR_SESSION="$SESSION"
 export PATH="$FAKEBIN:$ORIGINAL_PATH"
 export FM_ROOT_OVERRIDE="$FAKE_ROOT"
@@ -115,8 +117,14 @@ workspace_out=$("$LAB_HELPER" run "$SESSION" workspace create \
 WORKSPACE_ID=$(printf '%s' "$workspace_out" | jq -r '.result.workspace.workspace_id // empty')
 [ -n "$WORKSPACE_ID" ] || fail "real Herdr workspace create returned no workspace id"
 
-task_endpoint=$(fm_backend_herdr_create_task \
-  "$SESSION:$WORKSPACE_ID" "fm-$ID" "$WORKTREE" "")
+if task_endpoint=$(fm_backend_herdr_create_task \
+    "$SESSION:$WORKSPACE_ID" "fm-$ID" "$WORKTREE" ""); then
+  :
+else
+  printf '%s\n' "--- production Herdr adapter trace ---" >&2
+  cat "$HERDR_LAB_WRAPPER_LOG" >&2
+  fail "real Herdr task create failed through the production adapter"
+fi
 TAB_ID=${task_endpoint%% *}
 PANE_ID=${task_endpoint#* }
 [ -n "$TAB_ID" ] && [ -n "$PANE_ID" ] || fail "real Herdr task create returned incomplete identity"
@@ -142,7 +150,14 @@ fm_write_meta "$HOME_DIR/state/$ID.meta" \
   "generation_id=real-herdr-auto-reap"
 printf 'done: local branch ready for approved merge\n' > "$HOME_DIR/state/$ID.status"
 
-out=$("$ROOT/bin/fm-merge-local.sh" "$ID" 2>&1)
+if out=$("$ROOT/bin/fm-merge-local.sh" "$ID" 2>&1); then
+  :
+else
+  printf '%s\n' "$out" >&2
+  printf '%s\n' "--- production Herdr adapter trace ---" >&2
+  cat "$HERDR_LAB_WRAPPER_LOG" >&2
+  fail "real local merge landed but automatic teardown refused"
+fi
 assert_contains "$out" "auto-reaped $ID" "real local merge did not report automatic reaping"
 [ ! -e "$HOME_DIR/state/$ID.meta" ] || fail "automatic teardown retained task metadata"
 [ ! -e "$WORKTREE" ] || fail "automatic teardown retained the Treehouse worktree"

@@ -2653,22 +2653,18 @@ fm_backend_herdr_expected_label_matches() {  # <target> [expected-label]
 # launch-grade fm_backend_herdr_server_ensure used to spawn new crewmates.
 #
 # Reading a pane or sending keys to it does not care how the server was
-# launched - the pane already exists and the server is up. It only needs the
-# server to be running and adapter-owned (this HOME's own certificate names the
-# live pid), which fm_backend_herdr_server_adapter_owned proves without the
-# closed-shell launch certification. This is what keeps peek/steer working when
-# FirstMate itself runs INSIDE the herdr session it manages (HERDR_ENV=1): that
-# server was not launched through the crewmate adapter's own closed-shell path, so
-# closed_shell_environment_ready is false and the full ensure would try to
-# restart+recertify - impossible while the session is occupied by live crewmates and
-# FirstMate itself. The SPAWN path deliberately keeps the strict ensure so a new
-# crewmate still launches only in a certified closed-shell server.
+# launched - the pane already exists and the server is up. Native agent routing
+# removed production's server-certificate requirement, so exact pane identity is
+# the authority boundary there. The explicit legacy certificate-lifecycle test
+# mode retains its adapter-owned-server proof.
 fm_backend_herdr_server_reachable_for_readsteer() {  # <session>
   local session=$1 running
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
     | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
   [ "$running" = true ] || return 1
-  fm_backend_herdr_server_adapter_owned "$session"
+  if fm_backend_herdr_server_certificate_required; then
+    fm_backend_herdr_server_adapter_owned "$session"
+  fi
 }
 
 fm_backend_herdr_target_ready() {  # <target> [expected-label]

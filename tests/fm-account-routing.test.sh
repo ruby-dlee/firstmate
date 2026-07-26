@@ -458,11 +458,60 @@ run_spawn() {
 }
 
 run_teardown() {
+  local id=$1 slot pool state report
+  report="$HOME_DIR/data/$id/completion.md"
+  if [ ! -f "$report" ]; then
+    mkdir -p "$(dirname "$report")"
+    cat > "$report" <<'EOF'
+## Summary
+
+Test completion summary.
+## What changed
+
+Test completion changes.
+## Verification
+
+Test completion verification.
+## Visual evidence
+
+No visual evidence applies.
+## Artifacts
+
+Test completion artifacts.
+## Follow-ups
+
+No follow-ups remain.
+EOF
+  fi
+  slot=$(cd "$(dirname "$WT_DIR")" && pwd -P) || fail "could not resolve the Treehouse fixture slot"
+  pool=$(cd "$(dirname "$slot")" && pwd -P) || fail "could not resolve the Treehouse fixture pool"
+  state="$pool/treehouse-state.json"
+  python3 - "$state" "$(cd "$WT_DIR" && pwd -P)" "firstmate-$id" <<'PY'
+import json
+import sys
+
+state, path, holder = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": path,
+                    "leased": True,
+                    "lease_holder": holder,
+                }
+            ]
+        },
+        stream,
+    )
+PY
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
-    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_PATH="$WT_DIR" \
+    FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
@@ -3092,7 +3141,8 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
 }
 
 test_concurrent_continuations_serialize_before_mutation() {
-  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count second_lock_waiter
+  local id rec marker gate first_pid second_pid first_rc second_rc lease_count endpoint_count
+  local held_lease_count held_endpoint_count
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
@@ -3110,21 +3160,21 @@ test_concurrent_continuations_serialize_before_mutation() {
     sleep 0.05
   done
   [ -f "$marker" ] || { kill "$first_pid" 2>/dev/null || true; fail "first continuation never reached endpoint creation"; }
+  held_lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
+  held_endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     run_spawn "$id" --continue-account --account-profile claude-3 > "$CASE_DIR/second.out" 2>&1 &
   second_pid=$!
-  second_lock_waiter=
-  for _ in $(seq 1 100); do
-    second_lock_waiter=$(find "$HOME_DIR/state" -maxdepth 1 -type f \
-      -name ".account-lifecycle-$id.owner.*" -print -quit)
-    [ -n "$second_lock_waiter" ] && break
-    sleep 0.05
-  done
-  if [ -z "$second_lock_waiter" ]; then
+  sleep 1
+  if ! kill -0 "$second_pid" 2>/dev/null; then
     touch "$gate"
-    kill "$first_pid" "$second_pid" 2>/dev/null || true
-    fail "second continuation never waited behind the first lifecycle owner"
+    kill "$first_pid" 2>/dev/null || true
+    fail "second continuation did not remain blocked behind the first lifecycle owner: $(cat "$CASE_DIR/second.out")"
   fi
+  lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
+  endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
+  [ "$lease_count" -eq "$held_lease_count" ] || fail "blocked continuation mutated lease state"
+  [ "$endpoint_count" -eq "$held_endpoint_count" ] || fail "blocked continuation mutated endpoint state"
   touch "$gate"
   wait "$first_pid"
   first_rc=$?

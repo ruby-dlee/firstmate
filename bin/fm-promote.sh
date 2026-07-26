@@ -19,6 +19,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-report-contract-lib.sh
+. "$SCRIPT_DIR/fm-report-contract-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 META="$STATE/$ID.meta"
@@ -48,7 +50,8 @@ fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" || exit 1
 LIFECYCLE_LOCK=
 trap - EXIT
 
-MESSAGE="<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write $DATA/$ID/completion.md with sections Summary, What changed, Verification, Visual evidence, Artifacts, and Follow-ups; report done>"
+REPORT_HEADINGS=$(fm_completion_report_required_headings)
+MESSAGE="<ship instructions: review scratch state with git status and git log; reset to a clean default-branch base; carry over only intended fix changes; create branch fm/$ID; implement; write $DATA/$ID/completion.md with exact headings $REPORT_HEADINGS; report done>"
 MESSAGE_Q=$(printf '%s' "$MESSAGE" | sed "s/'/'\\\\''/g")
 echo "promoted $ID to ship (teardown protection restored)"
 printf "next: FM_HOME=%q bin/fm-send.sh fm-%s '%s'\n" "$FM_HOME" "$ID" "$MESSAGE_Q"

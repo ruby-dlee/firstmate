@@ -123,12 +123,47 @@ function lastStatus(status) {
 
 const { markdownStructure } = markdownModule;
 
+function completionSectionStructure(markdown, options = {}) {
+  const structure = markdownStructure(markdown, options);
+  const requiredIndex = new Map(requiredSections.map((section, index) => [section.toLowerCase(), index]));
+  const headings = structure
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.heading?.level <= 2 && requiredIndex.has(entry.heading.content.toLowerCase()));
+  const level = headings[0]?.entry.heading.level;
+  const mixedLevels = headings.some(({ entry }) => entry.heading.level !== level);
+  let lastRequiredIndex = -1;
+  let outOfOrder = false;
+  for (const { entry } of headings) {
+    const index = requiredIndex.get(entry.heading.content.toLowerCase());
+    if (index <= lastRequiredIndex) outOfOrder = true;
+    lastRequiredIndex = index;
+  }
+  const firstHeadingIndex = headings[0]?.index;
+  const lastHeadingIndex = headings[headings.length - 1]?.index;
+  const interrupted = level === 2 && structure.some(({ heading }, index) => (
+    index > firstHeadingIndex
+    && index < lastHeadingIndex
+    && heading?.level === 1
+  ));
+  return {
+    structure,
+    level,
+    mixedLevels,
+    outOfOrder,
+    interrupted,
+  };
+}
+
 function firstSummary(markdown, fallback) {
-  const structure = markdownStructure(markdown);
-  const summaryStart = structure.findIndex(({ heading }) => heading?.level === 2 && heading.content.toLowerCase() === "summary");
+  const { structure, level } = completionSectionStructure(markdown);
+  const summaryStart = structure.findIndex(({ heading }) => (
+    heading && heading.level === level && heading.content.toLowerCase() === "summary"
+  ));
   let summaryLines;
   if (summaryStart >= 0) {
-    const followingHeading = structure.findIndex(({ heading }, index) => index > summaryStart && heading?.level === 2);
+    const followingHeading = structure.findIndex(({ heading }, index) => (
+      index > summaryStart && heading?.level <= level
+    ));
     summaryLines = structure.slice(summaryStart + 1, followingHeading < 0 ? undefined : followingHeading).map(({ line }) => line);
   } else {
     summaryLines = structure.map(({ line }) => line);
@@ -145,10 +180,19 @@ function firstSummary(markdown, fallback) {
 
 function requireCompletionSections(markdown, sourceFile, taskId) {
   const sections = new Map(requiredSections.map((section) => [section.toLowerCase(), { present: false, body: [] }]));
+  const {
+    structure,
+    level,
+    mixedLevels,
+    outOfOrder,
+    interrupted,
+  } = completionSectionStructure(markdown, { includeFenceContent: true });
   let currentSection;
-  for (const entry of markdownStructure(markdown, { includeFenceContent: true })) {
-    if (entry.heading?.level === 2) {
-      currentSection = sections.get(entry.heading.content.toLowerCase());
+  for (const entry of structure) {
+    if (entry.heading?.level <= level) {
+      currentSection = entry.heading.level === level
+        ? sections.get(entry.heading.content.toLowerCase())
+        : undefined;
       if (currentSection) currentSection.present = true;
     } else if (currentSection) {
       currentSection.body.push(entry);
@@ -169,16 +213,20 @@ function requireCompletionSections(markdown, sourceFile, taskId) {
     const state = sections.get(section.toLowerCase());
     return state.present && !state.body.some(substantive);
   });
-  if (missing.length === 0 && empty.length === 0) return;
+  if (missing.length === 0 && empty.length === 0 && !mixedLevels && !outOfOrder && !interrupted) return;
   const required = requiredSections.map((section) => `## ${section}`).join(", ");
   const absent = missing.map((section) => `## ${section}`).join(", ");
   const blank = empty.map((section) => `## ${section}`).join(", ");
   const problems = [];
   if (missing.length > 0) problems.push(`missing required section headings: ${absent}`);
   if (empty.length > 0) problems.push(`required sections have no substantive content: ${blank}`);
+  if (mixedLevels || interrupted) {
+    problems.push("required section headings do not share one top structural level (# or ##)");
+  }
+  if (outOfOrder) problems.push("required section headings are out of order");
   throw new Error(
     `completion report at ${sourceFile} ${problems.join("; ")}. `
-    + `Update ${sourceFile} to include these level-two headings with substantive content: ${required}. `
+    + `Update ${sourceFile} to include these headings at one common top structural level, in order, with substantive content (level two recommended): ${required}. `
     + `Then rerun ${fmRoot}/bin/fm-report-stack.mjs publish ${taskId} or ${fmRoot}/bin/fm-teardown.sh ${taskId}. `
     + "This attempt did not replace the durable report, and teardown remains stopped before destructive cleanup.",
   );

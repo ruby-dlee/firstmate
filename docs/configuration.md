@@ -173,6 +173,9 @@ The selected provider command receives `CLAUDE_CONFIG_DIR=<home>` or `CODEX_HOME
 New ship/scout launches never ask Agent Fleet to enable a profile, establish identity, install a bundle, or acquire a lease.
 They invoke Herdr's own integration installer against the selected profile directory and verify its per-profile hook file before launching.
 Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates, logs in, or invokes a model.
+Before installing that hook or creating an endpoint, spawn preflight requires usable credential material in the selected directory.
+Codex uses a cheap on-disk credential check, while Claude uses its bounded local `auth status` command because cached account metadata is not a credential and its macOS Keychain credential has no sufficient on-disk marker.
+Failure names the selected directory and prints the exact provider-scoped login command for a human.
 
 Codex health and usage are genuinely readable per account.
 Every selection performs a fresh per-account quota read instead of trusting a prior cache, and a Codex directory with no fresh general usage window is skipped.

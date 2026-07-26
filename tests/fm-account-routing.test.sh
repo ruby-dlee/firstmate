@@ -505,6 +505,12 @@ clear_case_logs() {
   rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/resume-arm.native-dir" "$CASE_DIR/session-refreshed"
 }
 
+write_teardown_completion_report() {
+  local id=$1
+  printf '# Completion\n\n## Summary\n\nRollback cleanup is ready.\n\n## What changed\n\nRecorded cleanup state.\n\n## Verification\n\nCleanup assertions follow.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nNone.\n\n## Follow-ups\n\nNone.\n' \
+    > "$HOME_DIR/data/$id/completion.md"
+}
+
 use_named_fake_tmux_target() {
   local id=$1 meta="$HOME_DIR/state/$1.meta" staged
   staged=$(mktemp "$HOME_DIR/state/.named-target-$id.XXXXXX") || fail "could not stage fake tmux target metadata"
@@ -2565,6 +2571,7 @@ test_failed_cleanup_persists_retryable_metadata() {
   assert_not_grep 'return --force' "$TREEHOUSE_LOG" "failed cleanup recycled its retained worktree"
 
   clear_case_logs
+  write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "teardown could not retry failed Agent Fleet cleanup"
   assert_grep "lease release --task $task --force" "$AF_LOG" "teardown did not retry the failed lease release"
   assert_grep "session remove --task $task" "$AF_LOG" "teardown did not retry the failed session cleanup"
@@ -2588,6 +2595,7 @@ test_unknown_spawn_endpoint_retains_lease_for_retry() {
   assert_contains "$out" "endpoint state is unknown" "unknown endpoint retention was not reported"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
+  write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "unknown endpoint retry state could not be torn down after absence was confirmed"
   pass "spawn rollback retains leases while endpoint state is unknown"
 }
@@ -2612,6 +2620,7 @@ test_rollback_retry_rechecks_live_endpoint_before_release() {
   assert_contains "$out" "endpoint is still alive" "live rollback retry blocker was unclear"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
+  write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "live rollback retry state could not be torn down after endpoint removal"
   pass "rollback cleanup retries prove the retained endpoint is dead"
 }
@@ -5996,6 +6005,13 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = unknown-endpoint-rollback ]; then
   run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = rollback-cleanup-retry ]; then
+  run_isolated_test test_failed_cleanup_persists_retryable_metadata
+  run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
+  run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
   exit 0
 fi
 

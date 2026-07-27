@@ -190,12 +190,15 @@ PY
 }
 
 write_dead_acquisition() {  # <id> <project> <worktree> <mode>
-  local id=$1 project=$2 worktree=$3 mode=$4 record
+  local id=$1 project=$2 worktree=$3 mode=$4 record home_real
   record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  home_real=$(cd "$HOME_DIR" && pwd -P)
   {
     printf '999999\nMon Jan  1 00:00:00 2001\n'
     printf 'id=%s\nproject=%s\nholder=firstmate-%s\n' "$id" "$project" "$id"
+    printf 'home=%s\n' "$home_real"
     printf 'kind=ship\nmode=%s\nyolo=off\ngeneration_id=orphan-test\n' "$mode"
+    printf 'tasktmp=/tmp/fm-%s-orphan-test\n' "$id"
     printf 'worktree=%s\n' "$worktree"
   } > "$record"
   touch -t 202001010000 "$record"
@@ -222,7 +225,8 @@ test_dead_acquisition_recovers_but_live_owner_is_untouched() {
   {
     printf '%s\n%s\n' "$$" "$start"
     printf 'id=live-slot\nproject=%s\nholder=firstmate-live-slot\n' "$project"
-    printf 'kind=ship\nmode=direct\nyolo=off\ngeneration_id=live\nworktree=\n'
+    printf 'home=%s\n' "$(cd "$HOME_DIR" && pwd -P)"
+    printf 'kind=ship\nmode=direct\nyolo=off\ngeneration_id=live\ntasktmp=/tmp/fm-live-slot-live\nworktree=\n'
   } > "$live_record"
   touch -t 202001010000 "$live_record"
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?

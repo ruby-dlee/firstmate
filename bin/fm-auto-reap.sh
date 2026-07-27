@@ -275,6 +275,7 @@ path_age() {
 
 recover_acquisition() {  # <record>
   local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status
+  local recorded_home home_real generation tasktmp tasktmp_owner
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
   [ "$(path_age "$record")" -ge "$AUTO_REAP_STALE_SECS" ] || return 0
   AUTO_REAP_ID=${record##*/.worktree-acquire-}
@@ -312,6 +313,27 @@ recover_acquisition() {  # <record>
     refuse "stale acquisition lease holder does not match task"
     return 0
   }
+  recorded_home=$(single_meta_value "$record" home) || {
+    refuse "stale acquisition record has missing or malformed FM_HOME ownership"
+    return 0
+  }
+  home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 0
+  [ "$recorded_home" = "$home_real" ] || {
+    refuse "stale acquisition record belongs to a different canonical FM_HOME"
+    return 0
+  }
+  generation=$(single_meta_value "$record" generation_id) || {
+    refuse "stale acquisition record has missing or malformed generation ownership"
+    return 0
+  }
+  tasktmp=$(single_meta_value "$record" tasktmp) || {
+    refuse "stale acquisition record has missing or malformed task temp ownership"
+    return 0
+  }
+  [ "$(fm_tasktmp_path "$id" "$generation" 2>/dev/null)" = "$tasktmp" ] || {
+    refuse "stale acquisition task temp path does not match its exact generation"
+    return 0
+  }
   snapshot=$(cat "$record") || return 0
   lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$id") || {
     refuse "could not serialize stale acquisition recovery"
@@ -347,6 +369,22 @@ recover_acquisition() {  # <record>
         absence_status=$?
       fi
       if [ "$absence_status" -eq 0 ]; then
+        tasktmp_owner=$(fm_tasktmp_owner_record "$STATE" "$id" "$generation") || {
+          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+          refuse "stale acquisition task temp ownership record is malformed"
+          return 0
+        }
+        if [ -e "$tasktmp_owner" ] || [ -L "$tasktmp_owner" ]; then
+          fm_tasktmp_remove_owned "$STATE" "$FM_HOME" "$id" "$generation" "$tasktmp" || {
+            fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+            refuse "Treehouse lease is absent but task temp ownership is forged or ambiguous; retained stale acquisition"
+            return 0
+          }
+        elif [ -e "$tasktmp" ] || [ -L "$tasktmp" ]; then
+          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+          refuse "Treehouse lease is absent but task temp root has no authoritative ownership record; retained stale acquisition"
+          return 0
+        fi
         rm -f "$record"
         fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
         log_result "cleared owner-dead acquisition $id after proving it owns no Treehouse lease"
@@ -380,8 +418,8 @@ recover_acquisition() {  # <record>
     printf 'harness=unknown\nkind=ship\n'
     printf 'mode=%s\n' "$(single_meta_value "$record" mode 2>/dev/null || printf no-mistakes)"
     printf 'yolo=%s\n' "$(single_meta_value "$record" yolo 2>/dev/null || printf off)"
-    printf 'tasktmp=\nmodel=default\neffort=default\n'
-    printf 'generation_id=%s\n' "$(single_meta_value "$record" generation_id 2>/dev/null || printf orphan)"
+    printf 'tasktmp=%s\nmodel=default\neffort=default\n' "$tasktmp"
+    printf 'generation_id=%s\n' "$generation"
     printf 'direct_spawn_endpoint=not-created\n'
     printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n'
   } > "$tmp"

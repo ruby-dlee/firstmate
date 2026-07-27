@@ -604,6 +604,84 @@ fm_account_task_key() {  # <home> <task> <attempt>
   printf 'fm-%.16s-%s-%s\n' "$home_hash" "$task" "$attempt"
 }
 
+fm_tasktmp_path() {  # <task> <generation>
+  local task=$1 generation=$2 token
+  fm_account_valid_id "$task" || return 1
+  token=${generation##*:}
+  fm_account_valid_id "$token" || return 1
+  printf '/tmp/fm-%s-%s\n' "$task" "$token"
+}
+
+fm_tasktmp_owner_record() {  # <state> <task> <generation>
+  local state=$1 task=$2 generation=$3 token
+  fm_account_valid_id "$task" || return 1
+  token=${generation##*:}
+  fm_account_valid_id "$token" || return 1
+  printf '%s/%s.tasktmp-owner.%s\n' "$state" "$task" "$token"
+}
+
+fm_tasktmp_owner_write() {  # <state> <home> <task> <generation> <root>
+  local state=$1 home=$2 task=$3 generation=$4 root=$5 home_real expected record tmp
+  home_real=$(cd "$home" 2>/dev/null && pwd -P) || return 1
+  expected=$(fm_tasktmp_path "$task" "$generation") || return 1
+  [ "$root" = "$expected" ] || return 1
+  record=$(fm_tasktmp_owner_record "$state" "$task" "$generation") || return 1
+  [ ! -e "$record" ] && [ ! -L "$record" ] || return 1
+  tmp=$(mktemp "$state/.$task.tasktmp-owner.XXXXXX") || return 1
+  {
+    printf 'home=%s\n' "$home_real"
+    printf 'task=%s\n' "$task"
+    printf 'generation=%s\n' "$generation"
+    printf 'root=%s\n' "$root"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! ln "$tmp" "$record" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+fm_tasktmp_owner_validate() {  # <record> <home> <task> <generation> <root>
+  local record=$1 home=$2 task=$3 generation=$4 root=$5 home_real expected
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  [ "$(wc -l < "$record" | tr -d ' ')" = 4 ] || return 1
+  home_real=$(cd "$home" 2>/dev/null && pwd -P) || return 1
+  expected=$(fm_tasktmp_path "$task" "$generation") || return 1
+  [ "$root" = "$expected" ] || return 1
+  [ "$(sed -n '1s/^home=//p' "$record")" = "$home_real" ] || return 1
+  [ "$(sed -n '2s/^task=//p' "$record")" = "$task" ] || return 1
+  [ "$(sed -n '3s/^generation=//p' "$record")" = "$generation" ] || return 1
+  [ "$(sed -n '4s/^root=//p' "$record")" = "$root" ] || return 1
+}
+
+fm_tasktmp_create() {  # <state> <home> <task> <generation> <root>
+  local state=$1 home=$2 task=$3 generation=$4 root=$5 proof="$5/.fm-tasktmp-owner" record
+  record=$(fm_tasktmp_owner_record "$state" "$task" "$generation") || return 1
+  fm_tasktmp_owner_write "$state" "$home" "$task" "$generation" "$root" || return 1
+  if ! mkdir "$root"; then
+    rm -f "$record"
+    return 1
+  fi
+  if ! cp "$record" "$proof" || ! chmod 600 "$proof" || ! mkdir "$root/gotmp"; then
+    rm -rf "$root"
+    rm -f "$record"
+    return 1
+  fi
+}
+
+fm_tasktmp_remove_owned() {  # <state> <home> <task> <generation> <root>
+  local state=$1 home=$2 task=$3 generation=$4 root=$5 record
+  record=$(fm_tasktmp_owner_record "$state" "$task" "$generation") || return 1
+  fm_tasktmp_owner_validate "$record" "$home" "$task" "$generation" "$root" || return 1
+  if [ -e "$root" ] || [ -L "$root" ]; then
+    [ -d "$root" ] && [ ! -L "$root" ] || return 1
+    fm_tasktmp_owner_validate "$root/.fm-tasktmp-owner" "$home" "$task" "$generation" "$root" || return 1
+    rm -rf "$root" || return 1
+  fi
+  rm -f "$record"
+}
+
 fm_account_ps_bin() {
   if fm_account_test_lab_enabled \
     && [ "${FM_ACCOUNT_TEST_HOOKS:-}" = firstmate-account-tests-v1 ] \
@@ -1195,7 +1273,7 @@ fm_account_meta_value() {  # <meta> <key>
 }
 
 fm_account_restore_artifacts() {
-  local state=$1 task=$2 backup_name=$3 tasktmp=${4:-} retain=${5:-0} backup name source
+  local state=$1 task=$2 backup_name=$3 tasktmp=${4:-} retain=${5:-0} backup name source generation owner_record
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   [ -n "$backup_name" ] || return 0
   case "$backup_name" in
@@ -1213,11 +1291,15 @@ fm_account_restore_artifacts() {
     fi
   done
   if [ -n "$tasktmp" ]; then
-    [ "$tasktmp" = "/tmp/fm-$task" ] || return 1
+    generation=$(sed -n '3s/^generation=//p' "$tasktmp/.fm-tasktmp-owner" 2>/dev/null)
+    owner_record=$(fm_tasktmp_owner_record "$state" "$task" "$generation") || return 1
+    fm_tasktmp_owner_validate "$owner_record" "${FM_HOME:?}" "$task" "$generation" "$tasktmp" || return 1
+    fm_tasktmp_owner_validate "$tasktmp/.fm-tasktmp-owner" "${FM_HOME:?}" "$task" "$generation" "$tasktmp" || return 1
     if [ -e "$backup/tasktmp-existed" ]; then
       [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
     else
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp" || return 1
+      fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$owner_record" || return 1
     fi
   fi
   [ "$retain" = 1 ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$backup"

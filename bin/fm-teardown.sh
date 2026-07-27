@@ -204,13 +204,9 @@ if [ "$BACKEND" = orca ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
-# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
+# tasktmp is recorded by fm-spawn for tasks that set up a per-generation temp root.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && [ "$TASK_TMP" != "/tmp/fm-$ID" ]; then
-  echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
-  exit 1
-fi
+TASK_GENERATION=$(fm_meta_get "$META" generation_id)
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
@@ -1772,9 +1768,21 @@ safe_rm_rf_child_worktree() {
 }
 
 safe_remove_task_tmp() {
-  local target=$1 base
+  local target=$1 base owner_record
   [ -n "$target" ] || return 0
-  [ "$target" = "/tmp/fm-$ID" ] || return 1
+  owner_record=$(fm_tasktmp_owner_record "$STATE" "$ID" "$TASK_GENERATION") || return 1
+  if ! fm_tasktmp_owner_validate "$owner_record" "$FM_HOME" "$ID" "$TASK_GENERATION" "$target"; then
+    echo "REFUSED: task temp ownership is missing, malformed, or ambiguous for $ID: $target" >&2
+    return 1
+  fi
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    rm -f "$owner_record"
+    return 0
+  fi
+  if ! fm_tasktmp_owner_validate "$target/.fm-tasktmp-owner" "$FM_HOME" "$ID" "$TASK_GENERATION" "$target"; then
+    echo "REFUSED: task temp root proof is missing, malformed, or forged for $ID: $target" >&2
+    return 1
+  fi
   base=$(python3 - <<'PY'
 import os
 import stat
@@ -1795,7 +1803,8 @@ if not stat.S_ISDIR(os.lstat(base).st_mode):
 print(base)
 PY
   ) || return 1
-  removal_tree_operation "$base/fm-$ID" "task temp root" remove
+  removal_tree_operation "$base/${target##*/}" "task temp root" remove || return 1
+  rm -f "$owner_record"
 }
 
 remove_worktree_compatibility_artifacts() {
@@ -4128,7 +4137,7 @@ EOF
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
+# Remove the exact owned per-generation temp root recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"

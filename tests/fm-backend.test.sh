@@ -1398,6 +1398,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = spawn-symlinked-project ]; then
+  test_spawn_symlinked_project_prefix_avoids_false_refusal
+  exit 0
+fi
+
 test_resolve_base_ref_uses_single_parent_when_main_is_head
 test_resolve_base_ref_refuses_unverified_merge_parent
 test_herdr_required_tools_include_backend_specific_launcher_dependencies

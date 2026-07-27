@@ -252,7 +252,7 @@ fm_account_path_uid() {
 fm_account_path_mode() {
   [ -n "$FM_ACCOUNT_SYSTEM_UNAME_BIN" ] && [ -n "$FM_ACCOUNT_SYSTEM_STAT_BIN" ] || return 1
   if [ "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_UNAME_BIN")" = Darwin ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -f %Lp "$1" 2>/dev/null
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -f %Mp%Lp "$1" 2>/dev/null
   else
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -c %a "$1" 2>/dev/null
   fi

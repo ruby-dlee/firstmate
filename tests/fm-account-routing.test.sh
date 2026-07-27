@@ -272,6 +272,13 @@ provider=${FM_FAKE_AF_PROVIDER:-claude}
 workspace=
 prev=
 for arg in "$@"; do
+  case "$arg" in
+    --task=*) task=${arg#--task=} ;;
+    --pool=*) pool=${arg#--pool=} ;;
+    --profile=*) profile=${arg#--profile=} ;;
+    --provider=*) provider=${arg#--provider=} ;;
+    --workspace=*) workspace=${arg#--workspace=} ;;
+  esac
   case "$prev" in
     --task) task=$arg ;;
     --pool) pool=$arg ;;
@@ -323,6 +330,15 @@ case "$*" in
     ;;
   *" session status "*)
     [ "${FM_FAKE_AF_SESSION_MISSING:-0}" != 1 ] || exit 1
+    fixture_dir=__FM_FAKE_FIXTURE_DIR__
+    if [ -e "$fixture_dir/.session-block-all" ] || [ -e "$fixture_dir/.session-block-$task" ]; then
+      printf '%s\n' "$*" >> "$fixture_dir/.session-started"
+      trap 'printf "%s\n" "$*" >> "$fixture_dir/.session-terminated"; exit 143' HUP INT TERM
+      while [ -e "$fixture_dir/.session-block-all" ] || [ -e "$fixture_dir/.session-block-$task" ]; do
+        sleep 0.05
+      done
+    fi
+    printf '%s\n' "$*" >> "$fixture_dir/.session-completed"
     resume_go=${FM_FAKE_AF_RESUME_GO:-}
     if [ -n "${FM_FAKE_AF_RESUME_ARM:-}" ] && [ -f "$FM_FAKE_AF_RESUME_ARM.native-dir" ]; then
       resume_go="$(cat "$FM_FAKE_AF_RESUME_ARM.native-dir")/go"
@@ -395,6 +411,8 @@ case "$*" in
   *) echo "unexpected fake agent-fleet command: $*" >&2; exit 64 ;;
 esac
 SH
+  FM_FAKE_FIXTURE_DIR="$fakebin" /usr/bin/perl -pi -e \
+    's{__FM_FAKE_FIXTURE_DIR__}{quotemeta($ENV{FM_FAKE_FIXTURE_DIR})}e' "$fakebin/agent-fleet"
   chmod +x "$fakebin/agent-fleet"
   printf '%s\n' "$fakebin"
 }
@@ -1532,7 +1550,7 @@ test_preinstall_managed_failure_restores_artifact_snapshot() {
 }
 
 test_session_sync_bounds_agent_fleet_queries() {
-  local id rec meta_tmp started elapsed out status
+  local id rec meta_tmp out status account_task
   id=account-sync-timeout-z9d
   rec=$(make_case sync-timeout claude "$id")
   read_case "$rec"
@@ -1540,15 +1558,25 @@ test_session_sync_bounds_agent_fleet_queries() {
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
-  started=$(date +%s)
+  account_task=$(sed -n 's/^account_task=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+  : > "$FAKEBIN_DIR/.session-block-all"
+  : > "$FAKEBIN_DIR/.session-started"
+  : > "$FAKEBIN_DIR/.session-terminated"
+  : > "$FAKEBIN_DIR/.session-completed"
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
     FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
-    FM_FAKE_AF_SESSION_SLEEP=10 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 \
+    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 \
     PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" "$id" --wait 0 --require 2>&1)
   status=$?
-  elapsed=$(( $(date +%s) - started ))
   [ "$status" -ne 0 ] || fail "timed-out session query unexpectedly succeeded"
-  [ "$elapsed" -lt 5 ] || fail "session query exceeded its command timeout (${elapsed}s)"
+  assert_grep "session status --task $account_task" "$FAKEBIN_DIR/.session-started" \
+    "timed-out session query was not invoked"
+  assert_grep "session status --task $account_task" "$FAKEBIN_DIR/.session-terminated" \
+    "session timeout did not terminate the blocking query"
+  assert_not_grep "session status --task $account_task" "$FAKEBIN_DIR/.session-completed" \
+    "session timeout allowed the blocking query to complete"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+    "session query timeout published a result from the terminated command"
   assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "timed-out session query retained the metadata lock"
   [ -n "$out" ] || true
   pass "session synchronization bounds every Agent Fleet query"
@@ -1584,7 +1612,7 @@ test_session_sync_rejects_workspace_mismatch_without_metadata_change() {
 }
 
 test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
-  local first later rec out status started elapsed
+  local first later rec out status
   first=account-sync-all-a1
   later=account-sync-all-z9
   rec=$(make_case sync-all-fair claude "$first" "$later")
@@ -1601,17 +1629,22 @@ test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
       "account_task=$id" \
       "account_attempt=attempt-$id"
   done
-  started=$(date +%s)
+  : > "$FAKEBIN_DIR/.session-block-$first"
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
     FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 FM_FAKE_AF_SESSION_SLEEP_TASK="$first" \
     FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=2 \
     PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all 2>&1)
   status=$?
-  elapsed=$(( $(date +%s) - started ))
   [ "$status" -ne 0 ] || fail "sync-all hid the timed-out first mapping"
-  [ "$elapsed" -lt 5 ] || fail "sync-all did not bound the slow mapping (${elapsed}s)"
-  assert_grep "session status --task $first" "$AF_LOG" "sync-all never attempted the slow first mapping"
+  assert_grep "session status --task $first" "$FAKEBIN_DIR/.session-started" \
+    "sync-all never attempted the slow first mapping"
+  assert_grep "session status --task $first" "$FAKEBIN_DIR/.session-terminated" \
+    "sync-all did not terminate the slow first mapping"
+  assert_not_grep "session status --task $first" "$FAKEBIN_DIR/.session-completed" \
+    "sync-all allowed the slow first mapping to complete"
+  assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$first.meta" \
+    "sync-all published a result from the terminated slow mapping"
   assert_grep "session status --task $later" "$AF_LOG" "sync-all starved the later mapping"
   assert_regex '^provider_session_id=' "$HOME_DIR/state/$later.meta" \
     "sync-all did not publish the later mapping after the first timed out"
@@ -1620,7 +1653,7 @@ test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
 }
 
 test_session_sync_all_has_one_total_task_timeout_budget() {
-  local rec out status started elapsed id
+  local rec out status id
   rec=$(make_case sync-all-total-bound claude account-sync-batch-a1 account-sync-batch-d4)
   read_case "$rec"
   for id in account-sync-batch-a1 account-sync-batch-b2 account-sync-batch-c3 account-sync-batch-d4; do
@@ -1635,17 +1668,22 @@ test_session_sync_all_has_one_total_task_timeout_budget() {
       "account_task=$id" \
       "account_attempt=attempt-$id"
   done
-  started=$(date +%s)
+  : > "$FAKEBIN_DIR/.session-block-all"
   if out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
     FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 \
     FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=2 \
     PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all 2>&1); then status=0; else status=$?; fi
-  elapsed=$(( $(date +%s) - started ))
   [ "$status" -ne 0 ] || fail "fully timed-out sync sweep unexpectedly succeeded"
-  [ "$elapsed" -lt 5 ] || fail "sync-all multiplied its timeout across tasks (${elapsed}s)"
   for id in account-sync-batch-a1 account-sync-batch-b2 account-sync-batch-c3 account-sync-batch-d4; do
-    assert_grep "session status --task $id" "$AF_LOG" "sync-all did not fairly attempt $id"
+    assert_grep "session status --task $id" "$FAKEBIN_DIR/.session-started" \
+      "sync-all did not fairly attempt $id"
+    assert_grep "session status --task $id" "$FAKEBIN_DIR/.session-terminated" \
+      "shared task budget did not terminate $id"
+    assert_not_grep "session status --task $id" "$FAKEBIN_DIR/.session-completed" \
+      "shared task budget allowed $id to complete"
+    assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
+      "shared task budget published a result for timed-out task $id"
   done
   [ -n "$out" ] || true
   pass "sync-all bounds the fair sweep to one task timeout window"
@@ -4236,8 +4274,8 @@ class Budget:
 
 process = Process()
 module.subprocess.Popen = lambda *args, **kwargs: process
-module.os.killpg = lambda *args, **kwargs: None
-started = time.monotonic()
+signals = []
+module.os.killpg = lambda pid, signal_number: signals.append((pid, signal_number))
 try:
     module.bounded_command_output(["git", "status"], Budget())
 except RuntimeError as error:
@@ -4247,13 +4285,20 @@ else:
     raise AssertionError("bounded command unexpectedly succeeded")
 finally:
     os.close(write_fd)
-elapsed = time.monotonic() - started
-if elapsed >= 0.5:
-    raise AssertionError(f"bounded reap took {elapsed:.3f} seconds")
+signal_numbers = [signal_number for _, signal_number in signals]
+if (
+    len(signal_numbers) < 2
+    or signal_numbers[0] != module.signal.SIGTERM
+    or signal_numbers[-1] != module.signal.SIGKILL
+    or any(signal_number != 0 for signal_number in signal_numbers[1:-1])
+):
+    raise AssertionError(f"cleanup did not escalate TERM to KILL: {signals}")
 if not process.waits or any(timeout is None or timeout < 0 for timeout in process.waits):
     raise AssertionError(f"unbounded reap attempts: {process.waits}")
 if max(process.waits) > 0.25:
     raise AssertionError(f"reap waits exceeded the shared deadline: {process.waits}")
+if len(process.waits) != 2 or process.waits[1] > process.waits[0]:
+    raise AssertionError(f"reap waits did not consume one shared deadline: {process.waits}")
 PY
   then
     status=0
@@ -6009,7 +6054,7 @@ if [ "${FM_TEST_FOCUSED:-}" = tail-safety ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = teardown-restore ]; then
+if [ "${FM_TEST_FOCUSED:-}" = teardown-restored-predecessor ]; then
   run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
   exit 0
 fi
@@ -6142,6 +6187,14 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-21 ]; then
   run_isolated_test test_continuation_appends_the_validated_brief_snapshot
   run_isolated_test test_session_sync_all_has_one_total_task_timeout_budget
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = observable-timeout-behavior ]; then
+  run_isolated_test test_session_sync_bounds_agent_fleet_queries
+  run_isolated_test test_session_sync_all_bounds_each_task_and_reaches_later_mappings
+  run_isolated_test test_session_sync_all_has_one_total_task_timeout_budget
+  run_isolated_test test_bounded_command_reap_never_waits_unbounded
   exit 0
 fi
 

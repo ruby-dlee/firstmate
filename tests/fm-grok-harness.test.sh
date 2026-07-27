@@ -134,10 +134,10 @@ EOF
   expect_code 0 "$status" "grok spawn should succeed before teardown: $out"
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
 
-  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
-    GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
-    "$TEARDOWN" "$id" --force >/dev/null 2>&1 \
-    || fail "grok teardown failed"
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_FAKE_TREEHOUSE_PATH="$wt" GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
+    "$TEARDOWN" "$id" --force 2>&1) \
+    || fail "grok teardown failed: $out"
 
   assert_absent "$wt/.fm-grok-turnend" "grok pointer survived teardown"
   assert_absent "$grok_home/hooks/fm-turn-end.d/$token" "grok auth token survived teardown"

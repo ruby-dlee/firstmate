@@ -1115,8 +1115,10 @@ test_failed_alert_persistence_forces_reinspection() {
   mkdir "$alert"
   printf '%s\n' dirty > "$project/untracked.txt"
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "failed checkout-alert persistence reported success"
   assert_contains "$out" "STUCK:" "failed alert write did not surface the unsafe checkout"
@@ -1125,8 +1127,10 @@ test_failed_alert_persistence_forces_reinspection() {
   [ "$(cat "$last_file")" = 1 ] || fail "failed refresh advanced checkout cadence state"
   assert_refresh_state "$state_root" unhealthy
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "run after failed alert persistence reported success"
   assert_contains "$out" "STUCK:" \

@@ -1612,7 +1612,8 @@ test_task_tmp_removal_pins_ancestors_during_swap() {
   printf 'outside\n' > "$outside/.task-tmp/$name/gotmp/sentinel"
   STATE=$state
   . "$ROOT/bin/fm-account-routing-lib.sh"
-  FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$state" \
+  FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$state" \
     FM_SAFE_TASK_TMP_SWAP_MOVED="$moved" \
     FM_SAFE_TASK_TMP_SWAP_OUTSIDE="$outside" \
     fm_account_safe_remove_task_tmp "$id" "$target" "$generation" \
@@ -1633,7 +1634,8 @@ test_task_tmp_partial_removal_fails_closed() {
   printf 'retain\n' > "$target/retained"
   STATE=$state
   . "$ROOT/bin/fm-account-routing-lib.sh"
-  if FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY=disappearing \
+  if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY=disappearing \
     fm_account_safe_remove_task_tmp "$id" "$target" "$generation" >/dev/null 2>&1; then
     fail "partial task temp removal reported success"
   fi

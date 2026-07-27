@@ -898,7 +898,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       if [ -n "$rollback_tasktmp" ] \
         && { fm_account_task_tmp_is_current "$rollback_id" "$rollback_tasktmp" "$rollback_generation" \
           || fm_account_task_tmp_is_previous "$rollback_id" "$rollback_tasktmp"; }; then
-        rm -rf "$rollback_tasktmp"
+        fm_account_safe_remove_task_tmp "$rollback_id" "$rollback_tasktmp" "$rollback_generation" || exit 1
       fi
     fi
     if [ -z "$rollback_profile" ]; then

@@ -8,6 +8,15 @@ def identity(metadata):
     return metadata.st_dev, metadata.st_ino
 
 
+def hooks_enabled():
+    return (
+        os.environ.get("FM_ACCOUNT_ROUTING_TEST_LAB")
+        == "firstmate-account-routing-test-lab-v1"
+        and os.environ.get("FM_ACCOUNT_TEST_HOOKS")
+        == "firstmate-account-tests-v1"
+    )
+
+
 target = os.path.normpath(os.path.abspath(sys.argv[1]))
 if not sys.argv[1] or target == os.path.sep:
     raise SystemExit(1)
@@ -24,8 +33,7 @@ def remove_tree(directory_fd, device):
     entries = sorted(os.listdir(directory_fd))
     disappearing = os.environ.get("FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY")
     if (
-        os.environ.get("FM_ACCOUNT_ROUTING_TEST_LAB")
-        == "firstmate-account-routing-test-lab-v1"
+        hooks_enabled()
         and disappearing in entries
     ):
         os.unlink(disappearing, dir_fd=directory_fd)
@@ -77,20 +85,27 @@ try:
                 parent_fd = next_fd
         except FileNotFoundError:
             raise SystemExit(0)
-        if (
-            os.environ.get("FM_ACCOUNT_ROUTING_TEST_LAB")
-            == "firstmate-account-routing-test-lab-v1"
-            and os.environ.get("FM_SAFE_TASK_TMP_SWAP_ANCESTOR")
-        ):
-            os.rename(
-                os.environ["FM_SAFE_TASK_TMP_SWAP_ANCESTOR"],
-                os.environ["FM_SAFE_TASK_TMP_SWAP_MOVED"],
+        swap_ancestor_value = os.environ.get("FM_SAFE_TASK_TMP_SWAP_ANCESTOR")
+        if hooks_enabled() and swap_ancestor_value:
+            swap_ancestor = os.path.normpath(os.path.abspath(swap_ancestor_value))
+            swap_moved = os.path.normpath(
+                os.path.abspath(os.environ["FM_SAFE_TASK_TMP_SWAP_MOVED"])
             )
-            os.symlink(
-                os.environ["FM_SAFE_TASK_TMP_SWAP_OUTSIDE"],
-                os.environ["FM_SAFE_TASK_TMP_SWAP_ANCESTOR"],
-                target_is_directory=True,
+            swap_outside = os.path.normpath(
+                os.path.abspath(os.environ["FM_SAFE_TASK_TMP_SWAP_OUTSIDE"])
             )
+            fixture_parent = os.path.dirname(swap_ancestor)
+            if (
+                swap_ancestor_value != swap_ancestor
+                or os.path.commonpath((target, swap_ancestor)) != swap_ancestor
+                or target == swap_ancestor
+                or os.path.dirname(swap_moved) != fixture_parent
+                or os.path.dirname(swap_outside) != fixture_parent
+                or len({swap_ancestor, swap_moved, swap_outside}) != 3
+            ):
+                raise OSError("unsafe task temp swap fixture")
+            os.rename(swap_ancestor, swap_moved)
+            os.symlink(swap_outside, swap_ancestor, target_is_directory=True)
         try:
             metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):

@@ -312,8 +312,8 @@ fm_account_task_tmp_is_expected() {  # <task-id> <path> <generation-id>
     || fm_account_task_tmp_is_legacy "$1" "$2"
 }
 
-fm_account_safe_remove_task_tmp() {  # <task-id> <path> <generation-id>
-  local task=$1 target=$2 generation=$3 legacy
+fm_account_safe_remove_task_tmp() {  # <task-id> <path> <generation-id> [subdirectory]
+  local task=$1 target=$2 generation=$3 child=${4:-} legacy
   [ -n "$target" ] || return 0
   fm_account_task_tmp_is_expected "$task" "$target" "$generation" || return 1
   legacy=$(fm_account_legacy_task_tmp_path "$task") || return 1
@@ -321,6 +321,11 @@ fm_account_safe_remove_task_tmp() {  # <task-id> <path> <generation-id>
   fm_account_task_tmp_is_current "$task" "$target" "$generation" \
     || fm_account_task_tmp_is_previous "$task" "$target" \
     || return 1
+  case "$child" in
+    '') ;;
+    gotmp) target="$target/$child" ;;
+    *) return 1 ;;
+  esac
   python3 "$FM_ACCOUNT_ROUTING_LIB_DIR/fm-safe-task-tmp.py" "$target" || return 1
 }
 
@@ -1304,9 +1309,9 @@ fm_account_restore_artifacts() {
     if fm_account_task_tmp_is_current "$task" "$tasktmp" "$generation" \
       || fm_account_task_tmp_is_previous "$task" "$tasktmp"; then
       if [ -e "$backup/tasktmp-existed" ]; then
-        [ -e "$backup/gotmp-existed" ] || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp/gotmp" || return 1
+        [ -e "$backup/gotmp-existed" ] || fm_account_safe_remove_task_tmp "$task" "$tasktmp" "$generation" gotmp || return 1
       else
-        fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$tasktmp" || return 1
+        fm_account_safe_remove_task_tmp "$task" "$tasktmp" "$generation" || return 1
       fi
     else
       # A legacy tasktmp is metadata-only compatibility. Never inspect or

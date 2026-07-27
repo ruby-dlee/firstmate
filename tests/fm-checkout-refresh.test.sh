@@ -1047,8 +1047,10 @@ test_unreadable_scan_root_invalidates_coverage_health() {
   canonical_scan=$(cd "$scan_root" && pwd -P)
   chmod 111 "$scan_root"
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
   chmod 700 "$scan_root"
 
   [ "$status" -ne 0 ] || fail "unreadable scan root reported successful coverage"
@@ -1084,10 +1086,12 @@ exec "${FM_TEST_REAL_GIT:?}" "$@"
 SH
   chmod +x "$fakebin/git"
 
+  set +e
   out=$(FM_TEST_REAL_GIT="$real_git" FM_TEST_UNREADABLE_ORIGIN_TARGET="$canonical_candidate" \
     PATH="$fakebin:$PATH" \
     run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "unreadable scanned origin reported successful coverage"
   assert_contains "$out" "discovered checkout origin identity cannot be inspected: $canonical_candidate" \

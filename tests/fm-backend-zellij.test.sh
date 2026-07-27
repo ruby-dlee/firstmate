@@ -949,6 +949,8 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   dir="$TMP_ROOT/teardown-zellij-secondmate-child"; state="$dir/state"; data="$dir/data"; config="$dir/config"; home="$dir/secondmate-home"; project="$dir/project"
   mkdir -p "$state" "$data" "$config" "$home/state" "$home/data" "$home/config" "$home/projects" "$project" "$dir/responses"
   printf 'smz\n' > "$home/.fm-secondmate-home"
+  printf -- '- smz - zellij fixture (home: %s; scope: zellij fixture; projects: ; added 2026-07-27)\n' \
+    "$home" > "$data/secondmates.md"
   fm_write_meta "$state/smz.meta" \
     "window=firstmate:99" \
     "backend=zellij" \

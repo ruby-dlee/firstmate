@@ -3655,14 +3655,25 @@ test_dispatch_composer_state_routes_by_backend() {
 }
 
 test_scripts_route_explicit_target_through_meta_backend() {
-  local dir state log resp fb neutral out
+  local dir state log resp fb neutral lock_root out
   dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
   neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  lock_root="$dir/locks"; mkdir -m 700 "$lock_root"
   fm_write_meta "$state/herdr-stale.meta" \
     "window=default:w1:p2" "backend=herdr" \
     "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
   touch "$state/.last-watcher-beat"
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" TEST_SERVER_PID="$$" \
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      key=$(fm_backend_herdr_server_lock_key default) || exit 1
+      certificate=$(fm_backend_herdr_server_legacy_env_certificate_path default) || exit 1
+      start=$(fm_backend_herdr_process_start "$TEST_SERVER_PID") || exit 1
+      printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+        "$key" "$TEST_SERVER_PID" "$start" > "$certificate" || exit 1
+      chmod 600 "$certificate"
+    ' "$ROOT" || fail "could not establish adapter ownership for the explicit-target routing fixture"
   printf 'captured herdr pane\n' > "$resp/1.out"
   printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}]}}\n' > "$resp/2.out"
   printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' > "$resp/3.out"
@@ -3678,6 +3689,7 @@ SH
 
   out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     "$ROOT/bin/fm-peek.sh" default:w1:p2 5 2>/dev/null )
   [ "$out" = "captured herdr pane" ] || fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''read'$'\x1f''w1:p2' \
@@ -3686,6 +3698,7 @@ SH
   : > "$log"
   PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     "$ROOT/bin/fm-send.sh" default:w1:p2 --key Escape >/dev/null 2>&1
   expect_code 0 $? "fm-send --key should route an explicit metadata-matched target through herdr"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''escape' \
@@ -4335,6 +4348,11 @@ if [ "${FM_TEST_FOCUSED:-}" = capture ]; then
   test_capture_calls_pane_read
   test_capture_works_around_small_lines_bug
   test_capture_preserves_pane_read_failure
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = script-routing ]; then
+  test_scripts_route_explicit_target_through_meta_backend
   exit 0
 fi
 

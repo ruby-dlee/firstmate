@@ -201,7 +201,7 @@ The pre-fix production path was invoked from a Bash driver in a throwaway tmux w
 Before destroying the parent window, the lab server PID 78507 and dummy agent PID 78625 shared session id 0 with the driver and the server retained process group 78149 from the driver.
 After `tmux kill-window -t firstmate:bridge-herdr-parent-16255` and 30 seconds, the server and dummy agent were dead and the scoped CLI returned `server.running=false` and connection refused.
 The fixed path uses `nohup` around a portable Perl double-fork: the first child calls `POSIX::setsid()`, forks once more, and execs only `herdr server --session <name>` with stdin redirected from `/dev/null` and output discarded.
-The adapter remains the single Herdr lifecycle owner, and captain launchers do not start or stop Herdr.
+The adapter owns servers it launches, while production may reuse an already-running server without claiming its lifecycle; captain launchers do not start or stop Herdr as part of the Firstmate workflow.
 The same lab shape was rerun from the fixed branch with isolated session `fm-lab-bridge-fix-91917` and throwaway window `firstmate:bridge-herdr-fix-91917`.
 Before the kill, driver PID 16023 was in process group 16023 while server PID 16206 was already reparented to PID 1 in process group 16205.
 After the parent window was absent for 84 seconds, server PID 16206 and dummy agent PID 16413 remained alive, `status --json` reported the scoped server running and compatible, and `pane get` plus `agent get` returned pane `w1:p2` with `agent_status=working`.
@@ -220,7 +220,7 @@ That worker path physically resolves each absolute caller entry, accepts only cu
 This preserves safe Homebrew and user toolchains (for example `node`, `npm`, and `uv`) for pane descendants without allowing a writable caller path to become server execution authority; Herdr's own control operations still use their fixed absolute binaries rather than this worker path.
 That envelope applies to both the double-fork Perl process and the exec'd Herdr grandchild, so ambient `PERL5OPT`, `PERLLIB`, loader injection, and tool shadows cannot alter startup.
 The per-session lifecycle lock lives at `/tmp/firstmate-herdr-server-locks-<uid>` regardless of `TMPDIR`; its physical parent ancestry is validated and its leaf must remain a current-user `0700` directory.
-It serializes current-certificate reuse, release-drift classification, any exact-session stop, recertified launch, and readiness before a caller can inspect or create a workspace.
+In the explicit certified-lifecycle lab path, it serializes current-certificate reuse, release-drift classification, any exact-session stop, recertified launch, and readiness before a caller can inspect or create a workspace.
 Lock candidates and owner records are inode-, mode-, link-, owner-, PID-, and process-start-checked around atomic link/rename operations.
 
 The managed per-session Herdr config is a private, helper-content-addressed exact-content file in that lock root.

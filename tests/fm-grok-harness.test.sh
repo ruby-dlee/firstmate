@@ -16,12 +16,21 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    [ ! -e "${FM_FAKE_TMUX_GONE:?}" ] || exit 1
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
+  display-message)
+    [ ! -e "${FM_FAKE_TMUX_GONE:?}" ] || exit 1
+    printf 'firstmate\n'
+    exit 0
+    ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  kill-window) touch "${FM_FAKE_TMUX_GONE:?}"; exit 0 ;;
+  has-session|new-session|new-window|send-keys) exit 0 ;;
 esac
 exit 0
 SH
@@ -80,7 +89,8 @@ run_grok_spawn() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
-    FM_FAKE_TREEHOUSE_PATH="$wt" GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
+    FM_FAKE_TREEHOUSE_PATH="$wt" FM_FAKE_TMUX_GONE="$home/state/fake-tmux-gone" \
+    GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$id" "$proj" grok 2>&1
 }
 
@@ -133,9 +143,12 @@ EOF
   status=$?
   expect_code 0 "$status" "grok spawn should succeed before teardown: $out"
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
+  printf '# Completion\n\n## Summary\n\nGrok teardown fixture.\n\n## What changed\n\nRecorded work.\n\n## Verification\n\nFixture verified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nNone.\n\n## Follow-ups\n\nNone.\n' \
+    > "$home/data/$id/completion.md"
 
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
-    FM_FAKE_TREEHOUSE_PATH="$wt" GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
+    FM_FAKE_TREEHOUSE_PATH="$wt" FM_FAKE_TMUX_GONE="$home/state/fake-tmux-gone" \
+    GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$TEARDOWN" "$id" --force 2>&1) \
     || fail "grok teardown failed: $out"
 

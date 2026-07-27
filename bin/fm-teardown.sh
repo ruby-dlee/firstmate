@@ -1001,6 +1001,14 @@ validate_teardown_target_identity() {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1
   }
+  # A legacy scout can outlive its scratch worktree while its exact runtime
+  # endpoint remains. There is no worktree mutation left to authorize in that
+  # case; retain the project-root proof and let the backend's endpoint identity
+  # checks decide whether the recorded terminal can be quiesced.
+  if [ "$KIND" = scout ] && [ "$BACKEND" != orca ] \
+    && [ ! -e "$WT" ] && [ ! -L "$WT" ]; then
+    return 0
+  fi
   worktree_root=$(exact_git_worktree_root "$WT") || {
     echo "error: teardown worktree metadata is not an exact inspectable repository root: ${WT:-<missing>}" >&2
     return 1
@@ -3900,6 +3908,12 @@ quiesce_task_endpoint() {
   zellij_tab=$(meta_value "$META" zellij_tab_id)
   scoped_target=$(meta_value "$META" tmux_session_target)
   [ "$BACKEND" != orca ] || scoped_target=$ORCA_WORKTREE_ID
+  if [ "$BACKEND" = zellij ] && [ -n "$zellij_tab" ]; then
+    fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$scoped_target" 2>/dev/null || {
+      echo "error: failed to stop task endpoint for $ID; retaining metadata" >&2
+      return 1
+    }
+  fi
   if [ "$BACKEND" = orca ]; then
     quiesce_authoritative_orca_endpoint "$T" "$ORCA_WORKTREE_ID" "fm-$ID" || {
       echo "error: task Orca endpoint authority or quiescence is unproven for $ID; retaining metadata" >&2

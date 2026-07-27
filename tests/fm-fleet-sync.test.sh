@@ -27,6 +27,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-checkout-lock-lib.sh
+. "$ROOT/bin/fm-checkout-lock-lib.sh"
 
 fm_git_identity fmtest fmtest@example.invalid
 
@@ -495,28 +497,26 @@ test_live_default_probe_overrides_stale_origin_head() {
 }
 
 test_direct_sync_honors_shared_checkout_lock() {
-  local home clone before common key lock_root lock out
+  local home clone before lock_root lock out held_pid
   home=$(new_home)
   clone=$(build_pair "$home" shared-lock)
   advance_origin "$home" shared-lock C1
   before=$(head_sha "$clone")
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-locks"
-  lock="$lock_root/$key.lock"
-  mkdir -p "$lock"
-  printf '%s\n' "$$" > "$lock/pid"
+  fm_checkout_lock_prepare "$lock_root" || fail "could not prepare shared checkout lock fixture"
+  lock=$(fm_checkout_lock_path "$clone" "$lock_root") \
+    || fail "could not resolve shared checkout lock fixture"
+  fm_lock_try_acquire "$lock" || fail "could not acquire shared checkout lock fixture"
+  held_pid=$(cat "$FM_LOCK_OWNER_DIR/pid")
 
   out=$(FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-fleet-sync.sh" "$clone" 2>/dev/null)
 
-  assert_contains "$out" "$clone: skipped: refresh already running (pid $$)" \
+  assert_contains "$out" "$clone: skipped: refresh already running (pid $held_pid)" \
     "direct fleet sync bypassed the shared checkout lock"
   [ "$(head_sha "$clone")" = "$before" ] || fail "direct sync mutated a contended checkout"
-  rm -rf "$lock"
+  fm_lock_release "$lock"
   pass "direct sync serializes through the shared canonical checkout lock"
 }
 

@@ -11,9 +11,9 @@
 # no-mistakes run-step attributed to this crewmate's branch, else the pane
 # busy-signature) and reconciles the possibly-stale log against it.
 #
-# The determinism lives entirely here - only run-step / pane / log reads plus
-# fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
-# token-tight line firstmate can read every heartbeat:
+# The determinism lives entirely here - bounded run-step, GitHub PR-state, pane,
+# and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
+# stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #

@@ -4201,6 +4201,12 @@ if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = workspace-lifecycle ]; then
+  test_workspace_ensure_prunes_default_tab
+  test_repeated_cycles_reuse_one_workspace_no_orphans
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr

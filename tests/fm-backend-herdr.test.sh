@@ -3554,6 +3554,7 @@ test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmat
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '
       . "$0/bin/fm-backend.sh"
+      . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_target_ready() { fm_backend_herdr_parse_target "$1"; }
       fm_backend_composer_state herdr default:w1:p2
     ' "$ROOT" )

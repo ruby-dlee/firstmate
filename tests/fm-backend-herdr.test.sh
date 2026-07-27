@@ -2684,7 +2684,11 @@ test_send_key_normalizes_and_targets_pane() {
   dir="$TMP_ROOT/sendkey"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   fb=$(make_herdr_fakebin "$dir")
   PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_key default:w1:p2 Escape' "$ROOT"
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_adapter_owned() { return 0; }
+      fm_backend_herdr_send_key default:w1:p2 Escape
+    ' "$ROOT"
   expect_code 0 $? "send_key should succeed"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''escape' "send_key did not normalize Escape to escape"
   pass "fm_backend_herdr_send_key: normalizes the key and targets the right pane"
@@ -2696,7 +2700,11 @@ test_kill_is_best_effort() {
   printf '1\n' > "$resp/1.exit"
   fb=$(make_herdr_fakebin "$dir")
   PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_kill default:w1:p2' "$ROOT"
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_server_adapter_owned() { return 0; }
+      fm_backend_herdr_kill default:w1:p2
+    ' "$ROOT"
   expect_code 0 $? "kill must be best-effort (never fail even when the pane close call itself fails)"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f''w1:p2' "kill did not call pane close on the right pane"
   pass "fm_backend_herdr_kill: calls pane close and stays best-effort on failure"

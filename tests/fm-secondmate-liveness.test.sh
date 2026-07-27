@@ -317,8 +317,10 @@ new_world() {
 # secondmate instead of relying on a non-Git legacy fixture.
 add_sm_home() {
   local w=$1 id=$2 window=$3 harness=${4:-claude}
-  local home="$w/$id" home_abs
-  git clone --quiet --no-checkout --single-branch --branch main "$ROOT" "$home"
+  local home="$w/$id" home_abs target
+  target=$(git -C "$ROOT" rev-parse refs/remotes/origin/main^{commit})
+  git clone --quiet --no-checkout "$ROOT" "$home"
+  git -C "$home" update-ref refs/remotes/origin/main "$target"
   git -C "$home" checkout --quiet --detach refs/remotes/origin/main
   git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"

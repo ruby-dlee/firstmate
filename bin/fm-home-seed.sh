@@ -450,16 +450,24 @@ ensure_home() {
         git -C "$FM_ROOT" show-ref --verify --quiet "refs/heads/$default" && break
       done
     fi
-    target=$(git -C "$FM_ROOT" rev-parse --verify --quiet "refs/heads/$default^{commit}") || {
+    target=$(git -C "$FM_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$default^{commit}" 2>/dev/null \
+      || git -C "$FM_ROOT" rev-parse --verify --quiet "refs/heads/$default^{commit}") || {
       echo "error: cannot resolve the firstmate default branch for $home" >&2
       return 1
     }
     source_origin=$(git -C "$FM_ROOT" remote get-url origin 2>/dev/null || true)
     mkdir -p "$(dirname "$home")"
-    git clone --quiet --no-checkout --single-branch --branch "$default" "$FM_ROOT" "$home"
+    git init -q "$home"
+    git -C "$home" remote add origin "$FM_ROOT"
+    git -C "$home" fetch -q --no-tags origin "$target"
     git -C "$home" checkout --quiet --detach "$target" || return 1
+    git -C "$home" for-each-ref --format='delete %(refname)' refs/remotes/origin \
+      | git -C "$home" update-ref --stdin || return 1
     if [ -n "$source_origin" ]; then
       git -C "$home" remote set-url origin "$source_origin" || return 1
+      git -C "$home" config --unset-all remote.origin.fetch || true
+      git -C "$home" config --add remote.origin.fetch \
+        "+refs/heads/$default:refs/remotes/origin/$default" || return 1
       git -C "$home" update-ref "refs/remotes/origin/$default" "$target" || return 1
       git -C "$home" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default" || return 1
     else

@@ -33,9 +33,11 @@ make_live_default_firstmate_clone() {
   local destination=$1 default source_origin target
   default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD)
   default=${default#origin/}
-  target=$(git -C "$ROOT" rev-parse "refs/heads/$default^{commit}")
+  target=$(git -C "$ROOT" rev-parse "refs/remotes/origin/$default^{commit}")
   source_origin=$(git -C "$ROOT" remote get-url origin)
-  git clone --quiet --no-checkout --single-branch --branch "$default" "$ROOT" "$destination"
+  git init -q "$destination"
+  git -C "$destination" remote add origin "$ROOT"
+  git -C "$destination" fetch -q --no-tags origin "$target"
   git -C "$destination" checkout --quiet --detach "$target"
   git -C "$destination" remote set-url origin "$source_origin"
   git -C "$destination" update-ref "refs/remotes/origin/$default" "$target"

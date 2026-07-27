@@ -136,9 +136,9 @@ make_seeded_secondmate_home() {
   local home=$1 id=$2 parent_home=$3 default source_origin target
   default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD)
   default=${default#origin/}
-  target=$(git -C "$ROOT" rev-parse "refs/heads/$default^{commit}")
+  target=$(git -C "$ROOT" rev-parse "refs/remotes/origin/$default^{commit}")
   source_origin=$(git -C "$ROOT" remote get-url origin)
-  git clone --quiet --no-checkout --single-branch --branch "$default" "$ROOT" "$home"
+  git clone --quiet --no-checkout "$ROOT" "$home"
   git -C "$home" checkout --quiet --detach "$target"
   git -C "$home" remote set-url origin "$source_origin"
   git -C "$home" update-ref "refs/remotes/origin/$default" "$target"

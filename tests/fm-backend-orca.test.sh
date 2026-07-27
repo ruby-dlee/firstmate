@@ -160,6 +160,10 @@ process.stdout.write(JSON.stringify(data) + "\n");
     if [ -n "${FM_ORCA_REMOVE_ERROR:-}" ]; then
       printf '{"ok":false,"error":{"code":"worktree_not_removed","message":"worktree not removed"}}\n'
     else
+      if [ -f "$RESP/.remove-worktree-path" ]; then
+        path=$(cat "$RESP/.remove-worktree-path")
+        git -C "$path" worktree remove --force "$path" || exit 1
+      fi
       printf '{"ok":true,"result":{"removed":true}}\n'
     fi
     ;;
@@ -1957,10 +1961,6 @@ test_secondmate_force_teardown_removes_orca_child_via_orca() {
     "home=$subhome" "projects=alpha"
   printf '%s\n' "- domain - Orca child cleanup (home: $subhome; scope: orca cleanup; projects: alpha; added 2026-07-03)" \
     > "$home/data/secondmates.md"
-  fm_write_meta "$subhome/state/$child_id.meta" \
-    "window=fm-$child_id" "terminal=term-child-cleanup" "worktree=$childwt" "project=$childproj" \
-    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
-    "backend=orca" "orca_worktree_id=wt-child-cleanup"
   orca_case secondmate-child-cleanup
   printf '{"ok":true,"result":{"worktree":{"id":"wt-child-cleanup","name":"fm-%s","path":"%s","terminals":[{"handle":"term-child-cleanup","title":"fm-%s"}]}}}\n' \
     "$child_id" "$childwt" "$child_id" > "$RESP/1.out"
@@ -1971,25 +1971,15 @@ test_secondmate_force_teardown_removes_orca_child_via_orca() {
   cp "$RESP/3.out" "$RESP/5.out"
   cp "$RESP/1.out" "$RESP/6.out"
   cp "$RESP/3.out" "$RESP/7.out"
-  printf '{"ok":true,"result":{"closed":true}}\n' > "$RESP/8.out"
-  printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"terminal handle stale"}}\n' > "$RESP/9.out"
-  printf '1\n' > "$RESP/9.exit"
-  printf '{"ok":true,"result":{"worktree":{"id":"wt-child-cleanup","name":"fm-%s","path":"%s","terminals":[]}}}\n' \
-    "$child_id" "$childwt" > "$RESP/10.out"
-  cp "$RESP/9.out" "$RESP/11.out"
-  cp "$RESP/9.exit" "$RESP/11.exit"
-  cp "$RESP/10.out" "$RESP/12.out"
-  cp "$RESP/10.out" "$RESP/13.out"
-  cp "$RESP/9.out" "$RESP/14.out"
-  cp "$RESP/9.exit" "$RESP/14.exit"
-  cp "$RESP/10.out" "$RESP/15.out"
-  cp "$RESP/9.out" "$RESP/16.out"
-  cp "$RESP/9.exit" "$RESP/16.exit"
-  cp "$RESP/10.out" "$RESP/17.out"
-  printf '{"ok":true,"result":{"removed":true}}\n' > "$RESP/18.out"
+  printf '%s\n' "$childwt" > "$RESP/.remove-worktree-path"
   add_tmux_fake "$FB"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
+  printf 'state/\n' > "$subhome/.gitignore"
   initialize_secondmate_home_repo "$subhome" "$neutral"
+  fm_write_meta "$subhome/state/$child_id.meta" \
+    "window=fm-$child_id" "terminal=term-child-cleanup" "worktree=$childwt" "project=$childproj" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "backend=orca" "orca_worktree_id=wt-child-cleanup"
   set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$neutral" FM_HOME="$home" "$ROOT/bin/fm-teardown.sh" domain --force 2>&1 )
@@ -2017,7 +2007,7 @@ test_secondmate_force_teardown_refuses_orca_child_id_path_mismatch() {
   mkdir -p "$home/state" "$home/data" "$subhome/state" "$subhome/projects"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   fm_git_worktree "$childproj" "$childwt" "fm/$child_id"
-  git -C "$childproj" worktree add --quiet -b "fm/$child_id-other" "$other_wt"
+  fm_git_init_commit "$other_wt"
   fm_write_meta "$home/state/domain.meta" \
     "window=firstmate:fm-domain" "worktree=$subhome" "project=$subhome" \
     "harness=echo" "kind=secondmate" "mode=secondmate" "yolo=off" \
@@ -2080,8 +2070,8 @@ test_secondmate_force_teardown_retains_partial_orca_child() {
   rc=$?
   set +e
   [ "$rc" -ne 0 ] || fail "forced secondmate teardown should refuse partial Orca child state"
-  assert_contains "$out" "child endpoint identity for $child_id is missing" \
-    "partial Orca child refusal did not surface missing endpoint identity"
+  assert_contains "$out" "child Orca endpoint authority or quiescence is unproven for $child_id" \
+    "partial Orca child refusal did not surface unproven endpoint authority"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm' \
     "partial child cleanup removed an Orca worktree without quiescence proof"
   assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close' \

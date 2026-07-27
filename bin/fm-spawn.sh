@@ -953,7 +953,6 @@ ORCA_TERMINAL=
 ORCA_TERMINAL_PROOF=
 ORCA_REPO_ID=
 ORCA_EXPECTED_TASK=
-ORCA_PROVIDER_TASK=
 ID=
 ACCOUNT_LEASE_CREATED=0
 FM_ACCOUNT_MUTATION_ACQUIRED=0
@@ -1044,7 +1043,6 @@ parse_orca_worktree_result() {
   rest=${rest#*$'\t'}
   ORCA_REPO_ID=$rest
   case "$ORCA_REPO_ID" in *$'\t'*) return 1 ;; esac
-  ORCA_PROVIDER_TASK=
 }
 
 persist_orca_cleanup_quarantine() {

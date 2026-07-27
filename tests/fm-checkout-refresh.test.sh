@@ -1322,7 +1322,9 @@ test_session_mode_preserves_gone_branch_pruning() {
 }
 
 test_config_and_external_identity_fail_closed() {
-  local remote project external original_origin out status config_real
+  local remote project external original_origin out status config_backup config_real
+  config_backup="$TMP_ROOT/config-external-identity-backup"
+  cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
   remote=$(build_origin identity-history)
   project="$FM_TEST_HOME/projects/identity-history"
   external="$TEST_HOME/identity-history"
@@ -1379,6 +1381,7 @@ test_config_and_external_identity_fail_closed() {
   assert_contains "$out" "unsafe config path" "symlinked config was not surfaced"
   assert_refresh_state "$STATE_ROOT" unhealthy
   rm -f "$FM_TEST_HOME/config/checkout-refresh" "$config_real"
+  mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
   pass "configuration and prior external identity failures invalidate coverage"
 }
 
@@ -1537,7 +1540,7 @@ test_worktree_freshness_verification_fails_closed() {
 }
 
 test_bounded_refresh_terminates_descendants() {
-  local remote checkout fakebin real_git out status parent_pid child_pid
+  local remote checkout fakebin real_git out status parent_pid child_pid timeout=10
   remote=$(build_origin bounded)
   checkout="$FM_TEST_HOME/projects/bounded"
   clone_from "$remote" "$checkout"
@@ -1548,13 +1551,14 @@ test_bounded_refresh_terminates_descendants() {
 #!/usr/bin/env bash
 if [ "${3:-}" = fetch ]; then
   trap '' TERM
-  printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_PARENT:?}"
+  printf '%s\n' "$$" > "${FM_TEST_FETCH_PARENT:?}"
   (
     trap '' TERM
-    printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_CHILD:?}"
     while :; do sleep 1; done
   ) &
-  wait
+  child_pid=$!
+  printf '%s\n' "$child_pid" > "${FM_TEST_FETCH_CHILD:?}"
+  wait "$child_pid"
 fi
 exec "${FM_TEST_REAL_GIT:?}" "$@"
 SH
@@ -1562,12 +1566,12 @@ SH
 
   set +e
   out=$(FM_TEST_REAL_GIT="$real_git" FM_TEST_FETCH_PARENT="$TMP_ROOT/fetch-parent.pid" \
-    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=1 \
+    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT="$timeout" \
     PATH="$fakebin:$PATH" run_refresh run-once --force 2>&1)
   status=$?
   set -e
   [ "$status" -eq 0 ] || fail "bounded refresh command failed unexpectedly: $out"
-  assert_contains "$out" "refresh timed out after 1s" \
+  assert_contains "$out" "refresh timed out after ${timeout}s" \
     "bounded refresh did not report its timeout"
   assert_refresh_state "$STATE_ROOT" unhealthy
   parent_pid=$(cat "$TMP_ROOT/fetch-parent.pid")

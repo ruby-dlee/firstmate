@@ -203,12 +203,14 @@ SH
 }
 
 initialize_secondmate_home_repo() {
-  local home=$1 source=$2 project source_head
+  local home=$1 source=$2 project source_branch source_head
+  source_branch=$(git -C "$source" branch --show-current)
+  [ -n "$source_branch" ] || fail "secondmate fixture source must have a checked-out branch"
   source_head=$(git -C "$source" rev-parse HEAD)
   git -C "$home" init -q
   git -C "$home" remote add origin "$source"
   git -C "$home" fetch -q origin
-  git -C "$home" checkout -q -b main "$source_head"
+  git -C "$home" checkout -q -b "$source_branch" "$source_head"
   printf '/projects/\n/state/\n' > "$home/.gitignore"
   git -C "$home" add .
   git -C "$home" -c user.name='Firstmate Tests' -c user.email=tests@example.invalid \

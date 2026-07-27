@@ -302,7 +302,7 @@ fi
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} recorded_scoped_target=${5:-}
-  local attempt state agent_state last=unknown
+  local attempt state last=unknown
   [ -n "$target" ] || return 2
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
@@ -312,17 +312,7 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
     fi
     case "$state" in
       absent) return 0 ;;
-      present)
-        if [ -n "$probe_home" ]; then
-          agent_state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        else
-          agent_state=$(fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        fi
-        case "$agent_state" in
-          dead|alive|unknown) last=present ;;
-          *) last=unknown ;;
-        esac
-        ;;
+      present) return 1 ;;
       unknown) last=unknown ;;
       *) last=unknown ;;
     esac

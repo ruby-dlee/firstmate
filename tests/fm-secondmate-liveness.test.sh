@@ -587,6 +587,8 @@ EOF
   spawn_root="$w/spawn-root"
   git clone -q --no-checkout "$ROOT" "$spawn_root"
   git -C "$spawn_root" checkout -q -B main "$primary_tip"
+  git -C "$spawn_root" remote set-url origin "file://$spawn_root"
+  git -C "$w/sm1" remote set-url origin "file://$spawn_root"
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'

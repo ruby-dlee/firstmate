@@ -42,7 +42,14 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_PANE_PATH:?}"
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -58,6 +65,7 @@ make_spawn_case() {
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
+  git -C "$wt" checkout --quiet --detach
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
@@ -75,7 +83,7 @@ enable_dispatch_profile() {
 make_seeded_secondmate_home() {
   local home=$1 id=$2
   mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  [ -f "$home/AGENTS.md" ] || printf '# Firstmate\n' > "$home/AGENTS.md"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
 }
@@ -84,12 +92,15 @@ run_spawn() {
   local home=$1 wt=$2 fakebin=$3 launchlog=$4
   shift 4
   : > "$launchlog"
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
-    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
-    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
-    FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
-    "$SPAWN" "$@" 2>&1
+  (
+    unset NO_MISTAKES_GATE
+    FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
+      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+      FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
+      "$SPAWN" "$@" 2>&1
+  )
 }
 
 read_case_record() {
@@ -371,10 +382,25 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
+  mkdir -p "$PROJ_DIR/bin"
+  printf '# Firstmate\n' > "$PROJ_DIR/AGENTS.md"
+  printf '%s\n' '.fm-secondmate-home' 'config/' 'data/' 'projects/' 'state/' > "$PROJ_DIR/.gitignore"
+  cat > "$PROJ_DIR/bin/fm-harness.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'codex\n'
+SH
+  chmod +x "$PROJ_DIR/bin/fm-harness.sh"
+  git -C "$PROJ_DIR" add .gitignore AGENTS.md bin/fm-harness.sh
+  git -C "$PROJ_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'add secondmate harness fixture'
   sm="$CASE_DIR/secondmate-home"
+  git -C "$PROJ_DIR" worktree add --quiet --detach "$sm"
   make_seeded_secondmate_home "$sm" "$id"
+  printf -- '- %s - dispatch profile test (home: %s; scope: dispatch profile test; projects: ; added 2026-07-27)\n' \
+    "$id" "$sm" > "$HOME_DIR/data/secondmates.md"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(FM_TEST_ROOT_OVERRIDE="$PROJ_DIR" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
   expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"

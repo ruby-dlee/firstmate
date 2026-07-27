@@ -2726,7 +2726,7 @@ if [ "$KIND" = secondmate ]; then
   fi
   if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     if ! secondmate_home_supports_account_routing "$PROJ_ABS"; then
-      echo "error: refusing account-routed secondmate launch for $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
+      echo "error: refusing account-routed secondmate launch for $ID at $PROJ_ABS: the home lacks Agent Fleet routing support. Fast-forward or otherwise reconcile the home to this Firstmate revision, run bin/fm-config-push.sh, and retry." >&2
       exit 1
     fi
   elif ! secondmate_home_supports_account_routing "$PROJ_ABS"; then

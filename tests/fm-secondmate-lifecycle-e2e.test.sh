@@ -32,7 +32,7 @@ export FM_BACKEND=tmux
 
 PRIMARY_ROOT="$TMP_ROOT/primary"
 git init -q -b main "$PRIMARY_ROOT"
-git -C "$PRIMARY_ROOT" fetch -q --no-tags "$ROOT" refs/heads/main
+git -C "$PRIMARY_ROOT" fetch -q --no-tags "$ROOT" HEAD
 git -C "$PRIMARY_ROOT" reset -q --hard FETCH_HEAD
 
 HOME_DIR="$TMP_ROOT/main home"

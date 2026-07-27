@@ -42,6 +42,7 @@ printf 'none\t-\tnative\n' > "$STATE_DIR/.afk-daemon-terminal"
 
 FM_STATE_OVERRIDE="$STATE_DIR" \
 FM_AFK_STATE_PREPARED=1 \
+FM_AFK_DELIVERY=reap-wake \
 FM_ESCALATE_BATCH_SECS=0 \
 FM_HOUSEKEEPING_TICK=1 \
 FM_POLL=1 \

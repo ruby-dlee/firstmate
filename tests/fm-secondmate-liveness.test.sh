@@ -175,7 +175,7 @@ test_agent_alive_dispatcher_routes_and_falls_back() {
   out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source herdr; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_agent_alive herdr sess:p1' "$ROOT")
   [ "$out" = alive ] || fail "dispatcher should route herdr to fm_backend_herdr_agent_alive, got '$out'"
 
-  out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_alive zellij sess:win' "$ROOT")
+  out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_alive cmux sess:win' "$ROOT")
   [ "$out" = unknown ] || fail "dispatcher should report unknown for a backend with no verified classifier, got '$out'"
 
   pass "fm_backend_agent_alive: routes tmux/herdr correctly, unknown for an unverified backend"
@@ -317,10 +317,13 @@ new_world() {
 # secondmate instead of relying on a non-Git legacy fixture.
 add_sm_home() {
   local w=$1 id=$2 window=$3 harness=${4:-claude}
-  local home="$w/$id" home_abs target
-  target=$(git -C "$ROOT" rev-parse refs/remotes/origin/main^{commit})
-  git clone --quiet --no-checkout "$ROOT" "$home"
-  git -C "$home" update-ref refs/remotes/origin/main "$target"
+  local home="$w/$id" home_abs source_origin primary_root="$w/primary-root"
+  source_origin=$(git -C "$ROOT" remote get-url origin)
+  if [ ! -d "$primary_root/.git" ]; then
+    git clone --quiet "$source_origin" "$primary_root"
+  fi
+  git clone --quiet --no-checkout "$primary_root" "$home"
+  git -C "$home" remote set-url origin "$source_origin"
   git -C "$home" checkout --quiet --detach refs/remotes/origin/main
   git -C "$home" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
@@ -579,14 +582,14 @@ EOF
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+FM_ROOT_OVERRIDE="$FM_TEST_PRIMARY_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
 status=$?
 cat "$FM_MANAGED_SPAWN_OUT"
 exit "$status"
 SH
   cat > "$fake_root/bin/fm-account-session-sync.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_REAL_ROOT" exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
+FM_ROOT_OVERRIDE="$FM_TEST_PRIMARY_ROOT" exec "$FM_TEST_REAL_ROOT/bin/fm-account-session-sync.sh" "$@"
 SH
   cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
 #!/usr/bin/env bash
@@ -632,7 +635,7 @@ SH
   native_dir_file="$w/native-dir"
   refreshed="$w/session-refreshed"
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
-    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_TEST_PRIMARY_ROOT="$w/primary-root" \
     FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
     FM_MANAGED_WORKSPACE="$workspace" \
     FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \

@@ -1053,12 +1053,21 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+[ "\${1:-}" != get ] || {
+  printf '%s\\n' "$wt"
+  exit 0
+}
+exit 0
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
 run_spawn_symlink_case() {  # <label> <physical|logical>
-  local label=$1 first_reply=$2 real_root link_root proj wt id fb data state config log out rc proj_phys initial_path
+  local label=$1 first_reply=$2 real_root link_root proj wt id fb data state config treehouse_root log out rc proj_phys initial_path
   real_root="$TMP_ROOT/symlink-real-$label"; link_root="$TMP_ROOT/symlink-link-$label"
   mkdir -p "$real_root"
   ln -s "$real_root" "$link_root"
@@ -1066,6 +1075,7 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   wt="$TMP_ROOT/symlink-wt-$label"
   id="spawnsymlink$label"
   fm_git_worktree "$real_root/proj" "$wt" "fm/$id"
+  git -C "$wt" checkout --quiet --detach
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
   # /var -> /private/var), so resolve the fakebin's "physical" reply with
   # pwd -P rather than string concatenation - it must match exactly what
@@ -1082,10 +1092,11 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   mkdir -p "$data/$id"
   printf 'test brief content\n' > "$data/$id/brief.md"
   state="$TMP_ROOT/symlink-state-$label"; config="$TMP_ROOT/symlink-config-$label"
-  mkdir -p "$state" "$config"
+  treehouse_root="$TMP_ROOT/symlink-treehouse-$label"
+  mkdir -p "$state" "$config" "$treehouse_root"
   log="$TMP_ROOT/symlink-spawn-$label.log"
 
-  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  out=$(FM_TREEHOUSE_ROOT="$treehouse_root" run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
   rc=$?
   expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
   assert_contains "$out" "worktree=$wt" \

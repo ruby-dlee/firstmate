@@ -3111,6 +3111,25 @@ except OSError:
 PY
 }
 
+secondmate_linked_worktree_is_recorded_child() {
+  local retiring_home=$1 repository=$2 linked_worktree=$3 child_metas child_meta child_kind child_project child_worktree
+  child_metas=$(secondmate_state_metadata "$retiring_home") || return 1
+  while IFS= read -r child_meta; do
+    [ -n "$child_meta" ] || continue
+    child_kind=$(meta_value "$child_meta" kind)
+    [ -n "$child_kind" ] || child_kind=ship
+    [ "$child_kind" != secondmate ] || continue
+    child_project=$(meta_value "$child_meta" project)
+    child_worktree=$(meta_value "$child_meta" worktree)
+    [ "$(fm_checkout_trusted_dir "$child_project" 2>/dev/null)" = "$repository" ] || continue
+    [ "$(fm_checkout_trusted_dir "$child_worktree" 2>/dev/null)" = "$linked_worktree" ] || continue
+    return 0
+  done <<EOF
+$child_metas
+EOF
+  return 1
+}
+
 validate_secondmate_repository_worktree_graph() {
   local repository=$1 retiring_home=$2 repository_container=${3:-$1}
   local common listed records path kind canonical count=0 bare_repository container_git submodule_admin=0
@@ -3181,6 +3200,8 @@ validate_secondmate_repository_worktree_graph() {
           :
         elif [ "$submodule_admin" -eq 1 ] && [ "$canonical" = "$common" ]; then
           :
+        elif secondmate_linked_worktree_is_recorded_child "$retiring_home" "$repository" "$canonical"; then
+          count=$((count - 1))
         else
           echo "REFUSED: secondmate project common Git directory owns another linked worktree at $canonical" >&2
           return 1

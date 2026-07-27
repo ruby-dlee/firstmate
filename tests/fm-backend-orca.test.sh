@@ -192,9 +192,21 @@ SH
 }
 
 initialize_secondmate_home_repo() {
-  local home=$1 source=$2
+  local home=$1 source=$2 default_branch project_origin
+  mkdir -p "$source/projects"
+  git clone --quiet "$home/projects/alpha" "$source/projects/alpha"
+  project_origin="$(dirname "$source")/alpha-origin.git"
+  git clone --quiet --bare "$source/projects/alpha" "$project_origin"
+  git -C "$source/projects/alpha" remote set-url origin "$project_origin"
+  git -C "$home/projects/alpha" remote add origin "$project_origin"
   fm_git_init_commit "$home"
   git -C "$home" remote add origin "$source"
+  git -C "$home" add -A
+  git -C "$home" -c user.name='Firstmate Tests' -c user.email=tests@example.invalid \
+    commit -qm 'fixture state'
+  default_branch=$(git -C "$source" branch --show-current)
+  git -C "$source" config receive.denyCurrentBranch ignore
+  git -C "$home" push --quiet --force origin "HEAD:$default_branch"
 }
 
 add_tmux_fake() {
@@ -756,6 +768,17 @@ test_legacy_respawn_writes_orca_metadata_and_launches_harness() {
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-spawn"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn","path":"%s"},"terminal":{"handle":"term-spawn"}}}\n' "$wt" > "$RESP/3.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn","path":"%s","name":"fm-%s","terminals":[{"handle":"term-spawn","title":"fm-%s"}]}}}\n' \
+    "$wt" "$id" "$id" > "$RESP/4.out"
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-spawn","title":"fm-%s","worktreeId":"wt-spawn","tail":[]}}}\n' \
+    "$id" > "$RESP/5.out"
+  cp "$RESP/4.out" "$RESP/6.out"
+  cp "$RESP/5.out" "$RESP/7.out"
+  cp "$RESP/4.out" "$RESP/8.out"
+  cp "$RESP/4.out" "$RESP/9.out"
+  printf '{"ok":true,"result":{"send":{"handle":"term-spawn","accepted":true}}}\n' > "$RESP/10.out"
+  cp "$RESP/10.out" "$RESP/11.out"
+  cp "$RESP/10.out" "$RESP/12.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
@@ -775,8 +798,10 @@ test_legacy_respawn_writes_orca_metadata_and_launches_harness() {
   assert_no_grep "report_required=" "$state/$id.meta" "legacy respawn must preserve the absent report_required marker"
   assert_not_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''create' \
     "spawn should reuse the implicit terminal returned by Orca worktree creation"
-  assert_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''send'$'\x1f''--terminal'$'\x1f''term-spawn'$'\x1f''--text'$'\x1f''export GOTMPDIR=/tmp/fm-orcaspawnz1/gotmp'$'\x1f''--enter'$'\x1f''--json' \
-    "spawn did not export GOTMPDIR through the Orca terminal"
+  assert_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''send'$'\x1f''--terminal'$'\x1f''term-spawn'$'\x1f''--text'$'\x1f''export PATH=' \
+    "spawn did not export the hardened crew PATH through the Orca terminal"
+  assert_contains "$(cat "$log")" "GOTMPDIR=/tmp/fm-orcaspawnz1/gotmp"$'\x1f''--enter'$'\x1f''--json' \
+    "spawn did not export the task-scoped GOTMPDIR through the Orca terminal"
   assert_contains "$(cat "$log")" "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions" \
     "spawn did not send the selected harness launch command through Orca"
   rm -rf "/tmp/fm-$id"
@@ -1273,7 +1298,9 @@ test_spawn_quarantines_orca_worktree_when_terminal_create_fails() {
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-terminal-fail"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-terminal-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
-  printf '1\n' > "$RESP/4.exit"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-terminal-fail","path":"%s"}}}\n' "$wt" > "$RESP/4.out"
+  printf '1\n' > "$RESP/5.exit"
+  printf '1\n' > "$RESP/6.exit"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
@@ -1604,7 +1631,7 @@ test_teardown_refuses_orca_worktree_when_path_missing() {
   rc=$?
   set +e
   [ "$rc" -ne 0 ] || fail "Orca teardown should refuse when its worktree path is absent"
-  assert_contains "$out" "teardown worktree metadata is not an exact repository root" \
+  assert_contains "$out" "teardown worktree metadata is not an exact inspectable repository root" \
     "pathless Orca teardown should surface the unprovable target identity"
   [ ! -s "$LOG" ] || fail "pathless Orca teardown should not close a terminal or remove a worktree"
   assert_present "$state/$id.meta" "pathless Orca teardown should preserve task metadata"
@@ -1695,7 +1722,7 @@ test_ship_teardown_refuses_orca_missing_worktree_path() {
   rc=$?
   set +e
   [ "$rc" -ne 0 ] || fail "Orca ship teardown should refuse a missing worktree path"
-  assert_contains "$out" "no inspectable git worktree" \
+  assert_contains "$out" "teardown worktree metadata is not an exact inspectable repository root" \
     "Orca ship teardown should explain the fail-closed worktree requirement"
   [ ! -s "$LOG" ] || fail "refused Orca ship teardown should not close terminals or remove worktrees"
   assert_present "$state/$id.meta" "refused Orca ship teardown should preserve metadata"
@@ -1937,6 +1964,29 @@ test_secondmate_force_teardown_removes_orca_child_via_orca() {
   orca_case secondmate-child-cleanup
   printf '{"ok":true,"result":{"worktree":{"id":"wt-child-cleanup","name":"fm-%s","path":"%s","terminals":[{"handle":"term-child-cleanup","title":"fm-%s"}]}}}\n' \
     "$child_id" "$childwt" "$child_id" > "$RESP/1.out"
+  cp "$RESP/1.out" "$RESP/2.out"
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-child-cleanup","title":"fm-%s","worktreeId":"wt-child-cleanup","tail":[]}}}\n' \
+    "$child_id" > "$RESP/3.out"
+  cp "$RESP/1.out" "$RESP/4.out"
+  cp "$RESP/3.out" "$RESP/5.out"
+  cp "$RESP/1.out" "$RESP/6.out"
+  cp "$RESP/3.out" "$RESP/7.out"
+  printf '{"ok":true,"result":{"closed":true}}\n' > "$RESP/8.out"
+  printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"terminal handle stale"}}\n' > "$RESP/9.out"
+  printf '1\n' > "$RESP/9.exit"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-child-cleanup","name":"fm-%s","path":"%s","terminals":[]}}}\n' \
+    "$child_id" "$childwt" > "$RESP/10.out"
+  cp "$RESP/9.out" "$RESP/11.out"
+  cp "$RESP/9.exit" "$RESP/11.exit"
+  cp "$RESP/10.out" "$RESP/12.out"
+  cp "$RESP/10.out" "$RESP/13.out"
+  cp "$RESP/9.out" "$RESP/14.out"
+  cp "$RESP/9.exit" "$RESP/14.exit"
+  cp "$RESP/10.out" "$RESP/15.out"
+  cp "$RESP/9.out" "$RESP/16.out"
+  cp "$RESP/9.exit" "$RESP/16.exit"
+  cp "$RESP/10.out" "$RESP/17.out"
+  printf '{"ok":true,"result":{"removed":true}}\n' > "$RESP/18.out"
   add_tmux_fake "$FB"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   initialize_secondmate_home_repo "$subhome" "$neutral"

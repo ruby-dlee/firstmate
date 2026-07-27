@@ -785,7 +785,7 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 90,85
-  id=direct-new-retained-z8
+  id=direct-new-retained-z8-$$
   record=$(make_spawn_case direct-new-retained codex "$id")
   read_spawn_case "$record"
   : > "/tmp/fm-$id"
@@ -835,7 +835,7 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   local record id out status recorded_worktree
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-rollback-z9
+  id=direct-new-rollback-z9-$$
   record=$(make_spawn_case direct-new-rollback codex "$id")
   read_spawn_case "$record"
   recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
@@ -863,7 +863,7 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   local record id out status meta
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-return-fail-z9
+  id=direct-new-return-fail-z9-$$
   record=$(make_spawn_case direct-new-return-fail codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
@@ -892,7 +892,7 @@ test_failed_new_direct_spawn_never_records_an_uncreated_endpoint() {
   local record id out status meta
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-no-endpoint-z9
+  id=direct-new-no-endpoint-z9-$$
   record=$(make_spawn_case direct-new-no-endpoint codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"

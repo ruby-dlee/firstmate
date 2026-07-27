@@ -556,7 +556,7 @@ test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
   local w workspace primary_tip spawn_root fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
   w=$(new_world sweep-enforced-inherited-lock)
   add_sm_home "$w" sm1 firstmate:fm-sm1 claude
-  primary_tip=$(git -C "$ROOT" rev-parse refs/remotes/origin/HEAD)
+  primary_tip=$(git -C "$ROOT" rev-parse HEAD)
   rm -rf "$w/sm1"
   git clone -q --no-checkout "$ROOT" "$w/sm1"
   git -C "$w/sm1" checkout -q --detach "$primary_tip"
@@ -585,8 +585,8 @@ EOF
   printf 'enforce\n' > "$w/home/config/account-routing-mode"
 
   spawn_root="$w/spawn-root"
-  git clone -q "$ROOT" "$spawn_root"
-  git -C "$spawn_root" branch -f main refs/remotes/origin/main
+  git clone -q --no-checkout "$ROOT" "$spawn_root"
+  git -C "$spawn_root" checkout -q -B main "$primary_tip"
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'

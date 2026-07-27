@@ -398,7 +398,7 @@ quiesce_secondmate_endpoint() {
 
 quiesce_child_endpoint() {
   local meta=$1 task=$2 owner_home=$3 child_home=${4:-}
-  local backend target kind endpoint_home probe_home='' endpoint_status scoped_target
+  local backend target kind endpoint_home probe_home='' endpoint_status scoped_target zellij_tab
   backend=$(fm_backend_of_meta "$meta")
   target=$(teardown_backend_target_of_meta "$meta")
   kind=$(meta_value "$meta" kind)
@@ -407,6 +407,21 @@ quiesce_child_endpoint() {
   [ "$endpoint_home" = "$FM_HOME" ] || probe_home=$endpoint_home
   scoped_target=$(meta_value "$meta" tmux_session_target)
   [ "$backend" != orca ] || scoped_target=$(meta_value "$meta" orca_worktree_id)
+  zellij_tab=$(meta_value "$meta" zellij_tab_id)
+  if [ "$backend" = zellij ] && [ -n "$zellij_tab" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" \
+        fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$scoped_target" ) 2>/dev/null || {
+        echo "error: failed to stop child endpoint for $task; refusing destructive cleanup" >&2
+        return 1
+      }
+    else
+      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$scoped_target" 2>/dev/null || {
+        echo "error: failed to stop child endpoint for $task; refusing destructive cleanup" >&2
+        return 1
+      }
+    fi
+  fi
   if [ "$backend" = orca ]; then
     quiesce_authoritative_orca_endpoint "$target" "$scoped_target" "fm-$task" || {
       echo "error: child Orca endpoint authority or quiescence is unproven for $task" >&2

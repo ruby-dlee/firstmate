@@ -2815,7 +2815,7 @@ test_busy_state_working_maps_to_busy() {
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = busy ] || fail "agent_status=working should map to busy, got '$out'"
   assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''get'$'\x1f''w1:p2' "busy_state did not call agent get"
   pass "fm_backend_herdr_busy_state: working -> busy"
@@ -2827,14 +2827,14 @@ test_busy_state_done_and_blocked_map_to_idle() {
   printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = idle ] || fail "agent_status=done should map to idle, got '$out'"
 
   dir="$TMP_ROOT/busy-blocked"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = idle ] || fail "agent_status=blocked should map to idle (stuck waiting on the human, not grinding), got '$out'"
   pass "fm_backend_herdr_busy_state: done -> idle, blocked -> idle (surfaced like a stale pane, not suppressed as busy)"
 }
@@ -2845,7 +2845,7 @@ test_busy_state_unknown_on_no_agent() {
   printf '1\n' > "$resp/1.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = unknown ] || fail "a failed agent get should report unknown (the fallback-to-regex cue), got '$out'"
   pass "fm_backend_herdr_busy_state: unparseable/absent agent state reports unknown, the regex-fallback cue"
 }
@@ -3211,7 +3211,7 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 test_send_text_submit_detects_landed_send() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text (literal, no output)
+  # 1: agent send (literal, no output)
   # 2: agent get - pre-Enter baseline is idle
   # 3: send-keys enter
   # 4: agent get - agent_status working (a real turn started: submitted)
@@ -3221,7 +3221,7 @@ test_send_text_submit_detects_landed_send() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 3 0.01 0.01' "$ROOT" )
   [ "$out" = empty ] || fail "send_text_submit should report empty (submitted) once agent_status reports working, got '$out'"
-  assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-text'$'\x1f''w1:p2'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
+  assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''send'$'\x1f''w1:p2'$'\x1f''hello captain' "send_text_submit did not type the literal text first"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "send_text_submit should not need a second Enter for a plain message with no popup, sent $enter_count Enter(s)"
   [ "$(grep -c $'\x1f''pane'$'\x1f''read' "$log")" -eq 0 ] || fail "send_text_submit must never read the composer/pane content for confirmation anymore"
@@ -3379,11 +3379,12 @@ test_send_text_submit_send_failed() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf '1\n' > "$resp/1.exit"
+  printf '1\n' > "$resp/2.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
   [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the literal send itself fails, got '$out'"
-  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when the literal send-text call itself errors"
+  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when both literal-send paths error"
 }
 
 test_send_text_submit_unknown_on_capture_failure() {

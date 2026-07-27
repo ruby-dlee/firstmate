@@ -30,6 +30,11 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-lifecycle)
 export FM_BACKEND=tmux
 
+PRIMARY_ROOT="$TMP_ROOT/primary"
+git init -q -b main "$PRIMARY_ROOT"
+git -C "$PRIMARY_ROOT" fetch -q --no-tags "$ROOT" refs/heads/main
+git -C "$PRIMARY_ROOT" reset -q --hard FETCH_HEAD
+
 HOME_DIR="$TMP_ROOT/main home"
 SUB="$TMP_ROOT/design-home"
 SUB_ABS=
@@ -70,7 +75,7 @@ EOF
 
 phase_seed() {
   local out
-  out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" \
+  out=$(PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_HOME="$HOME_DIR" \
     "$ROOT/bin/fm-home-seed.sh" design "$SUB" alpha beta gamma) \
     || fail "seed failed"
   SUB_ABS=$(cd "$SUB" && pwd -P)
@@ -93,6 +98,7 @@ phase_seed() {
   assert_present "$SUB/projects/gamma/.no-mistakes-init" "no-mistakes project was not initialized in the subhome"
   assert_present "$SUB/projects/gamma/.no-mistakes-doctor" "no-mistakes project was not doctored in the subhome"
   assert_absent "$HOME_DIR/projects/gamma/.no-mistakes-init" "seed wrote no-mistakes state through the parent project"
+  rm -f "$SUB/projects/gamma/.no-mistakes-init" "$SUB/projects/gamma/.no-mistakes-doctor"
 
   # Registry line: scope from the filled brief, project list, no legacy owns field.
   assert_grep '- design - customer onboarding charter' "$HOME_DIR/data/secondmates.md" "registry summary not from the charter"
@@ -112,7 +118,7 @@ phase_seed() {
 
 phase_spawn() {
   : > "$LOG"
-  PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_CONFIG_OVERRIDE="$HOME_DIR/parent-config" \
+  PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_HOME="$HOME_DIR" FM_CONFIG_OVERRIDE="$HOME_DIR/parent-config" \
     FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-spawn.sh" design "$SUB" codex --secondmate >/dev/null \
     || fail "secondmate spawn failed"
@@ -198,7 +204,7 @@ phase_recovery() {
   # Simulate a restart: drop the live meta, then respawn from the registry +
   # persistent home (no explicit home argument).
   rm -f "$HOME_DIR/state/design.meta"
-  PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
+  PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-spawn.sh" design "echo relaunch" --secondmate >/dev/null 2>&1 \
     || fail "recovery respawn failed"
   local meta="$HOME_DIR/state/design.meta"
@@ -211,7 +217,8 @@ phase_recovery() {
 phase_teardown() {
   local teardown_out
   : > "$LOG"
-  teardown_out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
+  teardown_out=$(PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" \
+    FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-teardown.sh" design 2>&1) \
     || fail "teardown failed for the empty secondmate home"
   printf '%s\n' "$teardown_out" | grep -F 'Backlog:' >/dev/null \

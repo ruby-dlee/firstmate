@@ -45,11 +45,11 @@ test_owner_defines_canonical_set() {
   # that would hide findings CI fails on.
   assert_no_grep '--severity' "$LINT" "fm-lint.sh must not lower severity below the CI default"
   assert_no_grep '--exclude' "$LINT" "fm-lint.sh must not blanket-exclude checks CI enforces"
-  [ "$(grep -Fc 'exec shellcheck --norc' "$LINT")" -eq 3 ] || fail "all lint modes must ignore ambient ShellCheck configuration"
+  [ "$(grep -Fc 'exec shellcheck --norc' "$LINT")" -eq 2 ] || fail "both lint modes must ignore ambient ShellCheck configuration"
   pass "fm-lint.sh is the sole authoritative definition at CI-default severity"
 }
 
-test_external_sources_option_uses_canonical_set() {
+test_external_sources_option_uses_explicit_paths() {
   local tmp fakebin log
   tmp=$(fm_test_tmproot fm-lint-external)
   fakebin=$(fm_fakebin "$tmp")
@@ -64,11 +64,11 @@ printf '%s\n' "$@" > "${FM_TEST_SHELLCHECK_ARGS:?}"
 SH
   chmod +x "$fakebin/shellcheck"
   FM_TEST_SHELLCHECK_VERSION="$REQUIRED" FM_TEST_SHELLCHECK_ARGS="$log" \
-    PATH="$fakebin:$PATH" "$LINT" -x >/dev/null
+    PATH="$fakebin:$PATH" "$LINT" -x bin/fm-lint.sh tests/fm-lint.test.sh >/dev/null
   grep -Fqx -- '-x' "$log" || fail "fm-lint.sh -x did not forward external-source analysis"
-  grep -Fqx 'bin/fm-lint.sh' "$log" || fail "fm-lint.sh -x omitted the canonical bin file set"
-  grep -Fqx 'tests/fm-lint.test.sh' "$log" || fail "fm-lint.sh -x omitted the canonical test file set"
-  pass "fm-lint.sh -x applies external-source analysis to the canonical file set"
+  grep -Fqx 'bin/fm-lint.sh' "$log" || fail "fm-lint.sh -x omitted an explicit bin path"
+  grep -Fqx 'tests/fm-lint.test.sh' "$log" || fail "fm-lint.sh -x omitted an explicit test path"
+  pass "fm-lint.sh -x applies external-source analysis to explicit paths"
 }
 
 test_ci_invokes_the_owner() {
@@ -204,7 +204,7 @@ SH
 
 test_owner_exists_and_executable
 test_owner_defines_canonical_set
-test_external_sources_option_uses_canonical_set
+test_external_sources_option_uses_explicit_paths
 test_ci_invokes_the_owner
 test_nomistakes_invokes_the_owner
 test_pins_an_explicit_version

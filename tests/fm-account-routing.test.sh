@@ -3306,7 +3306,11 @@ test_concurrent_continuations_serialize_before_mutation() {
     kill -0 "$first_pid" 2>/dev/null || break
     sleep 0.05
   done
-  [ -f "$marker" ] || { kill "$first_pid" 2>/dev/null || true; fail "first continuation never reached endpoint creation"; }
+  [ -f "$marker" ] || {
+    touch "$gate"
+    wait "$first_pid" 2>/dev/null || true
+    fail "first continuation never reached endpoint creation: $(cat "$CASE_DIR/first.out")"
+  }
   second_lock_waiter="$CASE_DIR/second-lock-wait-observed"
   FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
     FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$second_lock_waiter" \
@@ -3330,7 +3334,8 @@ test_concurrent_continuations_serialize_before_mutation() {
   second_rc=$?
   [ "$first_rc" -eq 0 ] || fail "first serialized continuation failed: $(cat "$CASE_DIR/first.out")"
   [ "$second_rc" -ne 0 ] || fail "second concurrent continuation also launched"
-  assert_grep 'managed recovery endpoint is still alive' "$CASE_DIR/second.out" "concurrent continuation did not revalidate the serialized replacement endpoint"
+  assert_grep 'managed recovery endpoint is still alive' "$CASE_DIR/second.out" \
+    "concurrent continuation did not revalidate the serialized replacement endpoint: $(cat "$CASE_DIR/second.out")"
   lease_count=$(grep -Ec 'lease choose|lease acquire' "$AF_LOG" || true)
   endpoint_count=$(grep -c '^new-window ' "$TMUX_LOG" || true)
   [ "$lease_count" -eq 1 ] || fail "concurrent continuations acquired $lease_count leases"
@@ -5726,7 +5731,7 @@ test_agent_fleet_lifecycle_calls_are_bounded() {
   assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
 
   rm -f "$CASE_DIR/endpoint-live"
-  write_completion_report "$id"
+  write_teardown_completion_report "$id"
   clear_case_logs
   release_completed="$CASE_DIR/release-completed"
   if out=$(FM_FAKE_AF_RELEASE_SLEEP=10 FM_FAKE_AF_RELEASE_COMPLETED="$release_completed" \
@@ -6015,7 +6020,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   [ "$failed_task" != "$old_task" ] || fail "failed continuation did not install its rollback generation"
 
   rm -f "$CASE_DIR/endpoint-live"
-  write_completion_report "$id"
+  write_teardown_completion_report "$id"
   clear_case_logs
   if out=$(run_teardown "$id" --force 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "teardown continued after restoring predecessor metadata"
@@ -6542,6 +6547,17 @@ if [ "${FM_TEST_FOCUSED:-}" = production-routing-authority ]; then
   run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
   run_isolated_test test_darwin_stat_mode_preserves_special_permission_bits
   run_isolated_test test_production_routing_ignores_ambient_mode_and_forbids_binary_override
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = concurrent-continuation ]; then
+  run_isolated_test test_concurrent_continuations_serialize_before_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = teardown-report-gates ]; then
+  run_isolated_test test_agent_fleet_lifecycle_calls_are_bounded
+  run_isolated_test test_teardown_stops_after_rollback_restores_predecessor
   exit 0
 fi
 

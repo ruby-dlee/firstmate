@@ -1383,6 +1383,29 @@ persist_failed_direct_spawn() {  # <endpoint-created:0|1>
       }
     } > "$tmp" || { rm -f "$tmp"; return 1; }
   fi
+  if [ "$endpoint_created" = 1 ]; then
+    case "${BACKEND:-tmux}" in
+      tmux)
+        grep -q '^tmux_window_id=' "$tmp" || printf 'tmux_window_id=%s\n' "${WID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^tmux_session_target=' "$tmp" || printf 'tmux_session_target=%s\n' "$retained_tmux_session" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        ;;
+      herdr)
+        grep -q '^herdr_session=' "$tmp" || printf 'herdr_session=%s\n' "${HERDR_SES:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^herdr_workspace_id=' "$tmp" || printf 'herdr_workspace_id=%s\n' "${HERDR_WORKSPACE_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^herdr_tab_id=' "$tmp" || printf 'herdr_tab_id=%s\n' "${HERDR_TAB_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^herdr_pane_id=' "$tmp" || printf 'herdr_pane_id=%s\n' "${HERDR_PANE_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        ;;
+      zellij)
+        grep -q '^zellij_session=' "$tmp" || printf 'zellij_session=%s\n' "${ZELLIJ_SES:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^zellij_tab_id=' "$tmp" || printf 'zellij_tab_id=%s\n' "${ZELLIJ_TAB_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^zellij_pane_id=' "$tmp" || printf 'zellij_pane_id=%s\n' "${ZELLIJ_PANE_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        ;;
+      cmux)
+        grep -q '^cmux_workspace_id=' "$tmp" || printf 'cmux_workspace_id=%s\n' "${CMUX_WORKSPACE_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        grep -q '^cmux_surface_id=' "$tmp" || printf 'cmux_surface_id=%s\n' "${CMUX_SURFACE_ID:-}" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        ;;
+    esac
+  fi
   if [ "$preserve_extensions" = 1 ]; then
     fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
   fi

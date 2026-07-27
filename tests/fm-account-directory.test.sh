@@ -230,6 +230,7 @@ case "${1:-}" in
   list-windows) exit 0 ;;
   has-session|new-session) exit 0 ;;
   new-window)
+    [ "${FM_FAKE_NEW_WINDOW_FAIL:-0}" != 1 ] || exit 73
     touch "${FM_FAKE_ENDPOINT_FILE:?}"
     printf '@1\n'
     exit 0
@@ -239,6 +240,7 @@ case "${1:-}" in
     exit 0
     ;;
   send-keys)
+    [ "${FM_FAKE_SEND_KEYS_FAIL:-0}" != 1 ] || exit 74
     prev=
     for argument in "$@"; do
       if [ "$prev" = -l ]; then
@@ -292,6 +294,8 @@ run_direct_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
+    FM_FAKE_NEW_WINDOW_FAIL="${FM_FAKE_NEW_WINDOW_FAIL:-0}" \
+    FM_FAKE_SEND_KEYS_FAIL="${FM_FAKE_SEND_KEYS_FAIL:-0}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     T="${T:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
@@ -744,10 +748,8 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   set_remaining 1 20,15
   set_remaining 2 95,90
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
-  rm -rf "$SPAWN_HOME/state/.task-tmp/fm-$id"
-  : > "$SPAWN_HOME/state/.task-tmp/fm-$id"
 
-  if out=$(FM_FAKE_KILL_RETAIN=1 \
+  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" --recover-direct-account 2>&1); then
     status=0
@@ -765,7 +767,7 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   [ -f "$SPAWN_HOME/state/$backup_name" ] || fail "failed recovery did not retain its prior metadata backup"
   [ -d "$SPAWN_HOME/state/$artifacts_name" ] || fail "failed recovery did not retain its artifact backup"
 
-  rm -f "$SPAWN_HOME/state/.task-tmp/fm-$id" "$SPAWN_HOME/state/.fake-endpoint"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
   retry=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" --recover-direct-account 2>&1)
   launch=$(cat "$SPAWN_LAUNCH_LOG")
@@ -776,7 +778,6 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   if grep -q '^direct_recovery_' "$meta"; then fail "successful retry left direct recovery markers in metadata"; fi
   [ ! -e "$SPAWN_HOME/state/$backup_name" ] || fail "successful retry left the retained metadata backup"
   [ ! -e "$SPAWN_HOME/state/$artifacts_name" ] || fail "successful retry left the retained artifact backup"
-  rm -rf "$SPAWN_HOME/state/.task-tmp/fm-$id"
   pass "failed direct recovery tracks and reconciles a retained replacement endpoint"
 }
 
@@ -788,9 +789,8 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   id=direct-new-retained-z8
   record=$(make_spawn_case direct-new-retained codex "$id")
   read_spawn_case "$record"
-  : > "$SPAWN_HOME/state/.task-tmp/fm-$id"
 
-  if out=$(FM_FAKE_KILL_RETAIN=1 \
+  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
@@ -827,7 +827,7 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   [ "$recovery_status" -ne 0 ] || fail "direct recovery bypassed pending new-spawn cleanup"
   assert_contains "$recovery_out" "failed direct spawn cleanup is pending" \
     "pending new-spawn cleanup refusal was not actionable"
-  rm -f "$SPAWN_HOME/state/.task-tmp/fm-$id" "$SPAWN_HOME/state/.fake-endpoint"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
   pass "new direct spawn tracks retained endpoint and worktree state"
 }
 
@@ -840,9 +840,9 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   read_spawn_case "$record"
   recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
   : > "$TREEHOUSE_LOG"
-  : > "$SPAWN_HOME/state/.task-tmp/fm-$id"
 
-  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+  if out=$(FM_FAKE_SEND_KEYS_FAIL=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
   else
@@ -855,7 +855,6 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   [ ! -e "$SPAWN_WORKTREE" ] || fail "failed new direct spawn left its worktree registered"
   [ ! -e "$SPAWN_HOME/state/$id.meta" ] || fail "successful direct rollback left task metadata"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "successful direct rollback left its endpoint"
-  rm -f "$SPAWN_HOME/state/.task-tmp/fm-$id"
   pass "failed new direct spawn removes its endpoint and returns its worktree"
 }
 
@@ -867,9 +866,8 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   record=$(make_spawn_case direct-new-return-fail codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
-  : > "$SPAWN_HOME/state/.task-tmp/fm-$id"
 
-  if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
+  if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 FM_FAKE_SEND_KEYS_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
@@ -884,7 +882,6 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   assert_grep "rollback_pending=1" "$meta" \
     "direct return failure did not fail closed"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "direct return failure retained an already-removed endpoint"
-  rm -f "$SPAWN_HOME/state/.task-tmp/fm-$id"
   pass "direct spawn persists cleanup state when worktree return cannot be confirmed"
 }
 
@@ -896,11 +893,11 @@ test_failed_new_direct_spawn_never_records_an_uncreated_endpoint() {
   record=$(make_spawn_case direct-new-no-endpoint codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
-  : > "$SPAWN_HOME/state/.task-tmp/fm-$id"
 
   if out=$(T=default:captain-pane FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
+    FM_FAKE_NEW_WINDOW_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-      "$id" "$SPAWN_PROJECT" --backend herdr --account-pool legacy-codex-pool 2>&1); then
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
   else
     status=$?
@@ -919,7 +916,6 @@ test_failed_new_direct_spawn_never_records_an_uncreated_endpoint() {
   assert_no_grep "herdr_pane_id=" "$meta" \
     "pre-endpoint failure copied an ambient Herdr pane identity"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "pre-endpoint failure created an endpoint"
-  rm -f "$SPAWN_HOME/state/.task-tmp/fm-$id"
   pass "failed direct spawn never records an endpoint it did not create"
 }
 

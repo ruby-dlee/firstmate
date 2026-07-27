@@ -49,6 +49,11 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#
+# Also covers already-returned worktree (external treehouse return) and fd leak:
+#   (z1) already-returned worktree + landed work              -> ALLOW (cleanup-only)
+#   (z2) already-returned worktree + unlanded work            -> REFUSE (safety)
+#   (z3) low ulimit -n + many directories in worktree         -> ALLOW (fd leak fix)
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -82,6 +87,33 @@ with open(state, "w", encoding="utf-8") as stream:
                     "path": path,
                     "leased": True,
                     "lease_holder": holder,
+                }
+            ]
+        },
+        stream,
+    )
+PY
+}
+
+write_treehouse_unleased() {
+  local worktree=$1 slot pool state
+  slot=$(cd "$(dirname "$worktree")" && pwd -P)
+  pool=$(cd "$(dirname "$slot")" && pwd -P)
+  state="$pool/treehouse-state.json"
+  python3 - "$state" "$(cd "$worktree" && pwd -P)" <<'PY'
+import json
+import sys
+
+state, path = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": path,
+                    "leased": False,
+                    "lease_holder": "",
                 }
             ]
         },
@@ -4320,6 +4352,82 @@ test_secondmate_registry_updates_are_locked_and_literal() {
   pass "secondmate registry updates are serialized and compare ids literally"
 }
 
+test_already_returned_worktree_with_landed_work_allows() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-landed)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  write_treehouse_unleased "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 0 ] || fail "already-returned-landed: teardown should succeed when work is on a remote: $(cat "$case_dir/stderr")"
+  assert_grep 'lease already cleared' "$case_dir/stderr" \
+    "already-returned-landed: teardown did not log the cleared-lease detection"
+  pass "already-returned worktree with landed work tears down cleanly"
+}
+
+test_already_returned_worktree_with_unlanded_work_refuses() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-unlanded)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" unlanded.txt "content not in main" "add unlanded work"
+
+  write_treehouse_unleased "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-unlanded: teardown should refuse when work is not landed"
+  assert_grep 'REFUSED' "$case_dir/stderr" \
+    "already-returned-unlanded: teardown did not print REFUSED"
+  pass "already-returned worktree with unlanded work is refused"
+}
+
+test_fd_leak_under_low_ulimit() {
+  local case_dir rc dir_count i
+  case_dir=$(make_case fd-leak-ulimit)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  dir_count=200
+  i=0
+  while [ "$i" -lt "$dir_count" ]; do
+    mkdir -p "$case_dir/wt/deep/dir_$i"
+    : > "$case_dir/wt/deep/dir_$i/.keep"
+    i=$((i + 1))
+  done
+  git -C "$case_dir/wt" add -A
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add dirs"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  set +e
+  (
+    ulimit -n 256 2>/dev/null || exit 99
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  )
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 0 ] || fail "fd-leak-ulimit: teardown failed under low ulimit (rc=$rc): $(cat "$case_dir/stderr")"
+  pass "teardown succeeds under low ulimit -n with many directories (fd leak fix)"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
+  test_already_returned_worktree_with_landed_work_allows
+  test_already_returned_worktree_with_unlanded_work_refuses
+  test_fd_leak_under_low_ulimit
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   test_teardown_refuses_unsafe_tasktmp_metadata
   exit 0
@@ -4574,3 +4682,6 @@ test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
 test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
+test_already_returned_worktree_with_landed_work_allows
+test_already_returned_worktree_with_unlanded_work_refuses
+test_fd_leak_under_low_ulimit

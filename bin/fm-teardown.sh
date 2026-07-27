@@ -1034,6 +1034,37 @@ except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error
 PY
 }
 
+treehouse_lease_is_cleared() {
+  local worktree=$1 state
+  state=$(treehouse_state_for_worktree "$worktree") || return 1
+  python3 - "$state" "$(cd "$worktree" 2>/dev/null && pwd -P || printf '%s' "$worktree")" <<'PY'
+import json
+import os
+import sys
+
+state_path, expected_path = sys.argv[1:]
+try:
+    with open(state_path, encoding="utf-8") as stream:
+        state = json.load(stream)
+    worktrees = state.get("worktrees", [])
+    if not isinstance(worktrees, list):
+        raise SystemExit(1)
+    matches = [
+        e for e in worktrees
+        if isinstance(e, dict) and isinstance(e.get("path"), str)
+        and os.path.realpath(e["path"]) == expected_path
+    ]
+    if not matches:
+        raise SystemExit(0)
+    entry = matches[0]
+    if entry.get("leased") is True:
+        raise SystemExit(1)
+    raise SystemExit(0)
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
 require_treehouse_return_authority() {
   local worktree=$1 project=$2 worktree_root project_root worktree_common project_common
   worktree_root=$(exact_git_worktree_root "$worktree") || return 1
@@ -1083,7 +1114,14 @@ validate_teardown_target_identity() {
     echo "error: teardown worktree is not registered to the recorded project: $worktree_root" >&2
     return 1
   }
-  require_treehouse_task_lease "$worktree_root" "firstmate-$ID"
+  if require_treehouse_task_lease "$worktree_root" "firstmate-$ID"; then
+    return 0
+  fi
+  if treehouse_lease_is_cleared "$worktree_root"; then
+    echo "teardown: worktree lease already cleared (worktree may have been returned externally): $worktree_root" >&2
+    return "$TEARDOWN_WORKTREE_ALREADY_RETURNED"
+  fi
+  return 1
 }
 
 retry_wait_secs_is_valid() {
@@ -1104,6 +1142,7 @@ fi
 STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS
 TEARDOWN_TREEHOUSE_LOCK_REFUSED=2
 TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED=3
+TEARDOWN_WORKTREE_ALREADY_RETURNED=4
 
 # True when treehouse/git stderr shows the transient index.lock "File exists" race.
 # Other return failures must not enter the retry path.
@@ -3929,7 +3968,19 @@ if [ "$KIND" = scout ]; then
   fi
 fi
 
-[ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
+WORKTREE_ALREADY_RETURNED=0
+if [ "$KIND" != secondmate ]; then
+  if validate_teardown_target_identity; then
+    :
+  else
+    _vtid_rc=$?
+    if [ "$_vtid_rc" -eq "$TEARDOWN_WORKTREE_ALREADY_RETURNED" ]; then
+      WORKTREE_ALREADY_RETURNED=1
+    else
+      exit 1
+    fi
+  fi
+fi
 
 PROBE_HOME=
 ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
@@ -4014,14 +4065,26 @@ post_quiescence_safety_refusal() {
   echo "The task endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
 }
 
+validate_teardown_target_identity_or_returned() {
+  if validate_teardown_target_identity; then
+    return 0
+  fi
+  _vtid_rc=$?
+  if [ "$_vtid_rc" -eq "$TEARDOWN_WORKTREE_ALREADY_RETURNED" ]; then
+    WORKTREE_ALREADY_RETURNED=1
+    return 0
+  fi
+  return "$_vtid_rc"
+}
+
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ]; then
   if [ "$DIRECT_SPAWN_ENDPOINT" != not-created ]; then
     quiesce_retained_direct_spawn_endpoint || exit 1
   fi
-  validate_teardown_target_identity || { post_quiescence_safety_refusal; exit 1; }
+  validate_teardown_target_identity_or_returned || { post_quiescence_safety_refusal; exit 1; }
 elif [ "$KIND" != secondmate ]; then
   quiesce_task_endpoint || exit 1
-  validate_teardown_target_identity || { post_quiescence_safety_refusal; exit 1; }
+  validate_teardown_target_identity_or_returned || { post_quiescence_safety_refusal; exit 1; }
 fi
 
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
@@ -4068,7 +4131,7 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH" || exit 1
 fi
 
-[ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
+[ "$KIND" = secondmate ] || validate_teardown_target_identity_or_returned || exit 1
 
 remove_orca_worktree_locked() {
   local branch=HEAD boundary_token
@@ -4097,18 +4160,20 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_orca_worktree_locked || exit 1
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. teardown_treehouse_return tolerates transient and stale git locks
-  # left by a killed crewmate process; see the script header for retry and stale-lock proof.
-  post_lock_cleanup_check=
-  if [ "$KIND" != secondmate ]; then
-    post_lock_cleanup_check=validate_worktree_teardown_safety
+  if [ "$WORKTREE_ALREADY_RETURNED" = 1 ]; then
+    cleanup_returned_worktree \
+      "$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)" \
+      "$WT" "$PROJ"
+  else
+    post_lock_cleanup_check=
+    if [ "$KIND" != secondmate ]; then
+      post_lock_cleanup_check=validate_worktree_teardown_safety
+    fi
+    teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree || {
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      exit 1
+    }
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-    exit 1
-  }
 fi
 
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then

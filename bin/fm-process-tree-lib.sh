@@ -184,6 +184,17 @@ fm_run_bounded() {
       if (!$command) {
         close $status_write;
         close $finish_read;
+        # Close inherited fds above stderr so the bounded command starts
+        # with a clean fd table.  The boundary walker in
+        # fm_checkout_treehouse_return_locked opens one fd per directory
+        # in the worktree; inherited fds from the parent bash process
+        # consume headroom and cause EMFILE on large trees.
+        if (opendir my $devfd, "/dev/fd") {
+          my @inherited = grep { $_ > 2 }
+            map { /^(\d+)$/ ? $1 : () } readdir $devfd;
+          closedir $devfd;
+          POSIX::close($_) for @inherited;
+        }
         $SIG{HUP} = "DEFAULT";
         $SIG{INT} = "DEFAULT";
         $SIG{QUIT} = "DEFAULT";

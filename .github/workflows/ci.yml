@@ -27,9 +27,10 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # The pre-cutover suite reached 25m35s, and the exhaustive Bridge crash
-    # matrix adds bounded work. Keep enough margin without masking a real hang.
-    timeout-minutes: 45
+    # The serial suite now includes the bounded direct-account recovery matrix
+    # as well as the exhaustive Bridge crash matrix. Keep enough margin for both
+    # without masking a real hang.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
         with:

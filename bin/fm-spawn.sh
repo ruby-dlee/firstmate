@@ -3104,9 +3104,11 @@ fi
 # GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] || [ "$RESUME_ACCOUNT" = 1 ]; then
-  fm_tasktmp_owner_validate "$(fm_tasktmp_owner_record "$STATE" "$ID" "$SPAWN_GENERATION_ID")" "$FM_HOME" "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP" \
-    && fm_tasktmp_owner_validate "$TASK_TMP/.fm-tasktmp-owner" "$FM_HOME" "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP" \
-    || { echo "error: account recovery task temp ownership is not exact for $ID" >&2; exit 1; }
+  if ! fm_tasktmp_owner_validate "$(fm_tasktmp_owner_record "$STATE" "$ID" "$SPAWN_GENERATION_ID")" "$FM_HOME" "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP" \
+    || ! fm_tasktmp_owner_validate "$TASK_TMP/.fm-tasktmp-owner" "$FM_HOME" "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP"; then
+    echo "error: account recovery task temp ownership is not exact for $ID" >&2
+    exit 1
+  fi
 else
   if spawn_test_lab_enabled && [ "${FM_TEST_TASKTMP_CREATE_FAIL:-0}" = 1 ]; then
     echo "error: test-only task temp creation failure for $ID" >&2

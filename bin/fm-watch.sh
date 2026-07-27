@@ -542,6 +542,17 @@ capacity_rescue_append_blocked() {  # <task> <note>
   printf 'blocked [key=capacity-rescue]: %s\n' "$note" >> "$statusf"
 }
 
+model_capacity_append_blocked() {  # <task> <note>
+  local task=$1 note=$2
+  local statusf="$STATE/$task.status"
+  [ ! -L "$statusf" ] && { [ ! -e "$statusf" ] || [ -f "$statusf" ]; } || return 1
+  if [ -f "$statusf" ] \
+    && status_open_decisions "$statusf" | grep -Fq $'model-capacity\t'; then
+    return 1
+  fi
+  printf 'blocked [key=model-capacity]: %s\n' "$note" >> "$statusf"
+}
+
 capacity_rescue_release_lifecycle() {  # <lock>
   local lock=$1
   [ -n "$lock" ] || return 0
@@ -1441,14 +1452,23 @@ EOF
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
+    h=$(printf '%s' "$tail40" | hash_pane)
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    window_busy=0
+    if window_is_busy "$w" "$tail40"; then
+      window_busy=1
+      mark_brief_processing_started "$task" || true
+    fi
     capacity_failure=
     credential_failure=
-    case "$kind" in
-      ship|scout)
-        credential_failure=$(provider_credential_failure_kind "$(window_harness "$w")" "$tail40" || true)
-        capacity_failure=$(provider_capacity_failure_kind "$(window_harness "$w")" "$tail40" || true)
-        ;;
-    esac
+    if [ "$window_busy" != 1 ]; then
+      case "$kind" in
+        ship|scout)
+          credential_failure=$(provider_credential_failure_kind "$(window_harness "$w")" "$tail40" || true)
+          capacity_failure=$(provider_capacity_failure_kind "$(window_harness "$w")" "$tail40" || true)
+          ;;
+      esac
+    fi
     if [ -n "$credential_failure" ]; then
       capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$credential_failure" || true
       case "$CAPACITY_RESCUE_OUTCOME" in
@@ -1470,6 +1490,17 @@ EOF
       esac
     fi
     if [ -n "$capacity_failure" ]; then
+      if [ "$capacity_failure" = codex-model-capacity ]; then
+        if model_capacity_append_blocked "$task" \
+          "selected Codex model is at capacity; choose a different model or retry after capacity recovers"; then
+          reason="signal: $STATE/$task.status (Codex model capacity requires a model change; account rotation was not attempted)"
+          fm_wake_append signal "$task.status" "$reason" || exit 1
+          mark_surfaced "$STATE/$task.status"
+          wake "$reason"
+        fi
+        triage_log "Codex model capacity remains surfaced: $task"
+        continue
+      fi
       capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$capacity_failure" || true
       case "$CAPACITY_RESCUE_OUTCOME" in
         rescued)
@@ -1492,13 +1523,6 @@ EOF
           wake "$reason"
           ;;
       esac
-    fi
-    h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
-    window_busy=0
-    if window_is_busy "$w" "$tail40"; then
-      window_busy=1
-      mark_brief_processing_started "$task" || true
     fi
     if [ "$window_busy" != 1 ]; then
       allow_directory_trust=0

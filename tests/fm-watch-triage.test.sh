@@ -213,7 +213,7 @@ write_capacity_rescue_meta() {  # <meta> <window> <account-home> [attempts]
   local meta=$1 window=$2 account_home=$3 attempts=${4:-}
   fm_write_meta "$meta" \
     "window=$window" \
-    "harness=codex" \
+    "harness=claude" \
     "kind=ship" \
     "account_home=$account_home" \
     "generation_id=spawn:test-generation"
@@ -228,7 +228,7 @@ set -u
 printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${FM_CAPACITY_RESCUE_RECOVERY:-}" >> "$FM_FAKE_CAPACITY_SPAWN_LOG"
 rm -f "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}"
 if [ "${FM_FAKE_CAPACITY_SPAWN_RESULT:-success}" = no-capacity ]; then
-  echo "CAPACITY_UNAVAILABLE: no unused Codex account has a freshly readable positive usage window" >&2
+  echo "CAPACITY_UNAVAILABLE: no unused Claude account has a freshly readable positive usage window" >&2
   exit 1
 fi
 tmp=$(mktemp "${FM_FAKE_CAPACITY_META}.replacement.XXXXXX") || exit 1
@@ -243,7 +243,7 @@ test_capacity_rescue_records_attempt_and_changes_account() {
   local dir state meta fake_spawn old_account new_account
   dir=$(make_case capacity-rescue-success); state="$dir/state"
   meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
-  old_account="$dir/accounts/codex/1"; new_account="$dir/accounts/codex/2"
+  old_account="$dir/accounts/claude/1"; new_account="$dir/accounts/claude/2"
   mkdir -p "$old_account" "$new_account"
   write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account"
   make_capacity_spawn_fake "$fake_spawn"
@@ -261,7 +261,7 @@ test_capacity_rescue_records_attempt_and_changes_account() {
     . "$WATCH"
     fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
     fm_backend_target_state() { printf 'absent'; }
-    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    capacity_rescue_task "sess:fm-task" task claude claude-session-limit
     [ "$CAPACITY_RESCUE_OUTCOME" = rescued ] \
       || fail "successful capacity handoff did not report rescued: $CAPACITY_RESCUE_OUTCOME"
   )
@@ -272,7 +272,7 @@ test_capacity_rescue_records_attempt_and_changes_account() {
     "capacity handoff did not reuse guarded direct-account recovery mode"
   assert_grep 'capacity_rescue_attempts=1' "$meta" \
     "successful capacity handoff did not record its bounded attempt count"
-  grep -E "^capacity_rescue_attempt_1=.*\\|harness=codex\\|account=$old_account\\|failure=codex-model-capacity$" "$meta" >/dev/null \
+  grep -E "^capacity_rescue_attempt_1=.*\\|harness=claude\\|account=$old_account\\|failure=claude-session-limit$" "$meta" >/dev/null \
     || fail "successful capacity handoff did not record an auditable attempt"
   assert_grep "capacity_rescue_exhausted_account=$old_account" "$meta" \
     "successful capacity handoff did not remember the exhausted account"
@@ -289,7 +289,7 @@ test_capacity_rescue_no_capacity_stops_once() {
   local dir state meta fake_spawn old_account
   dir=$(make_case capacity-rescue-empty); state="$dir/state"
   meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
-  old_account="$dir/accounts/codex/1"
+  old_account="$dir/accounts/claude/1"
   mkdir -p "$old_account"
   write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account"
   make_capacity_spawn_fake "$fake_spawn"
@@ -300,7 +300,7 @@ test_capacity_rescue_no_capacity_stops_once() {
     export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
     export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
     export FM_FAKE_CAPACITY_META="$meta"
-    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/claude/2"
     export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
     export FM_FAKE_CAPACITY_SPAWN_RESULT=no-capacity
     export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
@@ -308,12 +308,12 @@ test_capacity_rescue_no_capacity_stops_once() {
     . "$WATCH"
     fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
     fm_backend_target_state() { printf 'absent'; }
-    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    capacity_rescue_task "sess:fm-task" task claude claude-session-limit
     [ "$CAPACITY_RESCUE_OUTCOME" = blocked ] \
       || fail "no-capacity handoff did not stop blocked: $CAPACITY_RESCUE_OUTCOME"
     [ "$CAPACITY_RESCUE_REASON" = no-capacity ] \
       || fail "no-capacity handoff reported the wrong reason: $CAPACITY_RESCUE_REASON"
-    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    capacity_rescue_task "sess:fm-task" task claude claude-session-limit
     [ "$CAPACITY_RESCUE_OUTCOME" = already-stopped ] \
       || fail "stopped no-capacity task tried to rescue again: $CAPACITY_RESCUE_OUTCOME"
   )
@@ -337,10 +337,10 @@ test_capacity_rescue_attempt_cap_stops_without_spawn() {
   local dir state meta fake_spawn old_account
   dir=$(make_case capacity-rescue-cap); state="$dir/state"
   meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
-  old_account="$dir/accounts/codex/1"
+  old_account="$dir/accounts/claude/1"
   mkdir -p "$old_account"
   write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account" 1
-  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=codex|account=%s|failure=codex-model-capacity\n' \
+  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=claude|account=%s|failure=claude-session-limit\n' \
     "$old_account" >> "$meta"
   printf 'capacity_rescue_result_1=rescued|account=%s\n' "$old_account" >> "$meta"
   make_capacity_spawn_fake "$fake_spawn"
@@ -352,14 +352,14 @@ test_capacity_rescue_attempt_cap_stops_without_spawn() {
     export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
     export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
     export FM_FAKE_CAPACITY_META="$meta"
-    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/claude/2"
     export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
     export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
     # shellcheck disable=SC1090
     . "$WATCH"
     fm_backend_kill() { printf '%s\n' "$*" >> "$FM_FAKE_CAPACITY_KILL_LOG"; }
     fm_backend_target_state() { printf 'absent'; }
-    capacity_rescue_task "sess:fm-task" task codex codex-model-capacity
+    capacity_rescue_task "sess:fm-task" task claude claude-session-limit
     [ "$CAPACITY_RESCUE_OUTCOME" = blocked ] \
       || fail "attempt-capped task did not stop blocked: $CAPACITY_RESCUE_OUTCOME"
     [ "$CAPACITY_RESCUE_REASON" = max-attempts ] \
@@ -379,10 +379,10 @@ test_capacity_rescue_interrupted_attempt_never_respawns() {
   local dir state meta fake_spawn old_account first second
   dir=$(make_case capacity-rescue-interrupted); state="$dir/state"
   meta="$state/task.meta"; fake_spawn="$dir/fake-capacity-spawn"
-  old_account="$dir/accounts/codex/1"
+  old_account="$dir/accounts/claude/1"
   mkdir -p "$old_account"
   write_capacity_rescue_meta "$meta" "sess:fm-task" "$old_account" 1
-  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=codex|account=%s|failure=codex-model-capacity\n' \
+  printf 'capacity_rescue_attempt_1=2026-07-25T00:00:00Z|harness=claude|account=%s|failure=claude-session-limit\n' \
     "$old_account" >> "$meta"
   make_capacity_spawn_fake "$fake_spawn"
 
@@ -392,7 +392,7 @@ test_capacity_rescue_interrupted_attempt_never_respawns() {
     export FM_CAPACITY_RESCUE_TEST_LAB=firstmate-capacity-rescue-test-lab-v1
     export FM_CAPACITY_RESCUE_SPAWN_BIN="$fake_spawn"
     export FM_FAKE_CAPACITY_META="$meta"
-    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/codex/2"
+    export FM_FAKE_CAPACITY_NEW_ACCOUNT="$dir/accounts/claude/2"
     export FM_FAKE_CAPACITY_SPAWN_LOG="$dir/spawn.log"
     export FM_FAKE_CAPACITY_KILL_LOG="$dir/kill.log"
     # shellcheck disable=SC1090
@@ -466,6 +466,54 @@ test_claude_credentials_stop_without_consuming_rescue_attempt() {
   assert_grep 'capacity_rescue_stopped=credentials' "$meta" \
     "Claude credential failure did not persist its no-retry stop"
   pass "Claude credential failure blocks once without rotation or rescue accounting"
+}
+
+test_codex_model_capacity_surfaces_without_account_rescue() {
+  local dir state fakebin out capture_file statusf window pid
+  dir=$(make_case codex-model-capacity); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/task.status"
+  window="test:fm-task"
+  cat > "$capture_file" <<'EOF'
+⚠ Selected model is at capacity. Please try a different model.
+
+› Explain this codebase
+  gpt-5.6-sol xhigh · /tmp/project
+EOF
+  printf 'window=%s\nkind=ship\nharness=codex\naccount_home=%s\n' \
+    "$window" "$dir/accounts/codex/1" > "$state/task.meta"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "idle Codex model capacity did not surface"; }
+  assert_grep 'blocked [key=model-capacity]:' "$statusf" \
+    "Codex model capacity did not emit a model-scoped blocked status"
+  ! grep -q '^capacity_rescue_' "$state/task.meta" \
+    || fail "Codex model capacity entered account rescue metadata"
+  grep -F 'account rotation was not attempted' "$out" >/dev/null \
+    || fail "Codex model capacity did not explicitly preserve the account"
+
+  dir=$(make_case codex-stale-capacity-busy); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-task"
+  cat > "$capture_file" <<'EOF'
+⚠ Selected model is at capacity. Please try a different model.
+• Working (2s • esc to interrupt)
+EOF
+  printf 'window=%s\nkind=ship\nharness=codex\naccount_home=%s\n' \
+    "$window" "$dir/accounts/codex/1" > "$state/task.meta"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PERMISSION_STALL_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_live "$pid" 20 \
+    || { reap "$pid"; fail "stale capacity chrome terminated a currently busy Codex endpoint"; }
+  [ ! -s "$state/.wake-queue" ] \
+    || { reap "$pid"; fail "stale capacity chrome on a busy endpoint enqueued a wake"; }
+  ! grep -q '^capacity_rescue_' "$state/task.meta" \
+    || { reap "$pid"; fail "stale capacity chrome on a busy endpoint entered rescue"; }
+  reap "$pid"
+  pass "Codex model capacity surfaces once without account rescue, and stale busy chrome is ignored"
 }
 
 test_managed_tmux_window_id_reverse_mapping() {
@@ -1822,6 +1870,7 @@ if [ "${FM_TEST_FOCUSED:-}" = capacity-rescue ]; then
   test_capacity_rescue_attempt_cap_stops_without_spawn
   test_capacity_rescue_interrupted_attempt_never_respawns
   test_claude_credentials_stop_without_consuming_rescue_attempt
+  test_codex_model_capacity_surfaces_without_account_rescue
   exit 0
 fi
 
@@ -1835,6 +1884,7 @@ test_capacity_rescue_no_capacity_stops_once
 test_capacity_rescue_attempt_cap_stops_without_spawn
 test_capacity_rescue_interrupted_attempt_never_respawns
 test_claude_credentials_stop_without_consuming_rescue_attempt
+test_codex_model_capacity_surfaces_without_account_rescue
 test_managed_tmux_window_id_reverse_mapping
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier

@@ -2226,7 +2226,7 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
   assert_contains "$out" "$id" "capability refusal omitted the offending secondmate"
-  assert_contains "$out" "dirty working tree" "capability refusal did not stop at the freshness gate"
+  assert_contains "$out" "lacks Agent Fleet routing support" "capability refusal omitted the missing capability"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }

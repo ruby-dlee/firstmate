@@ -55,9 +55,10 @@ FM_SUPERVISOR_TARGET=missing-pane \
 "$START" > "$STATE_DIR/daemon.out" 2> "$STATE_DIR/daemon.err" &
 DAEMON_PID=$!
 
-for _ in $(seq 1 60); do
+start_deadline=$(( $(date +%s) + 30 ))
+while [ "$(date +%s)" -lt "$start_deadline" ]; do
   [ -f "$STATE_DIR/.supervise-daemon.pid" ] && break
-  sleep 0.1
+  sleep 0.2
 done
 [ -f "$STATE_DIR/.supervise-daemon.pid" ] || {
   sed 's/^/  /' "$STATE_DIR/daemon.err" >&2
@@ -74,9 +75,10 @@ fi
 pass "routine wake stays in bash and keeps the native task parked"
 
 printf 'needs-decision: choose the safe rollout\n' > "$STATE_DIR/crew.status"
-for _ in $(seq 1 120); do
+completion_deadline=$(( $(date +%s) + 60 ))
+while [ "$(date +%s)" -lt "$completion_deadline" ]; do
   kill -0 "$DAEMON_PID" 2>/dev/null || break
-  sleep 0.1
+  sleep 0.2
 done
 if kill -0 "$DAEMON_PID" 2>/dev/null; then
   sed 's/^/  /' "$STATE_DIR/daemon.err" >&2

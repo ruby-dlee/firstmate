@@ -85,9 +85,11 @@ mkdir -p "$PRIMARY_HOME/state" "$PRIMARY_HOME/data/cm1" "$PRIMARY_HOME/config"
 printf 'trivial e2e primary crewmate brief: nothing to do.\n' > "$PRIMARY_HOME/data/cm1/brief.md"
 
 SM_HOME="$TMP_ROOT/secondmate-home"
-git clone -q "$ROOT" "$SM_HOME"
-git -C "$SM_HOME" fetch -q "$ROOT" refs/remotes/origin/main:refs/remotes/origin/main
-git -C "$SM_HOME" checkout -q -B main 3e597f4f3c093d7210a486c7688fb1f41adc14bd
+SM_ORIGIN=$(git -C "$ROOT" remote get-url origin)
+git init -q "$SM_HOME"
+git -C "$SM_HOME" remote add origin "$SM_ORIGIN"
+git -C "$SM_HOME" fetch -q origin main
+git -C "$SM_HOME" checkout -q -B main FETCH_HEAD
 git -C "$SM_HOME" remote set-head origin main
 mkdir -p "$SM_HOME/state" "$SM_HOME/data/cm2" "$SM_HOME/config" "$SM_HOME/projects" "$SM_HOME/bin"
 printf 'e2esm1\n' > "$SM_HOME/.fm-secondmate-home"

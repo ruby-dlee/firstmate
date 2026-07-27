@@ -342,12 +342,15 @@ test_scenario_a() {
   fm_backend_herdr_send_key "$SUPERVISOR_TARGET" Enter
   sleep 0.5
 
-  sleep 8
+  local deadline=$(( $(date +%s) + 30 ))
+  while ! grep -q 'Supervisor escalate' "$LOG_FILE"; do
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "Scenario A: timed out waiting for the deferred digest submission"
+    sleep 1
+  done
 
   grep -q 'human draft text' "$LOG_FILE" \
     || fail "Scenario A: human text not in log after submit"
-  grep -q 'Supervisor escalate' "$LOG_FILE" \
-    || fail "Scenario A: digest not injected after the pane went idle"
   if grep -q 'human draft text.*Supervisor escalate' "$LOG_FILE" || \
      grep -q 'Supervisor escalate.*human draft text' "$LOG_FILE"; then
     fail "Scenario A: human text and digest merged into one line (after idle)"
@@ -383,7 +386,13 @@ test_scenario_b() {
 
   echo "done: PR https://example.test/pr/200" > "$STATE_DIR/fake-c1.status"
 
-  sleep 10
+  local deadline=$(( $(date +%s) + 30 ))
+  while [ "$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)" -lt 1 ]; do
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "Scenario B: timed out waiting for the retried digest submission"
+    sleep 1
+  done
+  sleep 2
 
   local digest_count
   digest_count=$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)
@@ -419,7 +428,13 @@ test_scenario_c() {
   start_daemon
 
   echo "done: PR https://example.test/pr/300" > "$STATE_DIR/fake-c1.status"
-  sleep 8
+  local deadline=$(( $(date +%s) + 30 ))
+  while [ "$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)" -lt 1 ]; do
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "Scenario C: timed out waiting for the digest submission"
+    sleep 1
+  done
+  sleep 2
 
   local digest_count
   digest_count=$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)

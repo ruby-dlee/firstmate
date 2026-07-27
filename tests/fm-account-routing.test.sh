@@ -398,18 +398,24 @@ SH
 }
 
 make_case() {
-  local name=$1 harness=$2 case_dir home proj wt fakebin
+  local name=$1 harness=$2 case_dir home proj wt fakebin first_id
   shift 2
+  first_id=${1:-}
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$case_dir/treehouse-pool/1/wt"
   fakebin=$(make_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$case_dir/treehouse-pools"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" \
+    "$case_dir/treehouse-pool/1" "$case_dir/treehouse-pools"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   git -C "$wt" checkout --quiet --detach
   fm_git_add_origin "$proj" "$case_dir/origin.git"
+  if [ -n "$first_id" ]; then
+    printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"firstmate-%s"}]}\n' \
+      "$wt" "$first_id" > "$case_dir/treehouse-pool/treehouse-state.json"
+  fi
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
@@ -436,11 +442,12 @@ EOF
   : > "$ORCA_LOG"
   : > "$LAUNCH_LOG"
   : > "$NATIVE_LAUNCH_LOG"
+  FM_TEST_SPAWN_ROOT=
 }
 
 run_spawn() {
   local id=$1
-  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
+  FM_ROOT_OVERRIDE="${FM_TEST_SPAWN_ROOT:-${FM_TEST_ROOT_OVERRIDE:-}}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_TEST_PANE_PATH:-$WT_DIR}" FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
@@ -477,6 +484,7 @@ run_teardown() {
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
+    FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
@@ -2062,21 +2070,29 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
 }
 
 make_seeded_secondmate_home() {
-  local home=$1 id=$2 home_abs primary
+  local home=$1 id=$2 capability=${3:-capable} primary home_abs
   primary="$CASE_DIR/primary-home"
-  git clone --quiet --no-hardlinks "$ROOT" "$primary"
+  git clone --quiet --no-local "$ROOT" "$primary" \
+    || fail "could not create inspectable primary fixture for $id"
   git -C "$primary" branch --force main HEAD
   git -C "$primary" checkout --quiet main
   git -C "$primary" remote remove origin
-  git clone --quiet --no-hardlinks "$primary" "$home"
-  git -C "$home" checkout --quiet --detach "$(git -C "$primary" rev-parse main)"
-  FM_TEST_ROOT_OVERRIDE=$primary
+  if [ "$capability" = incapable ]; then
+    rm -f "$primary/bin/fm-account-routing-lib.sh"
+    git -C "$primary" -c user.name=Fixture -c user.email=fixture.invalid \
+      commit --quiet -am "Remove account routing capability"
+  fi
+  git clone --quiet --no-local --branch main "$primary" "$home" \
+    || fail "could not create inspectable secondmate fixture for $id"
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
-  home_abs=$(cd "$home" && pwd -P)
+  printf '/.fm-secondmate-home\n' >> "$home/.git/info/exclude"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
-  printf -- '- %s - account routing fixture (home: %s; scope: account routing; projects: ; added 2026-07-25)\n' \
+  home_abs=$(cd "$home" && pwd -P)
+  printf -- '- %s - account routing fixture (home: %s; scope: account routing fixture; projects: ; added 2026-07-27)\n' \
     "$id" "$home_abs" > "$HOME_DIR/data/secondmates.md"
+  FM_TEST_SPAWN_ROOT=$primary
+  FM_TEST_ROOT_OVERRIDE=$primary
 }
 
 test_secondmate_pool_is_nonactivating_and_noninherited() {
@@ -2163,9 +2179,8 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   rec=$(make_case secondmate-incapable-refuse claude)
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
-  rm -f "$sm/bin/fm-account-routing-lib.sh"
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
@@ -2210,9 +2225,8 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   rec=$(make_case secondmate-off-incapable claude)
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
-  rm -f "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "off secondmate launched from a dirty, capability-drifted home"

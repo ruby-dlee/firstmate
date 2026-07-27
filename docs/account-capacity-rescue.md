@@ -1,13 +1,14 @@
 # Automatic account-capacity rescue
 
-Firstmate automatically hands a direct-account ship or scout task to a fresh agent when verified provider TUI chrome shows that its current account has exhausted capacity.
+Firstmate automatically hands a direct-account ship or scout task to a fresh agent only when verified provider TUI chrome shows empirically account-scoped exhaustion.
 The handoff deliberately replays the task brief in the recorded worktree through `bin/fm-spawn.sh <id> --recover-direct-account`.
 It does not migrate the exhausted provider session.
+Codex's verified model-capacity warning is model-scoped instead: the watcher surfaces one keyed blocked status without removing the endpoint, rotating accounts, or writing account-rescue metadata.
 
 ## Empirical detection signatures
 
-The classifier matches only a bounded final pane tail from the harness recorded in task metadata.
-It never treats generic API errors, task prose, documentation, or a quoted sentence without the harness chrome as account exhaustion.
+The classifier matches only a bounded final pane tail from the harness recorded in task metadata while the current endpoint is idle.
+It never treats generic API errors, task prose, documentation, a quoted sentence without the harness chrome, or stale chrome above a current busy indicator as an actionable provider failure.
 
 The following signatures came from real local pane captures recovered from harness transcript archives on 2026-07-25.
 
@@ -53,6 +54,8 @@ claude --version
 Codex requires the warning glyph and full anchored sentence.
 Claude requires either the result glyph and reset sentence or every line of the complete choice dialog.
 An unknown harness never inherits another harness's signatures.
+The Codex token denotes model capacity and surfaces once for a model change or later retry.
+The verified Claude session-limit shapes denote account-scoped exhaustion and are the only current capacity tokens that enter automatic account rescue.
 
 The watcher separately recognizes Claude's anchored `Not logged in - Please run /login` TUI line as a credential failure.
 That guard does not rotate accounts, remove the endpoint, consume an attempt, or mark the current account exhausted.
@@ -61,10 +64,10 @@ Ordinary prose that mentions the login message does not match, and Codex does no
 
 ## Rescue transaction
 
-`bin/fm-watch.sh` runs the capacity classifier immediately after each bounded pane capture, before ordinary busy or stale classification.
+`bin/fm-watch.sh` establishes the endpoint's current busy state after each bounded pane capture and runs provider-failure classifiers only when the endpoint is idle.
 Secondmates and legacy managed generations are outside this path because automatic direct-account recovery is defined only for recorded ship or scout tasks with `account_home=` and a direct worktree identity.
 
-On a match, the watcher:
+On an empirically account-scoped match, the watcher:
 
 1. Acquires the task's existing account-lifecycle lock and revalidates that the pane still belongs to the recorded task generation.
 2. Atomically records the next attempt and exhausted account in task metadata before removing anything.
@@ -74,8 +77,8 @@ On a match, the watcher:
 
 The spawn path preserves the task brief, project, worktree, exact Git identity, harness, model, effort, delivery mode, report requirement, and generation identity.
 The capacity-rescue marker makes direct selection exclude the current account and every account previously exhausted by that task.
-Codex selection also requires a fresh positive general usage score.
-Claude selection cannot read config-directory-specific Keychain quota non-interactively, so it advances deterministically through unused account directories.
+Claude selection cannot read config-directory-specific Keychain quota non-interactively, so the current account-scoped rescue path advances deterministically through unused account directories.
+Codex account selection still requires a fresh positive general usage score for ordinary direct launches, but the model-capacity warning never enters this rescue transaction.
 
 ## Bounded stop and audit fields
 
@@ -101,6 +104,7 @@ The selector emits the stable internal prefix `CAPACITY_UNAVAILABLE:` when no un
 That result, the attempt cap, an unprovable endpoint removal, malformed recovery metadata, a same-account replacement, and a generic recovery failure all set `capacity_rescue_stopped=`, append one keyed `blocked [key=capacity-rescue]:` status, and stop automatic retries.
 The Claude credential guard reaches the same durable single-blocked stop without starting a rescue transaction.
 Later polls recognize the durable stop marker and absorb the unchanged provider chrome without another endpoint removal, account scan, spawn, or blocked status.
+Codex model capacity uses the separate `blocked [key=model-capacity]:` status and does not create any of these rescue audit or stop fields.
 
 The lifecycle lock serializes capacity rescue with spawn and teardown.
 There is no retry timer and no fleet-wide retry loop.

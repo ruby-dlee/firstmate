@@ -180,9 +180,10 @@ This means an account re-authenticated immediately before spawn is eligible on t
 Claude's config-directory-specific macOS Keychain credential is not currently distinguishable through non-interactive quota reads.
 Claude therefore treats missing quota as unreadable rather than unhealthy, chooses the first real profile directory in stable sort order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
 
-For a direct-account ship or scout that later reaches verified provider capacity, the watcher reuses `--recover-direct-account` and excludes the current account plus every account that task previously exhausted.
-Codex alternatives must have a fresh positive general usage score, while Claude advances through unused directories because its per-directory quota remains unreadable.
-The handoff is attempt-capped and stops durably instead of retrying when no unused eligible account remains.
+For a direct-account ship or scout that later reaches verified account-scoped capacity, the watcher reuses `--recover-direct-account` and excludes the current account plus every account that task previously exhausted.
+The current account-scoped classifier covers Claude session exhaustion, so rescue advances through unused Claude directories because per-directory quota remains unreadable.
+Codex model capacity instead surfaces once without endpoint removal, account rotation, or account-rescue metadata.
+Account handoff is attempt-capped and stops durably instead of retrying when no unused eligible account remains.
 [Automatic account-capacity rescue](account-capacity-rescue.md) owns the signatures, audit metadata, default bound, and failure transaction.
 
 Account routing remains default-off.

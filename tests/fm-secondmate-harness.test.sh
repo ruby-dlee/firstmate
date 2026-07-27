@@ -41,7 +41,8 @@ BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-harness)
 PRIMARY_ROOT="$TMP_ROOT/primary"
-git clone -q --branch main --single-branch "$ROOT" "$PRIMARY_ROOT"
+git clone -q --no-checkout "$ROOT" "$PRIMARY_ROOT"
+git -C "$PRIMARY_ROOT" checkout -q -B main "$(git -C "$ROOT" rev-parse HEAD)"
 git -C "$PRIMARY_ROOT" remote remove origin
 export FM_BACKEND=tmux
 

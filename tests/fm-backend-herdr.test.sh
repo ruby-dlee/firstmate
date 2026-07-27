@@ -3444,10 +3444,24 @@ test_dispatch_composer_state_routes_by_backend() {
 }
 
 test_scripts_route_explicit_target_through_meta_backend() {
-  local dir state log resp fb neutral out
+  local dir state log resp fb neutral out lock_root owner_pid
   dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
   neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  lock_root="$dir/locks"
+  /bin/sleep 30 &
+  owner_pid=$!
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 OWNER_PID="$owner_pid" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      key=$(fm_backend_herdr_server_lock_key default) || exit 1
+      certificate=$(fm_backend_herdr_server_legacy_env_certificate_path default) || exit 1
+      start=$(fm_backend_herdr_process_start "$OWNER_PID") || exit 1
+      printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+        "$key" "$OWNER_PID" "$start" > "$certificate" || exit 1
+      chmod 600 "$certificate"
+    ' "$ROOT" || { kill "$owner_pid" 2>/dev/null || true; fail "could not establish adapter ownership for routed script fixture"; }
   fm_write_meta "$state/herdr-stale.meta" \
     "window=default:w1:p2" "backend=herdr" \
     "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
@@ -3467,19 +3481,24 @@ SH
 
   out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     "$ROOT/bin/fm-peek.sh" default:w1:p2 5 2>/dev/null )
-  [ "$out" = "captured herdr pane" ] || fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"
+  [ "$out" = "captured herdr pane" ] \
+    || { kill "$owner_pid" 2>/dev/null || true; fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"; }
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''read'$'\x1f''w1:p2' \
     "fm-peek did not route the explicit stale target through herdr capture"
 
   : > "$log"
   PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     "$ROOT/bin/fm-send.sh" default:w1:p2 --key Escape >/dev/null 2>&1
   expect_code 0 $? "fm-send --key should route an explicit metadata-matched target through herdr"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''escape' \
     "fm-send did not route the explicit stale target through herdr send-key"
 
+  kill "$owner_pid" 2>/dev/null || true
+  wait "$owner_pid" >/dev/null 2>&1 || true
   pass "fm-peek/fm-send: explicit stale targets matching metadata use the recorded backend"
 }
 

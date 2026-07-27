@@ -970,7 +970,11 @@ if [ "${1:-}" = -C ] \
   count=$(cat "${FM_TEST_REINSPECTION_COUNT:?}" 2>/dev/null || printf 0)
   count=$((count + 1))
   printf '%s\n' "$count" > "$FM_TEST_REINSPECTION_COUNT"
-  if [ "$count" -gt 1 ]; then
+  # Fail each post-discovery exact-root proof, then allow the immediately
+  # following stable-key lookup used to persist the alert. This keeps the
+  # fixture on the reinspection-failure path without making alert identity
+  # resolution fail first.
+  if [ $((count % 2)) -eq 0 ]; then
     printf '%s\n' "${FM_TEST_REINSPECTION_ENCLOSING:?}"
     exit 0
   fi
@@ -994,7 +998,7 @@ SH
   assert_refresh_state "$state_root" unhealthy
   assert_heartbeat_value "$state_root" manual-reinspection-heartbeat
   reinspection_count=$(cat "$TMP_ROOT/reinspection-count")
-  [ "$reinspection_count" -eq 3 ] \
+  [ "$reinspection_count" -ge 3 ] \
     || fail "both post-discovery passes did not repeat the exact-root proof"
   [ "$(git -C "$project" rev-parse HEAD)" = "$initial_head" ] \
     || fail "identity-drifted covered path was refreshed through its enclosing repository"

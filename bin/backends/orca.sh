@@ -153,7 +153,7 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
   wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path 2>/dev/null || true)
   proof=unproven
   [ -z "$terminal" ] || proof=recorded
-  printf '%s\t%s\t%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal" "$proof" "$repo_id"
+  printf '%s\t%s\t%s\t%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal" "$proof" "$repo_id" "$name"
   if [ "$status" -ne 0 ] || [ -z "$wt_id" ] || [ -z "$wt_path" ]; then
     echo "error: orca worktree create returned incomplete or unsuccessful authority for $name" >&2
     return 2

@@ -3353,6 +3353,7 @@ EOF
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} expected_source=${4:-$FM_ROOT} expected_registry=${5:-} expected_project
   local abs_home_path metadata_home_root marker_id source_authority=${7:-1}
+  local project_authority=${8:-1}
   expected_project=${6:-$home}
   [ -n "$home" ] && [ -e "$home" ] || {
     echo "REFUSED: missing $label removal target ${home:-<empty>}" >&2
@@ -3390,7 +3391,7 @@ validate_firstmate_home_for_removal() {
     fm_treehouse_require_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
   validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
-  if [ -n "$expected_id" ]; then
+  if [ -n "$expected_id" ] && [ "$project_authority" -eq 1 ]; then
     validate_secondmate_project_clones \
       "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
   fi
@@ -3855,7 +3856,7 @@ if [ "$KIND" = secondmate ]; then
     exit 1
   }
   validate_firstmate_home_for_removal \
-    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 \
+    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 0 \
     >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1

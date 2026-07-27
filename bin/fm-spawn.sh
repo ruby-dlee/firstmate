@@ -1062,9 +1062,10 @@ parse_orca_worktree_result() {
   ORCA_TERMINAL_PROOF=${rest%%$'\t'*}
   [ "$rest" != "$ORCA_TERMINAL_PROOF" ] || return 1
   rest=${rest#*$'\t'}
-  ORCA_REPO_ID=$rest
-  case "$ORCA_REPO_ID" in *$'\t'*) return 1 ;; esac
-  ORCA_PROVIDER_TASK=
+  ORCA_REPO_ID=${rest%%$'\t'*}
+  [ "$rest" != "$ORCA_REPO_ID" ] || return 1
+  ORCA_PROVIDER_TASK=${rest#*$'\t'}
+  case "$ORCA_PROVIDER_TASK" in *$'\t'*) return 1 ;; esac
 }
 
 persist_orca_cleanup_quarantine() {

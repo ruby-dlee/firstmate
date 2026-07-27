@@ -29,19 +29,26 @@ SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
-if [ "${1:-}" = get ]; then
-  lease_holder=
-  previous=
-  for argument in "$@"; do
-    [ "$previous" != --lease-holder ] || lease_holder=$argument
-    previous=$argument
-  done
-  git -C "${FM_FAKE_TREEHOUSE_PATH:?}" checkout --quiet --detach "$(git rev-parse HEAD)"
-  pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
-  printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"%s","destroying":false}]}\n' \
-    "$FM_FAKE_TREEHOUSE_PATH" "$lease_holder" > "$pool/treehouse-state.json"
-  printf '%s\n' "$FM_FAKE_TREEHOUSE_PATH"
-fi
+case "${1:-}" in
+  get)
+    lease_holder=
+    previous=
+    for argument in "$@"; do
+      [ "$previous" != --lease-holder ] || lease_holder=$argument
+      previous=$argument
+    done
+    git -C "${FM_FAKE_TREEHOUSE_PATH:?}" checkout --quiet --detach "$(git rev-parse HEAD)"
+    pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
+    printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"%s","destroying":false}]}\n' \
+      "$FM_FAKE_TREEHOUSE_PATH" "$lease_holder" > "$pool/treehouse-state.json"
+    printf '%s\n' "$FM_FAKE_TREEHOUSE_PATH"
+    ;;
+  return)
+    pool=$(dirname "$(dirname "${FM_FAKE_TREEHOUSE_PATH:?}")")
+    git -C "$FM_FAKE_TREEHOUSE_PATH" worktree remove --force "$FM_FAKE_TREEHOUSE_PATH"
+    printf '{"worktrees":[]}\n' > "$pool/treehouse-state.json"
+    ;;
+esac
 exit 0
 SH
   chmod +x "$fakebin/treehouse"

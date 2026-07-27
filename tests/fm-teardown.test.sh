@@ -122,6 +122,14 @@ with open(state, "w", encoding="utf-8") as stream:
 PY
 }
 
+write_treehouse_without_worktree() {
+  local worktree=$1 slot pool state
+  slot=$(cd "$(dirname "$worktree")" && pwd -P)
+  pool=$(cd "$(dirname "$slot")" && pwd -P)
+  state="$pool/treehouse-state.json"
+  printf '%s\n' '{"worktrees":[]}' > "$state"
+}
+
 write_treehouse_duplicate_mixed_lease() {
   local worktree=$1 slot pool state
   slot=$(cd "$(dirname "$worktree")" && pwd -P)
@@ -239,6 +247,7 @@ make_case() {
   echo "secondmate parent was not quiesced before child cleanup: $FM_EXPECT_PARENT_QUIESCED" >&2
   exit 98
 }
+[ -z "${FM_FAKE_COMPLETE_RETURN:-}" ] || "$REAL_GIT_FOR_TEST" -C "${!#}" checkout --quiet --detach
 [ -z "${FM_TEARDOWN_ORDER_LOG:-}" ] || printf 'treehouse-return %s\n' "$*" >> "$FM_TEARDOWN_ORDER_LOG"
 exit 0
 SH
@@ -4385,8 +4394,9 @@ test_secondmate_registry_updates_are_locked_and_literal() {
 }
 
 test_already_returned_worktree_with_landed_work_allows() {
-  local case_dir rc
+  local case_dir order_log rc
   case_dir=$(make_case already-returned-landed)
+  order_log="$case_dir/teardown-order.log"
   write_meta "$case_dir" no-mistakes ship
   wt_commit "$case_dir" "fix the thing"
   git -C "$case_dir/wt" push -q origin fm/task-x1
@@ -4394,13 +4404,16 @@ test_already_returned_worktree_with_landed_work_allows() {
   write_treehouse_unleased "$case_dir/wt"
 
   set +e
-  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  FM_FAKE_COMPLETE_RETURN=1 FM_TEARDOWN_ORDER_LOG="$order_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
   [ "$rc" -eq 0 ] || fail "already-returned-landed: teardown should succeed when work is on a remote: $(cat "$case_dir/stderr")"
   assert_grep 'lease already cleared' "$case_dir/stderr" \
     "already-returned-landed: teardown did not log the cleared-lease detection"
+  assert_grep 'treehouse-return return --force' "$order_log" \
+    "already-returned-landed: teardown did not complete the Treehouse return"
   pass "already-returned worktree with landed work tears down cleanly"
 }
 
@@ -4467,6 +4480,25 @@ test_duplicate_treehouse_entries_refuse_cleared_lease() {
   pass "duplicate Treehouse entries fail closed"
 }
 
+test_missing_treehouse_entry_refuses_cleared_lease() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-missing)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  write_treehouse_without_worktree "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-missing: missing lease entry was accepted"
+  assert_present "$case_dir/wt" "already-returned-missing: teardown removed the unproven worktree"
+  assert_present "$case_dir/state/task-x1.meta" "already-returned-missing: teardown removed task metadata"
+  pass "missing Treehouse entry fails closed"
+}
+
 test_fd_leak_under_low_ulimit() {
   local case_dir rc dir_count i
   case_dir=$(make_case fd-leak-ulimit)
@@ -4502,6 +4534,7 @@ if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_already_returned_worktree_with_unlanded_work_refuses
   test_already_returned_worktree_cleanup_honors_checkout_lock
   test_duplicate_treehouse_entries_refuse_cleared_lease
+  test_missing_treehouse_entry_refuses_cleared_lease
   test_fd_leak_under_low_ulimit
   exit 0
 fi

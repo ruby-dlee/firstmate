@@ -1054,12 +1054,14 @@ try:
         if isinstance(e, dict) and isinstance(e.get("path"), str)
         and os.path.realpath(e["path"]) == expected_path
     ]
-    if not matches:
-        raise SystemExit(0)
     if len(matches) != 1:
         raise SystemExit(1)
     entry = matches[0]
     if entry.get("leased") is not False:
+        raise SystemExit(1)
+    if entry.get("lease_holder") not in ("", None):
+        raise SystemExit(1)
+    if entry.get("destroying") is True:
         raise SystemExit(1)
     raise SystemExit(0)
 except (OSError, ValueError, json.JSONDecodeError):
@@ -1359,8 +1361,19 @@ cleanup_returned_worktree() {
   remove_worktree_compatibility_artifacts "$worktree" "returned worktree"
 }
 
+cleanup_recovered_worktree() {
+  local branch=$1 worktree=$2 project=$3
+  if [ "$branch" != "HEAD" ]; then
+    git -C "$project" branch -D "$branch" >/dev/null 2>&1 || {
+      echo "error: recovered worktree task branch could not be deleted: $branch" >&2
+      return 1
+    }
+  fi
+  remove_worktree_compatibility_artifacts "$worktree" "returned worktree"
+}
+
 cleanup_already_returned_worktree_locked() {
-  local branch
+  local branch out return_status
   treehouse_lease_is_cleared "$WT" || {
     echo "error: worktree lease is no longer provably cleared; retaining $WT" >&2
     return 1
@@ -1371,7 +1384,20 @@ cleanup_already_returned_worktree_locked() {
     return 1
   }
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
-  cleanup_returned_worktree "$branch" "$WT" "$PROJ"
+  validate_removal_tree_boundaries "$WT" "worktree" || return 1
+  if out=$(fm_checkout_treehouse_return_locked "$WT" "$CHECKOUT_LOCK_ROOT" "$PROJ" 2>&1); then
+    [ -n "$out" ] && printf '%s\n' "$out"
+  else
+    return_status=$?
+    [ -n "$out" ] && printf '%s\n' "$out" >&2
+    echo "error: failed to complete the externally-started Treehouse return for $WT" >&2
+    return "$return_status"
+  fi
+  treehouse_lease_is_cleared "$WT" || {
+    echo "error: Treehouse return did not leave a provably returned pool slot; retaining task metadata" >&2
+    return 1
+  }
+  cleanup_recovered_worktree "$branch" "$WT" "$PROJ"
 }
 
 validate_worktree_teardown_safety() {

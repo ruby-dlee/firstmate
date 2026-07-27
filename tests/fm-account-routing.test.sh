@@ -5862,6 +5862,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_not_grep "lease release --task $old_task" "$AF_LOG" "teardown released the restored predecessor in the stale generation pass"
   assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
 
+  write_test_completion_report "$id"
   clear_case_logs
   write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"

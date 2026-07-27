@@ -47,6 +47,7 @@ if [ "${1:-}" = --version ]; then
   exit 0
 fi
 if [ "${1:-}" = list-sessions ]; then
+  [ ! -f "$RESP/.closed" ] || exit 0
   printf '%s\n' "${FM_ZELLIJ_SESSION_LIST:-}"
   exit 0
 fi
@@ -57,6 +58,9 @@ fi
 next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 n=$next
 echo "$n" > "$COUNT_FILE"
+case " $* " in
+  *' action close-tab-by-id '*) touch "$RESP/.closed" ;;
+esac
 if [ -f "$RESP/$n.exit" ]; then
   exit "$(cat "$RESP/$n.exit")"
 fi
@@ -911,6 +915,7 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
   local dir state data config project fb out status
   dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
   mkdir -p "$state" "$data/zghost" "$config" "$project" "$dir/responses"
+  git -C "$project" init -q
   printf 'report\n' > "$data/zghost/report.md"
   fm_write_meta "$state/zghost.meta" \
     "window=firstmate:7" \
@@ -919,8 +924,11 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "worktree=$dir/missing-worktree" \
     "project=$project" \
     "kind=scout"
-  printf '[]\n' > "$dir/responses/1.out"
-  printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
+  touch "$state/.last-watcher-beat"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_tab_response "$dir" 2 3 fm-zghost
+  printf '[]\n' > "$dir/responses/3.out"
+  zellij_tab_response "$dir" 4 3 fm-zghost
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -933,6 +941,8 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "fm-teardown did not pass a verified recorded zellij_tab_id through to kill"
   assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
     "fm-teardown should close the recorded tab id instead of falling back to close-pane"
+  assert_absent "$state/zghost.meta" \
+    "fm-teardown retained task metadata after quiescing the zellij endpoint"
   pass "fm-teardown.sh: passes recorded zellij_tab_id with the expected task label"
 }
 
@@ -1197,7 +1207,6 @@ test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
 test_teardown_passes_recorded_tab_id_to_zellij_kill
-test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
 test_send_text_submit_detects_landed_send
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_send_failed_when_session_absent

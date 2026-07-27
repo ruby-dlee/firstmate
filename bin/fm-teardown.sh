@@ -315,6 +315,7 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
     case "$state" in
       absent) return 0 ;;
       present)
+        [ "$backend" != zellij ] || return 1
         if [ -n "$probe_home" ]; then
           agent_state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
         else
@@ -1096,6 +1097,10 @@ validate_teardown_target_identity() {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1
   }
+  if [ "$KIND" = scout ] && [ "$BACKEND" != orca ] &&
+      [ ! -e "$WT" ] && [ ! -L "$WT" ]; then
+    return 0
+  fi
   worktree_root=$(exact_git_worktree_root "$WT") || {
     echo "error: teardown worktree metadata is not an exact inspectable repository root: ${WT:-<missing>}" >&2
     return 1

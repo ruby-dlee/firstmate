@@ -3556,6 +3556,7 @@ test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmat
       . "$0/bin/fm-backend.sh"
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_target_ready() { fm_backend_herdr_parse_target "$1"; }
+      fm_backend_source() { :; }
       fm_backend_composer_state herdr default:w1:p2
     ' "$ROOT" )
   [ "$out" = pending ] || fail "the pre-injection empty-box guard must still refuse real unsubmitted composer text after this change, got '$out'"

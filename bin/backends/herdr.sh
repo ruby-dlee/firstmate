@@ -2672,6 +2672,7 @@ fm_backend_herdr_server_reachable_for_readsteer() {  # <session>
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
     | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
   [ "$running" = true ] || return 1
+  fm_backend_herdr_server_certificate_required || return 0
   fm_backend_herdr_server_adapter_owned "$session"
 }
 

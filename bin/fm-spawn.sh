@@ -2793,6 +2793,7 @@ fi
 # once here so every downstream comparison uses the same physical form
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
+PROJ_ABS=$PROJ_ABS_REAL
 
 real_path_or_raw() {  # <path>
   local path=$1 real
@@ -3546,15 +3547,19 @@ spawn_send_key() {  # <target> <key>
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
   WT_REAL=$(real_path_or_raw "$WT")
-  for _ in $(seq 1 60); do
+  ENDPOINT_READY_STARTED=$(date +%s)
+  ENDPOINT_READY_TIMEOUT=60
+  while :; do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" = "$WT_REAL" ]; then
       break
     fi
+    ENDPOINT_READY_NOW=$(date +%s)
+    [ $((ENDPOINT_READY_NOW - ENDPOINT_READY_STARTED)) -lt "$ENDPOINT_READY_TIMEOUT" ] || break
     sleep 1
   done
   if [ -z "${p:-}" ] || [ "$(real_path_or_raw "$p")" != "$WT_REAL" ]; then
-    echo "error: task endpoint did not start in leased worktree $WT within 60s; inspect window $T" >&2
+    echo "error: task endpoint did not start in leased worktree $WT within ${ENDPOINT_READY_TIMEOUT}s; inspect window $T" >&2
     exit 1
   fi
 fi

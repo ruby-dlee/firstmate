@@ -927,8 +927,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
         *) printf 'unknown'; return 0 ;;
       esac
       if [ "$pane_record" = null ]; then
-        if [ -n "$expected_tab_id" ] && printf '%s\n' "$panes" | jq -e --arg tab "$expected_tab_id" \
-          'any(.[]?; .is_plugin == false and (.tab_id | tostring) == $tab)' >/dev/null 2>&1; then
+        if [ -n "$expected_tab_id" ]; then
           printf 'present'
         else
           printf 'absent'
@@ -1048,6 +1047,7 @@ fm_backend_agent_alive() {  # <backend> <target> [expected-label] [recorded-scop
   case "$backend" in
     tmux) fm_backend_tmux_agent_alive "$target" "$expected_label" "${4:-}" ;;
     herdr) fm_backend_herdr_agent_alive "$target" "$expected_label" ;;
+    zellij) fm_backend_zellij_agent_alive "$target" ;;
     *) printf 'unknown' ;;
   esac
 }

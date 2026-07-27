@@ -521,19 +521,17 @@ test_direct_sync_honors_shared_checkout_lock() {
 }
 
 test_direct_sync_timeout_terminates_descendants() {
-  local home clone fakebin real_git out status parent_pid child_pid common key lock_root lock
+  local home clone fakebin real_git out status parent_pid child_pid lock_root lock
   home=$(new_home)
   clone=$(build_pair "$home" direct-timeout)
   advance_origin "$home" direct-timeout C1
   fakebin="$home/direct-timeout-fakebin"
   real_git=$(command -v git)
   mkdir -p "$fakebin"
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-refresh-state/locks"
-  lock="$lock_root/$key.lock"
+  fm_checkout_lock_prepare "$lock_root" || fail "could not prepare bounded checkout lock fixture"
+  lock=$(fm_checkout_lock_path "$clone" "$lock_root") \
+    || fail "could not resolve bounded checkout lock fixture"
   cat > "$fakebin/git" <<'SH'
 #!/usr/bin/env bash
 is_fetch=0
@@ -541,9 +539,16 @@ for arg in "$@"; do
   [ "$arg" = fetch ] && is_fetch=1
 done
 if [ "$is_fetch" -eq 1 ]; then
-  if { [ -e "$FM_TEST_EXPECT_LOCK" ] || [ -L "$FM_TEST_EXPECT_LOCK" ]; } \
-    && lock_pid=$(cat "$FM_TEST_EXPECT_LOCK/pid" 2>/dev/null) \
-    && kill -0 "$lock_pid" 2>/dev/null; then
+  owner=${FM_FLEET_SYNC_LOCK_OWNER_DIR:-}
+  owner_pid=${FM_FLEET_SYNC_LOCK_OWNER_PID:-}
+  if [ -n "$owner" ] \
+    && [ -n "$owner_pid" ] \
+    && [ -d "$owner" ] \
+    && [ ! -L "$owner" ] \
+    && [ "$(cat "$owner/pid" 2>/dev/null)" = "$owner_pid" ] \
+    && [ -L "$FM_TEST_EXPECT_LOCK" ] \
+    && [ "$(readlink "$FM_TEST_EXPECT_LOCK" 2>/dev/null)" = "$owner" ] \
+    && kill -0 "$owner_pid" 2>/dev/null; then
     : > "$FM_TEST_LOCK_BEFORE_MUTATION"
   fi
   trap '

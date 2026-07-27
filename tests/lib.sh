@@ -75,6 +75,7 @@ fm_test_cleanup() {
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  return 0
 }
 
 fm_test_tmproot() {

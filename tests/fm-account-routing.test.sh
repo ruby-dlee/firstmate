@@ -2267,6 +2267,7 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  printf 'draft capability repair\n' > "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "off secondmate launched from a dirty, capability-drifted home"

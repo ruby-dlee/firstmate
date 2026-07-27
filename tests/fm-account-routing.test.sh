@@ -2225,8 +2225,9 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
-  assert_contains "$out" "$id" "capability refusal omitted the offending secondmate"
-  assert_contains "$out" "dirty working tree" "capability refusal did not stop at the freshness gate"
+  assert_contains "$out" "$sm" "capability refusal omitted the offending secondmate home"
+  assert_contains "$out" "lacks Agent Fleet routing support" \
+    "capability refusal did not stop at the capability gate"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }
@@ -2269,9 +2270,9 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm=$(cd "$sm" && pwd -P)
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -ne 0 ] || fail "off secondmate launched from a dirty, capability-drifted home"
-  assert_contains "$out" "dirty working tree" "off capability drift did not stop at the freshness gate"
-  assert_not_grep '^new-window ' "$TMUX_LOG" "off capability drift created an endpoint"
+  [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"
+  assert_contains "$out" "lacks Agent Fleet routing support" \
+    "routing-off legacy-home launch omitted its capability warning"
   pass "secondmate launches require authoritative routing policy in every mode"
 }
 

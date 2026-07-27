@@ -122,6 +122,39 @@ with open(state, "w", encoding="utf-8") as stream:
 PY
 }
 
+write_treehouse_duplicate_mixed_lease() {
+  local worktree=$1 slot pool state
+  slot=$(cd "$(dirname "$worktree")" && pwd -P)
+  pool=$(cd "$(dirname "$slot")" && pwd -P)
+  state="$pool/treehouse-state.json"
+  python3 - "$state" "$(cd "$worktree" && pwd -P)" <<'PY'
+import json
+import sys
+
+state, path = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": path,
+                    "leased": False,
+                    "lease_holder": "",
+                },
+                {
+                    "name": "duplicate",
+                    "path": path,
+                    "leased": True,
+                    "lease_holder": "firstmate-other-task",
+                },
+            ]
+        },
+        stream,
+    )
+PY
+}
+
 prepare_secondmate_home_fixture() {
   local case_dir=$1 id=${2:-task-x1} root_default default root_tip exclude home_abs
   mkdir -p "$case_dir/data" "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" \
@@ -607,12 +640,11 @@ git_index_lock_path() {
 }
 
 checkout_lock_path() {
-  local dir=$1 lock_root=$2 common key
-  common=$(git -C "$dir" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$dir/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  printf '%s/%s.lock\n' "$lock_root" "$key"
+  local dir=$1 lock_root=$2
+  bash -c '
+    . "$1/bin/fm-checkout-lock-lib.sh"
+    fm_checkout_lock_path "$2" "$3"
+  ' _ "$ROOT" "$dir" "$lock_root"
 }
 
 # fakebin/lsof stub: no process ever holds anything open (lsof's not-found exit
@@ -4391,6 +4423,50 @@ test_already_returned_worktree_with_unlanded_work_refuses() {
   pass "already-returned worktree with unlanded work is refused"
 }
 
+test_already_returned_worktree_cleanup_honors_checkout_lock() {
+  local case_dir rc lock
+  case_dir=$(make_case already-returned-lock)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  write_treehouse_unleased "$case_dir/wt"
+  lock=$(checkout_lock_path "$case_dir/wt" "$case_dir/checkout-locks")
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-lock: teardown bypassed the checkout lock"
+  assert_present "$case_dir/wt" "already-returned-lock: teardown removed the contended worktree"
+  assert_present "$case_dir/state/task-x1.meta" "already-returned-lock: teardown removed task metadata"
+  assert_grep "checkout mutation already running for $case_dir/wt (pid $$)" \
+    "$case_dir/stderr" "already-returned-lock: teardown did not surface checkout lock contention"
+  rm -rf "$lock"
+  pass "already-returned cleanup holds the shared checkout lock"
+}
+
+test_duplicate_treehouse_entries_refuse_cleared_lease() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-duplicate)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  write_treehouse_duplicate_mixed_lease "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-duplicate: duplicate lease entries were accepted"
+  assert_present "$case_dir/wt" "already-returned-duplicate: teardown removed the ambiguous worktree"
+  assert_present "$case_dir/state/task-x1.meta" "already-returned-duplicate: teardown removed task metadata"
+  pass "duplicate Treehouse entries fail closed"
+}
+
 test_fd_leak_under_low_ulimit() {
   local case_dir rc dir_count i
   case_dir=$(make_case fd-leak-ulimit)
@@ -4424,6 +4500,8 @@ test_fd_leak_under_low_ulimit() {
 if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_already_returned_worktree_with_landed_work_allows
   test_already_returned_worktree_with_unlanded_work_refuses
+  test_already_returned_worktree_cleanup_honors_checkout_lock
+  test_duplicate_treehouse_entries_refuse_cleared_lease
   test_fd_leak_under_low_ulimit
   exit 0
 fi
@@ -4684,4 +4762,6 @@ test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_already_returned_worktree_with_landed_work_allows
 test_already_returned_worktree_with_unlanded_work_refuses
+test_already_returned_worktree_cleanup_honors_checkout_lock
+test_duplicate_treehouse_entries_refuse_cleared_lease
 test_fd_leak_under_low_ulimit

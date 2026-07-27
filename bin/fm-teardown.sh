@@ -1056,8 +1056,10 @@ try:
     ]
     if not matches:
         raise SystemExit(0)
+    if len(matches) != 1:
+        raise SystemExit(1)
     entry = matches[0]
-    if entry.get("leased") is True:
+    if entry.get("leased") is not False:
         raise SystemExit(1)
     raise SystemExit(0)
 except (OSError, ValueError, json.JSONDecodeError):
@@ -1355,6 +1357,21 @@ cleanup_returned_worktree() {
     git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
   fi
   remove_worktree_compatibility_artifacts "$worktree" "returned worktree"
+}
+
+cleanup_already_returned_worktree_locked() {
+  local branch
+  treehouse_lease_is_cleared "$WT" || {
+    echo "error: worktree lease is no longer provably cleared; retaining $WT" >&2
+    return 1
+  }
+  validate_worktree_teardown_safety || return 1
+  treehouse_lease_is_cleared "$WT" || {
+    echo "error: worktree lease changed during final safety checks; retaining $WT" >&2
+    return 1
+  }
+  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  cleanup_returned_worktree "$branch" "$WT" "$PROJ"
 }
 
 validate_worktree_teardown_safety() {
@@ -4161,9 +4178,8 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_orca_worktree_locked || exit 1
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$WORKTREE_ALREADY_RETURNED" = 1 ]; then
-    cleanup_returned_worktree \
-      "$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)" \
-      "$WT" "$PROJ"
+    fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" \
+      cleanup_already_returned_worktree_locked || exit 1
   else
     post_lock_cleanup_check=
     if [ "$KIND" != secondmate ]; then

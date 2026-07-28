@@ -9,6 +9,14 @@ set -u
 # shellcheck source=bin/fm-checkout-lock-lib.sh
 . "$ROOT/bin/fm-checkout-lock-lib.sh"
 
+# This suite captures and asserts expected nonzero statuses explicitly.
+# Individual tests may temporarily enable errexit, so restore the file-level
+# set -u baseline after every successful test before the next case starts.
+pass() {
+  printf 'ok - %s\n' "$1"
+  set +e
+}
+
 fm_git_identity fmtest fmtest@example.invalid
 
 TMP_ROOT=$(fm_test_tmproot fm-checkout-refresh-tests)
@@ -1036,6 +1044,7 @@ test_unreadable_scan_root_invalidates_coverage_health() {
   canonical_scan=$(cd "$scan_root" && pwd -P)
   chmod 111 "$scan_root"
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
   chmod 700 "$scan_root"

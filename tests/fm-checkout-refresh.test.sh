@@ -642,7 +642,7 @@ test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() 
 }
 
 test_bootstrap_relays_hygiene_alerts() {
-  local project draft out config_backup config_real
+  local project draft out diagnostic_out config_backup config_real
   project=$(cd "$FM_TEST_HOME/projects/relvino" && pwd -P)
   draft="$project/.agents/skills/bootstrap-draft/SKILL.md"
   mkdir -p "$(dirname "$draft")"
@@ -650,9 +650,13 @@ test_bootstrap_relays_hygiene_alerts() {
   : > "$FM_TEST_HOME/config/checkout-refresh"
   config_backup=$(mktemp "$TMP_ROOT/checkout-refresh-config.XXXXXX")
   cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
-  printf '%s\n' 'unexpected directive' >> "$FM_TEST_HOME/config/checkout-refresh"
 
   out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
+    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  printf '%s\n' 'unexpected directive' >> "$FM_TEST_HOME/config/checkout-refresh"
+  diagnostic_out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
     FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
     "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
@@ -660,7 +664,7 @@ test_bootstrap_relays_hygiene_alerts() {
 
   assert_contains "$out" "FLEET_SYNC: $project: HYGIENE: 1 untracked skill-draft files" \
     "session-start bootstrap did not relay the unresolved hygiene alert"
-  assert_contains "$out" "FLEET_SYNC: checkout-refresh: skipped: unknown config directive 'unexpected'" \
+  assert_contains "$diagnostic_out" "FLEET_SYNC: checkout-refresh: skipped: unknown config directive 'unexpected'" \
     "session-start bootstrap swallowed checkout discovery diagnostics"
 
   config_real="$TMP_ROOT/checkout-refresh-real"

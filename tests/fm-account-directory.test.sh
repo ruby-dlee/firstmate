@@ -278,6 +278,11 @@ printf 'called\n' >> "$FM_FAKE_AGENT_FLEET_LOG"
 exit 99
 SH
   chmod +x "$fakebin/forbidden-agent-fleet"
+  cat > "$fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/chrome-devtools-axi"
 }
 
 run_direct_spawn() {

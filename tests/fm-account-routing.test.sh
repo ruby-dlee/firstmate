@@ -2226,13 +2226,15 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  [ -z "$(git -C "$sm" status --porcelain)" ] \
+    || fail "incapable secondmate fixture was not a clean pre-routing revision"
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
   assert_contains "$out" "$sm" "capability refusal omitted the offending secondmate home"
-  assert_contains "$out" "lacks Agent Fleet routing support" \
-    "capability refusal did not stop at the capability gate"
+  assert_contains "$out" "reconcile the home to this Firstmate revision" \
+    "capability refusal omitted the baseline reconciliation action"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }
@@ -2273,12 +2275,21 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  [ -z "$(git -C "$sm" status --porcelain)" ] \
+    || fail "off-mode incapable secondmate fixture was not a clean pre-routing revision"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"
-  assert_contains "$out" "lacks Agent Fleet routing support" \
-    "routing-off legacy-home launch omitted its capability warning"
-  pass "secondmate launches require authoritative routing policy in every mode"
+  [ "$status" -eq 0 ] || fail "off-mode secondmate rejected a clean pre-routing home (exit $status): $out"
+  assert_contains "$out" "$id" "off-mode capability warning omitted the offending secondmate"
+  assert_contains "$out" "launching because account routing is off" \
+    "off-mode capability warning did not explain the compatibility launch"
+  assert_contains "$out" "spawned $id" "off-mode compatibility launch did not complete"
+  assert_grep 'kind=secondmate' "$HOME_DIR/state/$id.meta" \
+    "off-mode compatibility launch did not publish secondmate metadata"
+  assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" \
+    "off-mode compatibility launch published managed account metadata"
+  [ ! -s "$AF_LOG" ] || fail "off-mode compatibility launch called Agent Fleet"
+  pass "secondmate launches require authoritative routing policy while off mode preserves legacy homes"
 }
 
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
@@ -6131,6 +6142,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
   run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-capability ]; then
+  run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
+  run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
   exit 0
 fi
 

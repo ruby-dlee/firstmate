@@ -86,6 +86,12 @@ printf 'trivial e2e primary crewmate brief: nothing to do.\n' > "$PRIMARY_HOME/d
 
 SM_HOME="$TMP_ROOT/secondmate-home"
 SM_ORIGIN=$(git -C "$ROOT" remote get-url origin)
+PRIMARY_ROOT="$TMP_ROOT/primary-root"
+git init -q "$PRIMARY_ROOT"
+git -C "$PRIMARY_ROOT" remote add origin "$SM_ORIGIN"
+git -C "$PRIMARY_ROOT" fetch -q "$ROOT" refs/remotes/origin/main:refs/remotes/origin/main
+git -C "$PRIMARY_ROOT" checkout -q -B main FETCH_HEAD
+git -C "$PRIMARY_ROOT" remote set-head origin main
 git init -q "$SM_HOME"
 git -C "$SM_HOME" remote add origin "$SM_ORIGIN"
 git -C "$SM_HOME" fetch -q origin main
@@ -150,7 +156,7 @@ pass "real herdr E2E: the primary-shaped home's crewmate landed in the 'firstmat
 # exactly this call - AGENTS.md task herdr-sm-spaces-k4, requirement 3.)
 
 SM_OUT="$TMP_ROOT/sm.out"; SM_ERR="$TMP_ROOT/sm.err"
-FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" \
   "$ROOT/bin/fm-spawn.sh" e2esm1 "$SM_HOME" "sh -c 'echo secondmate-launch-ok; sleep 300'" --secondmate --backend herdr \
   >"$SM_OUT" 2>"$SM_ERR"
 rc=$?

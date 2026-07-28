@@ -21,6 +21,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 TMP_ROOT=$(fm_test_tmproot fm-backend-herdr-tests)
 export FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=0
 export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
+export FM_TEST_HERDR_FAKE_READSTEER_OWNED=firstmate-herdr-tests-v1
 
 assert_no_server_transients() {  # <lock-root> <label>
   local root=$1 label=$2 artifact leaf mode

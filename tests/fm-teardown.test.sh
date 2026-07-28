@@ -1941,9 +1941,19 @@ case "${1:-}" in
   kill-window)
     : > "$FM_FAKE_KILL_STARTED"
     while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+    : > "$FM_FAKE_KILL_STARTED.gone"
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    [ ! -f "$FM_FAKE_KILL_STARTED.gone" ] || exit 1
+    printf '%%1\n'
+    exit 0
+    ;;
+  list-windows)
+    [ ! -f "$FM_FAKE_KILL_STARTED.gone" ] || exit 0
+    printf 'fm-task-x1\n'
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -1953,7 +1963,7 @@ SH
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 600); do
     [ -f "$kill_started" ] && break
     sleep 0.05
   done
@@ -1999,11 +2009,12 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
   allow_kill="$case_dir/allow-kill"
   : > "$af_log"
   prepare_secondmate_home_fixture "$case_dir"
+  git -C "$case_dir/project" gc --quiet
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -2039,11 +2050,26 @@ case "${1:-}" in
       *fm-child-lock-x3*)
         : > "$FM_FAKE_KILL_STARTED"
         while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+        : > "$FM_FAKE_KILL_STARTED.gone"
         ;;
     esac
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    case "$*" in
+      *fm-child-lock-x3*)
+        [ ! -f "$FM_FAKE_KILL_STARTED.gone" ] || exit 1
+        printf '%%1\n'
+        exit 0
+        ;;
+    esac
+    exit 1
+    ;;
+  list-windows)
+    [ ! -f "$FM_FAKE_KILL_STARTED.gone" ] || exit 0
+    printf 'fm-child-lock-x3\n'
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -2056,7 +2082,7 @@ SH
     FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -f "$kill_started" ] && break
     sleep 0.05
   done

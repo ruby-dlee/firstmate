@@ -12,8 +12,8 @@ A zero-token bash watcher (`bin/fm-watch.sh`) sleeps on the fleet, classifies de
 Actionable wakes include captain-relevant status signals, no-verb signals whose crewmate is not provably working, check-script output such as PR merge polling or an X-mode mention, stale panes whose crewmate is not provably working whether their status log looks terminal or non-terminal, provably-working stale panes that persist past `FM_STALE_ESCALATE_SECS`, declared external waits that remain paused past `FM_PAUSE_RESURFACE_SECS`, and heartbeat backstop hits.
 They also include recognized mid-run Claude or Codex permission prompts and busy panes that make no semantic pane, status, or turn-end progress for `FM_PERMISSION_STALL_ESCALATE_SECS`.
 The permission-prompt matcher and the explicitly heuristic macOS system-dialog fallback are detailed in [permission-stall-detection.md](permission-stall-detection.md).
-Before stale classification, empirically verified Claude and Codex capacity chrome triggers a serialized fresh-agent handoff through the recorded task's direct-account recovery path.
-The handoff excludes every account already exhausted by that task, records each bounded attempt in task metadata, and emits one blocked wake with a durable no-retry marker when no unused eligible account remains.
+Before stale classification, empirically verified capacity chrome on an idle endpoint is routed by scope: Claude account exhaustion triggers a serialized fresh-agent handoff, while Codex model capacity surfaces once without endpoint removal, account rotation, or rescue metadata.
+The account-scoped handoff excludes every account already exhausted by that task, records each bounded attempt in task metadata, and emits one blocked wake with a durable no-retry marker when no unused eligible account remains.
 [Automatic account-capacity rescue](account-capacity-rescue.md) owns the exact signatures, transaction, audit fields, and stop conditions.
 Repeated unchanged wedge or permission-stall escalations add an escalation count to the wake reason and, at `FM_WEDGE_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
@@ -28,6 +28,7 @@ Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed 
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crewmate status files are append-only wake-event logs, not current-state fields.
 `bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and keeps that run-step authoritative even if the pane has closed.
+When a terminal run reports `outcome: passed`, the helper preserves the terminal `done` state but verifies the PR detail through a bounded `gh-axi` query, distinguishing merged, open, closed without merge, and unavailable states instead of inferring them from the pipeline outcome.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 The most recent recognized ci log marker wins, so checks-green monitoring reports done while a later re-arm, failed-check, or issue marker returns the crewmate to working.
 Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.

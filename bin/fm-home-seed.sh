@@ -929,6 +929,33 @@ seed_home() {
   SEED_CHARTER_EXISTED=0
   SEED_MARKER_EXISTED=0
   trap seed_exit_cleanup EXIT
+  if [ ! -f "$SEED_PARENT_BRIEF" ]; then
+    [ -n "${FM_SECONDMATE_CHARTER:-}" ] || {
+      echo "error: no filled secondmate charter brief at $SEED_PARENT_BRIEF; set FM_SECONDMATE_CHARTER or scaffold one and replace {TASK}" >&2
+      return 1
+    }
+    [ -d "$DATA/$id" ] || SEED_PARENT_BRIEF_DIR_CREATED=1
+    if [ "$no_projects" -eq 1 ]; then
+      "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects
+    else
+      "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate "$@"
+    fi
+    SEED_PARENT_BRIEF_CREATED=1
+  fi
+  if grep -F '{TASK}' "$SEED_PARENT_BRIEF" >/dev/null 2>&1; then
+    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF still contains {TASK}; fill it before seeding" >&2
+    return 1
+  fi
+  charter_summary=$(registry_summary_for_brief "$SEED_PARENT_BRIEF")
+  [ -n "$charter_summary" ] || {
+    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF has an empty Charter section; fill it before seeding" >&2
+    return 1
+  }
+  charter_scope=$(registry_scope_for_brief "$SEED_PARENT_BRIEF")
+  [ -n "$charter_scope" ] || {
+    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF has an empty Routing scope section; fill it before seeding" >&2
+    return 1
+  }
   SEED_PARENT_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FM_HOME") || return 1
   fm_checkout_trusted_dir "$FM_HOME" >/dev/null || {
     echo "error: active firstmate home was removed or redirected while seed waited for lifecycle ownership" >&2
@@ -946,6 +973,7 @@ seed_home() {
     home=$(acquire_treehouse_home "$id")
     SEED_HOME="$home"
     SEED_HOME_RETAINED=1
+    refuse_active_home_path "$home" || return 1
     SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home") || return 1
     freshness_status=0
     "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$home" "$FM_ROOT" || freshness_status=$?
@@ -965,6 +993,10 @@ seed_home() {
     SEED_HOME="$requested_abs"
     [ -e "$requested_abs" ] || SEED_HOME_CREATED=1
     home=$(ensure_home "$id" "$requested_abs")
+    if [ "$no_projects" -eq 1 ]; then
+      refuse_populated_projectless_home "$home" || return 1
+      refuse_projectful_projectless_charter "$id" "$SEED_PARENT_BRIEF" || return 1
+    fi
     "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$home" || {
       echo "error: refusing explicit secondmate home whose default branch cannot be refreshed safely" >&2
       return 1
@@ -999,34 +1031,6 @@ seed_home() {
     cp "$home/$SUB_HOME_MARKER" "$SEED_BACKUP_DIR/marker"
   fi
   SEED_HOME_BACKED_UP=1
-
-  if [ ! -f "$SEED_PARENT_BRIEF" ]; then
-    [ -n "${FM_SECONDMATE_CHARTER:-}" ] || {
-      echo "error: no filled secondmate charter brief at $SEED_PARENT_BRIEF; set FM_SECONDMATE_CHARTER or scaffold one and replace {TASK}" >&2
-      return 1
-    }
-    [ -d "$DATA/$id" ] || SEED_PARENT_BRIEF_DIR_CREATED=1
-    if [ "$no_projects" -eq 1 ]; then
-      "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects
-    else
-      "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate "$@"
-    fi
-    SEED_PARENT_BRIEF_CREATED=1
-  fi
-  if grep -F '{TASK}' "$SEED_PARENT_BRIEF" >/dev/null 2>&1; then
-    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF still contains {TASK}; fill it before seeding" >&2
-    return 1
-  fi
-  charter_summary=$(registry_summary_for_brief "$SEED_PARENT_BRIEF")
-  [ -n "$charter_summary" ] || {
-    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF has an empty Charter section; fill it before seeding" >&2
-    return 1
-  }
-  charter_scope=$(registry_scope_for_brief "$SEED_PARENT_BRIEF")
-  [ -n "$charter_scope" ] || {
-    echo "error: secondmate charter brief at $SEED_PARENT_BRIEF has an empty Routing scope section; fill it before seeding" >&2
-    return 1
-  }
 
   for project in "$@"; do
     project_dst=$(validate_project_destination "$home" "$project") || return 1

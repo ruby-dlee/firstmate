@@ -1898,7 +1898,8 @@ fm_backend_herdr_server_stop_owned_empty() {  # <session>
 # lifecycle before any caller may inspect or create a workspace. A current
 # certified server is reused. An adapter-owned but release-drifted server is
 # restarted only when the exact named session is proven structurally empty;
-# occupied, unreadable, or manual servers fail closed without mutation.
+# an occupied exact session is reused without lifecycle mutation so native
+# agent routing can continue, while unreadable or manual servers fail closed.
 fm_backend_herdr_server_ensure() {  # <session>
   local session=$1 running
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
@@ -1948,8 +1949,20 @@ fm_backend_herdr_server_ensure() {  # <session>
       case "$exact_state" in
         empty) ;;
         occupied)
-          echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is occupied" >&2
-          exit 1
+          # The server is this adapter's own (checked above) and running, but its
+          # closed-shell certificate drifted - typically because an fm-update or a
+          # landed source change altered the managed-shell-source digest after the
+          # server was launched, or because FirstMate itself runs inside this herdr
+          # session (HERDR_ENV=1) and the server was launched by the interactive
+          # launcher rather than the crewmate adapter's own closed-shell path. It is
+          # OCCUPIED (live crewmates and/or FirstMate), so it cannot be restarted to
+          # re-certify. Refusing here would impose a hard no-spawn state on an
+          # otherwise healthy, adapter-owned server. Accept it: every new crewmate is
+          # launched through Herdr's native agent API with its explicit environment,
+          # so a drifted SERVER certificate does not govern a NEW agent's isolation.
+          # The strict certified restart still applies whenever the session is empty
+          # (the 'empty' arm above), so the boundary is preserved when it can be.
+          exit 0
           ;;
         *)
           echo "error: refusing to restart release-drifted Herdr session '$session' because its exact workspace/tab/pane state is indeterminate" >&2
@@ -2842,10 +2855,15 @@ FM_BACKEND_HERDR_COMPOSER_LINES=${FM_BACKEND_HERDR_COMPOSER_LINES:-20}
 # Known ghost/placeholder composer text. Extend this if another
 # herdr-verified harness needs its own idle placeholder recognized.
 FM_BACKEND_HERDR_IDLE_RE=${FM_BACKEND_HERDR_IDLE_RE:-'^Type a message\.\.\.$'}
-# Known bare (unbordered) prompt glyphs a composer row may start with: ❯
-# (claude) and › (codex) only. Generic shell-style glyphs > $ % # are still
-# recognized after a bordered composer row has already been structurally found.
-FM_BACKEND_HERDR_BARE_PROMPT_RE=${FM_BACKEND_HERDR_BARE_PROMPT_RE:-'^[❯›]'}
+fm_backend_herdr_is_bare_prompt_row() {  # <plain-trimmed-row>
+  # Match complete UTF-8 glyphs with shell literals, not a grep bracket
+  # expression. Under LC_ALL=C, `[❯›]` is a byte set that also matches the
+  # leading byte of unrelated box glyphs such as ╭ and ╰.
+  case "$1" in
+    '❯'*|'›'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
   local target=$1 cap line trimmed found=0 shape="" raw_match="" bordered=0 stripped
@@ -2867,7 +2885,7 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
         found=1
         ;;
       *)
-        if printf '%s' "$trimmed" | fm_backend_herdr_control_grep -qE "$FM_BACKEND_HERDR_BARE_PROMPT_RE"; then
+        if fm_backend_herdr_is_bare_prompt_row "$trimmed"; then
           shape=bare
           raw_match=$line
           found=1
@@ -2896,9 +2914,9 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
     stripped="${stripped%"${stripped##*[![:space:]]}"}"
   fi
   # Delegate the empty/pending/unknown decision to the shared owner. The bare
-  # shape only ever starts with an AGENT glyph (FM_BACKEND_HERDR_BARE_PROMPT_RE
-  # is '^[❯›]'), so a bare shell prompt never reaches here - it stays 'unknown'
-  # via the no-composer-row path above, exactly as before.
+  # shape only ever starts with an AGENT glyph (`❯` or `›`), so a bare shell
+  # prompt never reaches here - it stays `unknown` via the no-composer-row path
+  # above, exactly as before.
   fm_composer_classify_content "$bordered" "$stripped" "$FM_BACKEND_HERDR_IDLE_RE"
 }
 

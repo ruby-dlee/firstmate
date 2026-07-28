@@ -180,9 +180,10 @@ This means an account re-authenticated immediately before spawn is eligible on t
 Claude's config-directory-specific macOS Keychain credential is not currently distinguishable through non-interactive quota reads.
 Claude therefore treats missing quota as unreadable rather than unhealthy, chooses the first real profile directory in stable sort order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
 
-For a direct-account ship or scout that later reaches verified provider capacity, the watcher reuses `--recover-direct-account` and excludes the current account plus every account that task previously exhausted.
-Codex alternatives must have a fresh positive general usage score, while Claude advances through unused directories because its per-directory quota remains unreadable.
-The handoff is attempt-capped and stops durably instead of retrying when no unused eligible account remains.
+For a direct-account ship or scout that later reaches verified account-scoped capacity, the watcher reuses `--recover-direct-account` and excludes the current account plus every account that task previously exhausted.
+The current account-scoped classifier covers Claude session exhaustion, so rescue advances through unused Claude directories because per-directory quota remains unreadable.
+Codex model capacity instead surfaces once without endpoint removal, account rotation, or account-rescue metadata.
+Account handoff is attempt-capped and stops durably instead of retrying when no unused eligible account remains.
 [Automatic account-capacity rescue](account-capacity-rescue.md) owns the signatures, audit metadata, default bound, and failure transaction.
 
 Account routing remains default-off.
@@ -528,6 +529,7 @@ FM_CHECK_INTERVAL=300   # seconds between slow checks (merge polls or the X-mode
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
+FM_CREW_STATE_GH_TIMEOUT=10   # seconds allowed for the passed-run GitHub PR-state query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes runs rows scanned when cross-branch attribution falls back from axi status
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions
@@ -597,6 +599,8 @@ FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher c
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 ```
+
+`FM_CREW_STATE_GH_TIMEOUT` accepts only strictly positive whole seconds, defaults to 10 seconds, and clamps every numerically zero, negative, whitespace-padded, or unparseable value to that same 10-second default because an indefinitely hung supervision state reader would stall wedge detection.
 
 [`permission-stall-detection.md`](permission-stall-detection.md) records why the watcher uses direct harness-prompt matching but a timeout heuristic for macOS system dialogs.
 

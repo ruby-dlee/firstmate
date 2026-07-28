@@ -559,6 +559,7 @@ test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
   primary_tip=$(git -C "$ROOT" rev-parse HEAD)
   rm -rf "$w/sm1"
   git clone -q --no-checkout "$ROOT" "$w/sm1"
+  git -C "$w/sm1" branch --force main "$primary_tip"
   git -C "$w/sm1" checkout -q --detach "$primary_tip"
   mkdir -p "$w/sm1/bin" "$w/sm1/data" "$w/sm1/state" "$w/sm1/config" "$w/sm1/projects"
   printf '%s\n' sm1 > "$w/sm1/.fm-secondmate-home"

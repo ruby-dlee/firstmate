@@ -9,8 +9,9 @@
  *   sweep <owner-home> <state-dir>
  *   classify <ps-inventory-file>
  *
- * The spawn path prepares a private browser root under /tmp/fm-<id>/browser
- * and puts bin/chrome-devtools-axi ahead of the real AXI on the crew PATH.
+ * The spawn path prepares a home- and task-scoped private browser root under
+ * /tmp/fm-browser-<home-key>-<id> and puts bin/chrome-devtools-axi ahead of the
+ * real AXI on the crew PATH.
  * The wrapper launches a separate Chrome for Testing/Canary executable lazily,
  * attaches AXI through a loopback debugging endpoint, and keeps the captain's
  * stable Chrome app and profile out of the process tree.

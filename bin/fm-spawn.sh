@@ -3487,8 +3487,8 @@ EOF
         echo "error: cannot durably record Orca create authority for $ID" >&2
         exit 1
       }
-      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ] || [ "$ORCA_PROVIDER_TASK" != "$ORCA_EXPECTED_TASK" ]; then
-        echo "error: orca did not return matching worktree id, path, and task authority for $W" >&2
+      if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
+        echo "error: orca did not return worktree id and path authority for $W" >&2
         exit 1
       fi
       validate_spawn_worktree "orca worktree create" "$W"

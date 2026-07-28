@@ -466,6 +466,13 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = get ] || exit 0
+printf '%s\n' "${FM_FAKE_TREEHOUSE_WORKTREE:?}"
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -679,8 +686,10 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   proj="$w/crew-project"
   wt="$w/crew-wt"
   fakebin=$(make_launch_capturing_tmux "$w/tmux-crew")
-  fm_git_worktree "$proj" "$wt" "wt-crew"
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state"
+  fm_git_init_commit "$proj"
+  git -C "$proj" worktree add --quiet --detach "$wt" HEAD
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" \
+    "$home/treehouse-pools" "$home/checkout-refresh-state"
   printf 'brief\n' > "$home/data/$id/brief.md"
   : > "$launchlog"
   spawn_err="$w/crew-spawn.err"
@@ -690,7 +699,10 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" FM_FAKE_LAUNCH_LOG="$launchlog" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" >/dev/null 2>"$spawn_err"
   spawn_rc=$?
   expect_code 0 "$spawn_rc" "crew-unaffected spawn should succeed: $(cat "$spawn_err")"

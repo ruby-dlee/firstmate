@@ -371,8 +371,9 @@ test_discovery_rejects_nested_configured_and_scanned_paths() {
     printf 'scan %s\n' "$scan_root"
   } > "$FM_TEST_HOME/config/checkout-refresh"
 
-  run_refresh discover > "$out" 2> "$err" \
-    || fail "exact-root discovery fixture failed"
+  if run_refresh discover > "$out" 2> "$err"; then
+    fail "nested configured and scanned paths were accepted"
+  fi
 
   assert_no_grep "^$configured_child$" "$out" \
     "configured nested directory was emitted as a checkout"

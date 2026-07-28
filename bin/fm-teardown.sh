@@ -29,6 +29,14 @@
 # Uncommitted changes are never landed.
 # Ordinary teardown first proves that metadata names the exact registered project,
 # worktree, and task lease, then quiesces the endpoint before its final safety checks.
+# If Treehouse already cleared that exact pool entry's lease, teardown treats the
+# worktree as a partial or completed external return only when the state has exactly
+# one matching entry, leased=false, no lease holder, and destroying is not true.
+# It then re-proves landed work under the checkout lock before completing the return
+# or cleaning the returned worktree, branch, and task bookkeeping. A missing
+# worktree directory is accepted only through the same cleared-lease proof and a
+# recovered task branch whose landed state can still be proved; ambiguous lease
+# state, branch lookup failure, and unlanded recovered work all retain task state.
 # Each locked Treehouse return repeats repository, lease, and landed-work checks
 # immediately before the destructive return command.
 # local-only projects additionally accept work merged into the local default

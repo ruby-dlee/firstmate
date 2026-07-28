@@ -541,7 +541,8 @@ bin/fm-teardown.sh <id>
 ```
 
 The script refuses if the worktree holds uncommitted changes or committed work that has not landed; treat a refusal as a stop-and-investigate, not an obstacle.
-Teardown validates that the recorded project and worktree are exact roots with the expected repository registration, quiesces every ordinary task endpoint, and then runs the final non-destructive safety checks before any Treehouse return.
+Teardown normally validates that the recorded project and worktree are exact roots with the expected repository registration, quiesces every ordinary task endpoint, and then runs the final non-destructive safety checks before any Treehouse return.
+It can also finish bookkeeping for a provably landed worktree whose Treehouse lease was already cleared; `bin/fm-teardown.sh`'s header owns the fail-closed recovery contract.
 For a task whose metadata carries `report_required=1`, teardown also publishes the validated completion report before releasing the account lease or removing the worktree.
 A safety refusal after quiescence leaves the endpoint stopped while preserving all task state for repair and retry.
 `bin/fm-teardown.sh`'s header owns the full landed-work definition (remote-reachable, merged-PR-head containment for the squash-merge-then-delete-branch flow, content already in the default branch, local-only merges) and the `pr=` discovery fallback for merges that skipped `bin/fm-pr-check.sh`.

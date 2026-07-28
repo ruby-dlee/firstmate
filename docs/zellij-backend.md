@@ -31,7 +31,7 @@ You do not need to attach for routine supervision: from an active firstmate sess
 
 Verify it works by spawning a trivial task with `--backend zellij` and confirming the task's meta records `backend=zellij` plus `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`; attaching to the session should show the new home-scoped tab title, such as `fm-firstmate-<8hex>-<id>`.
 
-Limitations: zellij is experimental, has no per-home workspace split (all tasks share one tab bar, unlike herdr), has no verified agent-process liveness classifier for the session-start secondmate sweep, and still carries the known gaps documented below (no native busy-state signal and a narrow focus-steal race on tab creation) - see "Known gaps left for a follow-up" at the end of this document.
+Limitations: zellij is experimental, has no per-home workspace split (all tasks share one tab bar, unlike herdr), can prove only structural endpoint absence rather than present-pane agent-process liveness for the session-start secondmate sweep, and still carries the known gaps documented below (no native busy-state signal and a narrow focus-steal race on tab creation) - see "Known gaps left for a follow-up" at the end of this document.
 
 ## Status: experimental
 

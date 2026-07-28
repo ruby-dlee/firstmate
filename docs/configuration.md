@@ -195,7 +195,8 @@ Neither mode invokes Agent Fleet selection or leases for a new ship/scout launch
 The existing `--account-pool`, `--account-profile`, and dispatch-profile fields remain compatibility activation inputs for those crewmates while the inactive-code removal is handled separately.
 Their legacy aliases do not constrain the new usage-based account choice.
 Secondmate integration is deferred: secondmate launches retain their pre-cutover Agent Fleet selection and lease behavior, including `config/secondmate-account-pool`.
-Every secondmate launch also verifies that tracked Agent Fleet routing support has not been removed from the home, even when routing is off; a missing tracked implementation is treated as unreconciled home drift rather than permission to launch without the safety path.
+Every secondmate launch refuses a home whose index tracks Agent Fleet routing support but whose working tree has removed it, even when routing is off.
+An older home that does not track the support may still launch with a warning while routing is off or observe, but enforce mode refuses it until the home is reconciled.
 Firstmate's spawn flags and `config/secondmate-account-pool` continue to accept aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
 Account email addresses and filesystem paths are invalid in every input surface.
 Direct ship/scout task metadata records only `account_home=` from this account mechanism.

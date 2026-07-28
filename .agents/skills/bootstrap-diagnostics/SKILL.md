@@ -48,7 +48,7 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
   A secondmate that was skipped, already current, or whose advance changed no instructions is not listed and must not be disturbed.
 - `REPORT_RETENTION: unavailable: <reason>` - the machine-global report-retention LaunchAgent is absent, stale, unloaded, or has not reported a recent successful prune, so opportunistic bounded pruning remains available but post-minimum-age cleanup is not guaranteed to run while Firstmate is idle.
   Surface the failure, wait for the captain's consent, then run `bin/fm-bootstrap.sh install report-retention`; never install or activate it without that consent.
-- `BROWSER_GC: reaped <detail>` - the locked session-start sweep removed task-owned or legacy AXI browser processes and temp profiles that survived graceful teardown; no action is needed.
+- `BROWSER_GC: reaped <detail>` - an explicitly enabled machine-wide legacy sweep removed legacy AXI browser processes or temp profiles, and may also report task-owned state removed in the same pass; no action is needed.
 - `BROWSER_GC: unavailable: <reason>` - the browser orphan backstop could not prove cleanup, so surface the reason and inspect `bin/fm-browser-isolation.sh` before relying on the next sweep; task-scoped teardown remains fail-closed independently.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.

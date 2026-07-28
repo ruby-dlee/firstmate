@@ -46,7 +46,8 @@ The legacy cleanup classifier recognizes only:
 - an unused `puppeteer_dev_chrome_profile-*` directory directly under the system temporary root.
 
 Stable Chrome, partial-marker commands, headed temp-profile Chrome, headless Chrome with a non-temporary profile, and active task-owned browser roots are preserved.
-The sweep prints `BROWSER_GC:` only when it reaps something or cannot verify cleanup.
+The default home-scoped sweep is silent after successful task-root cleanup.
+With machine-wide legacy cleanup enabled, it prints `BROWSER_GC: reaped` when it removes anything; bootstrap prints `BROWSER_GC: unavailable` when cleanup cannot be verified.
 
 ## Verification
 

@@ -4,10 +4,13 @@
  *
  * Commands:
  *   prepare <task-id> <tasktmp> <owner-home> <real-axi> <browser-executable> [mcp-path]
+ *   root <task-id> <owner-home>
  *   run <chrome-devtools-axi arguments...>
  *   reap <task-id> <tasktmp>
  *   sweep <owner-home> <state-dir>
  *   classify <ps-inventory-file>
+ *
+ * The internal sentinel command is launched only by this implementation.
  *
  * The spawn path prepares a home- and task-scoped private browser root under
  * /tmp/fm-browser-<home-key>-<id> and puts bin/chrome-devtools-axi ahead of the

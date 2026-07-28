@@ -251,37 +251,32 @@ SH
 # A minimal seeded secondmate home (validate_firstmate_home_for_spawn needs the
 # seed marker, AGENTS.md, bin/, and a charter to launch). config/ is intentionally
 # left absent so the spawn's propagation is what creates it.
+make_fixture_clone() {
+  local destination=$1
+  git clone -q --no-checkout "$ROOT" "$destination"
+  git -C "$destination" checkout -q -b main "$(git -C "$ROOT" rev-parse HEAD)"
+  git -C "$destination" update-ref refs/remotes/origin/main HEAD
+  git -C "$destination" remote set-head origin main
+}
+
 make_seeded_home() {
-  local home=$1 id=$2 default_branch
-  default_branch=$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD)
-  default_branch=${default_branch#origin/}
-  git clone -q --branch "$default_branch" "$ROOT" "$home"
-  git -C "$home" checkout -q --detach
-  git -C "$home" update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch"
-  git -C "$home" checkout -q "$default_branch"
-  git -C "$home" remote set-head origin "$default_branch"
+  local home=$1 id=$2
+  make_fixture_clone "$home"
   mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
 }
 
 prepare_spawn_world() {
-  local world=$1 id=$2 home=$3 home_real primary default_branch
+  local world=$1 id=$2 home=$3 home_real primary
   mkdir -p "$world/home/state" "$world/home/data"
   primary="$world/primary"
   if [ ! -d "$primary/.git" ]; then
-    default_branch=$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD)
-    default_branch=${default_branch#origin/}
-    git clone -q --branch "$default_branch" "$ROOT" "$primary"
-    git -C "$primary" checkout -q --detach
-    git -C "$primary" update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch"
-    git -C "$primary" checkout -q "$default_branch"
+    make_fixture_clone "$primary"
     git -C "$primary" remote set-url origin "$primary"
-    git -C "$primary" remote set-head origin "$default_branch"
   fi
   git -C "$home" remote set-url origin "$primary"
-  default_branch=$(git -C "$primary" branch --show-current)
-  git -C "$home" remote set-head origin "$default_branch"
+  git -C "$home" remote set-head origin main
   home_real=$(cd "$home" && pwd -P)
   printf -- '- %s - harness test (home: %s; scope: harness test; projects: ; added 2026-07-27)\n' \
     "$id" "$home_real" > "$world/home/data/secondmates.md"

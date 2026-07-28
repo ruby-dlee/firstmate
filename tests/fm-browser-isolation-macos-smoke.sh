@@ -17,6 +17,9 @@ BROWSER_ROOT=
 MONITOR_PID=
 PROFILE=
 BRIDGE_PID=
+CONTROL_PID=
+CONTROL_PGID=
+CONTROL_PROFILE=
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
@@ -38,18 +41,54 @@ process_group_count() {
   ps -axo pgid= | awk -v pgid="$1" '$1 == pgid { count += 1 } END { print count + 0 }'
 }
 
-stable_window_count() {
+stable_window_fingerprint() {
   # shellcheck disable=SC2016 # Swift source is intentionally a shell literal.
   swift -e '
     import CoreGraphics
+    let ownerPID = Int(CommandLine.arguments[1])!
     let rows = CGWindowListCopyWindowInfo(
       [.optionOnScreenOnly, .excludeDesktopElements],
       kCGNullWindowID
     ) as? [[String: Any]] ?? []
-    print(rows.filter {
-      ($0[kCGWindowOwnerName as String] as? String) == "Google Chrome"
-    }.count)
-  '
+    let windows = rows.filter {
+      ($0[kCGWindowOwnerPID as String] as? Int) == ownerPID
+    }.map {
+      $0[kCGWindowNumber as String] as? Int ?? 0
+    }.sorted()
+    print(windows.map(String.init).joined(separator: "|"))
+  ' "$1"
+}
+
+cleanup_control() {
+  [ -n "$CONTROL_PID" ] || return 0
+  local command current_pgid
+  current_pgid=$(ps -p "$CONTROL_PID" -o pgid= 2>/dev/null | tr -d ' ' || true)
+  [ -n "$current_pgid" ] || {
+    CONTROL_PID=
+    return 0
+  }
+  command=$(ps -p "$CONTROL_PID" -o command= 2>/dev/null || true)
+  case "$command" in
+    *"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"*) ;;
+    *) return 1 ;;
+  esac
+  case "$command" in
+    *"--user-data-dir=$CONTROL_PROFILE"*) ;;
+    *) return 1 ;;
+  esac
+  [ "$current_pgid" = "$CONTROL_PGID" ] || return 1
+  kill -TERM -- "-$CONTROL_PGID" 2>/dev/null || true
+  local attempts=0
+  while [ "$(process_group_count "$CONTROL_PGID")" -ne 0 ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -eq 100 ]; then
+      kill -KILL -- "-$CONTROL_PGID" 2>/dev/null || true
+    fi
+    [ "$attempts" -lt 200 ] || return 1
+    sleep 0.05
+  done
+  CONTROL_PID=
+  rm -rf "$CONTROL_PROFILE"
 }
 
 cleanup() {
@@ -58,6 +97,7 @@ cleanup() {
   if [ -n "$MONITOR_PID" ]; then
     wait "$MONITOR_PID" 2>/dev/null || cleanup_rc=1
   fi
+  cleanup_control || cleanup_rc=1
   if [ -n "$BROWSER_ROOT" ] && [ -f "$BROWSER_ROOT/owner.json" ]; then
     "$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" "$ROOT" >/dev/null 2>&1 || cleanup_rc=1
   fi
@@ -122,6 +162,7 @@ STABLE_PID=$(
 )
 [ -n "$STABLE_PID" ] || fail "captain stable Chrome process was not found"
 STABLE_IDENTITY=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
+STABLE_WINDOWS=$(stable_window_fingerprint "$STABLE_PID")
 
 mkdir -p "$TASK_TMP/gotmp" "$TASK_TMP/shots"
 "$BROWSER_LIFECYCLE" prepare \
@@ -221,17 +262,47 @@ done
 
 if [ "${FM_BROWSER_ROUTING_TEST:-0}" = 1 ]; then
   ROUTING_TOKEN="fm-routing-$TASK_ID"
-  STABLE_WINDOWS_BEFORE=$(stable_window_count)
-  open -na "Google Chrome" --args --new-window "https://example.com/?$ROUTING_TOKEN"
-  sleep 3
-  STABLE_WINDOWS_AFTER=$(stable_window_count)
-  [ "$STABLE_WINDOWS_AFTER" -gt "$STABLE_WINDOWS_BEFORE" ] \
-    || fail "stable Chrome did not gain the requested new window"
+  CONTROL_PROFILE="$TASK_TMP/stable-control-profile"
+  mkdir -p "$CONTROL_PROFILE"
+  CONTROL_PID=$(CONTROL_EXECUTABLE="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    CONTROL_PROFILE="$CONTROL_PROFILE" ROUTING_TOKEN="$ROUTING_TOKEN" node <<'JS'
+const { spawn } = require("child_process");
+const child = spawn(process.env.CONTROL_EXECUTABLE, [
+  "--use-mock-keychain",
+  "--password-store=basic",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--noerrdialogs",
+  "--remote-debugging-address=127.0.0.1",
+  "--remote-debugging-port=0",
+  `--user-data-dir=${process.env.CONTROL_PROFILE}`,
+  `https://example.com/?${process.env.ROUTING_TOKEN}`,
+], { detached: true, stdio: "ignore" });
+child.unref();
+process.stdout.write(`${child.pid}\n`);
+JS
+  )
+  CONTROL_PGID=$CONTROL_PID
+  CONTROL_READY_ATTEMPTS=0
+  while [ ! -f "$CONTROL_PROFILE/DevToolsActivePort" ]; do
+    kill -0 "$CONTROL_PID" 2>/dev/null || fail "isolated stable control exited before routing proof"
+    CONTROL_READY_ATTEMPTS=$((CONTROL_READY_ATTEMPTS + 1))
+    [ "$CONTROL_READY_ATTEMPTS" -lt 200 ] || fail "isolated stable control did not expose DevTools"
+    sleep 0.05
+  done
+  CONTROL_PORT=$(head -n 1 "$CONTROL_PROFILE/DevToolsActivePort")
+  CONTROL_COMMAND=$(ps -p "$CONTROL_PID" -o command=)
+  case "$CONTROL_COMMAND" in
+    *--use-mock-keychain*--password-store=basic*"--user-data-dir=$CONTROL_PROFILE"*) ;;
+    *) fail "isolated stable control lacks credential-safe ownership flags" ;;
+  esac
+  curl -fsS "http://127.0.0.1:$CONTROL_PORT/json/list" | grep -F "$ROUTING_TOKEN" >/dev/null \
+    || fail "isolated stable control did not receive the routing URL"
   if curl -fsS "http://127.0.0.1:$BROWSER_PORT/json/list" | grep -F "$ROUTING_TOKEN" >/dev/null; then
     fail "captain routing test URL landed in the automation browser"
   fi
-  printf 'stable_windows_before=%s\n' "$STABLE_WINDOWS_BEFORE"
-  printf 'stable_windows_after=%s\n' "$STABLE_WINDOWS_AFTER"
+  CONTROL_DURING=$(process_group_count "$CONTROL_PGID")
+  printf 'control_stable_received_route=1\n'
   printf 'routing_url_in_automation=0\n'
 fi
 
@@ -265,10 +336,20 @@ kill -0 "$BRIDGE_PID" 2>/dev/null && fail "AXI bridge survived wrapper stop"
 [ ! -e "$BROWSER_ROOT" ] || fail "task profile root survived reap"
 PROFILE_AFTER_REAP=0
 [ ! -e "$BROWSER_ROOT/profile" ] || PROFILE_AFTER_REAP=1
+CONTROL_AFTER_STOP=0
+CONTROL_PROFILE_AFTER_STOP=0
+if [ -n "$CONTROL_PID" ]; then
+  cleanup_control || fail "isolated stable control cleanup could not be verified"
+  CONTROL_AFTER_STOP=$(process_group_count "$CONTROL_PGID")
+  [ ! -e "$CONTROL_PROFILE" ] || CONTROL_PROFILE_AFTER_STOP=1
+fi
 
 STABLE_IDENTITY_AFTER=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 [ "$STABLE_IDENTITY_AFTER" = "$STABLE_IDENTITY" ] \
   || fail "captain stable Chrome identity changed during the smoke test"
+STABLE_WINDOWS_AFTER=$(stable_window_fingerprint "$STABLE_PID")
+[ "$STABLE_WINDOWS_AFTER" = "$STABLE_WINDOWS" ] \
+  || fail "captain stable Chrome window set changed during the smoke test"
 
 printf 'screenshots=15\n'
 printf 'owned_processes_during_run=%s\n' "$OWNED_DURING_RUN"
@@ -277,5 +358,9 @@ printf 'browser_tree_processes_during_run=%s\n' "$TREE_DURING_RUN"
 printf 'browser_tree_processes_after_stop=%s\n' "$TREE_AFTER_STOP"
 printf 'bridge_alive_after_stop=%s\n' "$BRIDGE_AFTER_STOP"
 printf 'profile_exists_after_reap=%s\n' "$PROFILE_AFTER_REAP"
+printf 'control_processes_during_run=%s\n' "${CONTROL_DURING:-0}"
+printf 'control_processes_after_stop=%s\n' "$CONTROL_AFTER_STOP"
+printf 'control_profile_exists_after_stop=%s\n' "$CONTROL_PROFILE_AFTER_STOP"
 printf 'stable_chrome_identity_preserved=1\n'
+printf 'stable_chrome_window_set_preserved=1\n'
 printf 'ok - macOS credential isolation and teardown smoke test passed\n'

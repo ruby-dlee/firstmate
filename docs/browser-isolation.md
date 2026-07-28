@@ -49,5 +49,5 @@ The sweep prints `BROWSER_GC:` only when it reaps something or cannot verify cle
 
 Run `tests/fm-browser-isolation.test.sh` for fake-process behavior, failure-latch, teardown, backstop, and discrimination coverage.
 On macOS, run `tests/fm-browser-isolation-macos-smoke.sh` manually to launch the real separate browser, capture 15 screenshots, continuously sample automation windows and newly appearing credential-dialog owners or titles, record the live browser arguments, and prove zero bridge, complete browser-tree, and profile counts after stop and reap.
-Set `FM_BROWSER_ROUTING_TEST=1` only when a new isolated stable-Chrome window is acceptable; the smoke test then proves `open -na "Google Chrome" --args --new-window <url>` increases stable Chrome's window count, leaves the captain's existing stable process identity unchanged, and keeps the URL out of automation.
+Set `FM_BROWSER_ROUTING_TEST=1` to launch a credential-safe stable-Chrome control with its own temporary profile; the smoke test proves the control receives the unique URL, automation does not, the control is fully reaped, and the captain's stable process and window set remain unchanged.
 Measured macOS evidence is recorded in `docs/browser-isolation-verification.md`.

@@ -337,13 +337,18 @@ async function terminateOwnedBrowserTree(state) {
     : rootMatches && root.pgid === root.pid
       ? root.pgid
       : 0;
+  const groupRows =
+    dedicatedPgid === state.pid
+      ? rows.filter((row) => row.pgid === dedicatedPgid)
+      : [];
+  if (!rootMatches && groupRows.length > 0) {
+    fail(`cannot verify persisted browser process group ownership: ${dedicatedPgid}`);
+  }
   const ownedPids = new Set(
     rootMatches ? [root.pid, ...descendantsOf(root.pid, rows)] : [],
   );
-  if (dedicatedPgid === state.pid) {
-    for (const row of rows) {
-      if (row.pgid === dedicatedPgid) ownedPids.add(row.pid);
-    }
+  if (rootMatches && dedicatedPgid === state.pid) {
+    for (const row of groupRows) ownedPids.add(row.pid);
   }
   const owned = rows.filter((row) => ownedPids.has(row.pid));
   if (owned.length === 0) return false;

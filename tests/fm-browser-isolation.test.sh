@@ -31,7 +31,8 @@ cleanup() {
     "${LEGACY_BROWSER_PID:-}" \
     "${HEADED_BROWSER_PID:-}" \
     "${TEARDOWN_BROWSER_PID:-}" \
-    "${TEARDOWN_BRIDGE_PID:-}"
+    "${TEARDOWN_BRIDGE_PID:-}" \
+    "${REUSED_GROUP_PID:-}"
   do
     [ -n "$cleanup_pid" ] || continue
     if kill -0 "$cleanup_pid" 2>/dev/null; then
@@ -76,15 +77,17 @@ if (
 ) process.exit(2);
 const profile = profileArg.slice("--user-data-dir=".length);
 fs.mkdirSync(profile, { recursive: true });
-const helperReady = path.join(profile, "helper.ready");
-const helper = spawn(process.execPath, [
-  "-e",
-  "require('fs').writeFileSync(process.argv[1], 'ready\\n'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
-  helperReady,
-], {
-  stdio: "ignore",
-});
-fs.writeFileSync(path.join(profile, "helper.pid"), `${helper.pid}\n`);
+if (process.env.FM_FAKE_TERM_HELPER === "1") {
+  const helperReady = path.join(profile, "helper.ready");
+  const helper = spawn(process.execPath, [
+    "-e",
+    "require('fs').writeFileSync(process.argv[1], 'ready\\n'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+    helperReady,
+  ], {
+    stdio: "ignore",
+  });
+  fs.writeFileSync(path.join(profile, "helper.pid"), `${helper.pid}\n`);
+}
 const server = http.createServer((request, response) => {
   response.setHeader("content-type", "application/json");
   response.end(JSON.stringify({
@@ -186,6 +189,7 @@ test_task_launch_and_reap() {
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     FM_BROWSER_TASK_ID="$id" \
     FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
+    FM_FAKE_TERM_HELPER=1 \
     "$WRAPPER" open https://example.test/
 
   grep -F "home=$root/home" "$AXI_RECORD" >/dev/null \
@@ -259,6 +263,53 @@ test_failed_browser_cannot_respawn() {
     || fail "stale browser state survived failed-browser cleanup"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
   pass "unexpected browser death is cleaned and cannot trigger an implicit respawn"
+}
+
+test_stale_pgid_preserves_unrelated_group() {
+  local id=browser-reused-z7 tasktmp="$TMP_ROOT/tmp/fm-browser-reused-z7"
+  local root reused_pid reap_output
+  mkdir -p "$tasktmp/gotmp"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
+  reused_pid=$(node - "$TMP_ROOT/reused-group.pid" <<'JS'
+const { spawn } = require("child_process");
+const fs = require("fs");
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  detached: true,
+  stdio: "ignore",
+});
+child.unref();
+fs.writeFileSync(process.argv[2], `${child.pid}\n`);
+process.stdout.write(`${child.pid}\n`);
+JS
+  )
+  REUSED_GROUP_PID=$reused_pid
+  node - "$root/browser.json" "$root/profile" "$FAKE_BROWSER" "$reused_pid" <<'JS'
+const fs = require("fs");
+const [file, profile, executable, pid] = process.argv.slice(2);
+fs.writeFileSync(file, `${JSON.stringify({
+  pid: Number(pid),
+  pgid: Number(pid),
+  port: 0,
+  profile,
+  executable,
+  startedAt: new Date(0).toISOString(),
+})}\n`);
+JS
+  if reap_output=$(FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home" 2>&1); then
+    fail "reap trusted a stale persisted process group"
+  fi
+  printf '%s\n' "$reap_output" | grep -F 'cannot verify persisted browser process group ownership' >/dev/null \
+    || fail "stale process group was not rejected for ownership"
+  kill -0 "$reused_pid" 2>/dev/null || fail "unrelated reused process group was killed"
+  [ -d "$root/profile" ] || fail "profile was removed after unverified group cleanup"
+  kill "$reused_pid"
+  while kill -0 "$reused_pid" 2>/dev/null; do sleep 0.01; done
+  REUSED_GROUP_PID=
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
+  pass "stale persisted PGID cannot signal an unrelated live group"
 }
 
 test_real_teardown_path_reaps_owned_browser() {
@@ -416,7 +467,7 @@ test_orphan_sweep() {
   [ ! -e "$root" ] || fail "metadata-free task browser root survived sweep"
   [ ! -e "$legacy_profile" ] || fail "unused legacy temp profile survived sweep"
   [ -d "$headed_profile" ] || fail "active headed temp profile was removed by orphan sweep"
-  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=[1-9][0-9]* browser_processes=2 profiles=1$' >/dev/null \
+  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=[1-9][0-9]* browser_processes=1 profiles=1$' >/dev/null \
     || fail "sweep did not report measured cleanup: $out"
   pass "backstop kills only exact orphan markers and preserves unrelated processes"
 }
@@ -448,6 +499,7 @@ test_spawn_and_teardown_wiring() {
 test_process_discrimination
 test_task_launch_and_reap
 test_failed_browser_cannot_respawn
+test_stale_pgid_preserves_unrelated_group
 test_real_teardown_path_reaps_owned_browser
 test_same_id_isolated_across_homes
 test_orphan_sweep

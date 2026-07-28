@@ -4,8 +4,8 @@
 
 The real separate automation browser completed a browser-heavy AXI workload without attaching to or changing stable Chrome.
 The run used macOS 26.5.2 and Google Chrome for Testing 143.0.7499.40.
-The routing assertion used an isolated stable-Chrome app launch and left the captain's existing stable process identity unchanged.
-The unique routing URL was absent from the automation browser.
+The routing assertion used an independently profiled, credential-safe stable-Chrome control and left the captain's existing stable process and window set unchanged.
+The control received the unique routing URL, and the URL was absent from the automation browser.
 
 Command:
 
@@ -18,10 +18,9 @@ Measured output:
 ```text
 live_browser_mock_keychain=1
 live_browser_basic_password_store=1
-stable_windows_before=2
-stable_windows_after=3
+control_stable_received_route=1
 routing_url_in_automation=0
-dialog_monitor_samples=115
+dialog_monitor_samples=117
 automation_visible_windows_seen=0
 screenshots=15
 owned_processes_during_run=8
@@ -30,7 +29,11 @@ browser_tree_processes_during_run=8
 browser_tree_processes_after_stop=0
 bridge_alive_after_stop=0
 profile_exists_after_reap=0
+control_processes_during_run=9
+control_processes_after_stop=0
+control_profile_exists_after_stop=0
 stable_chrome_identity_preserved=1
+stable_chrome_window_set_preserved=1
 ok - macOS credential isolation and teardown smoke test passed
 ```
 

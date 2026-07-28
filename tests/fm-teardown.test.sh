@@ -4499,6 +4499,60 @@ test_missing_treehouse_entry_refuses_cleared_lease() {
   pass "missing Treehouse entry fails closed"
 }
 
+test_already_returned_directory_gone_cleans_metadata() {
+  local case_dir rc wt_path
+  case_dir=$(make_case already-returned-directorygone)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  wt_path=$(cd "$case_dir/wt" && pwd -P)
+
+  write_treehouse_unleased "$case_dir/wt"
+
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt" 2>/dev/null || true
+  rm -rf "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 0 ] || fail "already-returned-directorygone: teardown should succeed when work is landed and directory is gone: $(cat "$case_dir/stderr")"
+  assert_grep 'lease already cleared' "$case_dir/stderr" \
+    "already-returned-directorygone: teardown did not log the cleared-lease detection"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "already-returned-directorygone: task metadata was not cleaned"
+  pass "already-returned worktree with directory gone cleans metadata"
+}
+
+test_already_returned_absent_leased_field_is_cleared() {
+  local case_dir rc slot pool state
+  case_dir=$(make_case already-returned-absent-leased)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  slot=$(cd "$(dirname "$case_dir/wt")" && pwd -P)
+  pool=$(cd "$(dirname "$slot")" && pwd -P)
+  state="$pool/treehouse-state.json"
+  python3 - "$state" "$(cd "$case_dir/wt" && pwd -P)" <<'PY'
+import json, sys
+state, path = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump({"worktrees": [{"name": "1", "path": path}]}, stream)
+PY
+
+  set +e
+  FM_FAKE_COMPLETE_RETURN=1 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 0 ] || fail "already-returned-absent-leased: teardown should succeed when leased field is absent: $(cat "$case_dir/stderr")"
+  assert_grep 'lease already cleared' "$case_dir/stderr" \
+    "already-returned-absent-leased: teardown did not detect the cleared lease"
+  pass "already-returned worktree with absent leased field is treated as cleared"
+}
+
 test_fd_leak_under_low_ulimit() {
   local case_dir rc dir_count i
   case_dir=$(make_case fd-leak-ulimit)
@@ -4535,6 +4589,8 @@ if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_already_returned_worktree_cleanup_honors_checkout_lock
   test_duplicate_treehouse_entries_refuse_cleared_lease
   test_missing_treehouse_entry_refuses_cleared_lease
+  test_already_returned_directory_gone_cleans_metadata
+  test_already_returned_absent_leased_field_is_cleared
   test_fd_leak_under_low_ulimit
   exit 0
 fi
@@ -4798,4 +4854,6 @@ test_already_returned_worktree_with_unlanded_work_refuses
 test_already_returned_worktree_cleanup_honors_checkout_lock
 test_duplicate_treehouse_entries_refuse_cleared_lease
 test_missing_treehouse_entry_refuses_cleared_lease
+test_already_returned_directory_gone_cleans_metadata
+test_already_returned_absent_leased_field_is_cleared
 test_fd_leak_under_low_ulimit

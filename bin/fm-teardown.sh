@@ -1057,7 +1057,8 @@ try:
     if len(matches) != 1:
         raise SystemExit(1)
     entry = matches[0]
-    if entry.get("leased") is not False:
+    leased = entry.get("leased")
+    if leased is not False and leased is not None:
         raise SystemExit(1)
     if entry.get("lease_holder") not in ("", None):
         raise SystemExit(1)
@@ -1094,7 +1095,19 @@ validate_teardown_target_identity() {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1
   }
+  if ! [ -d "$WT" ]; then
+    if treehouse_lease_is_cleared "$WT"; then
+      echo "teardown: worktree lease already cleared and directory gone (partial or completed return): $WT" >&2
+      return "$TEARDOWN_WORKTREE_ALREADY_RETURNED"
+    fi
+    echo "error: teardown worktree directory is missing and lease state is indeterminate: ${WT:-<missing>}" >&2
+    return 1
+  fi
   worktree_root=$(exact_git_worktree_root "$WT") || {
+    if treehouse_lease_is_cleared "$WT"; then
+      echo "teardown: worktree lease already cleared (worktree may be a partial-return remnant): $WT" >&2
+      return "$TEARDOWN_WORKTREE_ALREADY_RETURNED"
+    fi
     echo "error: teardown worktree metadata is not an exact inspectable repository root: ${WT:-<missing>}" >&2
     return 1
   }
@@ -1383,7 +1396,7 @@ cleanup_already_returned_worktree_locked() {
     echo "error: worktree lease changed during final safety checks; retaining $WT" >&2
     return 1
   }
-  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=HEAD
   validate_removal_tree_boundaries "$WT" "worktree" || return 1
   if out=$(fm_checkout_treehouse_return_locked "$WT" "$CHECKOUT_LOCK_ROOT" "$PROJ" 2>&1); then
     [ -n "$out" ] && printf '%s\n' "$out"
@@ -1398,6 +1411,18 @@ cleanup_already_returned_worktree_locked() {
     return 1
   }
   cleanup_recovered_worktree "$branch" "$WT" "$PROJ"
+}
+
+cleanup_already_returned_worktree_no_directory() {
+  treehouse_lease_is_cleared "$WT" || {
+    echo "error: worktree lease is no longer provably cleared after directory-gone detection; retaining metadata" >&2
+    return 1
+  }
+  local branch
+  branch=$(git -C "$PROJ" for-each-ref --format='%(refname:short)' "refs/heads/fm/$ID" 2>/dev/null)
+  if [ -n "$branch" ]; then
+    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
+  fi
 }
 
 validate_worktree_teardown_safety() {
@@ -4202,11 +4227,15 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     ORCA_PATH_MATCH_VERIFIED=1
   fi
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_orca_worktree_locked || exit 1
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+elif [ "$KIND" != secondmate ]; then
   if [ "$WORKTREE_ALREADY_RETURNED" = 1 ]; then
-    fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" \
-      cleanup_already_returned_worktree_locked || exit 1
-  else
+    if [ -d "$WT" ]; then
+      fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" \
+        cleanup_already_returned_worktree_locked || exit 1
+    else
+      cleanup_already_returned_worktree_no_directory || exit 1
+    fi
+  elif [ -d "$WT" ]; then
     post_lock_cleanup_check=
     if [ "$KIND" != secondmate ]; then
       post_lock_cleanup_check=validate_worktree_teardown_safety

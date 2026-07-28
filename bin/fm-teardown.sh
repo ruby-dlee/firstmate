@@ -1826,9 +1826,12 @@ safe_rm_rf_child_worktree() {
 }
 
 safe_remove_task_tmp() {
-  local target=$1 base
+  local target=$1 task_id=${2:-$ID} base
   [ -n "$target" ] || return 0
-  [ "$target" = "/tmp/fm-$ID" ] || return 1
+  case "$task_id" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "$target" = "/tmp/fm-$task_id" ] || return 1
   base=$(python3 - <<'PY'
 import os
 import stat
@@ -1849,7 +1852,14 @@ if not stat.S_ISDIR(os.lstat(base).st_mode):
 print(base)
 PY
   ) || return 1
-  removal_tree_operation "$base/fm-$ID" "task temp root" remove
+  removal_tree_operation "$base/fm-$task_id" "task temp root" remove
+}
+
+reap_task_browser() {
+  local id=$1 tasktmp=$2
+  [ -n "$tasktmp" ] || return 0
+  [ -x "$FM_ROOT/bin/fm-browser-isolation.sh" ] || return 0
+  "$FM_ROOT/bin/fm-browser-isolation.sh" reap "$id" "$tasktmp"
 }
 
 remove_worktree_compatibility_artifacts() {
@@ -3597,7 +3607,7 @@ remove_child_orca_worktree_locked() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_metas child_meta child_id child_wt child_proj child_kind child_prelock_kind child_home child_home_after child_home_lock child_registry_lock child_backend child_orca_worktree_id child_return_rc child_account_lock child_endpoint_home remaining_child_metas child_registry_prepared child_registry_update child_registry_backup
+  local home=$1 sub_state child_metas child_meta child_id child_wt child_proj child_kind child_prelock_kind child_home child_home_after child_home_lock child_registry_lock child_backend child_orca_worktree_id child_return_rc child_account_lock child_endpoint_home child_tasktmp remaining_child_metas child_registry_prepared child_registry_update child_registry_backup
   sub_state="$home/state"
   child_metas=$(secondmate_state_metadata "$home") || return 1
   while IFS= read -r child_meta; do
@@ -3668,6 +3678,11 @@ cleanup_firstmate_home_children() {
     else
       quiesce_child_endpoint "$child_meta" "$child_id" "$home" "$child_home" || return 1
     fi
+    child_tasktmp=$(meta_value "$child_meta" tasktmp)
+    reap_task_browser "$child_id" "$child_tasktmp" || {
+      echo "error: retained child metadata for $child_id because its browser cleanup could not be verified" >&2
+      return 1
+    }
     if [ "$child_kind" = secondmate ]; then
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home" || return 1
@@ -3751,6 +3766,10 @@ EOF
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
+    safe_remove_task_tmp "$child_tasktmp" "$child_id" || {
+      echo "error: retained child metadata for $child_id because its task temp root could not be removed" >&2
+      return 1
+    }
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
     [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done <<EOF
@@ -3885,6 +3904,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  reap_task_browser "$ID" "$TASK_TMP" || exit 1
   safe_remove_task_tmp "$TASK_TMP" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
@@ -4184,6 +4204,7 @@ remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
+[ -z "$TASK_TMP" ] || reap_task_browser "$ID" "$TASK_TMP" || exit 1
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true

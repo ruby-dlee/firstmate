@@ -30,6 +30,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
 | `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crewmates on the resolved account and runtime backend |
+| `chrome-devtools-axi`    | Route crew browser commands through the task-scoped credential-safe automation browser |
+| `fm-browser-isolation.sh` | Prepare, run, reap, sweep, and classify task-owned automation browser state          |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule through quota or the deferred legacy pool-summary branch |
 | `fm-account-directory.sh` | Select a direct Claude/Codex account directory and install its per-profile Herdr hook |
 | `fm-account-routing-lib.sh` | Own routing mode plus legacy Agent Fleet lease, exec, resume, and release recovery |

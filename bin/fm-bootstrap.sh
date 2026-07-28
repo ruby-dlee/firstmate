@@ -17,6 +17,7 @@
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
+#                 "BROWSER_GC: reaped|unavailable: <detail>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
@@ -76,9 +77,10 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (report_retention_ensure, secondmate_sync,
-#          secondmate_liveness_sweep, x_mode_setup, fleet_sync) while still
+#          secondmate_liveness_sweep, browser_gc_sweep, x_mode_setup,
+#          fleet_sync) while still
 #          printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -124,6 +126,20 @@ report_retention_ensure() {
   if ! out=$("$SCRIPT_DIR/fm-report-retention.sh" ensure 2>&1); then
     [ -n "$out" ] || out="persistent owner did not start"
     echo "REPORT_RETENTION: unavailable: ${out%%$'\n'*}"
+  fi
+}
+
+browser_gc_sweep() {
+  local out
+  if [ "${FM_GATE_REFUSE_BYPASS:-0}" = 1 ] && [ "${FM_BROWSER_GC_BOOTSTRAP_TEST:-0}" != 1 ]; then
+    return 0
+  fi
+  [ -x "$SCRIPT_DIR/fm-browser-isolation.sh" ] || return 0
+  if out=$("$SCRIPT_DIR/fm-browser-isolation.sh" sweep "$FM_HOME" "$STATE" 2>&1); then
+    [ -z "$out" ] || printf '%s\n' "$out"
+  else
+    [ -n "$out" ] || out="browser cleanup could not be verified"
+    echo "BROWSER_GC: unavailable: ${out%%$'\n'*}"
   fi
 }
 
@@ -878,6 +894,7 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   report_retention_ensure
   secondmate_sync
   secondmate_liveness_sweep
+  browser_gc_sweep
   x_mode_setup
   fleet_sync
 fi

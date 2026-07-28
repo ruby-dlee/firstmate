@@ -4515,12 +4515,11 @@ test_missing_treehouse_entry_refuses_cleared_lease() {
 }
 
 test_already_returned_directory_gone_cleans_metadata() {
-  local case_dir rc wt_path
+  local case_dir rc
   case_dir=$(make_case already-returned-directorygone)
   write_meta "$case_dir" no-mistakes ship
   wt_commit "$case_dir" "fix the thing"
   git -C "$case_dir/wt" push -q origin fm/task-x1
-  wt_path=$(cd "$case_dir/wt" && pwd -P)
 
   write_treehouse_unleased "$case_dir/wt"
 

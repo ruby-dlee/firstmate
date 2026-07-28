@@ -59,6 +59,64 @@ stable_window_fingerprint() {
   ' "$1"
 }
 
+stable_tab_fingerprint() {
+  swift -e '
+    import AppKit
+    import Carbon
+
+    let target = NSAppleEventDescriptor(bundleIdentifier: "com.google.Chrome")
+    let permission = AEDeterminePermissionToAutomateTarget(
+      target.aeDesc,
+      typeWildCard,
+      typeWildCard,
+      false
+    )
+    guard permission == noErr else {
+      fputs("stable Chrome tab observation is not pre-authorized\n", stderr)
+      exit(77)
+    }
+    let source = """
+    tell application "Google Chrome"
+      set rows to {}
+      repeat with windowIndex from 1 to count of windows
+        set chromeWindow to window windowIndex
+        repeat with tabIndex from 1 to count of tabs of chromeWindow
+          set chromeTab to tab tabIndex of chromeWindow
+          try
+            set tabURL to URL of chromeTab as text
+          on error
+            set tabURL to ""
+          end try
+          set end of rows to ((windowIndex as text) & tab & (tabIndex as text) & tab & tabURL)
+        end repeat
+      end repeat
+      set AppleScript'"'"'s text item delimiters to linefeed
+      return rows as text
+    end tell
+    """
+    var error: NSDictionary?
+    guard let result = NSAppleScript(source: source)?.executeAndReturnError(&error) else {
+      fputs("stable Chrome tab observation failed: \(error ?? [:])\n", stderr)
+      exit(78)
+    }
+    print(result.stringValue ?? "")
+  '
+}
+
+stable_tab_fingerprint_retry() {
+  local attempts=0 result
+  while [ "$attempts" -lt 20 ]; do
+    if result=$(stable_tab_fingerprint 2>&1); then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  printf '%s\n' "$result" >&2
+  return 1
+}
+
 cleanup_control() {
   [ -n "$CONTROL_PID" ] || return 0
   local command current_pgid
@@ -163,6 +221,8 @@ STABLE_PID=$(
 [ -n "$STABLE_PID" ] || fail "captain stable Chrome process was not found"
 STABLE_IDENTITY=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 STABLE_WINDOWS=$(stable_window_fingerprint "$STABLE_PID")
+STABLE_TABS=$(stable_tab_fingerprint_retry) \
+  || fail "stable Chrome tab observation lacks existing no-prompt authorization"
 
 mkdir -p "$TASK_TMP/gotmp" "$TASK_TMP/shots"
 "$BROWSER_LIFECYCLE" prepare \
@@ -350,6 +410,10 @@ STABLE_IDENTITY_AFTER=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 STABLE_WINDOWS_AFTER=$(stable_window_fingerprint "$STABLE_PID")
 [ "$STABLE_WINDOWS_AFTER" = "$STABLE_WINDOWS" ] \
   || fail "captain stable Chrome window set changed during the smoke test"
+STABLE_TABS_AFTER=$(stable_tab_fingerprint_retry) \
+  || fail "stable Chrome tab observation lost authorization"
+[ "$STABLE_TABS_AFTER" = "$STABLE_TABS" ] \
+  || fail "captain stable Chrome tab set changed during the smoke test"
 
 printf 'screenshots=15\n'
 printf 'owned_processes_during_run=%s\n' "$OWNED_DURING_RUN"
@@ -363,4 +427,5 @@ printf 'control_processes_after_stop=%s\n' "$CONTROL_AFTER_STOP"
 printf 'control_profile_exists_after_stop=%s\n' "$CONTROL_PROFILE_AFTER_STOP"
 printf 'stable_chrome_identity_preserved=1\n'
 printf 'stable_chrome_window_set_preserved=1\n'
+printf 'stable_chrome_tab_set_preserved=1\n'
 printf 'ok - macOS credential isolation and teardown smoke test passed\n'

@@ -22,7 +22,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -53,6 +53,7 @@ const BRIDGE_PROCESS_RE =
 const OWNER_FILE = "owner.json";
 const BROWSER_FILE = "browser.json";
 const BROWSER_FAILURE_FILE = "browser.failed";
+const BROWSER_SENTINEL_FILE = "browser-sentinel.json";
 const AXI_PORT_FILE = "axi-port";
 const LOCK_FILE = "lifecycle.lock";
 const START_TIMEOUT_MS = 20_000;
@@ -270,6 +271,19 @@ function processMatchesBrowser(state, row) {
   );
 }
 
+function processMatchesSentinel(state, row) {
+  return (
+    row !== null &&
+    Number.isSafeInteger(state.sentinelPid) &&
+    state.sentinelPid === state.pgid &&
+    row.pid === state.sentinelPid &&
+    row.pgid === state.pgid &&
+    row.command.includes("fm-browser-isolation.mjs sentinel") &&
+    row.command.includes(state.profile) &&
+    row.command.includes(state.sentinelNonce)
+  );
+}
+
 function processMatchesBridge(row) {
   return row !== null && isLegacyBridge(row);
 }
@@ -332,27 +346,35 @@ async function terminateOwnedBrowserTree(state) {
   const rows = processInventory();
   const root = rowForPid(state.pid, rows);
   const rootMatches = processMatchesBrowser(state, root);
+  const sentinelMatches = processMatchesSentinel(
+    state,
+    rowForPid(state.sentinelPid, rows),
+  );
   const dedicatedPgid = Number.isSafeInteger(state.pgid)
     ? state.pgid
     : rootMatches && root.pgid === root.pid
       ? root.pgid
       : 0;
+  const groupLeaderPid = Number.isSafeInteger(state.sentinelPid)
+    ? state.sentinelPid
+    : state.pid;
+  const dedicatedGroup = dedicatedPgid === groupLeaderPid;
   const groupRows =
-    dedicatedPgid === state.pid
+    dedicatedGroup
       ? rows.filter((row) => row.pgid === dedicatedPgid)
       : [];
-  if (!rootMatches && groupRows.length > 0) {
+  if (!rootMatches && !sentinelMatches && groupRows.length > 0) {
     fail(`cannot verify persisted browser process group ownership: ${dedicatedPgid}`);
   }
   const ownedPids = new Set(
     rootMatches ? [root.pid, ...descendantsOf(root.pid, rows)] : [],
   );
-  if (rootMatches && dedicatedPgid === state.pid) {
+  if ((rootMatches || sentinelMatches) && dedicatedGroup) {
     for (const row of groupRows) ownedPids.add(row.pid);
   }
   const owned = rows.filter((row) => ownedPids.has(row.pid));
   if (owned.length === 0) return false;
-  if (dedicatedPgid === state.pid) {
+  if (dedicatedGroup) {
     try {
       process.kill(-dedicatedPgid, "SIGTERM");
     } catch {
@@ -560,6 +582,8 @@ function readBrowserState(root) {
     if (
       Number.isSafeInteger(state.pid) &&
       (!("pgid" in state) || Number.isSafeInteger(state.pgid)) &&
+      (!("sentinelPid" in state) || Number.isSafeInteger(state.sentinelPid)) &&
+      (!("sentinelNonce" in state) || typeof state.sentinelNonce === "string") &&
       Number.isSafeInteger(state.port) &&
       typeof state.profile === "string" &&
       typeof state.executable === "string"
@@ -607,6 +631,7 @@ async function stopTaskBrowser(root) {
     );
   }
   rmSync(path.join(root, BROWSER_FILE), { force: true });
+  rmSync(path.join(root, BROWSER_SENTINEL_FILE), { force: true });
   return stopped || stillOwned.length > 0;
 }
 
@@ -641,7 +666,6 @@ async function ensureBrowser(root, owner) {
   }
 
   const logFile = path.join(root, "browser.log");
-  const logFd = openSync(logFile, "a", 0o600);
   const args = [
     "--headless=new",
     ...CREDENTIAL_ISOLATION_ARGS,
@@ -659,17 +683,48 @@ async function ensureBrowser(root, owner) {
     `--user-data-dir=${profile}`,
     "about:blank",
   ];
-  const child = spawn(owner.browserExecutable, args, {
+  const sentinelNonce = randomUUID();
+  rmSync(path.join(root, BROWSER_SENTINEL_FILE), { force: true });
+  const sentinel = spawn(process.execPath, [
+    path.resolve(process.argv[1]),
+    "sentinel",
+    root,
+    sentinelNonce,
+    owner.browserExecutable,
+    logFile,
+    ...args,
+  ], {
     detached: true,
     env: { ...process.env, HOME: home },
-    stdio: ["ignore", logFd, logFd],
+    stdio: "ignore",
   });
-  closeSync(logFd);
-  child.unref();
+  sentinel.unref();
+  const sentinelDeadline = Date.now() + START_TIMEOUT_MS;
+  let sentinelState = null;
+  while (Date.now() < sentinelDeadline) {
+    if (!processAlive(sentinel.pid)) break;
+    try {
+      sentinelState = readJson(path.join(root, BROWSER_SENTINEL_FILE));
+      if (
+        sentinelState.pid === sentinel.pid &&
+        sentinelState.pgid === sentinel.pid &&
+        sentinelState.nonce === sentinelNonce &&
+        Number.isSafeInteger(sentinelState.browserPid)
+      ) {
+        break;
+      }
+    } catch {
+      sentinelState = null;
+    }
+    await sleep(25);
+  }
+  if (!sentinelState) fail("automation browser sentinel failed to start");
 
   const state = {
-    pid: child.pid,
-    pgid: child.pid,
+    pid: sentinelState.browserPid,
+    pgid: sentinel.pid,
+    sentinelPid: sentinel.pid,
+    sentinelNonce,
     port: 0,
     profile,
     executable: owner.browserExecutable,
@@ -680,7 +735,7 @@ async function ensureBrowser(root, owner) {
   const activePortFile = path.join(profile, "DevToolsActivePort");
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (!processAlive(child.pid)) break;
+    if (!processAlive(state.pid)) break;
     if (existsSync(activePortFile)) {
       const port = Number(readFileSync(activePortFile, "utf8").split(/\r?\n/, 1)[0]);
       if (Number.isInteger(port) && port > 0 && (await browserReachable(port))) {
@@ -706,6 +761,41 @@ async function ensureBrowser(root, owner) {
     diagnostic = "";
   }
   fail(`automation browser failed to start${diagnostic ? `: ${diagnostic}` : ""}`);
+}
+
+async function commandSentinel(args) {
+  if (args.length < 5) fail("invalid browser sentinel invocation");
+  const [rootInput, nonce, executableInput, logFile, ...browserArgs] = args;
+  const ownerRecord = readJson(path.join(rootInput, OWNER_FILE));
+  const root = validateBrowserRoot(
+    ownerRecord.taskId,
+    rootInput,
+    ownerRecord.ownerHome,
+  );
+  const executable = validateExecutable(executableInput, "automation browser executable");
+  if (executable !== ownerRecord.browserExecutable) {
+    fail("browser sentinel executable changed");
+  }
+  const logFd = openSync(logFile, "a", 0o600);
+  const browser = spawn(executable, browserArgs, {
+    env: process.env,
+    stdio: ["ignore", logFd, logFd],
+  });
+  const browserExit = new Promise((resolve) => {
+    browser.once("exit", resolve);
+    browser.once("error", resolve);
+  });
+  closeSync(logFd);
+  writeJson(path.join(root, BROWSER_SENTINEL_FILE), {
+    version: 1,
+    pid: process.pid,
+    pgid: process.pid,
+    nonce,
+    browserPid: browser.pid,
+  });
+  await browserExit;
+  setInterval(() => {}, 60_000);
+  await new Promise(() => {});
 }
 
 function axiEnvironment(root, owner, browserState, axiPort) {
@@ -1063,6 +1153,9 @@ async function main() {
   switch (command) {
     case "prepare":
       await commandPrepare(args);
+      break;
+    case "sentinel":
+      await commandSentinel(args);
       break;
     case "root":
       if (args.length !== 2) fail("usage: root <task-id> <owner-home>");

@@ -32,7 +32,9 @@ cleanup() {
     "${HEADED_BROWSER_PID:-}" \
     "${TEARDOWN_BROWSER_PID:-}" \
     "${TEARDOWN_BRIDGE_PID:-}" \
-    "${REUSED_GROUP_PID:-}"
+    "${REUSED_GROUP_PID:-}" \
+    "${KILLED_SENTINEL_PID:-}" \
+    "${KILLED_HELPER_PID:-}"
   do
     [ -n "$cleanup_pid" ] || continue
     if kill -0 "$cleanup_pid" 2>/dev/null; then
@@ -312,6 +314,39 @@ JS
   pass "stale persisted PGID cannot signal an unrelated live group"
 }
 
+test_killed_root_reaps_verified_sentinel_group() {
+  local id=browser-killed-z8 tasktmp="$TMP_ROOT/tmp/fm-browser-killed-z8"
+  local root browser_pid helper_pid sentinel_pid attempts=0
+  mkdir -p "$tasktmp/gotmp"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" FM_BROWSER_TASK_ID="$id" \
+    FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
+    FM_FAKE_TERM_HELPER=1 "$WRAPPER" open https://killed.example.test/
+  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/browser.json")
+  sentinel_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).sentinelPid)' "$root/browser.json")
+  helper_pid=$(cat "$root/profile/helper.pid")
+  KILLED_SENTINEL_PID=$sentinel_pid
+  KILLED_HELPER_PID=$helper_pid
+  while [ ! -f "$root/profile/helper.ready" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || fail "killed-root helper did not become ready"
+    sleep 0.01
+  done
+  kill -KILL "$browser_pid"
+  while kill -0 "$browser_pid" 2>/dev/null; do sleep 0.01; done
+  kill -0 "$sentinel_pid" 2>/dev/null || fail "browser sentinel did not survive root death"
+  kill -0 "$helper_pid" 2>/dev/null || fail "TERM-resistant helper did not survive root death"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
+  kill -0 "$sentinel_pid" 2>/dev/null && fail "browser sentinel survived verified reap"
+  kill -0 "$helper_pid" 2>/dev/null && fail "TERM-resistant helper survived verified reap"
+  [ ! -e "$root" ] || fail "killed browser profile survived verified reap"
+  KILLED_SENTINEL_PID=
+  KILLED_HELPER_PID=
+  pass "killed browser root reaps its verified sentinel and helper group"
+}
+
 test_real_teardown_path_reaps_owned_browser() {
   local id="browser-td-z5-$$" tasktmp="/tmp/fm-browser-td-z5-$$"
   local home="$TMP_ROOT/teardown-home" pool="$TMP_ROOT/teardown-pool"
@@ -500,6 +535,7 @@ test_process_discrimination
 test_task_launch_and_reap
 test_failed_browser_cannot_respawn
 test_stale_pgid_preserves_unrelated_group
+test_killed_root_reaps_verified_sentinel_group
 test_real_teardown_path_reaps_owned_browser
 test_same_id_isolated_across_homes
 test_orphan_sweep

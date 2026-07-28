@@ -27,6 +27,7 @@ Successful AXI commands reuse that task browser so page state survives between c
 Failed spawn rollback uses the same verified reap before it removes a prepared task temp root.
 
 A browser that exits unexpectedly or an AXI command that fails is cleaned immediately and writes a failure latch.
+Each browser group retains a task-bound sentinel so cleanup can verify and reap helpers after the browser root exits without trusting a historical process-group number.
 Later commands refuse to respawn it implicitly.
 An explicit `chrome-devtools-axi stop` clears the latch.
 This prevents a screenshot loop from recreating browsers while an operator is trying to contain an incident.
@@ -49,5 +50,5 @@ The sweep prints `BROWSER_GC:` only when it reaps something or cannot verify cle
 
 Run `tests/fm-browser-isolation.test.sh` for fake-process behavior, failure-latch, teardown, backstop, and discrimination coverage.
 On macOS, run `tests/fm-browser-isolation-macos-smoke.sh` manually to launch the real separate browser, capture 15 screenshots, continuously sample automation windows and newly appearing credential-dialog owners or titles, record the live browser arguments, and prove zero bridge, complete browser-tree, and profile counts after stop and reap.
-Set `FM_BROWSER_ROUTING_TEST=1` to launch a credential-safe stable-Chrome control with its own temporary profile; the smoke test proves the control receives the unique URL, automation does not, the control is fully reaped, and the captain's stable process and window set remain unchanged.
+Set `FM_BROWSER_ROUTING_TEST=1` to launch a credential-safe stable-Chrome control with its own temporary profile; the smoke test proves the control receives the unique URL, automation does not, the control is fully reaped, and the captain's stable process, window set, and read-only tab fingerprint remain unchanged.
 Measured macOS evidence is recorded in `docs/browser-isolation-verification.md`.

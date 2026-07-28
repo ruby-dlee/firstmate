@@ -2289,6 +2289,51 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   pass "secondmate launches require authoritative routing policy while off mode preserves legacy homes"
 }
 
+test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate() {
+  local id rec sm out status
+  id=account-secondmate-enforce-dirty-incapable-z11i
+  rec=$(make_case secondmate-enforce-dirty-incapable claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id" incapable
+  sm=$(cd "$sm" && pwd -P)
+  printf '\n' >> "$sm/AGENTS.md"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "enforced dirty incapable secondmate launched"
+  assert_contains "$out" "dirty working tree" \
+    "enforced dirty incapable secondmate did not stop at the freshness gate"
+  assert_not_contains "$out" "lacks Agent Fleet routing support" \
+    "enforced dirty incapable secondmate reached capability handling"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "enforced dirty incapable secondmate created an endpoint"
+  pass "enforced dirty incapable secondmates stop at the freshness gate"
+}
+
+test_off_dirty_incapable_secondmate_stops_at_freshness_gate() {
+  local id rec sm out status
+  id=account-secondmate-off-dirty-incapable-z11j
+  rec=$(make_case secondmate-off-dirty-incapable claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id" incapable
+  sm=$(cd "$sm" && pwd -P)
+  printf '\n' >> "$sm/AGENTS.md"
+
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "off-mode dirty incapable secondmate launched"
+  assert_contains "$out" "dirty working tree" \
+    "off-mode dirty incapable secondmate did not stop at the freshness gate"
+  assert_not_contains "$out" "launching because account routing is off" \
+    "off-mode dirty incapable secondmate reached capability handling"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "off-mode dirty incapable secondmate created an endpoint"
+  pass "off-mode dirty incapable secondmates stop at the freshness gate"
+}
+
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
   local id rec sm zellij_log out status scope
   id=account-secondmate-zellij-z11a
@@ -6142,9 +6187,9 @@ if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = secondmate-capability ]; then
-  run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
-  run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+if [ "${FM_TEST_FOCUSED:-}" = dirty-secondmate-freshness ]; then
+  run_isolated_test test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate
+  run_isolated_test test_off_dirty_incapable_secondmate_stops_at_freshness_gate
   exit 0
 fi
 
@@ -6454,6 +6499,8 @@ run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inh
 run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
 run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
 run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+run_isolated_test test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate
+run_isolated_test test_off_dirty_incapable_secondmate_stops_at_freshness_gate
 run_isolated_test test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt

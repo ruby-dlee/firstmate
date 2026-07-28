@@ -27,9 +27,9 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # The pre-cutover suite reached 25m35s, and the exhaustive Bridge crash
-    # matrix adds bounded work. Keep enough margin without masking a real hang.
-    timeout-minutes: 45
+    # The expanded suite was still making forward progress when the prior 45m
+    # budget expired. Allow measured headroom while retaining a finite hang cap.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
         with:

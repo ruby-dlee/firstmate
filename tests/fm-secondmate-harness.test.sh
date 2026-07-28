@@ -252,21 +252,48 @@ SH
 # seed marker, AGENTS.md, bin/, and a charter to launch). config/ is intentionally
 # left absent so the spawn's propagation is what creates it.
 make_seeded_home() {
-  local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  local home=$1 id=$2 default_branch
+  default_branch=$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD)
+  default_branch=${default_branch#origin/}
+  git clone -q --branch "$default_branch" "$ROOT" "$home"
+  git -C "$home" checkout -q --detach
+  git -C "$home" update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch"
+  git -C "$home" checkout -q "$default_branch"
+  git -C "$home" remote set-head origin "$default_branch"
+  mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
 }
 
-# spawn_secondmate <world> <id> <home> [explicit-harness]
-# Runs fm-spawn.sh in secondmate mode. FM_ROOT is the real repo (so fm-harness.sh
-# resolves), the primary config dir is <world>/home/config, and CLAUDECODE pins
-# detect_own. stderr is discarded (the local-HEAD ff sync harmlessly skips a
-# non-worktree home). Inspect <world>/home/state/<id>.meta and <home>/config after.
-spawn_secondmate() {
-  local world=$1 id=$2 home=$3 harness=${4:-} fakebin
+prepare_spawn_world() {
+  local world=$1 id=$2 home=$3 home_real primary default_branch
   mkdir -p "$world/home/state" "$world/home/data"
+  primary="$world/primary"
+  if [ ! -d "$primary/.git" ]; then
+    default_branch=$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD)
+    default_branch=${default_branch#origin/}
+    git clone -q --branch "$default_branch" "$ROOT" "$primary"
+    git -C "$primary" checkout -q --detach
+    git -C "$primary" update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch"
+    git -C "$primary" checkout -q "$default_branch"
+    git -C "$primary" remote set-url origin "$primary"
+    git -C "$primary" remote set-head origin "$default_branch"
+  fi
+  git -C "$home" remote set-url origin "$primary"
+  default_branch=$(git -C "$primary" branch --show-current)
+  git -C "$home" remote set-head origin "$default_branch"
+  home_real=$(cd "$home" && pwd -P)
+  printf -- '- %s - harness test (home: %s; scope: harness test; projects: ; added 2026-07-27)\n' \
+    "$id" "$home_real" > "$world/home/data/secondmates.md"
+  printf '%s\n' "$primary"
+}
+
+# spawn_secondmate <world> <id> <home> [explicit-harness]
+# Runs fm-spawn.sh in secondmate mode. CLAUDECODE pins detect_own. Inspect
+# <world>/home/state/<id>.meta and <home>/config after.
+spawn_secondmate() {
+  local world=$1 id=$2 home=$3 harness=${4:-} fakebin primary
+  primary=$(prepare_spawn_world "$world" "$id" "$home")
   fakebin=$(make_noop_tmux "$world/tmux-$id")
   # An empty harness must contribute zero args, not an empty positional; build the
   # arg list explicitly so the optional harness is omitted cleanly.
@@ -274,7 +301,7 @@ spawn_secondmate() {
   [ -n "$harness" ] && spawn_args+=("$harness")
   spawn_args+=(--secondmate)
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
-    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
+    FM_ROOT_OVERRIDE="$primary" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
     FM_SPAWN_NO_GUARD=1 \
@@ -374,12 +401,15 @@ test_spawn_explicit_harness_wins() {
 # The unverified-adapter guard holds on the resolved secondmate path: an unknown
 # config/secondmate-harness aborts the spawn (no meta written) and names the source.
 test_spawn_unverified_secondmate_harness_refused() {
-  local w sm fakebin err rc
+  local w sm sm_real fakebin err rc
   w="$TMP_ROOT/spawn-unverified"
   sm="$w/sm"
-  mkdir -p "$w/home/config" "$w/home/state"
+  mkdir -p "$w/home/config" "$w/home/state" "$w/home/data"
   printf 'bogus\n' > "$w/home/config/secondmate-harness"
   make_seeded_home "$sm" sm
+  sm_real=$(cd "$sm" && pwd -P)
+  printf -- '- sm - harness test (home: %s; scope: harness test; projects: ; added 2026-07-27)\n' \
+    "$sm_real" > "$w/home/data/secondmates.md"
   fakebin=$(make_noop_tmux "$w/tmux")
   err="$w/spawn.err"
   rc=0
@@ -448,13 +478,13 @@ SH
 # Same shape as spawn_secondmate but captures the launch command into <launchlog>
 # and does not discard stderr, so callers can assert on both.
 spawn_secondmate_capture() {
-  local world=$1 id=$2 home=$3 launchlog=$4 fakebin
+  local world=$1 id=$2 home=$3 launchlog=$4 fakebin primary
   shift 4
-  mkdir -p "$world/home/state" "$world/home/data"
+  primary=$(prepare_spawn_world "$world" "$id" "$home")
   fakebin=$(make_launch_capturing_tmux "$world/tmux-$id")
   : > "$launchlog"
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
-    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
+    FM_ROOT_OVERRIDE="$primary" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_LAUNCH_LOG="$launchlog" \

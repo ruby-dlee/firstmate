@@ -1418,7 +1418,10 @@ cleanup_already_returned_worktree_no_directory() {
     echo "error: worktree lease is no longer provably cleared after directory-gone detection; retaining metadata" >&2
     return 1
   }
-  branch=$(git -C "$PROJ" for-each-ref --format='%(refname:short)' "refs/heads/fm/$ID" 2>/dev/null)
+  if ! branch=$(git -C "$PROJ" for-each-ref --format='%(refname:short)' "refs/heads/fm/$ID" 2>/dev/null); then
+    echo "REFUSED: cannot inspect the recovered task branch for fm/$ID." >&2
+    return 1
+  fi
   if [ -n "$branch" ]; then
     if ! unpushed_raw=$(git -C "$PROJ" log --oneline "$branch" --not --remotes -- 2>/dev/null); then
       echo "REFUSED: cannot inspect recovered branch $branch for commits not on a remote." >&2

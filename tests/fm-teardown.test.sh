@@ -740,6 +740,21 @@ SH
   chmod +x "$case_dir/fakebin/git"
 }
 
+add_git_recovered_branch_lookup_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -C ] \
+  && [ "${2:-}" = "${FM_FAKE_FOR_EACH_REF_PROJECT:?}" ] \
+  && [ "${3:-}" = for-each-ref ]; then
+  echo "fatal: simulated recovered branch lookup failure" >&2
+  exit 128
+fi
+exec "${REAL_GIT_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+}
+
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
 run_teardown() {
   local case_dir=$1; shift
@@ -4577,6 +4592,34 @@ test_already_returned_directory_gone_with_unpushed_work_refuses() {
   pass "directory-gone recovery preserves an unpushed task branch"
 }
 
+test_already_returned_directory_gone_branch_lookup_failure_refuses() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-directorygone-lookup-failure)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  write_treehouse_unleased "$case_dir/wt"
+
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt" 2>/dev/null || true
+  rm -rf "$case_dir/wt"
+  add_git_recovered_branch_lookup_failure "$case_dir"
+
+  set +e
+  FM_FAKE_FOR_EACH_REF_PROJECT="$case_dir/project" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-directorygone-lookup-failure: teardown ignored branch lookup failure"
+  git -C "$case_dir/project" show-ref --verify --quiet refs/heads/fm/task-x1 \
+    || fail "already-returned-directorygone-lookup-failure: task branch was deleted"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "already-returned-directorygone-lookup-failure: task metadata was removed"
+  assert_grep 'REFUSED: cannot inspect the recovered task branch for fm/task-x1' "$case_dir/stderr" \
+    "already-returned-directorygone-lookup-failure: teardown did not explain the refusal"
+  pass "directory-gone recovery fails closed on branch lookup errors"
+}
+
 test_fd_leak_under_low_ulimit() {
   local case_dir rc dir_count i
   case_dir=$(make_case fd-leak-ulimit)
@@ -4616,6 +4659,7 @@ if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_already_returned_directory_gone_cleans_metadata
   test_already_returned_absent_leased_field_refuses
   test_already_returned_directory_gone_with_unpushed_work_refuses
+  test_already_returned_directory_gone_branch_lookup_failure_refuses
   test_fd_leak_under_low_ulimit
   exit 0
 fi
@@ -4882,4 +4926,5 @@ test_missing_treehouse_entry_refuses_cleared_lease
 test_already_returned_directory_gone_cleans_metadata
 test_already_returned_absent_leased_field_refuses
 test_already_returned_directory_gone_with_unpushed_work_refuses
+test_already_returned_directory_gone_branch_lookup_failure_refuses
 test_fd_leak_under_low_ulimit

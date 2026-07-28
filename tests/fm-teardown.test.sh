@@ -4172,6 +4172,28 @@ test_surviving_object_storage_is_bound_through_graph_proof() {
   pass "surviving object storage remains identity-bound through graph proof"
 }
 
+test_surviving_object_storage_descriptor_use_is_bounded() {
+  local case_dir source item rc
+  case_dir=$(make_case secondmate-object-storage-fd-bound)
+  prepare_secondmate_home_fixture "$case_dir"
+  write_secondmate_meta "$case_dir"
+  source="$case_dir/source-projects/test"
+  for item in $(seq 1 96); do
+    printf 'unreachable object %s\n' "$item" \
+      | git -C "$source" hash-object -w --stdin >/dev/null
+  done
+  set +e
+  (
+    ulimit -n 48
+    run_teardown "$case_dir" --force
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "object graph proof must stay within a bounded descriptor budget"
+  assert_absent "$case_dir/wt" "bounded object graph proof retained the secondmate home"
+  pass "surviving object storage proof bounds descriptor use"
+}
+
 test_secondmate_retirement_serializes_child_spawn() {
   local case_dir child_project rc teardown_pid spawn_rc waited
   case_dir=$(make_case secondmate-retirement-child-race)
@@ -4501,6 +4523,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-13-network ]; then
   test_secondmate_network_fetches_pin_validated_addresses
   test_surviving_object_storage_is_bound_through_graph_proof
+  test_surviving_object_storage_descriptor_use_is_bounded
   exit 0
 fi
 
@@ -4561,6 +4584,7 @@ test_secondmate_retirement_retains_reflog_and_rewritten_history
 test_secondmate_retirement_rejects_http_proxy_and_object_redirects
 test_secondmate_network_fetches_pin_validated_addresses
 test_surviving_object_storage_is_bound_through_graph_proof
+test_surviving_object_storage_descriptor_use_is_bounded
 test_secondmate_retirement_serializes_child_spawn
 test_nested_secondmate_cleanup_requires_child_home_lock
 test_secondmate_registry_updates_are_locked_and_literal

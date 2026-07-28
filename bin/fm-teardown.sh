@@ -2342,7 +2342,7 @@ def confined(path):
     except ValueError:
         return False
 
-def retain(path, expected_directory):
+def retain(path, expected_directory, keep_open=False):
     metadata = os.lstat(path)
     if stat.S_ISLNK(metadata.st_mode):
         raise OSError(f"redirected object storage entry: {path}")
@@ -2375,49 +2375,58 @@ def retain(path, expected_directory):
     if confined(os.path.realpath(path)):
         os.close(descriptor)
         raise OSError(f"object storage depends on retiring home: {path}")
-    held.append((path, descriptor, expected))
-    return descriptor, opened
+    held.append((path, expected))
+    if keep_open:
+        return descriptor, opened
+    os.close(descriptor)
+    return None, opened
 
 def inspect(objects):
     objects = os.path.normpath(objects)
-    directory, metadata = retain(objects, True)
-    identity = (metadata.st_dev, metadata.st_ino)
-    if identity in visited:
-        return
-    visited.add(identity)
-    object_device = metadata.st_dev
-    for name in sorted(os.listdir(directory)):
-        path = os.path.join(objects, name)
-        item = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if item.st_dev != object_device:
-            raise OSError(f"object storage crosses a filesystem boundary: {path}")
-        if stat.S_ISLNK(item.st_mode):
-            raise OSError(f"redirected object storage entry: {path}")
-        if stat.S_ISDIR(item.st_mode):
-            inspect(path)
-        elif stat.S_ISREG(item.st_mode):
-            retain(path, False)
-        else:
-            raise OSError(f"unsafe object storage entry: {path}")
-    alternates = os.path.join(objects, "info", "alternates")
-    http_alternates = os.path.join(objects, "info", "http-alternates")
-    if os.path.lexists(http_alternates):
-        raise OSError(f"HTTP alternates are not durable proof: {http_alternates}")
-    if not os.path.lexists(alternates):
-        return
-    alternate_fd, _ = retain(alternates, False)
-    with os.fdopen(os.dup(alternate_fd), "r", encoding="utf-8") as stream:
-        entries = [line.rstrip("\n") for line in stream]
-    if not entries or any(not entry or "\x00" in entry for entry in entries):
-        raise OSError(f"malformed alternates file: {alternates}")
-    for entry in entries:
-        if entry.startswith('"') or entry.endswith('"'):
-            raise OSError(f"quoted alternates are ambiguous: {alternates}")
-        candidate = entry if os.path.isabs(entry) else os.path.join(objects, entry)
-        inspect(os.path.realpath(candidate))
+    directory, metadata = retain(objects, True, True)
+    try:
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in visited:
+            return
+        visited.add(identity)
+        object_device = metadata.st_dev
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(objects, name)
+            item = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if item.st_dev != object_device:
+                raise OSError(f"object storage crosses a filesystem boundary: {path}")
+            if stat.S_ISLNK(item.st_mode):
+                raise OSError(f"redirected object storage entry: {path}")
+            if stat.S_ISDIR(item.st_mode):
+                inspect(path)
+            elif stat.S_ISREG(item.st_mode):
+                retain(path, False)
+            else:
+                raise OSError(f"unsafe object storage entry: {path}")
+        alternates = os.path.join(objects, "info", "alternates")
+        http_alternates = os.path.join(objects, "info", "http-alternates")
+        if os.path.lexists(http_alternates):
+            raise OSError(f"HTTP alternates are not durable proof: {http_alternates}")
+        if not os.path.lexists(alternates):
+            return
+        alternate_fd, _ = retain(alternates, False, True)
+        try:
+            with os.fdopen(os.dup(alternate_fd), "r", encoding="utf-8") as stream:
+                entries = [line.rstrip("\n") for line in stream]
+        finally:
+            os.close(alternate_fd)
+        if not entries or any(not entry or "\x00" in entry for entry in entries):
+            raise OSError(f"malformed alternates file: {alternates}")
+        for entry in entries:
+            if entry.startswith('"') or entry.endswith('"'):
+                raise OSError(f"quoted alternates are ambiguous: {alternates}")
+            candidate = entry if os.path.isabs(entry) else os.path.join(objects, entry)
+            inspect(os.path.realpath(candidate))
+    finally:
+        os.close(directory)
 
 def verify_retained():
-    for path, descriptor, expected in held:
+    for path, expected in held:
         metadata = os.lstat(path)
         current = (
             metadata.st_dev,
@@ -2425,14 +2434,34 @@ def verify_retained():
             stat.S_IFMT(metadata.st_mode),
             metadata.st_size,
         )
-        opened = os.fstat(descriptor)
-        retained = (
-            opened.st_dev,
-            opened.st_ino,
-            stat.S_IFMT(opened.st_mode),
-            opened.st_size,
-        )
-        if current != expected or retained != expected or stat.S_ISLNK(metadata.st_mode):
+        if (
+            current != expected
+            or stat.S_ISLNK(metadata.st_mode)
+            or confined(os.path.realpath(path))
+        ):
+            raise OSError(f"object storage identity changed during graph proof: {path}")
+        flags = os.O_RDONLY
+        if expected[2] == stat.S_IFDIR:
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                retained = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    stat.S_IFMT(opened.st_mode),
+                    opened.st_size,
+                )
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise OSError(
+                f"object storage identity changed during graph proof: {path}"
+            ) from error
+        if retained != expected:
             raise OSError(f"object storage identity changed during graph proof: {path}")
 
 def run(arguments, input_data=None):
@@ -2515,9 +2544,6 @@ try:
 except (OSError, UnicodeError, subprocess.SubprocessError) as error:
     print(f"REFUSED: {label} complete object graph is unavailable: {error}", file=sys.stderr)
     raise SystemExit(1)
-finally:
-    for _, descriptor, _ in reversed(held):
-        os.close(descriptor)
 PY
 }
 

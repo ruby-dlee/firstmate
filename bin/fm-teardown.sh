@@ -1057,8 +1057,7 @@ try:
     if len(matches) != 1:
         raise SystemExit(1)
     entry = matches[0]
-    leased = entry.get("leased")
-    if leased is not False and leased is not None:
+    if entry.get("leased") is not False:
         raise SystemExit(1)
     if entry.get("lease_holder") not in ("", None):
         raise SystemExit(1)
@@ -1414,14 +1413,43 @@ cleanup_already_returned_worktree_locked() {
 }
 
 cleanup_already_returned_worktree_no_directory() {
+  local branch unpushed_raw unpushed DEFAULT
   treehouse_lease_is_cleared "$WT" || {
     echo "error: worktree lease is no longer provably cleared after directory-gone detection; retaining metadata" >&2
     return 1
   }
-  local branch
   branch=$(git -C "$PROJ" for-each-ref --format='%(refname:short)' "refs/heads/fm/$ID" 2>/dev/null)
   if [ -n "$branch" ]; then
-    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
+    if ! unpushed_raw=$(git -C "$PROJ" log --oneline "$branch" --not --remotes -- 2>/dev/null); then
+      echo "REFUSED: cannot inspect recovered branch $branch for commits not on a remote." >&2
+      return 1
+    fi
+    unpushed=$(printf '%s\n' "$unpushed_raw" | head -5)
+    if [ -n "$unpushed" ]; then
+      if [ "$MODE" = local-only ]; then
+        DEFAULT=$(default_branch) || {
+          echo "REFUSED: cannot determine default branch for recovered branch $branch." >&2
+          return 1
+        }
+        git -C "$PROJ" merge-base --is-ancestor "$branch" "$DEFAULT" 2>/dev/null || {
+          echo "REFUSED: recovered branch $branch has work not on any remote and not merged into $DEFAULT." >&2
+          printf 'unpushed commits:\n%s\n' "$unpushed" >&2
+          return 1
+        }
+      else
+        echo "REFUSED: recovered branch $branch has work not on any remote." >&2
+        printf 'unpushed commits:\n%s\n' "$unpushed" >&2
+        return 1
+      fi
+    fi
+    treehouse_lease_is_cleared "$WT" || {
+      echo "error: worktree lease changed during recovered branch safety checks; retaining metadata" >&2
+      return 1
+    }
+    git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || {
+      echo "error: recovered worktree task branch could not be deleted: $branch" >&2
+      return 1
+    }
   fi
 }
 

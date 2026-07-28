@@ -4524,7 +4524,7 @@ test_already_returned_directory_gone_cleans_metadata() {
   pass "already-returned worktree with directory gone cleans metadata"
 }
 
-test_already_returned_absent_leased_field_is_cleared() {
+test_already_returned_absent_leased_field_refuses() {
   local case_dir rc slot pool state
   case_dir=$(make_case already-returned-absent-leased)
   write_meta "$case_dir" no-mistakes ship
@@ -4542,15 +4542,39 @@ with open(state, "w", encoding="utf-8") as stream:
 PY
 
   set +e
-  FM_FAKE_COMPLETE_RETURN=1 \
-    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  [ "$rc" -eq 0 ] || fail "already-returned-absent-leased: teardown should succeed when leased field is absent: $(cat "$case_dir/stderr")"
-  assert_grep 'lease already cleared' "$case_dir/stderr" \
-    "already-returned-absent-leased: teardown did not detect the cleared lease"
-  pass "already-returned worktree with absent leased field is treated as cleared"
+  [ "$rc" -ne 0 ] || fail "already-returned-absent-leased: missing leased field was accepted"
+  assert_present "$case_dir/wt" "already-returned-absent-leased: teardown removed the worktree"
+  assert_present "$case_dir/state/task-x1.meta" "already-returned-absent-leased: teardown removed task metadata"
+  pass "already-returned worktree with absent leased field fails closed"
+}
+
+test_already_returned_directory_gone_with_unpushed_work_refuses() {
+  local case_dir rc
+  case_dir=$(make_case already-returned-directorygone-unpushed)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" unpushed.txt "content not on a remote" "add unpushed work"
+  write_treehouse_unleased "$case_dir/wt"
+
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt" 2>/dev/null || true
+  rm -rf "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-directorygone-unpushed: teardown deleted an unpushed branch"
+  git -C "$case_dir/project" show-ref --verify --quiet refs/heads/fm/task-x1 \
+    || fail "already-returned-directorygone-unpushed: task branch was deleted"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "already-returned-directorygone-unpushed: task metadata was removed"
+  assert_grep 'REFUSED: recovered branch fm/task-x1 has work not on any remote' "$case_dir/stderr" \
+    "already-returned-directorygone-unpushed: teardown did not explain the refusal"
+  pass "directory-gone recovery preserves an unpushed task branch"
 }
 
 test_fd_leak_under_low_ulimit() {
@@ -4590,7 +4614,8 @@ if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_duplicate_treehouse_entries_refuse_cleared_lease
   test_missing_treehouse_entry_refuses_cleared_lease
   test_already_returned_directory_gone_cleans_metadata
-  test_already_returned_absent_leased_field_is_cleared
+  test_already_returned_absent_leased_field_refuses
+  test_already_returned_directory_gone_with_unpushed_work_refuses
   test_fd_leak_under_low_ulimit
   exit 0
 fi
@@ -4855,5 +4880,6 @@ test_already_returned_worktree_cleanup_honors_checkout_lock
 test_duplicate_treehouse_entries_refuse_cleared_lease
 test_missing_treehouse_entry_refuses_cleared_lease
 test_already_returned_directory_gone_cleans_metadata
-test_already_returned_absent_leased_field_is_cleared
+test_already_returned_absent_leased_field_refuses
+test_already_returned_directory_gone_with_unpushed_work_refuses
 test_fd_leak_under_low_ulimit

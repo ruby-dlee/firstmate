@@ -4538,6 +4538,36 @@ test_already_returned_directory_gone_cleans_metadata() {
   pass "already-returned worktree with directory gone cleans metadata"
 }
 
+test_already_returned_directory_gone_cleanup_honors_checkout_lock() {
+  local case_dir rc lock
+  case_dir=$(make_case already-returned-directorygone-lock)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  write_treehouse_unleased "$case_dir/wt"
+
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt" 2>/dev/null || true
+  rm -rf "$case_dir/wt"
+  lock=$(checkout_lock_path "$case_dir/project" "$case_dir/checkout-locks")
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "already-returned-directorygone-lock: teardown bypassed the checkout lock"
+  git -C "$case_dir/project" show-ref --verify --quiet refs/heads/fm/task-x1 \
+    || fail "already-returned-directorygone-lock: task branch was deleted"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "already-returned-directorygone-lock: task metadata was removed"
+  assert_grep "checkout mutation already running for $case_dir/project (pid $$)" \
+    "$case_dir/stderr" "already-returned-directorygone-lock: teardown did not surface checkout lock contention"
+  rm -rf "$lock"
+  pass "directory-gone recovery holds the shared checkout lock"
+}
+
 test_already_returned_absent_leased_field_refuses() {
   local case_dir rc slot pool state
   case_dir=$(make_case already-returned-absent-leased)
@@ -4656,6 +4686,7 @@ if [ "${FM_TEST_FOCUSED:-}" = already-returned-and-fd-leak ]; then
   test_duplicate_treehouse_entries_refuse_cleared_lease
   test_missing_treehouse_entry_refuses_cleared_lease
   test_already_returned_directory_gone_cleans_metadata
+  test_already_returned_directory_gone_cleanup_honors_checkout_lock
   test_already_returned_absent_leased_field_refuses
   test_already_returned_directory_gone_with_unpushed_work_refuses
   test_already_returned_directory_gone_branch_lookup_failure_refuses
@@ -4923,6 +4954,7 @@ test_already_returned_worktree_cleanup_honors_checkout_lock
 test_duplicate_treehouse_entries_refuse_cleared_lease
 test_missing_treehouse_entry_refuses_cleared_lease
 test_already_returned_directory_gone_cleans_metadata
+test_already_returned_directory_gone_cleanup_honors_checkout_lock
 test_already_returned_absent_leased_field_refuses
 test_already_returned_directory_gone_with_unpushed_work_refuses
 test_already_returned_directory_gone_branch_lookup_failure_refuses

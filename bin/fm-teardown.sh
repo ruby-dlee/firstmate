@@ -1412,7 +1412,7 @@ cleanup_already_returned_worktree_locked() {
   cleanup_recovered_worktree "$branch" "$WT" "$PROJ"
 }
 
-cleanup_already_returned_worktree_no_directory() {
+cleanup_already_returned_worktree_no_directory_locked() {
   local branch unpushed_raw unpushed DEFAULT
   treehouse_lease_is_cleared "$WT" || {
     echo "error: worktree lease is no longer provably cleared after directory-gone detection; retaining metadata" >&2
@@ -4264,7 +4264,8 @@ elif [ "$KIND" != secondmate ]; then
       fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" \
         cleanup_already_returned_worktree_locked || exit 1
     else
-      cleanup_already_returned_worktree_no_directory || exit 1
+      fm_checkout_lock_run "$PROJ" "$CHECKOUT_LOCK_ROOT" \
+        cleanup_already_returned_worktree_no_directory_locked || exit 1
     fi
   elif [ -d "$WT" ]; then
     post_lock_cleanup_check=

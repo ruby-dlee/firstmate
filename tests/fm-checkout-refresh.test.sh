@@ -599,22 +599,27 @@ test_treehouse_pool_skill_drafts_are_inventoried() {
 }
 
 test_ignored_skill_files_are_outside_the_collision_guard() {
-  local source="$TMP_ROOT/ignored-source" worktree="$TMP_ROOT/ignored-worktree" draft out
+  local source="$TMP_ROOT/ignored-source" worktree="$TMP_ROOT/ignored-worktree"
+  local source_draft worktree_draft out
   fm_git_worktree "$source" "$worktree" ignored-skill
   git -C "$worktree" checkout --quiet --detach
   printf '%s\n' '.agents/skills/' >> "$source/.git/info/exclude"
-  draft="$worktree/.agents/skills/intentional/SKILL.md"
-  mkdir -p "$(dirname "$draft")"
-  printf '%s\n' '# intentional ignored material' > "$draft"
+  source_draft="$source/.agents/skills/intentional/SKILL.md"
+  worktree_draft="$worktree/.agents/skills/intentional/SKILL.md"
+  mkdir -p "$(dirname "$source_draft")" "$(dirname "$worktree_draft")"
+  printf '%s\n' '# intentional ignored material' > "$source_draft"
+  printf '%s\n' '# intentional ignored material' > "$worktree_draft"
 
   run_refresh verify-worktree "$worktree" "$source" \
     || fail "an ignored skill file made a clean local acquisition fail"
-  out=$(run_refresh preflight "$worktree") \
-    || fail "preflight rejected an acquisition containing only ignored skill material"
+  out=$(run_refresh preflight "$source") \
+    || fail "preflight rejected a source checkout containing only ignored skill material"
   assert_not_contains "$out" "HYGIENE:" \
     "ignored skill material entered the untracked-draft collision inventory"
-  grep -Fq '# intentional ignored material' "$draft" \
-    || fail "ignored skill-file inspection changed its contents"
+  grep -Fq '# intentional ignored material' "$source_draft" \
+    || fail "ignored source skill-file inspection changed its contents"
+  grep -Fq '# intentional ignored material' "$worktree_draft" \
+    || fail "ignored worktree skill-file inspection changed its contents"
   pass "gitignored skill files remain outside the non-ignored collision guard"
 }
 

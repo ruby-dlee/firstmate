@@ -1655,6 +1655,19 @@ test_task_tmp_partial_removal_fails_closed() {
   pass "partial task temp removal fails closed"
 }
 
+test_spawn_rollback_uses_generation_safe_task_tmp_removal() {
+  local safe_cleanup_count
+  safe_cleanup_count=$(grep -cF \
+    '&& ! fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then' \
+    "$ROOT/bin/fm-spawn.sh")
+  [ "$safe_cleanup_count" -eq 2 ] \
+    || fail "spawn rollback does not generation-validate both new task temp cleanup paths"
+  if grep -F 'rm -rf "$TASK_TMP"' "$ROOT/bin/fm-spawn.sh" >/dev/null 2>&1; then
+    fail "spawn rollback still removes a task temp root without descriptor-pinned validation"
+  fi
+  pass "spawn rollback generation-validates both task temp cleanup paths"
+}
+
 test_preinstall_managed_failure_restores_artifact_snapshot() {
   local id rec expected out status artifact
   id=account-preinstall-rollback-z9f
@@ -6291,6 +6304,7 @@ if [ "${FM_TEST_FOCUSED:-}" = session-sync-teardown-race ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
+  run_isolated_test test_spawn_rollback_uses_generation_safe_task_tmp_removal
   run_isolated_test test_secondmate_rollback_refuses_unsafe_tasktmp
   run_isolated_test test_rollback_backup_rejects_symlink_and_rechecks_under_lock
   exit 0

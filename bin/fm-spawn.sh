@@ -1720,7 +1720,11 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        if [ "$ORIGINAL_TASK_TMP_PRESENT" = 0 ] && [ -n "${TASK_TMP:-}" ] \
+          && ! fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then
+          worktree_clean=0
+          echo "warning: failed to remove direct spawn task temp for ${ID:-unknown}; retaining cleanup metadata" >&2
+        fi
       fi
     fi
     if [ "$worktree_clean" != 1 ]; then
@@ -1799,7 +1803,11 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        if [ "$ORIGINAL_TASK_TMP_PRESENT" = 0 ] && [ -n "${TASK_TMP:-}" ] \
+          && ! fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then
+          account_clean=0
+          echo "warning: failed to remove Agent Fleet task temp for ${ID:-unknown}; retaining cleanup metadata" >&2
+        fi
       fi
       if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
         persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2

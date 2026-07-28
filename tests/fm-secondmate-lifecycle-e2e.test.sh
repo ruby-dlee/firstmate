@@ -27,6 +27,7 @@ set -u
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
+fm_git_identity fmtest fmtest@example.invalid
 fm_test_tmproot_into TMP_ROOT fm-secondmate-lifecycle
 export FM_BACKEND=tmux
 
@@ -52,7 +53,7 @@ setup_world() {
     > "$HOME_DIR/projects/gamma/.gitignore"
   git -C "$HOME_DIR/projects/gamma" add .gitignore
   git -C "$HOME_DIR/projects/gamma" commit -qm 'ignore local no-mistakes test state'
-  git -C "$HOME_DIR/projects/gamma" push -q origin main
+  git -C "$HOME_DIR/projects/gamma" push -q origin HEAD
   cat > "$HOME_DIR/data/projects.md" <<EOF
 - alpha [direct-PR +yolo] - alpha project (added 2026-06-22)
 - beta [direct-PR] - beta project (added 2026-06-22)

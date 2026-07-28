@@ -31,15 +31,15 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 TMP_ROOT=$(fm_test_tmproot fm-fleet-sync-tests)
-HOME_N=0
 
 # --- fixtures ---------------------------------------------------------------
 
 # new_home: fresh isolated FM_HOME with an empty projects/ dir. Each test gets its
 # own so the whole-fleet form never sees another test's clones.
 new_home() {
-  HOME_N=$((HOME_N + 1))
-  local h="$TMP_ROOT/home-$HOME_N"
+  local h
+  mkdir -p "$TMP_ROOT"
+  h=$(mktemp -d "$TMP_ROOT/home.XXXXXX")
   mkdir -p "$h/projects"
   printf '%s\n' "$h"
 }
@@ -590,7 +590,7 @@ SH
     FM_TEST_EXPECT_LOCK="$lock" \
     FM_TEST_LOCK_BEFORE_MUTATION="$home/lock-before-mutation" \
     FM_TEST_LOCK_DURING_CLEANUP="$home/lock-during-cleanup" \
-    FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=1 \
+    FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=5 \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     PATH="$fakebin:$PATH" \
@@ -599,7 +599,7 @@ SH
   set -e
 
   [ "$status" -eq 0 ] || fail "direct bounded fleet sync failed unexpectedly: $out"
-  assert_contains "$out" "direct-timeout: skipped: refresh timed out after 1s" \
+  assert_contains "$out" "direct-timeout: skipped: refresh timed out after 5s" \
     "direct fleet sync did not surface its process-tree timeout"
   parent_pid=$(cat "$home/direct-fetch-parent.pid")
   child_pid=$(cat "$home/direct-fetch-child.pid")

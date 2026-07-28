@@ -43,9 +43,10 @@
 # the handle stale, and remove the recorded worktree under its checkout lock;
 # teardown never substitutes the shared window alias for a missing terminal.
 # Secondmates (kind=secondmate in meta) are retired explicitly. Teardown proves
-# the home clean and every ref and reflog commit landed, then quiesces its endpoint and
-# refuses while the home has in-flight crewmate meta files. --force authorizes
-# recursive retirement only after every child passes the same endpoint, identity,
+# the home clean and every ref and reflog commit landed, then without --force
+# refuses an in-flight child or non-empty child registry before quiescing the
+# endpoint. --force quiesces only after the parent proofs, then authorizes
+# recursive retirement after every child passes the same endpoint, identity,
 # cleanliness, stash, and landed-work proofs. Project retirement also rejects
 # mount boundaries, rewritten history, and landing authorities whose complete Git
 # object storage or network transport may depend on the retiring home or local machine. Removing a

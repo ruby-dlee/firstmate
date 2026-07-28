@@ -3053,8 +3053,9 @@ fi
 # share a root even when their human-readable task ids match. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
 # Nested (not a bare task-root/gotmp) so other per-task temp can live alongside
-# later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
-# targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
+# later, and teardown removes only this recorded generation. GOTMPDIR (not TMPDIR)
+# is the targeted knob: TMPDIR is too broad (affects every program's temp, not
+# just Go's).
 TASK_TMP=$SPAWN_TASK_TMP
 mkdir -p "$TASK_TMP/gotmp"
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into

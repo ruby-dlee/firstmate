@@ -1034,9 +1034,11 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [recorded-sco
 # Scoped to today's --secondmate-spawn-capable backends with an empirically
 # verified classifier: tmux (docs/tmux-backend.md "Agent liveness probe") and
 # herdr (docs/herdr-backend.md "Agent liveness probe reuses the husk
-# classifier"). zellij, orca, and cmux report unknown until independently
-# verified - future work, not a functional gap for the two backends
-# --secondmate spawns actually support today plus tmux's reference path.
+# classifier"). Zellij can report dead only when the recorded session or pane
+# is structurally absent; a present pane remains unknown. Orca and cmux report
+# unknown until independently verified - future work, not a functional gap for
+# the two backends --secondmate spawns actually support today plus tmux's
+# reference path.
 # Callers must treat unknown exactly like an unreadable target: NEVER license
 # an action from it alone - the secondmate-liveness sweep gates a respawn on
 # `dead` only, precisely so a momentary read glitch can never duplicate a

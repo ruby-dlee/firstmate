@@ -1859,7 +1859,7 @@ reap_task_browser() {
   local id=$1 tasktmp=$2
   [ -n "$tasktmp" ] || return 0
   [ -x "$FM_ROOT/bin/fm-browser-isolation.sh" ] || return 0
-  "$FM_ROOT/bin/fm-browser-isolation.sh" reap "$id" "$tasktmp"
+  "$FM_ROOT/bin/fm-browser-isolation.sh" reap "$id" "$tasktmp" "$FM_HOME"
 }
 
 remove_worktree_compatibility_artifacts() {

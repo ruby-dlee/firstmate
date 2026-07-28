@@ -1512,6 +1512,16 @@ spawn_restore_unmanaged_state() {
   return "$status"
 }
 
+cleanup_prepared_task_tmp() {
+  [ -n "${TASK_TMP:-}" ] || return 0
+  if [ "${BROWSER_PREPARED:-0}" = 1 ]; then
+    "$SCRIPT_DIR/fm-browser-isolation.sh" reap "$ID" "$TASK_TMP" "$FM_HOME" || return 1
+    BROWSER_PREPARED=0
+  fi
+  [ "${ORIGINAL_TASK_TMP_PRESENT:-0}" != 1 ] || return 0
+  rm -rf "$TASK_TMP"
+}
+
 spawn_abort_cleanup() {
   local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
@@ -1691,7 +1701,10 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || cleanup_prepared_task_tmp || {
+          worktree_clean=0
+          echo "warning: failed to reap task-owned browser during spawn rollback for ${ID:-unknown}" >&2
+        }
       fi
     fi
     if [ "$worktree_clean" != 1 ]; then
@@ -1770,7 +1783,10 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || cleanup_prepared_task_tmp || {
+          account_clean=0
+          echo "warning: failed to reap task-owned browser during spawn rollback for ${ID:-unknown}" >&2
+        }
       fi
       if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
         persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
@@ -1792,6 +1808,12 @@ spawn_abort_cleanup() {
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
+  if [ "$status" -ne 0 ] && [ "${BROWSER_PREPARED:-0}" = 1 ]; then
+    cleanup_prepared_task_tmp || {
+      status=1
+      echo "warning: failed to reap task-owned browser after spawn abort for ${ID:-unknown}" >&2
+    }
+  fi
   [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
   release_secondmate_home_lifecycle_locks
   LIFECYCLE_LOCK=
@@ -3074,7 +3096,8 @@ BROWSER_MCP_PATH=$(browser_mcp_path)
 "$SCRIPT_DIR/fm-browser-isolation.sh" prepare \
   "$ID" "$TASK_TMP" "$FM_HOME" "$REAL_CHROME_DEVTOOLS_AXI" \
   "$BROWSER_AUTOMATION_EXECUTABLE" "$BROWSER_MCP_PATH" || exit 1
-BROWSER_ROOT="$TASK_TMP/browser"
+BROWSER_PREPARED=1
+BROWSER_ROOT=$("$SCRIPT_DIR/fm-browser-isolation.sh" root "$ID" "$FM_HOME") || exit 1
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
 # the pane shell just before the launch line, further down. CREW_PATH and the
 # task-scoped browser identity ride the same two channels for the same reason.
@@ -3084,6 +3107,7 @@ if [ "$BACKEND" = herdr ]; then
   HERDR_AGENT_ENV+=("PATH=$CREW_PATH")
   HERDR_AGENT_ENV+=("FM_BROWSER_TASK_ID=$ID")
   HERDR_AGENT_ENV+=("FM_BROWSER_ROOT=$BROWSER_ROOT")
+  HERDR_AGENT_ENV+=("FM_BROWSER_OWNER_HOME=$FM_HOME")
 fi
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the
@@ -3760,7 +3784,7 @@ fi
 # same LAUNCH string as its argv and PATH/GOTMPDIR injected via --env, so there is
 # nothing to type into a pane here.
 if [ "$BACKEND" != herdr ]; then
-  spawn_send_text_line "$T" "export GOTMPDIR=$(shell_quote "$TASK_TMP/gotmp") PATH=$(shell_quote "$CREW_PATH") FM_BROWSER_TASK_ID=$(shell_quote "$ID") FM_BROWSER_ROOT=$(shell_quote "$BROWSER_ROOT")"
+  spawn_send_text_line "$T" "export GOTMPDIR=$(shell_quote "$TASK_TMP/gotmp") PATH=$(shell_quote "$CREW_PATH") FM_BROWSER_TASK_ID=$(shell_quote "$ID") FM_BROWSER_ROOT=$(shell_quote "$BROWSER_ROOT") FM_BROWSER_OWNER_HOME=$(shell_quote "$FM_HOME")"
   sleep 0.3
   spawn_send_literal "$T" "$LAUNCH"
   sleep 0.3

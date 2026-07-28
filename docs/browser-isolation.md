@@ -3,7 +3,8 @@
 Firstmate-launched crew use a task-scoped automation browser.
 The captain's stable Google Chrome process and profile are never an automation target.
 
-`bin/fm-spawn.sh` selects Chrome Canary, Chrome for Testing, or Chromium as a separate application identity and prepares `/tmp/fm-<id>/browser`.
+`bin/fm-spawn.sh` selects Chrome Canary, Chrome for Testing, or Chromium as a separate application identity and prepares `/tmp/fm-browser-<home-key>-<id>`.
+The home key is derived from the canonical Firstmate home, so identical task IDs in sibling homes cannot share lifecycle state, a profile, or ownership records.
 It then places `bin/chrome-devtools-axi` first on that crew's `PATH`.
 The wrapper launches the selected browser with a private profile and attaches the real AXI bridge through a loopback DevTools endpoint.
 
@@ -23,6 +24,7 @@ One browser and one AXI session are owned by each task.
 Successful AXI commands reuse that task browser so page state survives between commands.
 `chrome-devtools-axi stop` stops the bridge and browser, verifies that no process still references the task profile, and leaves the task root ready for a clean relaunch.
 `fm-teardown.sh` performs the same reap after the agent endpoint is quiescent and before deleting `/tmp/fm-<id>`.
+Failed spawn rollback uses the same verified reap before it removes a prepared task temp root.
 
 A browser that exits unexpectedly or an AXI command that fails is cleaned immediately and writes a failure latch.
 Later commands refuse to respawn it implicitly.
@@ -46,5 +48,6 @@ The sweep prints `BROWSER_GC:` only when it reaps something or cannot verify cle
 ## Verification
 
 Run `tests/fm-browser-isolation.test.sh` for fake-process behavior, failure-latch, teardown, backstop, and discrimination coverage.
-On macOS, run `tests/fm-browser-isolation-macos-smoke.sh` manually to launch the real separate browser, capture 15 screenshots, continuously sample on-screen windows, and prove zero bridge and browser processes after stop.
+On macOS, run `tests/fm-browser-isolation-macos-smoke.sh` manually to launch the real separate browser, capture 15 screenshots, continuously sample automation windows and newly appearing credential-dialog owners or titles, record the live browser arguments, and prove zero bridge, complete browser-tree, and profile counts after stop and reap.
 Set `FM_BROWSER_ROUTING_TEST=1` only when a new stable-Chrome window is acceptable; the smoke test then proves `open -na "Google Chrome" --args --new-window <url>` increases stable Chrome's window count and that the URL never reaches automation.
+Measured macOS evidence is recorded in `docs/browser-isolation-verification.md`.

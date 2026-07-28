@@ -13,6 +13,7 @@ BROWSER_LIFECYCLE="$ROOT/bin/fm-browser-isolation.sh"
 WRAPPER="$ROOT/bin/chrome-devtools-axi"
 TASK_ID="credential-smoke-$$"
 TASK_TMP="/tmp/fm-$TASK_ID"
+BROWSER_ROOT=
 MONITOR_PID=
 PROFILE=
 BRIDGE_PID=
@@ -31,6 +32,10 @@ const commands = execFileSync("ps", ["-axo", "command="], { encoding: "utf8" })
   .split(/\r?\n/);
 console.log(commands.filter((command) => command.includes(marker)).length);
 JS
+}
+
+process_group_count() {
+  ps -axo pgid= | awk -v pgid="$1" '$1 == pgid { count += 1 } END { print count + 0 }'
 }
 
 stable_window_count() {
@@ -53,8 +58,8 @@ cleanup() {
   if [ -n "$MONITOR_PID" ]; then
     wait "$MONITOR_PID" 2>/dev/null || cleanup_rc=1
   fi
-  if [ -f "$TASK_TMP/browser/owner.json" ]; then
-    "$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" >/dev/null 2>&1 || cleanup_rc=1
+  if [ -n "$BROWSER_ROOT" ] && [ -f "$BROWSER_ROOT/owner.json" ]; then
+    "$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" "$ROOT" >/dev/null 2>&1 || cleanup_rc=1
   fi
   if [ -n "$PROFILE" ]; then
     remaining=$(owned_process_count "$PROFILE")
@@ -121,6 +126,7 @@ STABLE_IDENTITY=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 mkdir -p "$TASK_TMP/gotmp" "$TASK_TMP/shots"
 "$BROWSER_LIFECYCLE" prepare \
   "$TASK_ID" "$TASK_TMP" "$ROOT" "$REAL_AXI" "$AUTOMATION_BROWSER" "$MCP_PATH"
+BROWSER_ROOT=$("$BROWSER_LIFECYCLE" root "$TASK_ID" "$ROOT")
 
 # shellcheck disable=SC2016 # Swift source is intentionally a shell literal.
 swift -e '
@@ -130,11 +136,25 @@ swift -e '
   let taskRoot = CommandLine.arguments[1]
   let stopFile = taskRoot + "/monitor.stop"
   let readyFile = taskRoot + "/monitor.ready"
-  let browserOwners: Set<String> = [
+  let automationOwners: Set<String> = [
     "Chromium",
     "Google Chrome Canary",
     "Google Chrome for Testing"
   ]
+  let credentialOwners: Set<String> = [
+    "SecurityAgent",
+    "CoreServicesUIAgent",
+    "System Settings",
+    "System Preferences"
+  ]
+  let credentialTerms = ["keychain", "password", "credential", "safe storage", "login keychain"]
+  let baselineRows = CGWindowListCopyWindowInfo(
+    [.optionOnScreenOnly, .excludeDesktopElements],
+    kCGNullWindowID
+  ) as? [[String: Any]] ?? []
+  let baselineWindows = Set(baselineRows.compactMap {
+    $0[kCGWindowNumber as String] as? Int
+  })
   try? "ready\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
   var samples = 0
   var maximumVisibleAutomationWindows = 0
@@ -146,7 +166,11 @@ swift -e '
     let visible = rows.filter { row in
       let owner = row[kCGWindowOwnerName as String] as? String ?? ""
       let title = (row[kCGWindowName as String] as? String ?? "").lowercased()
-      return browserOwners.contains(owner) || title.contains("keychain not found")
+      let number = row[kCGWindowNumber as String] as? Int ?? 0
+      let credentialDialog = credentialOwners.contains(owner)
+        || credentialTerms.contains(where: { title.contains($0) })
+      return automationOwners.contains(owner)
+        || (!baselineWindows.contains(number) && credentialDialog)
     }.count
     maximumVisibleAutomationWindows = max(maximumVisibleAutomationWindows, visible)
     samples += 1
@@ -166,18 +190,21 @@ while [ ! -f "$TASK_TMP/monitor.ready" ]; do
   sleep 0.1
 done
 
-FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$TASK_TMP/browser" \
+FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
   "$WRAPPER" open https://example.com/
 
-STATE_FILE="$TASK_TMP/browser/browser.json"
+STATE_FILE="$BROWSER_ROOT/browser.json"
 PROFILE=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).profile)' "$STATE_FILE")
 BROWSER_PID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$STATE_FILE")
 BROWSER_PORT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).port)' "$STATE_FILE")
 BROWSER_COMMAND=$(ps -p "$BROWSER_PID" -o command=)
+BROWSER_PGID=$(ps -p "$BROWSER_PID" -o pgid= | tr -d ' ')
 case "$BROWSER_COMMAND" in
   *--use-mock-keychain*) ;;
   *) fail "live automation browser lacks --use-mock-keychain" ;;
 esac
+printf 'live_browser_mock_keychain=1\n'
+printf 'live_browser_basic_password_store=1\n'
 case "$BROWSER_COMMAND" in
   *--password-store=basic*) ;;
   *) fail "live automation browser lacks --password-store=basic" ;;
@@ -185,7 +212,7 @@ esac
 
 INDEX=1
 while [ "$INDEX" -le 15 ]; do
-  FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$TASK_TMP/browser" \
+    FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
     "$WRAPPER" screenshot "$TASK_TMP/shots/shot-$INDEX.png" >/dev/null
   INDEX=$((INDEX + 1))
 done
@@ -209,8 +236,9 @@ if [ "${FM_BROWSER_ROUTING_TEST:-0}" = 1 ]; then
 fi
 
 OWNED_DURING_RUN=$(owned_process_count "$PROFILE")
+TREE_DURING_RUN=$(process_group_count "$BROWSER_PGID")
 BRIDGE_PID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' \
-  "$TASK_TMP/browser/home/.chrome-devtools-axi/sessions/fm-$TASK_ID/bridge.pid")
+  "$BROWSER_ROOT/home/.chrome-devtools-axi/sessions/fm-$TASK_ID/bridge.pid")
 kill -0 "$BRIDGE_PID" 2>/dev/null || fail "AXI bridge was not live during the run"
 
 touch "$TASK_TMP/monitor.stop"
@@ -219,18 +247,24 @@ MONITOR_PID=
 cat "$TASK_TMP/monitor.out"
 grep -Fx 'automation_visible_windows_seen=0' "$TASK_TMP/monitor.out" >/dev/null \
   || fail "native-dialog monitor observed an automation window"
-if grep -Ei 'keychain|password store' "$TASK_TMP/browser/browser.log" >/dev/null; then
-  grep -Ei 'keychain|password store' "$TASK_TMP/browser/browser.log" >&2
+if grep -Ei 'keychain|password store|safe storage' "$BROWSER_ROOT/browser.log" >/dev/null; then
+  grep -Ei 'keychain|password store|safe storage' "$BROWSER_ROOT/browser.log" >&2
   fail "automation browser logged a credential-store error"
 fi
 
-FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$TASK_TMP/browser" \
+FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
   "$WRAPPER" stop >/dev/null
 OWNED_AFTER_STOP=$(owned_process_count "$PROFILE")
+TREE_AFTER_STOP=$(process_group_count "$BROWSER_PGID")
+BRIDGE_AFTER_STOP=0
+kill -0 "$BRIDGE_PID" 2>/dev/null && BRIDGE_AFTER_STOP=1
 kill -0 "$BRIDGE_PID" 2>/dev/null && fail "AXI bridge survived wrapper stop"
 [ "$OWNED_AFTER_STOP" -eq 0 ] || fail "automation browser survived wrapper stop"
-"$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP"
-[ ! -e "$TASK_TMP/browser" ] || fail "task profile root survived reap"
+[ "$TREE_AFTER_STOP" -eq 0 ] || fail "automation browser process group survived wrapper stop"
+"$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" "$ROOT"
+[ ! -e "$BROWSER_ROOT" ] || fail "task profile root survived reap"
+PROFILE_AFTER_REAP=0
+[ ! -e "$BROWSER_ROOT/profile" ] || PROFILE_AFTER_REAP=1
 
 STABLE_IDENTITY_AFTER=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 [ "$STABLE_IDENTITY_AFTER" = "$STABLE_IDENTITY" ] \
@@ -239,7 +273,9 @@ STABLE_IDENTITY_AFTER=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
 printf 'screenshots=15\n'
 printf 'owned_processes_during_run=%s\n' "$OWNED_DURING_RUN"
 printf 'owned_processes_after_stop=%s\n' "$OWNED_AFTER_STOP"
-printf 'bridge_alive_after_stop=0\n'
-printf 'profile_exists_after_reap=0\n'
+printf 'browser_tree_processes_during_run=%s\n' "$TREE_DURING_RUN"
+printf 'browser_tree_processes_after_stop=%s\n' "$TREE_AFTER_STOP"
+printf 'bridge_alive_after_stop=%s\n' "$BRIDGE_AFTER_STOP"
+printf 'profile_exists_after_reap=%s\n' "$PROFILE_AFTER_REAP"
 printf 'stable_chrome_identity_preserved=1\n'
 printf 'ok - macOS credential isolation and teardown smoke test passed\n'

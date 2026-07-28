@@ -22,6 +22,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -98,6 +99,23 @@ function expectedTaskTmp(taskId) {
   return path.join(canonicalTmpRoot(), `fm-${validateTaskId(taskId)}`);
 }
 
+function canonicalOwnerHome(ownerHome) {
+  const resolved = realpathSync(ownerHome);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail(`unsafe browser owner home: ${ownerHome}`);
+  }
+  return resolved;
+}
+
+function expectedBrowserRoot(taskId, ownerHome) {
+  const homeKey = createHash("sha256")
+    .update(canonicalOwnerHome(ownerHome))
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(canonicalTmpRoot(), `fm-browser-${homeKey}-${validateTaskId(taskId)}`);
+}
+
 function validateTaskTmp(taskId, taskTmp, requireExisting = true) {
   const expected = expectedTaskTmp(taskId);
   const resolved = requireExisting
@@ -115,8 +133,8 @@ function validateTaskTmp(taskId, taskTmp, requireExisting = true) {
   return resolved;
 }
 
-function validateBrowserRoot(taskId, browserRoot) {
-  const expected = path.join(expectedTaskTmp(taskId), "browser");
+function validateBrowserRoot(taskId, browserRoot, ownerHome) {
+  const expected = expectedBrowserRoot(taskId, ownerHome);
   const resolved = realpathSync(browserRoot);
   if (resolved !== expected) {
     fail(`unsafe browser root for ${taskId}: ${browserRoot}`);
@@ -144,12 +162,22 @@ function validateExecutable(file, label) {
   return resolved;
 }
 
-function validateOwner(owner, root, taskId) {
-  if (!owner || owner.version !== 1 || owner.taskId !== taskId) {
+function validateOwner(owner, root, taskId, ownerHome, taskTmp = "") {
+  if (!owner || owner.version !== 2 || owner.taskId !== taskId) {
     fail(`browser owner record does not match ${taskId}`);
   }
   if (owner.root !== root) fail(`browser owner root changed for ${taskId}`);
-  owner.ownerHome = realpathSync(owner.ownerHome);
+  owner.ownerHome = canonicalOwnerHome(owner.ownerHome);
+  if (owner.ownerHome !== canonicalOwnerHome(ownerHome)) {
+    fail(`browser owner home changed for ${taskId}`);
+  }
+  owner.taskTmp = validateTaskTmp(taskId, owner.taskTmp, existsSync(owner.taskTmp));
+  if (
+    taskTmp &&
+    owner.taskTmp !== validateTaskTmp(taskId, taskTmp, existsSync(taskTmp))
+  ) {
+    fail(`browser task temp changed for ${taskId}`);
+  }
   owner.realAxi = validateExecutable(owner.realAxi, "chrome-devtools-axi");
   owner.browserExecutable = owner.browserExecutable
     ? validateExecutable(owner.browserExecutable, "automation browser executable")
@@ -158,8 +186,8 @@ function validateOwner(owner, root, taskId) {
   return owner;
 }
 
-function loadOwner(root, taskId) {
-  return validateOwner(readJson(path.join(root, OWNER_FILE)), root, taskId);
+function loadOwner(root, taskId, ownerHome, taskTmp = "") {
+  return validateOwner(readJson(path.join(root, OWNER_FILE)), root, taskId, ownerHome, taskTmp);
 }
 
 function parseInventory(text) {
@@ -219,7 +247,7 @@ function isLegacyBrowser(row) {
 
 function taskProfileFromCommand(command) {
   const match = command.match(
-    /--user-data-dir(?:=|\s+)(["']?)((?:\/private)?\/tmp\/fm-[A-Za-z0-9._-]+\/browser\/profile)\1(?:\s|$)/,
+    /--user-data-dir(?:=|\s+)(["']?)((?:\/private)?\/tmp\/fm-browser-[a-f0-9]{16}-[A-Za-z0-9._-]+\/profile)\1(?:\s|$)/,
   );
   return match ? match[2] : null;
 }
@@ -275,6 +303,16 @@ async function terminateExactPid(pid, matches, allowGroup = false) {
   return waitForExit(pid, 1_000);
 }
 
+function sameProcessIdentity(original, current) {
+  return (
+    current !== null &&
+    original.pid === current.pid &&
+    original.ppid === current.ppid &&
+    original.pgid === current.pgid &&
+    original.command === current.command
+  );
+}
+
 function descendantsOf(pid, rows) {
   const descendants = new Set([pid]);
   let changed = true;
@@ -289,6 +327,55 @@ function descendantsOf(pid, rows) {
   }
   descendants.delete(pid);
   return [...descendants];
+}
+
+async function terminateOwnedBrowserTree(state) {
+  const rows = processInventory();
+  const root = rowForPid(state.pid, rows);
+  if (!processMatchesBrowser(state, root)) return false;
+  const ownedPids = new Set([root.pid, ...descendantsOf(root.pid, rows)]);
+  if (root.pgid === root.pid) {
+    for (const row of rows) {
+      if (row.pgid === root.pgid) ownedPids.add(row.pid);
+    }
+  }
+  const owned = rows.filter((row) => ownedPids.has(row.pid));
+  if (root.pgid === root.pid) {
+    try {
+      process.kill(-root.pgid, "SIGTERM");
+    } catch {
+      // The dedicated process group already exited.
+    }
+  } else {
+    for (const row of owned.slice().reverse()) {
+      try {
+        process.kill(row.pid, "SIGTERM");
+      } catch {
+        // The exact process already exited.
+      }
+    }
+  }
+  await sleep(STOP_GRACE_MS);
+  for (const original of owned) {
+    if (!sameProcessIdentity(original, rowForPid(original.pid))) continue;
+    try {
+      process.kill(original.pid, "SIGKILL");
+    } catch {
+      // The exact process exited after verification.
+    }
+  }
+  await sleep(100);
+  const survivors = owned.filter((original) =>
+    sameProcessIdentity(original, rowForPid(original.pid)),
+  );
+  if (survivors.length > 0) {
+    fail(
+      `task browser process tree survived cleanup: ${survivors
+        .map((row) => row.pid)
+        .join(",")}`,
+    );
+  }
+  return true;
 }
 
 async function terminateLegacyBridgeTree(pid) {
@@ -475,11 +562,7 @@ function readBrowserState(root) {
 async function stopTaskBrowser(root) {
   const state = readBrowserState(root);
   if (!state) return false;
-  const stopped = await terminateExactPid(
-    state.pid,
-    (row) => processMatchesBrowser(state, row),
-    true,
-  );
+  const stopped = await terminateOwnedBrowserTree(state);
   const stillOwned = processInventory().filter(
     (row) => row.command.includes(`--user-data-dir=${state.profile}`),
   );
@@ -745,17 +828,18 @@ async function commandPrepare(args) {
     args;
   validateTaskId(taskId);
   const taskTmp = validateTaskTmp(taskId, taskTmpInput);
-  const root = path.join(taskTmp, "browser");
+  const ownerHome = canonicalOwnerHome(ownerHomeInput);
+  const root = expectedBrowserRoot(taskId, ownerHome);
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const canonicalRoot = validateBrowserRoot(taskId, root);
+  const canonicalRoot = validateBrowserRoot(taskId, root, ownerHome);
   mkdirSync(path.join(canonicalRoot, "home"), { recursive: true, mode: 0o700 });
   mkdirSync(path.join(canonicalRoot, "profile"), { recursive: true, mode: 0o700 });
-  const ownerHome = realpathSync(ownerHomeInput);
   const owner = {
-    version: 1,
+    version: 2,
     taskId,
     root: canonicalRoot,
     ownerHome,
+    taskTmp,
     realAxi: validateExecutable(realAxiInput, "chrome-devtools-axi"),
     browserExecutable: browserInput
       ? validateExecutable(browserInput, "automation browser executable")
@@ -767,8 +851,9 @@ async function commandPrepare(args) {
 
 async function commandRun(args) {
   const taskId = validateTaskId(process.env.FM_BROWSER_TASK_ID || "");
-  const root = validateBrowserRoot(taskId, process.env.FM_BROWSER_ROOT || "");
-  const owner = loadOwner(root, taskId);
+  const ownerHome = canonicalOwnerHome(process.env.FM_BROWSER_OWNER_HOME || "");
+  const root = validateBrowserRoot(taskId, process.env.FM_BROWSER_ROOT || "", ownerHome);
+  const owner = loadOwner(root, taskId, ownerHome);
   const lock = await acquireLock(root);
   try {
     const command = args[0] || "";
@@ -809,14 +894,12 @@ async function commandRun(args) {
   }
 }
 
-async function reapRoot(taskId, taskTmp, removeRoot = true) {
+async function reapRoot(taskId, taskTmp, ownerHome, removeRoot = true) {
   const expectedTmp = validateTaskTmp(taskId, taskTmp, false);
-  if (!existsSync(expectedTmp)) return { bridge: 0, browser: 0 };
-  const validatedTmp = validateTaskTmp(taskId, expectedTmp);
-  const root = path.join(validatedTmp, "browser");
+  const root = expectedBrowserRoot(taskId, ownerHome);
   if (!existsSync(root)) return { bridge: 0, browser: 0 };
-  const canonicalRoot = validateBrowserRoot(taskId, root);
-  const owner = loadOwner(canonicalRoot, taskId);
+  const canonicalRoot = validateBrowserRoot(taskId, root, ownerHome);
+  const owner = loadOwner(canonicalRoot, taskId, ownerHome, expectedTmp);
   const lock = await acquireLock(canonicalRoot);
   let bridge = 0;
   let browser = 0;
@@ -836,15 +919,15 @@ async function reapRoot(taskId, taskTmp, removeRoot = true) {
 }
 
 async function commandReap(args) {
-  if (args.length !== 2) fail("usage: reap <task-id> <tasktmp>");
-  await reapRoot(validateTaskId(args[0]), args[1]);
+  if (args.length !== 3) fail("usage: reap <task-id> <tasktmp> <owner-home>");
+  await reapRoot(validateTaskId(args[0]), args[1], args[2]);
 }
 
 function taskRoots(tmpRoot) {
   const roots = [];
   for (const entry of readdirSync(tmpRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !entry.name.startsWith("fm-")) continue;
-    const browserRoot = path.join(tmpRoot, entry.name, "browser");
+    if (!entry.isDirectory() || !entry.name.startsWith("fm-browser-")) continue;
+    const browserRoot = path.join(tmpRoot, entry.name);
     if (!existsSync(path.join(browserRoot, OWNER_FILE))) continue;
     roots.push(browserRoot);
   }
@@ -854,7 +937,13 @@ function taskRoots(tmpRoot) {
 function protectedTaskPids(tmpRoot) {
   const protectedPids = new Set();
   for (const root of taskRoots(tmpRoot)) {
-    const taskId = path.basename(path.dirname(root)).slice(3);
+    let owner;
+    try {
+      owner = readJson(path.join(root, OWNER_FILE));
+    } catch {
+      continue;
+    }
+    const taskId = owner.taskId;
     const browserState = readBrowserState(root);
     if (browserState?.pid) protectedPids.add(browserState.pid);
     const bridgePid = readBridgePid(root, taskId);
@@ -896,7 +985,8 @@ async function commandSweep(args) {
     }
     if (owner.ownerHome !== ownerHome || !TASK_ID_RE.test(owner.taskId || "")) continue;
     if (existsSync(path.join(stateDir, `${owner.taskId}.meta`))) continue;
-    const result = await reapRoot(owner.taskId, path.dirname(root));
+    if (canonicalOwnerHome(owner.ownerHome) !== ownerHome) continue;
+    const result = await reapRoot(owner.taskId, owner.taskTmp, ownerHome);
     taskRootsReaped += 1;
     bridgesReaped += result.bridge;
     browsersReaped += result.browser;
@@ -906,10 +996,16 @@ async function commandSweep(args) {
   let profilesReaped = 0;
   try {
     for (const root of taskRoots(tmpRoot)) {
-      const taskId = path.basename(path.dirname(root)).slice(3);
+      let owner;
+      try {
+        owner = readJson(path.join(root, OWNER_FILE));
+      } catch {
+        continue;
+      }
+      const taskId = owner.taskId;
       let canonicalRoot;
       try {
-        canonicalRoot = validateBrowserRoot(taskId, root);
+        canonicalRoot = validateBrowserRoot(taskId, root, owner.ownerHome);
       } catch {
         continue;
       }
@@ -954,6 +1050,10 @@ async function main() {
     case "prepare":
       await commandPrepare(args);
       break;
+    case "root":
+      if (args.length !== 2) fail("usage: root <task-id> <owner-home>");
+      process.stdout.write(`${expectedBrowserRoot(validateTaskId(args[0]), args[1])}\n`);
+      break;
     case "run":
       await commandRun(args);
       break;
@@ -967,7 +1067,7 @@ async function main() {
       commandClassify(args);
       break;
     default:
-      fail("usage: fm-browser-isolation.mjs <prepare|run|reap|sweep|classify> ...");
+      fail("usage: fm-browser-isolation.mjs <prepare|root|run|reap|sweep|classify> ...");
   }
 }
 

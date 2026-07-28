@@ -65,6 +65,7 @@ cat > "$FAKE_BROWSER" <<'JS'
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { spawn } = require("child_process");
 
 const profileArg = process.argv.find((arg) => arg.startsWith("--user-data-dir="));
 const requiredArgs = ["--use-mock-keychain", "--password-store=basic"];
@@ -75,6 +76,10 @@ if (
 ) process.exit(2);
 const profile = profileArg.slice("--user-data-dir=".length);
 fs.mkdirSync(profile, { recursive: true });
+const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
+fs.writeFileSync(path.join(profile, "helper.pid"), `${helper.pid}\n`);
 const server = http.createServer((request, response) => {
   response.setHeader("content-type", "application/json");
   response.end(JSON.stringify({
@@ -137,6 +142,10 @@ JS
 
 chmod +x "$FAKE_BROWSER" "$FAKE_AXI" "$FAKE_BRIDGE" "$FAKE_HEADED"
 
+browser_root() {
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" root "$1" "$2"
+}
+
 test_process_discrimination() {
   local fixture="$TMP_ROOT/processes.txt" out
   cat > "$fixture" <<'ROWS'
@@ -147,7 +156,7 @@ test_process_discrimination() {
 105 1 105 codex task text says chrome-devtools-axi-bridge process cleanup
 106 1 106 node /opt/axi/chrome-devtools-axi-bridge.js
 107 106 106 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --user-data-dir=/tmp/puppeteer_dev_chrome_profile-leaked
-108 1 108 /cache/Google Chrome for Testing --headless=new --user-data-dir=/tmp/fm-task-z1/browser/profile
+108 1 108 /cache/Google Chrome for Testing --headless=new --user-data-dir=/tmp/fm-browser-0123456789abcdef-task-z1/profile
 109 1 109 python worker.py --headless=new --user-data-dir=/tmp/puppeteer_dev_chrome_profile-not-a-browser
 ROWS
   out=$("$BROWSER" classify "$fixture")
@@ -164,17 +173,17 @@ ROWS
 
 test_task_launch_and_reap() {
   local id=browser-owned-z2 tasktmp="$TMP_ROOT/tmp/fm-browser-owned-z2"
-  local browser_pid bridge_pid canonical_tasktmp
+  local browser_pid bridge_pid helper_pid root
   mkdir -p "$tasktmp/gotmp"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     FM_BROWSER_TASK_ID="$id" \
-    FM_BROWSER_ROOT="$tasktmp/browser" \
+    FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
     "$WRAPPER" open https://example.test/
 
-  canonical_tasktmp=$(cd "$tasktmp" && pwd -P)
-  grep -F "home=$canonical_tasktmp/browser/home" "$AXI_RECORD" >/dev/null \
+  grep -F "home=$root/home" "$AXI_RECORD" >/dev/null \
     || fail "AXI HOME was not isolated under the task browser root"
   grep -F "session=fm-$id" "$AXI_RECORD" >/dev/null \
     || fail "AXI session was not keyed to the task"
@@ -189,8 +198,9 @@ test_task_launch_and_reap() {
   grep -Fx 'chrome_args=--use-mock-keychain --password-store=basic' "$AXI_RECORD" >/dev/null \
     || fail "AXI fallback launch did not inherit credential-store isolation"
 
-  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$tasktmp/browser/browser.json")
-  bridge_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$tasktmp/browser/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
+  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/browser.json")
+  helper_pid=$(cat "$root/profile/helper.pid")
+  bridge_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
   TEARDOWN_BROWSER_PID=$browser_pid
   TEARDOWN_BRIDGE_PID=$bridge_pid
   kill -0 "$browser_pid" 2>/dev/null || fail "fake automation browser did not remain live"
@@ -198,11 +208,12 @@ test_task_launch_and_reap() {
   sleep 300 &
   UNRELATED_PID=$!
 
-  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
   kill -0 "$browser_pid" 2>/dev/null && fail "task browser survived reap"
+  kill -0 "$helper_pid" 2>/dev/null && fail "unmarked browser helper survived reap"
   kill -0 "$bridge_pid" 2>/dev/null && fail "task bridge survived reap"
   kill -0 "$UNRELATED_PID" 2>/dev/null || fail "unrelated process was killed by task reap"
-  [ ! -e "$tasktmp/browser" ] || fail "task browser profile root survived reap"
+  [ ! -e "$root" ] || fail "task browser profile root survived reap"
   TEARDOWN_BROWSER_PID=
   TEARDOWN_BRIDGE_PID=
   pass "task reap removes the exact bridge, browser, and profile without collateral"
@@ -210,32 +221,33 @@ test_task_launch_and_reap() {
 
 test_failed_browser_cannot_respawn() {
   local id=browser-failure-z4 tasktmp="$TMP_ROOT/tmp/fm-browser-failure-z4"
-  local browser_pid second_output
+  local browser_pid second_output root
   mkdir -p "$tasktmp/gotmp"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     FM_BROWSER_TASK_ID="$id" \
-    FM_BROWSER_ROOT="$tasktmp/browser" \
+    FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
     "$WRAPPER" open https://example.test/
-  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$tasktmp/browser/browser.json")
+  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/browser.json")
   kill "$browser_pid"
   wait "$browser_pid" 2>/dev/null || true
   if second_output=$(
     FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
       FM_BROWSER_TASK_ID="$id" \
-      FM_BROWSER_ROOT="$tasktmp/browser" \
+      FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
       "$WRAPPER" screenshot 2>&1
   ); then
     fail "wrapper respawned a browser after its owned browser died"
   fi
   printf '%s\n' "$second_output" | grep -F 'refusing to respawn it implicitly' >/dev/null \
     || fail "unexpected browser death did not trip the respawn latch"
-  [ -f "$tasktmp/browser/browser.failed" ] \
+  [ -f "$root/browser.failed" ] \
     || fail "browser failure latch was not recorded"
-  [ ! -f "$tasktmp/browser/browser.json" ] \
+  [ ! -f "$root/browser.json" ] \
     || fail "stale browser state survived failed-browser cleanup"
-  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
   pass "unexpected browser death is cleaned and cannot trigger an implicit respawn"
 }
 
@@ -245,7 +257,7 @@ test_real_teardown_path_reaps_owned_browser() {
   local project="$TMP_ROOT/teardown-project" origin="$TMP_ROOT/teardown-origin.git"
   local worktree="$pool/1/worktree" seed="$TMP_ROOT/teardown-seed"
   local fakebin="$TMP_ROOT/teardown-fakebin"
-  local browser_pid bridge_pid output
+  local browser_pid bridge_pid output root
   TEARDOWN_TASK_TMP=$tasktmp
   mkdir -p "$tasktmp/gotmp" "$home/state" "$home/data" "$home/config" "$pool/1" "$fakebin"
   git init -q --bare "$origin"
@@ -301,10 +313,11 @@ yolo=off
 tasktmp=$tasktmp
 META
   "$BROWSER" prepare "$id" "$tasktmp" "$home" "$FAKE_AXI" "$FAKE_BROWSER" ""
-  FM_BROWSER_TASK_ID="$id" FM_BROWSER_ROOT="$tasktmp/browser" \
+  root=$("$BROWSER" root "$id" "$home")
+  FM_BROWSER_TASK_ID="$id" FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$home" \
     "$WRAPPER" open https://example.test/
-  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$tasktmp/browser/browser.json")
-  bridge_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$tasktmp/browser/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
+  browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/browser.json")
+  bridge_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
   TEARDOWN_BROWSER_PID=$browser_pid
   TEARDOWN_BRIDGE_PID=$bridge_pid
 
@@ -313,7 +326,7 @@ META
       FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
       FM_CONFIG_OVERRIDE="$home/config" FM_CHECKOUT_REFRESH_LOCK_ROOT="$TMP_ROOT/checkout-locks" \
       FM_FAKE_TASK_ID="$id" PATH="$fakebin:$PATH" \
-      "$TEARDOWN" "$id" 2>&1
+      env -u NO_MISTAKES_GATE FM_GATE_REFUSE_BYPASS=1 "$TEARDOWN" "$id" 2>&1
   ) || fail "fm-teardown rejected an otherwise-finished browser-owning task: $output"
   kill -0 "$browser_pid" 2>/dev/null && fail "browser survived the real fm-teardown path"
   kill -0 "$bridge_pid" 2>/dev/null && fail "bridge survived the real fm-teardown path"
@@ -325,13 +338,46 @@ META
   pass "real fm-teardown path reaps the bridge, browser process tree, and task profile"
 }
 
+test_same_id_isolated_across_homes() {
+  local id=shared-browser-z6 tasktmp="$TMP_ROOT/tmp/fm-shared-browser-z6"
+  local home_a="$TMP_ROOT/home-a" home_b="$TMP_ROOT/home-b"
+  local root_a root_b browser_a browser_b bridge_a bridge_b
+  mkdir -p "$tasktmp/gotmp" "$home_a" "$home_b"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$home_a" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$home_b" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root_a=$(browser_root "$id" "$home_a")
+  root_b=$(browser_root "$id" "$home_b")
+  [ "$root_a" != "$root_b" ] || fail "sibling homes received the same browser root"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" FM_BROWSER_TASK_ID="$id" \
+    FM_BROWSER_ROOT="$root_a" FM_BROWSER_OWNER_HOME="$home_a" \
+    "$WRAPPER" open https://home-a.example.test/
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" FM_BROWSER_TASK_ID="$id" \
+    FM_BROWSER_ROOT="$root_b" FM_BROWSER_OWNER_HOME="$home_b" \
+    "$WRAPPER" open https://home-b.example.test/
+  browser_a=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root_a/browser.json")
+  browser_b=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root_b/browser.json")
+  bridge_a=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root_a/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
+  bridge_b=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root_b/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$home_a"
+  kill -0 "$browser_a" 2>/dev/null && fail "reaped home browser survived"
+  kill -0 "$bridge_a" 2>/dev/null && fail "reaped home bridge survived"
+  kill -0 "$browser_b" 2>/dev/null || fail "sibling home browser was killed"
+  kill -0 "$bridge_b" 2>/dev/null || fail "sibling home bridge was killed"
+  [ -d "$root_b/profile" ] || fail "sibling home profile was removed"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$home_b"
+  pass "same task id remains browser-isolated across sibling homes"
+}
+
 test_orphan_sweep() {
   local id=browser-orphan-z3 tasktmp="$TMP_ROOT/tmp/fm-browser-orphan-z3"
   local legacy_profile="$TMP_ROOT/tmp/puppeteer_dev_chrome_profile-stale"
-  local headed_profile="$TMP_ROOT/tmp/puppeteer_dev_chrome_profile-headed" out
+  local headed_profile="$TMP_ROOT/tmp/puppeteer_dev_chrome_profile-headed" out root
   mkdir -p "$tasktmp/gotmp" "$legacy_profile" "$headed_profile"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
 
   node "$FAKE_BRIDGE" &
   LEGACY_BRIDGE_PID=$!
@@ -357,10 +403,10 @@ test_orphan_sweep() {
   wait "$LEGACY_BROWSER_PID" 2>/dev/null || true
   kill -0 "$UNRELATED_PID" 2>/dev/null || fail "unrelated process was killed by orphan sweep"
   kill -0 "$HEADED_BROWSER_PID" 2>/dev/null || fail "headed temp-profile browser was killed by orphan sweep"
-  [ ! -e "$tasktmp/browser" ] || fail "metadata-free task browser root survived sweep"
+  [ ! -e "$root" ] || fail "metadata-free task browser root survived sweep"
   [ ! -e "$legacy_profile" ] || fail "unused legacy temp profile survived sweep"
   [ -d "$headed_profile" ] || fail "active headed temp profile was removed by orphan sweep"
-  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=1 browser_processes=1 profiles=1$' >/dev/null \
+  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=1 browser_processes=2 profiles=1$' >/dev/null \
     || fail "sweep did not report measured cleanup: $out"
   pass "backstop kills only exact orphan markers and preserves unrelated processes"
 }
@@ -372,10 +418,14 @@ test_spawn_and_teardown_wiring() {
     || fail "spawn does not put the task AXI wrapper first on PATH"
   grep -F "HERDR_AGENT_ENV+=(\"FM_BROWSER_TASK_ID=\$ID\")" "$SPAWN" >/dev/null \
     || fail "Herdr does not receive the task browser identity natively"
+  grep -F "HERDR_AGENT_ENV+=(\"FM_BROWSER_OWNER_HOME=\$FM_HOME\")" "$SPAWN" >/dev/null \
+    || fail "Herdr does not receive the home-qualified browser owner"
   grep -F "FM_BROWSER_ROOT=\$(shell_quote \"\$BROWSER_ROOT\")" "$SPAWN" >/dev/null \
     || fail "terminal backends do not export the task browser root"
   grep -F "reap_task_browser \"\$ID\" \"\$TASK_TMP\"" "$TEARDOWN" >/dev/null \
     || fail "teardown does not reap the task browser before temp-root deletion"
+  grep -F 'cleanup_prepared_task_tmp' "$SPAWN" >/dev/null \
+    || fail "spawn abort does not route prepared temp cleanup through browser reap"
   grep -F 'browser_gc_sweep' "$BOOTSTRAP" >/dev/null \
     || fail "bootstrap does not expose the crash-orphan backstop"
   grep -F "\"\$SCRIPT_DIR/fm-browser-isolation.sh\" sweep \"\$FM_HOME\" \"\$STATE\"" "$BOOTSTRAP" >/dev/null \
@@ -387,5 +437,6 @@ test_process_discrimination
 test_task_launch_and_reap
 test_failed_browser_cannot_respawn
 test_real_teardown_path_reaps_owned_browser
+test_same_id_isolated_across_homes
 test_orphan_sweep
 test_spawn_and_teardown_wiring

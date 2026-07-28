@@ -2173,6 +2173,13 @@ make_seeded_secondmate_home() {
   FM_TEST_ROOT_OVERRIDE=$primary
 }
 
+make_seeded_secondmate_home_dirty() {
+  local home=$1
+  printf '\nDirty secondmate fixture.\n' >> "$home/AGENTS.md"
+  [ -n "$(git -C "$home" status --porcelain --untracked-files=no)" ] \
+    || fail "secondmate fixture did not become dirty"
+}
+
 test_secondmate_pool_is_nonactivating_and_noninherited() {
   local id rec sm out status
   id=account-secondmate-off-z10
@@ -2237,7 +2244,7 @@ test_explicit_secondmate_route_preserves_ambient_primary_enforce() {
   pass "explicit secondmate routes preserve the ambient primary enforce policy"
 }
 
-test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
+test_enforced_secondmate_requires_routing_inheritance() {
   local id rec sm out status
   id=account-secondmate-inherit-refuse-z11d
   rec=$(make_case secondmate-inherit-refuse claude)
@@ -2252,7 +2259,11 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   assert_contains "$out" "secondmate-home" "inheritance refusal omitted the offending secondmate home"
   assert_contains "$out" "run bin/fm-config-push.sh" "inheritance refusal omitted the manual reconciliation step"
   assert_not_grep '^new-window ' "$TMUX_LOG" "inheritance refusal created an endpoint"
+  pass "enforced secondmates require authoritative inherited routing policy"
+}
 
+test_enforced_secondmate_clean_incapable_home_refuses_at_capability_gate() {
+  local id rec sm out status
   id=account-secondmate-incapable-refuse-z11e
   rec=$(make_case secondmate-incapable-refuse claude)
   read_case "$rec"
@@ -2264,9 +2275,38 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
   assert_contains "$out" "$id" "capability refusal omitted the offending secondmate"
-  assert_contains "$out" "dirty working tree" "capability refusal did not stop at the freshness gate"
+  assert_contains "$out" "lacks Agent Fleet routing support" \
+    "capability refusal omitted the unsupported capability"
+  assert_contains "$out" "Fast-forward or otherwise reconcile the home to this Firstmate revision" \
+    "capability refusal omitted the source-reconciliation action"
+  assert_contains "$out" "run bin/fm-config-push.sh" \
+    "capability refusal omitted the config-reconciliation action"
+  assert_not_contains "$out" "dirty working tree" \
+    "clean capability refusal was misclassified as a freshness failure"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
-  pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
+  pass "clean incapable secondmates refuse at the capability gate with reconciliation guidance"
+}
+
+test_enforced_secondmate_dirty_incapable_home_refuses_at_freshness_gate() {
+  local id rec sm out status
+  id=account-secondmate-dirty-incapable-refuse-z11i
+  rec=$(make_case secondmate-dirty-incapable-refuse claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id" incapable
+  sm=$(cd "$sm" && pwd -P)
+  make_seeded_secondmate_home_dirty "$sm"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "enforced secondmate launched from a dirty, incapable home"
+  assert_contains "$out" "$id" "freshness refusal omitted the offending secondmate"
+  assert_contains "$out" "dirty working tree" \
+    "dirty, incapable home did not stop at the freshness gate"
+  assert_not_contains "$out" "lacks Agent Fleet routing support" \
+    "dirty, incapable home reached the later capability gate"
+  assert_not_grep '^new-window ' "$TMUX_LOG" "freshness refusal created an endpoint"
+  pass "dirty incapable secondmates refuse at freshness before capability"
 }
 
 test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
@@ -2305,6 +2345,7 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  make_seeded_secondmate_home_dirty "$sm"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "off secondmate launched from a dirty, capability-drifted home"
@@ -6189,6 +6230,14 @@ if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-freshness-capability-order ]; then
+  run_isolated_test test_enforced_secondmate_requires_routing_inheritance
+  run_isolated_test test_enforced_secondmate_clean_incapable_home_refuses_at_capability_gate
+  run_isolated_test test_enforced_secondmate_dirty_incapable_home_refuses_at_freshness_gate
+  run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
@@ -6493,7 +6542,9 @@ run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
 run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
 run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
 run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
-run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
+run_isolated_test test_enforced_secondmate_requires_routing_inheritance
+run_isolated_test test_enforced_secondmate_clean_incapable_home_refuses_at_capability_gate
+run_isolated_test test_enforced_secondmate_dirty_incapable_home_refuses_at_freshness_gate
 run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
 run_isolated_test test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn

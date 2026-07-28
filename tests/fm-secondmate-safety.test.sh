@@ -1070,7 +1070,7 @@ test_home_seed_refuses_active_home_and_root() {
   root_descendant="$root_clone/tmp/design-home"
   root_ancestor="$TMP_ROOT/active-seed-root-ancestor"
   root_inside="$root_ancestor/nested-root"
-  git clone --quiet "$ROOT" "$active_ancestor"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$active_ancestor"
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/active-alpha.git"
@@ -1097,13 +1097,13 @@ test_home_seed_refuses_active_home_and_root() {
     || fail "seed did not explain active FM_HOME ancestor rejection"
   [ ! -f "$active_ancestor/.fm-secondmate-home" ] || fail "seed marked an ancestor of active FM_HOME"
 
-  if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$ROOT" alpha >/dev/null 2>"$err"; then
+  if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$FM_ROOT_OVERRIDE" alpha >/dev/null 2>"$err"; then
     fail "seed allowed secondmate home to reuse FM_ROOT"
   fi
   grep -F 'secondmate home cannot be the firstmate repo' "$err" >/dev/null \
     || fail "seed did not explain FM_ROOT rejection"
 
-  git clone --quiet "$ROOT" "$root_clone"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$root_clone"
   if FM_HOME="$home" FM_ROOT_OVERRIDE="$root_clone" "$ROOT/bin/fm-home-seed.sh" design "$root_descendant" alpha >/dev/null 2>"$err"; then
     fail "seed allowed secondmate home inside FM_ROOT"
   fi
@@ -1111,8 +1111,8 @@ test_home_seed_refuses_active_home_and_root() {
     || fail "seed did not explain FM_ROOT descendant rejection"
   [ ! -e "$root_clone/tmp" ] || fail "seed created a directory inside FM_ROOT before descendant rejection"
 
-  git clone --quiet "$ROOT" "$root_ancestor"
-  git clone --quiet "$ROOT" "$root_inside"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$root_ancestor"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$root_inside"
   if FM_HOME="$home" FM_ROOT_OVERRIDE="$root_inside" "$ROOT/bin/fm-home-seed.sh" design "$root_ancestor" alpha >/dev/null 2>"$err"; then
     fail "seed allowed secondmate home to contain FM_ROOT"
   fi
@@ -1130,7 +1130,7 @@ test_home_seed_refuses_home_marked_for_another_id() {
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/marked-alpha.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   printf 'other\n' > "$subhome/.fm-secondmate-home"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
   scaffold_secondmate_charter "$home" design 'design domain' alpha || fail "charter scaffold failed for marked-home seed test"
@@ -1151,7 +1151,7 @@ test_home_seed_refuses_home_registered_to_another_id() {
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/registered-alpha.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   subhome_abs=$(cd "$subhome" && pwd -P)
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
   printf '%s\n' '- other - other domain (home: '"$subhome_abs"'; scope: other domain; projects: beta; added 2026-06-22)' > "$home/data/secondmates.md"
@@ -1208,13 +1208,15 @@ test_home_seed_refuses_home_overlapping_registered_home() {
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/overlap-alpha.git"
-  git clone --quiet "$ROOT" "$registered_parent"
-  git clone --quiet "$ROOT" "$registered_child"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$registered_parent"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$registered_child"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
   cat > "$home/data/secondmates.md" <<EOF
 - parent - parent domain (home: $registered_parent; scope: parent domain; projects: beta; added 2026-06-22)
 - child - child domain (home: $registered_child; scope: child domain; projects: gamma; added 2026-06-22)
 EOF
+  scaffold_secondmate_charter "$home" design 'design domain' alpha \
+    || fail "charter scaffold failed for registered-overlap seed test"
 
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$nested" alpha >/dev/null 2>"$err"; then
     fail "seed accepted a home inside a registered secondmate home"
@@ -1257,7 +1259,7 @@ test_home_seed_refuses_existing_remote_backed_project_with_wrong_origin() {
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/wrong-alpha.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   subhome_abs=$(cd "$subhome" && pwd -P)
   mkdir -p "$subhome/projects"
   git clone --quiet "$home/projects/alpha" "$subhome/projects/alpha"
@@ -1309,7 +1311,7 @@ test_home_seed_skips_initialized_existing_no_mistakes_projects() {
   fm_git_init_commit "$home/projects/beta"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/existing-alpha.git"
   fm_git_add_origin "$home/projects/beta" "$TMP_ROOT/remotes/existing-beta.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   mkdir -p "$subhome/projects"
   origin=$(git -C "$home/projects/alpha" remote get-url origin)
   git clone --quiet "$origin" "$subhome/projects/alpha"
@@ -1342,7 +1344,7 @@ test_home_seed_refuses_uninitialized_existing_no_mistakes_project() {
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/uninitialized-alpha.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   mkdir -p "$subhome/projects"
   origin=$(git -C "$home/projects/alpha" remote get-url origin)
   git clone --quiet "$origin" "$subhome/projects/alpha"
@@ -1371,7 +1373,7 @@ test_home_seed_refuses_project_destinations_outside_subhome() {
   mkdir -p "$home/projects" "$home/data" "$home/state" "$sink"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/symlink-alpha.git"
-  git clone --quiet "$ROOT" "$subhome"
+  git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
   rm -rf "$subhome/projects"
   ln -s "$sink" "$subhome/projects"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
@@ -1401,7 +1403,7 @@ test_home_seed_refuses_operational_dirs_outside_subhome() {
     subhome="$TMP_ROOT/symlink-opdir-subhome-$opdir"
     sink="$home/data/symlink-opdir-$opdir"
     rm -rf "$subhome" "$sink"
-    git clone --quiet "$ROOT" "$subhome"
+    git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
     mkdir -p "$sink"
     rm -rf "${subhome:?}/${opdir:?}"
     ln -s "$sink" "$subhome/$opdir"
@@ -1429,7 +1431,7 @@ test_home_seed_refuses_symlinked_leaf_files() {
     subhome="$TMP_ROOT/symlink-leaf-subhome-${leaf//\//-}"
     sink="$home/data/symlink-leaf-${leaf//\//-}"
     rm -rf "$subhome" "$sink"
-    git clone --quiet "$ROOT" "$subhome"
+    git clone --quiet "$FM_ROOT_OVERRIDE" "$subhome"
     mkdir -p "$(dirname "$subhome/$leaf")" "$(dirname "$sink")"
     expected=outside
     if [ "$leaf" = ".fm-secondmate-home" ]; then
@@ -1521,9 +1523,9 @@ SH
   fi
   grep -F 'secondmate home cannot be the active firstmate home' "$err" >/dev/null || fail "spawn did not reject active home"
 
-  write_secondmate_registration "$home" domain "$ROOT"
+  write_secondmate_registration "$home" domain "$FM_ROOT_OVERRIDE"
   if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/spawn-validate-fake/pane.txt" \
-    "$ROOT/bin/fm-spawn.sh" domain "$ROOT" codex --secondmate >/dev/null 2>"$err"; then
+    "$ROOT/bin/fm-spawn.sh" domain "$FM_ROOT_OVERRIDE" codex --secondmate >/dev/null 2>"$err"; then
     fail "secondmate spawn accepted the firstmate repo root"
   fi
   grep -F 'secondmate home cannot be the firstmate repo' "$err" >/dev/null || fail "spawn did not reject firstmate repo root"

@@ -17,16 +17,71 @@ make_spawn_fakebin() {
 set -u
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_id}"*)
+    [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1
+    printf '%%1\n'
+    exit 0
+    ;;
+  *"#{pane_current_command}"*)
+    [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1
+    printf 'grok\n'
+    exit 0
+    ;;
+  *"#{session_name}"*"#{window_name}"*)
+    [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1
+    printf 'firstmate\tfm-%s\n' "${FM_FAKE_TASK_ID:?}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  list-windows)
+    [ ! -f "${FM_FAKE_ENDPOINT_FILE:?}" ] \
+      || printf 'fm-%s\n' "${FM_FAKE_TASK_ID:?}"
+    exit 0
+    ;;
+  new-window)
+    : > "${FM_FAKE_ENDPOINT_FILE:?}"
+    printf '@1\n'
+    exit 0
+    ;;
+  kill-window) rm -f "${FM_FAKE_ENDPOINT_FILE:?}"; exit 0 ;;
+  has-session|new-session|send-keys|set-window-option) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse gh-axi gh
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_TREEHOUSE_WORKTREE:?}"
+  exit 0
+fi
+if [ "${1:-}" = return ]; then
+  target=${@: -1}
+  [ "$target" != . ] || target=$(pwd -P)
+  git -C "${FM_FAKE_TREEHOUSE_PROJECT:?}" worktree remove --force "$target"
+  status=$?
+  [ "$status" -eq 0 ] || exit "$status"
+  python3 - "${FM_FAKE_TREEHOUSE_STATE:?}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+state["worktrees"][0]["leased"] = False
+state["worktrees"][0]["lease_holder"] = None
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" gh-axi gh
   printf '%s\n' "$fakebin"
 }
 
@@ -35,13 +90,17 @@ make_spawn_case() {
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$home/treehouse-pools/grok-pool/1/wt"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   grok_home="$case_dir/grok"
   id="grok-$name-x1"
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$grok_home"
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" \
+    "$home/treehouse-pools/grok-pool/1" "$grok_home"
   printf 'brief\n' > "$home/data/$id/brief.md"
   fm_git_worktree "$proj" "$wt" "fm/$id"
+  git -C "$wt" switch --detach --quiet
+  printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"firstmate-%s"}]}\n' \
+    "$wt" "$id" > "$home/treehouse-pools/grok-pool/treehouse-state.json"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$grok_home|$id"
 }
@@ -51,7 +110,12 @@ run_grok_spawn() {
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_FAKE_ENDPOINT_FILE="$home/state/$id.endpoint" FM_FAKE_TASK_ID="$id" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$wt" FM_FAKE_TREEHOUSE_PROJECT="$proj" \
+    FM_FAKE_TREEHOUSE_STATE="$home/treehouse-pools/grok-pool/treehouse-state.json" \
     GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$id" "$proj" grok 2>&1
 }
@@ -105,9 +169,18 @@ EOF
   status=$?
   expect_code 0 "$status" "grok spawn should succeed before teardown"
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
+  assert_present "$home/state/$id.endpoint" "fake tmux endpoint was not recorded"
+  printf '# Completion\n\n## Summary\n\nGrok lifecycle cleanup is ready.\n\n## What changed\n\nRecorded hook cleanup state.\n\n## Verification\n\nThe teardown assertions below verify cleanup.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nNone.\n\n## Follow-ups\n\nNone.\n' \
+    > "$home/data/$id/completion.md"
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
+    FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+    FM_FAKE_ENDPOINT_FILE="$home/state/$id.endpoint" FM_FAKE_TASK_ID="$id" \
     GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
+    FM_FAKE_TREEHOUSE_PROJECT="$proj" \
+    FM_FAKE_TREEHOUSE_STATE="$home/treehouse-pools/grok-pool/treehouse-state.json" \
     "$TEARDOWN" "$id" --force >/dev/null 2>&1 \
     || fail "grok teardown failed"
 

@@ -1655,17 +1655,93 @@ test_task_tmp_partial_removal_fails_closed() {
   pass "partial task temp removal fails closed"
 }
 
-test_spawn_rollback_uses_generation_safe_task_tmp_removal() {
-  local safe_cleanup_count
-  safe_cleanup_count=$(grep -cF \
-    '&& ! fm_account_safe_remove_task_tmp "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then' \
-    "$ROOT/bin/fm-spawn.sh")
-  [ "$safe_cleanup_count" -eq 2 ] \
-    || fail "spawn rollback does not generation-validate both new task temp cleanup paths"
-  if grep -F 'rm -rf "$TASK_TMP"' "$ROOT/bin/fm-spawn.sh" >/dev/null 2>&1; then
-    fail "spawn rollback still removes a task temp root without descriptor-pinned validation"
-  fi
-  pass "spawn rollback generation-validates both task temp cleanup paths"
+test_spawn_rollback_task_tmp_refusal_is_retryable() {
+  local mode id rec marker release output ancestor moved outside tasktmp spawn_pid status tries
+  for mode in direct managed; do
+    id="account-tasktmp-rollback-$mode-z9g"
+    rec=$(make_case "tasktmp-rollback-$mode" claude "$id")
+    read_case "$rec"
+    marker="$CASE_DIR/gotmp-send-started"
+    release="$CASE_DIR/gotmp-send-release"
+    output="$CASE_DIR/spawn.out"
+    ancestor="$HOME_DIR/state/.task-tmp"
+    moved="$HOME_DIR/state/task-tmp-$mode-moved"
+    outside="$HOME_DIR/state/task-tmp-$mode-outside"
+    mkdir -p "$outside"
+
+    if [ "$mode" = direct ]; then
+      mkdir -p "$CASE_DIR/accounts/claude/account-1"
+      cat > "$FAKEBIN_DIR/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = integration ] && [ "${2:-}" = install ] && [ "${3:-}" = claude ] || exit 64
+mkdir -p "${CLAUDE_CONFIG_DIR:?}/hooks"
+printf '#!/usr/bin/env bash\n' > "$CLAUDE_CONFIG_DIR/hooks/herdr-agent-state.sh"
+SH
+      chmod +x "$FAKEBIN_DIR/herdr"
+      FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST='' \
+        FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+        FM_ACCOUNT_DIRECTORY_ROOT="$CASE_DIR/accounts" \
+        FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN_DIR/herdr" \
+        FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+        FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$ancestor" \
+        FM_SAFE_TASK_TMP_SWAP_MOVED="$moved" \
+        FM_SAFE_TASK_TMP_SWAP_OUTSIDE="$outside" \
+        FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY=gotmp \
+        FM_FAKE_TMUX_GATE_SEND_MATCH=GOTMPDIR \
+        FM_FAKE_TMUX_GATE_SEND_MARKER="$marker" \
+        FM_FAKE_TMUX_GATE_SEND_RELEASE="$release" \
+        FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
+        run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew > "$output" &
+    else
+      FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+        FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$ancestor" \
+        FM_SAFE_TASK_TMP_SWAP_MOVED="$moved" \
+        FM_SAFE_TASK_TMP_SWAP_OUTSIDE="$outside" \
+        FM_SAFE_TASK_TMP_DISAPPEAR_ENTRY=gotmp \
+        FM_FAKE_TMUX_GATE_SEND_MATCH=GOTMPDIR \
+        FM_FAKE_TMUX_GATE_SEND_MARKER="$marker" \
+        FM_FAKE_TMUX_GATE_SEND_RELEASE="$release" \
+        FM_FAKE_TMUX_FAIL_SEND_MATCH=GOTMPDIR \
+        run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew > "$output" &
+    fi
+    spawn_pid=$!
+    tries=0
+    while [ ! -f "$marker" ] && kill -0 "$spawn_pid" 2>/dev/null && [ "$tries" -lt 200 ]; do
+      sleep 0.05
+      tries=$((tries + 1))
+    done
+    if [ ! -f "$marker" ]; then
+      touch "$release"
+      wait "$spawn_pid" 2>/dev/null || true
+      fail "$mode rollback task temp test never reached its post-metadata failure"
+    fi
+    tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta" | tail -1)
+    [ -n "$tasktmp" ] || {
+      touch "$release"
+      wait "$spawn_pid" 2>/dev/null || true
+      fail "$mode rollback task temp test did not publish provisional metadata"
+    }
+    mkdir -p "$outside/${tasktmp##*/}"
+    printf 'preserve\n' > "$outside/${tasktmp##*/}/sentinel"
+    touch "$release"
+    if wait "$spawn_pid"; then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "$mode rollback task temp refusal unexpectedly succeeded"
+    assert_present "$outside/${tasktmp##*/}/sentinel" \
+      "$mode rollback followed the swapped task temp ancestor"
+    assert_present "$moved/${tasktmp##*/}" \
+      "$mode rollback discarded its partially cleaned task temp generation"
+    assert_contains "$(cat "$output")" "retaining cleanup metadata" \
+      "$mode rollback did not report retryable task temp cleanup"
+    if [ "$mode" = direct ]; then
+      assert_regex '^direct_spawn_cleanup=pending$' "$HOME_DIR/state/$id.meta" \
+        "direct rollback task temp refusal lost retry metadata"
+    else
+      assert_regex '^account_rollback_cleanup=pending$' "$HOME_DIR/state/$id.meta" \
+        "managed rollback task temp refusal lost retry metadata"
+    fi
+  done
+  pass "spawn rollback task temp refusals preserve outside data and retry state"
 }
 
 test_preinstall_managed_failure_restores_artifact_snapshot() {
@@ -6304,7 +6380,7 @@ if [ "${FM_TEST_FOCUSED:-}" = session-sync-teardown-race ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
-  run_isolated_test test_spawn_rollback_uses_generation_safe_task_tmp_removal
+  run_isolated_test test_spawn_rollback_task_tmp_refusal_is_retryable
   run_isolated_test test_secondmate_rollback_refuses_unsafe_tasktmp
   run_isolated_test test_rollback_backup_rejects_symlink_and_rechecks_under_lock
   exit 0

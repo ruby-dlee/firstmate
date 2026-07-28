@@ -307,7 +307,6 @@ function sameProcessIdentity(original, current) {
   return (
     current !== null &&
     original.pid === current.pid &&
-    original.ppid === current.ppid &&
     original.pgid === current.pgid &&
     original.command === current.command
   );
@@ -332,17 +331,25 @@ function descendantsOf(pid, rows) {
 async function terminateOwnedBrowserTree(state) {
   const rows = processInventory();
   const root = rowForPid(state.pid, rows);
-  if (!processMatchesBrowser(state, root)) return false;
-  const ownedPids = new Set([root.pid, ...descendantsOf(root.pid, rows)]);
-  if (root.pgid === root.pid) {
+  const rootMatches = processMatchesBrowser(state, root);
+  const dedicatedPgid = Number.isSafeInteger(state.pgid)
+    ? state.pgid
+    : rootMatches && root.pgid === root.pid
+      ? root.pgid
+      : 0;
+  const ownedPids = new Set(
+    rootMatches ? [root.pid, ...descendantsOf(root.pid, rows)] : [],
+  );
+  if (dedicatedPgid === state.pid) {
     for (const row of rows) {
-      if (row.pgid === root.pgid) ownedPids.add(row.pid);
+      if (row.pgid === dedicatedPgid) ownedPids.add(row.pid);
     }
   }
   const owned = rows.filter((row) => ownedPids.has(row.pid));
-  if (root.pgid === root.pid) {
+  if (owned.length === 0) return false;
+  if (dedicatedPgid === state.pid) {
     try {
-      process.kill(-root.pgid, "SIGTERM");
+      process.kill(-dedicatedPgid, "SIGTERM");
     } catch {
       // The dedicated process group already exited.
     }
@@ -547,6 +554,7 @@ function readBrowserState(root) {
     const state = readJson(file);
     if (
       Number.isSafeInteger(state.pid) &&
+      (!("pgid" in state) || Number.isSafeInteger(state.pgid)) &&
       Number.isSafeInteger(state.port) &&
       typeof state.profile === "string" &&
       typeof state.executable === "string"
@@ -656,6 +664,7 @@ async function ensureBrowser(root, owner) {
 
   const state = {
     pid: child.pid,
+    pgid: child.pid,
     port: 0,
     profile,
     executable: owner.browserExecutable,

@@ -1856,10 +1856,10 @@ PY
 }
 
 reap_task_browser() {
-  local id=$1 tasktmp=$2
+  local id=$1 tasktmp=$2 owner_home=$3
   [ -n "$tasktmp" ] || return 0
   [ -x "$FM_ROOT/bin/fm-browser-isolation.sh" ] || return 0
-  "$FM_ROOT/bin/fm-browser-isolation.sh" reap "$id" "$tasktmp" "$FM_HOME"
+  "$FM_ROOT/bin/fm-browser-isolation.sh" reap "$id" "$tasktmp" "$owner_home"
 }
 
 remove_worktree_compatibility_artifacts() {
@@ -3679,7 +3679,7 @@ cleanup_firstmate_home_children() {
       quiesce_child_endpoint "$child_meta" "$child_id" "$home" "$child_home" || return 1
     fi
     child_tasktmp=$(meta_value "$child_meta" tasktmp)
-    reap_task_browser "$child_id" "$child_tasktmp" || {
+    reap_task_browser "$child_id" "$child_tasktmp" "$home" || {
       echo "error: retained child metadata for $child_id because its browser cleanup could not be verified" >&2
       return 1
     }
@@ -3904,7 +3904,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-  reap_task_browser "$ID" "$TASK_TMP" || exit 1
+  reap_task_browser "$ID" "$TASK_TMP" "$FM_HOME" || exit 1
   safe_remove_task_tmp "$TASK_TMP" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
@@ -4204,7 +4204,7 @@ remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
-[ -z "$TASK_TMP" ] || reap_task_browser "$ID" "$TASK_TMP" || exit 1
+[ -z "$TASK_TMP" ] || reap_task_browser "$ID" "$TASK_TMP" "$FM_HOME" || exit 1
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true

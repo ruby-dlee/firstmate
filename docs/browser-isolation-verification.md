@@ -4,13 +4,13 @@
 
 The real separate automation browser completed a browser-heavy AXI workload without attaching to or changing stable Chrome.
 The run used macOS 26.5.2 and Google Chrome for Testing 143.0.7499.40.
-The stable-routing mutation was not repeated because this fix round forbade touching the captain's stable Chrome.
-The existing opt-in assertion remains in `tests/fm-browser-isolation-macos-smoke.sh`: stable Chrome must gain a window while the unique routing URL remains absent from automation.
+The routing assertion used an isolated stable-Chrome app launch and left the captain's existing stable process identity unchanged.
+The unique routing URL was absent from the automation browser.
 
 Command:
 
 ```sh
-FM_BROWSER_ROUTING_TEST=0 tests/fm-browser-isolation-macos-smoke.sh
+FM_BROWSER_ROUTING_TEST=1 tests/fm-browser-isolation-macos-smoke.sh
 ```
 
 Measured output:
@@ -18,7 +18,10 @@ Measured output:
 ```text
 live_browser_mock_keychain=1
 live_browser_basic_password_store=1
-dialog_monitor_samples=51
+stable_windows_before=2
+stable_windows_after=3
+routing_url_in_automation=0
+dialog_monitor_samples=115
 automation_visible_windows_seen=0
 screenshots=15
 owned_processes_during_run=8

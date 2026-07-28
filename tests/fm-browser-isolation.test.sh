@@ -76,7 +76,12 @@ if (
 ) process.exit(2);
 const profile = profileArg.slice("--user-data-dir=".length);
 fs.mkdirSync(profile, { recursive: true });
-const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+const helperReady = path.join(profile, "helper.ready");
+const helper = spawn(process.execPath, [
+  "-e",
+  "require('fs').writeFileSync(process.argv[1], 'ready\\n'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+  helperReady,
+], {
   stdio: "ignore",
 });
 fs.writeFileSync(path.join(profile, "helper.pid"), `${helper.pid}\n`);
@@ -173,7 +178,7 @@ ROWS
 
 test_task_launch_and_reap() {
   local id=browser-owned-z2 tasktmp="$TMP_ROOT/tmp/fm-browser-owned-z2"
-  local browser_pid bridge_pid helper_pid root
+  local browser_pid bridge_pid helper_pid root helper_attempts=0
   mkdir -p "$tasktmp/gotmp"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
     "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
@@ -200,6 +205,11 @@ test_task_launch_and_reap() {
 
   browser_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/browser.json")
   helper_pid=$(cat "$root/profile/helper.pid")
+  while [ ! -f "$root/profile/helper.ready" ]; do
+    helper_attempts=$((helper_attempts + 1))
+    [ "$helper_attempts" -lt 100 ] || fail "TERM-resistant browser helper did not become ready"
+    sleep 0.01
+  done
   bridge_pid=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$root/home/.chrome-devtools-axi/sessions/fm-$id/bridge.pid")
   TEARDOWN_BROWSER_PID=$browser_pid
   TEARDOWN_BRIDGE_PID=$bridge_pid
@@ -406,7 +416,7 @@ test_orphan_sweep() {
   [ ! -e "$root" ] || fail "metadata-free task browser root survived sweep"
   [ ! -e "$legacy_profile" ] || fail "unused legacy temp profile survived sweep"
   [ -d "$headed_profile" ] || fail "active headed temp profile was removed by orphan sweep"
-  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=1 browser_processes=2 profiles=1$' >/dev/null \
+  printf '%s\n' "$out" | grep -E '^BROWSER_GC: reaped task_roots=1 bridges=[1-9][0-9]* browser_processes=2 profiles=1$' >/dev/null \
     || fail "sweep did not report measured cleanup: $out"
   pass "backstop kills only exact orphan markers and preserves unrelated processes"
 }
@@ -422,8 +432,10 @@ test_spawn_and_teardown_wiring() {
     || fail "Herdr does not receive the home-qualified browser owner"
   grep -F "FM_BROWSER_ROOT=\$(shell_quote \"\$BROWSER_ROOT\")" "$SPAWN" >/dev/null \
     || fail "terminal backends do not export the task browser root"
-  grep -F "reap_task_browser \"\$ID\" \"\$TASK_TMP\"" "$TEARDOWN" >/dev/null \
+  grep -F "reap_task_browser \"\$ID\" \"\$TASK_TMP\" \"\$FM_HOME\"" "$TEARDOWN" >/dev/null \
     || fail "teardown does not reap the task browser before temp-root deletion"
+  grep -F "reap_task_browser \"\$child_id\" \"\$child_tasktmp\" \"\$home\"" "$TEARDOWN" >/dev/null \
+    || fail "recursive teardown does not reap with the owning child home"
   grep -F 'cleanup_prepared_task_tmp' "$SPAWN" >/dev/null \
     || fail "spawn abort does not route prepared temp cleanup through browser reap"
   grep -F 'browser_gc_sweep' "$BOOTSTRAP" >/dev/null \

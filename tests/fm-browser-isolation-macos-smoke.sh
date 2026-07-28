@@ -4,7 +4,7 @@
 #
 # This test launches only the separate automation browser selected by
 # FM_BROWSER_AUTOMATION_EXECUTABLE. It never attaches to or stops stable Chrome.
-# Set FM_BROWSER_ROUTING_TEST=1 to exercise the explicit `open -na` routing
+# Set FM_BROWSER_ROUTING_TEST=1 to exercise the isolated stable-app routing
 # assertion, which creates one real stable-Chrome window for review.
 set -eu
 

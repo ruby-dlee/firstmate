@@ -410,6 +410,10 @@ quiesce_child_endpoint() {
   scoped_target=$(meta_value "$meta" tmux_session_target)
   [ "$backend" != orca ] || scoped_target=$(meta_value "$meta" orca_worktree_id)
   if [ "$backend" = orca ]; then
+    [ -n "$target" ] || {
+      echo "error: child endpoint identity for $task is missing; refusing destructive cleanup" >&2
+      return 1
+    }
     quiesce_authoritative_orca_endpoint "$target" "$scoped_target" "fm-$task" || {
       echo "error: child Orca endpoint authority or quiescence is unproven for $task" >&2
       return 1

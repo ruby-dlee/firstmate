@@ -34,7 +34,10 @@ cleanup() {
     "${TEARDOWN_BRIDGE_PID:-}" \
     "${REUSED_GROUP_PID:-}" \
     "${KILLED_SENTINEL_PID:-}" \
-    "${KILLED_HELPER_PID:-}"
+    "${KILLED_HELPER_PID:-}" \
+    "${HANDSHAKE_SENTINEL_PID:-}" \
+    "${HANDSHAKE_BROWSER_PID:-}" \
+    "${HANDSHAKE_HELPER_PID:-}"
   do
     [ -n "$cleanup_pid" ] || continue
     if kill -0 "$cleanup_pid" 2>/dev/null; then
@@ -89,6 +92,12 @@ if (process.env.FM_FAKE_TERM_HELPER === "1") {
     stdio: "ignore",
   });
   fs.writeFileSync(path.join(profile, "helper.pid"), `${helper.pid}\n`);
+  if (process.env.FM_FAKE_BROWSER_GROUP_RECORD) {
+    fs.writeFileSync(
+      process.env.FM_FAKE_BROWSER_GROUP_RECORD,
+      `sentinel=${process.ppid}\nbrowser=${process.pid}\nhelper=${helper.pid}\n`,
+    );
+  }
 }
 const server = http.createServer((request, response) => {
   response.setHeader("content-type", "application/json");
@@ -265,6 +274,49 @@ test_failed_browser_cannot_respawn() {
     || fail "stale browser state survived failed-browser cleanup"
   FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
   pass "unexpected browser death is cleaned and cannot trigger an implicit respawn"
+}
+
+test_sentinel_handshake_failure_reaps_group() {
+  local id=browser-handshake-z9 tasktmp="$TMP_ROOT/tmp/fm-browser-handshake-z9"
+  local root record output unrelated_pid
+  mkdir -p "$tasktmp/gotmp"
+  record="$TMP_ROOT/handshake-group"
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" "$FAKE_AXI" "$FAKE_BROWSER" ""
+  root=$(browser_root "$id" "$TMP_ROOT/home")
+  sleep 300 &
+  unrelated_pid=$!
+  UNRELATED_PID=$unrelated_pid
+  if output=$(FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" FM_BROWSER_TASK_ID="$id" \
+    FM_BROWSER_ROOT="$root" FM_BROWSER_OWNER_HOME="$TMP_ROOT/home" \
+    FM_FAKE_TERM_HELPER=1 FM_FAKE_BROWSER_GROUP_RECORD="$record" \
+    FM_BROWSER_TEST_SENTINEL_HANDSHAKE_FAILURE=firstmate-browser-isolation-handshake-failure-v1 \
+    "$WRAPPER" open https://handshake-failure.example.test/ 2>&1); then
+    fail "injected sentinel handshake failure unexpectedly succeeded"
+  fi
+  printf '%s\n' "$output" | grep -F 'automation browser sentinel failed to start' >/dev/null \
+    || fail "sentinel handshake failure was not reported"
+  [ -f "$record" ] || fail "sentinel handshake fixture did not start its browser group"
+  HANDSHAKE_SENTINEL_PID=$(sed -n 's/^sentinel=//p' "$record")
+  HANDSHAKE_BROWSER_PID=$(sed -n 's/^browser=//p' "$record")
+  HANDSHAKE_HELPER_PID=$(sed -n 's/^helper=//p' "$record")
+  kill -0 "$HANDSHAKE_SENTINEL_PID" 2>/dev/null \
+    && fail "sentinel survived handshake rollback"
+  kill -0 "$HANDSHAKE_BROWSER_PID" 2>/dev/null \
+    && fail "browser survived handshake rollback"
+  kill -0 "$HANDSHAKE_HELPER_PID" 2>/dev/null \
+    && fail "TERM-resistant helper survived handshake rollback"
+  kill -0 "$unrelated_pid" 2>/dev/null || fail "unrelated process was killed by handshake rollback"
+  [ ! -e "$root/profile" ] || fail "profile survived verified handshake rollback"
+  [ ! -e "$root/browser.json" ] || fail "browser state survived verified handshake rollback"
+  [ ! -e "$root/browser-sentinel.json" ] || fail "sentinel state survived verified handshake rollback"
+  [ ! -e "$root/axi.pid" ] || fail "AXI bridge state survived handshake rollback"
+  [ -f "$root/browser.failed" ] || fail "handshake rollback discarded failure evidence"
+  HANDSHAKE_SENTINEL_PID=
+  HANDSHAKE_BROWSER_PID=
+  HANDSHAKE_HELPER_PID=
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" reap "$id" "$tasktmp" "$TMP_ROOT/home"
+  pass "sentinel handshake failure reaps its complete browser group"
 }
 
 test_stale_pgid_preserves_unrelated_group() {
@@ -534,6 +586,7 @@ test_spawn_and_teardown_wiring() {
 test_process_discrimination
 test_task_launch_and_reap
 test_failed_browser_cannot_respawn
+test_sentinel_handshake_failure_reaps_group
 test_stale_pgid_preserves_unrelated_group
 test_killed_root_reaps_verified_sentinel_group
 test_real_teardown_path_reaps_owned_browser

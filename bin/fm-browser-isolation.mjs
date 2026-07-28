@@ -59,6 +59,8 @@ const LOCK_FILE = "lifecycle.lock";
 const START_TIMEOUT_MS = 20_000;
 const STOP_GRACE_MS = 2_000;
 const CREDENTIAL_ISOLATION_ARGS = ["--use-mock-keychain", "--password-store=basic"];
+const SENTINEL_HANDSHAKE_FAILURE_FIXTURE =
+  "firstmate-browser-isolation-handshake-failure-v1";
 
 function fail(message) {
   throw new Error(message);
@@ -412,6 +414,46 @@ async function terminateOwnedBrowserTree(state) {
   return true;
 }
 
+async function terminatePendingSentinel(pid, root, nonce) {
+  const rows = processInventory();
+  const sentinel = rowForPid(pid, rows);
+  const matches =
+    sentinel !== null &&
+    sentinel.pid === pid &&
+    sentinel.pgid === pid &&
+    sentinel.command.includes("fm-browser-isolation.mjs sentinel") &&
+    sentinel.command.includes(root) &&
+    sentinel.command.includes(nonce);
+  const groupRows = rows.filter((row) => row.pgid === pid);
+  if (!matches) {
+    if (groupRows.length > 0) {
+      fail(`cannot verify failed browser sentinel ownership: ${pid}`);
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {}
+  await sleep(STOP_GRACE_MS);
+  for (const original of groupRows) {
+    if (!sameProcessIdentity(original, rowForPid(original.pid))) continue;
+    try {
+      process.kill(original.pid, "SIGKILL");
+    } catch {}
+  }
+  await sleep(100);
+  const survivors = groupRows.filter((original) =>
+    sameProcessIdentity(original, rowForPid(original.pid)),
+  );
+  if (survivors.length > 0) {
+    fail(
+      `failed browser sentinel process group survived cleanup: ${survivors
+        .map((row) => row.pid)
+        .join(",")}`,
+    );
+  }
+}
+
 async function terminateLegacyBridgeTree(pid) {
   const rows = processInventory();
   const root = rowForPid(pid, rows);
@@ -701,6 +743,7 @@ async function ensureBrowser(root, owner) {
   sentinel.unref();
   const sentinelDeadline = Date.now() + START_TIMEOUT_MS;
   let sentinelState = null;
+  let sentinelReady = false;
   while (Date.now() < sentinelDeadline) {
     if (!processAlive(sentinel.pid)) break;
     try {
@@ -711,14 +754,36 @@ async function ensureBrowser(root, owner) {
         sentinelState.nonce === sentinelNonce &&
         Number.isSafeInteger(sentinelState.browserPid)
       ) {
+        sentinelReady = true;
         break;
       }
+      break;
     } catch {
       sentinelState = null;
     }
     await sleep(25);
   }
-  if (!sentinelState) fail("automation browser sentinel failed to start");
+  if (!sentinelReady) {
+    try {
+      await terminatePendingSentinel(sentinel.pid, root, sentinelNonce);
+    } catch (error) {
+      writeFileSync(
+        path.join(root, BROWSER_FAILURE_FILE),
+        `automation browser sentinel handshake failed and cleanup was not verified: ${error.message}\n`,
+        { mode: 0o600 },
+      );
+      fail("automation browser sentinel failed to start and cleanup could not be verified");
+    }
+    rmSync(path.join(root, BROWSER_SENTINEL_FILE), { force: true });
+    rmSync(path.join(root, BROWSER_FILE), { force: true });
+    rmSync(profile, { recursive: true, force: true });
+    writeFileSync(
+      path.join(root, BROWSER_FAILURE_FILE),
+      "automation browser sentinel handshake failed; process group cleanup verified\n",
+      { mode: 0o600 },
+    );
+    fail("automation browser sentinel failed to start");
+  }
 
   const state = {
     pid: sentinelState.browserPid,
@@ -766,35 +831,66 @@ async function ensureBrowser(root, owner) {
 async function commandSentinel(args) {
   if (args.length < 5) fail("invalid browser sentinel invocation");
   const [rootInput, nonce, executableInput, logFile, ...browserArgs] = args;
-  const ownerRecord = readJson(path.join(rootInput, OWNER_FILE));
-  const root = validateBrowserRoot(
-    ownerRecord.taskId,
-    rootInput,
-    ownerRecord.ownerHome,
-  );
-  const executable = validateExecutable(executableInput, "automation browser executable");
-  if (executable !== ownerRecord.browserExecutable) {
-    fail("browser sentinel executable changed");
-  }
-  const logFd = openSync(logFile, "a", 0o600);
-  const browser = spawn(executable, browserArgs, {
-    env: process.env,
-    stdio: ["ignore", logFd, logFd],
-  });
-  const browserExit = new Promise((resolve) => {
-    browser.once("exit", resolve);
-    browser.once("error", resolve);
-  });
-  closeSync(logFd);
-  writeJson(path.join(root, BROWSER_SENTINEL_FILE), {
-    version: 1,
-    pid: process.pid,
-    pgid: process.pid,
-    nonce,
-    browserPid: browser.pid,
-  });
-  await browserExit;
   setInterval(() => {}, 60_000);
+  try {
+    const ownerRecord = readJson(path.join(rootInput, OWNER_FILE));
+    const root = validateBrowserRoot(
+      ownerRecord.taskId,
+      rootInput,
+      ownerRecord.ownerHome,
+    );
+    const executable = validateExecutable(executableInput, "automation browser executable");
+    if (executable !== ownerRecord.browserExecutable) {
+      fail("browser sentinel executable changed");
+    }
+    const logFd = openSync(logFile, "a", 0o600);
+    const browser = spawn(executable, browserArgs, {
+      env: process.env,
+      stdio: ["ignore", logFd, logFd],
+    });
+    const browserExit = new Promise((resolve) => {
+      browser.once("exit", resolve);
+      browser.once("error", resolve);
+    });
+    closeSync(logFd);
+    if (
+      process.env.FM_BROWSER_TEST_SENTINEL_HANDSHAKE_FAILURE ===
+      SENTINEL_HANDSHAKE_FAILURE_FIXTURE
+    ) {
+      const groupRecord = process.env.FM_FAKE_BROWSER_GROUP_RECORD;
+      const deadline = Date.now() + 2_000;
+      while (groupRecord && !existsSync(groupRecord) && Date.now() < deadline) {
+        await sleep(10);
+      }
+      writeJson(path.join(root, BROWSER_SENTINEL_FILE), {
+        version: 1,
+        pid: process.pid,
+        pgid: process.pid,
+        nonce,
+        error: "injected browser sentinel handshake failure",
+      });
+      await browserExit;
+      await new Promise(() => {});
+    }
+    writeJson(path.join(root, BROWSER_SENTINEL_FILE), {
+      version: 1,
+      pid: process.pid,
+      pgid: process.pid,
+      nonce,
+      browserPid: browser.pid,
+    });
+    await browserExit;
+  } catch (error) {
+    try {
+      writeJson(path.join(rootInput, BROWSER_SENTINEL_FILE), {
+        version: 1,
+        pid: process.pid,
+        pgid: process.pid,
+        nonce,
+        error: error.message,
+      });
+    } catch {}
+  }
   await new Promise(() => {});
 }
 

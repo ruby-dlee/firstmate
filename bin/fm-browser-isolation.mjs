@@ -18,8 +18,9 @@
  *
  * Teardown reaps the recorded bridge and browser before deleting the task
  * profile. The locked bootstrap sweep also removes task roots whose owning
- * home no longer has metadata and legacy AXI orphans identified by exact
- * bridge/headless/temp-profile markers. Set FM_BROWSER_TMP_ROOT only in tests.
+ * home no longer has metadata. Explicit machine-wide migration cleanup also
+ * recognizes legacy AXI orphans by exact bridge/headless/temp-profile markers.
+ * Set FM_BROWSER_TMP_ROOT only in tests.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -1030,24 +1031,32 @@ async function commandPrepare(args) {
   validateTaskId(taskId);
   const taskTmp = validateTaskTmp(taskId, taskTmpInput);
   const ownerHome = canonicalOwnerHome(ownerHomeInput);
+  const realAxi = validateExecutable(realAxiInput, "chrome-devtools-axi");
+  const browserExecutable = browserInput
+    ? validateExecutable(browserInput, "automation browser executable")
+    : "";
+  const mcpPath = mcpInput ? validateExecutable(mcpInput, "chrome-devtools-mcp") : "";
   const root = expectedBrowserRoot(taskId, ownerHome);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  const canonicalRoot = validateBrowserRoot(taskId, root, ownerHome);
-  mkdirSync(path.join(canonicalRoot, "home"), { recursive: true, mode: 0o700 });
-  mkdirSync(path.join(canonicalRoot, "profile"), { recursive: true, mode: 0o700 });
-  const owner = {
-    version: 2,
-    taskId,
-    root: canonicalRoot,
-    ownerHome,
-    taskTmp,
-    realAxi: validateExecutable(realAxiInput, "chrome-devtools-axi"),
-    browserExecutable: browserInput
-      ? validateExecutable(browserInput, "automation browser executable")
-      : "",
-    mcpPath: mcpInput ? validateExecutable(mcpInput, "chrome-devtools-mcp") : "",
-  };
-  writeJson(path.join(canonicalRoot, OWNER_FILE), owner);
+  const rootExisted = existsSync(root);
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const canonicalRoot = validateBrowserRoot(taskId, root, ownerHome);
+    mkdirSync(path.join(canonicalRoot, "home"), { recursive: true, mode: 0o700 });
+    mkdirSync(path.join(canonicalRoot, "profile"), { recursive: true, mode: 0o700 });
+    writeJson(path.join(canonicalRoot, OWNER_FILE), {
+      version: 2,
+      taskId,
+      root: canonicalRoot,
+      ownerHome,
+      taskTmp,
+      realAxi,
+      browserExecutable,
+      mcpPath,
+    });
+  } catch (error) {
+    if (!rootExisted) rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 async function commandRun(args) {
@@ -1192,6 +1201,8 @@ async function commandSweep(args) {
     bridgesReaped += result.bridge;
     browsersReaped += result.browser;
   }
+
+  if (process.env.FM_BROWSER_MACHINE_WIDE_LEGACY_CLEANUP !== "1") return;
 
   const activeRootLocks = [];
   let profilesReaped = 0;

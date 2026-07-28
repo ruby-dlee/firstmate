@@ -518,6 +518,48 @@ test_same_id_isolated_across_homes() {
   pass "same task id remains browser-isolated across sibling homes"
 }
 
+test_prepare_failure_leaves_no_ownerless_root() {
+  local id=browser-prepare-failure-z9 tasktmp="$TMP_ROOT/tmp/fm-browser-prepare-failure-z9"
+  local root
+  mkdir -p "$tasktmp/gotmp"
+  root=$(browser_root "$id" "$TMP_ROOT/home")
+  if FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" prepare "$id" "$tasktmp" "$TMP_ROOT/home" \
+    "$TMP_ROOT/fakes/missing-axi" "$FAKE_BROWSER" "" 2>/dev/null
+  then
+    fail "prepare accepted a missing AXI executable"
+  fi
+  [ ! -e "$root" ] || fail "failed prepare left an ownerless browser root"
+  pass "failed prepare leaves no ownerless browser root"
+}
+
+test_default_sweep_preserves_unowned_legacy_processes() {
+  local legacy_profile="$TMP_ROOT/tmp/puppeteer_dev_chrome_profile-unowned"
+  mkdir -p "$legacy_profile"
+  node "$FAKE_BRIDGE" &
+  LEGACY_BRIDGE_PID=$!
+  "$FAKE_BROWSER" \
+    --headless=new \
+    --use-mock-keychain \
+    --password-store=basic \
+    "--user-data-dir=$legacy_profile" &
+  LEGACY_BROWSER_PID=$!
+  sleep 0.2
+  FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" \
+    "$BROWSER" sweep "$TMP_ROOT/home" "$TMP_ROOT/state"
+  kill -0 "$LEGACY_BRIDGE_PID" 2>/dev/null \
+    || fail "default home sweep killed an unowned legacy bridge"
+  kill -0 "$LEGACY_BROWSER_PID" 2>/dev/null \
+    || fail "default home sweep killed an unowned legacy browser"
+  kill "$LEGACY_BRIDGE_PID" "$LEGACY_BROWSER_PID"
+  wait "$LEGACY_BRIDGE_PID" 2>/dev/null || true
+  wait "$LEGACY_BROWSER_PID" 2>/dev/null || true
+  LEGACY_BRIDGE_PID=
+  LEGACY_BROWSER_PID=
+  rm -rf "$legacy_profile"
+  pass "default home sweep preserves unowned legacy processes"
+}
+
 test_orphan_sweep() {
   local id=browser-orphan-z3 tasktmp="$TMP_ROOT/tmp/fm-browser-orphan-z3"
   local legacy_profile="$TMP_ROOT/tmp/puppeteer_dev_chrome_profile-stale"
@@ -544,7 +586,8 @@ test_orphan_sweep() {
   sleep 300 &
   UNRELATED_PID=$!
 
-  out=$(FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" "$BROWSER" sweep "$TMP_ROOT/home" "$TMP_ROOT/state")
+  out=$(FM_BROWSER_TMP_ROOT="$TMP_ROOT/tmp" FM_BROWSER_MACHINE_WIDE_LEGACY_CLEANUP=1 \
+    "$BROWSER" sweep "$TMP_ROOT/home" "$TMP_ROOT/state")
   kill -0 "$LEGACY_BRIDGE_PID" 2>/dev/null && fail "legacy AXI bridge survived orphan sweep"
   kill -0 "$LEGACY_BROWSER_PID" 2>/dev/null && fail "legacy headless temp-profile browser survived orphan sweep"
   wait "$LEGACY_BRIDGE_PID" 2>/dev/null || true
@@ -591,5 +634,7 @@ test_stale_pgid_preserves_unrelated_group
 test_killed_root_reaps_verified_sentinel_group
 test_real_teardown_path_reaps_owned_browser
 test_same_id_isolated_across_homes
+test_prepare_failure_leaves_no_ownerless_root
+test_default_sweep_preserves_unowned_legacy_processes
 test_orphan_sweep
 test_spawn_and_teardown_wiring

@@ -37,6 +37,8 @@ This prevents a screenshot loop from recreating browsers while an operator is tr
 The locked `fm-bootstrap.sh` session-start path sweeps browser state that survived a crashed agent.
 It reaps a task root only when its `owner.json` belongs to the current Firstmate home and no matching task metadata exists.
 
+Legacy process and profile cleanup is machine-wide because legacy state has no home identity, so bootstrap does not perform it by default.
+Set `FM_BROWSER_MACHINE_WIDE_LEGACY_CLEANUP=1` for an explicit one-time migration sweep.
 The legacy cleanup classifier recognizes only:
 
 - an exact `chrome-devtools-axi-bridge.js` process;

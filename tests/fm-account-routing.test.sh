@@ -450,18 +450,30 @@ make_case() {
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/treehouse-pool/1/wt"
+  wt="$case_dir/treehouse-root/pool/1/wt"
   fakebin=$(make_fakebin "$case_dir/fake")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" \
-    "$case_dir/treehouse-pool/1" "$case_dir/treehouse-pools"
+    "$case_dir/treehouse-root/pool" "$case_dir/treehouse-pools"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   git -C "$wt" checkout --quiet --detach
   fm_git_add_origin "$proj" "$case_dir/origin.git"
-  if [ -n "$first_id" ]; then
-    printf '{"worktrees":[{"path":"%s","leased":true,"lease_holder":"firstmate-%s"}]}\n' \
-      "$wt" "$first_id" > "$case_dir/treehouse-pool/treehouse-state.json"
-  fi
+  python3 - "$case_dir/treehouse-root/pool/treehouse-state.json" "$wt" "$first_id" <<'PY'
+import json
+import os
+import sys
+
+state, path, first_id = sys.argv[1:]
+worktree = {
+    "name": "1",
+    "path": os.path.realpath(path),
+    "leased": bool(first_id),
+}
+if first_id:
+    worktree["lease_holder"] = f"firstmate-{first_id}"
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump({"worktrees": [worktree]}, stream)
+PY
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
@@ -2339,8 +2351,10 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   rec=$(make_case secondmate-incapable-refuse claude)
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id" incapable
+  make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
+  rm -f "$sm/bin/fm-account-routing-lib.sh"
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
@@ -2386,8 +2400,10 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   rec=$(make_case secondmate-off-incapable claude)
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id" incapable
+  make_seeded_secondmate_home "$sm" "$id"
   sm=$(cd "$sm" && pwd -P)
+  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
+  rm -f "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"
@@ -6030,7 +6046,6 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_not_grep "lease release --task $old_task" "$AF_LOG" "teardown released the restored predecessor in the stale generation pass"
   assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
 
-  write_test_completion_report "$id"
   clear_case_logs
   write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"

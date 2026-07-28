@@ -495,45 +495,65 @@ test_live_default_probe_overrides_stale_origin_head() {
 }
 
 test_direct_sync_honors_shared_checkout_lock() {
-  local home clone before common key lock_root lock out
+  local home clone before state_base lock_root lock_ready lock_release holder_pid waited out
   home=$(new_home)
   clone=$(build_pair "$home" shared-lock)
   advance_origin "$home" shared-lock C1
   before=$(head_sha "$clone")
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  lock_root="$home/checkout-locks"
-  lock="$lock_root/$key.lock"
-  mkdir -p "$lock"
-  printf '%s\n' "$$" > "$lock/pid"
+  state_base="$home/checkout-refresh-state"
+  lock_root="$state_base/locks"
+  lock_ready="$home/shared-lock-ready"
+  lock_release="$home/shared-lock-release"
+  bash -c '
+    set -eu
+    FM_ROOT=$1
+    FM_HOME=$2
+    . "$FM_ROOT/bin/fm-checkout-lock-lib.sh"
+    fm_checkout_lock_prepare "$3"
+    lock=$(fm_checkout_lock_path "$4" "$3")
+    fm_lock_try_acquire "$lock"
+    trap '\''fm_lock_release "$lock"'\'' EXIT
+    : > "$5"
+    while [ ! -e "$6" ]; do sleep 0.05; done
+  ' _ "$ROOT" "$home" "$lock_root" "$clone" "$lock_ready" "$lock_release" &
+  holder_pid=$!
+  waited=0
+  while [ ! -e "$lock_ready" ] && kill -0 "$holder_pid" 2>/dev/null && [ "$waited" -lt 200 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -e "$lock_ready" ] || {
+    kill "$holder_pid" 2>/dev/null || true
+    wait "$holder_pid" 2>/dev/null || true
+    fail "shared checkout lock holder did not become ready"
+  }
 
-  out=$(FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+  out=$(FM_CHECKOUT_REFRESH_STATE_BASE="$state_base" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-fleet-sync.sh" "$clone" 2>/dev/null)
+  : > "$lock_release"
+  wait "$holder_pid"
 
-  assert_contains "$out" "$clone: skipped: refresh already running (pid $$)" \
+  assert_contains "$out" "$clone: skipped: refresh already running (pid $holder_pid)" \
     "direct fleet sync bypassed the shared checkout lock"
   [ "$(head_sha "$clone")" = "$before" ] || fail "direct sync mutated a contended checkout"
-  rm -rf "$lock"
   pass "direct sync serializes through the shared canonical checkout lock"
 }
 
 test_direct_sync_timeout_terminates_descendants() {
-  local home clone fakebin real_git out status parent_pid child_pid common key lock_root lock
+  local home clone fakebin real_git out status parent_pid child_pid lock_root lock
   home=$(new_home)
   clone=$(build_pair "$home" direct-timeout)
   advance_origin "$home" direct-timeout C1
   fakebin="$home/direct-timeout-fakebin"
   real_git=$(command -v git)
   mkdir -p "$fakebin"
-  common=$(git -C "$clone" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$home/checkout-refresh-state/locks"
-  lock="$lock_root/$key.lock"
+  lock=$(FM_ROOT="$ROOT" FM_HOME="$home" bash -c '
+    set -eu
+    . "$1/bin/fm-checkout-lock-lib.sh"
+    fm_checkout_lock_path "$2" "$3"
+  ' _ "$ROOT" "$clone" "$lock_root")
   cat > "$fakebin/git" <<'SH'
 #!/usr/bin/env bash
 is_fetch=0

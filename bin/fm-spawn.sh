@@ -1808,9 +1808,7 @@ spawn_abort_cleanup() {
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
-  if [ "$status" -ne 0 ] && [ "${BROWSER_PREPARED:-0}" = 1 ] \
-    && [ "$endpoint_gone" = 1 ] && [ "$account_clean" = 1 ] \
-    && [ "$state_clean" = 1 ] && [ "$worktree_clean" = 1 ]; then
+  if [ "$status" -ne 0 ] && [ "${BROWSER_PREPARED:-0}" = 1 ]; then
     cleanup_prepared_task_tmp || {
       status=1
       echo "warning: failed to reap task-owned browser after spawn abort for ${ID:-unknown}" >&2

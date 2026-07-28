@@ -2672,10 +2672,6 @@ fm_backend_herdr_server_reachable_for_readsteer() {  # <session>
   running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null \
     | fm_backend_herdr_control_jq -r '.server.running // false' 2>/dev/null)
   [ "$running" = true ] || return 1
-  if fm_backend_herdr_test_lab_enabled \
-    && [ "${FM_TEST_HERDR_FAKE_READSTEER_OWNED:-}" = firstmate-herdr-tests-v1 ]; then
-    return 0
-  fi
   fm_backend_herdr_server_adapter_owned "$session"
 }
 

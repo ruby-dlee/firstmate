@@ -1919,7 +1919,7 @@ test_managed_release_failure_preserves_unrecycled_worktree_for_retry() {
 }
 
 test_managed_teardown_locks_generation_before_endpoint_cleanup() {
-  local case_dir af_log kill_started allow_kill teardown_pid teardown_rc updater_rc
+  local case_dir af_log kill_started allow_kill teardown_pid teardown_rc updater_rc wait_ticks
   case_dir=$(make_case managed-generation-lock)
   af_log="$case_dir/agent-fleet.log"
   kill_started="$case_dir/kill-started"
@@ -1937,13 +1937,23 @@ test_managed_teardown_locks_generation_before_endpoint_cleanup() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+fakebin=$(cd "$(dirname "$0")" && pwd -P)
+case_dir=$(dirname "$fakebin")
+state="$fakebin/.tmux-live"
 case "${1:-}" in
   kill-window)
-    : > "$FM_FAKE_KILL_STARTED"
-    while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+    : > "$case_dir/kill-started"
+    while [ ! -f "$case_dir/allow-kill" ]; do sleep 0.01; done
+    rm -f "$state"
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    [ -f "$state" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    ;;
+  list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1 ;;
 esac
 exit 0
 SH
@@ -1953,11 +1963,18 @@ SH
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  wait_ticks=0
+  while [ "$wait_ticks" -lt 100 ]; do
     [ -f "$kill_started" ] && break
+    kill -0 "$teardown_pid" 2>/dev/null || break
     sleep 0.05
+    wait_ticks=$((wait_ticks + 1))
   done
-  [ -f "$kill_started" ] || { kill "$teardown_pid" 2>/dev/null || true; fail "managed generation teardown never reached endpoint cleanup"; }
+  [ -f "$kill_started" ] || {
+    kill "$teardown_pid" 2>/dev/null || true
+    wait "$teardown_pid" 2>/dev/null || true
+    fail "managed generation teardown never reached endpoint cleanup: $(cat "$case_dir/stderr")"
+  }
 
   set +e
   FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 bash -c '
@@ -1980,7 +1997,8 @@ SH
   set -e
 
   [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced metadata after teardown began"
-  expect_code 0 "$teardown_rc" "managed generation teardown should complete with its original locked generation"
+  [ "$teardown_rc" -eq 0 ] \
+    || fail "managed generation teardown should complete with its original locked generation: $(cat "$case_dir/stderr")"
   assert_grep 'lease release --task fm-home-task-x1-old-attempt --force' "$af_log" "teardown did not release its locked generation"
   assert_not_contains "$(cat "$af_log")" 'fm-home-task-x1-new-attempt' "teardown targeted a concurrent replacement generation"
   assert_absent "$case_dir/state/.replacement.meta" "blocked continuation left replacement scratch metadata"

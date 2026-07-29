@@ -3212,13 +3212,15 @@ test_teardown_refuses_unsafe_tasktmp_metadata() {
 
 test_teardown_removes_safe_tasktmp_and_accepts_absence() {
   local case_dir tasktmp
-  tasktmp=/tmp/fm-task-x1
-  assert_absent "$tasktmp" "safe tasktmp fixture collided with an existing task temp root"
+  case_dir=$(make_case safe-tasktmp)
+  tasktmp="$case_dir/state/.task-tmp/fm-task-x1-safe-tasktmp"
   mkdir -p "$tasktmp/gotmp"
   printf '%s\n' leftover > "$tasktmp/gotmp/build-artifact"
 
-  case_dir=$(make_case safe-tasktmp)
   write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^generation_id=.*/generation_id=spawn:safe-tasktmp/' \
+    "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
   printf 'tasktmp=%s\n' "$tasktmp" >> "$case_dir/state/task-x1.meta"
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
     || fail "teardown rejected its exact task temp root: $(cat "$case_dir/stderr")"

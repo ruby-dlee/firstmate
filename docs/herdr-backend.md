@@ -330,6 +330,10 @@ stderr bytes: 0
 
 The existing submission regressions still cover first-Enter autocomplete swallowing, Enter-only retry, native `working` or `blocked` confirmation, and preservation of unsubmitted text on exhausted retries.
 
+The spawn-readiness implementation and automated coverage built on this repair are green, but no live end-to-end Herdr spawn was run because the fixing task was not provisioned as a Herdr lifecycle lab.
+Real backend timing, native process registration, and post-land behavior of the next ordinary production spawn therefore remain unproven.
+Firstmate will verify the next ordinary spawn after landing, and an isolated Herdr-lab lifecycle exercise remains a separate follow-up.
+
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker
 
 A routed request reached a Pi/Herdr secondmate without the visible `[fm-from-firstmate]` label, so the secondmate correctly treated it as direct captain conversation and returned nothing to the parent status path.

@@ -433,7 +433,7 @@ acquire_treehouse_home() {
 }
 
 ensure_home() {
-  local id=$1 requested=$2 home default source_origin
+  local id=$1 requested=$2 home default default_ref default_tip source_origin
   if [ "$requested" = "-" ]; then
     home=$(acquire_treehouse_home "$id")
     verify_firstmate_home "$home"
@@ -450,7 +450,16 @@ ensure_home() {
       echo "error: cannot determine the active firstmate home's default branch" >&2
       return 1
     }
-    git clone --quiet --branch "$default" "$FM_ROOT" "$home"
+    default_ref="refs/remotes/origin/$default"
+    if ! git -C "$FM_ROOT" show-ref --verify --quiet "$default_ref"; then
+      default_ref="refs/heads/$default"
+    fi
+    default_tip=$(git -C "$FM_ROOT" rev-parse --verify "$default_ref^{commit}") || {
+      echo "error: cannot resolve the active firstmate home's default branch tip" >&2
+      return 1
+    }
+    git clone --quiet --no-checkout "$FM_ROOT" "$home"
+    git -C "$home" checkout --quiet -B "$default" "$default_tip"
     source_origin=$(git -C "$FM_ROOT" remote get-url origin 2>/dev/null || true)
     if [ -n "$source_origin" ]; then
       git -C "$home" remote set-url origin "$source_origin"

@@ -244,6 +244,7 @@ test_home_seed_clones_default_branch_from_detached_source() {
   seeded="$TMP_ROOT/detached-source-seeded-home"
   source=$(make_live_default_firstmate_worktree "$unused_home" detached-source-firstmate)
   git -C "$source" checkout --quiet --detach
+  git -C "$source" branch --delete --force main
   mkdir -p "$source/data" "$source/state" "$source/projects"
 
   FM_HOME="$source" FM_ROOT_OVERRIDE="$source" \

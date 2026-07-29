@@ -1967,7 +1967,7 @@ test_secondmate_force_teardown_removes_orca_child_via_orca() {
   orca_case secondmate-child-cleanup
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   initialize_secondmate_home_repo "$subhome" "$neutral"
-  initialize_secondmate_project_repo "$home" "$childproj" "$childwt" "fm/$child_id"
+  initialize_secondmate_project_repo "$neutral" "$childproj" "$childwt" "fm/$child_id"
   fm_write_meta "$home/state/domain.meta" \
     "window=firstmate:fm-domain" "worktree=$subhome" "project=$subhome" \
     "harness=echo" "kind=secondmate" "mode=secondmate" "yolo=off" \
@@ -2012,7 +2012,7 @@ test_secondmate_force_teardown_refuses_orca_child_id_path_mismatch() {
   orca_case secondmate-child-mismatch
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   initialize_secondmate_home_repo "$subhome" "$neutral"
-  initialize_secondmate_project_repo "$home" "$childproj" "$childwt" "fm/$child_id"
+  initialize_secondmate_project_repo "$neutral" "$childproj" "$childwt" "fm/$child_id"
   mkdir -p "$other_wt"
   fm_write_meta "$home/state/domain.meta" \
     "window=firstmate:fm-domain" "worktree=$subhome" "project=$subhome" \
@@ -2054,7 +2054,7 @@ test_secondmate_force_teardown_retains_partial_orca_child() {
   orca_case secondmate-partial-child-cleanup
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   initialize_secondmate_home_repo "$subhome" "$neutral"
-  initialize_secondmate_project_repo "$home" "$childproj" "$childwt" "fm/$child_id"
+  initialize_secondmate_project_repo "$neutral" "$childproj" "$childwt" "fm/$child_id"
   fm_write_meta "$home/state/domain.meta" \
     "window=firstmate:fm-domain" "worktree=$subhome" "project=$subhome" \
     "harness=echo" "kind=secondmate" "mode=secondmate" "yolo=off" \

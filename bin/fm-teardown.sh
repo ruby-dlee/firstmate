@@ -3439,7 +3439,7 @@ validate_firstmate_home_for_removal() {
     require_treehouse_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
   validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
-  if [ -n "$expected_id" ]; then
+  if [ -n "$expected_id" ] && [ "$source_authority" -eq 1 ]; then
     validate_secondmate_project_clones \
       "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
   fi

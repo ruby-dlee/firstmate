@@ -1044,7 +1044,6 @@ parse_orca_worktree_result() {
   rest=${rest#*$'\t'}
   ORCA_REPO_ID=$rest
   case "$ORCA_REPO_ID" in *$'\t'*) return 1 ;; esac
-  ORCA_PROVIDER_TASK=
 }
 
 persist_orca_cleanup_quarantine() {

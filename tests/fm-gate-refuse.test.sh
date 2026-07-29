@@ -55,6 +55,7 @@ X_FOLLOWUP="$ROOT/bin/fm-x-followup.sh"
 X_LINK="$ROOT/bin/fm-x-link.sh"
 X_POLL="$ROOT/bin/fm-x-poll.sh"
 WATCH="$ROOT/bin/fm-watch.sh"
+AUTO_REAP="$ROOT/bin/fm-auto-reap.sh"
 WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
 WATCH_CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 WAKE_DRAIN="$ROOT/bin/fm-wake-drain.sh"
@@ -655,7 +656,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
+  for name in fleet-sync x-reply x-dismiss x-followup x-link x-poll watch auto-reap watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
     case "$name" in
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
       x-reply) script=$(guarded_script "$NORMAL_CWD" "$X_REPLY"); set -- request-x "reply" ;;
@@ -664,6 +665,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
       x-link) script=$(guarded_script "$NORMAL_CWD" "$X_LINK"); set -- task-x request-x ;;
       x-poll) script=$(guarded_script "$NORMAL_CWD" "$X_POLL"); set -- ;;
       watch) script=$(guarded_script "$NORMAL_CWD" "$WATCH"); set -- ;;
+      auto-reap) script=$(guarded_script "$NORMAL_CWD" "$AUTO_REAP"); set -- scan ;;
       watch-arm) script=$(guarded_script "$NORMAL_CWD" "$WATCH_ARM"); set -- ;;
       watch-checkpoint) script=$(guarded_script "$NORMAL_CWD" "$WATCH_CHECKPOINT"); set -- ;;
       wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;

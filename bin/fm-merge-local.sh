@@ -71,3 +71,6 @@ before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"
+if ! "$SCRIPT_DIR/fm-auto-reap.sh" task "$ID" local-merged; then
+  echo "warning: local merge landed, but automatic teardown retained the task for inspection" >&2
+fi

@@ -535,12 +535,15 @@ If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
 The helper defaults to `--squash`, accepts explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge`, and refuses `--repo` or `-R` overrides because the repository is derived from the URL.
 
-### Ship teardown (only after merge is confirmed)
+### Ship teardown (automatic after merge is confirmed)
 
 ```sh
 bin/fm-teardown.sh <id>
 ```
 
+The watcher normally invokes `bin/fm-auto-reap.sh` when a recorded PR is confirmed merged, while failed tasks and completed scouts enter the same path from terminal supervision signals.
+Automatic reclamation excludes secondmates, aborts only an exactly attributed no-mistakes run after teardown succeeds, and surfaces both collections and refusals.
+The command above remains the explicit retry path after resolving a surfaced refusal.
 The script refuses if the worktree holds uncommitted changes or committed work that has not landed; treat a refusal as a stop-and-investigate, not an obstacle.
 Teardown validates that the recorded project and worktree are exact roots with the expected repository registration, quiesces every ordinary task endpoint, and then runs the final non-destructive safety checks before any Treehouse return.
 For a task whose metadata carries `report_required=1`, teardown also publishes the validated completion report before releasing the account lease or removing the worktree.
@@ -567,7 +570,8 @@ A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold th
 
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
 - Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
-- Tear down immediately - no merge gate. For a post-cutover scout, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product.
+- The watcher automatically attempts teardown from the terminal `done` signal, with no merge gate.
+  For a post-cutover scout, `bin/fm-teardown.sh` still requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses automatic reclamation because the findings are the work product.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 When the captain invokes `/reports` or asks to browse, open, search, or summarize completed work, load the `reports` skill.

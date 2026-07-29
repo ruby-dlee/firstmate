@@ -189,6 +189,19 @@ require_status_verb() {  # <verb>
   }
 }
 
+require_no_open_decisions() {
+  local status="$STATE/$AUTO_REAP_ID.status" open
+  [ -f "$status" ] && [ ! -L "$status" ] && [ -r "$status" ] || {
+    refuse "terminal status is unreadable"
+    return 1
+  }
+  open=$(status_open_decisions "$status")
+  [ -z "$open" ] || {
+    refuse "terminal status has unresolved decisions"
+    return 1
+  }
+}
+
 require_current_state() {  # <state>
   local expected=$1 reader output actual
   reader=$(auto_reap_tool FM_AUTO_REAP_CREW_STATE_BIN "$SCRIPT_DIR/fm-crew-state.sh") || {
@@ -461,6 +474,7 @@ validate_terminal_trigger() {
     refuse "X-linked task still requires its final follow-up"
     return 1
   }
+  require_no_open_decisions || return 1
   case "$AUTO_REAP_TRIGGER:$KIND:$MODE" in
     pr-merged:ship:local-only)
       refuse "local-only tasks cannot use a PR-merged trigger"
@@ -503,6 +517,10 @@ run_teardown() {
   if [ -n "$NM_RUN_ID" ]; then
     prepare_run_cleanup_marker || return 1
     marker_prepared=1
+  fi
+  if ! require_no_open_decisions; then
+    [ "$marker_prepared" -eq 0 ] || clear_run_cleanup_marker || true
+    return 1
   fi
   if output=$("$teardown" "$AUTO_REAP_ID" 2>&1); then
     rc=0
@@ -606,32 +624,32 @@ scan_task() {  # <id> <trigger>
 }
 
 scan_terminal_tasks() {
-  local meta id kind status last verb pr_count
+  local meta id status last verb
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     [ -f "$meta" ] && [ ! -L "$meta" ] && [ -r "$meta" ] || continue
     id=${meta##*/}
     id=${id%.meta}
     fm_account_valid_id "$id" || continue
-    kind=$(sed -n 's/^kind=//p' "$meta")
-    [ -n "$kind" ] || kind=ship
-    [ "$kind" != secondmate ] || continue
     status="$STATE/$id.status"
     [ -f "$status" ] && [ ! -L "$status" ] && [ -r "$status" ] || continue
     last=$(grep -v '^[[:space:]]*$' "$status" 2>/dev/null | tail -1)
     verb=$(status_line_verb "$last")
-    case "$verb:$kind" in
+    case "$verb" in done|failed) ;; *) continue ;; esac
+    AUTO_REAP_ID=$id
+    AUTO_REAP_TRIGGER=scan-terminal
+    load_task "$id" || continue
+    case "$verb:$KIND" in
       done:ship)
-        if grep -qx 'mode=local-only' "$meta"; then
+        if [ "$MODE" = local-only ]; then
           scan_task "$id" local-merged
         else
-          pr_count=$(grep -Ec '^pr=https://github\.com/[^/]+/[^/]+/pull/[0-9]+([/?#].*)?$' "$meta")
-          [ "$pr_count" -eq 1 ] || continue
           scan_task "$id" pr-merged
         fi
         ;;
       done:scout) scan_task "$id" scout-done ;;
       failed:ship|failed:scout) scan_task "$id" failed ;;
+      done:secondmate|failed:secondmate) scan_task "$id" scan-terminal ;;
     esac
   done
 }

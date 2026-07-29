@@ -44,6 +44,9 @@ cat > "$FAKEBIN/no-mistakes" <<'SH'
 set -u
 case "$*" in
   axi)
+    if [ -n "${FM_FAKE_DECISION_STATUS:-}" ]; then
+      printf 'needs-decision: raised during run inspection\n' >> "$FM_FAKE_DECISION_STATUS"
+    fi
     printf 'runs[1]{id,branch,status,head,pr}:\n'
     printf '  "%s",%s,running,abc1234,""\n' \
       "${FM_FAKE_NM_RUN_ID:-RUN-1}" "${FM_FAKE_NM_BRANCH:?}"
@@ -117,9 +120,11 @@ reset_fakes() {
   FM_FAKE_NM_RUN_ID=RUN-1
   FM_FAKE_NM_ABORT_STATUS=0
   FM_FAKE_CREW_STATE='state: failed · source: status-log · failed cleanly'
+  FM_FAKE_DECISION_STATUS=
   export FM_FAKE_PR_STATE FM_FAKE_TEARDOWN_STATUS FM_FAKE_CREW_PID
   export FM_FAKE_NM_AGENT_PID FM_FAKE_NM_RUN_ID FM_FAKE_NM_ABORT_STATUS
   export FM_FAKE_CREW_STATE
+  export FM_FAKE_DECISION_STATUS
 }
 
 make_task() {  # <id> <kind> <mode>
@@ -280,7 +285,8 @@ test_secondmate_is_never_automatically_reclaimed() {
   out=$("$AUTO_REAP" scan 2>&1)
   rc=$?
   expect_code 0 "$rc" "secondmate scan"
-  [ -z "$out" ] || fail "secondmate scan produced a reclamation result: $out"
+  assert_contains "$out" "secondmates are never automatically reclaimed" \
+    "secondmate scan did not surface its retention"
   assert_present "$HOME_DIR/state/$id.meta" "secondmate metadata was removed by scan"
   [ ! -s "$TEARDOWN_LOG" ] || fail "secondmate scan invoked teardown"
 
@@ -296,7 +302,7 @@ test_secondmate_is_never_automatically_reclaimed() {
 }
 
 test_ambiguous_metadata_is_retained_without_teardown() {
-  local id=ambiguous-meta worktree out rc
+  local id=ambiguous-meta duplicate=duplicate-kind unknown=unknown-kind worktree out rc
   reset_fakes
   worktree="$TMP_ROOT/$id"
   fm_git_init_commit "$worktree"
@@ -307,17 +313,66 @@ test_ambiguous_metadata_is_retained_without_teardown() {
     "mode=direct-PR"
   printf 'failed: synthetic terminal status\n' > "$HOME_DIR/state/$id.status"
 
+  make_task "$duplicate" ship direct-PR
+  printf 'kind=scout\n' >> "$HOME_DIR/state/$duplicate.meta"
+  printf 'failed: synthetic terminal status\n' > "$HOME_DIR/state/$duplicate.status"
+  make_task "$unknown" ship direct-PR
+  sed -i.bak 's/^kind=ship$/kind=unknown/' "$HOME_DIR/state/$unknown.meta"
+  rm -f "$HOME_DIR/state/$unknown.meta.bak"
+  printf 'failed: synthetic terminal status\n' > "$HOME_DIR/state/$unknown.status"
+
+  out=$("$AUTO_REAP" scan 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "ambiguous metadata supervision scan"
+  assert_contains "$out" "metadata field kind is missing or ambiguous" \
+    "missing or duplicate kind scan refusal was not explicit"
+  assert_contains "$out" "task kind is unknown: unknown" \
+    "unknown kind scan refusal was not explicit"
+  assert_present "$HOME_DIR/state/$id.meta" "ambiguous metadata was automatically removed"
+  assert_present "$HOME_DIR/state/$duplicate.meta" "duplicate-kind metadata was automatically removed"
+  assert_present "$HOME_DIR/state/$unknown.meta" "unknown-kind metadata was automatically removed"
+  [ ! -s "$TEARDOWN_LOG" ] || fail "ambiguous metadata reached ordinary teardown"
+  rm -f "$HOME_DIR/state/$id.meta" "$HOME_DIR/state/$id.status" \
+    "$HOME_DIR/state/$duplicate.meta" "$HOME_DIR/state/$duplicate.status" \
+    "$HOME_DIR/state/$unknown.meta" "$HOME_DIR/state/$unknown.status"
+  pass "terminal scans surface and retain missing, duplicate, and unknown task kinds"
+}
+
+test_open_decisions_block_initial_and_racing_teardown() {
+  local id=open-decision race=racing-decision out rc
+  reset_fakes
+  make_task "$id" ship direct-PR
+  printf 'needs-decision: awaiting approval\ndone: PR checks green\n' \
+    > "$HOME_DIR/state/$id.status"
+
   set +e
-  out=$("$AUTO_REAP" task "$id" failed 2>&1)
+  out=$("$AUTO_REAP" task "$id" pr-merged 2>&1)
   rc=$?
   set -e
-  expect_code 1 "$rc" "ambiguous metadata auto-reap refusal"
-  assert_contains "$out" "metadata field kind is missing or ambiguous" \
-    "ambiguous metadata refusal was not explicit"
-  assert_present "$HOME_DIR/state/$id.meta" "ambiguous metadata was automatically removed"
-  [ ! -s "$TEARDOWN_LOG" ] || fail "ambiguous metadata reached ordinary teardown"
-  rm -f "$HOME_DIR/state/$id.meta" "$HOME_DIR/state/$id.status"
-  pass "ambiguous task metadata is retained before automatic teardown"
+  expect_code 1 "$rc" "initial open-decision refusal"
+  assert_contains "$out" "terminal status has unresolved decisions" \
+    "initial open decision was not surfaced"
+
+  make_task "$race" ship no-mistakes
+  printf 'done: PR checks green\n' > "$HOME_DIR/state/$race.status"
+  FM_FAKE_NM_BRANCH="fm/$race"
+  FM_FAKE_DECISION_STATUS="$HOME_DIR/state/$race.status"
+  export FM_FAKE_NM_BRANCH FM_FAKE_DECISION_STATUS
+  set +e
+  out=$("$AUTO_REAP" task "$race" pr-merged 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "racing open-decision refusal"
+  assert_contains "$out" "terminal status has unresolved decisions" \
+    "decision raised during inspection was not surfaced"
+  assert_present "$HOME_DIR/state/$id.meta" "initial open-decision task was removed"
+  assert_present "$HOME_DIR/state/$race.meta" "racing open-decision task was removed"
+  [ ! -s "$TEARDOWN_LOG" ] || fail "open decision reached ordinary teardown"
+  assert_absent "$HOME_DIR/state/.auto-reap-run-$race.pending" \
+    "racing open-decision refusal left a cleanup marker"
+  rm -f "$HOME_DIR/state/$id.meta" "$HOME_DIR/state/$id.status" \
+    "$HOME_DIR/state/$race.meta" "$HOME_DIR/state/$race.status"
+  pass "open decisions are rechecked immediately before ordinary teardown"
 }
 
 test_real_teardown_authority_retains_dirty_worktree() {
@@ -506,6 +561,7 @@ test_teardown_refusal_preserves_unlanded_task_and_processes
 test_orphaned_run_cleanup_retries_from_durable_identity
 test_secondmate_is_never_automatically_reclaimed
 test_ambiguous_metadata_is_retained_without_teardown
+test_open_decisions_block_initial_and_racing_teardown
 test_real_teardown_authority_retains_dirty_worktree
 test_watcher_runs_automatic_scan_inside_supervision_loop
 test_terminal_reap_preserves_coalesced_actionable_signal

@@ -2007,7 +2007,7 @@ SH
 }
 
 test_managed_child_teardown_locks_generation_before_snapshot() {
-  local case_dir af_log child_id child_project child_worktree kill_started allow_kill teardown_pid teardown_rc updater_rc
+  local case_dir af_log child_id child_project child_worktree kill_started allow_kill teardown_pid teardown_rc updater_rc wait_ticks
   case_dir=$(make_case managed-child-generation-lock)
   af_log="$case_dir/agent-fleet.log"
   child_id=child-lock-x3
@@ -2021,7 +2021,7 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -2051,35 +2051,57 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+fakebin=$(cd "$(dirname "$0")" && pwd -P)
+case_dir=$(dirname "$fakebin")
+state="$fakebin/.tmux-live"
 case "${1:-}" in
   kill-window)
     case "$*" in
       *fm-child-lock-x3*)
-        : > "$FM_FAKE_KILL_STARTED"
-        while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+        : > "$case_dir/kill-started"
+        while [ ! -f "$case_dir/allow-kill" ]; do sleep 0.01; done
+        rm -f "$state"
         ;;
     esac
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    [ -f "$state" ] || exit 1
+    case " $* " in
+      *fm-child-lock-x3*) ;;
+      *) exit 1 ;;
+    esac
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    ;;
+  list-windows) [ ! -f "$state" ] || printf '%s\n' fm-child-lock-x3 ;;
 esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tmux"
+  : > "$case_dir/fakebin/.tmux-live"
 
-  FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
-    FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
-    FM_EXPECT_CHILD_LINEAGE_PATH="$case_dir/wt/data/$child_id/account-attempts.md" \
-    FM_REJECT_CHILD_LINEAGE_PATH="$case_dir/data/$child_id/account-attempts.md" \
-    FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
-    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  (
+    ulimit -n 8192 2>/dev/null || true
+    FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
+      FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+      FM_EXPECT_CHILD_LINEAGE_PATH="$case_dir/wt/data/$child_id/account-attempts.md" \
+      FM_REJECT_CHILD_LINEAGE_PATH="$case_dir/data/$child_id/account-attempts.md" \
+      FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
+      run_teardown "$case_dir" --force
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
-  for _ in $(seq 1 100); do
+  wait_ticks=0
+  while [ "$wait_ticks" -lt 600 ]; do
     [ -f "$kill_started" ] && break
+    kill -0 "$teardown_pid" 2>/dev/null || break
     sleep 0.05
+    wait_ticks=$((wait_ticks + 1))
   done
   [ -f "$kill_started" ] || {
     kill "$teardown_pid" 2>/dev/null || true
+    wait "$teardown_pid" 2>/dev/null || true
     fail "managed child teardown never reached endpoint cleanup: $(cat "$case_dir/stderr")"
   }
 
@@ -2104,7 +2126,8 @@ SH
   set -e
 
   [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced managed child metadata after teardown began"
-  expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation"
+  [ "$teardown_rc" -eq 0 ] \
+    || fail "managed child generation teardown should complete with its locked generation: $(cat "$case_dir/stderr")"
   assert_grep 'lease release --task fm-child-old-attempt --force' "$af_log" "child teardown did not release its locked generation"
   assert_grep 'lease release --task fm-child-predecessor --force' "$af_log" "child teardown did not clean its predecessor generation"
   assert_not_contains "$(cat "$af_log")" 'fm-child-new-attempt' "child teardown targeted a concurrent replacement generation"

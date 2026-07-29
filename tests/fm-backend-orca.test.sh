@@ -566,7 +566,7 @@ test_remove_worktree_refuses_empty_id() {
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_remove_worktree ""' "$ROOT" 2>&1 )
   status=$?
-  set -e
+  set +e
   [ "$status" -ne 0 ] || fail "remove_worktree should fail when the Orca worktree id is empty"
   assert_contains "$out" "missing Orca worktree id" "remove_worktree did not explain the missing id"
   [ ! -s "$LOG" ] || fail "remove_worktree should not call Orca with an empty id"
@@ -582,7 +582,7 @@ test_remove_worktree_rejects_orca_error_json() {
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_remove_worktree_bound wt-gone /tmp/orca-wt "$1"' "$ROOT" "$token" 2>&1 )
   status=$?
-  set -e
+  set +e
   [ "$status" -ne 0 ] || fail "bound remove_worktree should fail on Orca ok:false JSON"
   assert_contains "$out" "worktree not found" "bound remove_worktree should surface the Orca removal error"
   assert_contains "$(cat "$LOG")" $'--expected-path\x1f/tmp/orca-wt' \
@@ -596,10 +596,12 @@ test_remove_worktree_requires_bound_provider_capability() {
   local out status token
   orca_case remove-boundary-capability
   token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  set +e
   out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ORCA_TEST_BOUND_REMOVAL_CAPABILITIES=unavailable \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_remove_worktree_bound wt-retained /tmp/orca-wt "$1"' "$ROOT" "$token" 2>&1)
   status=$?
+  set +e
   [ "$status" -ne 0 ] || fail "Orca removal proceeded without a bound provider capability"
   assert_contains "$out" "identity-bound provider capability" \
     "unbound Orca removal did not surface its provider limitation"
@@ -773,13 +775,15 @@ test_legacy_respawn_refuses_without_provider_task_authority() {
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-spawn"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn","path":"%s"},"terminal":{"handle":"term-spawn"}}}\n' "$wt" > "$RESP/3.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn","path":"%s","terminals":[{"handle":"term-spawn"}]}}}\n' \
+    "$wt" > "$RESP/4.out"
   if out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 ); then
     fail "legacy Orca respawn proceeded without provider task authority"
   fi
-  assert_contains "$out" "did not return matching worktree id, path, and task authority" \
+  assert_contains "$out" "Orca terminal is not authoritatively bound" \
     "legacy Orca respawn did not explain its fail-closed authority refusal"
   assert_not_contains "$(cat "$log")" $'orca\x1f''terminal'$'\x1f''send' \
     "refused legacy Orca respawn launched the harness"

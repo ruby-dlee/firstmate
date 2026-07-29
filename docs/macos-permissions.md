@@ -24,6 +24,9 @@ The default macOS wedge notification uses `osascript` to display a notification,
 
 `chrome-devtools-axi` takes page screenshots through the Chrome DevTools Protocol, so those screenshots do not require macOS Screen & System Audio Recording.
 
+Firstmate crew browser launches also stay outside the macOS credential store.
+The task-scoped launch and cleanup contract, including the required mock-keychain flags, is documented in [browser-isolation.md](browser-isolation.md).
+
 Native desktop capture and Codex Computer Use are different because they read pixels outside the browser protocol.
 
 Native UI control is also different because it uses macOS Accessibility APIs and may use Apple Events for app-specific operations.

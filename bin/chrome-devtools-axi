@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# PATH-scoped chrome-devtools-axi entrypoint for firstmate-launched agents.
+# fm-spawn.sh puts this directory ahead of the real AXI only inside a crew task.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/fm-browser-isolation.sh" run "$@"

@@ -56,6 +56,11 @@ PY
 make_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/chrome-devtools-axi"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u

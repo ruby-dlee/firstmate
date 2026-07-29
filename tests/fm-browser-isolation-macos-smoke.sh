@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# Manual macOS integration proof for credential-store isolation, screenshot
+# reuse, teardown, and optional stable-Chrome routing.
+#
+# This test launches only the separate automation browser selected by
+# FM_BROWSER_AUTOMATION_EXECUTABLE. It never attaches to or stops stable Chrome.
+# Set FM_BROWSER_ROUTING_TEST=1 to exercise the isolated stable-app routing
+# assertion, which creates one real stable-Chrome window for review.
+set -eu
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BROWSER_LIFECYCLE="$ROOT/bin/fm-browser-isolation.sh"
+WRAPPER="$ROOT/bin/chrome-devtools-axi"
+TASK_ID="credential-smoke-$$"
+TASK_TMP="/tmp/fm-$TASK_ID"
+BROWSER_ROOT=
+MONITOR_PID=
+PROFILE=
+BRIDGE_PID=
+CONTROL_PID=
+CONTROL_PGID=
+CONTROL_PROFILE=
+
+fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  exit 1
+}
+
+owned_process_count() {
+  local marker=$1
+  FM_BROWSER_OWNED_MARKER="$marker" node <<'JS'
+const { execFileSync } = require("child_process");
+const marker = process.env.FM_BROWSER_OWNED_MARKER;
+const commands = execFileSync("ps", ["-axo", "command="], { encoding: "utf8" })
+  .split(/\r?\n/);
+console.log(commands.filter((command) => command.includes(marker)).length);
+JS
+}
+
+process_group_count() {
+  ps -axo pgid= | awk -v pgid="$1" '$1 == pgid { count += 1 } END { print count + 0 }'
+}
+
+stable_window_fingerprint() {
+  # shellcheck disable=SC2016 # Swift source is intentionally a shell literal.
+  swift -e '
+    import CoreGraphics
+    let ownerPID = Int(CommandLine.arguments[1])!
+    let rows = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements],
+      kCGNullWindowID
+    ) as? [[String: Any]] ?? []
+    let windows = rows.filter {
+      ($0[kCGWindowOwnerPID as String] as? Int) == ownerPID
+    }.map {
+      $0[kCGWindowNumber as String] as? Int ?? 0
+    }.sorted()
+    print(windows.map(String.init).joined(separator: "|"))
+  ' "$1"
+}
+
+stable_tab_fingerprint() {
+  swift -e '
+    import AppKit
+    import Carbon
+
+    let target = NSAppleEventDescriptor(bundleIdentifier: "com.google.Chrome")
+    let permission = AEDeterminePermissionToAutomateTarget(
+      target.aeDesc,
+      typeWildCard,
+      typeWildCard,
+      false
+    )
+    guard permission == noErr else {
+      fputs("stable Chrome tab observation is not pre-authorized\n", stderr)
+      exit(77)
+    }
+    let source = """
+    tell application "Google Chrome"
+      set rows to {}
+      repeat with windowIndex from 1 to count of windows
+        set chromeWindow to window windowIndex
+        repeat with tabIndex from 1 to count of tabs of chromeWindow
+          set chromeTab to tab tabIndex of chromeWindow
+          try
+            set tabURL to URL of chromeTab as text
+          on error
+            set tabURL to ""
+          end try
+          set end of rows to ((windowIndex as text) & tab & (tabIndex as text) & tab & tabURL)
+        end repeat
+      end repeat
+      set AppleScript'"'"'s text item delimiters to linefeed
+      return rows as text
+    end tell
+    """
+    var error: NSDictionary?
+    guard let result = NSAppleScript(source: source)?.executeAndReturnError(&error) else {
+      fputs("stable Chrome tab observation failed: \(error ?? [:])\n", stderr)
+      exit(78)
+    }
+    print(result.stringValue ?? "")
+  '
+}
+
+stable_tab_fingerprint_retry() {
+  local attempts=0 result
+  while [ "$attempts" -lt 20 ]; do
+    if result=$(stable_tab_fingerprint 2>&1); then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  printf '%s\n' "$result" >&2
+  return 1
+}
+
+cleanup_control() {
+  [ -n "$CONTROL_PID" ] || return 0
+  local command current_pgid
+  current_pgid=$(ps -p "$CONTROL_PID" -o pgid= 2>/dev/null | tr -d ' ' || true)
+  [ -n "$current_pgid" ] || {
+    CONTROL_PID=
+    return 0
+  }
+  command=$(ps -p "$CONTROL_PID" -o command= 2>/dev/null || true)
+  case "$command" in
+    *"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"*) ;;
+    *) return 1 ;;
+  esac
+  case "$command" in
+    *"--user-data-dir=$CONTROL_PROFILE"*) ;;
+    *) return 1 ;;
+  esac
+  [ "$current_pgid" = "$CONTROL_PGID" ] || return 1
+  kill -TERM -- "-$CONTROL_PGID" 2>/dev/null || true
+  local attempts=0
+  while [ "$(process_group_count "$CONTROL_PGID")" -ne 0 ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -eq 100 ]; then
+      kill -KILL -- "-$CONTROL_PGID" 2>/dev/null || true
+    fi
+    [ "$attempts" -lt 200 ] || return 1
+    sleep 0.05
+  done
+  CONTROL_PID=
+  rm -rf "$CONTROL_PROFILE"
+}
+
+cleanup() {
+  local cleanup_rc=0 remaining=0
+  touch "$TASK_TMP/monitor.stop" 2>/dev/null || true
+  if [ -n "$MONITOR_PID" ]; then
+    wait "$MONITOR_PID" 2>/dev/null || cleanup_rc=1
+  fi
+  cleanup_control || cleanup_rc=1
+  if [ -n "$BROWSER_ROOT" ] && [ -f "$BROWSER_ROOT/owner.json" ]; then
+    "$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" "$ROOT" >/dev/null 2>&1 || cleanup_rc=1
+  fi
+  if [ -n "$PROFILE" ]; then
+    remaining=$(owned_process_count "$PROFILE")
+    [ "$remaining" -eq 0 ] || cleanup_rc=1
+  fi
+  rm -rf "$TASK_TMP"
+  if [ "$cleanup_rc" -ne 0 ]; then
+    printf 'not ok - integration cleanup could not prove zero owned processes\n' >&2
+  fi
+  return "$cleanup_rc"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+[ "$(uname)" = Darwin ] || fail "macOS smoke test requires Darwin"
+REAL_AXI=$(command -v chrome-devtools-axi 2>/dev/null) \
+  || fail "chrome-devtools-axi is unavailable"
+MCP_PATH=${CHROME_DEVTOOLS_AXI_MCP_PATH:-}
+if [ -z "$MCP_PATH" ]; then
+  NPM_PREFIX=$(npm prefix -g 2>/dev/null || true)
+  if [ -n "$NPM_PREFIX" ]; then
+    MCP_PATH="$NPM_PREFIX/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"
+  fi
+fi
+if [ ! -f "$MCP_PATH" ]; then
+  MCP_PATH=$(
+    find "$HOME/.npm/_npx" \
+      -type f -path '*/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js' \
+      2>/dev/null |
+      sort |
+      tail -n 1
+  )
+fi
+[ -f "$MCP_PATH" ] || fail "chrome-devtools-mcp is unavailable"
+
+AUTOMATION_BROWSER=${FM_BROWSER_AUTOMATION_EXECUTABLE:-}
+if [ -z "$AUTOMATION_BROWSER" ]; then
+  AUTOMATION_BROWSER=$(
+    find "$HOME/.cache/puppeteer/chrome" "$HOME/Library/Caches/puppeteer/chrome" \
+      -type f -path '*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' \
+      -perm -111 2>/dev/null |
+      sort |
+      tail -n 1
+  )
+fi
+[ -x "$AUTOMATION_BROWSER" ] || fail "separate Chrome for Testing is unavailable"
+
+STABLE_PID=$(
+  ps -axo pid=,command= |
+    awk -v executable="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
+      {
+        pid = $1
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+        if ($0 == executable) {
+          print pid
+          exit
+        }
+      }
+    '
+)
+[ -n "$STABLE_PID" ] || fail "captain stable Chrome process was not found"
+STABLE_IDENTITY=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
+STABLE_WINDOWS=$(stable_window_fingerprint "$STABLE_PID")
+STABLE_TABS=$(stable_tab_fingerprint_retry) \
+  || fail "stable Chrome tab observation lacks existing no-prompt authorization"
+
+mkdir -p "$TASK_TMP/gotmp" "$TASK_TMP/shots"
+"$BROWSER_LIFECYCLE" prepare \
+  "$TASK_ID" "$TASK_TMP" "$ROOT" "$REAL_AXI" "$AUTOMATION_BROWSER" "$MCP_PATH"
+BROWSER_ROOT=$("$BROWSER_LIFECYCLE" root "$TASK_ID" "$ROOT")
+
+# shellcheck disable=SC2016 # Swift source is intentionally a shell literal.
+swift -e '
+  import CoreGraphics
+  import Foundation
+
+  let taskRoot = CommandLine.arguments[1]
+  let stopFile = taskRoot + "/monitor.stop"
+  let readyFile = taskRoot + "/monitor.ready"
+  let automationOwners: Set<String> = [
+    "Chromium",
+    "Google Chrome Canary",
+    "Google Chrome for Testing"
+  ]
+  let credentialOwners: Set<String> = [
+    "SecurityAgent",
+    "CoreServicesUIAgent",
+    "System Settings",
+    "System Preferences"
+  ]
+  let credentialTerms = ["keychain", "password", "credential", "safe storage", "login keychain"]
+  let baselineRows = CGWindowListCopyWindowInfo(
+    [.optionOnScreenOnly, .excludeDesktopElements],
+    kCGNullWindowID
+  ) as? [[String: Any]] ?? []
+  let baselineWindows = Set(baselineRows.compactMap {
+    $0[kCGWindowNumber as String] as? Int
+  })
+  try? "ready\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
+  var samples = 0
+  var maximumVisibleAutomationWindows = 0
+  while samples < 10 || !FileManager.default.fileExists(atPath: stopFile) {
+    let rows = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements],
+      kCGNullWindowID
+    ) as? [[String: Any]] ?? []
+    let visible = rows.filter { row in
+      let owner = row[kCGWindowOwnerName as String] as? String ?? ""
+      let title = (row[kCGWindowName as String] as? String ?? "").lowercased()
+      let number = row[kCGWindowNumber as String] as? Int ?? 0
+      let credentialDialog = credentialOwners.contains(owner)
+        || credentialTerms.contains(where: { title.contains($0) })
+      return automationOwners.contains(owner)
+        || (!baselineWindows.contains(number) && credentialDialog)
+    }.count
+    maximumVisibleAutomationWindows = max(maximumVisibleAutomationWindows, visible)
+    samples += 1
+    usleep(100_000)
+  }
+  print("dialog_monitor_samples=\(samples)")
+  print("automation_visible_windows_seen=\(maximumVisibleAutomationWindows)")
+  exit(maximumVisibleAutomationWindows == 0 ? 0 : 1)
+' "$TASK_TMP" >"$TASK_TMP/monitor.out" 2>"$TASK_TMP/monitor.err" &
+MONITOR_PID=$!
+
+READY_ATTEMPTS=0
+while [ ! -f "$TASK_TMP/monitor.ready" ]; do
+  kill -0 "$MONITOR_PID" 2>/dev/null || fail "native-dialog monitor failed to start"
+  READY_ATTEMPTS=$((READY_ATTEMPTS + 1))
+  [ "$READY_ATTEMPTS" -lt 100 ] || fail "native-dialog monitor did not become ready"
+  sleep 0.1
+done
+
+FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
+  "$WRAPPER" open https://example.com/
+
+STATE_FILE="$BROWSER_ROOT/browser.json"
+PROFILE=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).profile)' "$STATE_FILE")
+BROWSER_PID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' "$STATE_FILE")
+BROWSER_PORT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).port)' "$STATE_FILE")
+BROWSER_COMMAND=$(ps -p "$BROWSER_PID" -o command=)
+BROWSER_PGID=$(ps -p "$BROWSER_PID" -o pgid= | tr -d ' ')
+case "$BROWSER_COMMAND" in
+  *--use-mock-keychain*) ;;
+  *) fail "live automation browser lacks --use-mock-keychain" ;;
+esac
+printf 'live_browser_mock_keychain=1\n'
+printf 'live_browser_basic_password_store=1\n'
+case "$BROWSER_COMMAND" in
+  *--password-store=basic*) ;;
+  *) fail "live automation browser lacks --password-store=basic" ;;
+esac
+
+INDEX=1
+while [ "$INDEX" -le 15 ]; do
+    FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
+    "$WRAPPER" screenshot "$TASK_TMP/shots/shot-$INDEX.png" >/dev/null
+  INDEX=$((INDEX + 1))
+done
+[ "$(find "$TASK_TMP/shots" -type f -name 'shot-*.png' | wc -l | tr -d ' ')" -eq 15 ] \
+  || fail "browser-heavy flow did not produce 15 screenshots"
+
+if [ "${FM_BROWSER_ROUTING_TEST:-0}" = 1 ]; then
+  ROUTING_TOKEN="fm-routing-$TASK_ID"
+  CONTROL_PROFILE="$TASK_TMP/stable-control-profile"
+  mkdir -p "$CONTROL_PROFILE"
+  CONTROL_PID=$(CONTROL_EXECUTABLE="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    CONTROL_PROFILE="$CONTROL_PROFILE" ROUTING_TOKEN="$ROUTING_TOKEN" node <<'JS'
+const { spawn } = require("child_process");
+const child = spawn(process.env.CONTROL_EXECUTABLE, [
+  "--use-mock-keychain",
+  "--password-store=basic",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--noerrdialogs",
+  "--remote-debugging-address=127.0.0.1",
+  "--remote-debugging-port=0",
+  `--user-data-dir=${process.env.CONTROL_PROFILE}`,
+  `https://example.com/?${process.env.ROUTING_TOKEN}`,
+], { detached: true, stdio: "ignore" });
+child.unref();
+process.stdout.write(`${child.pid}\n`);
+JS
+  )
+  CONTROL_PGID=$CONTROL_PID
+  CONTROL_READY_ATTEMPTS=0
+  while [ ! -f "$CONTROL_PROFILE/DevToolsActivePort" ]; do
+    kill -0 "$CONTROL_PID" 2>/dev/null || fail "isolated stable control exited before routing proof"
+    CONTROL_READY_ATTEMPTS=$((CONTROL_READY_ATTEMPTS + 1))
+    [ "$CONTROL_READY_ATTEMPTS" -lt 200 ] || fail "isolated stable control did not expose DevTools"
+    sleep 0.05
+  done
+  CONTROL_PORT=$(head -n 1 "$CONTROL_PROFILE/DevToolsActivePort")
+  CONTROL_COMMAND=$(ps -p "$CONTROL_PID" -o command=)
+  case "$CONTROL_COMMAND" in
+    *--use-mock-keychain*--password-store=basic*"--user-data-dir=$CONTROL_PROFILE"*) ;;
+    *) fail "isolated stable control lacks credential-safe ownership flags" ;;
+  esac
+  curl -fsS "http://127.0.0.1:$CONTROL_PORT/json/list" | grep -F "$ROUTING_TOKEN" >/dev/null \
+    || fail "isolated stable control did not receive the routing URL"
+  if curl -fsS "http://127.0.0.1:$BROWSER_PORT/json/list" | grep -F "$ROUTING_TOKEN" >/dev/null; then
+    fail "captain routing test URL landed in the automation browser"
+  fi
+  CONTROL_DURING=$(process_group_count "$CONTROL_PGID")
+  printf 'control_stable_received_route=1\n'
+  printf 'routing_url_in_automation=0\n'
+fi
+
+OWNED_DURING_RUN=$(owned_process_count "$PROFILE")
+TREE_DURING_RUN=$(process_group_count "$BROWSER_PGID")
+BRIDGE_PID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).pid)' \
+  "$BROWSER_ROOT/home/.chrome-devtools-axi/sessions/fm-$TASK_ID/bridge.pid")
+kill -0 "$BRIDGE_PID" 2>/dev/null || fail "AXI bridge was not live during the run"
+
+touch "$TASK_TMP/monitor.stop"
+wait "$MONITOR_PID" || fail "automation browser displayed a native dialog"
+MONITOR_PID=
+cat "$TASK_TMP/monitor.out"
+grep -Fx 'automation_visible_windows_seen=0' "$TASK_TMP/monitor.out" >/dev/null \
+  || fail "native-dialog monitor observed an automation window"
+if grep -Ei 'keychain|password store|safe storage' "$BROWSER_ROOT/browser.log" >/dev/null; then
+  grep -Ei 'keychain|password store|safe storage' "$BROWSER_ROOT/browser.log" >&2
+  fail "automation browser logged a credential-store error"
+fi
+
+FM_BROWSER_TASK_ID="$TASK_ID" FM_BROWSER_ROOT="$BROWSER_ROOT" FM_BROWSER_OWNER_HOME="$ROOT" \
+  "$WRAPPER" stop >/dev/null
+OWNED_AFTER_STOP=$(owned_process_count "$PROFILE")
+TREE_AFTER_STOP=$(process_group_count "$BROWSER_PGID")
+BRIDGE_AFTER_STOP=0
+kill -0 "$BRIDGE_PID" 2>/dev/null && BRIDGE_AFTER_STOP=1
+kill -0 "$BRIDGE_PID" 2>/dev/null && fail "AXI bridge survived wrapper stop"
+[ "$OWNED_AFTER_STOP" -eq 0 ] || fail "automation browser survived wrapper stop"
+[ "$TREE_AFTER_STOP" -eq 0 ] || fail "automation browser process group survived wrapper stop"
+"$BROWSER_LIFECYCLE" reap "$TASK_ID" "$TASK_TMP" "$ROOT"
+[ ! -e "$BROWSER_ROOT" ] || fail "task profile root survived reap"
+PROFILE_AFTER_REAP=0
+[ ! -e "$BROWSER_ROOT/profile" ] || PROFILE_AFTER_REAP=1
+CONTROL_AFTER_STOP=0
+CONTROL_PROFILE_AFTER_STOP=0
+if [ -n "$CONTROL_PID" ]; then
+  cleanup_control || fail "isolated stable control cleanup could not be verified"
+  CONTROL_AFTER_STOP=$(process_group_count "$CONTROL_PGID")
+  [ ! -e "$CONTROL_PROFILE" ] || CONTROL_PROFILE_AFTER_STOP=1
+fi
+
+STABLE_IDENTITY_AFTER=$(ps -p "$STABLE_PID" -o pid=,lstart=,pgid=)
+[ "$STABLE_IDENTITY_AFTER" = "$STABLE_IDENTITY" ] \
+  || fail "captain stable Chrome identity changed during the smoke test"
+STABLE_WINDOWS_AFTER=$(stable_window_fingerprint "$STABLE_PID")
+[ "$STABLE_WINDOWS_AFTER" = "$STABLE_WINDOWS" ] \
+  || fail "captain stable Chrome window set changed during the smoke test"
+STABLE_TABS_AFTER=$(stable_tab_fingerprint_retry) \
+  || fail "stable Chrome tab observation lost authorization"
+[ "$STABLE_TABS_AFTER" = "$STABLE_TABS" ] \
+  || fail "captain stable Chrome tab set changed during the smoke test"
+
+printf 'screenshots=15\n'
+printf 'owned_processes_during_run=%s\n' "$OWNED_DURING_RUN"
+printf 'owned_processes_after_stop=%s\n' "$OWNED_AFTER_STOP"
+printf 'browser_tree_processes_during_run=%s\n' "$TREE_DURING_RUN"
+printf 'browser_tree_processes_after_stop=%s\n' "$TREE_AFTER_STOP"
+printf 'bridge_alive_after_stop=%s\n' "$BRIDGE_AFTER_STOP"
+printf 'profile_exists_after_reap=%s\n' "$PROFILE_AFTER_REAP"
+printf 'control_processes_during_run=%s\n' "${CONTROL_DURING:-0}"
+printf 'control_processes_after_stop=%s\n' "$CONTROL_AFTER_STOP"
+printf 'control_profile_exists_after_stop=%s\n' "$CONTROL_PROFILE_AFTER_STOP"
+printf 'stable_chrome_identity_preserved=1\n'
+printf 'stable_chrome_window_set_preserved=1\n'
+printf 'stable_chrome_tab_set_preserved=1\n'
+printf 'ok - macOS credential isolation and teardown smoke test passed\n'

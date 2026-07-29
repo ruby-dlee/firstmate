@@ -1512,6 +1512,16 @@ spawn_restore_unmanaged_state() {
   return "$status"
 }
 
+cleanup_prepared_task_tmp() {
+  [ -n "${TASK_TMP:-}" ] || return 0
+  if [ "${BROWSER_PREPARED:-0}" = 1 ]; then
+    "$SCRIPT_DIR/fm-browser-isolation.sh" reap "$ID" "$TASK_TMP" "$FM_HOME" || return 1
+    BROWSER_PREPARED=0
+  fi
+  [ "${ORIGINAL_TASK_TMP_PRESENT:-0}" != 1 ] || return 0
+  rm -rf "$TASK_TMP"
+}
+
 spawn_abort_cleanup() {
   local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
@@ -1691,7 +1701,10 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || cleanup_prepared_task_tmp || {
+          worktree_clean=0
+          echo "warning: failed to reap task-owned browser during spawn rollback for ${ID:-unknown}" >&2
+        }
       fi
     fi
     if [ "$worktree_clean" != 1 ]; then
@@ -1770,7 +1783,10 @@ spawn_abort_cleanup() {
         [ "$ORIGINAL_CHECK_PRESENT" != 0 ] || rm -f "$STATE/$ID.check.sh"
         [ "$ORIGINAL_PI_EXT_PRESENT" != 0 ] || rm -f "$STATE/$ID.pi-ext.ts"
         [ "$ORIGINAL_GROK_TOKEN_PRESENT" != 0 ] || rm -f "$STATE/$ID.grok-turnend-token"
-        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || { [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP"; }
+        [ "$ORIGINAL_TASK_TMP_PRESENT" != 0 ] || cleanup_prepared_task_tmp || {
+          account_clean=0
+          echo "warning: failed to reap task-owned browser during spawn rollback for ${ID:-unknown}" >&2
+        }
       fi
       if [ "$account_clean" != 1 ] && [ -n "$rollback_lock" ]; then
         persist_failed_account_rollback || echo "warning: failed to persist Agent Fleet rollback state for ${ID:-unknown}" >&2
@@ -1792,6 +1808,12 @@ spawn_abort_cleanup() {
   [ -z "$rollback_lock" ] || fm_account_meta_lock_release "$rollback_lock" >/dev/null 2>&1 || true
   [ -z "$META_BACKUP" ] || [ -f "$META_BACKUP" ] || META_BACKUP=
   [ -z "$EXISTING_ARTIFACT_BACKUP" ] || [ -d "$EXISTING_ARTIFACT_BACKUP" ] || EXISTING_ARTIFACT_BACKUP=
+  if [ "$status" -ne 0 ] && [ "${BROWSER_PREPARED:-0}" = 1 ]; then
+    cleanup_prepared_task_tmp || {
+      status=1
+      echo "warning: failed to reap task-owned browser after spawn abort for ${ID:-unknown}" >&2
+    }
+  fi
   [ "${LIFECYCLE_LOCK_OWNED:-0}" != 1 ] || [ -z "${LIFECYCLE_LOCK:-}" ] || fm_account_lifecycle_lock_release "$LIFECYCLE_LOCK" >/dev/null 2>&1 || true
   release_secondmate_home_lifecycle_locks
   LIFECYCLE_LOCK=
@@ -2961,6 +2983,79 @@ crew_tool_path() {
   printf '%s' "$out"
 }
 
+browser_automation_executable() {
+  local candidate selected=''
+  if [ -n "${FM_BROWSER_AUTOMATION_EXECUTABLE:-}" ]; then
+    [ -x "$FM_BROWSER_AUTOMATION_EXECUTABLE" ] || {
+      echo "error: FM_BROWSER_AUTOMATION_EXECUTABLE is not executable: $FM_BROWSER_AUTOMATION_EXECUTABLE" >&2
+      return 1
+    }
+    printf '%s\n' "$FM_BROWSER_AUTOMATION_EXECUTABLE"
+    return 0
+  fi
+
+  case "$(uname)" in
+    Darwin)
+      # Canary and Chrome for Testing have app identities distinct from the
+      # captain's stable Google Chrome. Prefer Canary when installed, then the
+      # newest Puppeteer-managed Chrome for Testing already on disk.
+      candidate="/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      candidate="/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      for candidate in \
+        "$HOME"/.cache/puppeteer/chrome/mac_*/chrome-mac-*/Google\ Chrome\ for\ Testing.app/Contents/MacOS/Google\ Chrome\ for\ Testing \
+        "$HOME"/Library/Caches/puppeteer/chrome/mac_*/chrome-mac-*/Google\ Chrome\ for\ Testing.app/Contents/MacOS/Google\ Chrome\ for\ Testing
+      do
+        [ -x "$candidate" ] || continue
+        [ -z "$selected" ] || [ "$candidate" -nt "$selected" ] || continue
+        selected=$candidate
+      done
+      ;;
+    *)
+      for candidate in \
+        "$HOME"/.cache/puppeteer/chrome/linux-*/chrome-linux*/chrome \
+        /usr/bin/google-chrome-unstable \
+        /usr/bin/chromium \
+        /usr/bin/chromium-browser
+      do
+        [ -x "$candidate" ] || continue
+        [ -z "$selected" ] || [ "$candidate" -nt "$selected" ] || continue
+        selected=$candidate
+      done
+      ;;
+  esac
+  printf '%s\n' "$selected"
+}
+
+browser_mcp_path() {
+  local candidate selected='' prefix
+  if [ -n "${CHROME_DEVTOOLS_AXI_MCP_PATH:-}" ] && [ -f "$CHROME_DEVTOOLS_AXI_MCP_PATH" ]; then
+    printf '%s\n' "$CHROME_DEVTOOLS_AXI_MCP_PATH"
+    return 0
+  fi
+  prefix=$(npm prefix -g 2>/dev/null || true)
+  if [ -n "$prefix" ]; then
+    candidate="$prefix/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  for candidate in "$HOME"/.npm/_npx/*/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js; do
+    [ -f "$candidate" ] || continue
+    [ -z "$selected" ] || [ "$candidate" -nt "$selected" ] || continue
+    selected=$candidate
+  done
+  printf '%s\n' "$selected"
+}
+
 # depends on - worktree canonicalization, the per-task temp root, the per-harness
 # turn-end hook, delivery mode/yolo, and account selection. The body is unchanged
 # and deliberately NOT re-indented (it contains heredocs whose bodies are written
@@ -2988,13 +3083,31 @@ fi
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 TASK_TMP="/tmp/fm-$ID"
 mkdir -p "$TASK_TMP/gotmp"
+REAL_CHROME_DEVTOOLS_AXI=$(command -v chrome-devtools-axi 2>/dev/null) || {
+  echo "error: chrome-devtools-axi is unavailable for task-scoped browser isolation" >&2
+  exit 1
+}
+[ "$REAL_CHROME_DEVTOOLS_AXI" != "$SCRIPT_DIR/chrome-devtools-axi" ] || {
+  echo "error: chrome-devtools-axi resolved to firstmate's crew wrapper before task setup" >&2
+  exit 1
+}
+BROWSER_AUTOMATION_EXECUTABLE=$(browser_automation_executable) || exit 1
+BROWSER_MCP_PATH=$(browser_mcp_path)
+"$SCRIPT_DIR/fm-browser-isolation.sh" prepare \
+  "$ID" "$TASK_TMP" "$FM_HOME" "$REAL_CHROME_DEVTOOLS_AXI" \
+  "$BROWSER_AUTOMATION_EXECUTABLE" "$BROWSER_MCP_PATH" || exit 1
+BROWSER_PREPARED=1
+BROWSER_ROOT=$("$SCRIPT_DIR/fm-browser-isolation.sh" root "$ID" "$FM_HOME") || exit 1
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
-# the pane shell just before the launch line, further down. CREW_PATH rides the same
-# two channels for the same reason.
-CREW_PATH=$(crew_tool_path)
+# the pane shell just before the launch line, further down. CREW_PATH and the
+# task-scoped browser identity ride the same two channels for the same reason.
+CREW_PATH="$SCRIPT_DIR:$(crew_tool_path)"
 if [ "$BACKEND" = herdr ]; then
   HERDR_AGENT_ENV+=("GOTMPDIR=$TASK_TMP/gotmp")
   HERDR_AGENT_ENV+=("PATH=$CREW_PATH")
+  HERDR_AGENT_ENV+=("FM_BROWSER_TASK_ID=$ID")
+  HERDR_AGENT_ENV+=("FM_BROWSER_ROOT=$BROWSER_ROOT")
+  HERDR_AGENT_ENV+=("FM_BROWSER_OWNER_HOME=$FM_HOME")
 fi
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the
@@ -3653,9 +3766,9 @@ META_WRITE_LOCK=
 if [ "$BACKEND" != herdr ]; then
   build_launch_command
 fi
-# Export the crew PATH and GOTMPDIR into the crewmate's pane shell so the agent and
-# every child process (go build, go test, ...) inherit them. Sent before the launch
-# command so the env is set when the agent starts; the brief sleep lets it land.
+# Export the crew PATH, GOTMPDIR, and browser identity into the crewmate's pane
+# shell so the agent and every child process inherit them. Sent before the launch
+# command so the environment is set when the agent starts; the brief sleep lets it land.
 if [ "$BACKEND" = orca ]; then
   if [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" != present ] \
     || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T"; then
@@ -3671,7 +3784,7 @@ fi
 # same LAUNCH string as its argv and PATH/GOTMPDIR injected via --env, so there is
 # nothing to type into a pane here.
 if [ "$BACKEND" != herdr ]; then
-  spawn_send_text_line "$T" "export PATH='$CREW_PATH' GOTMPDIR=$TASK_TMP/gotmp"
+  spawn_send_text_line "$T" "export GOTMPDIR=$(shell_quote "$TASK_TMP/gotmp") PATH=$(shell_quote "$CREW_PATH") FM_BROWSER_TASK_ID=$(shell_quote "$ID") FM_BROWSER_ROOT=$(shell_quote "$BROWSER_ROOT") FM_BROWSER_OWNER_HOME=$(shell_quote "$FM_HOME")"
   sleep 0.3
   spawn_send_literal "$T" "$LAUNCH"
   sleep 0.3

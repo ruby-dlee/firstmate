@@ -2449,7 +2449,7 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
   assert_contains "$out" "$sm" "capability refusal omitted the offending secondmate home"
-  assert_contains "$out" "lacks Agent Fleet routing support" \
+  assert_contains "$out" "missing tracked Agent Fleet routing support" \
     "capability refusal did not stop at the capability gate"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
@@ -2489,10 +2489,8 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   rec=$(make_case secondmate-off-incapable claude)
   read_case "$rec"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
-  git -C "$sm" update-index --assume-unchanged bin/fm-account-routing-lib.sh
-  rm -f "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"

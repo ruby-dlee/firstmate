@@ -4807,8 +4807,12 @@ test_continuation_rollback_preserves_concurrent_packet_replacement() {
     FM_ACCOUNT_CONTINUATION_INSTALL_TEST_PROCEED="$proceed" PATH="$FAKEBIN_DIR:$PATH" \
     "$CONTINUATION" "$id" owned-rollback > "$output" 2>&1 &
   packet_pid=$!
-  for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.05; done
-  [ -e "$ready" ] || { kill -TERM "$packet_pid" 2>/dev/null || true; fail "owned-rollback continuation gate did not open"; }
+  for _ in $(seq 1 400); do [ -e "$ready" ] && break; sleep 0.05; done
+  [ -e "$ready" ] || {
+    kill -TERM "$packet_pid" 2>/dev/null || true
+    wait "$packet_pid" 2>/dev/null || true
+    fail "owned-rollback continuation gate did not open: $(cat "$output" 2>/dev/null)"
+  }
   rm -f "$packet"
   cp "$replacement" "$packet"
   printf 'changed during owned packet rollback\n' > "$worktree/owned-rollback-race.txt"
@@ -5166,10 +5170,10 @@ SH
   rm -rf "$lock"
 
   mkdir -p "$lock/.reclaiming"
-  printf '%s\nstale-reclaimer\n' "$$" > "$lock/.reclaiming/owner"
+  printf '999999\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
   touch -t 200001010000 "$lock" "$lock/.reclaiming"
   FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
-    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task); fm_account_meta_lock_release "$held"' \
+    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit $?; fm_account_meta_lock_release "$held"' \
     _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "abandoned metadata reclaim owner blocked acquisition"
   assert_absent "$lock" "metadata lock retained an abandoned reclaim owner"
   pass "metadata locks reclaim abandoned directories without deleting new owners"

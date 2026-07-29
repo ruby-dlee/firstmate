@@ -54,9 +54,16 @@ default_branch() {
 # section 8) still yields the true default-branch tip instead of propagating a
 # stray feature branch to the fleet. Echoes the commit SHA, or returns 1.
 primary_head_commit() {
-  local root=$1 default
+  local root=$1 default ref
   default=$(default_branch "$root") || return 1
-  git -C "$root" rev-parse --verify --quiet "refs/heads/$default^{commit}" 2>/dev/null || return 1
+  ref="refs/heads/$default"
+  if ! git -C "$root" show-ref --verify --quiet "$ref"; then
+    # CI-style and isolated worktree checkouts may intentionally omit the local
+    # default ref. Their checked-out commit is the stable local source; an
+    # origin tracking ref can move asynchronously after the home is seeded.
+    ref=HEAD
+  fi
+  git -C "$root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || return 1
 }
 
 resolve_path() {

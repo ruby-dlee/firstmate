@@ -84,6 +84,8 @@ phase_seed() {
   assert_present "$SUB/projects/alpha/.git" "alpha was not cloned"
   assert_present "$SUB/projects/beta/.git" "beta was not cloned"
   assert_present "$SUB/projects/gamma/.git" "gamma was not cloned"
+  [ "$(git -C "$SUB" symbolic-ref --short refs/remotes/origin/HEAD)" = "origin/main" ] \
+    || fail "seeded home did not preserve the primary default branch as origin/HEAD"
   [ "$(git -C "$SUB/projects/alpha" remote get-url origin)" = "$ALPHA_ORIGIN" ] \
     || fail "alpha clone did not preserve its origin URL"
   [ "$(git -C "$SUB/projects/beta" remote get-url origin)" = "$BETA_ORIGIN" ] \

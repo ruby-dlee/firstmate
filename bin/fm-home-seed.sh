@@ -460,6 +460,7 @@ ensure_home() {
     }
     git clone --quiet --no-checkout "$FM_ROOT" "$home"
     git -C "$home" checkout --quiet -B "$default" "$default_tip"
+    git -C "$home" remote set-head origin "$default"
     source_origin=$(git -C "$FM_ROOT" remote get-url origin 2>/dev/null || true)
     if [ -n "$source_origin" ]; then
       git -C "$home" remote set-url origin "$source_origin"

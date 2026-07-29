@@ -5131,7 +5131,9 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   [ "$owner_lines" -eq 2 ] || fail "published metadata lock did not contain complete ownership"
 
   mkdir -p "$lock"
-  printf '%s\nstale-owner\n' "$$" > "$lock/owner"
+  # PID 1 is observable on both CI Linux and macOS; the deliberately mismatched
+  # start identity makes this owner stale without assuming a PID is absent.
+  printf '1\nstale-owner\n' > "$lock/owner"
   workers="$case_dir/workers.sh"
   cat > "$workers" <<'SH'
 #!/usr/bin/env bash
@@ -5170,7 +5172,7 @@ SH
   rm -rf "$lock"
 
   mkdir -p "$lock/.reclaiming"
-  printf '999999\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
+  printf '1\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
   touch -t 200001010000 "$lock" "$lock/.reclaiming"
   FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
     bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit $?; fm_account_meta_lock_release "$held"' \

@@ -55,6 +55,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# shellcheck source=bin/fm-tangle-lib.sh
+. "$SCRIPT_DIR/fm-tangle-lib.sh"
 fm_refuse_if_gate_agent
 
 usage() {
@@ -431,7 +433,7 @@ acquire_treehouse_home() {
 }
 
 ensure_home() {
-  local id=$1 requested=$2 home
+  local id=$1 requested=$2 home default source_origin
   if [ "$requested" = "-" ]; then
     home=$(acquire_treehouse_home "$id")
     verify_firstmate_home "$home"
@@ -444,7 +446,15 @@ ensure_home() {
     [ -d "$home" ] || { echo "error: $home exists and is not a directory" >&2; return 1; }
   else
     mkdir -p "$(dirname "$home")"
-    git clone --quiet "$FM_ROOT" "$home"
+    default=$(fm_default_branch "$FM_ROOT") || {
+      echo "error: cannot determine the active firstmate home's default branch" >&2
+      return 1
+    }
+    git clone --quiet --branch "$default" "$FM_ROOT" "$home"
+    source_origin=$(git -C "$FM_ROOT" remote get-url origin 2>/dev/null || true)
+    if [ -n "$source_origin" ]; then
+      git -C "$home" remote set-url origin "$source_origin"
+    fi
   fi
   verify_firstmate_home "$home"
 }

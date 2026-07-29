@@ -238,6 +238,26 @@ test_home_seed_uses_treehouse_acquired_home() {
   pass "home seeding durably leases treehouse-acquired dash homes under the secondmate id"
 }
 
+test_home_seed_clones_default_branch_from_detached_source() {
+  local source unused_home seeded
+  unused_home="$TMP_ROOT/detached-source-unused-worktree"
+  seeded="$TMP_ROOT/detached-source-seeded-home"
+  source=$(make_live_default_firstmate_worktree "$unused_home" detached-source-firstmate)
+  git -C "$source" checkout --quiet --detach
+  mkdir -p "$source/data" "$source/state" "$source/projects"
+
+  FM_HOME="$source" FM_ROOT_OVERRIDE="$source" \
+    FM_SECONDMATE_CHARTER='detached source scope' FM_SECONDMATE_SCOPE='detached source scope' \
+    "$ROOT/bin/fm-home-seed.sh" detached-source "$seeded" --no-projects >/dev/null \
+    || fail "explicit home seed inherited a detached CI checkout instead of the default branch"
+
+  [ "$(git -C "$seeded" symbolic-ref --quiet --short HEAD)" = main ] \
+    || fail "explicit home seeded from detached source was not attached to its proven default branch"
+  [ "$(git -C "$seeded" rev-parse HEAD)" = "$(git -C "$source" rev-parse refs/remotes/origin/main)" ] \
+    || fail "explicit home seeded from detached source did not use the live default tip"
+  pass "explicit home seeding uses the proven default branch when the source checkout is detached"
+}
+
 test_home_seed_acquisition_honors_shared_checkout_lock() {
   local home acquired fakebin log err source common key lock_root lock state_root
   home="$TMP_ROOT/dash-lock-home"
@@ -2513,6 +2533,7 @@ EOF
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = checkout-freshness ]; then
+  test_home_seed_clones_default_branch_from_detached_source
   test_home_seed_rejects_stale_treehouse_acquired_home
   test_home_seed_retains_dirty_treehouse_acquired_home
   test_home_seed_retains_repository_mismatch_acquisition
@@ -2554,6 +2575,7 @@ test_home_seed_validate_rejects_duplicate_ids
 test_home_seed_validate_rejects_nested_homes
 test_home_seed_validate_rejects_partial_registry_rows
 test_home_seed_uses_treehouse_acquired_home
+test_home_seed_clones_default_branch_from_detached_source
 test_home_seed_acquisition_honors_shared_checkout_lock
 test_home_seed_rejects_stale_treehouse_acquired_home
 test_home_seed_retains_dirty_treehouse_acquired_home

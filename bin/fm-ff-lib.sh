@@ -59,9 +59,9 @@ primary_head_commit() {
   ref="refs/heads/$default"
   if ! git -C "$root" show-ref --verify --quiet "$ref"; then
     # CI-style and isolated worktree checkouts may intentionally omit the local
-    # default ref. Their checked-out commit is the stable local source; an
-    # origin tracking ref can move asynchronously after the home is seeded.
-    ref=HEAD
+    # default ref. Follow the resolved remote default instead of a detached PR
+    # merge commit or feature HEAD.
+    ref="refs/remotes/origin/$default"
   fi
   git -C "$root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || return 1
 }

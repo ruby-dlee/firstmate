@@ -128,7 +128,7 @@ run_ff() {
   FF_OUT=$(cat "$outfile")
 }
 
-# --- T0: CI-style checkout without local default uses its stable HEAD --------
+# --- T0: CI-style checkout without local default uses the remote default -----
 test_primary_head_commit_without_local_default() {
   local w default_tip feature_tip resolved
   w=$(new_world primary-remote-default)
@@ -146,11 +146,9 @@ test_primary_head_commit_without_local_default() {
   resolved=$(primary_head_commit "$w/main") \
     || fail "primary default commit was unresolved without a local default branch"
 
-  [ "$resolved" = "$feature_tip" ] \
-    || fail "expected stable checked-out commit $feature_tip, got $resolved"
-  [ "$resolved" != "$default_tip" ] \
-    || fail "primary resolution followed the mutable remote default"
-  pass "T0 a CI-style checkout resolves its stable checked-out commit"
+  [ "$resolved" = "$default_tip" ] \
+    || fail "expected remote default commit $default_tip instead of checked-out feature $feature_tip, got $resolved"
+  pass "T0 a CI-style checkout resolves its remote default commit"
 }
 
 # --- T1: updated - a behind home fast-forwards to the primary's local HEAD ---

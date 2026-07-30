@@ -601,13 +601,17 @@ git_index_lock_path() {
   esac
 }
 
+# Delegate to the product's own derivation rather than re-deriving the key here.
+# The re-implementation this replaced hashed the physical common-dir path
+# verbatim, while fm_checkout_lock_key lowercases it - so every lock path
+# computed under a mktemp directory with an uppercase character (nearly all of
+# them) named a file that never existed, and the assertions built on it either
+# passed vacuously or failed for a reason that had nothing to do with locking.
+# shellcheck source=bin/fm-checkout-lock-lib.sh disable=SC1091
+. "$ROOT/bin/fm-checkout-lock-lib.sh"
+
 checkout_lock_path() {
-  local dir=$1 lock_root=$2 common key
-  common=$(git -C "$dir" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$dir/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  printf '%s/%s.lock\n' "$lock_root" "$key"
+  fm_checkout_lock_path "$1" "$2"
 }
 
 # fakebin/lsof stub: no process ever holds anything open (lsof's not-found exit

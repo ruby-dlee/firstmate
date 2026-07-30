@@ -3550,15 +3550,21 @@ done
 case "${1:-}" in
   display-message)
     case "$target" in
-      *task-x1) [ -f "$FM_FAKE_PARENT_LIVE" ] ;;
-      *child-live-x9) [ -f "$FM_FAKE_CHILD_LIVE" ] ;;
+      *task-x1) [ -f "$FM_FAKE_PARENT_LIVE" ] || exit 1 ;;
+      *child-live-x9) [ -f "$FM_FAKE_CHILD_LIVE" ] || exit 1 ;;
       *) exit 1 ;;
     esac
-    exit $?
+    # Both endpoints are running agents. Without a #{pane_current_command}
+    # answer the pane classifies as `unknown`, which blocks cleanup for an
+    # unprovable state rather than for the live child this case is about.
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' claude ;;
+    esac
+    exit 0
     ;;
   list-windows)
-    [ -f "$FM_FAKE_PARENT_LIVE" ] && printf '%s\n' fm-task-x1
-    [ -f "$FM_FAKE_CHILD_LIVE" ] && printf '%s\n' fm-child-live-x9
+    [ ! -f "$FM_FAKE_PARENT_LIVE" ] || printf '%s\n' fm-task-x1
+    [ ! -f "$FM_FAKE_CHILD_LIVE" ] || printf '%s\n' fm-child-live-x9
     ;;
   kill-window)
     case "$target" in

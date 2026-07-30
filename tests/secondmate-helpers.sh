@@ -53,6 +53,18 @@ case "${1:-}" in
     if [ -n "$target" ] && [ -f "$FM_FAKE_TMUX_LOG.killed" ] && grep -qxF "$target" "$FM_FAKE_TMUX_LOG.killed"; then
       exit 1
     fi
+    # Answer #{pane_current_command} separately. A present pane whose foreground
+    # command is unreadable classifies as `unknown` (fm_backend_tmux_agent_alive),
+    # and callers must never act on unknown - so every caller that has to prove an
+    # endpoint's state would retain instead, for an unprovable read rather than
+    # for anything the fixture meant to say. This pane is idle, matching the
+    # "idle prompt" capture below; FM_FAKE_TMUX_COMMAND overrides it.
+    case " $* " in
+      *' #{pane_current_command} '*)
+        printf '%s\n' "${FM_FAKE_TMUX_COMMAND:-bash}"
+        exit 0
+        ;;
+    esac
     printf 'firstmate\n'
     exit 0
     ;;

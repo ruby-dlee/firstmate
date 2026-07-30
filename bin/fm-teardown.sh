@@ -4516,6 +4516,17 @@ if [ "$KIND" = secondmate ]; then
     >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+  else
+    # Prove the home registers no child homes BEFORE stopping its endpoint. Stopping
+    # a supervisor is irreversible - it cannot be un-stopped and its in-flight context
+    # is gone - so a read-only proof that gates it must run first, or an operator loses
+    # a live secondmate to a teardown that was always going to refuse. The same proof
+    # still runs at its original place below, so nothing is skipped.
+    # Non-force only, deliberately: on the --force path cleanup_firstmate_home_children
+    # removes child registry entries before the later check, so that check legitimately
+    # observes post-cleanup state and hoisting it there would change what it observes,
+    # not merely when it runs.
+    require_empty_secondmate_registry "$HOME_PATH" || exit 1
   fi
   quiesce_secondmate_endpoint || exit 1
   if [ "$FORCE" = "--force" ]; then

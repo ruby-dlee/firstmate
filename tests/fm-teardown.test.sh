@@ -695,7 +695,13 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-if [ -n "$dir" ] && [ "${args[2]:-}" = status ] && [ "${args[3]:-}" = --porcelain ]; then
+# Match the porcelain flag in either spelling: teardown's dirty checks all pass
+# --porcelain=v1, so keying on a bare --porcelain made this stub a silent no-op.
+porcelain=0
+case "${args[3]:-}" in
+  --porcelain|--porcelain=*) porcelain=1 ;;
+esac
+if [ -n "$dir" ] && [ "${args[2]:-}" = status ] && [ "$porcelain" -eq 1 ]; then
   lock=$("$real" -C "$dir" rev-parse --git-path index.lock 2>/dev/null || true)
   case "$lock" in
     /*|'') ;;

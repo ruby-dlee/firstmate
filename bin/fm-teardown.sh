@@ -3243,13 +3243,24 @@ EOF
 }
 
 validate_surviving_repository_authority() {
-  local repository=$1 bare
+  local repository=$1 container=${3:-$1} bare
   bare=$(git -C "$repository" rev-parse --is-bare-repository 2>/dev/null) || return 1
   if [ "$bare" = true ]; then
     validate_surviving_repository_authority_locked "$@"
     return
   fi
-  fm_checkout_lock_run "$repository" "$CHECKOUT_LOCK_ROOT" \
+  # Serialize on the enclosing CONTAINER checkout, not on the nested repository
+  # itself. The proof below is read-only; the lock exists so a concurrent checkout
+  # mutation cannot invalidate it, and the container is the checkout that
+  # enumeration walked and whose mutation is the hazard. It is also the only shape
+  # that can be keyed: a submodule's .git is a gitlink FILE whose absolute git dir
+  # IS its common dir (verified with git 2.50.1: <super>/.git/modules/<path>), and
+  # `git worktree list` run inside one reports that git dir rather than the working
+  # tree, so fm_checkout_validate_git_metadata's registered-worktree assertion can
+  # never hold for it and the lock identity was simply unresolvable - which refused
+  # every retirement of a home whose project carries a submodule. For a top-level
+  # repository the container IS the repository, so that path is unchanged.
+  fm_checkout_lock_run "$container" "$CHECKOUT_LOCK_ROOT" \
     validate_surviving_repository_authority_locked "$@"
 }
 

@@ -583,16 +583,29 @@ test_home_seed_refuses_placeholder_charter() {
 }
 
 test_home_seed_refuses_empty_charter_fields() {
-  local home subhome err
+  local home subhome scope_subhome err state_root
   home="$TMP_ROOT/empty-charter-home"
   subhome="$TMP_ROOT/empty-charter-subhome"
+  # The two attempts below need SEPARATE destinations. The refresher records each
+  # covered checkout's physical identity, so recreating a home at a path it
+  # already recorded reads as `covered checkout physical identity drifted` and the
+  # second seed is refused for an unrefreshable default branch long before it can
+  # reach the charter-field validation under test.
+  scope_subhome="$TMP_ROOT/empty-scope-subhome"
   err="$TMP_ROOT/empty-charter.err"
+  # Keep those identity records inside the case. Unscoped they land in the real
+  # ${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh, which both
+  # writes through to the operator's own state and makes this test depend on what
+  # earlier runs left behind.
+  state_root="$TMP_ROOT/empty-charter-refresh-state"
+  mkdir -p "$state_root"
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/empty-charter-alpha.git"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
 
-  if FM_HOME="$home" FM_SECONDMATE_CHARTER='   ' "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
+  if FM_HOME="$home" FM_CHECKOUT_REFRESH_STATE_ROOT="$state_root" FM_SECONDMATE_CHARTER='   ' \
+    "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
     fail "seed accepted a whitespace-only charter"
   fi
   grep -F 'empty Charter section' "$err" >/dev/null \
@@ -602,12 +615,13 @@ test_home_seed_refuses_empty_charter_fields() {
   rm -rf "$home/data/design" "$subhome" "$err"
   FM_SECONDMATE_SCOPE='   ' scaffold_secondmate_charter "$home" design 'filled charter' alpha \
     || fail "empty scope fixture scaffold failed"
-  if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
+  if FM_HOME="$home" FM_CHECKOUT_REFRESH_STATE_ROOT="$state_root" \
+    "$ROOT/bin/fm-home-seed.sh" design "$scope_subhome" alpha >/dev/null 2>"$err"; then
     fail "seed accepted an empty routing scope"
   fi
   grep -F 'empty Routing scope section' "$err" >/dev/null \
     || fail "seed did not explain empty routing scope refusal"
-  [ ! -e "$subhome" ] || fail "empty routing scope seed left a generated subhome"
+  [ ! -e "$scope_subhome" ] || fail "empty routing scope seed left a generated subhome"
   pass "home seeding refuses empty normalized charter fields"
 }
 
@@ -865,7 +879,13 @@ test_home_seed_refuses_projectless_home_with_uninspectable_projects() {
   home="$TMP_ROOT/no-projects-uninspectable-home"
   sub="$TMP_ROOT/no-projects-uninspectable-subhome"
   err="$TMP_ROOT/no-projects-uninspectable.err"
-  mkdir -p "$home/data" "$home/state" "$sub/data" "$sub/projects/hidden-clone"
+  mkdir -p "$home/data" "$home/state"
+  # Seed runs the refresher's preflight on the home before it inspects projects,
+  # and that preflight requires an exact Git repository root, so a bare directory
+  # is refused for an unrefreshable default branch and never reaches the
+  # inspection failure under test. Use a real clone, like the sibling case above.
+  git clone -q "$FM_ROOT_OVERRIDE" "$sub"
+  mkdir -p "$sub/data" "$sub/projects/hidden-clone"
   mark_firstmate_home "$sub"
   fm_git_init_commit "$sub/projects/hidden-clone"
   chmod 311 "$sub/projects"

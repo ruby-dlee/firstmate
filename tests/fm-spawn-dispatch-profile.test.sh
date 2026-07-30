@@ -12,7 +12,6 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
-REAL_GIT_FOR_TEST=$(command -v git)
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -52,30 +51,6 @@ fi
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
-  # A seeded secondmate home's freshness proof resolves the LIVE upstream default tip
-  # of FM_ROOT (fm-spawn.sh -> fm-checkout-refresh.sh verify-home -> probe_upstream's
-  # `git ls-remote --symref origin HEAD`). Unstubbed, that escapes the fixture to the
-  # real remote, so the home - cloned from this checkout - reads as stale on any branch
-  # whose HEAD is ahead of origin/main. That made the case fail for the checkout's
-  # position rather than for anything it asserts; verified by reproducing it on
-  # unmodified main plus a single empty commit. Answer the probe from this checkout's
-  # own default branch so the fixture is hermetic, and pass every other git call
-  # through untouched.
-  cat > "$fakebin/git" <<'SH'
-#!/usr/bin/env bash
-real=${REAL_GIT_FOR_TEST:?}
-case " $* " in
-  *" ls-remote --symref origin HEAD "*)
-    source=${FM_FAKE_UPSTREAM_SOURCE:?}
-    branch=$("$real" -C "$source" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'main')
-    tip=$("$real" -C "$source" rev-parse "refs/heads/$branch" 2>/dev/null) || exit 1
-    printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$branch" "$tip"
-    exit 0
-    ;;
-esac
-exec "$real" "$@"
-SH
-  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -108,10 +83,20 @@ enable_dispatch_profile() {
     > "$home/config/crew-dispatch.json"
 }
 
+make_upstream_source() {
+  local source=$1 tip
+  tip=$(git -C "$ROOT" rev-parse HEAD) || return 1
+  git clone -q --no-checkout "$ROOT" "$source"
+  git -C "$source" update-ref refs/heads/main "$tip"
+  git -C "$source" checkout -q main
+  git -C "$source" remote set-url origin "$source"
+  git -C "$source" update-ref refs/remotes/origin/main refs/heads/main
+  git -C "$source" remote set-head origin main
+}
+
 make_seeded_secondmate_home() {
-  local home=$1 id=$2
-  git clone -q --no-checkout "$ROOT" "$home"
-  git -C "$home" checkout -q main
+  local home=$1 id=$2 source=$3
+  git clone -q "$source" "$home"
   git -C "$home" update-ref refs/remotes/origin/main refs/heads/main
   git -C "$home" remote set-head origin main
   mkdir -p "$home/data"
@@ -123,13 +108,12 @@ run_spawn() {
   local home=$1 wt=$2 fakebin=$3 launchlog=$4
   shift 4
   : > "$launchlog"
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
-    REAL_GIT_FOR_TEST="$REAL_GIT_FOR_TEST" FM_FAKE_UPSTREAM_SOURCE="$ROOT" \
     FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
@@ -425,17 +409,20 @@ test_batch_forwards_shared_profile_flags() {
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
-  local rec id sm out status
+  local rec id sm source out status
   id=profile-secondmate-z16
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
+  source="$CASE_DIR/upstream-source"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id"
+  make_upstream_source "$source"
+  make_seeded_secondmate_home "$sm" "$id" "$source"
   printf -- '- %s - dispatch profile test (home: %s; scope: test; projects: ; added 2026-07-29)\n' \
     "$id" "$(cd "$sm" && pwd -P)" > "$HOME_DIR/data/secondmates.md"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(FM_TEST_ROOT_OVERRIDE="$source" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
   expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"

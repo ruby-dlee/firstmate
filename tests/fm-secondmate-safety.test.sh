@@ -2524,25 +2524,20 @@ EOF
 
 test_secondmate_force_teardown_refuses_unregistered_child_worktree() {
   local home subhome childproj childwt fakebin err log
-  home="$TMP_ROOT/unregistered-child-home"
-  subhome="$TMP_ROOT/unregistered-child-subhome"
-  childproj="$subhome/projects/alpha"
-  childwt="$TMP_ROOT/unregistered-child-worktree"
   err="$TMP_ROOT/unregistered-child.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$childproj" "$childwt"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  # Real home shapes, or home validation refuses before the child worktree is reached.
+  make_secondmate_home_and_source unregistered-child domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  childproj="$subhome/projects/alpha"
+  # The point of the case: the child's recorded worktree is a real repository that is
+  # nevertheless not a worktree of the child project. It must be an exact Git root,
+  # because that is proved first - a bare directory is refused as "not an exact Git
+  # root" before the belongs-to-project proof this case names is ever reached. Its own
+  # common Git dir is what makes it unregistered.
+  childwt="$TMP_ROOT/unregistered-child-worktree"
+  fm_git_init_commit "$childwt"
   cat > "$subhome/state/child.meta" <<EOF
 window=firstmate:fm-child
 worktree=$childwt
@@ -2554,7 +2549,8 @@ yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/unregistered-child-fake")
   log="$TMP_ROOT/unregistered-child-fake/tmux.log"
-  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/unregistered-child-fake/pane.txt" \
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/unregistered-child-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
     fail "force teardown removed an unregistered child worktree"
   fi

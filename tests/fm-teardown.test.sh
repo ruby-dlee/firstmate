@@ -2535,12 +2535,15 @@ SH
 
 test_forced_secondmate_quiesces_parent_before_child_cleanup() {
   local case_dir child_project child_worktree child_id parent_live parent_quiesced rc
+  local child_live child_quiesced
   case_dir=$(make_case secondmate-parent-quiesce)
   child_project="$case_dir/child-project"
   child_worktree="$case_dir/child-worktree"
   child_id=child-after-quiesce-x4
   parent_live="$case_dir/parent-live"
   parent_quiesced="$case_dir/parent-quiesced"
+  child_live="$case_dir/child-live"
+  child_quiesced="$case_dir/child-quiesced"
   prepare_secondmate_home_fixture "$case_dir"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
@@ -2552,22 +2555,54 @@ test_forced_secondmate_quiesces_parent_before_child_cleanup() {
     "home=$case_dir/wt"
   fm_git_worktree "$child_project" "$child_worktree" child-branch
   write_treehouse_lease "$child_worktree" "firstmate-$child_id"
+  # A real tmux spawn records a session-scoped handle (bin/fm-spawn.sh builds
+  # T="$SES:$W" and persists it), so an unscoped bare window name is not a shape
+  # the product ever writes. fm_backend_target_state cannot derive a session from
+  # one, so it answers `unknown` for every probe and no stub could ever prove the
+  # child absent. Carry the same window= + tmux_session_target= pair the parent
+  # meta and the suite's write_meta helper already use.
   fm_write_meta "$case_dir/wt/state/$child_id.meta" \
     "window=fm-$child_id" \
+    "tmux_session_target=firstmate:fm-$child_id" \
     "worktree=$child_worktree" \
     "project=$child_project" \
     'kind=ship' \
     'mode=local-only'
   : > "$parent_live"
+  : > "$child_live"
+  # Answer PER TARGET: the parent and the child are independent endpoints, and
+  # each stays observable until its own kill-window lands (the same
+  # observable-until-killed contract the suite's default tmux stub implements).
+  # A single global liveness marker made the child unresolvable the moment the
+  # parent was quiesced, which is exactly the ordering this case exercises.
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+live_marker() {
+  case "$*" in
+    *fm-task-x1*) printf '%s' "$FM_FAKE_PARENT_LIVE" ;;
+    *fm-child-after-quiesce-x4*) printf '%s' "$FM_FAKE_CHILD_LIVE" ;;
+  esac
+}
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_PARENT_LIVE" ] ;;
+  display-message)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
+  list-windows)
+    [ ! -f "$FM_FAKE_PARENT_LIVE" ] || printf '%s\n' fm-task-x1
+    [ ! -f "$FM_FAKE_CHILD_LIVE" ] || printf '%s\n' fm-child-after-quiesce-x4
+    exit 0
+    ;;
   kill-window)
     case "$*" in
       *fm-task-x1*) rm -f "$FM_FAKE_PARENT_LIVE"; : > "$FM_FAKE_PARENT_QUIESCED" ;;
+      *fm-child-after-quiesce-x4*) rm -f "$FM_FAKE_CHILD_LIVE"; : > "$FM_FAKE_CHILD_QUIESCED" ;;
     esac
     exit 0
     ;;
@@ -2577,12 +2612,14 @@ SH
 
   set +e
   FM_FAKE_PARENT_LIVE="$parent_live" FM_FAKE_PARENT_QUIESCED="$parent_quiesced" \
+    FM_FAKE_CHILD_LIVE="$child_live" FM_FAKE_CHILD_QUIESCED="$child_quiesced" \
     FM_EXPECT_PARENT_QUIESCED="$parent_quiesced" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
   expect_code 0 "$rc" "secondmate-parent-quiesce: forced teardown should succeed"
   assert_present "$parent_quiesced" "forced secondmate teardown did not quiesce its parent endpoint"
+  assert_present "$child_quiesced" "forced secondmate teardown did not quiesce its managed child endpoint"
   assert_absent "$case_dir/wt" "forced secondmate teardown retained the retired home"
   pass "forced secondmate teardown quiesces and verifies the parent before child cleanup"
 }

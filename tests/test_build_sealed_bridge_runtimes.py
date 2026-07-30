@@ -30,19 +30,28 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def host_system_tool_paths(fallback: Path) -> dict[str, Path]:
+def host_system_tool_paths() -> dict[str, Path]:
     def usable(path: Path) -> bool:
         try:
-            builder._require_regular(
-                path,
-                "fixture system tool",
-                executable=True,
-                allow_root_owner=True,
-            )
-        except (OSError, builder.BuildError):
+            metadata = path.lstat()
+        except OSError:
             return False
-        return Path(os.path.realpath(path)) == path
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == 0
+            and not stat.S_IMODE(metadata.st_mode) & 0o022
+            and Path(os.path.realpath(path)) == path
+            and os.access(path, os.X_OK)
+        )
 
+    fallback = next(
+        path
+        for path in map(
+            Path,
+            ("/usr/bin/true", "/bin/true", "/usr/bin/env", "/bin/echo"),
+        )
+        if usable(path)
+    )
     return {
         name: path if usable(path) else fallback
         for name, path in builder.SYSTEM_TOOL_PATHS.items()
@@ -171,11 +180,8 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sealed-builder-test-")
         self.root = Path(os.path.realpath(self.temporary.name))
-        fallback = self.root / "system-tool"
-        fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        fallback.chmod(0o700)
         self.system_tools_patch = mock.patch.object(
-            builder, "SYSTEM_TOOL_PATHS", host_system_tool_paths(fallback)
+            builder, "SYSTEM_TOOL_PATHS", host_system_tool_paths()
         )
         self.system_tools_patch.start()
         self.fixture = ManifestFixture(self.root)

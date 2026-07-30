@@ -201,6 +201,35 @@ SH
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
+# make_leased_secondmate_home <pool> <fmroot> <id>: a Treehouse-slot-shaped
+# secondmate home. bin/fm-teardown.sh takes the Treehouse-return path for any home
+# that is a registered worktree of the firstmate source, and that path then proves
+# ownership from the AUTHORITATIVE pool state - <pool>/treehouse-state.json, found
+# by walking up two levels from the worktree (worktree -> slot -> pool). A worktree
+# parked directly under the test temp root has no such pool, so teardown refuses
+# with "cannot resolve authoritative Treehouse state" before it ever tries the
+# return. Lay the home out as <pool>/1/home and record its durable lease, held by
+# the task id (which is what teardown passes as the expected holder).
+# Prints the home path.
+make_leased_secondmate_home() {
+  local pool=$1 fmroot=$2 id=$3 home
+  home="$pool/1/home"
+  mkdir -p "$pool/1"
+  git -C "$fmroot" worktree add --quiet --detach "$home" HEAD
+  python3 - "$pool/treehouse-state.json" "$(cd "$home" && pwd -P)" "$id" <<'PY'
+import json
+import sys
+
+state, path, holder = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {"worktrees": [{"name": "1", "path": path, "leased": True, "lease_holder": holder}]},
+        stream,
+    )
+PY
+  printf '%s\n' "$home"
+}
+
 # Scaffold a filled secondmate charter brief under <home>/data/<id>/brief.md.
 # Args: home id charter [project...]
 scaffold_secondmate_charter() {

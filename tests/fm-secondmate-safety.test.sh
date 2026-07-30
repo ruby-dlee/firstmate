@@ -1750,10 +1750,9 @@ test_fm_send_refuses_bare_window_without_home_meta() {
 test_secondmate_teardown_retires_empty_home() {
   local home subhome subhome_abs fakebin log lease fmroot
   home="$TMP_ROOT/teardown-home"
-  subhome="$TMP_ROOT/teardown-subhome"
   fmroot="$TMP_ROOT/teardown-fmroot"
   make_firstmate_git_root "$fmroot"
-  git -C "$fmroot" worktree add --quiet --detach "$subhome" HEAD
+  subhome=$(make_leased_secondmate_home "$TMP_ROOT/teardown-pool" "$fmroot" domain)
   mkdir -p "$home/state" "$home/data" "$subhome/state"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   subhome_abs=$(cd "$subhome" && pwd -P)
@@ -1788,11 +1787,10 @@ EOF
 test_secondmate_teardown_refuses_failed_leased_home_return() {
   local home subhome subhome_abs fakebin log fmroot err rc
   home="$TMP_ROOT/teardown-return-fail-home"
-  subhome="$TMP_ROOT/teardown-return-fail-subhome"
   fmroot="$TMP_ROOT/teardown-return-fail-fmroot"
   err="$TMP_ROOT/teardown-return-fail.err"
   make_firstmate_git_root "$fmroot"
-  git -C "$fmroot" worktree add --quiet --detach "$subhome" HEAD
+  subhome=$(make_leased_secondmate_home "$TMP_ROOT/teardown-return-fail-pool" "$fmroot" domain)
   mkdir -p "$home/state" "$home/data" "$subhome/state"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   subhome_abs=$(cd "$subhome" && pwd -P)

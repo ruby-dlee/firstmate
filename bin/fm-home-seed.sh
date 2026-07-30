@@ -946,6 +946,15 @@ seed_home() {
     home=$(acquire_treehouse_home "$id")
     SEED_HOME="$home"
     SEED_HOME_RETAINED=1
+    # Prove the acquired home is a legal destination BEFORE taking its lifecycle
+    # lock, exactly as the explicit-home branch below does. These locks are keyed
+    # on the home path and are not reentrant, so an acquired home that IS the
+    # active firstmate home resolves to the lock this seed already holds for
+    # $FM_HOME above, and the second acquisition could only ever wait out
+    # FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS against itself. Refusing first turns
+    # that self-deadlock into the actionable refusal the caller needs. Retention
+    # is already armed, so the acquired home is still kept for manual recovery.
+    refuse_active_home_path "$home" || return 1
     SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home") || return 1
     freshness_status=0
     "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$home" "$FM_ROOT" || freshness_status=$?

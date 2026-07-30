@@ -3001,11 +3001,22 @@ test_required_report_blocks_then_publishes_before_cleanup() {
   mkdir -p "$data/task-x1"
   printf '# Task\n\nPublish before cleanup\n' > "$data/task-x1/brief.md"
   printf 'done: implementation landed\n' > "$case_dir/state/task-x1.status"
+  # Answer #{pane_current_command} and list-windows too: a present pane whose
+  # foreground command is unreadable classifies as `unknown`, which retains
+  # metadata before teardown ever reaches kill-window, so the quiescence this
+  # case asserts could never happen. A bare shell is a present-but-idle endpoint.
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  display-message)
+    [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
+  list-windows) [ ! -f "$FM_FAKE_REPORT_LIVE" ] || printf '%s\n' fm-task-x1; exit 0 ;;
   kill-window)
     if [ -f "$FM_FAKE_COMPLETION_PATH" ]; then
       printf '\nQuiesced final state.\n' >> "$FM_FAKE_COMPLETION_PATH"

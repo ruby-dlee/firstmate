@@ -64,6 +64,8 @@ REAL_PYTHON_FOR_TEST=$(command -v python3)
 export REAL_PYTHON_FOR_TEST
 REAL_STAT_FOR_TEST=$(command -v stat)
 export REAL_STAT_FOR_TEST
+REAL_PS_FOR_TEST=$(command -v ps)
+export REAL_PS_FOR_TEST
 
 write_treehouse_lease() {
   local worktree=$1 holder=$2 slot pool state
@@ -2764,16 +2766,18 @@ SH
 }
 
 test_forced_secondmate_retains_unverified_process_group() {
-  local case_dir child_worktree child_id lock child_pid_file rc group anchor_state owner
+  local case_dir child_worktree child_id lock child_pid_file rc group anchor_state owner ps_broken
   child_id=child-return-unverified-x8
   setup_forced_secondmate_child_case secondmate-child-return-unverified "$child_id"
   case_dir=$FORCED_CHILD_CASE_DIR
   child_worktree=$FORCED_CHILD_WORKTREE
   lock=$(checkout_lock_path "$child_worktree" "$case_dir/checkout-locks")
   child_pid_file="$case_dir/treehouse-unverified-child.pid"
+  ps_broken="$case_dir/ps-broken"
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = return ]; then
+  : > "$FM_FAKE_PS_BROKEN"
   (
     trap '' TERM
     while :; do
@@ -2784,14 +2788,20 @@ if [ "${1:-}" = return ]; then
 fi
 exit 0
 SH
+  # Break `ps` only from the Treehouse return onward. An unconditionally failing
+  # `ps` also breaks the earlier bounded upstream probe of the firstmate source,
+  # which refuses long before any child cleanup and hides the behaviour under
+  # test - the process-tree reap of THIS return being unverifiable.
   cat > "$case_dir/fakebin/ps" <<'SH'
 #!/usr/bin/env bash
-exit 1
+[ ! -f "$FM_FAKE_PS_BROKEN" ] || exit 1
+exec "${REAL_PS_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/ps"
 
   set +e
   FM_FAKE_PARENT_LIVE="$FORCED_CHILD_PARENT_LIVE" \
+  FM_FAKE_PS_BROKEN="$ps_broken" \
   TREEHOUSE_RETURN_CHILD_PID_FILE="$child_pid_file" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?

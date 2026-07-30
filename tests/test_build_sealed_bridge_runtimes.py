@@ -58,6 +58,25 @@ def host_system_tool_paths() -> dict[str, Path]:
     }
 
 
+def require_safe_fixture_ancestry(
+    path: Path,
+    label: str,
+    *,
+    system_only: bool = False,
+) -> None:
+    if not system_only:
+        builder._ORIGINAL_REQUIRE_SAFE_ANCESTRY(path, label)
+        return
+    current = path
+    while True:
+        info = os.lstat(current)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+            raise builder.BuildError(f"{label} has unsafe system ancestry: {current}")
+        if current == current.parent:
+            return
+        current = current.parent
+
+
 class ManifestFixture:
     def __init__(self, temporary: Path) -> None:
         self.root = temporary
@@ -180,6 +199,14 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sealed-builder-test-")
         self.root = Path(os.path.realpath(self.temporary.name))
+        if not hasattr(builder, "_ORIGINAL_REQUIRE_SAFE_ANCESTRY"):
+            builder._ORIGINAL_REQUIRE_SAFE_ANCESTRY = builder._require_safe_ancestry
+        self.system_ancestry_patch = mock.patch.object(
+            builder,
+            "_require_safe_ancestry",
+            side_effect=require_safe_fixture_ancestry,
+        )
+        self.system_ancestry_patch.start()
         self.system_tools_patch = mock.patch.object(
             builder, "SYSTEM_TOOL_PATHS", host_system_tool_paths()
         )
@@ -189,6 +216,7 @@ class SealedRuntimeBuilderTests(unittest.TestCase):
     def tearDown(self) -> None:
         builder._unseal(self.root)
         self.system_tools_patch.stop()
+        self.system_ancestry_patch.stop()
         self.temporary.cleanup()
 
     def test_manifest_accepts_exact_four_role_schema(self) -> None:

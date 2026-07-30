@@ -947,6 +947,43 @@ test_home_seed_refuses_projectless_home_with_symlinked_projects() {
   pass "home seeding refuses project-less homes with symlinked projects directories"
 }
 
+test_home_seed_honours_no_projects_before_reading_the_projects_tree() {
+  local home sub err
+  home="$TMP_ROOT/no-projects-precedes-preflight-home"
+  sub="$TMP_ROOT/no-projects-precedes-preflight-subhome"
+  err="$TMP_ROOT/no-projects-precedes-preflight.err"
+  mkdir -p "$home/data" "$home/state" "$sub/data" "$sub/projects/hidden-clone"
+  mark_firstmate_home "$sub"
+  fm_git_init_commit "$sub/projects/hidden-clone"
+
+  # The destination is deliberately NOT a Git repository, so the refresher
+  # preflight - which reads the destination tree, projects/ included - cannot
+  # succeed for it. --no-projects preconditions must still be honoured first and
+  # must report the specific project-data refusal, not the generic
+  # "cannot be refreshed safely". This pins the precondition ordering: a caller
+  # who passed --no-projects is never gated on a read of the tree they just said
+  # is irrelevant.
+  if FM_HOME="$home" FM_SECONDMATE_CHARTER='firstmate self-development' \
+    FM_SECONDMATE_SCOPE='firstmate repo work' \
+    "$ROOT/bin/fm-home-seed.sh" fdev "$sub" --no-projects >/dev/null 2>"$err"; then
+    fail "project-less seed accepted a home that already contains project data"
+  fi
+  grep -F 'because it contains project data' "$err" >/dev/null \
+    || fail "project-less precondition did not run before the destination tree was read"
+  grep -F 'projects/ entries: hidden-clone' "$err" >/dev/null \
+    || fail "project-less precondition did not name the existing clone"
+  grep -F 'cannot be refreshed safely' "$err" >/dev/null \
+    && fail "project-less precondition was gated on the refresher preflight"
+  assert_present "$sub/projects/hidden-clone/.git" "project-less precondition refusal removed the existing clone"
+  assert_absent "$sub/.fm-secondmate-home" "project-less precondition refusal wrote a home marker"
+  assert_absent "$sub/data/charter.md" "project-less precondition refusal copied a charter"
+  assert_absent "$sub/state" "project-less precondition refusal left an operational directory"
+  if [ -f "$home/data/secondmates.md" ] && grep -F -- '- fdev ' "$home/data/secondmates.md" >/dev/null; then
+    fail "project-less precondition refusal wrote a parent registry route"
+  fi
+  pass "home seeding honours --no-projects before reading the destination projects tree"
+}
+
 test_home_seed_refuses_projectless_home_with_non_directory_projects() {
   local home sub err projects_before
   home="$TMP_ROOT/no-projects-nondirectory-projects-home"
@@ -2601,6 +2638,7 @@ test_home_seed_refuses_projectful_reused_charter_for_projectless_home
 test_home_seed_refuses_projectless_conversion_of_populated_home
 test_home_seed_refuses_projectless_home_with_uninspectable_projects
 test_home_seed_refuses_projectless_home_with_symlinked_projects
+test_home_seed_honours_no_projects_before_reading_the_projects_tree
 test_home_seed_refuses_projectless_home_with_non_directory_projects
 test_home_seed_refuses_projectless_home_with_uninspectable_registry
 test_home_seed_refuses_missing_projects_without_signal

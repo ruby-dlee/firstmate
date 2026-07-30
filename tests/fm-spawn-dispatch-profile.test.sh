@@ -12,6 +12,7 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+REAL_GIT_FOR_TEST=$(command -v git)
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -51,6 +52,30 @@ fi
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
+  # A seeded secondmate home's freshness proof resolves the LIVE upstream default tip
+  # of FM_ROOT (fm-spawn.sh -> fm-checkout-refresh.sh verify-home -> probe_upstream's
+  # `git ls-remote --symref origin HEAD`). Unstubbed, that escapes the fixture to the
+  # real remote, so the home - cloned from this checkout - reads as stale on any branch
+  # whose HEAD is ahead of origin/main. That made the case fail for the checkout's
+  # position rather than for anything it asserts; verified by reproducing it on
+  # unmodified main plus a single empty commit. Answer the probe from this checkout's
+  # own default branch so the fixture is hermetic, and pass every other git call
+  # through untouched.
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+real=${REAL_GIT_FOR_TEST:?}
+case " $* " in
+  *" ls-remote --symref origin HEAD "*)
+    source=${FM_FAKE_UPSTREAM_SOURCE:?}
+    branch=$("$real" -C "$source" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'main')
+    tip=$("$real" -C "$source" rev-parse "refs/heads/$branch" 2>/dev/null) || exit 1
+    printf 'ref: refs/heads/%s\tHEAD\n%s\tHEAD\n' "$branch" "$tip"
+    exit 0
+    ;;
+esac
+exec "$real" "$@"
+SH
+  chmod +x "$fakebin/git"
   printf '%s\n' "$fakebin"
 }
 
@@ -104,6 +129,7 @@ run_spawn() {
     FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    REAL_GIT_FOR_TEST="$REAL_GIT_FOR_TEST" FM_FAKE_UPSTREAM_SOURCE="$ROOT" \
     FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1

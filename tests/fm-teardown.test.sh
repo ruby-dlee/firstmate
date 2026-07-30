@@ -2636,7 +2636,7 @@ setup_forced_secondmate_child_case() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$FORCED_CHILD_CASE_DIR/wt" \
-    "project=$FORCED_CHILD_CASE_DIR/project" \
+    "project=$FORCED_CHILD_CASE_DIR/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$FORCED_CHILD_CASE_DIR/wt"

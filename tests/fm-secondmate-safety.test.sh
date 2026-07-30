@@ -2445,25 +2445,17 @@ EOF
 
 test_secondmate_force_teardown_refuses_child_active_home_descendant() {
   local home subhome childproj childwt fakebin err log
-  home="$TMP_ROOT/child-active-descendant-home"
-  subhome="$TMP_ROOT/child-active-descendant-subhome"
-  childproj="$subhome/projects/alpha"
-  childwt="$home/data"
   err="$TMP_ROOT/child-active-descendant.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$childproj"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  # The retiring home needs its real shape, or home validation refuses it as "not an
+  # exact repository root" long before the child worktree this case is about is ever
+  # inspected.
+  make_secondmate_home_and_source child-active-descendant domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  childproj="$subhome/projects/alpha"
+  # The point of the case: the child's worktree sits inside the ACTIVE firstmate home.
+  childwt="$home/data"
   cat > "$subhome/state/child.meta" <<EOF
 window=firstmate:fm-child
 worktree=$childwt
@@ -2475,7 +2467,8 @@ yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/child-active-descendant-fake")
   log="$TMP_ROOT/child-active-descendant-fake/tmux.log"
-  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-active-descendant-fake/pane.txt" \
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-active-descendant-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
     fail "force teardown removed a child worktree inside active FM_HOME"
   fi

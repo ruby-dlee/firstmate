@@ -1216,7 +1216,7 @@ SH
 }
 
 test_content_in_default_fallback_allows() {
-  local case_dir rc common key expected_lock lock_marker
+  local case_dir rc expected_lock lock_marker
   case_dir=$(make_case content-landed)
   write_meta "$case_dir" no-mistakes ship
   # No pr= recorded and the default gh-axi mock reports no PR, so the merged-PR path
@@ -1224,11 +1224,10 @@ test_content_in_default_fallback_allows() {
   # the same net change has independently landed on origin/main via a squash commit.
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   land_on_origin_main "$case_dir" feature.txt hello
-  common=$(git -C "$case_dir/wt" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$case_dir/wt/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
-  expected_lock="$case_dir/checkout-locks/$key.lock"
+  # Name the lock through the product's own deriver, like the other lock cases: it
+  # lowercases the common-dir path before hashing, so any hand-rolled shasum of the
+  # raw path names a file that never exists under a mixed-case mktemp directory.
+  expected_lock=$(checkout_lock_path "$case_dir/wt" "$case_dir/checkout-locks")
   lock_marker="$case_dir/checkout-return-held-lock"
 
   set +e

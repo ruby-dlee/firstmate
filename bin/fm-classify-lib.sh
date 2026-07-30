@@ -320,8 +320,8 @@ signal_reason_is_actionable() {  # <file> ...
 #             (e.g. waiting on CI);
 #   paused  - the crewmate's authoritative current state is a declared external-wait
 #             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
-#             torn-down/unknown crewmate, or an unreadable verdict).
+#   none    - neither, so the wake must surface (a wedged/stopped/finished/parked/
+#             failed/torn-down/unknown crewmate, or an unreadable verdict).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crewmate
 # that appended paused: but then STARTED a run reports working, never paused.
@@ -329,10 +329,14 @@ signal_reason_is_actionable() {  # <file> ...
 # PR-state calls, so callers run it only on no-verb signal and first-sighting
 # stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
-crew_absorb_class() {  # <id>
-  local id=$1 line state src
-  [ -n "$id" ] || { printf 'none'; return; }
-  line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
+crew_state_line() {  # <id>
+  local id=$1
+  [ -n "$id" ] || return 1
+  "$FM_CREW_STATE_BIN" "$id" 2>/dev/null || true
+}
+
+crew_absorb_class_from_line() {  # <fm-crew-state-line>
+  local line=$1 state src
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
   if [ "$state" = paused ]; then printf 'paused'; return; fi
@@ -341,6 +345,30 @@ crew_absorb_class() {  # <id>
     case "$src" in run-step|pane) printf 'working'; return ;; esac
   fi
   printf 'none'
+}
+
+crew_absorb_class() {  # <id>
+  local id=$1 line
+  [ -n "$id" ] || { printf 'none'; return; }
+  line=$(crew_state_line "$id")
+  crew_absorb_class_from_line "$line"
+}
+
+# Print the detail from a wedged fm-crew-state verdict, including its run id and
+# concrete liveness reason. Empty for every non-wedged or unreadable state.
+crew_wedge_detail_from_line() {  # <fm-crew-state-line>
+  local line=$1
+  case "$line" in "state: wedged "*"source: run-step"*) ;; *) return 0 ;; esac
+  case "$line" in
+    *" · source: run-step · "*) printf '%s' "${line#*" · source: run-step · "}" ;;
+    *) printf '%s' "$line" ;;
+  esac
+}
+
+crew_wedge_detail() {  # <id>
+  local line
+  line=$(crew_state_line "$1")
+  crew_wedge_detail_from_line "$line"
 }
 
 # 0 if crewmate <id> shows POSITIVE evidence it is still working (crew_absorb_class
@@ -382,6 +410,30 @@ signal_crew_provably_working() {  # <file> ...
   done
   [ -n "$seen" ] || return 1
   return 0
+}
+
+# Print one "task: <run-and-reason>" clause for every wedged task referenced by
+# a signal file list. The watcher calls this only on an already-actionable path,
+# so the second bounded state read adds detail to a wake rather than slowing
+# routine absorbed signals.
+signal_crew_wedge_details() {  # <file> ...
+  local f base task seen="" detail out=""
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    detail=$(crew_wedge_detail "$task")
+    [ -n "$detail" ] || continue
+    [ -z "$out" ] || out="$out; "
+    out="$out$task: $detail"
+  done
+  printf '%s' "$out"
 }
 
 # 0 (terminal/actionable) if a stale window's last status line is

@@ -26,6 +26,10 @@
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
+#   (l) active run health: dead/missing PID + stale activity      -> wedged
+#       while a live PID remains working regardless of activity age.
+#   (m) an unobserved stale approval gate                         -> wedged
+#       while an acknowledged but unanswered gate remains parked.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -106,6 +110,13 @@ pull_request:
   state: ${FM_FAKE_PR_STATE:-merged}
 EOF
 SH
+  cat > "$fb/sqlite3" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"FROM step_results"*) printf '%s\n' "${FM_FAKE_NM_STEP_ROW:-}" ;;
+esac
+SH
   cat > "$fb/herdr" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -150,7 +161,7 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/herdr"
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/herdr" "$fb/sqlite3"
   printf '%s\n' "$fb"
 }
 
@@ -168,7 +179,7 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 # Run the helper for one case dir. FM_FAKE_* env (run output, busy flag) are read
 # from the caller's environment by the fakes above.
 run_crew_state() {  # <case-dir> <id>
-  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
+  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" NM_HOME="$1/nm-home" \
     FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_READSTEER_REACHABLE=1 \
@@ -177,7 +188,8 @@ run_crew_state() {  # <case-dir> <id>
 
 new_case() {  # <name> -> echoes case dir with an empty state/
   local d="$TMP_ROOT/$1"
-  mkdir -p "$d/state"
+  mkdir -p "$d/state" "$d/nm-home"
+  : > "$d/nm-home/state.sqlite"
   printf '%s\n' "$d"
 }
 
@@ -196,9 +208,11 @@ reset_fakes() {
   FM_FAKE_CI_LOGS=""
   FM_FAKE_PR_STATE=merged
   FM_FAKE_GH_AXI_FAIL=0
+  FM_FAKE_NM_STEP_ROW=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_GH_AXI_FAIL
+  export FM_FAKE_NM_STEP_ROW
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -682,6 +696,109 @@ test_top_level_fixing_done_log_stays_working() {
   assert_contains "$out" "validating (fixing)" "top-level fixing keeps fixing detail"
   assert_not_contains "$out" "state: done" "top-level fixing must not read as stale checks-green done"
   pass "top-level fixing is not overridden by a stale done log"
+}
+
+# (l) The coarse AXI status says only "fixing" or "running".
+# Firstmate corroborates that state against no-mistakes' recorded PID and
+# activity timestamp before it calls the run absorbably healthy.
+test_dead_agent_while_fixing_surfaces_wedged() {
+  reset_fakes
+  local d old out
+  d=$(new_case dead-fix-agent)
+  make_repo_on_branch "$d/wt" fm/dead-fix-agent
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/dead-fix-agent.meta" "window=fm:fm-dead-fix-agent" "worktree=$d/wt" "kind=ship"
+  printf 'working: no-mistakes validating\n' > "$d/state/dead-fix-agent.status"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/dead-fix-agent)"
+  old=$(( $(date +%s) - 600 ))
+  FM_FAKE_NM_STEP_ROW="review|fixing|$old|"
+  out=$(run_crew_state "$d" dead-fix-agent)
+  assert_contains "$out" "state: wedged" "dead fixing agent -> wedged"
+  assert_contains "$out" "source: run-step" "dead fixing agent keeps run-step authority"
+  assert_contains "$out" "run 01RUN step review fixing is wedged" "wedge names the run and step"
+  assert_contains "$out" "agent pid is absent" "wedge names the missing PID reason"
+  assert_contains "$out" "threshold 300s" "wedge reports the bounded threshold"
+  assert_not_contains "$out" "state: working" "dead fixing agent must not remain absorbably working"
+  pass "a fixing step with an absent agent PID and stale activity reports wedged"
+}
+
+test_dead_recorded_pid_while_running_surfaces_wedged() {
+  reset_fakes
+  local d old out
+  d=$(new_case dead-running-pid)
+  make_repo_on_branch "$d/wt" fm/dead-running-pid
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/dead-running-pid.meta" "window=fm:fm-dead-running-pid" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running fm/dead-running-pid)"
+  old=$(( $(date +%s) - 600 ))
+  FM_FAKE_NM_STEP_ROW="review|running|$old|999999"
+  out=$(run_crew_state "$d" dead-running-pid)
+  assert_contains "$out" "state: wedged" "dead recorded PID -> wedged"
+  assert_contains "$out" "recorded pid 999999 is not alive" "dead PID reason is explicit"
+  assert_contains "$out" "run 01RUN" "dead PID wedge names its run"
+  pass "a running step with a dead recorded PID and stale activity reports wedged"
+}
+
+test_long_quiet_step_with_live_pid_stays_working() {
+  reset_fakes
+  local d old out
+  d=$(new_case long-quiet-live)
+  make_repo_on_branch "$d/wt" fm/long-quiet-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/long-quiet-live.meta" "window=fm:fm-long-quiet-live" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running fm/long-quiet-live)"
+  # Simulate a 40-minute test suite whose launch timestamp never advances.
+  # The current test shell is the live recorded process, so liveness must
+  # outrank the deliberately ancient last_activity_at value.
+  old=$(( $(date +%s) - 2400 ))
+  FM_FAKE_NM_STEP_ROW="test|running|$old|$$"
+  out=$(run_crew_state "$d" long-quiet-live)
+  assert_contains "$out" "state: working" "live long-running process remains working"
+  assert_contains "$out" "validating (running)" "live quiet step keeps the normal run detail"
+  assert_not_contains "$out" "wedged" "staleness alone must not call a live process wedged"
+  pass "a 40-minute quiet step with a live PID remains working"
+}
+
+# (m) A stale gate with no delivery acknowledgement needs a re-drive.
+# A needs-decision/blocked status proves the crewmate received the gate, so that
+# sibling case remains parked and needs a steer or answer instead.
+test_gate_without_client_acknowledgement_surfaces_distinctly() {
+  reset_fakes
+  local d old out
+  d=$(new_case gate-no-client)
+  make_repo_on_branch "$d/wt" fm/gate-no-client
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/gate-no-client.meta" "window=fm:fm-gate-no-client" "worktree=$d/wt" "kind=ship"
+  printf 'working: no-mistakes validating\n' > "$d/state/gate-no-client.status"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/gate-no-client)"
+  old=$(( $(date +%s) - 600 ))
+  FM_FAKE_NM_STEP_ROW="review|awaiting_approval|$old|"
+  out=$(run_crew_state "$d" gate-no-client)
+  assert_contains "$out" "state: wedged" "unobserved stale gate -> wedged"
+  assert_contains "$out" "run 01RUN gate review is unobserved" "unobserved gate names run and gate"
+  assert_contains "$out" "no attached no-mistakes client" "unobserved gate names the missing-client reason"
+  assert_contains "$out" "re-drive the run" "unobserved gate gives the re-drive remedy"
+  assert_not_contains "$out" "crewmate response pending" "unobserved gate is not mislabeled unanswered"
+  pass "a stale gate with no client acknowledgement surfaces as an unobserved wedge"
+}
+
+test_acknowledged_unanswered_gate_remains_parked() {
+  reset_fakes
+  local d old out
+  d=$(new_case gate-unanswered)
+  make_repo_on_branch "$d/wt" fm/gate-unanswered
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/gate-unanswered.meta" "window=fm:fm-gate-unanswered" "worktree=$d/wt" "kind=ship"
+  printf 'needs-decision: review gate requires an answer\n' > "$d/state/gate-unanswered.status"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/gate-unanswered)"
+  old=$(( $(date +%s) - 600 ))
+  FM_FAKE_NM_STEP_ROW="review|awaiting_approval|$old|"
+  out=$(run_crew_state "$d" gate-unanswered)
+  assert_contains "$out" "state: parked" "acknowledged unanswered gate remains parked"
+  assert_contains "$out" "crewmate response pending" "unanswered gate names the steer/answer remedy"
+  assert_not_contains "$out" "state: wedged" "acknowledged gate is not a missing-client wedge"
+  assert_not_contains "$out" "re-drive the run" "acknowledged gate does not prescribe re-drive"
+  pass "an acknowledged but unanswered gate remains distinctly parked"
 }
 
 # (d) terminal run-step is authoritative, but a passed outcome does not prove
@@ -1264,6 +1381,11 @@ test_ci_ready_done_log_relapse_stays_working
 test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
+test_dead_agent_while_fixing_surfaces_wedged
+test_dead_recorded_pid_while_running_surfaces_wedged
+test_long_quiet_step_with_live_pid_stays_working
+test_gate_without_client_acknowledgement_surfaces_distinctly
+test_acknowledged_unanswered_gate_remains_parked
 test_terminal_passed_verifies_merged_pr
 test_terminal_passed_does_not_claim_open_pr_merged
 test_terminal_passed_reports_closed_without_merge

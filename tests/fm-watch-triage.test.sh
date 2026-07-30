@@ -201,6 +201,10 @@ test_crew_is_provably_working_classifier() {
   crew_is_provably_working a || fail "busy pane not treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   ! crew_is_provably_working a || fail "stale status-log working: treated as provably working"
+  FM_FAKE_CREW_STATE='state: wedged · source: run-step · run 01DEAD step review fixing is wedged: recorded agent pid is absent'
+  ! crew_is_provably_working a || fail "wedged run-step treated as provably working"
+  [ "$(crew_wedge_detail a)" = 'run 01DEAD step review fixing is wedged: recorded agent pid is absent' ] \
+    || fail "wedged run-step detail was not preserved for the actionable wake"
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green'
   ! crew_is_provably_working a || fail "finished run treated as provably working"
   FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review'
@@ -338,6 +342,10 @@ test_crew_absorb_class_classifier() {
   ! crew_is_provably_working a || fail "a paused crew was treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   [ "$(crew_absorb_class a)" = none ] || fail "stale working: status-log classed absorbable"
+  FM_FAKE_CREW_STATE='state: wedged · source: run-step · run 01DEAD step review fixing is wedged: recorded agent pid is absent'
+  [ "$(crew_absorb_class a)" = none ] || fail "wedged run-step classed absorbable"
+  [ "$(crew_wedge_detail a)" = 'run 01DEAD step review fixing is wedged: recorded agent pid is absent' ] \
+    || fail "wedged run-step detail was not preserved"
   FM_FAKE_CREW_STATE='state: unknown · source: none · worktree gone'
   [ "$(crew_absorb_class a)" = none ] || fail "unknown crew classed absorbable"
   ! crew_is_paused a || fail "unknown crew classed paused"
@@ -929,6 +937,43 @@ test_nonterminal_stale_not_working_surfaced() {
   pass "a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)"
 }
 
+# An authoritative wedged verdict follows the same immediate non-absorb path,
+# but its wake must retain the run id and process-health reason so firstmate can
+# act without first mistaking it for an ordinary stopped pane.
+test_wedged_run_stale_surfaces_with_actionable_detail() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case wedged-run-stale); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-wedged"
+  printf 'idle after validation client exited' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged.meta"
+  printf 'working: no-mistakes validating\n' > "$state/wedged.status"
+  sig=$(seen_sig "$state/wedged.status"); printf '%s' "$sig" > "$state/.seen-wedged_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle after validation client exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: wedged · source: run-step · run 01DEAD step review fixing is wedged: recorded agent pid is absent and last activity is stale 600s (threshold 300s)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher absorbed an authoritative wedged run-step"
+  grep -F "stale: $window" "$out" >/dev/null || fail "wedged run did not emit a stale wake"
+  grep -F "run 01DEAD step review fixing is wedged" "$out" >/dev/null \
+    || fail "wedged wake omitted the run id and step"
+  grep -F "recorded agent pid is absent" "$out" >/dev/null \
+    || fail "wedged wake omitted the liveness reason"
+  grep -F "threshold 300s" "$out" >/dev/null \
+    || fail "wedged wake omitted the health threshold"
+  [ ! -e "$state/.stale-since-$key" ] || fail "explicit wedge incorrectly entered the generic possible-wedge timer"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after explicit wedge failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "run 01DEAD" >/dev/null \
+    || fail "explicit wedge detail was not queued durably"
+  pass "an authoritative wedged run surfaces immediately with run id, reason, and threshold"
+}
+
 # --- non-terminal stale, crewmate DECLARED a pause: absorbed, re-surfaced on a
 #     long cadence, never wedge-escalated -------------------------------------
 # The live 2026-07-09/10 case: a crewmate intentionally held awaiting an upstream tool
@@ -1315,9 +1360,10 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
-  fi
+  wait_numeric_file "$state/.stale-since-$key" 300 \
+    || { reap "$pid"; fail "watcher did not finish the priming absorb round: $(cat "$out")"; }
+  kill -0 "$pid" 2>/dev/null \
+    || { reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"; }
   reap "$pid"
 
   n=1
@@ -1763,6 +1809,7 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
+test_wedged_run_stale_surfaces_with_actionable_detail
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_failure_pause_stale_surfaced_not_absorbed
 test_herdr_blocked_transition_enters_pause_absorb_path

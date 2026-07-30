@@ -23,7 +23,10 @@
 #                          re-surface cadence, never as a wedge. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
+#                          both surfaced at once. A run-step verdict that is already
+#                          explicitly wedged surfaces at once with its run id and
+#                          liveness reason instead of entering the generic timer.
+#                          A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
@@ -431,13 +434,15 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
-surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key
+surface_nonterminal_stale() {  # <window> <hash> [wedge-detail]
+  local win=$1 h=$2 detail=${3:-} key reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  fm_wake_append stale "$win" "stale: $win" || exit 1
+  reason="stale: $win"
+  [ -n "$detail" ] && reason="$reason ($detail)"
+  fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
-  wake "stale: $win"
+  wake "$reason"
 }
 
 # Recognize the stable confirmation chrome rendered by verified harnesses when a
@@ -1006,8 +1011,22 @@ EOF
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    signal_actionable=0
+    wedge_detail=""
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if afk_present || signal_reason_is_actionable $files; then
+      signal_actionable=1
+    elif ! signal_crew_provably_working $files; then
+      signal_actionable=1
+      # The generic file list remains the durable signal identity, while an
+      # explicit run-step wedge adds the run id and concrete process/gate reason
+      # firstmate needs to choose recovery instead of treating it as a routine
+      # stopped turn. This second state read runs only after the first read made
+      # a no-verb signal actionable, never on ordinary captain-relevant wakes.
+      wedge_detail=$(signal_crew_wedge_details $files)
+      [ -n "$wedge_detail" ] && reason="$reason (wedged: $wedge_detail)"
+    fi
+    if [ "$signal_actionable" = 1 ]; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -1137,16 +1156,21 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            task=$(window_to_task "$w" "$STATE")
+            crew_line=$(crew_state_line "$task")
+            if [ "$(crew_absorb_class_from_line "$crew_line")" = working ]; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
             else
-              fm_wake_append stale "$w" "stale: $w" || exit 1
+              wedge_detail=$(crew_wedge_detail_from_line "$crew_line")
+              reason="stale: $w"
+              [ -n "$wedge_detail" ] && reason="$reason ($wedge_detail)"
+              fm_wake_append stale "$w" "$reason" || exit 1
               printf '%s' "$h" > "$sf"
               rm -f "$ssf"
-              mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
-              wake "stale: $w"
+              mark_surfaced "$STATE/$task.status"
+              wake "$reason"
             fi
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a
@@ -1175,7 +1199,8 @@ EOF
           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(crew_absorb_class "$task")" in
+            crew_line=$(crew_state_line "$task")
+            case "$(crew_absorb_class_from_line "$crew_line")" in
               working)
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
@@ -1186,7 +1211,7 @@ EOF
                 handle_paused_stale "$w" "$task" "$h"
                 ;;
               *)
-                surface_nonterminal_stale "$w" "$h"
+                surface_nonterminal_stale "$w" "$h" "$(crew_wedge_detail_from_line "$crew_line")"
                 ;;
             esac
           else
@@ -1198,7 +1223,7 @@ EOF
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
-                *)       surface_nonterminal_stale "$w" "$h" ;;
+                *)       surface_nonterminal_stale "$w" "$h" "$(crew_wedge_detail "$task")" ;;
               esac
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"

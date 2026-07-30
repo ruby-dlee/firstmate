@@ -102,6 +102,21 @@ test_classify_routine_signal_self() {
   case "$out" in self\|*) pass "routine signal self-handles" ;; *) fail "routine signal did not self-handle: $out" ;; esac
 }
 
+test_classify_wedged_signal_escalates_with_detail() {
+  local dir state fake out
+  dir=$(make_supercase classify-wedged-signal)
+  state="$dir/state"
+  fake=$(make_fake_crew_state "$dir/fakebin")
+  printf 'working: no-mistakes validating\n' > "$state/foo-w1.status"
+  out=$(FM_CREW_STATE_BIN="$fake" \
+    FM_FAKE_CREW_STATE='state: wedged · source: run-step · run 01DEAD step review fixing is wedged: recorded agent pid is absent' \
+    classify_signal "$state/foo-w1.status" "$state")
+  case "$out" in escalate\|*) ;; *) fail "wedged routine signal did not escalate: $out" ;; esac
+  assert_contains "$out" "run 01DEAD" "wedged signal escalation omitted its run id"
+  assert_contains "$out" "agent pid is absent" "wedged signal escalation omitted its reason"
+  pass "away-mode classifier escalates a wedged signal with actionable detail"
+}
+
 test_classify_terminal_signal_escalates() {
   local dir state kw out
   dir=$(make_supercase classify-terminal)
@@ -138,6 +153,21 @@ test_stale_transient_self_records_marker() {
   key=$(printf '%s' "$(window_to_task "sess:fm-qux-w4")" | tr ':/.' '___')
   [ -e "$state/.subsuper-stale-$key" ] || fail "stale marker was not recorded"
   pass "transient stale self-handles and records a persistence marker"
+}
+
+test_stale_wedged_escalates_with_detail() {
+  local dir state fake out
+  dir=$(make_supercase stale-wedged)
+  state="$dir/state"
+  fake=$(make_fake_crew_state "$dir/fakebin")
+  printf 'working: no-mistakes validating\n' > "$state/qux-w5.status"
+  out=$(FM_CREW_STATE_BIN="$fake" \
+    FM_FAKE_CREW_STATE='state: wedged · source: run-step · run 01DEAD step review fixing is wedged: recorded pid 999999 is not alive' \
+    classify_stale "sess:fm-qux-w5" "$state")
+  case "$out" in escalate\|*) ;; *) fail "wedged stale did not escalate: $out" ;; esac
+  assert_contains "$out" "run 01DEAD" "wedged stale escalation omitted its run id"
+  assert_contains "$out" "pid 999999 is not alive" "wedged stale escalation omitted its reason"
+  pass "away-mode classifier escalates a wedged stale immediately with actionable detail"
 }
 
 test_stale_terminal_escalates() {
@@ -1680,9 +1710,11 @@ test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
+test_classify_wedged_signal_escalates_with_detail
 test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
+test_stale_wedged_escalates_with_detail
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker

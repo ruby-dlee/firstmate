@@ -15,15 +15,16 @@
 # and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|wedged|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crewmate's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
-#      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
-#      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. A passed
+#      The run-step is AUTHORITATIVE: a live running/fixing process -> working,
+#      a missing/dead process after the bounded health grace -> wedged, ci ->
+#      working, awaiting_approval/fix_review -> parked (with gate findings),
+#      terminal passed/checks-passed -> done, failed/cancelled -> failed. A passed
 #      outcome's PR detail is cross-checked against GitHub through gh-axi rather
 #      than inferred from the pipeline outcome. EXCEPT: while the active step is
 #      ci, `axi status` alone cannot tell "still waiting on checks" from "checks
@@ -76,6 +77,19 @@ esac
 # history every call.
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
 case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;; esac
+# A missing or dead active-step process is allowed this grace before it is called
+# wedged. The delay covers the short database handoff between command launch and
+# PID recording without turning a five-hour dead fixer into "working".
+# Staleness is corroboration only: a live recorded PID always wins, regardless of
+# how old last_activity_at is, because shell steps record launch rather than
+# continuous progress.
+NM_WEDGE_STALE_SECS=${FM_CREW_STATE_NM_WEDGE_STALE_SECS:-300}
+case "$NM_WEDGE_STALE_SECS" in ''|*[!0-9]*|0) NM_WEDGE_STALE_SECS=300 ;; esac
+NM_DB_TIMEOUT=${FM_CREW_STATE_NM_DB_TIMEOUT:-3}
+case "$NM_DB_TIMEOUT" in ''|*[!0-9]*|0) NM_DB_TIMEOUT=3 ;; esac
+NM_ROOT=${NM_HOME:-"$HOME/.no-mistakes"}
+NM_DB=${FM_CREW_STATE_NM_DB:-"$NM_ROOT/state.sqlite"}
+NM_SOCKET="$NM_ROOT/socket"
 SEP=' · '
 
 # Emit the one canonical line and exit 0. Detail is optional.
@@ -220,6 +234,151 @@ nm_run() {  # <args...>
     perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
     *)        true ;;
   esac
+}
+
+# Bounded, read-only query of no-mistakes' own recorded process health.
+# The public AXI status surface deliberately stays compact and does not expose
+# step_results.agent_pid or last_activity_at, so firstmate reads those two
+# existing fields from the same local database instead of inventing shadow
+# liveness state.
+nm_db_query() {  # <sql>
+  local sql=$1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  [ -f "$NM_DB" ] || return 1
+  case "$HAVE_TIMEOUT" in
+    timeout)
+      timeout "$NM_DB_TIMEOUT" sqlite3 -readonly -separator '|' "$NM_DB" "$sql" 2>/dev/null
+      ;;
+    gtimeout)
+      gtimeout "$NM_DB_TIMEOUT" sqlite3 -readonly -separator '|' "$NM_DB" "$sql" 2>/dev/null
+      ;;
+    perl)
+      perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+        "$NM_DB_TIMEOUT" sqlite3 -readonly -separator '|' "$NM_DB" "$sql" 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+nm_valid_run_id() {  # <run-id>
+  case "$1" in
+    ''|*[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Print the active step's process-health row:
+#   <step>|<status>|<last_activity_at-or-started_at>|<agent_pid>
+nm_active_step_health() {  # <run-id>
+  local run_id=$1
+  nm_valid_run_id "$run_id" || return 1
+  nm_db_query "SELECT step_name, status, COALESCE(last_activity_at, started_at, ''), COALESCE(agent_pid, '') FROM step_results WHERE run_id = '$run_id' AND status IN ('running', 'fixing', 'awaiting_approval', 'fix_review') ORDER BY step_order LIMIT 1;"
+}
+
+nm_pid_is_alive() {  # <pid>
+  local pid=$1 stat
+  case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  stat=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')
+  case "$stat" in Z*|'') return 1 ;; esac
+  return 0
+}
+
+# Print a concrete wedge reason and return 0 only when the current running/fixing
+# step has both forms of evidence: no live recorded process and an activity age
+# beyond NM_WEDGE_STALE_SECS. A live PID always returns 1 even after hours of
+# quiet, preserving legitimate long ShellCheck and test commands.
+nm_running_step_wedge_reason() {  # <run-id>
+  local run_id=$1 row step rest status activity pid now age
+  row=$(nm_active_step_health "$run_id" 2>/dev/null || true)
+  [ -n "$row" ] || return 1
+  step=${row%%|*}
+  rest=${row#*|}
+  status=${rest%%|*}
+  rest=${rest#*|}
+  activity=${rest%%|*}
+  pid=${rest#*|}
+  case "$status" in running|fixing) ;; *) return 1 ;; esac
+
+  # The CI monitor is daemon-owned and intentionally has no child PID while it
+  # polls GitHub. Its own log markers already distinguish progress and readiness.
+  [ "$step" = ci ] && [ "$status" = running ] && return 1
+  nm_pid_is_alive "$pid" && return 1
+  case "$activity" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s)
+  age=$(( now - activity ))
+  [ "$age" -ge 0 ] || age=0
+  [ "$age" -ge "$NM_WEDGE_STALE_SECS" ] || return 1
+  if [ -n "$pid" ]; then
+    printf 'run %s step %s %s is wedged: recorded pid %s is not alive and last activity is stale %ss (threshold %ss)' \
+      "$run_id" "$step" "$status" "$pid" "$age" "$NM_WEDGE_STALE_SECS"
+  else
+    printf 'run %s step %s %s is wedged: recorded agent pid is absent and last activity is stale %ss (threshold %ss)' \
+      "$run_id" "$step" "$status" "$age" "$NM_WEDGE_STALE_SECS"
+  fi
+  return 0
+}
+
+# Resolve a process working directory without depending on one platform.
+nm_process_cwd() {  # <pid>
+  local pid=$1 cwd
+  if [ -L "/proc/$pid/cwd" ]; then
+    cwd=$(cd -P "/proc/$pid/cwd" 2>/dev/null && pwd -P) || return 1
+    printf '%s' "$cwd"
+    return 0
+  fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+# 0 only when a non-daemon no-mistakes client process for this exact worktree
+# still owns the daemon socket. An attached client gets time to deliver a fresh
+# gate before the missing-client classifier can call it unobserved.
+nm_client_is_attached() {
+  local pid cmd cwd wt_physical pids
+  wt_physical=$(cd -P "$WT" 2>/dev/null && pwd -P) || return 1
+  if command -v pgrep >/dev/null 2>&1; then
+    pids=$(pgrep -x no-mistakes 2>/dev/null || true)
+  else
+    pids=$(ps -axo pid=,comm= 2>/dev/null | awk '$2 == "no-mistakes" { print $1 }')
+  fi
+  for pid in $pids; do
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case " $cmd " in *" daemon "*) continue ;; esac
+    cwd=$(nm_process_cwd "$pid" 2>/dev/null || true)
+    [ "$cwd" = "$wt_physical" ] || continue
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -a -p "$pid" -U 2>/dev/null | grep -F "$NM_SOCKET" >/dev/null && return 0
+    else
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Print an actionable reason when a gate has remained unacknowledged in the
+# crewmate status stream beyond the same bounded grace and no client remains
+# attached to deliver it. A needs-decision/blocked status means the crewmate did
+# receive the gate and simply has not answered, which remains ordinary parked
+# state with a different remedy.
+nm_unobserved_gate_reason() {  # <run-id> <gate-name>
+  local run_id=$1 gate=$2 row rest status activity now age
+  case "$LOG_VERB" in needs-decision|blocked) return 1 ;; esac
+  nm_client_is_attached && return 1
+  row=$(nm_active_step_health "$run_id" 2>/dev/null || true)
+  [ -n "$row" ] || return 1
+  rest=${row#*|}
+  status=${rest%%|*}
+  rest=${rest#*|}
+  activity=${rest%%|*}
+  case "$status" in awaiting_approval|fix_review) ;; *) return 1 ;; esac
+  case "$activity" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s)
+  age=$(( now - activity ))
+  [ "$age" -ge 0 ] || age=0
+  [ "$age" -ge "$NM_WEDGE_STALE_SECS" ] || return 1
+  printf 'run %s gate %s is unobserved: no attached no-mistakes client for %ss (threshold %ss); re-drive the run instead of steering for a gate answer' \
+    "$run_id" "$gate" "$age" "$NM_WEDGE_STALE_SECS"
 }
 
 # Bounded, read-only GitHub query in the worktree; stdout only, never fails the
@@ -495,6 +654,7 @@ if [ "$HAVE_RUN" = 1 ]; then
   else
     status=$(strip_quotes "$(nm_field status)")
     RUN_STATUS=$status
+    run_id=$(strip_quotes "$(nm_field id)")
     outcome=$(strip_quotes "$(nm_field outcome)")
     awaiting=$(printf '%s\n' "$RUN_OUT" | grep -E '^[[:space:]]*awaiting_agent:' | head -1 || true)
     gate_status=$(nm_gate_status)
@@ -528,12 +688,17 @@ if [ "$HAVE_RUN" = 1 ]; then
       fi
       [ -n "$gate" ] || gate=$status
       [ -n "$gate" ] || gate=gate
-      RUN_STATE=parked
-      RUN_DETAIL="parked at $gate"
-      fcount=$(nm_gate_findings_count)
-      [ -n "$fcount" ] && RUN_DETAIL="$RUN_DETAIL: $fcount finding(s)"
-      if printf '%s\n' "$RUN_OUT" | grep -q 'ask-user'; then
-        RUN_DETAIL="$RUN_DETAIL (ask-user: captain decision)"
+      if gate_wedge=$(nm_unobserved_gate_reason "$run_id" "$gate"); then
+        RUN_STATE=wedged
+        RUN_DETAIL=$gate_wedge
+      else
+        RUN_STATE=parked
+        RUN_DETAIL="parked at $gate: crewmate response pending"
+        fcount=$(nm_gate_findings_count)
+        [ -n "$fcount" ] && RUN_DETAIL="$RUN_DETAIL: $fcount finding(s)"
+        if printf '%s\n' "$RUN_OUT" | grep -q 'ask-user'; then
+          RUN_DETAIL="$RUN_DETAIL (ask-user: captain decision)"
+        fi
       fi
     else
       case "$status" in
@@ -560,6 +725,10 @@ if [ "$HAVE_RUN" = 1 ]; then
             ;;
         esac
       fi
+      if [ "$RUN_STATE" = working ] && step_wedge=$(nm_running_step_wedge_reason "$run_id"); then
+        RUN_STATE=wedged
+        RUN_DETAIL=$step_wedge
+      fi
     fi
   fi
 
@@ -585,7 +754,7 @@ if [ "$HAVE_RUN" = 1 ]; then
   # stale: the gate resolved and the run resumed or finished.
   case "$LOG_VERB" in
     needs-decision|blocked)
-      if [ "$RUN_STATE" != parked ]; then
+      if [ "$RUN_STATE" != parked ] && [ "$RUN_STATE" != wedged ]; then
         if [ "$RUN_STATE" = working ]; then
           RUN_DETAIL="$RUN_DETAIL${SEP}status-log superseded by active run"
         else

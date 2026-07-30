@@ -329,7 +329,7 @@ _collapse_newlines() {  # <text>
 # summary firstmate would otherwise have to re-read.
 
 classify_signal() {  # <reason-after-colon> <state>
-  local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
+  local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen wedge_detail
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
@@ -348,6 +348,12 @@ classify_signal() {  # <reason-after-colon> <state>
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
   if [ -z "$rel" ]; then
+    # shellcheck disable=SC2086  # $reason is the watcher's space-separated signal file list.
+    wedge_detail=$(signal_crew_wedge_details $reason)
+    if [ -n "$wedge_detail" ]; then
+      printf 'escalate|wedged: %s' "$wedge_detail"
+      return
+    fi
     printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
@@ -362,9 +368,15 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen
+  local win=$1 state=$2 task last seen crew_line wedge_detail
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
+  crew_line=$(crew_state_line "$task")
+  wedge_detail=$(crew_wedge_detail_from_line "$crew_line")
+  if [ -n "$wedge_detail" ]; then
+    printf 'escalate|wedged: %s: %s' "$task" "$wedge_detail"
+    return
+  fi
   if [ -n "$last" ] && status_is_paused "$last"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
     # so this is not a wedge. The caller records a pause marker (long re-surface

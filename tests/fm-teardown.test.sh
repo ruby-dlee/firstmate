@@ -49,6 +49,17 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#
+# Writing a new fake tmux for this suite: teardown proves endpoint state through
+# fm_backend_target_state plus fm_backend_tmux_agent_alive, and releases nothing
+# on `unknown`. A stub therefore needs all three of:
+#   - a `#{pane_current_command}` answer on display-message (a bare shell for an
+#     idle pane, a harness name for a live agent) - without it a present pane is
+#     `unknown` and every case refuses for an unprovable read;
+#   - a `list-windows` arm, which is the only way absence is ever proved;
+#   - per-target answers when a case has more than one endpoint.
+# The task metadata needs a session-scoped handle for the same reason - see
+# docs/tmux-backend.md "Proving absence needs a session-scoped handle".
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091

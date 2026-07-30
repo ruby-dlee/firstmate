@@ -1330,17 +1330,17 @@ SH
 }
 
 test_content_fallback_honors_shared_checkout_lock() {
-  local case_dir rc common key lock_root lock
+  local case_dir rc lock_root lock
   case_dir=$(make_case content-shared-lock)
   write_meta "$case_dir" no-mistakes ship
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   land_on_origin_main "$case_dir" feature.txt hello
-  common=$(git -C "$case_dir/wt" rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$case_dir/wt/$common" ;; esac
-  common=$(cd "$common" && pwd -P)
-  key=$(printf '%s' "$common" | shasum -a 256 | awk '{print substr($1,1,24)}')
   lock_root="$case_dir/checkout-locks"
-  lock="$lock_root/$key.lock"
+  # Contend the lock at the path the product itself derives; hashing the raw
+  # common-dir path skips the lowercasing in fm_checkout_stable_path_key, so the
+  # lock would be planted where nothing looks for it and the contention this case
+  # exists to prove would go undetected.
+  lock=$(checkout_lock_path "$case_dir/wt" "$lock_root")
   mkdir -p "$lock"
   printf '%s\n' "$$" > "$lock/pid"
 

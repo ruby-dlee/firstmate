@@ -108,6 +108,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# Same canonical resolution every other script uses (fm-spawn, fm-bootstrap,
+# fm-home-seed, fm-fleet-sync, fm-fleet-snapshot, fm-checkout-refresh): with
+# FM_HOME set, `projects/` is an operational dir of the HOME, not of the repo.
+PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
@@ -3825,6 +3829,7 @@ EOF
 
 validate_secondmate_project_clones() {
   local home=$1 registry=$2 expected_id=$3 expected_source=$4 projects_root source_projects_root
+  local source_projects_candidate
   local expected listed project clone source_clone repositories relative repository source_repository
   if ! expected=$(fm_secondmate_registry_query "$registry" query "$expected_id" projects); then
     if [ "$registry" = "$PREPARED_REGISTRY_PATH" ] \
@@ -3871,13 +3876,20 @@ PY
     echo "REFUSED: secondmate project clones do not exactly match the registration for $expected_id" >&2
     return 1
   }
-  if [ "$expected_source" = "$FM_ROOT" ] && [ -n "${FM_PROJECTS_OVERRIDE:-}" ]; then
-    source_projects_root=$FM_PROJECTS_OVERRIDE
+  # When the source IS this firstmate's own repo, its projects live wherever THIS
+  # home puts them, exactly as the registry lookup above resolves through $DATA
+  # rather than "$expected_source/data". Requiring FM_PROJECTS_OVERRIDE to be set
+  # here meant that with FM_HOME pointing at a home outside the repo - the
+  # documented multi-home layout - teardown looked for the parent's clones in the
+  # repo root, found nothing, and refused to retire any secondmate.
+  # A source that is NOT this repo is a foreign home, so it keeps its own layout.
+  if [ "$expected_source" = "$FM_ROOT" ]; then
+    source_projects_candidate=$PROJECTS
   else
-    source_projects_root="$expected_source/projects"
+    source_projects_candidate="$expected_source/projects"
   fi
-  source_projects_root=$(fm_checkout_trusted_dir "$source_projects_root") || {
-    echo "REFUSED: registered source projects are unavailable or redirected at $source_projects_root" >&2
+  source_projects_root=$(fm_checkout_trusted_dir "$source_projects_candidate") || {
+    echo "REFUSED: registered source projects are unavailable or redirected at $source_projects_candidate" >&2
     return 1
   }
   while IFS= read -r project; do

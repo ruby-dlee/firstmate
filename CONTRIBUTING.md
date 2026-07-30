@@ -80,6 +80,8 @@ Agent Fleet is independently packaged under `tools/agent-fleet` and requires Pyt
 Run the complete locked verification in [`tools/agent-fleet/RELEASING.md`](tools/agent-fleet/RELEASING.md) before pushing; that document also owns versioning, tagging, and clean-install verification.
 
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
+When triaging a red `Behavior tests` job, remember that CI runs that loop under `set -eu` while the local loop above does not: CI stops at the first failing script, so its log proves nothing about the suites that sort after it, and a red job is a lower bound on the failure count rather than the whole list.
+Reproduce with the non-failing local loop to see every failure at once before concluding which ones are real.
 Tests that need a real optional backend, an explicit opt-in, or an ambient toolchain capability (real herdr/zellij/cmux smoke tests, the live Pi regression, the Pi TypeScript-extension checks when node cannot import `.ts` modules directly) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
 
 ## Questions

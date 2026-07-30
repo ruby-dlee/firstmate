@@ -2144,27 +2144,23 @@ test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
     subhome="$TMP_ROOT/symlink-inside-teardown-subhome-$opdir"
     target="$subhome/internal-$opdir"
     err="$TMP_ROOT/symlink-inside-teardown-$opdir.err"
-    rm -rf "$home" "$subhome"
-    mkdir -p "$home/state" "$home/data" "$subhome" "$target"
-    printf 'domain\n' > "$subhome/.fm-secondmate-home"
+    make_secondmate_home_and_source "symlink-inside-teardown-$opdir" domain alpha
+    home=$SECONDMATE_FIXTURE_HOME
+    subhome=$SECONDMATE_FIXTURE_SUBHOME
+    target="$subhome/internal-$opdir"
+    # Replace the real operational directory with a symlink to a target INSIDE the
+    # home, then populate the registered clone through it, so a symlinked projects/
+    # is exercised the same way as the other three.
+    rm -rf "$subhome/$opdir"
+    mkdir -p "$target"
     ln -s "$target" "$subhome/$opdir"
-    cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-    printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+    clone_registered_secondmate_project
     fakebin=$(make_fake_tmux "$TMP_ROOT/symlink-inside-teardown-fake-$opdir")
     log="$TMP_ROOT/symlink-inside-teardown-fake-$opdir/tmux.log"
-    PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/symlink-inside-teardown-fake-$opdir/pane.txt" \
+    PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+      FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/symlink-inside-teardown-fake-$opdir/pane.txt" \
       "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err" \
-      || fail "force teardown refused $opdir symlinked inside the secondmate home"
+      || fail "force teardown refused $opdir symlinked inside the secondmate home: $(cat "$err")"
     [ ! -e "$subhome" ] || fail "force teardown did not remove subhome with inside $opdir symlink"
     [ ! -e "$home/state/domain.meta" ] || fail "force teardown did not clear parent meta for inside $opdir symlink"
     grep -F 'kill-window -t firstmate:fm-domain' "$log" >/dev/null || fail "force teardown did not kill parent window for inside $opdir symlink"
@@ -2174,28 +2170,21 @@ EOF
 
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home() {
   local home subhome external_state fakebin err log
-  home="$TMP_ROOT/symlink-state-teardown-home"
-  subhome="$TMP_ROOT/symlink-state-teardown-subhome"
-  external_state="$home/data/external-state"
   err="$TMP_ROOT/symlink-state-teardown.err"
-  mkdir -p "$home/state" "$home/data" "$subhome" "$external_state"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  # The home needs its real shape for the operational-directory proof to be what
+  # refuses; a bare mkdir'd home is refused earlier, for not being a repository root.
+  make_secondmate_home_and_source symlink-state-teardown domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  external_state="$home/data/external-state"
+  mkdir -p "$external_state"
+  rm -rf "$subhome/state"
   ln -s "$external_state" "$subhome/state"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
   fakebin=$(make_fake_tmux "$TMP_ROOT/symlink-state-teardown-fake")
   log="$TMP_ROOT/symlink-state-teardown-fake/tmux.log"
-  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/symlink-state-teardown-fake/pane.txt" \
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/symlink-state-teardown-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
     fail "force teardown accepted a symlinked secondmate state directory"
   fi

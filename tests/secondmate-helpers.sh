@@ -208,6 +208,65 @@ SH
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
+# make_secondmate_home_and_source <prefix> <id> <project>: the standard two-sided
+# secondmate teardown fixture, minus the home's project clone (see
+# clone_registered_secondmate_project, kept separate so a case can reshape
+# <subhome>/projects first). Under $TMP_ROOT/<prefix>-* it builds:
+#   -fmroot   a firstmate source git root, carrying the .gitignore that keeps a
+#             seeded home clean
+#   -home     the parent firstmate home: state/, data/, the registered source clone
+#             projects/<project> with an origin, the <id> meta and the registry route
+#   -subhome  the secondmate home: a plain CLONE of the source (not a registered
+#             worktree of it, so teardown takes the non-Treehouse removal path),
+#             marked for <id>, with the full operational directory set
+# bin/fm-teardown.sh proves all of that - exact repository root, resolvable identity,
+# operational directories, and a projects/ matching the registration - before it
+# touches anything, so a bare mkdir'd home is refused long before whatever a case
+# actually means to pin. Sets SECONDMATE_FIXTURE_FMROOT/_HOME/_SUBHOME/_PROJECT and
+# exports nothing; pass SECONDMATE_FIXTURE_FMROOT as FM_ROOT_OVERRIDE when running
+# teardown.
+make_secondmate_home_and_source() {
+  local prefix=$1 id=$2 project=$3
+  SECONDMATE_FIXTURE_FMROOT="$TMP_ROOT/$prefix-fmroot"
+  SECONDMATE_FIXTURE_HOME="$TMP_ROOT/$prefix-home"
+  SECONDMATE_FIXTURE_SUBHOME="$TMP_ROOT/$prefix-subhome"
+  SECONDMATE_FIXTURE_PROJECT=$project
+  rm -rf "$SECONDMATE_FIXTURE_FMROOT" "$SECONDMATE_FIXTURE_HOME" "$SECONDMATE_FIXTURE_SUBHOME"
+  make_firstmate_git_root "$SECONDMATE_FIXTURE_FMROOT"
+  git clone --quiet "$SECONDMATE_FIXTURE_FMROOT" "$SECONDMATE_FIXTURE_SUBHOME"
+  mkdir -p "$SECONDMATE_FIXTURE_HOME/state" "$SECONDMATE_FIXTURE_HOME/data" \
+    "$TMP_ROOT/remotes" "$SECONDMATE_FIXTURE_SUBHOME/data" \
+    "$SECONDMATE_FIXTURE_SUBHOME/state" "$SECONDMATE_FIXTURE_SUBHOME/config" \
+    "$SECONDMATE_FIXTURE_SUBHOME/projects"
+  fm_git_init_commit "$SECONDMATE_FIXTURE_HOME/projects/$project"
+  fm_git_add_origin "$SECONDMATE_FIXTURE_HOME/projects/$project" \
+    "$TMP_ROOT/remotes/$prefix-$project.git"
+  printf '%s\n' "$id" > "$SECONDMATE_FIXTURE_SUBHOME/.fm-secondmate-home"
+  cat > "$SECONDMATE_FIXTURE_HOME/state/$id.meta" <<EOF
+window=firstmate:fm-$id
+worktree=$SECONDMATE_FIXTURE_SUBHOME
+project=$SECONDMATE_FIXTURE_SUBHOME
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$SECONDMATE_FIXTURE_SUBHOME
+projects=$project
+EOF
+  printf -- '- %s - design domain (home: %s; scope: design domain; projects: %s; added 2026-06-22)\n' \
+    "$id" "$SECONDMATE_FIXTURE_SUBHOME" "$project" \
+    > "$SECONDMATE_FIXTURE_HOME/data/secondmates.md"
+}
+
+# clone_registered_secondmate_project: clone the parent home's registered source of
+# SECONDMATE_FIXTURE_PROJECT into the secondmate home, so both sides of the
+# registration exist and share an origin.
+clone_registered_secondmate_project() {
+  git clone --quiet \
+    "$(git -C "$SECONDMATE_FIXTURE_HOME/projects/$SECONDMATE_FIXTURE_PROJECT" remote get-url origin)" \
+    "$SECONDMATE_FIXTURE_SUBHOME/projects/$SECONDMATE_FIXTURE_PROJECT"
+}
+
 # write_treehouse_pool_lease <worktree> <holder>: record <worktree> as durably
 # leased to <holder> in its Treehouse pool state. bin/fm-teardown.sh resolves that
 # state authoritatively by walking up two levels from the worktree (worktree ->

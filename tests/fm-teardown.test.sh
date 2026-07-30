@@ -2965,8 +2965,16 @@ test_herdr_teardown_clears_escalation_marker() {
   sed -i.bak 's/^window=.*/window=default:wG:pQ/' "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
+  # fm_backend_target_state validates `session list --json` with jq before it will
+  # call an endpoint absent; a stub that answers every subcommand with silent
+  # exit 0 leaves the state `unknown`, which correctly retains metadata and never
+  # reaches the marker cleanup this case is about. Report the pane's session as
+  # gone - the endpoint really is absent by teardown time.
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[]}\n' ;;
+esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/herdr"

@@ -2151,7 +2151,7 @@ test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
     # Replace the real operational directory with a symlink to a target INSIDE the
     # home, then populate the registered clone through it, so a symlinked projects/
     # is exercised the same way as the other three.
-    rm -rf "$subhome/$opdir"
+    rm -rf "${subhome:?}/${opdir:?}"
     mkdir -p "$target"
     ln -s "$target" "$subhome/$opdir"
     clone_registered_secondmate_project
@@ -2258,6 +2258,47 @@ active-descendant|inside the active firstmate home
 repo-descendant|inside the firstmate repo
 ROWS
   pass "secondmate teardown path-boundary matrix refuses unmarked/ancestor/active-descendant/repo-descendant homes"
+}
+
+# Pins the ordering Option D established: a structurally broken home must be
+# reported BY THE STRUCTURAL PROOF, not by the cleanliness proof. Both refuse, and
+# both run before any destruction, so this is about which cause an operator is told -
+# and being told "unlanded changes" for a symlinked operational directory sends them
+# looking for uncommitted work that does not exist. The negative assertion is the
+# point: the cleanliness message must NOT be what surfaces.
+test_secondmate_teardown_reports_structural_faults_before_cleanliness() {
+  local home subhome external fakebin err log
+  err="$TMP_ROOT/structural-before-clean.err"
+  make_secondmate_home_and_source structural-before-clean domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  external="$home/data/external-projects"
+  mkdir -p "$external"
+  # A projects/ symlinked OUT of the home is a structural fault, and it also reads to
+  # `git status` as untracked content - which is exactly the collision that used to
+  # make the cleanliness proof answer first.
+  rm -rf "${subhome:?}/projects"
+  ln -s "$external" "$subhome/projects"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/structural-before-clean-fake")
+  log="$TMP_ROOT/structural-before-clean-fake/tmux.log"
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/structural-before-clean-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+    fail "teardown accepted a home whose projects directory resolves outside it"
+  fi
+  grep -F 'projects directory' "$err" >/dev/null \
+    || fail "structural fault was not reported by the operational-directory proof: $(cat "$err")"
+  grep -F 'resolves outside the secondmate home' "$err" >/dev/null \
+    || fail "structural fault did not name the containment violation: $(cat "$err")"
+  grep -F 'has unlanded changes' "$err" >/dev/null \
+    && fail "structural fault was misreported as unlanded work: $(cat "$err")"
+  [ -d "$subhome" ] || fail "structural refusal removed the secondmate home"
+  [ -d "$external" ] || fail "structural refusal removed the external symlink target"
+  [ -e "$home/state/domain.meta" ] || fail "structural refusal cleared secondmate metadata"
+  grep -F 'kill-window' "$log" >/dev/null \
+    && fail "structural refusal stopped an endpoint before proving the home"
+  pass "secondmate teardown reports structural faults by their own proof, not as unlanded work"
 }
 
 test_secondmate_teardown_refuses_registered_nested_home() {
@@ -2798,6 +2839,7 @@ test_secondmate_force_teardown_refuses_unregistered_linked_worktree
 test_secondmate_force_teardown_refuses_misattributed_linked_worktree
 test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home
+test_secondmate_teardown_reports_structural_faults_before_cleanliness
 test_secondmate_teardown_refuses_registered_nested_home
 test_secondmate_teardown_refuses_child_registry_nested_home
 test_secondmate_force_teardown_prevalidates_before_child_cleanup

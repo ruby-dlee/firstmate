@@ -4008,6 +4008,11 @@ validate_firstmate_home_for_removal() {
     return 1
   }
   validate_firstmate_home_repository_identity "$abs_home_path" "$expected_source" || return 1
+  # The operational-directory proof is the most specific statement available about a
+  # structurally broken home, and it is read-only, so it speaks before the proofs
+  # below - all of which also read the home's state directory and would otherwise
+  # answer first with a vaguer reason for the same underlying fault.
+  validate_firstmate_operational_dirs_for_removal "$abs_home_path" "$label" || return 1
   if [ "$source_authority" -eq 1 ]; then
     validate_surviving_repository_authority \
       "$expected_source" "$abs_home_path" "$expected_source" \
@@ -4016,12 +4021,21 @@ validate_firstmate_home_for_removal() {
   if [ -n "$expected_id" ] && firstmate_home_has_treehouse_slot "$abs_home_path" "$expected_source"; then
     require_treehouse_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
-  validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
+  # Structural proofs run BEFORE the landed-state (cleanliness) proof. Every proof
+  # here is read-only and every one of them already runs before any destruction, so
+  # this only decides which refusal an operator is shown first - not whether any
+  # check happens. It matters because a structural violation manifests as untracked
+  # content: an operational directory symlinked out of the home, or a nested home
+  # inside it, both surface to `git status` as untracked paths, so the cleanliness
+  # proof used to answer first and report "has unlanded changes: ?? state" for a
+  # problem that has nothing to do with unlanded work. The more specific proof now
+  # speaks first. Each still returns non-zero on its own failure, so a home with
+  # both a structural violation and genuinely unlanded work is still refused.
   if [ -n "$expected_id" ]; then
     validate_secondmate_project_clones \
       "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
   fi
-  validate_firstmate_operational_dirs_for_removal "$abs_home_path" "$label" || return 1
+  validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
   secondmate_state_metadata "$abs_home_path" >/dev/null || return 1
   fm_secondmate_registry_query "$abs_home_path/data/secondmates.md" validate >/dev/null || {
     echo "REFUSED: child secondmate registry is malformed or uninspectable at $abs_home_path/data/secondmates.md" >&2

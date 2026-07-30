@@ -208,6 +208,29 @@ SH
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
+# write_treehouse_pool_lease <worktree> <holder>: record <worktree> as durably
+# leased to <holder> in its Treehouse pool state. bin/fm-teardown.sh resolves that
+# state authoritatively by walking up two levels from the worktree (worktree ->
+# slot -> pool) and reading <pool>/treehouse-state.json, so a worktree that is not
+# laid out inside a pool has no provable ownership and teardown refuses before it
+# does anything else.
+write_treehouse_pool_lease() {
+  local worktree=$1 holder=$2 slot pool
+  slot=$(cd "$(dirname "$worktree")" && pwd -P) || return 1
+  pool=$(cd "$(dirname "$slot")" && pwd -P) || return 1
+  python3 - "$pool/treehouse-state.json" "$(cd "$worktree" && pwd -P)" "$holder" <<'PY'
+import json
+import sys
+
+state, path, holder = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {"worktrees": [{"name": "1", "path": path, "leased": True, "lease_holder": holder}]},
+        stream,
+    )
+PY
+}
+
 # make_leased_secondmate_home <pool> <fmroot> <id>: a Treehouse-slot-shaped
 # secondmate home. bin/fm-teardown.sh takes the Treehouse-return path for any home
 # that is a registered worktree of the firstmate source, and that path then proves
@@ -229,17 +252,7 @@ make_leased_secondmate_home() {
   # proves each one before removal, and proves that the clones under projects/
   # exactly match the home's registered project list.
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
-  python3 - "$pool/treehouse-state.json" "$(cd "$home" && pwd -P)" "$id" <<'PY'
-import json
-import sys
-
-state, path, holder = sys.argv[1:]
-with open(state, "w", encoding="utf-8") as stream:
-    json.dump(
-        {"worktrees": [{"name": "1", "path": path, "leased": True, "lease_holder": holder}]},
-        stream,
-    )
-PY
+  write_treehouse_pool_lease "$home" "$id"
   printf '%s\n' "$home"
 }
 

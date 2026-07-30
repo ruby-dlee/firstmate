@@ -3608,9 +3608,36 @@ except OSError:
 PY
 }
 
+# registered_child_project_worktrees: the canonical worktree path of every child
+# REGISTERED in <retiring-home>'s own state whose recorded project resolves to
+# <repository>, one per line. This is the only thing that may vouch for a linked
+# worktree of a secondmate's project clone (see
+# validate_secondmate_repository_worktree_graph). Attribution is deliberately
+# narrow: a child must record BOTH a worktree and a project, the project must
+# resolve to exactly this repository, and both paths are canonicalized before
+# comparison, so an arbitrary or unattributable worktree can never be admitted.
+# Fails closed - an unenumerable state directory is an error, never an empty set.
+registered_child_project_worktrees() {  # <retiring-home> <repository>
+  local home=$1 repository=$2 metas meta child_worktree child_project canonical
+  metas=$(secondmate_state_metadata "$home") || return 1
+  while IFS= read -r meta; do
+    [ -n "$meta" ] || continue
+    child_worktree=$(meta_value "$meta" worktree)
+    child_project=$(meta_value "$meta" project)
+    [ -n "$child_worktree" ] && [ -n "$child_project" ] || continue
+    child_project=$(fm_checkout_trusted_dir "$child_project" 2>/dev/null) || continue
+    [ "$child_project" = "$repository" ] || continue
+    canonical=$(fm_checkout_trusted_dir "$child_worktree" 2>/dev/null) || continue
+    printf '%s\n' "$canonical"
+  done <<EOF
+$metas
+EOF
+}
+
 validate_secondmate_repository_worktree_graph() {
   local repository=$1 retiring_home=$2 repository_container=${3:-$1}
   local common listed records path kind canonical count=0 bare_repository container_git submodule_admin=0
+  local registered_worktrees
   bare_repository=$(git -C "$repository" rev-parse --is-bare-repository 2>/dev/null) || return 1
   common=$(git -C "$repository" rev-parse --git-common-dir 2>/dev/null) || return 1
   case "$common" in /*) ;; *) common="$repository/$common" ;; esac
@@ -3629,6 +3656,17 @@ validate_secondmate_repository_worktree_graph() {
   fi
   listed=$(git -C "$repository" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || {
     echo "REFUSED: secondmate project linked-worktree graph is uninspectable at $repository" >&2
+    return 1
+  }
+  # A secondmate holds its project CLONES under home/projects while its crewmates'
+  # worktrees live outside in the Treehouse pool as LINKED worktrees of those
+  # clones - the ordinary running state of any secondmate with live crewmates. So
+  # this graph admits a linked worktree that a REGISTERED child of this home owns,
+  # and nothing else. It stays a pre-destruction guard: an unregistered, foreign,
+  # or unattributable worktree still refuses retirement here, before anything is
+  # removed.
+  registered_worktrees=$(registered_child_project_worktrees "$retiring_home" "$repository") || {
+    echo "REFUSED: secondmate child registration is unprovable while proving linked-worktree ownership at $repository" >&2
     return 1
   }
   records=$(printf '%s\n' "$listed" | awk '
@@ -3673,10 +3711,12 @@ validate_secondmate_repository_worktree_graph() {
         fi
         ;;
       worktree)
-        count=$((count + 1))
         if [ "$canonical" = "$repository" ]; then
-          :
+          count=$((count + 1))
         elif [ "$submodule_admin" -eq 1 ] && [ "$canonical" = "$common" ]; then
+          count=$((count + 1))
+        elif [ -n "$registered_worktrees" ] \
+          && printf '%s\n' "$registered_worktrees" | grep -qxF -- "$canonical"; then
           :
         else
           echo "REFUSED: secondmate project common Git directory owns another linked worktree at $canonical" >&2

@@ -1941,7 +1941,7 @@ test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
   subhome="$TMP_ROOT/force-lock-subhome"
   fmroot="$TMP_ROOT/force-lock-fmroot"
   childproj="$subhome/projects/alpha"
-  childwt="$TMP_ROOT/force-lock-child-worktree"
+  childwt="$TMP_ROOT/force-lock-pool/1/child-worktree"
   err="$TMP_ROOT/force-lock-child.err"
   # The home must be a real firstmate clone with the full operational directory set
   # and a projects/ that matches its registration, all of which teardown proves
@@ -1956,7 +1956,12 @@ test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/force-lock-alpha.git"
   alpha_origin=$(git -C "$home/projects/alpha" remote get-url origin)
   git clone --quiet "$alpha_origin" "$childproj"
+  mkdir -p "$TMP_ROOT/force-lock-pool/1"
   git -C "$childproj" worktree add --quiet -b force-child-lock "$childwt"
+  # A crewmate worktree lives in the Treehouse pool as a linked worktree of the
+  # home's project clone, durably leased to that child. Teardown proves that lease
+  # authoritatively from the pool state before touching anything.
+  write_treehouse_pool_lease "$childwt" firstmate-child
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
@@ -2032,6 +2037,104 @@ SH
   [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta after child lock refusal"
   grep -F 'not provably stale' "$err" >/dev/null || fail "force teardown did not explain unproven child lock refusal"
   pass "secondmate force teardown preserves child worktree after unproven lock refusal"
+}
+
+# Guards the precision of the linked-worktree admission above: a secondmate's
+# project clone may own a linked worktree ONLY when a REGISTERED child of that home
+# vouches for it, by recording both that exact worktree and that exact project.
+# This proves the two ways an admission must still be refused - no registration at
+# all, and a registration that names a different project - each of which would
+# otherwise be a hole through which retirement could destroy an unattributable
+# worktree.
+setup_unattributed_worktree_case() {
+  local prefix=$1
+  UNATTRIBUTED_HOME="$TMP_ROOT/$prefix-home"
+  UNATTRIBUTED_SUBHOME="$TMP_ROOT/$prefix-subhome"
+  UNATTRIBUTED_FMROOT="$TMP_ROOT/$prefix-fmroot"
+  UNATTRIBUTED_PROJECT="$UNATTRIBUTED_SUBHOME/projects/alpha"
+  UNATTRIBUTED_WORKTREE="$TMP_ROOT/$prefix-pool/1/stray-worktree"
+  UNATTRIBUTED_ERR="$TMP_ROOT/$prefix.err"
+  make_firstmate_git_root "$UNATTRIBUTED_FMROOT"
+  git clone --quiet "$UNATTRIBUTED_FMROOT" "$UNATTRIBUTED_SUBHOME"
+  mkdir -p "$UNATTRIBUTED_HOME/state" "$UNATTRIBUTED_HOME/data" "$TMP_ROOT/remotes" \
+    "$UNATTRIBUTED_SUBHOME/state" "$UNATTRIBUTED_SUBHOME/data" \
+    "$UNATTRIBUTED_SUBHOME/config" "$UNATTRIBUTED_SUBHOME/projects" \
+    "$TMP_ROOT/$prefix-pool/1"
+  fm_git_init_commit "$UNATTRIBUTED_HOME/projects/alpha"
+  fm_git_add_origin "$UNATTRIBUTED_HOME/projects/alpha" "$TMP_ROOT/remotes/$prefix-alpha.git"
+  git clone --quiet "$(git -C "$UNATTRIBUTED_HOME/projects/alpha" remote get-url origin)" \
+    "$UNATTRIBUTED_PROJECT"
+  git -C "$UNATTRIBUTED_PROJECT" worktree add --quiet -b stray-branch "$UNATTRIBUTED_WORKTREE"
+  write_treehouse_pool_lease "$UNATTRIBUTED_WORKTREE" firstmate-stray
+  printf 'domain\n' > "$UNATTRIBUTED_SUBHOME/.fm-secondmate-home"
+  cat > "$UNATTRIBUTED_HOME/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$UNATTRIBUTED_SUBHOME
+project=$UNATTRIBUTED_SUBHOME
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$UNATTRIBUTED_SUBHOME
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$UNATTRIBUTED_SUBHOME"'; scope: design domain; projects: alpha; added 2026-06-22)' \
+    > "$UNATTRIBUTED_HOME/data/secondmates.md"
+  UNATTRIBUTED_FAKEBIN=$(make_fake_tmux "$TMP_ROOT/$prefix-fake")
+}
+
+run_unattributed_teardown() {
+  local prefix=$1
+  set +e
+  PATH="$UNATTRIBUTED_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$UNATTRIBUTED_FMROOT" \
+    FM_HOME="$UNATTRIBUTED_HOME" FM_FAKE_TMUX_LOG="$TMP_ROOT/$prefix-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/$prefix-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$UNATTRIBUTED_ERR"
+  UNATTRIBUTED_RC=$?
+  set -e
+}
+
+test_secondmate_force_teardown_refuses_unregistered_linked_worktree() {
+  setup_unattributed_worktree_case unregistered-linked-worktree
+  run_unattributed_teardown unregistered-linked-worktree
+
+  [ "$UNATTRIBUTED_RC" -ne 0 ] \
+    || fail "force teardown retired a home whose project owns an unregistered linked worktree"
+  grep -F 'owns another linked worktree' "$UNATTRIBUTED_ERR" >/dev/null \
+    || fail "unregistered linked worktree refusal was not surfaced: $(cat "$UNATTRIBUTED_ERR")"
+  [ -d "$UNATTRIBUTED_WORKTREE" ] \
+    || fail "unregistered linked worktree was destroyed instead of retained"
+  [ -d "$UNATTRIBUTED_SUBHOME" ] \
+    || fail "unregistered linked worktree refusal removed the secondmate home"
+  [ -e "$UNATTRIBUTED_HOME/state/domain.meta" ] \
+    || fail "unregistered linked worktree refusal cleared secondmate metadata"
+  pass "secondmate retirement refuses a project clone owning an unregistered linked worktree"
+}
+
+test_secondmate_force_teardown_refuses_misattributed_linked_worktree() {
+  setup_unattributed_worktree_case misattributed-linked-worktree
+  # A child meta DOES record this exact worktree, but names a different project, so
+  # it cannot vouch for a worktree of alpha. Registration alone must never be enough.
+  cat > "$UNATTRIBUTED_SUBHOME/state/stray.meta" <<EOF
+window=firstmate:fm-stray
+worktree=$UNATTRIBUTED_WORKTREE
+project=$UNATTRIBUTED_HOME/projects/alpha
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+EOF
+  run_unattributed_teardown misattributed-linked-worktree
+
+  [ "$UNATTRIBUTED_RC" -ne 0 ] \
+    || fail "force teardown accepted a linked worktree vouched for by a different project"
+  [ -d "$UNATTRIBUTED_WORKTREE" ] \
+    || fail "misattributed linked worktree was destroyed instead of retained"
+  [ -d "$UNATTRIBUTED_SUBHOME" ] \
+    || fail "misattributed linked worktree refusal removed the secondmate home"
+  [ -e "$UNATTRIBUTED_HOME/state/domain.meta" ] \
+    || fail "misattributed linked worktree refusal cleared secondmate metadata"
+  pass "secondmate retirement refuses a linked worktree attributed to another project"
 }
 
 test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
@@ -2702,6 +2805,8 @@ test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_force_teardown_retains_unlanded_child_work
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
+test_secondmate_force_teardown_refuses_unregistered_linked_worktree
+test_secondmate_force_teardown_refuses_misattributed_linked_worktree
 test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home
 test_secondmate_teardown_refuses_registered_nested_home

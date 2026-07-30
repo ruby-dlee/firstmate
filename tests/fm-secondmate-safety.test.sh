@@ -1837,11 +1837,23 @@ EOF
 }
 
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return() {
-  local home subhome subhome_abs fakebin log
+  local home subhome subhome_abs fakebin log fmroot
   home="$TMP_ROOT/plain-clone-teardown-home"
   subhome="$TMP_ROOT/plain-clone-teardown-subhome"
-  mkdir -p "$home/state" "$home/data" "$subhome/state"
-  mark_firstmate_home "$subhome"
+  fmroot="$TMP_ROOT/plain-clone-teardown-fmroot"
+  # A plain-CLONE home has to actually be a clone: teardown proves the home is an
+  # exact repository root whose identity resolves back to the source before it will
+  # remove anything, and a bare mkdir'd directory is refused long before the
+  # non-Treehouse removal path this case exists to cover. A clone (rather than a
+  # registered worktree of the source) is also what keeps it off the Treehouse path.
+  make_firstmate_git_root "$fmroot"
+  git clone --quiet "$fmroot" "$subhome"
+  mkdir -p "$home/state" "$home/data" "$TMP_ROOT/remotes" \
+    "$subhome/state" "$subhome/data" "$subhome/config" "$subhome/projects"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/plain-clone-alpha.git"
+  git clone --quiet "$(git -C "$home/projects/alpha" remote get-url origin)" \
+    "$subhome/projects/alpha"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   subhome_abs=$(cd "$subhome" && pwd -P)
   cat > "$home/state/domain.meta" <<EOF
@@ -1859,7 +1871,8 @@ EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/plain-clone-teardown-fake")
   log="$TMP_ROOT/plain-clone-teardown-fake/tmux.log"
 
-  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-clone-teardown-fake/pane.txt" \
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-clone-teardown-fake/pane.txt" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>/dev/null \
     || fail "teardown failed for plain-clone secondmate home"

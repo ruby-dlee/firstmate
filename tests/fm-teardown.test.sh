@@ -3336,8 +3336,16 @@ SH
 test_secondmate_rejects_drifted_home_repository_identity() {
   local case_dir marker rc
   case_dir=$(make_case secondmate-home-identity-drift)
-  mkdir -p "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" "$case_dir/wt/projects"
+  mkdir -p "$case_dir/data" "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" \
+    "$case_dir/wt/projects"
   printf '%s\n' task-x1 > "$case_dir/wt/.fm-secondmate-home"
+  # Registration is proved before the repository-identity check, so without a
+  # registry entry teardown refuses for a missing registration and never reaches
+  # the drift this case exists to pin. The home keeps make_case's own origin,
+  # which is what makes its repository identity genuinely differ from the source.
+  printf '%s\n' \
+    "- task-x1 - test secondmate (home: $(cd "$case_dir/wt" && pwd -P); scope: test; projects: test; added 2026-07-23)" \
+    > "$case_dir/data/secondmates.md"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \

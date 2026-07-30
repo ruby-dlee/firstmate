@@ -1936,14 +1936,27 @@ EOF
 }
 
 test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
-  local home subhome childproj childwt fakebin log err rc lock
+  local home subhome childproj childwt fakebin log err rc lock fmroot alpha_origin
   home="$TMP_ROOT/force-lock-home"
   subhome="$TMP_ROOT/force-lock-subhome"
+  fmroot="$TMP_ROOT/force-lock-fmroot"
   childproj="$subhome/projects/alpha"
   childwt="$TMP_ROOT/force-lock-child-worktree"
   err="$TMP_ROOT/force-lock-child.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state"
-  fm_git_worktree "$childproj" "$childwt" force-child-lock
+  # The home must be a real firstmate clone with the full operational directory set
+  # and a projects/ that matches its registration, all of which teardown proves
+  # before it reaches any child; and the registered project must exist on both
+  # sides, sharing an origin. A bare mkdir'd home is refused for not being an exact
+  # repository root long before the child lock refusal this case pins.
+  make_firstmate_git_root "$fmroot"
+  git clone --quiet "$fmroot" "$subhome"
+  mkdir -p "$home/state" "$home/data" "$TMP_ROOT/remotes" \
+    "$subhome/state" "$subhome/data" "$subhome/config" "$subhome/projects"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/force-lock-alpha.git"
+  alpha_origin=$(git -C "$home/projects/alpha" remote get-url origin)
+  git clone --quiet "$alpha_origin" "$childproj"
+  git -C "$childproj" worktree add --quiet -b force-child-lock "$childwt"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
@@ -2005,7 +2018,8 @@ SH
   touch -t 200001010000 "$lock"
 
   set +e
-  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-lock-child-fake/pane.txt" \
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-lock-child-fake/pane.txt" \
     FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
     "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
   rc=$?

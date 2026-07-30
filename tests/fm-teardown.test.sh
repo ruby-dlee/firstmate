@@ -3145,8 +3145,15 @@ test_required_report_revalidates_after_quiescence() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  display-message)
+    [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
+  list-windows) [ ! -f "$FM_FAKE_REPORT_LIVE" ] || printf '%s\n' fm-task-x1; exit 0 ;;
   kill-window)
     printf 'late work\n' > "$FM_FAKE_WORKTREE/late-work.txt"
     rm -f "$FM_FAKE_REPORT_LIVE"
@@ -3182,8 +3189,14 @@ test_legacy_teardown_revalidates_after_quiescence() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
-  list-windows) exit 0 ;;
+  display-message)
+    [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
+  list-windows) [ ! -f "$FM_FAKE_REPORT_LIVE" ] || printf '%s\n' fm-task-x1; exit 0 ;;
   kill-window)
     printf 'late work\n' > "$FM_FAKE_WORKTREE/late-work.txt"
     rm -f "$FM_FAKE_REPORT_LIVE"

@@ -54,13 +54,18 @@
 # the handle stale, and remove the recorded worktree under its checkout lock;
 # teardown never substitutes the shared window alias for a missing terminal.
 # Secondmates (kind=secondmate in meta) are retired explicitly. Teardown proves
-# the home clean and every ref and reflog commit landed, then quiesces its endpoint and
-# refuses while the home has in-flight crewmate meta files. --force authorizes
-# recursive retirement only after every child passes the same endpoint, identity,
-# cleanliness, stash, and landed-work proofs. Project retirement also rejects
-# mount boundaries, rewritten history, and landing authorities whose complete Git
-# object storage or network transport may depend on the retiring home or local machine. Removing a
-# leased home releases its durable treehouse lease so the pool slot is freed,
+# the home clean and every ref and reflog commit landed. Without --force it also
+# proves the child-secondmate registry empty before quiescing the endpoint, so a
+# known refusal never stops a live supervisor; the same proof is repeated after
+# quiescence. It still refuses while the home has in-flight crewmate meta files.
+# --force authorizes recursive retirement only after every child passes the same
+# endpoint, identity, cleanliness, stash, and landed-work proofs. A retiring
+# project's linked worktrees are admitted only when attributable to registered
+# child metadata. Project retirement also rejects symlinked operational
+# directories, mount boundaries, rewritten history, and landing authorities whose
+# complete Git object storage or network transport may depend on the retiring home
+# or local machine. Removing a leased home releases its durable treehouse lease so
+# the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch]

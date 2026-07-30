@@ -1753,7 +1753,14 @@ test_secondmate_teardown_retires_empty_home() {
   fmroot="$TMP_ROOT/teardown-fmroot"
   make_firstmate_git_root "$fmroot"
   subhome=$(make_leased_secondmate_home "$TMP_ROOT/teardown-pool" "$fmroot" domain)
-  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mkdir -p "$home/state" "$home/data" "$TMP_ROOT/remotes" "$subhome/state"
+  # The registered project list is proved on both sides: the parent home must hold
+  # the source clone, and the home's own projects/ must match the registration
+  # exactly, as an exact repository root sharing that source's origin.
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/teardown-alpha.git"
+  git clone --quiet "$(git -C "$home/projects/alpha" remote get-url origin)" \
+    "$subhome/projects/alpha"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   subhome_abs=$(cd "$subhome" && pwd -P)
   cat > "$home/state/domain.meta" <<EOF
@@ -1791,7 +1798,11 @@ test_secondmate_teardown_refuses_failed_leased_home_return() {
   err="$TMP_ROOT/teardown-return-fail.err"
   make_firstmate_git_root "$fmroot"
   subhome=$(make_leased_secondmate_home "$TMP_ROOT/teardown-return-fail-pool" "$fmroot" domain)
-  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mkdir -p "$home/state" "$home/data" "$TMP_ROOT/remotes" "$subhome/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/teardown-return-fail-alpha.git"
+  git clone --quiet "$(git -C "$home/projects/alpha" remote get-url origin)" \
+    "$subhome/projects/alpha"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   subhome_abs=$(cd "$subhome" && pwd -P)
   cat > "$home/state/domain.meta" <<EOF

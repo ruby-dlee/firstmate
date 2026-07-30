@@ -191,13 +191,20 @@ make_firstmate_git_root() {
   local home=$1
   mkdir -p "$home/bin"
   printf '# Firstmate\n' > "$home/AGENTS.md"
+  # A firstmate source's own tracked .gitignore is what makes a seeded secondmate
+  # home clean: the home marker and every operational directory the home creates
+  # are ignored by construction. Without it, teardown correctly reports the marker
+  # as unlanded changes and refuses - a fixture artifact, not a product refusal.
+  # Mirrors the operational subset of this repo's real .gitignore.
+  printf '%s\n' 'projects/' 'state/' 'data/' '.no-mistakes/' '.fm-secondmate-home' \
+    > "$home/.gitignore"
   cat > "$home/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
   chmod +x "$home/bin/fm-guard.sh"
   git -C "$home" init -q
-  git -C "$home" add AGENTS.md bin/fm-guard.sh
+  git -C "$home" add AGENTS.md .gitignore bin/fm-guard.sh
   git -C "$home" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
@@ -210,12 +217,18 @@ SH
 # with "cannot resolve authoritative Treehouse state" before it ever tries the
 # return. Lay the home out as <pool>/1/home and record its durable lease, held by
 # the task id (which is what teardown passes as the expected holder).
+# The home starts with no project clones; add them the way the suites already do,
+# by cloning the parent's registered source origin into <home>/projects/<name>.
 # Prints the home path.
 make_leased_secondmate_home() {
   local pool=$1 fmroot=$2 id=$3 home
   home="$pool/1/home"
   mkdir -p "$pool/1"
   git -C "$fmroot" worktree add --quiet --detach "$home" HEAD
+  # A seeded home always carries the full operational directory set; teardown
+  # proves each one before removal, and proves that the clones under projects/
+  # exactly match the home's registered project list.
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
   python3 - "$pool/treehouse-state.json" "$(cd "$home" && pwd -P)" "$id" <<'PY'
 import json
 import sys

@@ -2483,31 +2483,21 @@ EOF
 
 test_secondmate_force_teardown_refuses_child_repo_descendant() {
   local home subhome childproj childwt fakeroot fakebin err log
-  home="$TMP_ROOT/child-repo-descendant-home"
-  subhome="$TMP_ROOT/child-repo-descendant-subhome"
-  childproj="$subhome/projects/alpha"
-  fakeroot="$TMP_ROOT/child-repo-descendant-root"
-  childwt="$fakeroot/data"
   err="$TMP_ROOT/child-repo-descendant.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$childproj" "$childwt" "$fakeroot/bin"
-  cat > "$fakeroot/bin/fm-guard.sh" <<'SH'
-#!/usr/bin/env bash
-exit 0
-SH
-  chmod +x "$fakeroot/bin/fm-guard.sh"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  # Real home shapes, or home validation refuses on "not an exact repository root"
+  # before the child worktree this case is about is inspected. The source root that
+  # make_firstmate_git_root builds already carries the quiet bin/fm-guard.sh this
+  # case used to hand-roll, and its tracked .gitignore ignores data/, so hanging the
+  # child worktree off it leaves the root clean.
+  make_secondmate_home_and_source child-repo-descendant domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  childproj="$subhome/projects/alpha"
+  # The point of the case: the child's worktree sits inside FM_ROOT itself.
+  fakeroot=$SECONDMATE_FIXTURE_FMROOT
+  childwt="$fakeroot/data"
+  mkdir -p "$childwt"
   cat > "$subhome/state/child.meta" <<EOF
 window=firstmate:fm-child
 worktree=$childwt

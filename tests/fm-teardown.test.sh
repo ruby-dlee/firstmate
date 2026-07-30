@@ -1921,8 +1921,17 @@ test_stale_index_lock_cleanup_rechecks_dirty_worktree() {
 test_non_linked_index_lock_path_is_checked_from_worktree() {
   local case_dir rc lock
   case_dir=$(make_case non-linked-index-lock)
+  # Only a non-linked checkout makes `git rev-parse --git-path index.lock` answer with
+  # the RELATIVE `.git/index.lock`; a linked worktree always answers absolutely. So the
+  # task worktree here is a clone's own primary checkout, and the recorded project is a
+  # linked worktree of that same clone - two distinct exact roots sharing one common Git
+  # directory, which is what validate_teardown_target_identity requires. Re-cloning the
+  # worktree standalone instead would leave it belonging to no recorded project, which
+  # teardown refuses outright and for good reason.
   git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  rm -rf "$case_dir/project"
   git clone -q "$case_dir/origin.git" "$case_dir/wt"
+  git -C "$case_dir/wt" worktree add -q --detach "$case_dir/project"
   git -C "$case_dir/wt" checkout -q -b fm/task-x1
   write_meta "$case_dir" no-mistakes ship
   wt_commit "$case_dir" "shippable normal clone work"

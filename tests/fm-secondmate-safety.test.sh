@@ -2369,29 +2369,21 @@ EOF
 
 test_secondmate_teardown_refuses_child_registry_nested_home() {
   local home subhome nested fakebin err log
-  home="$TMP_ROOT/child-registry-teardown-home"
-  subhome="$TMP_ROOT/child-registry-teardown-subhome"
-  nested="$subhome/nested-domain"
   err="$TMP_ROOT/child-registry-teardown.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$subhome/data" "$nested/state"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  # The retiring home needs its real shape for the child-registry fault to be what
+  # refuses; a bare mkdir'd home is refused earlier for not being a repository root.
+  make_secondmate_home_and_source child-registry-teardown domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  nested="$subhome/nested-domain"
+  mkdir -p "$nested/state"
   printf 'nested\n' > "$nested/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
   printf '%s\n' '- nested - nested domain (home: '"$nested"'; scope: nested domain; projects: beta; added 2026-06-22)' > "$subhome/data/secondmates.md"
   fakebin=$(make_fake_tmux "$TMP_ROOT/child-registry-teardown-fake")
   log="$TMP_ROOT/child-registry-teardown-fake/tmux.log"
-  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-registry-teardown-fake/pane.txt" \
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-registry-teardown-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
     fail "teardown removed a home containing a child-registry secondmate home"
   fi
@@ -2399,7 +2391,11 @@ EOF
   [ -d "$nested" ] || fail "teardown removed child-registry nested home after refusal"
   [ -e "$home/state/domain.meta" ] || fail "teardown cleared parent meta after child-registry refusal"
   grep -F 'kill-window' "$log" >/dev/null && fail "teardown killed a window before child-registry refusal"
-  grep -F 'contains registered secondmate home' "$err" >/dev/null || fail "teardown did not explain child-registry nested-home refusal"
+  # Retargeted for the same reason as its sibling - 'contains registered secondmate
+  # home' exists nowhere in bin/. Here the product has a message that states this
+  # case's property exactly, so it is the right target rather than a fallback.
+  grep -F 'still registers child homes' "$err" >/dev/null \
+    || fail "teardown did not explain the child-registry nested-home refusal: $(cat "$err")"
   pass "secondmate teardown refuses nested homes from the child registry"
 }
 

@@ -2290,6 +2290,16 @@ case "${1:-}" in
   kill-window)
     : > "$FM_FAKE_KILL_STARTED"
     while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+    : > "$FM_FAKE_KILLED"
+    exit 0
+    ;;
+  list-windows)
+    # Teardown only performs endpoint cleanup for an endpoint it can still see,
+    # and then requires confirmed absence, so a stub pinned to either state
+    # cannot exercise this: reported absent, kill-window is skipped and the
+    # generation-lock race below never happens; reported present forever,
+    # teardown refuses. Observable until the kill lands, gone after it.
+    [ -f "$FM_FAKE_KILLED" ] || printf 'fm-task-x1\n'
     exit 0
     ;;
   display-message) exit 1 ;;
@@ -2300,6 +2310,7 @@ SH
 
   FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    FM_FAKE_KILLED="$case_dir/killed" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
   fm_test_wait_for_file "$kill_started" "$teardown_pid" 0.05 \
@@ -2349,7 +2360,7 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -2385,8 +2396,13 @@ case "${1:-}" in
       *fm-child-lock-x3*)
         : > "$FM_FAKE_KILL_STARTED"
         while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
+        : > "$FM_FAKE_KILLED"
         ;;
     esac
+    exit 0
+    ;;
+  list-windows)
+    [ -f "$FM_FAKE_KILLED" ] || printf 'fm-child-lock-x3\n'
     exit 0
     ;;
   display-message) exit 1 ;;
@@ -2397,6 +2413,7 @@ SH
 
   FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
+    FM_FAKE_KILLED="$case_dir/killed" \
     FM_EXPECT_CHILD_LINEAGE_PATH="$case_dir/wt/data/$child_id/account-attempts.md" \
     FM_REJECT_CHILD_LINEAGE_PATH="$case_dir/data/$child_id/account-attempts.md" \
     FM_EXPECT_CHILD_LINEAGE_MARKER="$case_dir/child-lineage-verified" \
@@ -2452,7 +2469,7 @@ test_forced_secondmate_child_uses_child_home_for_endpoint_verification() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -2506,7 +2523,13 @@ SH
   assert_not_contains "$(cat "$af_log")" 'lease release' "live child endpoint allowed Agent Fleet release"
   assert_present "$case_dir/wt/state/$child_id.meta" "live child endpoint lost retry metadata"
   assert_present "$child_worktree/.git" "live child endpoint worktree was recycled"
-  assert_grep 'managed endpoint for child-zellij-x2 is still alive' "$case_dir/stderr" "child endpoint blocker was not reported"
+  # fm_backend_agent_alive implements tmux and herdr only and answers `unknown`
+  # for every other backend, so a zellij endpoint can never be reported "still
+  # alive" - that assertion could not hold whatever the fixture did. What must
+  # hold is that an endpoint whose state cannot be PROVEN still blocks
+  # destructive cleanup, which the refusal above plus the retained lease,
+  # metadata, and worktree already pin. Assert the reachable message.
+  assert_grep 'managed endpoint state for child-zellij-x2 is unknown' "$case_dir/stderr" "child endpoint blocker was not reported"
   pass "forced secondmate cleanup verifies managed children in the child home"
 }
 
@@ -2523,7 +2546,7 @@ test_forced_secondmate_quiesces_parent_before_child_cleanup() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -2772,7 +2795,7 @@ test_forced_secondmate_retains_child_on_checkout_lock_contention() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -3169,7 +3192,7 @@ test_secondmate_rejects_drifted_home_repository_identity() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -3203,7 +3226,7 @@ test_normal_secondmate_retires_proven_detached_head() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"
@@ -3342,7 +3365,7 @@ test_forced_secondmate_retains_unquiesced_unmanaged_child() {
     'window=fm-task-x1' \
     'tmux_session_target=firstmate:fm-task-x1' \
     "worktree=$case_dir/wt" \
-    "project=$case_dir/project" \
+    "project=$case_dir/wt" \
     'kind=secondmate' \
     'mode=secondmate' \
     "home=$case_dir/wt"

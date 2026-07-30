@@ -2873,7 +2873,7 @@ test_forced_secondmate_retains_child_when_treehouse_unavailable() {
 }
 
 test_forced_secondmate_retains_child_on_checkout_lock_contention() {
-  local case_dir child_project child_worktree child_id lock_root lock parent_live rc
+  local case_dir child_project child_worktree child_id lock_root lock parent_live child_live rc
   case_dir=$(make_case secondmate-child-checkout-contention)
   child_project="$case_dir/child-project"
   child_worktree="$case_dir/child-worktree"
@@ -2892,6 +2892,7 @@ test_forced_secondmate_retains_child_on_checkout_lock_contention() {
   write_treehouse_lease "$child_worktree" "firstmate-$child_id"
   fm_write_meta "$case_dir/wt/state/$child_id.meta" \
     "window=fm-$child_id" \
+    "tmux_session_target=firstmate:fm-$child_id" \
     "worktree=$child_worktree" \
     "project=$child_project" \
     'kind=ship' \
@@ -2900,20 +2901,48 @@ test_forced_secondmate_retains_child_on_checkout_lock_contention() {
   mkdir -p "$lock"
   printf '%s\n' "$$" > "$lock/pid"
   parent_live="$case_dir/parent-live"
+  child_live="$case_dir/child-live"
   : > "$parent_live"
+  : > "$child_live"
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
+set -u
+live_marker() {
+  case "$*" in
+    *fm-task-x1*) printf '%s' "$FM_FAKE_PARENT_LIVE" ;;
+    *fm-child-contention-x5*) printf '%s' "$FM_FAKE_CHILD_LIVE" ;;
+  esac
+}
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_PARENT_LIVE" ]; exit $? ;;
+  display-message)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
-  kill-window) rm -f "$FM_FAKE_PARENT_LIVE"; exit 0 ;;
+  list-windows)
+    [ ! -f "$FM_FAKE_PARENT_LIVE" ] || printf '%s\n' fm-task-x1
+    [ ! -f "$FM_FAKE_CHILD_LIVE" ] || printf '%s\n' fm-child-contention-x5
+    exit 0
+    ;;
+  kill-window)
+    case "$*" in
+      *fm-task-x1*) rm -f "$FM_FAKE_PARENT_LIVE" ;;
+      *fm-child-contention-x5*) rm -f "$FM_FAKE_CHILD_LIVE" ;;
+    esac
+    exit 0
+    ;;
 esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tmux"
 
   set +e
-  FM_FAKE_PARENT_LIVE="$parent_live" FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+  FM_FAKE_PARENT_LIVE="$parent_live" FM_FAKE_CHILD_LIVE="$child_live" \
+  FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e

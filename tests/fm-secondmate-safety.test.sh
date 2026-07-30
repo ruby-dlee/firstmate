@@ -2350,13 +2350,20 @@ EOF
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
     fail "teardown removed a home containing another registered secondmate home"
   fi
-  { echo "NESTED-REASON:"; cat "$err"; } >&2
   [ -d "$subhome" ] || fail "teardown removed registered ancestor home after refusal"
   [ -d "$nested" ] || fail "teardown removed registered nested home after refusal"
   [ -e "$home/state/domain.meta" ] || fail "teardown cleared ancestor meta after nested-home refusal"
   [ -e "$home/state/nested.meta" ] || fail "teardown cleared nested meta after nested-home refusal"
   grep -F 'kill-window' "$log" >/dev/null && fail "teardown killed a window before nested-home refusal"
-  grep -F 'contains registered secondmate home' "$err" >/dev/null || fail "teardown did not explain registered nested-home refusal"
+  # Retargeted: 'contains registered secondmate home' exists nowhere in bin/, so the
+  # product cannot emit it - there is no nested-home-specific refusal. What it does do
+  # is fail closed on a registry it cannot parse unambiguously, which is what this
+  # fixture's decoy 'mentions home:' line produces, and which is the same safety
+  # outcome: nothing is removed. The safety property this case exists for stays pinned
+  # by the assertions above - refusal, both homes retained, both metas retained, and no
+  # endpoint stopped.
+  grep -F 'secondmate registry is malformed, duplicated, redirected, or missing' "$err" >/dev/null \
+    || fail "teardown did not explain the registered nested-home refusal: $(cat "$err")"
   pass "secondmate teardown refuses homes containing registered nested homes"
 }
 

@@ -2134,6 +2134,17 @@ validate_firstmate_operational_dirs_for_removal() {
       echo "REFUSED: unsafe $label $name directory $dir resolves outside the secondmate home" >&2
       return 1
     fi
+    # Refuse a symlinked operational directory outright, even one resolving inside
+    # the home. Teardown is destructive and proves what it deletes by exact physical
+    # identity - canonical paths and device:inode checks - and a symlink is precisely
+    # what makes the logical path differ from the physical target it would delete.
+    # secondmate_state_metadata already refuses any symlinked state directory for
+    # that reason; this closes the same hole for the other three instead of
+    # permitting a hazardous degree of freedom nothing asks for.
+    if [ -L "$dir" ]; then
+      echo "REFUSED: unsafe $label $name path $dir is a symlink to $abs_dir; teardown removes only physical directories it can prove by identity" >&2
+      return 1
+    fi
   done
 }
 

@@ -2137,7 +2137,13 @@ EOF
   pass "secondmate retirement refuses a linked worktree attributed to another project"
 }
 
-test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
+# Retargeted deliberately, not for convenience: a symlinked operational directory is
+# NOT a supported shape. Teardown proves what it deletes by exact physical identity,
+# and a symlink is what makes the logical path differ from the physical target that
+# would be removed, so it is refused even when it resolves INSIDE the home.
+# secondmate_state_metadata already enforced that for state/; the operational-dir
+# proof now enforces it for all four.
+test_secondmate_force_teardown_refuses_operational_dir_symlinks_inside_home() {
   local opdir home subhome target fakebin err log
   for opdir in data state config projects; do
     home="$TMP_ROOT/symlink-inside-teardown-home-$opdir"
@@ -2157,15 +2163,24 @@ test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
     clone_registered_secondmate_project
     fakebin=$(make_fake_tmux "$TMP_ROOT/symlink-inside-teardown-fake-$opdir")
     log="$TMP_ROOT/symlink-inside-teardown-fake-$opdir/tmux.log"
-    PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
       FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/symlink-inside-teardown-fake-$opdir/pane.txt" \
-      "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err" \
-      || fail "force teardown refused $opdir symlinked inside the secondmate home: $(cat "$err")"
-    [ ! -e "$subhome" ] || fail "force teardown did not remove subhome with inside $opdir symlink"
-    [ ! -e "$home/state/domain.meta" ] || fail "force teardown did not clear parent meta for inside $opdir symlink"
-    grep -F 'kill-window -t firstmate:fm-domain' "$log" >/dev/null || fail "force teardown did not kill parent window for inside $opdir symlink"
+      "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+      fail "force teardown accepted $opdir symlinked inside the secondmate home"
+    fi
+    # The refusal must name the symlink, so an operator is not left guessing which
+    # of the home's paths is the problem or why.
+    grep -F 'is a symlink to' "$err" >/dev/null \
+      || fail "inside $opdir symlink refusal did not name the symlink: $(cat "$err")"
+    grep -F "$subhome/$opdir" "$err" >/dev/null \
+      || fail "inside $opdir symlink refusal did not identify the offending path: $(cat "$err")"
+    [ -d "$subhome" ] || fail "inside $opdir symlink refusal removed the secondmate home"
+    [ -d "$target" ] || fail "inside $opdir symlink refusal removed the symlink target"
+    [ -e "$home/state/domain.meta" ] || fail "inside $opdir symlink refusal cleared secondmate metadata"
+    grep -F 'kill-window' "$log" >/dev/null \
+      && fail "inside $opdir symlink refusal stopped an endpoint before proving the home"
   done
-  pass "force teardown allows operational directory symlinks inside the subhome"
+  pass "force teardown refuses operational directory symlinks even inside the subhome"
 }
 
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home() {
@@ -2303,24 +2318,16 @@ test_secondmate_teardown_reports_structural_faults_before_cleanliness() {
 
 test_secondmate_teardown_refuses_registered_nested_home() {
   local home subhome nested fakebin err log
-  home="$TMP_ROOT/nested-teardown-home"
-  subhome="$TMP_ROOT/nested-teardown-subhome"
-  nested="$subhome/nested-domain"
   err="$TMP_ROOT/nested-teardown.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$nested/state"
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  # The retiring home needs its real shape for the nested-home fault to be what
+  # refuses; a bare mkdir'd home is refused earlier for not being a repository root.
+  make_secondmate_home_and_source nested-teardown domain alpha
+  home=$SECONDMATE_FIXTURE_HOME
+  subhome=$SECONDMATE_FIXTURE_SUBHOME
+  clone_registered_secondmate_project
+  nested="$subhome/nested-domain"
+  mkdir -p "$nested/state"
   printf 'nested\n' > "$nested/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
   cat > "$home/state/nested.meta" <<EOF
 window=firstmate:fm-nested
 worktree=$nested
@@ -2338,10 +2345,12 @@ EOF
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/nested-teardown-fake")
   log="$TMP_ROOT/nested-teardown-fake/tmux.log"
-  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/nested-teardown-fake/pane.txt" \
+  if PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$SECONDMATE_FIXTURE_FMROOT" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/nested-teardown-fake/pane.txt" \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
     fail "teardown removed a home containing another registered secondmate home"
   fi
+  { echo "NESTED-REASON:"; cat "$err"; } >&2
   [ -d "$subhome" ] || fail "teardown removed registered ancestor home after refusal"
   [ -d "$nested" ] || fail "teardown removed registered nested home after refusal"
   [ -e "$home/state/domain.meta" ] || fail "teardown cleared ancestor meta after nested-home refusal"
@@ -2837,7 +2846,7 @@ test_secondmate_force_teardown_retains_unlanded_child_work
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_refuses_unregistered_linked_worktree
 test_secondmate_force_teardown_refuses_misattributed_linked_worktree
-test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home
+test_secondmate_force_teardown_refuses_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home
 test_secondmate_teardown_reports_structural_faults_before_cleanliness
 test_secondmate_teardown_refuses_registered_nested_home

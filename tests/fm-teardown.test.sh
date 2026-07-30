@@ -2630,6 +2630,7 @@ setup_forced_secondmate_child_case() {
   FORCED_CHILD_PROJECT="$FORCED_CHILD_CASE_DIR/child-project"
   FORCED_CHILD_WORKTREE="$FORCED_CHILD_CASE_DIR/child-worktree"
   FORCED_CHILD_PARENT_LIVE="$FORCED_CHILD_CASE_DIR/parent-live"
+  FORCED_CHILD_LIVE="$FORCED_CHILD_CASE_DIR/child-live"
   prepare_secondmate_home_fixture "$FORCED_CHILD_CASE_DIR"
   fm_write_meta "$FORCED_CHILD_CASE_DIR/state/task-x1.meta" \
     'window=fm-task-x1' \
@@ -2641,22 +2642,59 @@ setup_forced_secondmate_child_case() {
     "home=$FORCED_CHILD_CASE_DIR/wt"
   fm_git_worktree "$FORCED_CHILD_PROJECT" "$FORCED_CHILD_WORKTREE" child-branch
   write_treehouse_lease "$FORCED_CHILD_WORKTREE" "firstmate-$child_id"
+  # window= plus tmux_session_target= mirrors what bin/fm-spawn.sh persists for a
+  # real tmux endpoint (T="$SES:$W"). Without a session-scoped handle
+  # fm_backend_target_state has nothing to scope `tmux list-windows` to and can
+  # only ever answer `unknown`, so the child endpoint would be unresolvable no
+  # matter what the stub replied.
   fm_write_meta "$FORCED_CHILD_CASE_DIR/wt/state/$child_id.meta" \
     "window=fm-$child_id" \
+    "tmux_session_target=firstmate:fm-$child_id" \
     "worktree=$FORCED_CHILD_WORKTREE" \
     "project=$FORCED_CHILD_PROJECT" \
     'kind=ship' \
     'mode=local-only'
   : > "$FORCED_CHILD_PARENT_LIVE"
-  cat > "$FORCED_CHILD_CASE_DIR/fakebin/tmux" <<'SH'
-#!/usr/bin/env bash
+  : > "$FORCED_CHILD_LIVE"
+  # Parent and child are independent endpoints, so the stub answers per target
+  # and each stays observable until its own kill-window lands.
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf 'child_live=%s\n' "$(printf '%q' "$FORCED_CHILD_LIVE")"
+    printf 'child_label=%s\n' "$(printf '%q' "fm-$child_id")"
+    cat <<'SH'
+live_marker() {
+  case "$*" in
+    *fm-task-x1*) printf '%s' "$FM_FAKE_PARENT_LIVE" ;;
+    *"$child_label"*) printf '%s' "$child_live" ;;
+  esac
+}
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_PARENT_LIVE" ]; exit $? ;;
+  display-message)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
-  kill-window) rm -f "$FM_FAKE_PARENT_LIVE"; exit 0 ;;
+  list-windows)
+    [ ! -f "$FM_FAKE_PARENT_LIVE" ] || printf '%s\n' fm-task-x1
+    [ ! -f "$child_live" ] || printf '%s\n' "$child_label"
+    exit 0
+    ;;
+  kill-window)
+    case "$*" in
+      *fm-task-x1*) rm -f "$FM_FAKE_PARENT_LIVE" ;;
+      *"$child_label"*) rm -f "$child_live" ;;
+    esac
+    exit 0
+    ;;
 esac
 exit 0
 SH
+  } > "$FORCED_CHILD_CASE_DIR/fakebin/tmux"
   chmod +x "$FORCED_CHILD_CASE_DIR/fakebin/tmux"
 }
 

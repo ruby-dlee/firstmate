@@ -4713,8 +4713,10 @@ test_secondmate_retirement_serializes_child_spawn() {
   case_dir=$(make_case secondmate-retirement-child-race)
   prepare_secondmate_home_fixture "$case_dir"
   write_secondmate_meta "$case_dir"
-  child_project="$case_dir/wt/projects/child-project"
-  fm_git_init_commit "$child_project"
+  # Spawn the child into the home's ALREADY REGISTERED project clone. Adding a
+  # second, unregistered clone under the home makes retirement refuse for a
+  # registration mismatch before it reaches the quiescence boundary this case races.
+  child_project="$case_dir/wt/projects/test"
   mkdir -p "$case_dir/wt/data/child"
   printf '%s\n' 'Do bounded child work.' > "$case_dir/wt/data/child/brief.md"
   cat > "$case_dir/fakebin/tmux" <<'SH'
@@ -4723,7 +4725,13 @@ state="$(dirname "$0")/.tmux-live"
 started="$(dirname "$0")/.retirement-started"
 release="$(dirname "$0")/.retirement-release"
 case "${1:-}" in
-  display-message) [ -f "$state" ]; exit $? ;;
+  display-message)
+    [ -f "$state" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1; exit 0 ;;
   kill-window)
     : > "$started"
@@ -4754,7 +4762,7 @@ SH
   FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
   FM_SPAWN_NO_GUARD=1 \
   PATH="$case_dir/fakebin:$PATH" \
-    "$ROOT/bin/fm-spawn.sh" child child-project claude \
+    "$ROOT/bin/fm-spawn.sh" child test claude \
       > "$case_dir/spawn-stdout" 2> "$case_dir/spawn-stderr"
   spawn_rc=$?
   set -e

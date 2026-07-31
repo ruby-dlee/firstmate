@@ -86,12 +86,12 @@ test_hostile_bash_env_cannot_replace_guard() {
   hostile="$TMPDIR/hostile-bash-env"
   marker="$TMPDIR/hostile-bash-env-ran"
   printf 'printf hostile > %q\n' "$marker" > "$hostile"
-  out=$(BASH_ENV="$hostile" bash -c 'printf "%s" "$BASH_ENV"')
+  out=$(BASH_ENV="$hostile" "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
   [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore the guard: $out"
   [ ! -e "$marker" ] || fail "hostile BASH_ENV executed before the isolation guard"
-  out=$(env -u BASH_ENV bash -c 'printf "%s" "$BASH_ENV"')
+  out=$(env -u BASH_ENV "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
   [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore an unset guard: $out"
-  bash -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
+  "$FM_TEST_BASH" -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
   pass "test isolation: hostile BASH_ENV cannot replace the child-shell guard"
 }
 
@@ -99,9 +99,9 @@ test_direct_execution_is_inert() {
   local out status=0
   # shellcheck disable=SC2016  # $1 is expanded by the child shell.
   out=$(env -u BASH_ENV -u FM_TEST_SEALED -u FM_TEST_SANDBOX_ROOT \
-    "$FM_TEST_REAL_BASH" -c '. "$1"' _ "$ROOT/tests/lib.sh" 2>&1) || status=$?
+    "$FM_TEST_BASH" -c '. "$1"' _ "$ROOT/tests/lib.sh" 2>&1) || status=$?
   [ "$status" -eq 97 ] || fail "direct test guard returned $status instead of 97: $out"
-  assert_contains "$out" 'test was not launched through tests/run-test.sh' \
+  assert_contains "$out" 'sealed Bash launcher is not configured' \
     "direct test guard did not name the required entry point"
   pass "test isolation: direct test execution fails before loading fleet helpers"
 }

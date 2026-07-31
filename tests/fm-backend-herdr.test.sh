@@ -369,7 +369,7 @@ BEGIN { open my \$fh, '>', '$marker' or die \$!; print {\$fh} "PERL5OPT\n"; clos
 PERL
   PATH="$fb" PERL5OPT=-MBridgeHerdrEvil PERL5LIB="$perl_lib" PERLLIB="$perl_lib" \
     DYLD_INSERT_LIBRARIES="$dir/not-a-library" LD_PRELOAD="$dir/not-a-library" \
-    FM_HERDR_DETACH_MARKER="$launched" /bin/bash -c '
+    FM_HERDR_DETACH_MARKER="$launched" "$FM_TEST_BASH" -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_server_launch_detached fmtest || exit 1
       attempt=1
@@ -416,7 +416,7 @@ printf 'TOOL\t%s\n' "$(/bin/sh -c bridge-worker-tool)" >> "$tmp"
 SH
   chmod 755 "$safe/bridge-worker-tool" "$unsafe/bridge-worker-tool" "$fb/herdr"
 
-  PATH="$unsafe:$safe:$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$marker" /bin/bash -c '
+  PATH="$unsafe:$safe:$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$marker" "$FM_TEST_BASH" -c '
     . "$0/bin/backends/herdr.sh"
     fm_backend_herdr_server_launch_detached fmtest || exit 1
     attempt=1
@@ -470,7 +470,7 @@ SH
   result=$(PATH="$fb:/usr/bin:/bin" FM_HERDR_DETACH_MARKER="$server_marker" \
     FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
-    FM_TEST_HERDR_PS_BIN="$ps_fake" /bin/bash --noprofile --norc -c '
+    FM_TEST_HERDR_PS_BIN="$ps_fake" "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_server_launch_detached fmtest || exit 1
       for _attempt in $(seq 1 100); do
@@ -534,7 +534,7 @@ SH
   done
   if PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 FM_TEST_HERDR_PS_BIN="$ps_fake" \
-    /bin/bash --noprofile --norc -c \
+    "$FM_TEST_BASH" --noprofile --norc -c \
       '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_closed_shell_environment_ready fmtest' \
       "$ROOT" >/dev/null 2>&1; then
     fail "dead certified Herdr server retained closed-shell authority"
@@ -574,7 +574,7 @@ SH
       FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
       FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
-      /bin/bash --noprofile --norc -c '
+      "$FM_TEST_BASH" --noprofile --norc -c '
         . "$0/bin/backends/herdr.sh"
         fm_backend_herdr_server_launch_detached "$1" || exit 1
         for _attempt in $(seq 1 100); do
@@ -595,7 +595,7 @@ SH
     PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
       FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
-      /bin/bash --noprofile --norc -c \
+      "$FM_TEST_BASH" --noprofile --norc -c \
         '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_closed_shell_environment_ready "$1"' \
         "$ROOT" "$fixture_session"
   }
@@ -670,7 +670,7 @@ SH
   chmod 755 "$ps_fake"
   result=$(FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
-    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" /bin/bash --noprofile --norc -c '
+    FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       printf "%s\n%s\n%s\n" \
         "$(fm_backend_herdr_managed_config_path fm-candidates)" \
@@ -701,7 +701,7 @@ SH
   FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_artifact_recover_candidates "$1" 0600
       fm_backend_herdr_artifact_recover_candidates "$2" 0600
@@ -728,7 +728,7 @@ SH
     FM_TEST_HERDR_ARTIFACT_REMOVE_TARGET="$raced_config" \
     FM_TEST_HERDR_ARTIFACT_REMOVE_READY="$ready" \
     FM_TEST_HERDR_ARTIFACT_REMOVE_PROCEED="$proceed" \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_artifact_recover_candidates "$1" 0600
     ' "$ROOT" "$config" >/dev/null 2>&1 &
@@ -817,7 +817,7 @@ SH
       FM_TEST_HERDR_ARTIFACT_PAIR_TARGET="${FM_TEST_HERDR_ARTIFACT_PAIR_TARGET:-}" \
       FM_TEST_HERDR_ARTIFACT_PAIR_READY="${FM_TEST_HERDR_ARTIFACT_PAIR_READY:-}" \
       FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED="${FM_TEST_HERDR_ARTIFACT_PAIR_PROCEED:-}" \
-      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+      "$FM_TEST_BASH" --noprofile --norc -c "$program" "$ROOT" "$@"
   }
 
   # Helper: kill immediately after no-replace link publication, then converge
@@ -1104,7 +1104,7 @@ SH
       FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE_MKDIR:-}" \
       FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_QUARANTINE:-}" \
       FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK="${FM_TEST_HERDR_KILL_AFTER_ARTIFACT_UNLINK:-}" \
-      /bin/bash --noprofile --norc -c "$program" "$ROOT" "$@"
+      "$FM_TEST_BASH" --noprofile --norc -c "$program" "$ROOT" "$@"
   }
   write_dead_candidate() {
     printf '999999\nMon Jan  1 00:00:00 2024\n%s\n' "${1##*.candidate.}" > "$1"
@@ -1336,7 +1336,7 @@ SH
     PATH="$fb:/usr/bin:/bin" FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
       FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
       FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" OLD_PID="$old_pid" \
-      /bin/bash --noprofile --norc -c '
+      "$FM_TEST_BASH" --noprofile --norc -c '
         . "$0/bin/backends/herdr.sh"
         key=$(fm_backend_herdr_server_lock_key "$1") || exit 1
         certificate=$(fm_backend_herdr_server_legacy_env_certificate_path "$1") || exit 1
@@ -1370,7 +1370,7 @@ SH
     FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
     FM_BACKEND_HERDR_LAUNCH_SETTLE=0.01 HERDR_SESSION=fm-empty \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_server_ensure fm-empty || exit 1
       fm_backend_herdr_server_closed_shell_environment_ready fm-empty
@@ -1419,7 +1419,7 @@ SH
     FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
     HERDR_SESSION=fm-occupied \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_container_ensure "$PWD"
     ' "$ROOT" 2>&1); then status=0; else status=$?; fi
@@ -1465,7 +1465,7 @@ SH
     FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_PS_BIN="$ps_fake" FM_TEST_HERDR_MANAGED_SHELL_SOURCE="$source" \
     HERDR_SESSION=fm-indeterminate \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       fm_backend_herdr_container_ensure "$PWD"
     ' "$ROOT" 2>&1); then status=0; else status=$?; fi
@@ -3586,7 +3586,7 @@ test_scripts_route_explicit_target_through_meta_backend() {
   owner_pid=$!
   FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 OWNER_PID="$owner_pid" \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       key=$(fm_backend_herdr_server_lock_key default) || exit 1
       certificate=$(fm_backend_herdr_server_legacy_env_certificate_path default) || exit 1
@@ -3685,7 +3685,7 @@ test_repeated_cycles_reuse_one_workspace_no_orphans() {
   # process; leaving it absent would make best-effort kill correctly no-op.
   owner_pid=$$
   FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" OWNER_PID="$owner_pid" \
-    /bin/bash --noprofile --norc -c '
+    "$FM_TEST_BASH" --noprofile --norc -c '
       . "$0/bin/backends/herdr.sh"
       key=$(fm_backend_herdr_server_lock_key fmtest) || exit 1
       certificate=$(fm_backend_herdr_server_legacy_env_certificate_path fmtest) || exit 1
@@ -4206,7 +4206,7 @@ test_wait_transition_bad_ack_returns_2_and_cleans_up() {
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
   result=$(PATH="$fb:$PATH" TMPDIR="$temp" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
     FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" FM_FAKE_READER_ACK=invalid \
-    /bin/bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; rc=$?; [ -e /dev/fd/9 ] && fd_open=yes || fd_open=no; printf "%s %s\n" "$rc" "$fd_open"' "$ROOT" "$state")
+    "$FM_TEST_BASH" -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; rc=$?; [ -e /dev/fd/9 ] && fd_open=yes || fd_open=no; printf "%s %s\n" "$rc" "$fd_open"' "$ROOT" "$state")
   rc=${result%% *}; fd_open=${result#* }
   [ "$rc" = 2 ] || fail "an invalid subscription acknowledgement must return 2, got $rc"
   [ "$fd_open" = no ] || fail "an invalid subscription acknowledgement must close fixed fd 9"
@@ -4222,7 +4222,7 @@ test_wait_transition_clean_timeout_returns_1() {
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"   # no events, reader exits 0
   result=$(PATH="$fb:$PATH" TMPDIR="$temp" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
     FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" \
-    /bin/bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; rc=$?; [ -e /dev/fd/9 ] && fd_open=yes || fd_open=no; printf "%s %s\n" "$rc" "$fd_open"' "$ROOT" "$state")
+    "$FM_TEST_BASH" -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; rc=$?; [ -e /dev/fd/9 ] && fd_open=yes || fd_open=no; printf "%s %s\n" "$rc" "$fd_open"' "$ROOT" "$state")
   rc=${result%% *}; fd_open=${result#* }
   [ "$rc" = 1 ] || fail "a clean full-budget wait with no actionable edge must return 1, got $rc"
   [ "$fd_open" = no ] || fail "a clean timeout must close fixed fd 9"

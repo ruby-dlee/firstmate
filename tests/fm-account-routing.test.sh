@@ -5402,7 +5402,7 @@ PERL
 printf 'BASH_ENV injection executed\n' > '$perl_marker'
 SH
   out=$(PATH="$fakebin" PERL5OPT=-MBridgeFleetEvil PERL5LIB="$perl_lib" \
-    PERLLIB="$perl_lib" FM_PERL_INJECTION_MARKER="$perl_marker" /bin/bash -c \
+    PERLLIB="$perl_lib" FM_PERL_INJECTION_MARKER="$perl_marker" "$FM_TEST_BASH" -c \
     '. "$1"
      export LD_PRELOAD=/tmp/hostile.so DYLD_INSERT_LIBRARIES=/tmp/hostile.dylib
      export NODE_OPTIONS="--require /tmp/hostile-node.js" PYTHONPATH=/tmp/hostile-python
@@ -5411,7 +5411,7 @@ SH
      selected=$(fm_account_json_field "$3" "$4" selection) || exit 1
      lock=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 fm_account_meta_lock_acquire "$5" hostile-tools) || exit 1
      fm_account_meta_lock_release "$lock" || exit 1
-     fm_account_system_exec /bin/bash -c '\''printf "%s|%s|%s|%s|%s\n" "${LD_PRELOAD-}" "${DYLD_INSERT_LIBRARIES-}" "${NODE_OPTIONS-}" "${PYTHONPATH-}" "${BASH_ENV-}" > "$FM_LOADER_ENV_LOG"'\'' || exit 1
+     fm_account_system_exec "$FM_TEST_BASH" -c '\''printf "%s|%s|%s|%s|%s\n" "${LD_PRELOAD-}" "${DYLD_INSERT_LIBRARIES-}" "${NODE_OPTIONS-}" "${PYTHONPATH-}" "${BASH_ENV-}" > "$FM_LOADER_ENV_LOG"'\'' || exit 1
      printf "%s\n%s\n" "$binary" "$selected"' \
     _ "$ROOT/bin/fm-account-routing-lib.sh" "$safe" '{"profile":"claude-1"}' \
     '.profile | select(type == "string" and length > 0)' "$lock_state" "$bash_env" "$loader_env") \
@@ -5510,7 +5510,7 @@ PERL
 SH
 
   # shellcheck disable=SC2016  # Dollar expressions belong to the nested shell.
-  out=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB /bin/bash --noprofile --norc -c '
+  out=$(env -u FM_ACCOUNT_ROUTING_TEST_LAB "$FM_TEST_BASH" --noprofile --norc -c '
     . "$1"
     export AGENT_FLEET_CONFIG=/tmp/hostile-config
     export AGENT_FLEET_STATE_DIR=/tmp/hostile-state
@@ -5850,7 +5850,7 @@ SH
 kill -TERM $$
 SH
     chmod +x "$fakebin/signaled"
-    if PATH="$fakebin" /bin/bash -c '. "$1"; fm_account_run_bounded 3 "$2"' \
+    if PATH="$fakebin" "$FM_TEST_BASH" -c '. "$1"; fm_account_run_bounded 3 "$2"' \
       _ "$ROOT/bin/fm-account-routing-lib.sh" "$fakebin/signaled"; then
       status=0
     else

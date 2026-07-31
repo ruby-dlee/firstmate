@@ -73,7 +73,8 @@ A Lavish board is a live surface, so reconcile it against live fleet state befor
 - Never navigate, reload, re-serve, or end it, never edit the file behind it, and never run browser automation against that window, including a read-only snapshot.
 - Verification with `chrome-devtools-axi` belongs before the board is surfaced; once the captain has it, the window is off limits too.
 - The test before any action is whether it could change what is on the captain's screen right now; if it could and their input may be unsubmitted, do not do it.
-- Answer preservation outranks the serve-fresh rule: a board showing slightly stale state costs one correction, while a cleared board costs the captain's answers outright.
+- Answer preservation takes precedence over the serve-fresh rule while the captain has unsubmitted input; a board showing slightly stale state costs one correction, while a cleared board costs the captain's answers outright.
+- Never edit, refresh, or reload a served board while the captain is answering because doing so clears in-progress input.
 - Fix a problem with a live board server-side or not at all; a per-request option such as `?no-gate=1` is safe because it changes only what a fresh request renders, whereas re-serving or editing the file is not.
 - After submission, reconcile and refresh before continuing; if freshness must be preserved sooner, use only a strategy proven to retain the captain's current input without editing, refreshing, or reloading the served board.
 - When poll feedback arrives, write every annotation to the chosen durable file immediately, before interpreting it, acting on it, or doing anything else.

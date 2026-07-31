@@ -36,6 +36,7 @@ mkdir -p "$user_home/.treehouse" "$fm_home/state" "$fm_home/data" \
 guard_ps=$(command -v ps) || { printf 'test isolation requires ps\n' >&2; exit 69; }
 guard_awk=$(command -v awk) || { printf 'test isolation requires awk\n' >&2; exit 69; }
 guard_tr=$(command -v tr) || { printf 'test isolation requires tr\n' >&2; exit 69; }
+guard_real_bash=$(command -v bash) || { printf 'test isolation requires bash\n' >&2; exit 69; }
 case "$(uname -s)" in
   Darwin) guard_real_kill=/bin/kill ;;
   *) guard_real_kill=/usr/bin/kill ;;
@@ -59,7 +60,11 @@ export FM_TEST_GUARD_AWK=$guard_awk
 export FM_TEST_GUARD_TR=$guard_tr
 export FM_TEST_GUARD_REAL_KILL=$guard_real_kill
 export FM_TEST_GUARD_KILL_WRAPPER=$TEST_DIR/test-kill-guard.sh
-export BASH_ENV=$TEST_DIR/test-env-guard.sh
+export FM_TEST_GUARD_ENV=$TEST_DIR/test-env-guard.sh
+export FM_TEST_REAL_BASH=$guard_real_bash
+export FM_TEST_BASH=$TEST_DIR/test-bash.sh
+export BASH_ENV=$FM_TEST_GUARD_ENV
+export PATH=$TEST_DIR/sealed-bin:$PATH
 unset FM_ROOT_OVERRIDE FM_DATA_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE \
   FM_CHECKOUT_REFRESH_STATE_ROOT FM_CHECKOUT_REFRESH_LOCK_ROOT FM_REPORT_STACK_ROOT \
   FM_ACCOUNT_DIRECTORY_ROOT FM_ACCOUNT_DIRECTORY_STATE_ROOT \

@@ -416,11 +416,11 @@ command() {
 SH
     if [ "$mode" = configured ]; then
       printf '%s\n' herdr > "$home/config/backend"
-      out=$(TMUX='' HERDR_ENV='' BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+      out=$(TMUX='' HERDR_ENV='' FM_TEST_BASH_ENV_PAYLOAD="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
       assert_not_contains "$out" "NOTICE: auto-detected herdr runtime" \
         "an explicit Herdr home should not be reported as auto-detected"
     else
-      out=$(TMUX='' HERDR_ENV=1 BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+      out=$(TMUX='' HERDR_ENV=1 FM_TEST_BASH_ENV_PAYLOAD="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
       assert_contains "$out" "NOTICE: auto-detected herdr runtime (HERDR_ENV=1)" \
         "session start did not preserve the Herdr runtime auto-detection fallback"
     fi

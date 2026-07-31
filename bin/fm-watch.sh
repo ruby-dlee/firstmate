@@ -718,10 +718,8 @@ write_backlog_ready_snapshot() {  # <ready-ids>
 
 # Print only IDs newly present in tasks-axi's ready view since the last heartbeat.
 # An absent snapshot establishes a baseline instead of waking for the whole queue.
-backlog_ready_additions() {
-  local marker="$STATE/.backlog-ready-ids" current previous added
-  fm_tasks_axi_backend_available "$CONFIG" || return 1
-  current=$(fm_tasks_axi_ready_ids "$DATA/backlog.md") || return 1
+backlog_ready_additions() {  # <current-ready-ids>
+  local current=$1 marker="$STATE/.backlog-ready-ids" previous added
   if ! safe_marker_path "$marker"; then
     safe_touch_marker_or_log "$marker" "backlog-ready snapshot" || true
     return 1
@@ -738,12 +736,6 @@ backlog_ready_additions() {
     return 1
   fi
   printf '%s\n' "$added" | paste -sd ' ' -
-}
-
-refresh_backlog_ready_snapshot() {
-  local current
-  current=$(fm_tasks_axi_ready_ids "$DATA/backlog.md") || return 1
-  write_backlog_ready_snapshot "$current"
 }
 
 marker_due() {  # <path> <interval-seconds> <label>
@@ -1278,9 +1270,12 @@ EOF
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
+    current_ready_ids=
     ready_ids=
     ready_changed=0
-    if ready_ids=$(backlog_ready_additions); then
+    if fm_tasks_axi_backend_available "$CONFIG" \
+      && current_ready_ids=$(fm_tasks_axi_ready_ids "$DATA/backlog.md") \
+      && ready_ids=$(backlog_ready_additions "$current_ready_ids"); then
       ready_changed=1
     fi
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
@@ -1295,13 +1290,13 @@ EOF
       fi
       fm_wake_append heartbeat heartbeat "$reason" || exit 1
       safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
-      [ "$ready_changed" -eq 0 ] || refresh_backlog_ready_snapshot || true
+      [ "$ready_changed" -eq 0 ] || write_backlog_ready_snapshot "$current_ready_ids" || true
       wake "$reason"
     elif [ "$ready_changed" -eq 1 ]; then
       reason="heartbeat: dependency-cleared queued work: $ready_ids"
       fm_wake_append heartbeat backlog-ready "$reason" || exit 1
       safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
-      refresh_backlog_ready_snapshot || true
+      write_backlog_ready_snapshot "$current_ready_ids" || true
       wake "$reason"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.

@@ -1530,6 +1530,10 @@ if [ "${1:-}" = ready ]; then
     [ -n "$id" ] || continue
     printf '  %s,queued,ship,firstmate,"Ready task"\n' "$id"
   done < "$FM_FAKE_READY_IDS_FILE"
+  if [ "${FM_FAKE_MUTATE_READY_AFTER_READ:-0}" = 1 ] \
+    && grep -Fx follow-up "$FM_FAKE_READY_IDS_FILE" >/dev/null; then
+    printf '%s\n' baseline later > "$FM_FAKE_READY_IDS_FILE"
+  fi
   exit 0
 fi
 exit 1
@@ -1538,6 +1542,7 @@ SH
 
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
     FM_CONFIG_OVERRIDE="$config" FM_FAKE_READY_IDS_FILE="$ready_ids" \
+    FM_FAKE_MUTATE_READY_AFTER_READ=1 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_HEARTBEAT_MAX=1 \
     "$WATCH" > "$out" &
   pid=$!
@@ -1552,7 +1557,9 @@ SH
     || fail "drain after backlog-ready heartbeat failed"
   grep -F 'dependency-cleared queued work: follow-up' "$drain_out" >/dev/null \
     || fail "backlog-ready heartbeat was not queued durably"
-  pass "heartbeat surfaces only newly-ready backlog work after its baseline changes"
+  [ "$(cat "$state/.backlog-ready-ids")" = "$(printf '%s\n' baseline follow-up)" ] \
+    || fail "heartbeat did not persist the ready snapshot used for detection"
+  pass "heartbeat surfaces and persists the observed newly-ready backlog snapshot"
 }
 
 # --- beacon stays fresh while absorbing -------------------------------------
@@ -1787,6 +1794,11 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = failure-pause ]; then
   test_failure_pause_is_failure_classifier
   test_failure_pause_stale_surfaced_not_absorbed
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = backlog-ready-snapshot ]; then
+  test_heartbeat_surfaces_newly_ready_backlog_work
   exit 0
 fi
 

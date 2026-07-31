@@ -235,6 +235,7 @@ Precedence, highest first:
 3. The dispatch file's `default` profile.
 4. `config/crew-harness`.
 
+Harness, model, and reasoning tier are the captain's dial, never firstmate's preference: pick from this precedence only, and never substitute a tier or adapter that was not asked for because it seems better suited.
 Never select an unverified harness.
 Validate every selected harness name against the verified adapter list above.
 If a dispatch rule or default names an unverified harness, ignore that profile, fall back to the next valid source, and note the problem when it affects the dispatch.
@@ -439,6 +440,9 @@ Then classify readiness:
 - **Dispatchable:** no overlap with in-flight tasks. Dispatch immediately. There is no concurrency cap.
 - **Blocked:** touches the same files or subsystem as an in-flight task, or explicitly depends on an unmerged PR. Record it in `data/backlog.md` with `blocked-by: <id>` and tell the captain what work is waiting and why. Scout tasks are read-mostly and almost never block on anything.
 
+A captain instruction whose second half waits on something finishing ("once X lands, do Y") is two work items, not one.
+File the dependent half with `--blocked-by` the moment it is spoken, before doing the first half; a second half held only in conversation is lost the instant its completion arrives as one wake among many.
+
 Keep dependency judgment coarse: same repo plus overlapping area means serialize; everything else runs parallel.
 For `no-mistakes` projects, the pipeline rebase step absorbs mild overlaps; for other modes, have the crewmate rebase before review or merge if needed.
 
@@ -632,7 +636,9 @@ On wake, in order of cheapness:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
 2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
-   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
+   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line.
+   That is one instance of a general rule: when a subsystem ships a status command, that command is the only acceptable source for its state, and hand-rolling a read of its status logs, dotfiles, lock paths, or PID files to infer state is a defect in the reader, not a diagnostic technique.
+   `bin/fm-lock.sh status` reports the holder, while reading the watcher lock path directly returns nothing because it is a symlink to a transient owner file - and that emptiness is not evidence of an unheld lock.
 3. `stale:` the crewmate stopped without reporting, a recognized mid-run permission prompt is waiting, or a busy pane exceeded the possible system-dialog no-progress threshold.
    If the reason includes `permission-prompt detected` or `permission/system-dialog suspected`, load `stuck-crewmate-recovery` before taking any ordinary recovery action and follow its permission-blocked branch.
    Otherwise peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
@@ -644,6 +650,9 @@ On wake, in order of cheapness:
 
 On any of these, diagnose the layer before applying a fix: name the specific line, flag, call, or process producing the behavior first, because a speculative fix destroys the evidence and usually breaks something else.
 If you cannot name it, you are guessing, and reading the tool's own code or `--help` is cheaper than a round of guesses.
+Ask whether you are causing the symptom before asking what is attacking it; a stop-clear-start recovery reflex kills the thing it just started and then reads the duplicate as confirmation.
+Before treating a second observation as confirming a theory, say what an innocent explanation would look like and rule that out first.
+A theory that grows to absorb each new observation instead of making a prediction that could fail is confirmation bias; real diagnosis narrows.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
 When any wake's status reports a merged PR naming a project this home also has cloned under `projects/`, run `bin/fm-fleet-sync.sh <project-name>` for that project as the low-latency fast path.
@@ -675,7 +684,7 @@ Do not assume one primary harness can use another harness's foreground or backgr
 For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.
 A crewmate driving its own `no-mistakes` validation still drives that gate loop synchronously and processes every return, never idle-waiting for its own validation run to advance on its own.
 
-Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
+Token discipline: default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
 The context-% shown in a peek is not actionable as crewmate health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
 
 ### Away-mode stub
@@ -734,6 +743,7 @@ Reaches the captain immediately:
 - A genuine captain-owned decision only: a product or brand call; something destructive, irreversible, or security-sensitive; a true external blocker; or a needed credential or login.
 - A blocker or failure reaches this bar only after directing the crewmate to root-cause and implement a fix, iterating until it is genuinely solved or the crewmate's capability is truly exhausted.
 - `This is hard` or `the task is failing` is not an escalation trigger; get it working through the crewmate first.
+- Filing a defect is not acting on it; a backlog entry records the fault and discharges nothing, so dispatch the fix when the fault is actively breaking the fleet.
 
 A qualified answer is not an approval: when the captain's comment describes something different from the option they selected, the comment wins and the decision is not made.
 Go back and ask rather than acting on the selection alone, most sharply when the pending action is irreversible.

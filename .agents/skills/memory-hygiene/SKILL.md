@@ -32,6 +32,10 @@ Learnings must live where they are read, so this is the first decision on every 
 ## Entry standard
 
 - Record only the actionable rule or durable fact.
+- Never record an inference as a capability fact.
+  An entry asserting a limit - "cannot", "impossible", "structural" - must cite the exact command and output that proved it, or it does not go in.
+- Never write "do not retry" or any equivalent into an entry, because that clause suppresses the one action that would disprove a wrong limit.
+  Capability claims decay as configs and permissions change, so every limit stays re-checkable by design.
 - Strip emotion, emphasis, interpersonal interpretation, and incident drama.
 - Do not preserve that anyone was furious, shocked, disappointed, emphatic, or otherwise emotionally affected.
 - Preserve the operational instruction or evidence-backed fact that remains after the mood is removed.
@@ -73,6 +77,7 @@ It drops mood, drama, chronology, and commentary that do not change the rule.
 Reject the update if any answer is yes:
 
 - Is it a general rule that belongs in `AGENTS.md` or a skill that loads at the triggering moment?
+- Does it assert a limit without citing the command and output that proved it, or tell a future session not to re-check?
 - Does it describe emotion or intensity instead of changing future action?
 - Does it retell an incident beyond one short example or pointer?
 - Does another entry already own the same rule or fact?

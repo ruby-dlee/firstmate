@@ -7,6 +7,7 @@ set -u
 
 GUARD="$ROOT/tests/test-env-guard.sh"
 RUNNER="$ROOT/tests/run-test.sh"
+SUITE="$ROOT/tests/run.sh"
 
 test_every_entry_sources_the_shared_harness() {
   local test_script missing=
@@ -127,6 +128,11 @@ test_hostile_bash_env_cannot_replace_guard() {
   [ "$status" -eq 0 ] || fail "sealed runner rejected safe entry under hostile ambient BASH_ENV: $out"
   assert_contains "$out" 'runner-entry-probe-ok' "sealed runner did not execute its guarded probe"
   [ ! -e "$marker" ] || fail "sealed runner sourced hostile ambient BASH_ENV"
+  status=0
+  out=$(BASH_ENV="$hostile" "$SUITE" tests/runner-entry-probe.test.sh 2>&1) || status=$?
+  [ "$status" -eq 0 ] || fail "public suite entry rejected safe execution under hostile ambient BASH_ENV: $out"
+  assert_contains "$out" 'runner-entry-probe-ok' "public suite entry did not execute its guarded probe"
+  [ ! -e "$marker" ] || fail "public suite entry sourced hostile ambient BASH_ENV"
   "$FM_TEST_BASH" -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
   pass "test isolation: hostile BASH_ENV cannot replace the child-shell guard"
 }
@@ -151,6 +157,7 @@ test_runner_exports_a_complete_sandbox() {
   [ "$FM_TREEHOUSE_ROOT" = "$HOME/.treehouse" ] \
     || fail "runner did not align Treehouse CLI and firstmate pool roots"
   assert_present "$RUNNER" "single-test sealed runner is missing"
+  assert_present "$SUITE" "public sealed suite entry is missing"
   assert_present "$GUARD" "test environment guard is missing"
   pass "test isolation: runner exports a complete private HOME/FM_HOME/state/pool world"
 }

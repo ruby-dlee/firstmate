@@ -2,7 +2,7 @@
 
 Firstmate behavior tests must run through `tests/run.sh`.
 
-That suite entry creates a fresh sandbox for each `tests/*.test.sh` file and delegates to `tests/run-test.sh`.
+That POSIX-shell suite entry discards ambient `BASH_ENV`, creates a fresh sandbox for each `tests/*.test.sh` file, and delegates to the internal `tests/run-test.sh` helper.
 The per-test runner exports a private `HOME`, `FM_HOME`, `FM_STATE_OVERRIDE`, `FM_TREEHOUSE_ROOT`, and `TMPDIR` before the test process starts.
 CI and the no-mistakes test command both use this same entry point.
 
@@ -39,4 +39,5 @@ For example, watcher restart verifies the recorded watcher path, process identit
 Every behavior test sources `tests/lib.sh`, including tests that otherwise carry their own assertions and cleanup.
 Run one file with `tests/run.sh tests/<subject>.test.sh`.
 Run the suite with `tests/run.sh`.
+Use `tests/run.sh` for both public paths; `tests/run-test.sh` is the suite's internal per-test helper.
 Never add a direct test loop to CI, documentation, or a validation command.

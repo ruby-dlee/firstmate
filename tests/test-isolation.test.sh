@@ -19,6 +19,24 @@ test_every_entry_sources_the_shared_harness() {
   pass "test isolation: every behavior test enters through the shared sealed harness"
 }
 
+test_no_test_combines_path_override_with_bash_env_mutation() {
+  local test_script violations= unaudited=
+  for test_script in "$ROOT"/tests/*.test.sh; do
+    [ "$test_script" != "$ROOT/tests/test-isolation.test.sh" ] || continue
+    if grep -E '(^|[[:space:]])PATH=' "$test_script" \
+      | grep -E '(^|[[:space:]])BASH_ENV=' >/dev/null; then
+      violations="$violations ${test_script#"$ROOT/"}"
+    fi
+    if grep -E '(^|[[:space:]])(export[[:space:]]+)?BASH_ENV=' "$test_script" \
+      | grep -v 'FM_TEST_BASH_ENV_SANITATION_CASE=1' >/dev/null; then
+      unaudited="$unaudited ${test_script#"$ROOT/"}"
+    fi
+  done
+  [ -z "$violations" ] || fail "PATH override combined with raw BASH_ENV mutation:$violations"
+  [ -z "$unaudited" ] || fail "raw BASH_ENV mutation lacks sanitation audit marker:$unaudited"
+  pass "test isolation: PATH overrides cannot carry raw BASH_ENV mutations"
+}
+
 assert_guard_rejects() {  # <label> <expected-path> <environment assignment...>
   local label=$1 expected=$2 out status=0
   shift 2
@@ -82,7 +100,7 @@ test_command_kill_rejects_external_pid() {
 }
 
 test_hostile_bash_env_cannot_replace_guard() {
-  local hostile marker out
+  local hostile marker out shebang
   hostile="$TMPDIR/hostile-bash-env"
   marker="$TMPDIR/hostile-bash-env-ran"
   printf 'printf hostile > %q\n' "$marker" > "$hostile"
@@ -91,6 +109,13 @@ test_hostile_bash_env_cannot_replace_guard() {
   [ ! -e "$marker" ] || fail "hostile BASH_ENV executed before the isolation guard"
   out=$(env -u BASH_ENV "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
   [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore an unset guard: $out"
+  shebang="$TMPDIR/hostile-env-bash-script"
+  printf '%s\nprintf "%%s" "$BASH_ENV"\n' '#!/usr/bin/env bash' > "$shebang"
+  chmod +x "$shebang"
+  out=$(PATH="${FM_TEST_REAL_BASH%/*}:/usr/bin:/bin" BASH_ENV="$hostile" \
+    "$FM_TEST_BASH" "$shebang")
+  [ "$out" = "$GUARD" ] || fail "sealed launcher did not guard the env-Bash shebang: $out"
+  [ ! -e "$marker" ] || fail "env-Bash shebang executed hostile BASH_ENV"
   "$FM_TEST_BASH" -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
   pass "test isolation: hostile BASH_ENV cannot replace the child-shell guard"
 }
@@ -132,6 +157,7 @@ test_pool_fixture_write_is_private() {
 }
 
 test_every_entry_sources_the_shared_harness
+test_no_test_combines_path_override_with_bash_env_mutation
 test_guard_rejects_external_operational_paths
 test_guard_rejects_symlink_escape
 test_guard_rejects_lock_symlink_escape

@@ -343,7 +343,7 @@ git() {
 }
 SH
 
-  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   expected="MISSING: git (install: brew install git  # or the platform's package manager)"
   [ "$out" = "$expected" ] || fail "missing git should report the supported install instruction, got: $out"
@@ -472,7 +472,7 @@ command() {
   builtin command "$@"
 }
 SH
-    out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_FAKE_MISSING_TOOL="$tool" \
+    out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_FAKE_MISSING_TOOL="$tool" \
       FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
       FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
     assert_contains "$out" "MISSING_MANUAL: $tool (instructions: $instructions)" \
@@ -504,7 +504,7 @@ command() {
   builtin command "$@"
 }
 SH
-  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" \
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" \
     FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: perl' \
@@ -570,7 +570,7 @@ jq() {
   return 127
 }
 SH
-    out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
       FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
     assert_contains "$out" "MISSING: jq" "backend=$backend must fail closed on missing jq"
     assert_not_contains "$out" "MISSING: tmux" "backend=$backend must not demand tmux when jq is missing"
@@ -787,7 +787,7 @@ jq() {
   return 127
 }
 SH
-  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "enforce mode did not retain the secondmate Agent Fleet dependency"
@@ -827,7 +827,7 @@ jq() {
 }
 SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
-    BASH_ENV="$bash_env" FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "observe mode did not require the pool-membership registry"
   assert_contains "$out" 'MISSING: jq' "observe mode did not report the direct selector dependency"
@@ -874,7 +874,7 @@ jq() {
   return 127
 }
 SH
-  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_PERL_BIN="$case_dir/missing-perl" \
@@ -950,7 +950,7 @@ command() {
   builtin command "$@"
 }
 SH
-  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+  out=$(PATH="$fakebin:$BASE_PATH" FM_TEST_BASH_ENV_PAYLOAD="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING: python3 (install: brew install python  # or the platform' \
     "bootstrap did not report the descriptor-relative reader dependency"

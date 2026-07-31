@@ -2559,13 +2559,10 @@ SH
   assert_not_contains "$(cat "$af_log")" 'lease release' "live child endpoint allowed Agent Fleet release"
   assert_present "$case_dir/wt/state/$child_id.meta" "live child endpoint lost retry metadata"
   assert_present "$child_worktree/.git" "live child endpoint worktree was recycled"
-  # fm_backend_agent_alive implements tmux and herdr only and answers `unknown`
-  # for every other backend, so a zellij endpoint can never be reported "still
-  # alive" - that assertion could not hold whatever the fixture did. What must
-  # hold is that an endpoint whose state cannot be PROVEN still blocks
-  # destructive cleanup, which the refusal above plus the retained lease,
-  # metadata, and worktree already pin. Assert the reachable message.
-  assert_grep 'managed endpoint state for child-zellij-x2 is unknown' "$case_dir/stderr" "child endpoint blocker was not reported"
+  # The Zellij control-plane fixture keeps the managed session reachable, so
+  # teardown must classify the endpoint as present and block destructive cleanup.
+  assert_grep 'managed endpoint for child-zellij-x2 is still alive' "$case_dir/stderr" \
+    "child endpoint blocker was not reported: $(cat "$case_dir/stderr")"
   pass "forced secondmate cleanup verifies managed children in the child home"
 }
 

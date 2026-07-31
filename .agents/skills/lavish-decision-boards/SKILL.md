@@ -40,7 +40,13 @@ A Lavish board is a live surface, so reconcile it against live fleet state befor
 
 ## Serve and verify
 
-1. Serve the board without auto-opening by passing `--no-open` or setting `LAVISH_AXI_NO_OPEN=1`.
+1. Serve the board with `lavish-axi <file> --no-open --no-gate`.
+   `--no-open` suppresses the auto-open, and `LAVISH_AXI_NO_OPEN=1` does the same.
+   `--no-gate` skips the open-time layout curtain, which is the difference between a working board and a blank one.
+   The curtain is CSS, not a hang: Lavish renders the shell with `body.layout-gate-active`, and `body.layout-gate-active iframe#artifact { opacity: 0 }` keeps the artifact invisible while the chrome paints, until the layout audit clears or a safety timer expires.
+   The gate is decided per request from the query string, so `?no-gate=1` on any already-served session URL uncurtains it with no re-serve; `?gate=0` is equivalent.
+   `--no-gate` sets no server-side state - it only stamps `?no-gate=1` onto the URL it prints, so the curtain returns the moment that parameter is dropped.
+   Carry the full printed URL, query string included, through every later step.
 2. Extract the printed session URL without its surrounding double quotes.
    A safe extraction pattern is `grep -oE 'https?://[^ "]+'`; verify that no quote or punctuation trails the URL.
 3. Open every board in its own dedicated Chrome window with `open -na "Google Chrome" --args --new-window "<url>"`.
@@ -49,6 +55,10 @@ A Lavish board is a live surface, so reconcile it against live fleet state befor
    Treat the board as not ready until the tool-authoritative connection signal confirms that it is genuinely connected.
    The transition to connected can take several minutes and is expected; during that lag, do not act on a poll return or prematurely re-serve, re-open, abandon, or otherwise thrash the session.
    Create and select a `chrome-devtools-axi` page for the exact served URL, then use a bounded retry to inspect that page's snapshots.
+   The artifact iframe is sandboxed `allow-scripts allow-forms allow-popups allow-downloads`, without `allow-same-origin`, so parent-frame JS evaluation can never reach into it.
+   Verify board content with a snapshot that crosses frames, never with an expression evaluated against the parent page.
+   Diagnose a board that looks blank with `curl -s <url> | grep -o '<body class="[^"]*"'`: `lavish layout-gate-active` means the curtain is on and `lavish` alone means it is off.
+   The browser tab title is not a gate indicator; verified 2026-07-30, it reads `<artifact title> · Lavish` when the artifact HTML carries a `<title>` and bare `Lavish Editor` when it does not, identically with and without the curtain.
    Pass only after the layout-audit-in-progress indicator has cleared and no layout-issue indicator is present, confirming zero error-severity `layout_warnings` for that board.
    A returned snapshot alone is not success; if the bound expires while the audit remains in progress, treat the board as unverified and do not surface it.
    Consult `chrome-devtools-axi --help` and the relevant command help for current commands and flags.
@@ -59,8 +69,12 @@ A Lavish board is a live surface, so reconcile it against live fleet state befor
 
 ## Protect answers
 
-- Answer preservation takes precedence over the serve-fresh rule while the captain has unsubmitted input.
-- Never edit, refresh, or reload a served board while the captain is answering because doing so clears in-progress input.
+- A board in front of the captain is theirs, and that ownership is absolute while it is open.
+- Never navigate, reload, re-serve, or end it, never edit the file behind it, and never run browser automation against that window, including a read-only snapshot.
+- Verification with `chrome-devtools-axi` belongs before the board is surfaced; once the captain has it, the window is off limits too.
+- The test before any action is whether it could change what is on the captain's screen right now; if it could and their input may be unsubmitted, do not do it.
+- Answer preservation outranks the serve-fresh rule: a board showing slightly stale state costs one correction, while a cleared board costs the captain's answers outright.
+- Fix a problem with a live board server-side or not at all; a per-request option such as `?no-gate=1` is safe because it changes only what a fresh request renders, whereas re-serving or editing the file is not.
 - After submission, reconcile and refresh before continuing; if freshness must be preserved sooner, use only a strategy proven to retain the captain's current input without editing, refreshing, or reloading the served board.
 - When poll feedback arrives, write every annotation to the chosen durable file immediately, before interpreting it, acting on it, or doing anything else.
 - Never rely on poll output or conversation memory as the only copy because ephemeral poll output can be reaped.

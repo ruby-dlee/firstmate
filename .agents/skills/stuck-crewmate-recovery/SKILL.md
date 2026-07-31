@@ -34,6 +34,13 @@ Handle permission evidence before the ordinary recovery ladder because approving
 6. After the captain clears the dialog, verify that the pane changes or `bin/fm-crew-state.sh <id>` reports resumed work before returning to supervision.
    If the permission was denied and the task still cannot proceed, use the ordinary ladder below with that denial as evidence.
 
+## Diagnose the layer before fixing
+
+Name the mechanism before applying any remedy, and treat "it is not working" as a symptom rather than a cause.
+State the specific line, flag, call, or process producing the behavior; if you cannot state it, you are guessing.
+Reading the tool's own code, header, or `--help` is cheaper than a round of speculative fixes, and each speculative fix destroys the evidence the next diagnosis needs and commonly breaks something that was working.
+Prove the layer before acting on it: confirm a dead agent from the process tree rather than from elapsed quiet, and confirm a wedge from two samples rather than one.
+
 For a non-permission stall, escalate in order:
 
 1. Peek the pane.

@@ -146,10 +146,13 @@ fm_test_isolation_guard_environment() {
     || fm_test_isolation_fail "sandbox root is not canonical: $FM_TEST_SANDBOX_ROOT"
   case "${FM_TEST_PROCESS_ROOT_PID:-}" in ''|*[!0-9]*) fm_test_isolation_fail 'test process-root PID is unset or malformed' ;; esac
   for label in FM_TEST_GUARD_PS FM_TEST_GUARD_AWK FM_TEST_GUARD_TR \
-    FM_TEST_GUARD_REAL_KILL FM_TEST_GUARD_KILL_WRAPPER; do
+    FM_TEST_GUARD_REAL_KILL FM_TEST_GUARD_KILL_WRAPPER FM_TEST_GUARD_ENV \
+    FM_TEST_REAL_BASH FM_TEST_BASH; do
     eval "value=\${$label:-}"
     [ -x "$value" ] || fm_test_isolation_fail "$label is not a pinned executable: ${value:-<unset>}"
   done
+  [ "${BASH_ENV:-}" = "$FM_TEST_GUARD_ENV" ] \
+    || fm_test_isolation_fail "BASH_ENV bypassed the sealed launcher: ${BASH_ENV:-<unset>}"
   "$FM_TEST_GUARD_PS" -p "$FM_TEST_PROCESS_ROOT_PID" -o pid= >/dev/null 2>&1 \
     || fm_test_isolation_fail "test process-root PID is not alive: $FM_TEST_PROCESS_ROOT_PID"
 
@@ -182,3 +185,9 @@ enable -n kill 2>/dev/null \
 hash -p "$FM_TEST_GUARD_KILL_WRAPPER" kill \
   || fm_test_isolation_fail "the guarded kill command could not be pinned: $FM_TEST_GUARD_KILL_WRAPPER"
 fm_test_isolation_guard_environment
+if [ -n "${FM_TEST_BASH_ENV_PAYLOAD:-}" ]; then
+  fm_test_isolation_assert_path FM_TEST_BASH_ENV_PAYLOAD "$FM_TEST_BASH_ENV_PAYLOAD" entry
+  [ -f "$FM_TEST_BASH_ENV_PAYLOAD" ] && [ ! -L "$FM_TEST_BASH_ENV_PAYLOAD" ] \
+    || fm_test_isolation_fail "FM_TEST_BASH_ENV_PAYLOAD is not a regular sandbox file: $FM_TEST_BASH_ENV_PAYLOAD"
+  . "$FM_TEST_BASH_ENV_PAYLOAD"
+fi

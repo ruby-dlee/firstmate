@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${FM_TEST_BASH:?test isolation violation: sealed Bash launcher is unset}" "$@"

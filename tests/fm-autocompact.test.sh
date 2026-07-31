@@ -125,7 +125,7 @@ jq() {
 EOF
 
   capture_out=$(printf '%s\n' '{"hook_event_name":"PreCompact","trigger":"auto","session_id":"session-no-jq","transcript_path":"/tmp/no-jq.jsonl"}' \
-    | BASH_ENV="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" capture 2>&1)
+    | FM_TEST_BASH_ENV_PAYLOAD="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" capture 2>&1)
   anchor="$home/data/autocompact-resume.md"
   assert_present "$anchor" "capture without jq did not publish an anchor"
   assert_contains "$capture_out" 'FIRSTMATE AUTOCOMPACT CAPTURE LIMITED' "missing jq was not surfaced loudly"
@@ -134,7 +134,7 @@ EOF
   assert_contains "$(cat "$anchor")" 'window=firstmate:fm-no-jq-1' "capture without jq omitted in-flight metadata"
 
   recover_out=$(printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact","session_id":"session-no-jq"}' \
-    | BASH_ENV="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover)
+    | FM_TEST_BASH_ENV_PAYLOAD="$no_jq" FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover)
   assert_contains "$recover_out" 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT' "recovery without jq emitted no context"
   assert_contains "$recover_out" '# no-jq-backlog' "recovery without jq omitted the durable anchor"
   assert_contains "$recover_out" 'NORMAL SESSION-START RECONCILIATION' "recovery without jq skipped reconciliation output"

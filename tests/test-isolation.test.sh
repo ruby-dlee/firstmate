@@ -81,11 +81,25 @@ test_command_kill_rejects_external_pid() {
   pass "test isolation: command kill cannot bypass the external-PID guard"
 }
 
+test_hostile_bash_env_cannot_replace_guard() {
+  local hostile marker out
+  hostile="$TMPDIR/hostile-bash-env"
+  marker="$TMPDIR/hostile-bash-env-ran"
+  printf 'printf hostile > %q\n' "$marker" > "$hostile"
+  out=$(BASH_ENV="$hostile" bash -c 'printf "%s" "$BASH_ENV"')
+  [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore the guard: $out"
+  [ ! -e "$marker" ] || fail "hostile BASH_ENV executed before the isolation guard"
+  out=$(env -u BASH_ENV bash -c 'printf "%s" "$BASH_ENV"')
+  [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore an unset guard: $out"
+  bash -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
+  pass "test isolation: hostile BASH_ENV cannot replace the child-shell guard"
+}
+
 test_direct_execution_is_inert() {
   local out status=0
   # shellcheck disable=SC2016  # $1 is expanded by the child shell.
   out=$(env -u BASH_ENV -u FM_TEST_SEALED -u FM_TEST_SANDBOX_ROOT \
-    bash -c '. "$1"' _ "$ROOT/tests/lib.sh" 2>&1) || status=$?
+    "$FM_TEST_REAL_BASH" -c '. "$1"' _ "$ROOT/tests/lib.sh" 2>&1) || status=$?
   [ "$status" -eq 97 ] || fail "direct test guard returned $status instead of 97: $out"
   assert_contains "$out" 'test was not launched through tests/run-test.sh' \
     "direct test guard did not name the required entry point"
@@ -124,6 +138,7 @@ test_guard_rejects_lock_symlink_escape
 test_guard_accepts_regular_session_lock
 test_guard_rejects_external_pid
 test_command_kill_rejects_external_pid
+test_hostile_bash_env_cannot_replace_guard
 test_direct_execution_is_inert
 test_runner_exports_a_complete_sandbox
 test_pool_fixture_write_is_private

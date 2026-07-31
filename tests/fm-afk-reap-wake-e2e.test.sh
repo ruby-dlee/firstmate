@@ -15,6 +15,10 @@
 # Isolation: every state artifact lives under a disposable directory inside
 # this worktree.
 set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 export FM_GATE_REFUSE_BYPASS=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,10 +40,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-STATE_DIR=$(mktemp -d "$ROOT/.afk-reap-wake-e2e.XXXXXX")
+STATE_HOME=$(fm_test_tmproot fm-afk-reap-wake-e2e)
+STATE_DIR="$STATE_HOME/state"
+mkdir -p "$STATE_DIR"
 : > "$STATE_DIR/.afk"
-printf 'none\t-\tnative\n' > "$STATE_DIR/.afk-daemon-terminal"
+printf 'none\t-\tnative\t%s\n' "$STATE_HOME" > "$STATE_DIR/.afk-daemon-terminal"
 
+FM_HOME="$STATE_HOME" \
 FM_STATE_OVERRIDE="$STATE_DIR" \
 FM_AFK_STATE_PREPARED=1 \
 FM_ESCALATE_BATCH_SECS=0 \
@@ -105,9 +112,9 @@ grep -F 'signal' "$STATE_DIR/.wake-queue" >/dev/null \
   || fail "native task completion incorrectly ended away mode"
 pass "captain-relevant wake completes natively despite old pane-guard false-defer inputs"
 
-FM_HOME="$ROOT" FM_STATE_OVERRIDE="$STATE_DIR" "$LAUNCH" start-native >/dev/null 2>&1 \
+FM_HOME="$STATE_HOME" FM_STATE_OVERRIDE="$STATE_DIR" "$LAUNCH" start-native >/dev/null 2>&1 \
   || fail "away lifecycle could not prepare the next native tracked task"
-[ "$(cat "$STATE_DIR/.afk-daemon-terminal" 2>/dev/null)" = $'none\t-\tnative' ] \
+[ "$(cat "$STATE_DIR/.afk-daemon-terminal" 2>/dev/null)" = $'none\t-\tnative\t'"$STATE_HOME" ] \
   || fail "away lifecycle did not restore the native launch record"
 pass "completed native task can be re-armed without leaving away mode"
 

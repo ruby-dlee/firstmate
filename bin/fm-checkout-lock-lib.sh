@@ -107,6 +107,7 @@ fm_checkout_git_common_dir() {
 
 fm_checkout_validate_git_metadata() {
   local checkout=$1 root metadata absolute_git common listed line listed_root found=0
+  local declared_worktree submodule_layout=0
   root=$(fm_checkout_trusted_dir "$checkout") || return 1
   metadata="$root/.git"
   [ -e "$metadata" ] && [ ! -L "$metadata" ] || return 1
@@ -122,7 +123,19 @@ fm_checkout_validate_git_metadata() {
     [ "$(fm_checkout_trusted_dir "$metadata")" = "$absolute_git" ] || return 1
     [ "$absolute_git" = "$common" ] || return 1
   elif [ -f "$metadata" ]; then
-    case "$absolute_git" in "$common"/worktrees/*) ;; *) return 1 ;; esac
+    if [ "$absolute_git" = "$common" ]; then
+      declared_worktree=$(git -C "$root" config --get-all core.worktree 2>/dev/null) || return 1
+      case "$declared_worktree" in ''|*$'\n'*) return 1 ;; esac
+      case "$declared_worktree" in
+        /*) ;;
+        *) declared_worktree="$absolute_git/$declared_worktree" ;;
+      esac
+      declared_worktree=$(fm_checkout_trusted_dir "$declared_worktree") || return 1
+      [ "$declared_worktree" = "$root" ] || return 1
+      submodule_layout=1
+    else
+      case "$absolute_git" in "$common"/worktrees/*) ;; *) return 1 ;; esac
+    fi
   else
     return 1
   fi
@@ -131,7 +144,10 @@ fm_checkout_validate_git_metadata() {
     case "$line" in
       "worktree "*)
         listed_root=$(fm_checkout_trusted_dir "${line#worktree }" 2>/dev/null) || return 1
-        [ "$listed_root" != "$root" ] || found=$((found + 1))
+        if [ "$listed_root" = "$root" ] \
+            || { [ "$submodule_layout" -eq 1 ] && [ "$listed_root" = "$common" ]; }; then
+          found=$((found + 1))
+        fi
         ;;
     esac
   done <<EOF

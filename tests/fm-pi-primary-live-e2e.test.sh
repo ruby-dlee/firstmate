@@ -2,6 +2,9 @@
 # Opt-in interactive Pi primary regression on a private tmux socket and isolated homes.
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 if [ "${FM_PI_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_PI_LIVE_E2E=1 to run the isolated interactive Pi regression"
   exit 0

@@ -60,7 +60,7 @@ No `/back` command is required.
 - A message beginning with `/afk` refreshes away mode rather than ending it.
 - Any other real user message means the captain is back.
 
-On a real return message, run `bin/fm-afk-launch.sh stop` before clearing any state yourself.
+On a real return message, run `bin/fm-afk-launch.sh stop --home "$FM_HOME"` before clearing any state yourself.
 The launcher stops the daemon while `state/.afk` still exists, closes any exact recorded terminal, and clears `state/.afk` last.
 Native shutdown preserves any buffered escalation for catch-up, while terminal-backed compatibility shutdown may make its final guarded submit while the flag is still present.
 Drain `state/.wake-queue`, summarize any pending `state/.subsuper-escalations`, surface any legacy `state/.subsuper-inject-wedged` marker, and resume the primary harness supervision protocol emitted at session start.
@@ -97,7 +97,7 @@ Legacy terminal-backed delivery retains `FM_MAX_DEFER_SECS` because its guarded 
 `state/.subsuper-escalations` and its `.since` sidecar are a transient batch cache.
 `state/.subsuper-inject-wedged` is a legacy terminal-backed delivery alarm and is not created by native reap-wake delivery.
 Always enter through `bin/fm-afk-launch.sh`, which clears prior-session transient artifacts only on a fresh away session and preserves the current session's buffer on refresh.
-Always exit through `bin/fm-afk-launch.sh stop`, which preserves the flag until daemon shutdown completes and clears it last.
+Always exit through `bin/fm-afk-launch.sh stop --home "$FM_HOME"`, which binds the signal authority to the recorded home, preserves the flag until daemon shutdown completes, and clears it last.
 
 ## Reliability properties
 

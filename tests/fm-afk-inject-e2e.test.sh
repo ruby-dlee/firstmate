@@ -29,11 +29,9 @@
 # appearance - terminal line-wrapping looks like newlines but isn't.
 set -u
 
-# This isolated test drives the guarded daemon from the no-mistakes gate
-# worktree, so opt into the same suite-only lifecycle exemption as tests/lib.sh.
-export FM_GATE_REFUSE_BYPASS=1
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
 # Skip gracefully if tmux is not installed.

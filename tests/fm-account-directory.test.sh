@@ -265,7 +265,7 @@ test_codex_picks_highest_fresh_minimum_and_skips_no_window() {
   set_remaining 1 80,40
   set_remaining 2 none
   set_remaining 3 90,75
-  out=$(QUOTA_AXI_HOSTILE=1 AGENT_FLEET_HOSTILE=1 XDG_CONFIG_HOME=/hostile \
+  out=$(QUOTA_AXI_HOSTILE=1 AGENT_FLEET_HOSTILE=1 XDG_CONFIG_HOME="$TMP_ROOT/hostile" \
     run_selector select codex 2>"$TMP_ROOT/codex-select.err")
   err=$(cat "$TMP_ROOT/codex-select.err")
   [ "$out" = "$ACCOUNT_ROOT/codex/3" ] || fail "Codex did not choose the account with the highest minimum remaining usage: $out"

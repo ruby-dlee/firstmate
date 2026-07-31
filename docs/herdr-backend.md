@@ -290,14 +290,14 @@ The probe now parses the complete schema once with `jq`, eliminating the early c
 The focused regression fails against the pre-fix adapter:
 
 ```text
-$ FM_TEST_FOCUSED=readsteer-native-cutover tests/fm-backend-herdr.test.sh
+$ FM_TEST_FOCUSED=readsteer-native-cutover tests/run.sh tests/fm-backend-herdr.test.sh
 not ok - native read/steer should accept a running server without the retired closed-shell certificate: expected exit 0, got 1
 ```
 
 The same regression passes after the fix:
 
 ```text
-$ FM_TEST_FOCUSED=readsteer-native-cutover tests/fm-backend-herdr.test.sh
+$ FM_TEST_FOCUSED=readsteer-native-cutover tests/run.sh tests/fm-backend-herdr.test.sh
 ok - fm_backend_herdr_server_reachable_for_readsteer: native-agent servers need only be running
 ok - fm_backend_herdr_server_reachable_for_readsteer: the explicit legacy lab retains certificate enforcement
 ok - fm_backend_herdr_events_capable: consumes the full schema without a broken pipe
@@ -378,7 +378,7 @@ No Herdr-specific injection or classification branch was added.
 The opt-in regression command is:
 
 ```sh
-FM_SEND_MARKER_HERDR_E2E=1 tests/fm-send-secondmate-marker-herdr-e2e.test.sh
+FM_SEND_MARKER_HERDR_E2E=1 tests/run.sh tests/fm-send-secondmate-marker-herdr-e2e.test.sh
 ```
 
 The real post-fix Pi capture reported exactly one marker followed by the request:
@@ -926,7 +926,7 @@ The topology invariant (entering AND exiting away mode leaves the captain's acti
 
 The away daemon's `state/.subsuper-escalations` (+ `.since`) is a transient delivery cache, and `state/.subsuper-inject-wedged` is the terminal-backed compatibility alarm marker.
 Two ordering/scoping bugs leaked them into the next away session: on a clean terminal-backed exit the `/afk` skill cleared `state/.afk` BEFORE stopping the daemon, so the daemon's shutdown flush hit its own presence gate (`inject_msg`: `afk_active || return 1`) and was a no-op; and nothing cleared them on entry.
-The fix: `bin/fm-afk-launch.sh stop` SIGTERMs the daemon while `state/.afk` is still present, permits a terminal-backed compatibility flush, preserves a native delivery buffer for catch-up, closes any recorded terminal by exact id, and then clears `state/.afk` last.
+The fix: `bin/fm-afk-launch.sh stop --home "$FM_HOME"` first requires the recorded home to match the explicitly named home, then SIGTERMs the daemon while `state/.afk` is still present, permits a terminal-backed compatibility flush, preserves a native delivery buffer for catch-up, closes any recorded terminal by exact id, and clears `state/.afk` last.
 On entry the launcher drops the prior session's artifacts when the daemon is not already running, never on a refresh; the sourceable `bin/fm-afk-start.sh` exposes the shared clearing helper and also applies it for a direct, non-prepared fresh start.
 This never drops the durable wake record: `state/.wake-queue` is the lossless backlog, each crewmate's `state/<id>.status` retains its current status, and any still-true condition is also re-escalated by the daemon's heartbeat catch-all scan.
 Covered by the unit cases in `tests/fm-afk-launch.test.sh` (clear-on-fresh-entry vs refresh, and stop ordering with `state/.afk` still present at SIGTERM).
@@ -939,7 +939,7 @@ Covered by the unit cases in `tests/fm-afk-launch.test.sh` (clear-on-fresh-entry
   Fixed 2026-07-06 (backlog `fm-spawn-symlink-guard-s8`): `bin/fm-spawn.sh` now canonicalizes once into `PROJ_ABS_REAL` (`cd "$PROJ_ABS" && pwd -P`) right after `PROJ_ABS` is resolved, canonicalizes each observed pane cwd for the worktree-discovery comparison, and uses `PROJ_ABS_REAL` in `validate_spawn_worktree`'s own primary-vs-worktree comparison instead of recomputing from the still-symlinked `PROJ_ABS`.
   This removes both failure directions: a symlinked prefix can no longer false-refuse an isolated spawn, and, since both sides are physically resolved for comparison, a genuinely tangled spawn (worktree resolves to the same physical directory as the project) still correctly refuses.
   Verified with GNU bash 5.3.9(1)-release (aarch64-apple-darwin25.3.0) and git 2.53.0 on macOS (Darwin 25.5.0): added `tests/fm-backend.test.sh:test_spawn_symlinked_project_prefix_avoids_false_refusal`, which drives the real `bin/fm-spawn.sh` against fake-tmux panes whose first `pane_current_path` poll returns both the project's `pwd -P`-resolved physical path and its logical symlink-preserving path while `PROJ_ABS` is reached through a synthetic symlinked prefix (`ln -s <real> <link>`, project passed as `<link>/proj`).
-  Confirmed the test reproduces the original bug against the pre-fix script (`git stash` the `bin/fm-spawn.sh` change and rerun: `not ok - fm-spawn.sh should succeed for a project reached through a symlinked prefix` / `error: treehouse get did not yield an isolated worktree ...`), and passes against the fix (`bash tests/fm-backend.test.sh` reports `ok - fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal`, with the rest of that suite's assertions unaffected).
+  Confirmed the test reproduces the original bug against the pre-fix script (`git stash` the `bin/fm-spawn.sh` change and rerun: `not ok - fm-spawn.sh should succeed for a project reached through a symlinked prefix` / `error: treehouse get did not yield an isolated worktree ...`), and passes against the fix (`tests/run.sh tests/fm-backend.test.sh` reports `ok - fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal`, with the rest of that suite's assertions unaffected).
   `shellcheck bin/*.sh bin/backends/*.sh tests/*.sh` passes clean on the changed scripts.
 - **RESOLVED: a restart's restored-layout husk no longer needs a manual pane close before respawn.** See "Respawn idempotency: a restored task tab is a husk, not a duplicate" above for the fix (`fm_backend_herdr_pane_agent_state`, `fm_backend_herdr_create_task`'s close-and-replace).
   Left over from that fix: the `dead` (`pane_not_found`) husk classification is exercised only at the unit level, never against the real binary - killing a pane's process on a live server was observed to make herdr reap the whole tab immediately (never leaving a dead-but-still-listed pane for the duplicate check to find), and a real session restart was never observed to produce one either.

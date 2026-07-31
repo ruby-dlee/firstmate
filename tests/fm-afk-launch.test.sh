@@ -18,6 +18,10 @@
 #   sleeper replaces the real daemon (FM_AFK_LAUNCH_ENTRY) so the test observes
 #   only the terminal lifecycle.
 set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 export FM_GATE_REFUSE_BYPASS=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,8 +125,8 @@ unit_stop_ordering() {
   mkdir -p "$lock"
   printf '%s' "$daemon_pid" > "$lock/pid"
   ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$daemon_pid" > "$lock/pid-identity" 2>/dev/null ) || true
-  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
+  FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1
   if [ "$(cat "$marker" 2>/dev/null || echo missing)" = present ]; then
     pass "stop-ordering: daemon SIGTERM'd while .afk still present (flush is not a no-op)"
   else
@@ -154,7 +158,7 @@ unit_stop_rejects_reused_pid() {
   mkdir -p "$lock"
   printf '%s' "$sleeper_pid" > "$lock/pid"
   printf 'different-process-identity' > "$lock/pid-identity"
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1
   if kill -0 "$sleeper_pid" 2>/dev/null; then
     pass "stop identity: stale lock cannot signal an unrelated live process"
   else
@@ -165,17 +169,67 @@ unit_stop_rejects_reused_pid() {
   rm -rf "$st"
 }
 
+unit_stop_requires_explicit_home() {
+  local st lock sleeper_pid out status
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-explicit.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$sleeper_pid" > "$lock/pid"
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$lock/pid-identity" )
+  status=0
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop 2>&1) || status=$?
+  if [ "$status" -eq 64 ] && [[ "$out" == *'refusing ambiguous stop'* ]] \
+    && kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$st/state/.afk" ]; then
+    pass "stop authority: inherited FM_HOME cannot authorize a daemon signal"
+  else
+    fail "stop authority: ambiguous stop was not refused before signaling (exit $status): $out"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+unit_stop_requires_recorded_home_match() {
+  local caller_home recorded_home lock sleeper_pid out status
+  caller_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-caller-home.XXXXXX")
+  recorded_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-recorded-home.XXXXXX")
+  mkdir -p "$recorded_home/state"
+  : > "$recorded_home/state/.afk"
+  printf 'none\t-\tnative\t%s\n' "$recorded_home" > "$recorded_home/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  lock="$recorded_home/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$sleeper_pid" > "$lock/pid"
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$lock/pid-identity" )
+  status=0
+  out=$(FM_STATE_OVERRIDE="$recorded_home/state" "$LAUNCH" stop --home "$caller_home" 2>&1) || status=$?
+  if [ "$status" -ne 0 ] && [[ "$out" == *"recorded daemon home '$recorded_home'"* ]] \
+    && [[ "$out" == *"caller-named home '$caller_home'"* ]] \
+    && kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$recorded_home/state/.afk" ]; then
+    pass "stop authority: record home must match the explicit caller home"
+  else
+    fail "stop authority: mismatched record home did not fail before signaling (exit $status): $out"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$caller_home" "$recorded_home"
+}
+
 unit_stop_rejects_native_marker_for_unrelated_command() {
   local st sleeper_pid identity
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-command.XXXXXX")
   mkdir -p "$st/state"
   : > "$st/state/.afk"
-  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   sleep 30 & sleeper_pid=$!
   identity=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '. "$1"; fm_afk_native_process_identity "$2"' _ "$START" "$sleeper_pid")
   printf '%s\n%s\n' "$sleeper_pid" "$identity" > "$st/state/.afk-native-process"
   if ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1 \
-    && ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1 \
+    && ! FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1 \
     && kill -0 "$sleeper_pid" 2>/dev/null \
     && [ -e "$st/state/.afk" ] && [ -e "$st/state/.afk-native-process" ]; then
     pass "native process identity: matching PID start time cannot authorize an unrelated command"
@@ -296,7 +350,7 @@ unit_concurrent_start_serialized() {
   else
     fail "concurrent start: leaked or lost daemon terminal (count $count, record $rec)"
   fi
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1
   tmux kill-session -t "$cap_session" 2>/dev/null || true
   rm -rf "$st"
 }
@@ -747,7 +801,7 @@ unit_tmux_record_is_home_scoped_and_exact() {
   local st hash target rc log
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-tmux-record-scope.XXXXXX")
   mkdir -p "$st/state"
-  printf 'tmux\tunrelated-session\t\n' > "$st/state/.afk-daemon-terminal"
+  printf 'tmux\tunrelated-session\t\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
     '. "$1"; fm_afk_launch_record_read >/dev/null 2>&1; [ "$?" -eq 2 ]' _ "$LAUNCH"
   rc=$?
@@ -755,7 +809,7 @@ unit_tmux_record_is_home_scoped_and_exact() {
 
   hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
   target="fm-afk-daemon-$hash-123-4-1700000000"
-  printf 'tmux\t%s\t\n' "$target" > "$st/state/.afk-daemon-terminal"
+  printf 'tmux\t%s\t\t%s\n' "$target" "$st" > "$st/state/.afk-daemon-terminal"
   log="$st/tmux.log"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_FAKE_TMUX_LOG="$log" bash -c '
     . "$1"
@@ -902,7 +956,7 @@ unit_herdr_creation_intent_reconciles() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-plan.XXXXXX")
   marker="$st/closed"
   mkdir -p "$st/state"
-  printf 'herdr-plan\tlab\tafk-planned-label\n' > "$st/state/.afk-daemon-terminal"
+  printf 'herdr-plan\tlab\tafk-planned-label\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" CLOSED="$marker" bash -c '
     . "$1"
     fm_backend_source() { return 0; }
@@ -929,7 +983,7 @@ unit_expired_herdr_creation_intent_clears() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-plan-absent.XXXXXX")
   mkdir -p "$st/state"
-  printf 'herdr-plan\tlab\tafk-never-created\n' > "$st/state/.afk-daemon-terminal"
+  printf 'herdr-plan\tlab\tafk-never-created\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   touch -t 200001010000 "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
@@ -1148,7 +1202,7 @@ unit_native_lifecycle() {
   else
     fail "native lifecycle: state preparation or no-terminal record failed"
   fi
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1
   if [ ! -e "$st/state/.afk" ] && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
     pass "native lifecycle: uniform stop clears state without closing a terminal"
   else
@@ -1190,7 +1244,7 @@ unit_native_entry_preserves_prepared_state() {
   mkdir -p "$st/state"
   : > "$st/state/.afk"
   : > "$st/state/.subsuper-escalations"
-  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_STATE_PREPARED=1 bash -c '
     . "$1"
     FM_AFK_DAEMON=/bin/true
@@ -1202,6 +1256,35 @@ unit_native_entry_preserves_prepared_state() {
     fail "native entry: launcher-prepared lifecycle state was mutated"
   fi
   rm -rf "$st"
+}
+
+unit_prepared_delivery_requires_recorded_home() {
+  local st other
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-prepared-home.XXXXXX")
+  other=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-prepared-other.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'tmux\towned-session\t\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_STATE_PREPARED=1
+    fm_afk_start_select_delivery
+    [ "$FM_AFK_DELIVERY" = inject ]
+  ' _ "$START"; then
+    pass "prepared delivery: a tmux record with an empty extra field retains inject delivery"
+  else
+    fail "prepared delivery: a valid home-bound tmux record was rejected"
+  fi
+  printf 'tmux\towned-session\t\t%s\n' "$other" > "$st/state/.afk-daemon-terminal"
+  if ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_STATE_PREPARED=1
+    fm_afk_start_select_delivery
+  ' _ "$START" >/dev/null 2>&1; then
+    pass "prepared delivery: a record for another home is rejected"
+  else
+    fail "prepared delivery: a mismatched record home was accepted"
+  fi
+  rm -rf "$st" "$other"
 }
 
 unit_native_start_stop_handoff_is_atomic() {
@@ -1238,6 +1321,7 @@ SH
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
+      FM_AFK_LAUNCH_STOP_HOME_NAMED=1
       fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
       fm_afk_launch_main stop
     ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
@@ -1291,6 +1375,7 @@ SH
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
+      FM_AFK_LAUNCH_STOP_HOME_NAMED=1
       fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
       fm_afk_launch_main stop
     ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
@@ -1342,7 +1427,7 @@ unit_close_failure_preserves_record() {
   mkdir -p "$st/state"
   hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
   target="fm-afk-daemon-$hash-123-4-1700000000"
-  printf 'tmux\t%s\towned\n' "$target" > "$st/state/.afk-daemon-terminal"
+  printf 'tmux\t%s\towned\t%s\n' "$target" "$st" > "$st/state/.afk-daemon-terminal"
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_launch_close_terminal() { return 1; }
@@ -1361,13 +1446,13 @@ unit_record_publication_atomic() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-atomic.XXXXXX")
   mkdir -p "$st/state"
-  printf 'tmux\told-session\towned\n' > "$st/state/.afk-daemon-terminal"
+  printf 'tmux\told-session\towned\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     mv() { return 1; }
     ! fm_afk_launch_record_write tmux new-session owned
   ' _ "$LAUNCH" \
-    && [ "$(cat "$st/state/.afk-daemon-terminal")" = $'tmux\told-session\towned' ] \
+    && [ "$(cat "$st/state/.afk-daemon-terminal")" = $'tmux\told-session\towned\t'"$st" ] \
     && ! find "$st/state" -name '.afk-daemon-terminal.pending.*' -print -quit | grep -q .; then
     pass "record publication: failed atomic rename preserves the complete prior record"
   else
@@ -1524,7 +1609,7 @@ unit_stop_validates_before_signal() {
   mkdir -p "$st/state/.supervise-daemon.lock"
   printf '%s' "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid"
   ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid-identity" )
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1 || true
+  FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1 || true
   if kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$st/state/.afk" ]; then
     pass "stop validation: malformed record causes no daemon or state side effects"
   else
@@ -1573,7 +1658,7 @@ unit_stop_confirms_daemon_exit() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-live.XXXXXX")
   mkdir -p "$st/state/.supervise-daemon.lock"
   : > "$st/state/.afk"
-  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   bash -c 'trap "" TERM; while :; do sleep 1; done' &
   daemon_pid=$!
   printf '%s' "$daemon_pid" > "$st/state/.supervise-daemon.lock/pid"
@@ -1607,7 +1692,7 @@ unit_stop_confirms_native_process_exit() {
   mkdir -p "$st/state"
   : > "$st/state/.afk"
   : > "$st/state/.afk-native-process"
-  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_native_process_live() { FM_AFK_NATIVE_PID=4242; return 0; }
@@ -1674,7 +1759,7 @@ unit_confirmed_absence_succeeds() {
   mkdir -p "$st/state"
   hash=$(printf '%s' "$st" | cksum | cut -d' ' -f1)
   target="fm-afk-daemon-$hash-123-4-1700000000"
-  printf 'tmux\t%s\towned\n' "$target" > "$st/state/.afk-daemon-terminal"
+  printf 'tmux\t%s\towned\t%s\n' "$target" "$st" > "$st/state/.afk-daemon-terminal"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_launch_close_terminal() { return 1; }
@@ -1867,7 +1952,7 @@ unit_herdr_reused_pane_identity_fails_closed() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-reused.XXXXXX")
   mkdir -p "$st/state"
-  printf 'herdr\tlab:pane-reused\tws-owned|afk-owned\n' > "$st/state/.afk-daemon-terminal"
+  printf 'herdr\tlab:pane-reused\tws-owned|afk-owned\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_backend_source() { return 0; }
@@ -1950,8 +2035,8 @@ e2e_herdr() {
   herdr_test_lab_available "$SESSION" || return 0
   home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-e2e-home.XXXXXX")
   E2E_HERDR_CLEANUP() {
-    FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" \
-      FM_SUPERVISOR_TARGET="$target" FM_SUPERVISOR_BACKEND=herdr "$LAUNCH" stop >/dev/null 2>&1 || true
+    FM_STATE_OVERRIDE="$home_tmp/state" FM_SUPERVISOR_TARGET="$target" \
+      FM_SUPERVISOR_BACKEND=herdr "$LAUNCH" stop --home "$home_tmp" >/dev/null 2>&1 || true
     herdr_safe_stop_and_delete "$SESSION" >/dev/null 2>&1 || true
     rm -rf "$home_tmp" 2>/dev/null || true
   }
@@ -1982,8 +2067,8 @@ e2e_herdr() {
   if [ -n "$dtab" ] && [ "$dtab" != "$cap_tab" ]; then pass "herdr e2e: daemon pane is NOT in the captain's tab"; else fail "herdr e2e: daemon pane shares the captain tab ($dtab)"; fi
   case "$dtgt" in "$SESSION":*) pass "herdr e2e: daemon terminal scoped to the lab session" ;; *) fail "herdr e2e: daemon terminal not in the lab session ($dtgt)" ;; esac
 
-  FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" \
-    FM_SUPERVISOR_TARGET="$target" FM_SUPERVISOR_BACKEND=herdr "$LAUNCH" stop >/dev/null 2>&1
+  FM_STATE_OVERRIDE="$home_tmp/state" FM_SUPERVISOR_TARGET="$target" \
+    FM_SUPERVISOR_BACKEND=herdr "$LAUNCH" stop --home "$home_tmp" >/dev/null 2>&1
 
   after=$(fm_backend_herdr_cli "$SESSION" pane list --workspace "$cap_ws" 2>/dev/null | jq --arg t "$cap_tab" '[.result.panes[]?|select(.tab_id==$t)]|length')
   ws_after=$(fm_backend_herdr_cli "$SESSION" workspace list 2>/dev/null | jq '[.result.workspaces[]?]|length')
@@ -2018,8 +2103,8 @@ e2e_tmux() {
   if [ "$before" = "$during" ]; then pass "tmux e2e: captain window pane count unchanged after start (no split-window)"; else fail "tmux e2e: captain window pane count changed ($before -> $during)"; fi
   if [ -n "$rec" ] && tmux has-session -t "$rec" 2>/dev/null && [ "$rec" != "$cap_session" ]; then pass "tmux e2e: daemon launched in a separate detached session"; else fail "tmux e2e: no separate daemon session ($rec)"; fi
 
-  FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" \
-    FM_SUPERVISOR_TARGET="$cap_pane" FM_SUPERVISOR_BACKEND=tmux "$LAUNCH" stop >/dev/null 2>&1
+  FM_STATE_OVERRIDE="$home_tmp/state" FM_SUPERVISOR_TARGET="$cap_pane" \
+    FM_SUPERVISOR_BACKEND=tmux "$LAUNCH" stop --home "$home_tmp" >/dev/null 2>&1
 
   after=$(tmux list-panes -t "$cap_session" | wc -l | tr -d ' ')
   if [ "$after" = "$before" ]; then pass "tmux e2e: captain window pane count unchanged after stop"; else fail "tmux e2e: captain window changed ($before -> $after)"; fi
@@ -2114,6 +2199,8 @@ unit_clear_stale
 unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
+unit_stop_requires_explicit_home
+unit_stop_requires_recorded_home_match
 unit_stop_rejects_native_marker_for_unrelated_command
 unit_native_command_identity_is_anchored
 unit_native_process_marker_is_one_bounded_snapshot
@@ -2145,6 +2232,7 @@ unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
 unit_recovery_preserves_buffered_escalations
+unit_prepared_delivery_requires_recorded_home
 unit_native_entry_preserves_prepared_state
 unit_native_start_stop_handoff_is_atomic
 unit_direct_native_start_stop_handoff_is_atomic

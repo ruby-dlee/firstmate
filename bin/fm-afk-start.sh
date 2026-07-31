@@ -281,12 +281,18 @@ fm_afk_start_flag_write() {
 }
 
 fm_afk_start_select_delivery() {
-  local record
+  local record record_backend record_target record_extra record_home home
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     record=$(fm_afk_safe_control_read "$FM_AFK_LAUNCH_RECORD" "$FM_AFK_NATIVE_PROCESS_MAX_BYTES" 2>/dev/null) || return 1
-    case "$record" in
-      $'none\t-\tnative') FM_AFK_DELIVERY=reap-wake ;;
-      $'tmux\t'*|$'herdr\t'*) FM_AFK_DELIVERY=inject ;;
+    printf '%s\n' "$record" | awk -F '\t' 'NF != 4 { bad=1 } END { exit !(NR == 1 && !bad) }' >/dev/null \
+      || return 1
+    IFS=$'\034' read -r record_backend record_target record_extra record_home \
+      <<< "${record//$'\t'/$'\034'}" || return 1
+    home=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+    [ "$record_home" = "$home" ] || return 1
+    case "$record_backend:$record_target:$record_extra" in
+      none:-:native) FM_AFK_DELIVERY=reap-wake ;;
+      tmux:?*:|herdr:?*:?*) FM_AFK_DELIVERY=inject ;;
       *) return 1 ;;
     esac
   else

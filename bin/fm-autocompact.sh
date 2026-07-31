@@ -5,14 +5,16 @@
 # `recover` from SessionStart with matcher `compact`.
 # Capture atomically replaces data/autocompact-resume.md with a fresh local-only
 # view of durable fleet state before either manual or automatic compaction.
-# Recover prints that anchor and a fresh fm-session-start.sh digest to stdout,
-# which Claude Code injects into the compacted context before the next model
-# request.
+# Recover prints that anchor, a scoped stow directive, and a fresh
+# fm-session-start.sh digest to stdout, which Claude Code injects into the
+# compacted context before the next model request.
 #
 # This script intentionally does not run /stow.
 # A shell hook cannot make the model judge conversation-only knowledge, so the
-# stow skill remains the one owner of that routing and must run periodically in
-# long Claude sessions before compaction pressure becomes acute.
+# recovery directive tells the resumed model to load the stow skill and inspect
+# the unswept pre-compact transcript slice.
+# After a successful sweep, the model runs `mark-stowed` to atomically advance
+# the durable byte marker; an incomplete sweep therefore remains pending.
 #
 # The hook is inert outside a primary firstmate checkout.
 # A plain main home is confirmed by equal git-dir and git-common-dir paths.
@@ -28,6 +30,7 @@
 # Usage:
 #   <PreCompact JSON | bin/fm-autocompact.sh capture
 #   <SessionStart JSON | bin/fm-autocompact.sh recover
+#   bin/fm-autocompact.sh mark-stowed
 set -u
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
@@ -36,21 +39,23 @@ FM_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}
 STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 DATA=${FM_DATA_OVERRIDE:-$FM_HOME/data}
 ANCHOR=$DATA/autocompact-resume.md
+STOW_MARKER=$STATE/.autocompact-stow.marker
 MODE=${1:-}
 
 usage() {
   cat <<'EOF'
-usage: fm-autocompact.sh capture|recover
+usage: fm-autocompact.sh capture|recover|mark-stowed
 
 Reads a Claude Code hook payload from stdin.
 capture accepts PreCompact payloads and atomically writes the durable resume anchor.
 recover accepts SessionStart source=compact payloads and prints the anchor plus a fresh session-start digest.
+mark-stowed atomically records that the current anchor's transcript slice was swept successfully.
 The script is a silent no-op outside a primary firstmate checkout.
 EOF
 }
 
 case "$MODE" in
-  capture|recover) ;;
+  capture|recover|mark-stowed) ;;
   -h|--help)
     usage
     exit 0
@@ -90,6 +95,89 @@ in_primary_scope() {
 }
 
 in_primary_scope || exit 0
+
+file_size_bytes() {
+  local path=$1 bytes
+  [ -f "$path" ] && [ -r "$path" ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$path" 2>/dev/null) || return 1
+  bytes=${bytes//[[:space:]]/}
+  case "$bytes" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$bytes"
+}
+
+anchor_field() {
+  local field=$1
+  [ -f "$ANCHOR" ] && [ ! -L "$ANCHOR" ] || return 1
+  awk -v field="$field" '
+    BEGIN {
+      prefix = field ": `"
+      count = 0
+    }
+    index($0, prefix) == 1 {
+      value = substr($0, length(prefix) + 1)
+      if (substr(value, length(value), 1) != "`") {
+        exit 2
+      }
+      value = substr(value, 1, length(value) - 1)
+      count++
+    }
+    END {
+      if (count != 1) {
+        exit 1
+      }
+      printf "%s", value
+    }
+  ' "$ANCHOR" 2>/dev/null
+}
+
+marker_field() {
+  local field=$1
+  [ -f "$STOW_MARKER" ] && [ ! -L "$STOW_MARKER" ] || return 1
+  awk -v field="$field" '
+    BEGIN {
+      prefix = field "="
+      count = 0
+    }
+    index($0, prefix) == 1 {
+      value = substr($0, length(prefix) + 1)
+      count++
+    }
+    END {
+      if (count != 1) {
+        exit 1
+      }
+      printf "%s", value
+    }
+  ' "$STOW_MARKER" 2>/dev/null
+}
+
+decimal_compare() {
+  local left=$1 right=$2 LC_ALL=C
+  case "$left:$right" in
+    *[!0-9:]*) return 1 ;;
+  esac
+  while [ "${left#0}" != "$left" ]; do
+    left=${left#0}
+  done
+  while [ "${right#0}" != "$right" ]; do
+    right=${right#0}
+  done
+  [ -n "$left" ] || left=0
+  [ -n "$right" ] || right=0
+  if [ "${#left}" -gt "${#right}" ]; then
+    printf '%s\n' 1
+  elif [ "${#left}" -lt "${#right}" ]; then
+    printf '%s\n' -1
+  elif [ "$left" = "$right" ]; then
+    printf '%s\n' 0
+  elif awk -v left="x$left" -v right="x$right" 'BEGIN { exit !(left > right) }'; then
+    printf '%s\n' 1
+  else
+    printf '%s\n' -1
+  fi
+}
 
 capture_failed() {
   local message=$1
@@ -189,11 +277,13 @@ json_string_field() {
 
 PAYLOAD=
 RECOVERY_WARNING=
-if ! PAYLOAD=$(cat 2>/dev/null); then
-  if [ "$MODE" = capture ]; then
-    capture_failed 'could not read the PreCompact payload'
+if [ "$MODE" != mark-stowed ]; then
+  if ! PAYLOAD=$(cat 2>/dev/null); then
+    if [ "$MODE" = capture ]; then
+      capture_failed 'could not read the PreCompact payload'
+    fi
+    RECOVERY_WARNING='could not read the compact SessionStart payload; recovering from durable state'
   fi
-  RECOVERY_WARNING='could not read the compact SessionStart payload; recovering from durable state'
 fi
 
 if [ "$MODE" = capture ]; then
@@ -201,7 +291,7 @@ if [ "$MODE" = capture ]; then
   EVENT=$(json_string_field hook_event_name "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   [ "$EVENT" = PreCompact ] || exit 0
-else
+elif [ "$MODE" = recover ]; then
   if [ -n "$RECOVERY_WARNING" ]; then
     :
   elif [ -z "$PAYLOAD" ]; then
@@ -223,7 +313,8 @@ render_anchor() {
   printf "Generated: \`%s\`\n" "$generated" || return 1
   printf "Trigger: \`%s\`\n" "$trigger" || return 1
   printf "Session: \`%s\`\n" "$session_id" || return 1
-  printf "Transcript: \`%s\`\n\n" "$transcript" || return 1
+  printf "Transcript: \`%s\`\n" "$transcript" || return 1
+  printf "Transcript end byte: \`%s\`\n\n" "$transcript_end" || return 1
   printf 'This file is the deterministic bridge across Claude Code context compaction.\n' || return 1
   printf "It captures durable file state only and does not replace the judgment-based \`stow\` skill.\n" || return 1
   printf "The compact-sourced SessionStart hook prints this anchor and then runs \`bin/fm-session-start.sh\` for normal lock, wake, backlog, task, and endpoint reconciliation.\n\n" || return 1
@@ -248,7 +339,7 @@ render_anchor() {
 }
 
 capture_anchor() {
-  local trigger session_id transcript generated snapshot tmp
+  local trigger session_id transcript transcript_end generated snapshot tmp
   trigger=$(json_string_field trigger "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   case "$trigger" in
@@ -257,6 +348,7 @@ capture_anchor() {
   esac
   session_id=$(json_string_field session_id "$PAYLOAD") || session_id=unknown
   transcript=$(json_string_field transcript_path "$PAYLOAD") || transcript=unknown
+  transcript_end=$(file_size_bytes "$transcript") || transcript_end=unknown
   generated=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
     || capture_failed 'could not read the clock'
 
@@ -305,6 +397,141 @@ capture_anchor() {
   }
 }
 
+emit_whole_context_stow_directive() {
+  local reason=$1 transcript=${2:-unknown} transcript_end=${3:-unknown}
+  printf '\n=== REQUIRED POST-COMPACTION STOW SWEEP ===\n'
+  printf '%s\n' 'ACTION REQUIRED: Before resuming ordinary work, load the stow skill and sweep the whole recovered context for conversation-only durable knowledge.'
+  printf 'Reason for full sweep: %s\n' "$reason"
+  if [ "$transcript" != unknown ]; then
+    printf 'Pre-compact transcript: %s\n' "$transcript"
+  fi
+  if [ "$transcript_end" != unknown ]; then
+    printf 'Captured boundary: zero-based byte offset 0 inclusive through %s exclusive.\n' "$transcript_end"
+  fi
+  printf '%s\n' 'Read the available pre-compact transcript through that boundary as part of the sweep; do not rely on the lossy compaction summary.'
+  printf 'Use %s as the single owner of routing destinations; do not recreate its routing table here.\n' "$FM_ROOT/.agents/skills/stow/SKILL.md"
+  printf 'Completion marker: %s\n' "$STOW_MARKER"
+  if [ "$transcript" != unknown ] && [ "$transcript_end" != unknown ]; then
+    printf 'Only after the sweep and every authorized stow write complete, run %s mark-stowed to atomically record completion through this boundary.\n' "$SCRIPT_DIR/fm-autocompact.sh"
+  else
+    printf '%s\n' 'The transcript boundary is not readable enough to mark complete; leave the marker unchanged so a later recovery retries the sweep.'
+  fi
+}
+
+emit_scoped_stow_directive() {
+  local transcript=$1 start=$2 transcript_end=$3
+  printf '\n=== REQUIRED POST-COMPACTION STOW SWEEP ===\n'
+  printf '%s\n' 'ACTION REQUIRED: Before resuming ordinary work, load the stow skill and sweep the unswept pre-compact conversation slice.'
+  printf 'Pre-compact transcript: %s\n' "$transcript"
+  printf 'Read zero-based byte offset %s inclusive through %s exclusive; the completion marker already covers every earlier byte.\n' "$start" "$transcript_end"
+  printf '%s\n' 'Judge durable conversation-only knowledge from that transcript slice and the recovered context, not from the lossy compaction summary.'
+  printf 'Use %s as the single owner of routing destinations; do not recreate its routing table here.\n' "$FM_ROOT/.agents/skills/stow/SKILL.md"
+  printf 'Completion marker: %s\n' "$STOW_MARKER"
+  printf 'Only after the sweep and every authorized stow write complete, run %s mark-stowed to atomically record completion through byte %s.\n' "$SCRIPT_DIR/fm-autocompact.sh" "$transcript_end"
+}
+
+emit_stow_directive() {
+  local transcript transcript_end current_end marker_transcript marker_end comparison
+  if ! transcript=$(anchor_field Transcript); then
+    emit_whole_context_stow_directive 'the fresh anchor has no readable transcript path'
+    return 0
+  fi
+  if ! transcript_end=$(anchor_field 'Transcript end byte'); then
+    emit_whole_context_stow_directive 'the fresh anchor has no valid transcript boundary' "$transcript"
+    return 0
+  fi
+  case "$transcript_end" in
+    ''|*[!0-9]*)
+      emit_whole_context_stow_directive 'the fresh anchor transcript boundary is malformed' "$transcript"
+      return 0
+      ;;
+  esac
+  if ! current_end=$(file_size_bytes "$transcript"); then
+    emit_whole_context_stow_directive 'the pre-compact transcript is unreadable' "$transcript"
+    return 0
+  fi
+  if [ "$current_end" -lt "$transcript_end" ]; then
+    emit_whole_context_stow_directive 'the pre-compact transcript is shorter than its captured boundary' "$transcript"
+    return 0
+  fi
+  if ! marker_transcript=$(marker_field transcript_path) \
+    || ! marker_end=$(marker_field completed_bytes); then
+    emit_whole_context_stow_directive 'the completion marker is missing or malformed' "$transcript" "$transcript_end"
+    return 0
+  fi
+  case "$marker_end" in
+    ''|*[!0-9]*)
+      emit_whole_context_stow_directive 'the completion marker offset is malformed' "$transcript" "$transcript_end"
+      return 0
+      ;;
+  esac
+  if [ "$marker_transcript" != "$transcript" ]; then
+    emit_whole_context_stow_directive 'the completion marker does not describe this transcript boundary' "$transcript" "$transcript_end"
+    return 0
+  fi
+  if ! comparison=$(decimal_compare "$marker_end" "$transcript_end"); then
+    emit_whole_context_stow_directive 'the completion marker offset is malformed' "$transcript" "$transcript_end"
+    return 0
+  fi
+  if [ "$comparison" -gt 0 ]; then
+    emit_whole_context_stow_directive 'the completion marker offset exceeds the captured boundary' "$transcript" "$transcript_end"
+    return 0
+  fi
+  if [ "$comparison" -eq 0 ]; then
+    printf '\n=== POST-COMPACTION STOW SWEEP ===\n'
+    printf 'NO STOW SWEEP PENDING: %s already records %s through byte %s; do not repeat the completed sweep.\n' \
+      "$STOW_MARKER" "$transcript" "$transcript_end"
+    return 0
+  fi
+  emit_scoped_stow_directive "$transcript" "$marker_end" "$transcript_end"
+}
+
+mark_stowed() {
+  local transcript transcript_end current_end tmp
+  transcript=$(anchor_field Transcript) || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: the fresh anchor has no readable transcript path' >&2
+    exit 2
+  }
+  transcript_end=$(anchor_field 'Transcript end byte') || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: the fresh anchor has no readable transcript boundary' >&2
+    exit 2
+  }
+  case "$transcript_end" in
+    ''|*[!0-9]*)
+      printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: the fresh anchor transcript boundary is malformed' >&2
+      exit 2
+      ;;
+  esac
+  current_end=$(file_size_bytes "$transcript") || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: the pre-compact transcript is unreadable' >&2
+    exit 2
+  }
+  [ "$current_end" -ge "$transcript_end" ] || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: the pre-compact transcript is shorter than its captured boundary' >&2
+    exit 2
+  }
+  if [ -L "$STOW_MARKER" ] || { [ -e "$STOW_MARKER" ] && [ ! -f "$STOW_MARKER" ]; }; then
+    printf 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: unsafe completion marker at %s\n' "$STOW_MARKER" >&2
+    exit 2
+  fi
+  umask 077
+  tmp=$(mktemp "$STATE/.autocompact-stow.marker.XXXXXX") || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: could not allocate a temporary marker' >&2
+    exit 2
+  }
+  printf 'transcript_path=%s\ncompleted_bytes=%s\n' "$transcript" "$transcript_end" > "$tmp" || {
+    rm -f "$tmp"
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: could not render the completion marker' >&2
+    exit 2
+  }
+  mv -f "$tmp" "$STOW_MARKER" || {
+    rm -f "$tmp"
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT STOW MARK FAILED: could not publish the completion marker atomically' >&2
+    exit 2
+  }
+  printf 'FIRSTMATE AUTOCOMPACT STOW MARKER ADVANCED: %s through byte %s.\n' "$transcript" "$transcript_end"
+}
+
 recover_context() {
   local digest digest_rc
   digest=$(
@@ -322,6 +549,7 @@ recover_context() {
   fi
   printf '%s\n' 'Treat the fresh durable anchor and session-start digest below as authoritative over the lossy compaction summary.'
   printf '%s\n' 'Resume the in-flight work directly after reconciling the drained wake queue and live endpoints.'
+  emit_stow_directive
   printf '\n=== FRESH RESUME ANCHOR: %s ===\n' "$ANCHOR"
   if [ -f "$ANCHOR" ] && [ ! -L "$ANCHOR" ]; then
     cat "$ANCHOR" || printf '%s\n' 'UNREADABLE - the resume anchor could not be read; rely on the session-start digest and surface the read failure.'
@@ -336,8 +564,8 @@ recover_context() {
   fi
 }
 
-if [ "$MODE" = capture ]; then
-  capture_anchor
-else
-  recover_context
-fi
+case "$MODE" in
+  capture) capture_anchor ;;
+  recover) recover_context ;;
+  mark-stowed) mark_stowed ;;
+esac

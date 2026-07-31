@@ -27,7 +27,7 @@ The existing `Stop` and `PreToolUse` hooks remain separate and unchanged.
 A shell `PreCompact` hook cannot invoke the interactive `stow` skill or make the model judge uncaptured conversation-only knowledge.
 Capture therefore records the transcript path and end byte without attempting the sweep itself.
 Compact-sourced recovery directs the resumed model to load `stow`, read only the transcript bytes after the last completed sweep, and use that skill as the single owner of routing destinations.
-After the sweep succeeds, `bin/fm-autocompact.sh mark-stowed` atomically advances `state/.autocompact-stow.marker`; if the sweep never completes, the marker stays behind and the next recovery asks again.
+After the sweep succeeds, the model runs the complete `mark-stowed` command emitted by recovery. That command binds the acknowledgement to the exact transcript boundary and prior marker state, then advances `state/.autocompact-stow.marker` only if neither changed during the sweep. If the sweep never completes or either value changes, the marker does not advance and the next recovery asks again.
 A missing or malformed marker, an unreadable transcript, or an invalid boundary fails open to a whole-recovered-context sweep and never blocks capture or recovery.
 
 `PreCompact` stdout is not the recovery transport.
@@ -99,7 +99,7 @@ Pre-compact transcript: /Users/dongkeun/.claude/projects/-Users-dongkeun--treeho
 Captured boundary: zero-based byte offset 0 inclusive through 86349 exclusive.
 ~~~
 
-On the next model request, the resumed model loaded the project-local `stow` skill, read that pre-compact slice, completed the sweep, ran `bin/fm-autocompact.sh mark-stowed`, and returned:
+On the next model request, the resumed model loaded the project-local `stow` skill, read that pre-compact slice, completed the sweep, ran the recovery directive's boundary-bound `mark-stowed` command, and returned:
 
 ~~~text
 DIRECTIVE_SEEN: yes

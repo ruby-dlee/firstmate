@@ -33,8 +33,9 @@ recover() {
 }
 
 mark_stowed() {
-  local root=$1 home=$2
-  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" mark-stowed
+  local root=$1 home=$2 transcript=$3 end=$4 state=$5
+  shift 5
+  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" mark-stowed "$transcript" "$end" "$state" "$@"
 }
 
 test_tracked_hook_registration_preserves_existing_hooks() {
@@ -256,7 +257,7 @@ EOF
 
   out=$(recover "$root" "$home")
   assert_contains "$out" 'ACTION REQUIRED' "the first boundary did not request a stow sweep"
-  mark_out=$(mark_stowed "$root" "$home")
+  mark_out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent)
   assert_contains "$mark_out" 'STOW MARKER ADVANCED' "successful stow acknowledgement did not advance the marker"
   marker="$home/state/.autocompact-stow.marker"
   assert_present "$marker" "successful stow acknowledgement did not publish a marker"
@@ -272,9 +273,51 @@ EOF
   capture "$root" "$home" auto
   out=$(recover "$root" "$home")
   assert_contains "$out" "Read zero-based byte offset $first_end inclusive through $second_end exclusive" "next compaction did not scope the sweep to new transcript bytes"
-  mark_stowed "$root" "$home" >/dev/null
+  mark_stowed "$root" "$home" "$transcript" "$second_end" present "$transcript" "$first_end" >/dev/null
   assert_contains "$(cat "$marker")" "completed_bytes=$second_end" "marker did not advance to the second boundary"
   pass "the durable marker advances only after acknowledgement and suppresses duplicate transcript sweeps"
+}
+
+test_stale_sweep_cannot_advance_a_changed_boundary() {
+  local rec root home transcript first_end second_end out marker rc
+  rec=$(new_primary stale-sweep)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"first boundary"}' > "$transcript"
+  first_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+  recover "$root" "$home" >/dev/null
+  marker="$home/state/.autocompact-stow.marker"
+  printf '%s\n' "transcript_path=$transcript" 'completed_bytes=changed-under-sweep' > "$marker"
+
+  set +e
+  out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "stale sweep after marker change"
+  assert_contains "$out" 'the completion marker changed during the sweep' "stale sweep did not reject the changed marker"
+  assert_contains "$(cat "$marker")" 'completed_bytes=changed-under-sweep' "stale sweep replaced the changed marker"
+  out=$(recover "$root" "$home")
+  assert_contains "$out" 'ACTION REQUIRED' "changed marker suppressed the required re-sweep"
+
+  rm "$marker"
+  printf '%s\n' '{"type":"assistant","message":"new boundary"}' >> "$transcript"
+  second_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+
+  set +e
+  out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "stale sweep acknowledgement"
+  assert_contains "$out" 'the recovery anchor changed during the sweep' "stale sweep did not reject the changed anchor"
+  assert_absent "$marker" "stale sweep advanced the marker"
+  out=$(recover "$root" "$home")
+  assert_contains "$out" "through $second_end exclusive" "changed boundary did not require a re-sweep"
+  assert_contains "$out" 'ACTION REQUIRED' "changed boundary suppressed its re-sweep"
+  pass "stale sweep acknowledgement fails closed and leaves the new boundary pending"
 }
 
 test_missing_or_corrupt_stow_marker_degrades_to_full_sweep() {
@@ -291,7 +334,7 @@ EOF
   out=$(recover "$root" "$home")
   rc=$?
   expect_code 0 "$rc" "recovery with a missing stow marker"
-  assert_contains "$out" 'the completion marker is missing or malformed' "missing marker reason was not surfaced"
+  assert_contains "$out" 'the completion marker is missing' "missing marker reason was not surfaced"
   assert_contains "$out" 'sweep the whole recovered context' "missing marker did not degrade to a full sweep"
 
   printf '%s\n' "transcript_path=$transcript" 'completed_bytes=not-a-byte-offset' > "$marker"
@@ -393,6 +436,7 @@ test_capture_and_recovery_do_not_require_jq
 test_intermediate_render_failure_preserves_prior_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
 test_stow_marker_advances_and_suppresses_duplicate_sweeps
+test_stale_sweep_cannot_advance_a_changed_boundary
 test_missing_or_corrupt_stow_marker_degrades_to_full_sweep
 test_unreadable_transcript_does_not_block_recovery
 test_recovery_payload_failures_still_emit_durable_context

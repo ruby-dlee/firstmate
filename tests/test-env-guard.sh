@@ -180,11 +180,11 @@ fm_test_isolation_guard_environment() {
   done
 }
 
+fm_test_isolation_guard_environment
 enable -n kill 2>/dev/null \
   || fm_test_isolation_fail 'the Bash kill builtin could not be disabled'
 hash -p "$FM_TEST_GUARD_KILL_WRAPPER" kill \
   || fm_test_isolation_fail "the guarded kill command could not be pinned: $FM_TEST_GUARD_KILL_WRAPPER"
-fm_test_isolation_guard_environment
 if [ -n "${FM_TEST_BASH_ENV_PAYLOAD:-}" ]; then
   fm_test_isolation_assert_path FM_TEST_BASH_ENV_PAYLOAD "$FM_TEST_BASH_ENV_PAYLOAD" entry
   [ -f "$FM_TEST_BASH_ENV_PAYLOAD" ] && [ ! -L "$FM_TEST_BASH_ENV_PAYLOAD" ] \

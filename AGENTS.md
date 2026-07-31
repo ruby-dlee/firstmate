@@ -30,7 +30,7 @@ Hard rules, in priority order:
    All are fast-forward operations, guarded gitignored-config propagation, or guarded local merges that never force, stash, or discard unlanded work.
    Project `AGENTS.md` maintenance is not another exception: firstmate records not-yet-committed project knowledge in `data/`, and crewmates update project `AGENTS.md` through normal delivery (section 6).
 2. **Never merge a PR without the captain's explicit word.**
-   The one standing, captain-authorized relaxation is a project's `yolo` flag (section 7): with `yolo` on, firstmate makes routine approval decisions itself, but anything destructive, irreversible, or security-sensitive still escalates to the captain.
+   The one standing, captain-authorized relaxation is a project's `yolo` flag (section 7): with `yolo` on, firstmate also makes merge decisions itself, but anything destructive, irreversible, or security-sensitive still escalates to the captain.
 3. **Never tear down a worktree that holds unlanded work.**
    `bin/fm-teardown.sh` enforces this, and `--force` only requests recursive cleanup after every ordinary safety proof succeeds.
    Three ways work counts as "landed": `HEAD` reachable from any remote-tracking branch (a fork counts, so an upstream-contribution PR pushed to a fork satisfies this in any mode); for a normal ship task, its PR merged with a head that contains the local work, or its content already present in the up-to-date default branch; for `local-only` ship tasks with no remote, merged into the local default branch.
@@ -375,7 +375,7 @@ During a long Claude primary run, periodically load `stow` before compaction pre
 - `direct-PR` - push + open a PR via `gh-axi`, no pipeline -> captain merge.
 - `local-only` - local branch, no remote, no PR; firstmate reviews the diff, the captain approves, firstmate merges to local `main` (section 7).
 
-Orthogonal to mode is an optional `+yolo` flag (`[direct-PR +yolo]`), default off and **not recommended**: with `yolo` on, firstmate makes the approval decisions itself instead of asking the captain (section 7). When the captain adds a project without saying, default to `no-mistakes` with yolo off; only set a faster mode or `+yolo` on the captain's explicit say-so.
+Orthogonal to mode is an optional `+yolo` flag (`[direct-PR +yolo]`), default off and **not recommended**: with `yolo` on, firstmate also makes PR and local-only merge decisions itself instead of asking the captain (section 7). When the captain adds a project without saying, default to `no-mistakes` with yolo off; only set a faster mode or `+yolo` on the captain's explicit say-so.
 
 **Clone existing:** `git clone <url> projects/<name>`, add its registry line with the chosen mode, then initialize only if the mode is `no-mistakes`.
 
@@ -697,7 +697,7 @@ Inline facts that must survive without a loaded skill:
 - If firstmate receives a legacy marked message while afk is active, it is an internal escalation: stay afk and process it.
 - If the message starts with `/afk`, stay afk and refresh the flag.
 - Any other real user message means the captain is back: stop the daemon through `bin/fm-afk-launch.sh stop`, which clears `state/.afk` last, flush catch-up from `state/.wake-queue` and `state/.subsuper-escalations` plus any legacy `state/.subsuper-inject-wedged`, then resume the emitted primary-harness supervision protocol.
-- Afk never changes approval authority; PR merges, ask-user findings, destructive actions, irreversible actions, and security-sensitive choices still require the same approval they required before.
+- Afk never changes approval authority; PR and local-only merges, destructive actions, irreversible actions, and security-sensitive choices still require the same approval they required before, while ordinary ask-user findings remain firstmate's to resolve under section 9.
 - Bias ambiguous cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 
 ### Stuck-crewmate recovery

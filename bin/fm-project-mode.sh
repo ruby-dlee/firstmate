@@ -12,8 +12,8 @@
 #   no-mistakes  full pipeline -> PR -> captain merge (default)
 #   direct-PR    push + PR via gh-axi, no pipeline -> captain merge
 #   local-only   local branch, no remote/PR -> firstmate review -> captain approve -> local merge
-# yolo (orthogonal) = when on, firstmate makes approval decisions itself (PR merges,
-#   ask-user findings, local-only merge approval) without checking the captain - except
+# yolo (orthogonal) = when on, firstmate also makes PR and local-only merge
+#   decisions without checking the captain - except
 #   anything destructive/irreversible/security-sensitive, which still escalates.
 #
 # An unknown/missing project or unknown mode falls back to "no-mistakes off" and warns

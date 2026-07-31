@@ -181,11 +181,48 @@ decimal_compare() {
 }
 
 acquire_stow_lock() {
-  mkdir "$STOW_LOCK" 2>/dev/null
+  if [ -d "$STOW_LOCK" ] && [ ! -L "$STOW_LOCK" ]; then
+    rmdir "$STOW_LOCK" 2>/dev/null || return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  umask 077
+  python3 -c '
+import os
+import stat
+import sys
+
+flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(sys.argv[1], flags, 0o600)
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise RuntimeError("lock is not a regular file")
+finally:
+    os.close(fd)
+' "$STOW_LOCK" 2>/dev/null || return 1
+  exec 9<> "$STOW_LOCK" || return 1
+  python3 -c '
+import fcntl
+import os
+import stat
+import sys
+
+held = os.fstat(9)
+named = os.lstat(sys.argv[1])
+if not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode):
+    raise RuntimeError("lock is not a regular file")
+if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+    raise RuntimeError("lock pathname changed before acquisition")
+fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+confirmed = os.lstat(sys.argv[1])
+if (held.st_dev, held.st_ino) != (confirmed.st_dev, confirmed.st_ino):
+    raise RuntimeError("lock pathname changed during acquisition")
+' "$STOW_LOCK" 2>/dev/null || { exec 9>&-; return 1; }
 }
 
 release_stow_lock() {
-  rmdir "$STOW_LOCK" 2>/dev/null || true
+  { exec 9>&-; } 2>/dev/null || true
 }
 
 shell_quote() {

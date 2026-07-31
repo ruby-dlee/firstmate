@@ -320,6 +320,47 @@ EOF
   pass "stale sweep acknowledgement fails closed and leaves the new boundary pending"
 }
 
+test_interrupted_lock_owner_does_not_wedge_future_capture() {
+  local rec root home lock holder rc out
+  rec=$(new_primary interrupted-lock)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '{"type":"user","message":"lock recovery"}' > "$home/transcript.jsonl"
+  lock="$home/state/.autocompact-stow.lock"
+  mkdir "$lock"
+  capture "$root" "$home" auto
+  [ -f "$lock" ] && [ ! -L "$lock" ] || fail "legacy stale lock directory was not recovered safely"
+
+  python3 -c '
+import fcntl
+import os
+import sys
+import time
+
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(1, b"locked\n")
+time.sleep(30)
+' "$lock" > "$home/lock-ready" &
+  holder=$!
+  while [ ! -s "$home/lock-ready" ] && kill -0 "$holder" 2>/dev/null; do sleep 0.01; done
+  kill -0 "$holder" 2>/dev/null || fail "synthetic lock owner exited before acquiring the lock"
+
+  set +e
+  out=$(capture "$root" "$home" auto 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "capture while the stow lock is live"
+  assert_contains "$out" 'could not lock the resume anchor for publication' "live lock did not preserve fail-closed capture"
+  kill -KILL "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+
+  capture "$root" "$home" auto
+  assert_present "$home/data/autocompact-resume.md" "killed lock owner permanently wedged capture"
+  pass "kernel-released lock recovers stale state and interrupted owners"
+}
+
 test_missing_or_corrupt_stow_marker_degrades_to_full_sweep() {
   local rec root home transcript out marker rc
   rec=$(new_primary marker-fallback)
@@ -437,6 +478,7 @@ test_intermediate_render_failure_preserves_prior_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
 test_stow_marker_advances_and_suppresses_duplicate_sweeps
 test_stale_sweep_cannot_advance_a_changed_boundary
+test_interrupted_lock_owner_does_not_wedge_future_capture
 test_missing_or_corrupt_stow_marker_degrades_to_full_sweep
 test_unreadable_transcript_does_not_block_recovery
 test_recovery_payload_failures_still_emit_durable_context

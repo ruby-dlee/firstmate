@@ -12,7 +12,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.."
 command -v lavish-axi >/dev/null 2>&1 || exit 0
 version=$(lavish-axi --version 2>/dev/null || true)
 case "$version" in
-  'lavish-axi 1.'*) ;;
+  'lavish-axi 1.'*'(store-forward protocol 1)') ;;
   *) exit 0 ;;
 esac
 

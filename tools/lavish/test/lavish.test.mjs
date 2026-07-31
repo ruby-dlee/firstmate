@@ -335,6 +335,7 @@ test('ordinary wake drain consumes the answer before draining its pointer', asyn
   const drained = await runExecutable(WAKE_DRAIN, [], {
     env: {
       FM_HOME: fx.home,
+      FM_GATE_REFUSE_BYPASS: '1',
       PATH: `${fakeBin}:${process.env.PATH}`,
     },
   });

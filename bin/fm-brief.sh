@@ -257,8 +257,8 @@ The report is the only thing that survives, so anything worth keeping must be in
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
-   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+   every lane/home, so restarting it kills in-flight pipeline runs in other lanes; only firstmate manages it.
+   Under known concurrent AXI runs, a socket I/O timeout is contention, not an outage: leave the daemon alone, re-enter no-mistakes axi run after 60, 120, then 240 seconds, and report blocked only after about 10 minutes with the exact error and elapsed time.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -347,7 +347,7 @@ Do not hand-edit, commit, or fix findings yourself while a run is active - the p
 Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
-- Avoid \`--yes\`: report \`needs-decision\` to firstmate, which applies AGENTS.md section 9's blocker triage; all safety and approval boundaries still apply.
+- Avoid \`--yes\`: report \`needs-decision\` to firstmate, which applies the blocker triage in AGENTS.md section 9; all safety and approval boundaries still apply.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
@@ -391,11 +391,11 @@ $RULE1
    cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If you encounter a product choice, destructive action, or ask-user finding,
-   append \`needs-decision: {summary of options}\` and stop. Firstmate applies AGENTS.md section 9's blocker triage and replies with the decision.
+   append \`needs-decision: {summary of options}\` and stop. Firstmate applies the blocker triage in AGENTS.md section 9 and replies with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
-   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+   every lane/home, so restarting it kills in-flight pipeline runs in other lanes; only firstmate manages it.
+   Under known concurrent AXI runs, a socket I/O timeout is contention, not an outage: leave the daemon alone, re-enter no-mistakes axi run after 60, 120, then 240 seconds, and report blocked only after about 10 minutes with the exact error and elapsed time.
 
 $REPORT_CONTRACT
 

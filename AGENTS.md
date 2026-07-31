@@ -679,6 +679,7 @@ Watcher liveness is harness-aware.
 Do not assume one primary harness can use another harness's foreground or background shape.
 For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.
 `no-mistakes axi run` is the blocking wait for a crewmate's own validation: re-enter it and process every return synchronously, because repeated `axi status` calls only poll, do not advance the run, and burn tokens.
+A shared-socket timeout under known concurrent AXI clients is queue contention, not a daemon outage: leave the daemon untouched, re-enter `axi run` after 60, 120, then 240 seconds, and escalate only after about 10 minutes with the exact error and elapsed time.
 Never park a crewmate on "firstmate is driving it" unless firstmate currently owns that live blocking loop; a check script only observes, so blocking firstmate on that observer deadlocks both sides.
 
 Token discipline: default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.

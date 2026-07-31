@@ -8,4 +8,5 @@ tests/fm-backend-herdr.test.sh	      export BASH_ENV="$FM_HERDR_EVIL_ENV"
 tests/test-isolation.test.sh	  out=$(BASH_ENV="$hostile" "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
 tests/test-isolation.test.sh	  out=$(env -u BASH_ENV "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
 tests/test-isolation.test.sh	  out=$(BASH_ENV="$hostile" "$RUNNER" tests/runner-entry-probe.test.sh 2>&1) || status=$?
+tests/test-isolation.test.sh	  out=$(BASH_ENV="$hostile" "$SUITE" tests/runner-entry-probe.test.sh 2>&1) || status=$?
 tests/test-isolation.test.sh	  out=$(env -u BASH_ENV -u FM_TEST_SEALED -u FM_TEST_SANDBOX_ROOT \

@@ -1,8 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Single sealed entry point for firstmate's behavior-test suite.
 set -u
+unset BASH_ENV
 
-TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$TEST_DIR/.." && pwd -P)"
 runner="$TEST_DIR/run-test.sh"
 result=0

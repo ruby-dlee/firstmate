@@ -578,8 +578,6 @@ test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
     "$workspace" > "$w/home/data/secondmates.md"
   account_task=fm-test-sm1-a1234
   mkdir -p "$w/home/data/sm1"
-  printf -- '- sm1 - test secondmate (home: %s; scope: test; projects: ; added 2026-07-13)\n' \
-    "$workspace" > "$w/home/data/secondmates.md"
   cat >> "$meta" <<EOF
 worktree=$workspace
 project=$workspace

@@ -239,8 +239,8 @@ phase_recovery() {
 phase_teardown() {
   local teardown_out
   : > "$LOG"
-  teardown_out=$(PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_HOME="$HOME_DIR" FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" \
-    FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
+  teardown_out=$(PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$PRIMARY_ROOT" FM_HOME="$HOME_DIR" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-teardown.sh" design 2>&1) \
     || fail "teardown failed for the empty secondmate home: $teardown_out"
   printf '%s\n' "$teardown_out" | grep -F 'Backlog:' >/dev/null \

@@ -15,6 +15,19 @@ This skill owns entry shape for `data/captain.md` and `data/learnings.md` only.
 `AGENTS.md` section 6 owns knowledge routing and the files' inspect-then-update, rewrite-in-place contract.
 The `/stow` skill owns session sweeps, and `firstmate-coding-guidelines` owns repository-wide knowledge placement and one-owner discipline.
 
+## Promote or delete
+
+Learnings must live where they are read, so this is the first decision on every candidate entry, before any question of wording.
+
+- A rule that should change behavior belongs in the instruction surface that loads at the moment it applies: `AGENTS.md` when every session needs it, or the skill that loads at the triggering moment.
+  Promote it there and do not also keep it here.
+- Private memory holds only what cannot live in the shared repo: machine-specific and fleet-local facts such as service regions, credential locations, environment drift, and tool quirks specific to this box.
+- Promote or delete is the default outcome for a candidate entry; keeping it is the exception that has to earn itself against those two.
+- A general rule parked in a private file is the failure mode, not a safe backup.
+  Length is not diligence: a file nobody reads at the moment it matters lets its lessons be re-learned the expensive way.
+- Convert an incident narrative to the durable fact plus a one-line `[[pointer]]`, or delete it.
+- Delete stale and superseded entries outright rather than preserving them for safety.
+
 ## Entry standard
 
 - Record only the actionable rule or durable fact.
@@ -29,7 +42,7 @@ The `/stow` skill owns session sweeps, and `firstmate-coding-guidelines` owns re
 
 ## Update practice
 
-1. Use `AGENTS.md` section 6 to confirm that the knowledge belongs in one of these private-memory files.
+1. Apply "Promote or delete" first, then use `AGENTS.md` section 6 to confirm that what remains belongs in one of these private-memory files.
 2. Inspect the current file and the candidate owning entry before writing.
 3. Search nearby entries for overlap, stale wording, and superseded variants.
 4. Reduce the new information to one actionable rule or durable fact.
@@ -58,6 +71,7 @@ It drops mood, drama, chronology, and commentary that do not change the rule.
 
 Reject the update if any answer is yes:
 
+- Is it a general rule that belongs in `AGENTS.md` or a skill that loads at the triggering moment?
 - Does it describe emotion or intensity instead of changing future action?
 - Does it retell an incident beyond one short example or pointer?
 - Does another entry already own the same rule or fact?

@@ -8,7 +8,7 @@ CI and the no-mistakes test command both use this same entry point.
 
 `tests/lib.sh` sources `tests/test-env-guard.sh` before exposing any fixture helper.
 Direct execution therefore fails before a behavior test can resolve operational state.
-`BASH_ENV` installs the same guard in every Bash child process.
+The POSIX-shell runner discards ambient `BASH_ENV` before doing any setup, then explicitly installs the same guard for the sealed test and ordinary Bash child processes.
 
 The guard fails with exit 97 and names the offending path or PID when any of these boundaries are violated:
 
@@ -19,6 +19,10 @@ The guard fails with exit 97 and names the offending path or PID when any of the
 
 The runner removes the complete sandbox at exit.
 Tests may execute tracked scripts from the real repository, but operational home, state, and pool resolution must remain private.
+
+The harness protects trusted project tests from accidental fleet escape, including stale or hostile `BASH_ENV` inherited from an operator or outer validation process.
+A child can deliberately bypass the in-shell guard only by setting or unsetting `BASH_ENV`, removing `tests/sealed-bin` from `PATH`, and invoking real system Bash directly or through an env-Bash shebang.
+The parent shell cannot intercept that child startup before Bash reads `BASH_ENV`; preventing it requires an OS-enforced sandbox, container, or equivalent process boundary and is outside this trusted-test threat model.
 
 ## Lifecycle stops
 

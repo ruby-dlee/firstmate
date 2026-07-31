@@ -1,0 +1,8 @@
+tests/fm-account-routing.test.sh	        export BASH_ENV=/hostile-bash-env PYTHONPATH=/hostile-python
+tests/fm-account-routing.test.sh	     export BASH_ENV="$6" FM_LOADER_ENV_LOG="$7"
+tests/fm-account-routing.test.sh	    export BASH_ENV="$4"
+tests/fm-account-routing.test.sh	      PYTHONHOME= PYTHONPATH= RUBYOPT= RUBYLIB= BASH_ENV= ENV= GCONV_PATH= \
+tests/fm-backend-herdr.test.sh	    BASH_ENV="$bash_env" AGENT_FLEET_CONFIG=/tmp/hostile-fleet \
+tests/fm-backend-herdr.test.sh	      export BASH_ENV="$FM_HERDR_EVIL_ENV"
+tests/test-isolation.test.sh	  out=$(BASH_ENV="$hostile" "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
+tests/test-isolation.test.sh	  out=$(PATH="$no_bash_path" BASH_ENV="$hostile" "$shebang" 2>&1) || status=$?

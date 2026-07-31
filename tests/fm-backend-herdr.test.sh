@@ -513,7 +513,7 @@ SH
 
   /usr/bin/env SHELLOPTS=xtrace \
     "PS4=\$(/usr/bin/touch '$shell_marker')" \
-    BASH_ENV="$bash_env" FM_TEST_BASH_ENV_SANITATION_CASE=1 AGENT_FLEET_CONFIG=/tmp/hostile-fleet \
+    BASH_ENV="$bash_env" AGENT_FLEET_CONFIG=/tmp/hostile-fleet \
     QUOTA_AXI_CACHE_DIR=/tmp/hostile-quota XDG_CONFIG_HOME=/tmp/hostile-xdg \
     "BASH_FUNC_hostile_shell%%=() { /usr/bin/touch '$shell_marker'; }" \
     "$wrapper" -c "/usr/bin/env > '$shell_dump'" \
@@ -1620,7 +1620,7 @@ SH
       export DYLD_INSERT_LIBRARIES=/tmp/hostile.dylib
       export NODE_OPTIONS="--require /tmp/hostile-node.js"
       export PERL5OPT=-MHostile
-      export BASH_ENV="$FM_HERDR_EVIL_ENV" FM_TEST_BASH_ENV_SANITATION_CASE=1
+      export BASH_ENV="$FM_HERDR_EVIL_ENV"
       . "$0/bin/backends/herdr.sh"
       control_uid=$(fm_backend_herdr_control_exec id -u) || exit 1
       case "$control_uid" in ""|*[!0-9]*) exit 1 ;; esac

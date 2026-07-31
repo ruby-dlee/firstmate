@@ -566,10 +566,18 @@ test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
   printf 'charter\n' > "$w/sm1/data/charter.md"
   workspace=$(cd "$w/sm1" && pwd -P)
   meta="$w/home/state/sm1.meta"
+  {
+    printf 'window=firstmate:fm-sm1\n'
+    printf 'kind=secondmate\n'
+    printf 'harness=claude\n'
+    printf 'home=%s\n' "$workspace"
+  } > "$meta"
+  touch "$w/home/state/.fake-endpoint"
+  mkdir -p "$w/home/data"
+  printf -- '- sm1 - liveness fixture (home: %s; scope: liveness recovery; projects: ; added 2026-07-31)\n' \
+    "$workspace" > "$w/home/data/secondmates.md"
   account_task=fm-test-sm1-a1234
   mkdir -p "$w/home/data/sm1"
-  printf -- '- sm1 - test secondmate (home: %s; scope: test; projects: ; added 2026-07-13)\n' \
-    "$workspace" > "$w/home/data/secondmates.md"
   cat >> "$meta" <<EOF
 worktree=$workspace
 project=$workspace

@@ -74,3 +74,34 @@ fm_tasks_axi_backend_available() {
   fm_backlog_backend_manual "$config_dir" && return 1
   fm_tasks_axi_compatible
 }
+
+# Print the sorted IDs from tasks-axi's ready view for one explicit backlog.
+fm_tasks_axi_ready_ids() {
+  local backlog_file=$1 output
+  [ -f "$backlog_file" ] && [ ! -L "$backlog_file" ] || return 0
+  output=$(tasks-axi ready --file="$backlog_file" 2>/dev/null) || return 1
+  printf '%s\n' "$output" \
+    | sed -n 's/^  \([^,][^,]*\),.*/\1/p' \
+    | LC_ALL=C sort -u
+}
+
+# Report only IDs that would become ready if <id> were marked Done.
+# The real backlog stays untouched: the mutation runs against a sibling copy.
+fm_tasks_axi_ready_after_done() {
+  local backlog_file=$1 id=$2 before after probe_file probe_status=0
+  [ -f "$backlog_file" ] && [ ! -L "$backlog_file" ] || return 0
+  before=$(fm_tasks_axi_ready_ids "$backlog_file") || return 1
+  probe_file=$(mktemp "$(dirname "$backlog_file")/.backlog-ready-probe.XXXXXX") || return 1
+  cp "$backlog_file" "$probe_file" || probe_status=$?
+  if [ "$probe_status" -eq 0 ]; then
+    tasks-axi "done" "$id" --file="$probe_file" --note "completion readiness probe" --no-prune >/dev/null 2>&1 \
+      || probe_status=$?
+  fi
+  if [ "$probe_status" -eq 0 ]; then
+    after=$(fm_tasks_axi_ready_ids "$probe_file") || probe_status=$?
+  fi
+  rm -f "$probe_file"
+  [ "$probe_status" -eq 0 ] || return "$probe_status"
+  awk 'NR == FNR { if (NF) before[$0] = 1; next } NF && !before[$0]' \
+    <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+}

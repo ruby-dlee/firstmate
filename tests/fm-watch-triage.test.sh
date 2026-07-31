@@ -1594,6 +1594,64 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   pass "heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed"
 }
 
+test_heartbeat_surfaces_newly_ready_backlog_work() {
+  local dir state fakebin config data out drain_out ready_ids pid
+  dir=$(make_case heartbeat-backlog-ready); state="$dir/state"; fakebin="$dir/fakebin"
+  config="$dir/config"; data="$dir/data"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  ready_ids="$dir/ready-ids"
+  mkdir -p "$config" "$data"
+  printf '%s\n' '# backlog-v1' '## Queued' > "$data/backlog.md"
+  printf '%s\n' baseline > "$ready_ids"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '%s\n' '0.2.2'; exit 0; fi
+if [ "${1:-}" = update ] && [ "${2:-}" = --help ]; then
+  printf '%s\n' 'usage: tasks-axi update <id> --archive-body'
+  exit 0
+fi
+if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
+  printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'
+  exit 0
+fi
+if [ "${1:-}" = ready ]; then
+  count=$(awk 'NF { n++ } END { print n + 0 }' "$FM_FAKE_READY_IDS_FILE")
+  printf 'count: %s\nready[%s]{id,state,kind,repo,title}:\n' "$count" "$count"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    printf '  %s,queued,ship,firstmate,"Ready task"\n' "$id"
+  done < "$FM_FAKE_READY_IDS_FILE"
+  if [ "${FM_FAKE_MUTATE_READY_AFTER_READ:-0}" = 1 ] \
+    && grep -Fx follow-up "$FM_FAKE_READY_IDS_FILE" >/dev/null; then
+    printf '%s\n' baseline later > "$FM_FAKE_READY_IDS_FILE"
+  fi
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/tasks-axi"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$config" FM_FAKE_READY_IDS_FILE="$ready_ids" \
+    FM_FAKE_MUTATE_READY_AFTER_READ=1 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_HEARTBEAT_MAX=1 \
+    "$WATCH" > "$out" &
+  pid=$!
+  wait_file_value "$state/.backlog-ready-ids" baseline 40 \
+    || { reap "$pid"; fail "heartbeat did not establish the ready-work baseline"; }
+  printf '%s\n' baseline follow-up > "$ready_ids"
+  wait_for_exit "$pid" 40 \
+    || { reap "$pid"; fail "heartbeat did not surface newly-ready backlog work"; }
+  grep -Fx 'heartbeat: dependency-cleared queued work: follow-up' "$out" >/dev/null \
+    || fail "heartbeat did not name the newly-ready backlog item: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
+    || fail "drain after backlog-ready heartbeat failed"
+  grep -F 'dependency-cleared queued work: follow-up' "$drain_out" >/dev/null \
+    || fail "backlog-ready heartbeat was not queued durably"
+  [ "$(cat "$state/.backlog-ready-ids")" = "$(printf '%s\n' baseline follow-up)" ] \
+    || fail "heartbeat did not persist the ready snapshot used for detection"
+  pass "heartbeat surfaces and persists the observed newly-ready backlog snapshot"
+}
+
 # --- beacon stays fresh while absorbing -------------------------------------
 
 test_beacon_stays_fresh_while_absorbing() {
@@ -1832,6 +1890,11 @@ if [ "${FM_TEST_FOCUSED:-}" = failure-pause ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = backlog-ready-snapshot ]; then
+  test_heartbeat_surfaces_newly_ready_backlog_work
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1871,6 +1934,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
+test_heartbeat_surfaces_newly_ready_backlog_work
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale

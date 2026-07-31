@@ -70,7 +70,7 @@ Check and test the toolbelt before pushing:
 ```sh
 for script in bin/*.sh bin/backends/*.sh; do bash -n "$script"; done   # syntax-check the toolbelt
 bin/fm-lint.sh   # lint the toolbelt and behavior tests; the single owner CI and the no-mistakes gate both run
-for test_script in tests/*.test.sh; do bash "$test_script"; done   # behavior tests, matching CI and no-mistakes commands.test
+tests/run.sh     # behavior tests in sealed per-test homes, matching CI and no-mistakes commands.test
 [ "$(readlink CLAUDE.md)" = "AGENTS.md" ]
 [ "$(readlink .claude/skills)" = "../.agents/skills" ]
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
@@ -79,7 +79,9 @@ tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVE
 Agent Fleet is independently packaged under `tools/agent-fleet` and requires Python 3.11 or newer plus `uv`.
 Run the complete locked verification in [`tools/agent-fleet/RELEASING.md`](tools/agent-fleet/RELEASING.md) before pushing; that document also owns versioning, tagging, and clean-install verification.
 
-Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
+Discover tests by listing `tests/*.test.sh`: each is a bash script named `<subject>.test.sh`, and its header comment describes what it covers.
+Run one through `tests/run.sh tests/<subject>.test.sh`; direct execution fails closed because it bypasses the sealed home and pool harness.
+See [`docs/test-isolation.md`](docs/test-isolation.md) for the sandbox and lifecycle-stop contracts.
 Tests that need a real optional backend, an explicit opt-in, or an ambient toolchain capability (real herdr/zellij/cmux smoke tests, the live Pi regression, the Pi TypeScript-extension checks when node cannot import `.ts` modules directly) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
 
 ## Questions

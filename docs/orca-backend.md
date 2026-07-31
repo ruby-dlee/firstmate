@@ -135,7 +135,7 @@ The fake-Orca authority lab is synthetic regression scaffolding, not provider ev
 Run the focused suite with:
 
 ```sh
-FM_TEST_FOCUSED=review-round-orca-authority tests/fm-backend-orca.test.sh
-tests/fm-backend.test.sh
-tests/fm-bootstrap.test.sh
+FM_TEST_FOCUSED=review-round-orca-authority tests/run.sh tests/fm-backend-orca.test.sh
+tests/run.sh tests/fm-backend.test.sh
+tests/run.sh tests/fm-bootstrap.test.sh
 ```

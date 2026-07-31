@@ -55,11 +55,7 @@ jobs:
           set -eu
           npm install -g tasks-axi
           tasks-axi --version
-      - run: |
-          set -eu
-          for test_script in tests/*.test.sh; do
-            "$test_script"
-          done
+      - run: tests/run.sh
 
   agent-fleet:
     name: Agent Fleet package

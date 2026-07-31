@@ -22,7 +22,7 @@ The extension tool returned Pi's required text `content` plus structured `detail
 The human command `/fm-watch-arm-pi` notified through `ctx.ui.notify(...)` and returned no value.
 The clean-exit probe ran `/quit`, printed `PI_EXIT=0`, and confirmed that both the attached arm process and watcher child were gone.
 That cleanup is owned by a one-shot process `exit` listener because Pi 0.80.5 did not reliably emit `session_shutdown` for `/quit`; the listener is removed when `session_shutdown` does run.
-Command run for the complete interactive regression: `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh`.
+Command run for the complete interactive regression: `FM_PI_LIVE_E2E=1 tests/run.sh tests/fm-pi-primary-live-e2e.test.sh`.
 Observed output: `ok - Pi 0.80.5 live E2E rendered the tool, guarded once, woke, re-armed, and cleaned up on exit`.
-Command run for the installed-type contract: `tests/fm-pi-primary-types.test.sh`.
+Command run for the installed-type contract: `tests/run.sh tests/fm-pi-primary-types.test.sh`.
 Observed output: `ok - Pi primary extensions pass strict no-emit typecheck against Pi 0.80.5`.

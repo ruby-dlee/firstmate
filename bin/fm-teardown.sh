@@ -4189,7 +4189,7 @@ cleanup_firstmate_home_children() {
     fi
     if [ "$child_kind" = secondmate ]; then
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home" || return 1
+        cleanup_firstmate_home_children "$child_home" || return $?
         child_registry_lock=$(fm_secondmate_registry_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home/data/secondmates.md") || return 1
         TEARDOWN_ACCOUNT_LOCKS+=("$child_registry_lock")
         validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" >/dev/null || return 1
@@ -4596,7 +4596,7 @@ if [ "$MANAGED_ACCOUNT" = 1 ]; then
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH" || exit 1
+  cleanup_firstmate_home_children "$HOME_PATH" || exit $?
 fi
 
 [ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1

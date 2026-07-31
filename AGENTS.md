@@ -687,7 +687,7 @@ Inline facts that must survive without a loaded skill:
 - `FM_INJECT_MARK`, ASCII unit separator `0x1f`, identifies only legacy terminal-backed injections and is never used by native reap-wake delivery.
 - If firstmate receives a legacy marked message while afk is active, it is an internal escalation: stay afk and process it.
 - If the message starts with `/afk`, stay afk and refresh the flag.
-- Any other real user message means the captain is back: stop the daemon through `bin/fm-afk-launch.sh stop`, which clears `state/.afk` last, flush catch-up from `state/.wake-queue` and `state/.subsuper-escalations` plus any legacy `state/.subsuper-inject-wedged`, then resume the emitted primary-harness supervision protocol.
+- Any other real user message means the captain is back: stop the daemon through `bin/fm-afk-launch.sh stop --home "$FM_HOME"`, which clears `state/.afk` last, flush catch-up from `state/.wake-queue` and `state/.subsuper-escalations` plus any legacy `state/.subsuper-inject-wedged`, then resume the emitted primary-harness supervision protocol.
 - Afk never changes approval authority; PR merges, ask-user findings, destructive actions, irreversible actions, and security-sensitive choices still require the same approval they required before.
 - Bias ambiguous cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 

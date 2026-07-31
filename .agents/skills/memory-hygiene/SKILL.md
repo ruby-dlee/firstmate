@@ -31,11 +31,8 @@ Learnings must live where they are read, so this is the first decision on every 
 
 ## Entry standard
 
-- Record only the actionable rule or durable fact.
-- Never record an inference as a capability fact.
-  An entry asserting a limit - "cannot", "impossible", "structural" - must cite the exact command and output that proved it, or it does not go in.
-- Never write "do not retry" or any equivalent into an entry, because that clause suppresses the one action that would disprove a wrong limit.
-  Capability claims decay as configs and permissions change, so every limit stays re-checkable by design.
+- Record only an actionable rule or evidence-backed durable fact, never an inference framed as capability.
+- Require any asserted limit - "cannot", "impossible", "structural" - to cite the exact command and output that proved it and remain re-checkable as configs and permissions change; never write "do not retry" or an equivalent that suppresses falsification.
 - Strip emotion, emphasis, interpersonal interpretation, and incident drama.
 - Do not preserve that anyone was furious, shocked, disappointed, emphatic, or otherwise emotionally affected.
 - Preserve the operational instruction or evidence-backed fact that remains after the mood is removed.

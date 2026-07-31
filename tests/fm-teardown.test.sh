@@ -295,6 +295,24 @@ if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'
   exit 0
 fi
+file=
+for arg in "$@"; do
+  case "$arg" in --file=*) file=${arg#--file=} ;; esac
+done
+if [ "${1:-}" = ready ]; then
+  if [ -n "$file" ] && grep -F '# completion-readiness-probe' "$file" >/dev/null 2>&1; then
+    printf '%s\n' 'count: 1' 'ready[1]{id,state,kind,repo,title}:' \
+      '  follow-up,queued,ship,firstmate,"Dependent follow-up"'
+  else
+    printf '%s\n' 'count: 0' 'ready[0]{id,state,kind,repo,title}:'
+  fi
+  exit 0
+fi
+if [ "${1:-}" = done ]; then
+  [ -n "$file" ] || exit 2
+  printf '%s\n' '# completion-readiness-probe' >> "$file"
+  exit 0
+fi
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tasks-axi"
@@ -768,23 +786,28 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
 
-test_teardown_prompts_tasks_axi_done_when_compatible() {
+test_teardown_surfaces_dependency_cleared_work_when_compatible() {
   local case_dir out
   case_dir=$(make_case tasks-axi-reminder)
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data"
+  printf '%s\n' '# backlog-v1' '## In flight' '- [ ] task-x1 - Current task' \
+    '## Queued' '- [ ] follow-up - Dependent follow-up blocked-by: task-x1' > "$case_dir/data/backlog.md"
   add_compatible_tasks_axi "$case_dir"
 
   out=$(run_teardown "$case_dir") || fail "teardown failed with compatible tasks-axi"
   printf '%s\n' "$out" | grep -F 'tasks-axi done task-x1 --pr https://github.com/example/repo/pull/7' >/dev/null \
     || fail "teardown did not prompt tasks-axi done: $out"
-  printf '%s\n' "$out" | grep -F 'tasks-axi ready' >/dev/null \
-    || fail "teardown did not prompt tasks-axi ready: $out"
-  printf '%s\n' "$out" | grep -F 'check date gates' >/dev/null \
-    || fail "teardown did not preserve date-gate check: $out"
+  printf '%s\n' "$out" | grep -F 'Dependency-cleared queued work when task-x1 is recorded Done: follow-up.' >/dev/null \
+    || fail "teardown did not surface the dependency-cleared follow-up: $out"
+  printf '%s\n' "$out" | grep -F 'Check date gates' >/dev/null \
+    || fail "teardown did not preserve the date-gate check: $out"
   printf '%s\n' "$out" | grep -F 'keep Done to the 10 most recent' >/dev/null \
     && fail "teardown kept manual Done pruning in compatible tasks-axi prompt: $out"
-  pass "teardown prompts tasks-axi backlog refresh when compatible"
+  grep -F '# completion-readiness-probe' "$case_dir/data/backlog.md" >/dev/null \
+    && fail "teardown mutated the real backlog while probing readiness"
+  pass "teardown surfaces dependency-cleared work without mutating the backlog"
 }
 
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present() {
@@ -5094,7 +5117,7 @@ if [ "${FM_TEST_FOCUSED:-}" = preserve-scratch ]; then
 fi
 
 test_local_only_fork_remote_allows
-test_teardown_prompts_tasks_axi_done_when_compatible
+test_teardown_surfaces_dependency_cleared_work_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows

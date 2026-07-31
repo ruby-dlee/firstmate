@@ -48,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
@@ -64,6 +65,8 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.
@@ -705,6 +708,44 @@ safe_touch_marker_or_log() {  # <path> <label>
   return 1
 }
 
+write_backlog_ready_snapshot() {  # <ready-ids>
+  local ready_ids=$1 marker="$STATE/.backlog-ready-ids" tmp
+  tmp=$(mktemp "$STATE/.backlog-ready-ids.XXXXXX") || return 1
+  printf '%s' "$ready_ids" > "$tmp" || { rm -f "$tmp"; return 1; }
+  safe_marker_path "$marker" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$marker"
+}
+
+# Print only IDs newly present in tasks-axi's ready view since the last heartbeat.
+# An absent snapshot establishes a baseline instead of waking for the whole queue.
+backlog_ready_additions() {
+  local marker="$STATE/.backlog-ready-ids" current previous added
+  fm_tasks_axi_backend_available "$CONFIG" || return 1
+  current=$(fm_tasks_axi_ready_ids "$DATA/backlog.md") || return 1
+  if ! safe_marker_path "$marker"; then
+    safe_touch_marker_or_log "$marker" "backlog-ready snapshot" || true
+    return 1
+  fi
+  if [ ! -e "$marker" ]; then
+    write_backlog_ready_snapshot "$current" || true
+    return 1
+  fi
+  previous=$(cat "$marker" 2>/dev/null || true)
+  added=$(awk 'NR == FNR { if (NF) before[$0] = 1; next } NF && !before[$0]' \
+    <(printf '%s\n' "$previous") <(printf '%s\n' "$current"))
+  if [ -z "$added" ]; then
+    write_backlog_ready_snapshot "$current" || true
+    return 1
+  fi
+  printf '%s\n' "$added" | paste -sd ' ' -
+}
+
+refresh_backlog_ready_snapshot() {
+  local current
+  current=$(fm_tasks_axi_ready_ids "$DATA/backlog.md") || return 1
+  write_backlog_ready_snapshot "$current"
+}
+
 marker_due() {  # <path> <interval-seconds> <label>
   local marker=$1 interval=$2 label=$3
   if ! safe_marker_path "$marker"; then
@@ -1237,15 +1278,31 @@ EOF
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
+    ready_ids=
+    ready_changed=0
+    if ready_ids=$(backlog_ready_additions); then
+      ready_changed=1
+    fi
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
-    # turns up a captain-relevant status the per-wake path missed. Absorb the
+    # turns up newly-ready backlog work or a captain-relevant status the per-wake path missed. Absorb the
     # no-change case (advance the schedule and back off exactly as wake() would,
     # without exiting); the away-mode daemon, when present, owns triage and wants
     # every heartbeat.
     if afk_present; then
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      reason=heartbeat
+      if [ "$ready_changed" -eq 1 ]; then
+        reason="heartbeat: dependency-cleared queued work: $ready_ids"
+      fi
+      fm_wake_append heartbeat heartbeat "$reason" || exit 1
       safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
-      wake "heartbeat"
+      [ "$ready_changed" -eq 0 ] || refresh_backlog_ready_snapshot || true
+      wake "$reason"
+    elif [ "$ready_changed" -eq 1 ]; then
+      reason="heartbeat: dependency-cleared queued work: $ready_ids"
+      fm_wake_append heartbeat backlog-ready "$reason" || exit 1
+      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
+      refresh_backlog_ready_snapshot || true
+      wake "$reason"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next

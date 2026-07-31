@@ -167,8 +167,11 @@ async function importLegacyPrompt(home, sessionKey, session, prompt, index) {
   const uid = typeof prompt.uid === 'string' && prompt.uid.trim() !== ''
     ? prompt.uid
     : String(index + 1);
+  const identityDigest = sha256Bytes(
+    Buffer.from(JSON.stringify([sessionKey, uid, index]), 'utf8'),
+  ).slice('sha256:'.length, 'sha256:'.length + 23);
   const id = validateDecisionId(
-    `legacy-${legacyIdPart(sessionKey)}-${legacyIdPart(uid)}`.slice(0, 64).replace(/-$/, ''),
+    `legacy-${legacyIdPart(sessionKey).slice(0, 16)}-${legacyIdPart(uid).slice(0, 16)}-${identityDigest}`,
   );
   const sourceFile = typeof session.file === 'string' ? session.file : '(unknown legacy file)';
   const request = [

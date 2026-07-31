@@ -7,6 +7,7 @@ import {
   chmod,
   copyFile,
   lstat,
+  link,
   mkdir,
   open,
   readFile,
@@ -14,6 +15,7 @@ import {
   readlink,
   rename,
   rm,
+  unlink,
 } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -690,10 +692,19 @@ async function copyFileAtomic(source, destination) {
     const handle = await open(temporary, 'r+');
     await handle.sync();
     await handle.close();
-    await rename(temporary, destination);
+    await chmod(temporary, 0o600);
+    try {
+      await link(temporary, destination);
+    } catch (error) {
+      if (error.code === 'EEXIST') {
+        return false;
+      }
+      throw error;
+    }
+    await unlink(temporary);
     committed = true;
-    await chmod(destination, 0o600);
     await syncDirectory(parent);
+    return true;
   } finally {
     if (!committed) {
       await rm(temporary, { force: true });
@@ -735,8 +746,18 @@ export async function intakeDecision(home, decision) {
         3,
       );
     }
-  } else {
-    await copyFileAtomic(decision.answerPath, destinationPath);
+  } else if (!await copyFileAtomic(decision.answerPath, destinationPath)) {
+    const concurrentDestinationState = await lstatIfPresent(destinationPath);
+    if (concurrentDestinationState === undefined || !concurrentDestinationState.isFile()) {
+      throw new LavishError(`destination is not a regular file: ${destinationPath}`, 2);
+    }
+    const concurrentDestinationDigest = await sha256File(destinationPath);
+    if (concurrentDestinationDigest !== answerDigest) {
+      throw new LavishError(
+        `destination already exists with different content: ${decision.manifest.destination}`,
+        3,
+      );
+    }
   }
 
   const destinationSha256 = await sha256File(destinationPath);

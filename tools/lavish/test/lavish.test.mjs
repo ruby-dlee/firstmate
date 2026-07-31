@@ -441,16 +441,55 @@ test('legacy migration snapshots first, imports queued input, and ignores open s
   const snapshots = await readdir(snapshotDirectory);
   assert.equal(snapshots.length, 1);
   assert.equal(await readFile(join(snapshotDirectory, snapshots[0]), 'utf8'), source);
-  const decisions = await readdir(join(fx.home, 'data/decisions'));
-  assert.deepEqual(decisions.filter((name) => !name.startsWith('.')), [
-    'legacy-session-200-captain-1',
-  ]);
+  const decisions = (await readdir(join(fx.home, 'data/decisions')))
+    .filter((name) => !name.startsWith('.'));
+  assert.equal(decisions.length, 1);
+  assert.match(decisions[0], /^legacy-session-200-captain-1-[0-9a-f]{23}$/);
   const answerText = await readFile(
-    join(fx.home, 'data/decisions/legacy-session-200-captain-1/answer.toon'),
+    join(fx.home, 'data/decisions', decisions[0], 'answer.toon'),
     'utf8',
   );
   const imported = decode(answerText, { strict: true });
   assert.equal(imported.note, 'Defer this option until the next review.');
+});
+
+test('legacy migration assigns distinct ids to lossy prompt-name collisions', async () => {
+  const fx = await fixture('migration-collisions');
+  const statePath = join(fx.root, 'state.json');
+  const snapshotDirectory = join(fx.root, 'audit');
+  await writeFile(
+    statePath,
+    `${JSON.stringify({
+      sessions: {
+        'session/with/a/name-that-shares-more-than-thirty-two-characters': {
+          file: '/legacy/collisions.html',
+          updated_at: '2026-07-30T12:00:00.000Z',
+          pending_prompts: 2,
+          prompts: [
+            { uid: 'review/a', prompt: 'First answer.' },
+            { uid: 'review-a', prompt: 'Second answer.' },
+          ],
+        },
+      },
+    })}\n`,
+  );
+
+  const migrated = await runCli(
+    [
+      'migrate-legacy',
+      '--state',
+      statePath,
+      '--snapshot-dir',
+      snapshotDirectory,
+    ],
+    { home: fx.home },
+  );
+  assert.equal(migrated.code, 0, migrated.stderr);
+  assert.match(migrated.stdout, /imported_prompt_count: 2/);
+  const decisions = (await readdir(join(fx.home, 'data/decisions')))
+    .filter((name) => !name.startsWith('.'));
+  assert.equal(decisions.length, 2);
+  assert.notEqual(decisions[0], decisions[1]);
 });
 
 test('an explicit reconciled map migrates only the named unanswered session', async () => {

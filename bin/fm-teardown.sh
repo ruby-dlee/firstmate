@@ -2,7 +2,7 @@
 # Tear down a finished task: return the treehouse worktree, release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
 # clear volatile state, refresh/prune the project's clone for PR-based ship
-# tasks, then print a backlog-refresh reminder for ship and scout teardowns
+# tasks, then surface backlog completion and newly-ready work for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
@@ -937,8 +937,8 @@ work_is_landed() {
   content_in_default
 }
 
-backlog_refresh_reminder() {
-  local pr done_cmd report_path
+backlog_completion_surface() {
+  local pr done_cmd report_path ready_ids ready_line
   [ "$KIND" = secondmate ] && return 0
   if fm_tasks_axi_backend_available "$CONFIG"; then
     case "$KIND" in
@@ -959,9 +959,23 @@ backlog_refresh_reminder() {
         fi
         ;;
     esac
-    printf '%s\n' "Backlog: $ID just finished. Run $done_cmd, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
+    printf '%s\n' "Backlog: $ID just finished. Run $done_cmd; dispatch only work whose blockers are gone and date is due."
   else
     printf '%s\n' "Backlog: $ID just finished. Update data/backlog.md - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
+  fi
+  if fm_tasks_axi_compatible; then
+    if ready_ids=$(fm_tasks_axi_ready_after_done "$DATA/backlog.md" "$ID"); then
+      if [ -n "$ready_ids" ]; then
+        ready_line=$(printf '%s\n' "$ready_ids" | paste -sd ' ' -)
+        printf '%s\n' "Dependency-cleared queued work when $ID is recorded Done: $ready_line. Check date gates, then dispatch every due item."
+      else
+        printf '%s\n' "Dependency-cleared queued work when $ID is recorded Done: none."
+      fi
+    else
+      printf '%s\n' "Dependency-cleared queued work: unavailable because the read-only completion probe failed; inspect tasks-axi before ending this teardown turn."
+    fi
+  else
+    printf '%s\n' "Dependency-cleared queued work: unavailable because compatible tasks-axi is not on PATH; inspect Queued before ending this teardown turn."
   fi
 }
 
@@ -4850,4 +4864,4 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
-backlog_refresh_reminder
+backlog_completion_surface

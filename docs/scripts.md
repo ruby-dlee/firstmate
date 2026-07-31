@@ -8,7 +8,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
-| `fm-autocompact.sh`      | Bridge Claude context compaction through a durable anchor and session-start recovery |
+| `fm-autocompact.sh`      | Bridge Claude compaction through durable recovery and transcript-scoped stow completion |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
 | `fm-checkout-refresh.sh` | Discover worktree seed checkouts, react to live upstream-default changes, surface untracked skill drafts, enforce the timed backstop, and manage the home-scoped scheduler |
 | `fm-fleet-sync.sh`       | Serialize live-default-proven project refreshes with safe fast-forwards, `STUCK:` reports, branch pruning, and orphaned-lock recovery |

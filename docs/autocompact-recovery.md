@@ -77,7 +77,7 @@ The event order for both successful paths was `PreCompact`, compact-sourced `Ses
 The manual probe also showed that `PreCompact` fires before an attempted `/compact` that later reports `Not enough messages to compact`, so capture must be safe and replace the prior anchor idempotently.
 The implementation proof then compacted a fixture Firstmate session through the tracked commands, confirmed that the anchor held fixture backlog and PR markers, and asked the resumed model to repeat backlog, status-tail, and PR markers without reading files.
 The model returned `RECOVERED:E2E_BACKLOG_ANCHOR_7421:E2E_IN_FLIGHT_ANCHOR_8842:9999`, proving that compact-sourced `SessionStart` stdout carried both the anchor and normal reconciliation into the resumed context.
-Automated coverage in `tests/fm-autocompact.test.sh` verifies atomic refresh, complete pickup surfaces, failure blocking, primary scoping, tracked registration, and post-compact anchor plus session-start recovery.
+Automated coverage in `tests/fm-autocompact.test.sh` verifies atomic refresh, complete pickup surfaces, failure blocking, primary and secondmate scoping, tracked registration, transcript-bounded sweep directives, atomic marker advancement, duplicate-sweep prevention, uncertainty fallback, and post-compact anchor plus session-start recovery.
 
 ## Empirical validation - 2026-07-31
 

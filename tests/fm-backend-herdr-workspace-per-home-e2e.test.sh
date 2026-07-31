@@ -30,6 +30,9 @@
 #   - list-live recovery seeing only its own home's tabs, for both homes
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }

@@ -182,7 +182,7 @@ make_case() {
   local name=$1 case_dir fakebin
   case_dir="$TMP_ROOT/$name"
   fakebin="$case_dir/fakebin"
-  mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
+  mkdir -p "$case_dir/state" "$case_dir/config" "$case_dir/owner-home" "$fakebin"
 
   # Mocks for the post-check teardown steps. Refuse logic exits before these
   # run; the ALLOW cases need them so the script can complete cleanly.
@@ -721,13 +721,18 @@ SH
 
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
 run_teardown() {
-  local case_dir=$1; shift
+  local case_dir=$1 data_override projects_override checkout_lock_root
+  shift
+  data_override=${FM_DATA_OVERRIDE:-$case_dir/data}
+  projects_override=${FM_PROJECTS_OVERRIDE:-$case_dir/source-projects}
+  checkout_lock_root=${FM_CHECKOUT_REFRESH_LOCK_ROOT:-$case_dir/checkout-locks}
+  FM_HOME="$case_dir/owner-home" \
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
-  FM_DATA_OVERRIDE="${FM_DATA_OVERRIDE:-$case_dir/data}" \
+  FM_DATA_OVERRIDE="$data_override" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
-  FM_PROJECTS_OVERRIDE="${FM_PROJECTS_OVERRIDE:-$case_dir/source-projects}" \
-  FM_CHECKOUT_REFRESH_LOCK_ROOT="${FM_CHECKOUT_REFRESH_LOCK_ROOT:-$case_dir/checkout-locks}" \
+  FM_PROJECTS_OVERRIDE="$projects_override" \
+  FM_CHECKOUT_REFRESH_LOCK_ROOT="$checkout_lock_root" \
   FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
   FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
   FM_FAKE_FIRSTMATE_SOURCE="${FM_FAKE_FIRSTMATE_SOURCE:-$ROOT}" \
@@ -739,13 +744,15 @@ run_teardown() {
 }
 
 run_teardown_named() {
-  local case_dir=$1 task=$2
+  local case_dir=$1 task=$2 projects_override
   shift 2
+  projects_override=${FM_PROJECTS_OVERRIDE:-$case_dir/source-projects}
+  FM_HOME="$case_dir/owner-home" \
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_DATA_OVERRIDE="$case_dir/data" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
-  FM_PROJECTS_OVERRIDE="${FM_PROJECTS_OVERRIDE:-$case_dir/source-projects}" \
+  FM_PROJECTS_OVERRIDE="$projects_override" \
   FM_CHECKOUT_REFRESH_LOCK_ROOT="$case_dir/checkout-locks" \
   FM_FAKE_FIRSTMATE_SOURCE="$ROOT" \
   FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
@@ -2316,7 +2323,7 @@ test_managed_teardown_locks_generation_before_endpoint_cleanup() {
     'account_attempt=old-attempt' \
     'provider_session_id=session-old' >> "$case_dir/state/task-x1.meta"
   add_fake_agent_fleet "$case_dir"
-  cat > "$case_dir/fakebin/tmux" <<'SH'
+cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
@@ -2426,7 +2433,22 @@ test_managed_child_teardown_locks_generation_before_snapshot() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+fakebin=$(dirname "$0")
+case "$*" in
+  *fm-child-lock-x3*) state="$fakebin/.managed-child-live" ;;
+  *) state="$fakebin/.managed-parent-live" ;;
+esac
 case "${1:-}" in
+  display-message)
+    [ -f "$state" ] || exit 1
+    printf '%%1\n'
+    exit 0
+    ;;
+  list-windows)
+    [ ! -f "$fakebin/.managed-parent-live" ] || printf '%s\n' fm-task-x1
+    [ ! -f "$fakebin/.managed-child-live" ] || printf '%s\n' fm-child-lock-x3
+    exit 0
+    ;;
   kill-window)
     case "$*" in
       *fm-child-lock-x3*)
@@ -2435,6 +2457,7 @@ case "${1:-}" in
         : > "$FM_FAKE_KILLED"
         ;;
     esac
+    rm -f "$state"
     exit 0
     ;;
   list-windows)
@@ -2446,6 +2469,8 @@ esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tmux"
+  : > "$case_dir/fakebin/.managed-parent-live"
+  : > "$case_dir/fakebin/.managed-child-live"
 
   FM_AGENT_FLEET_BIN="$case_dir/fakebin/agent-fleet" FM_FAKE_AF_LOG="$af_log" \
     FM_FAKE_KILL_STARTED="$kill_started" FM_FAKE_ALLOW_KILL="$allow_kill" \
@@ -2732,7 +2757,7 @@ SH
 }
 
 test_forced_secondmate_retains_child_on_treehouse_failure() {
-  local case_dir child_worktree child_id lock child_pid_file child_ready_file child_pid rc
+  local case_dir child_worktree child_id lock child_pid_file child_ready_file child_pid term_marker lock_diag rc
   child_id=child-return-failure-x6
   setup_forced_secondmate_child_case secondmate-child-return-failure "$child_id"
   case_dir=$FORCED_CHILD_CASE_DIR
@@ -2740,6 +2765,8 @@ test_forced_secondmate_retains_child_on_treehouse_failure() {
   lock=$(checkout_lock_path "$child_worktree" "$case_dir/checkout-locks")
   child_pid_file="$case_dir/treehouse-child.pid"
   child_ready_file="$case_dir/treehouse-child.ready"
+  term_marker="$case_dir/treehouse-child-terminated-under-lock"
+  lock_diag="$case_dir/treehouse-child-lock-diagnostic"
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = return ]; then
@@ -2747,7 +2774,16 @@ if [ "${1:-}" = return ]; then
 import os
 import signal
 
+def record_lock_state():
+    lock = os.environ["FM_EXPECT_CHECKOUT_LOCK"]
+    if os.path.lexists(lock):
+        open(os.environ["TREEHOUSE_RETURN_CHILD_TERM_MARKER"], "w").close()
+    else:
+        with open(os.environ["TREEHOUSE_RETURN_CHILD_LOCK_DIAG"], "w") as stream:
+            stream.write(f"missing expected checkout lock: {lock}\n")
+
 def terminate(_signum, _frame):
+    record_lock_state()
     raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, terminate)
@@ -2770,6 +2806,8 @@ SH
   FM_EXPECT_CHECKOUT_LOCK="$lock" \
   TREEHOUSE_RETURN_CHILD_PID_FILE="$child_pid_file" \
   TREEHOUSE_RETURN_CHILD_READY_FILE="$child_ready_file" \
+  TREEHOUSE_RETURN_CHILD_TERM_MARKER="$term_marker" \
+  TREEHOUSE_RETURN_CHILD_LOCK_DIAG="$lock_diag" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
@@ -2780,6 +2818,7 @@ SH
   child_pid=$(cat "$child_pid_file")
   ! kill -0 "$child_pid" 2>/dev/null \
     || fail "failed Treehouse return left descendant $child_pid alive"
+  assert_present "$term_marker" "failed Treehouse return released the checkout lock before terminating descendants: $(cat "$lock_diag" 2>/dev/null || printf 'no child diagnostic')"
   assert_absent "$lock" "failed Treehouse return left the checkout lock held"
   assert_present "$child_worktree" "failed Treehouse return deleted the child worktree"
   assert_present "$case_dir/wt/state/$child_id.meta" "failed Treehouse return removed child retry metadata"
@@ -2827,11 +2866,12 @@ SH
   FM_FAKE_PARENT_LIVE="$FORCED_CHILD_PARENT_LIVE" \
   FM_FAKE_PS_BROKEN="$ps_broken" \
   TREEHOUSE_RETURN_CHILD_PID_FILE="$child_pid_file" \
+  TREEHOUSE_RETURN_PS_FAIL_MARKER="$ps_fail_marker" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  expect_code 76 "$rc" "unverified Treehouse process cleanup should fail distinctly"
+  expect_code 76 "$rc" "unverified Treehouse process cleanup should fail distinctly"$'\n'"$(cat "$case_dir/stderr")"
   assert_present "$child_pid_file" "unverified Treehouse return did not start its descendant"
   assert_present "$lock" "unverified process cleanup released the checkout lock"
   assert_present "$lock/process-group" "unverified process cleanup lost its guarded group identity"
@@ -2847,12 +2887,15 @@ SH
   assert_grep "Treehouse return process cleanup could not be verified" "$case_dir/stderr" \
     "unverified process cleanup did not surface retain-only Treehouse handling"
   owner=$(readlink "$lock")
+  FM_PROCESS_TREE_GUARD_FILE="$owner/process-group"
+  export FM_PROCESS_TREE_GUARD_FILE
   kill -KILL -- "-$group" 2>/dev/null || true
   for _ in $(seq 1 50); do
     kill -0 "$group" 2>/dev/null || break
     sleep 0.02
   done
   ! kill -0 "$group" 2>/dev/null || fail "test cleanup could not terminate retained anchored group $group"
+  unset FM_PROCESS_TREE_GUARD_FILE
   rm -f "$lock"
   rm -rf "$owner"
   pass "unverified Treehouse process cleanup retains worktree and checkout lock"
@@ -2971,7 +3014,7 @@ SH
   rc=$?
   set -e
 
-  expect_code 75 "$rc" "forced secondmate cleanup should surface checkout lock contention distinctly"
+  expect_code 75 "$rc" "forced secondmate cleanup should surface checkout lock contention distinctly"$'\n'"$(cat "$case_dir/stderr")"
   assert_present "$child_worktree" "checkout lock contention deleted the child worktree"
   assert_present "$case_dir/wt/state/$child_id.meta" "checkout lock contention removed child retry metadata"
   assert_present "$case_dir/state/task-x1.meta" "checkout lock contention removed parent retry metadata"
@@ -3006,7 +3049,7 @@ SH
   : > "$marker"
 
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
-    || fail "herdr-marker-cleanup: forced teardown failed"
+    || fail "herdr-marker-cleanup: forced teardown failed: $(cat "$case_dir/stderr")"
   [ ! -e "$marker" ] || fail "herdr-marker-cleanup: teardown left the pane's escalation marker behind"
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
@@ -3062,7 +3105,7 @@ SH
   rc=$?
   set -e
   expect_code 1 "$rc" "required report: teardown without completion.md must fail"
-  assert_present "$quiesced" "required report failure did not quiesce its endpoint before publication"
+  assert_present "$quiesced" "required report failure did not quiesce its endpoint before publication: $(cat "$case_dir/missing-stderr")"
   assert_present "$case_dir/state/task-x1.meta" "required report failure erased task metadata"
   assert_grep 'required completion report is missing' "$case_dir/missing-stderr" \
     "required report failure did not explain the missing artifact"
@@ -3122,7 +3165,13 @@ test_required_report_restores_rollback_generation_before_publish() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  display-message) [ -f "$FM_FAKE_REPORT_LIVE" ]; exit $? ;;
+  display-message)
+    [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
+    case " $* " in
+      *' #{pane_current_command} '*) printf '%s\n' bash ;;
+    esac
+    exit 0
+    ;;
   list-panes) exit 0 ;;
   kill-window) rm -f "$FM_FAKE_REPORT_LIVE"; exit 0 ;;
 esac
@@ -3358,7 +3407,7 @@ SH
 }
 
 test_secondmate_rejects_drifted_home_repository_identity() {
-  local case_dir marker rc
+  local case_dir home_abs marker rc
   case_dir=$(make_case secondmate-home-identity-drift)
   mkdir -p "$case_dir/data" "$case_dir/wt/data" "$case_dir/wt/state" "$case_dir/wt/config" \
     "$case_dir/wt/projects"
@@ -3395,7 +3444,7 @@ SH
   assert_present "$case_dir/wt" "identity-drifted secondmate home was removed"
   assert_present "$case_dir/state/task-x1.meta" "identity-drifted secondmate metadata was removed"
   assert_grep "secondmate home repository identity does not match" "$case_dir/stderr" \
-    "secondmate home identity drift was not surfaced"
+    "secondmate home identity drift was not surfaced: $(cat "$case_dir/stderr")"
   pass "secondmate teardown proves its home repository identity"
 }
 
@@ -4008,7 +4057,7 @@ test_secondmate_retirement_recurses_into_ignored_nested_repositories() {
   assert_present "$nested/unlanded.txt" "unpushed submodule repository work was discarded"
   assert_present "$case_dir/state/task-x1.meta" "nested repository work allowed metadata removal"
   assert_grep 'not proven on a live remote branch' "$case_dir/stderr" \
-    "unlanded nested repository ref was not surfaced"
+    "unlanded nested repository ref was not surfaced: $(cat "$case_dir/stderr")"
   pass "secondmate retirement recursively proves submodule repositories"
 }
 
@@ -4759,14 +4808,14 @@ SH
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" &
   teardown_pid=$!
   waited=0
-  while [ ! -f "$case_dir/fakebin/.retirement-started" ] && [ "$waited" -lt 200 ]; do
+  while [ ! -f "$case_dir/fakebin/.retirement-started" ] && [ "$waited" -lt 2000 ]; do
     sleep 0.05
     waited=$((waited + 1))
   done
   [ -f "$case_dir/fakebin/.retirement-started" ] || {
     : > "$case_dir/fakebin/.retirement-release"
     wait "$teardown_pid" || true
-    fail "secondmate retirement did not reach the serialized quiescence boundary"
+    fail "secondmate retirement did not reach the serialized quiescence boundary: $(cat "$case_dir/stderr")"
   }
   set +e
   FM_HOME="$case_dir/wt" \

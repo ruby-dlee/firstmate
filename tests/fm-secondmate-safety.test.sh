@@ -7,6 +7,9 @@
 # destructive-invariant coverage that an e2e run cannot deterministically reach.
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 # shellcheck source=bin/fm-checkout-lock-lib.sh disable=SC1091

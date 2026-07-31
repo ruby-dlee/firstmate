@@ -10,6 +10,9 @@
 # Teardown cleanup is covered by tests/fm-teardown.test.sh's full lifecycle fixture.
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 

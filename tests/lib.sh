@@ -16,6 +16,17 @@
 # ROOT is exported as the firstmate repo root (this file lives in tests/), so a
 # sourcing test can use "$ROOT/bin/..." without recomputing it.
 
+# Every test must enter through tests/run-test.sh (normally via tests/run.sh).
+# This re-check is deliberate even though BASH_ENV checks Bash children: it
+# makes direct execution fail before a test can reach firstmate's live fleet.
+# shellcheck source=tests/test-env-guard.sh
+. "$(dirname "${BASH_SOURCE[0]}")/test-env-guard.sh"
+
+# The runner proves and records an explicit private state override at entry.
+# Test fixtures commonly select another private FM_HOME; after that entry proof,
+# let state follow the fixture home unless the fixture names its own override.
+unset FM_STATE_OVERRIDE
+
 # Idempotent guard: behavior-area helper files (secondmate-helpers.sh,
 # wake-helpers.sh) source this library for ROOT/fail/pass, and the test that
 # includes them may also source it directly. Re-sourcing must not wipe the
@@ -116,7 +127,7 @@ fm_test_cleanup() {
 
 fm_test_tmproot() {
   local prefix=${1:-fm-test} root
-  root=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+  root=$(mktemp -d "${TMPDIR:?sealed test TMPDIR is required}/${prefix}.XXXXXX")
   root=$(cd "$root" && pwd -P)
   printf '%s\n' "$root" >> "$FM_TEST_CLEANUP_MANIFEST"
   printf '%s\n' "$root"

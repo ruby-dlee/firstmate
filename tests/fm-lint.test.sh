@@ -61,6 +61,14 @@ test_nomistakes_invokes_the_owner() {
   pass "no-mistakes pre-push lint calls the shell owner and locked Agent Fleet lint"
 }
 
+test_behavior_suite_uses_the_sealed_runner() {
+  assert_grep '- run: tests/run.sh' "$CI" "CI behavior tests must enter through the sealed runner"
+  assert_no_grep 'for test_script in tests/*.test.sh' "$CI" "CI bypasses the sealed test runner"
+  assert_grep 'tests/run.sh || rc=1' "$NM" "no-mistakes behavior tests must enter through the sealed runner"
+  assert_no_grep 'for t in tests/*.test.sh' "$NM" "no-mistakes bypasses the sealed test runner"
+  pass "CI and no-mistakes both use the sealed behavior-test runner"
+}
+
 test_pins_an_explicit_version() {
   [ -n "$REQUIRED" ] || fail "fm-lint.sh --required-version printed nothing"
   # The captain-agreed pin: adopt ShellCheck 0.11.0's rule set consistently,
@@ -184,6 +192,7 @@ test_owner_exists_and_executable
 test_owner_defines_canonical_set
 test_ci_invokes_the_owner
 test_nomistakes_invokes_the_owner
+test_behavior_suite_uses_the_sealed_runner
 test_pins_an_explicit_version
 test_ci_installs_and_logs_the_pinned_version
 test_rejects_wrong_shellcheck_version

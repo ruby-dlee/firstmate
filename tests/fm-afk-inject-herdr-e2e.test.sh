@@ -32,6 +32,9 @@
 # agent_not_found forever and never confirm a submission.
 set -u
 
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 

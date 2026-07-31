@@ -29,12 +29,16 @@
 #   fm-afk-launch.sh start-native
 #                              Prepare lifecycle state for a harness-native
 #                              background job and record that no terminal exists.
-#   fm-afk-launch.sh stop      Correct-ordered exit: SIGTERM the daemon while
-#                              state/.afk is still present, wait for it, close the
-#                              recorded terminal by exact id, then clear
-#                              state/.afk last. Native delivery preserves its
-#                              buffer for catch-up; compatibility injection may
-#                              perform its final guarded flush during cleanup.
+#   fm-afk-launch.sh stop --home <path>
+#                              Correct-ordered exit for the explicitly named
+#                              home, after its recorded owner matches: SIGTERM
+#                              the daemon while state/.afk is still present,
+#                              wait for it, close the recorded terminal by exact
+#                              id, then clear state/.afk last. Native delivery
+#                              preserves its buffer for catch-up; compatibility
+#                              injection may perform its final guarded flush
+#                              during cleanup. An inherited or defaulted FM_HOME
+#                              never authorizes a stop.
 #   fm-afk-launch.sh reconcile Close a recorded-but-dead daemon terminal by exact
 #                              id and drop the record (recovery after a crash).
 #
@@ -46,10 +50,36 @@
 # placeholder instead of a real daemon. FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND
 # override the captured captain pane/backend (an isolated lab pane in tests).
 set -u
+FM_AFK_LAUNCH_STOP_HOME_NAMED=0
+
+# A terminating lifecycle action must bind its authority before any state or
+# daemon helpers resolve paths. Parse only when executed: tests source this file
+# for pure helpers and must not have their positional parameters reinterpreted.
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-start}" = stop ]; then
+  if [ "$#" -ne 3 ] || [ "${2:-}" != --home ] || [ -z "${3:-}" ]; then
+    printf 'fm-afk-launch: refusing ambiguous stop; use stop --home <path>\n' >&2
+    exit 64
+  fi
+  case "$3" in *$'\t'*|*$'\n'*) printf 'fm-afk-launch: explicit stop home contains a control character: %s\n' "$3" >&2; exit 64 ;; esac
+  if [ ! -d "$3" ] || [ -L "$3" ]; then
+    printf 'fm-afk-launch: explicit stop home is not a real directory: %s\n' "$3" >&2
+    exit 64
+  fi
+  FM_HOME=$(cd "$3" 2>/dev/null && pwd -P) || {
+    printf 'fm-afk-launch: explicit stop home cannot be resolved: %s\n' "$3" >&2
+    exit 64
+  }
+  export FM_HOME
+  FM_AFK_LAUNCH_STOP_HOME_NAMED=1
+fi
 
 FM_AFK_LAUNCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_AFK_LAUNCH_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+FM_AFK_LAUNCH_HOME="$(cd "$FM_HOME" 2>/dev/null && pwd -P)" || {
+  printf 'fm-afk-launch: Firstmate home cannot be resolved: %s\n' "$FM_HOME" >&2
+  exit 64
+}
 FM_AFK_LAUNCH_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LAUNCH_RECORD="$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal"
 FM_AFK_LAUNCH_LOCK="$FM_AFK_LAUNCH_STATE/.afk-launch.lock"
@@ -648,7 +678,8 @@ fm_afk_launch_record_write() {  # <backend> <target> <extra>
   local pending
   fm_afk_launch_state_prepare || return 1
   pending=$(mktemp "$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal.pending.XXXXXX") || return 1
-  printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$pending" || { rm -f "$pending"; return 1; }
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$FM_AFK_LAUNCH_HOME" > "$pending" \
+    || { rm -f "$pending"; return 1; }
   if [ -L "$FM_AFK_LAUNCH_RECORD" ] || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
     fm_afk_launch_log "refusing unsafe daemon-terminal record destination: $FM_AFK_LAUNCH_RECORD"
     rm -f "$pending"
@@ -723,11 +754,11 @@ fm_afk_launch_herdr_identity_state() {  # <target> <packed-identity>
   if [ "$code" = pane_not_found ]; then printf 'absent'; else printf 'unknown'; fi
 }
 
-# Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET and
-# FM_AFK_REC_EXTRA. Returns 1 when no record exists.
+# Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET,
+# FM_AFK_REC_EXTRA, and FM_AFK_REC_HOME. Returns 1 when no record exists.
 fm_afk_launch_record_read() {
   local record hash expected_prefix
-  FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; FM_AFK_REC_EXTRA=""
+  FM_AFK_REC_BACKEND=""; FM_AFK_REC_TARGET=""; FM_AFK_REC_EXTRA=""; FM_AFK_REC_HOME=""
   if [ -L "$FM_AFK_LAUNCH_RECORD" ] \
     || { [ -e "$FM_AFK_LAUNCH_RECORD" ] && [ ! -f "$FM_AFK_LAUNCH_RECORD" ]; }; then
     fm_afk_launch_log "daemon terminal record is not a real regular file; refusing to act on it"
@@ -739,10 +770,15 @@ fm_afk_launch_record_read() {
     fm_afk_launch_log "daemon terminal record changed while reading; refusing to act on it"
     return 2
   fi
-  IFS=$'\t' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA <<< "$record" || true
-  if ! printf '%s\n' "$record" | awk -F '\t' 'NF != 3 { bad=1 } END { exit !(NR == 1 && !bad) }' \
-    || [ -z "$FM_AFK_REC_BACKEND" ] || [ -z "$FM_AFK_REC_TARGET" ]; then
+  IFS=$'\034' read -r FM_AFK_REC_BACKEND FM_AFK_REC_TARGET FM_AFK_REC_EXTRA FM_AFK_REC_HOME \
+    <<< "${record//$'\t'/$'\034'}" || true
+  if ! printf '%s\n' "$record" | awk -F '\t' 'NF != 4 { bad=1 } END { exit !(NR == 1 && !bad) }' \
+    || [ -z "$FM_AFK_REC_BACKEND" ] || [ -z "$FM_AFK_REC_TARGET" ] || [ -z "$FM_AFK_REC_HOME" ]; then
     fm_afk_launch_log "daemon terminal record is malformed; refusing to act on it"
+    return 2
+  fi
+  if [ "$FM_AFK_REC_HOME" != "$FM_AFK_LAUNCH_HOME" ]; then
+    fm_afk_launch_log "recorded daemon home '$FM_AFK_REC_HOME' does not match caller-named home '$FM_AFK_LAUNCH_HOME'; refusing to act on it"
     return 2
   fi
   case "$FM_AFK_REC_BACKEND" in
@@ -1321,14 +1357,21 @@ fm_afk_launch_main() {
     return "$result"
   fi
   case "${1:-start}" in
-    start) fm_afk_launch_start ;;
-    start-native) fm_afk_launch_start_native ;;
-    stop) fm_afk_launch_stop ;;
-    reconcile) fm_afk_launch_reconcile ;;
-    -h|--help|help) fm_afk_launch_usage ;;
+    start) fm_afk_launch_start; result=$? ;;
+    start-native) fm_afk_launch_start_native; result=$? ;;
+    stop)
+      if [ "$FM_AFK_LAUNCH_STOP_HOME_NAMED" -ne 1 ]; then
+        fm_afk_launch_log "refusing ambiguous stop; use stop --home <path>"
+        result=64
+      else
+        fm_afk_launch_stop
+        result=$?
+      fi
+      ;;
+    reconcile) fm_afk_launch_reconcile; result=$? ;;
+    -h|--help|help) fm_afk_launch_usage; result=$? ;;
     *) fm_afk_launch_usage >&2; return 2 ;;
   esac
-  result=$?
   fm_afk_launch_lock_release || result=1
   trap - EXIT INT TERM
   return "$result"

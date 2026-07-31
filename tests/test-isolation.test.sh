@@ -24,19 +24,29 @@ test_bash_env_mutations_match_strict_allowlist() {
   pass "test isolation: BASH_ENV mutations match the strict centralized allowlist"
 }
 
-test_bash_env_audit_rejects_multiline_marker_spoof() {
-  local audit_dir allowlist out status=0
+test_bash_env_audit_rejects_unapproved_mutations() {
+  local audit_dir allowlist mutation out status
   audit_dir="$TMPDIR/bash-env-audit-spoof"
   allowlist="$audit_dir/allowlist"
   mkdir -p "$audit_dir"
   : > "$allowlist"
-  printf '%s\n' 'PATH=/usr/bin:/bin \' \
-    '  BASH'_ENV='/hostile FM_TEST_BASH_ENV_SANITATION_CASE=1 command' \
-    > "$audit_dir/spoof.test.sh"
-  out=$("$ROOT/tests/audit-bash-env.sh" "$audit_dir" "$allowlist" 2>&1) || status=$?
-  [ "$status" -eq 97 ] || fail "multiline marker spoof audit returned $status: $out"
-  assert_contains "$out" 'unaudited BASH_ENV mutation' "multiline marker spoof bypassed the audit"
-  pass "test isolation: multiline marker spoof cannot authorize BASH_ENV mutation"
+  for mutation in \
+    '  BASH'_ENV='/hostile command' \
+    'export BASH'_ENV \
+    'declare -x BASH'_ENV \
+    'typeset -x BASH'_ENV \
+    'readonly BASH'_ENV \
+    'unset BASH'_ENV \
+    'env -u BASH'_ENV' command' \
+    'env -uBASH'_ENV' command' \
+    'env --unset=BASH'_ENV' command'; do
+    printf '%s\n' 'PATH=/usr/bin:/bin \' "$mutation" > "$audit_dir/spoof.test.sh"
+    status=0
+    out=$("$ROOT/tests/audit-bash-env.sh" "$audit_dir" "$allowlist" 2>&1) || status=$?
+    [ "$status" -eq 97 ] || fail "BASH_ENV mutation audit returned $status for: $mutation"
+    assert_contains "$out" 'unaudited BASH_ENV mutation' "BASH_ENV mutation bypassed the audit: $mutation"
+  done
+  pass "test isolation: assignment, declaration, and unset mutations require exact allowlisting"
 }
 
 assert_guard_rejects() {  # <label> <expected-path> <environment assignment...>
@@ -102,7 +112,7 @@ test_command_kill_rejects_external_pid() {
 }
 
 test_hostile_bash_env_cannot_replace_guard() {
-  local hostile marker out shebang no_bash_path status=0
+  local hostile marker out status=0
   hostile="$TMPDIR/hostile-bash-env"
   marker="$TMPDIR/hostile-bash-env-ran"
   printf 'printf hostile > %q\n' "$marker" > "$hostile"
@@ -111,16 +121,12 @@ test_hostile_bash_env_cannot_replace_guard() {
   [ ! -e "$marker" ] || fail "hostile BASH_ENV executed before the isolation guard"
   out=$(env -u BASH_ENV "$FM_TEST_BASH" -c 'printf "%s" "$BASH_ENV"')
   [ "$out" = "$GUARD" ] || fail "sealed launcher did not restore an unset guard: $out"
-  shebang="$TMPDIR/hostile-env-bash-script"
-  no_bash_path="$TMPDIR/no-bash-path"
-  mkdir -p "$no_bash_path"
-  printf '%s\nprintf body-ran\nkill -0 "$FM_TEST_OUTSIDE_PID"\n' '#!/usr/bin/env bash' > "$shebang"
-  chmod +x "$shebang"
-  out=$(PATH="$no_bash_path" BASH_ENV="$hostile" "$shebang" 2>&1) || status=$?
-  [ "$status" -ne 0 ] || fail "shimless env-Bash shebang was not rejected"
-  assert_contains "$out" 'bash' "shimless env-Bash rejection did not name the missing interpreter"
-  assert_not_contains "$out" 'body-ran' "shimless env-Bash shebang reached its body"
-  [ ! -e "$marker" ] || fail "shimless env-Bash shebang executed hostile BASH_ENV"
+  printf 'printf hostile > %q\n/bin/kill -0 %q\n' \
+    "$marker" "$FM_TEST_OUTSIDE_PID" > "$hostile"
+  out=$(BASH_ENV="$hostile" "$RUNNER" tests/runner-entry-probe.test.sh 2>&1) || status=$?
+  [ "$status" -eq 0 ] || fail "sealed runner rejected safe entry under hostile ambient BASH_ENV: $out"
+  assert_contains "$out" 'runner-entry-probe-ok' "sealed runner did not execute its guarded probe"
+  [ ! -e "$marker" ] || fail "sealed runner sourced hostile ambient BASH_ENV"
   "$FM_TEST_BASH" -c 'kill -0 "$FM_TEST_OUTSIDE_PID"' >/dev/null 2>&1 && fail "restored guard allowed an external PID"
   pass "test isolation: hostile BASH_ENV cannot replace the child-shell guard"
 }
@@ -163,7 +169,7 @@ test_pool_fixture_write_is_private() {
 
 test_every_entry_sources_the_shared_harness
 test_bash_env_mutations_match_strict_allowlist
-test_bash_env_audit_rejects_multiline_marker_spoof
+test_bash_env_audit_rejects_unapproved_mutations
 test_guard_rejects_external_operational_paths
 test_guard_rejects_symlink_escape
 test_guard_rejects_lock_symlink_escape

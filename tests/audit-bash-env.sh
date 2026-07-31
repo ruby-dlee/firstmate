@@ -18,7 +18,7 @@ for test_script in "$test_dir"/*.test.sh; do
     seen="$seen
 $record"
   done <<EOF
-$(grep -E '(^|[[:space:](])(export[[:space:]]+)?BASH_ENV=' "$test_script" || true)
+$(grep -E 'BASH_ENV=|(^|[[:space:](;])(export|declare|typeset|readonly|unset)([[:space:]]+-[^[:space:]]+)*[[:space:]]+BASH_ENV([[:space:]=;]|$)|(^|[[:space:](;])-u[[:space:]]*BASH_ENV([[:space:];]|$)|--unset(=|[[:space:]])BASH_ENV' "$test_script" || true)
 EOF
 done
 

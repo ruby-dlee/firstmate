@@ -1,8 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Run one firstmate behavior test inside a fresh, sealed operational home.
 set -eu
+unset BASH_ENV
 
-TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$TEST_DIR/.." && pwd -P)"
 
 [ "$#" -eq 1 ] || { printf 'usage: tests/run-test.sh tests/<name>.test.sh\n' >&2; exit 64; }
@@ -36,11 +37,17 @@ mkdir -p "$user_home/.treehouse" "$fm_home/state" "$fm_home/data" \
 guard_ps=$(command -v ps) || { printf 'test isolation requires ps\n' >&2; exit 69; }
 guard_awk=$(command -v awk) || { printf 'test isolation requires awk\n' >&2; exit 69; }
 guard_tr=$(command -v tr) || { printf 'test isolation requires tr\n' >&2; exit 69; }
-guard_real_bash=$(command -v bash) || { printf 'test isolation requires bash\n' >&2; exit 69; }
 case "$(uname -s)" in
-  Darwin) guard_real_kill=/bin/kill ;;
-  *) guard_real_kill=/usr/bin/kill ;;
+  Darwin)
+    guard_real_bash=/bin/bash
+    guard_real_kill=/bin/kill
+    ;;
+  *)
+    if [ -x /usr/bin/bash ]; then guard_real_bash=/usr/bin/bash; else guard_real_bash=/bin/bash; fi
+    guard_real_kill=/usr/bin/kill
+    ;;
 esac
+[ -x "$guard_real_bash" ] || { printf 'test isolation requires a fixed system bash\n' >&2; exit 69; }
 [ -x "$guard_real_kill" ] || { printf 'test isolation requires a fixed system kill\n' >&2; exit 69; }
 
 export FM_TEST_SEALED=firstmate-test-v1

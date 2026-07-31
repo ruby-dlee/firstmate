@@ -367,7 +367,7 @@ Load `memory-hygiene` before writing or leaning `data/captain.md` or `data/learn
 
 When the captain invokes `/stow`, load the `stow` skill.
 It sweeps the current session for uncaptured durable knowledge, routes findings with this table, files undone next steps to the backlog, and reports whether the session is safe to reset.
-During a long Claude primary run, periodically load `stow` before compaction pressure becomes acute because the tracked `PreCompact` bridge captures deterministic file state only; `docs/autocompact-recovery.md` owns that boundary and recovery contract.
+After compact-sourced Claude recovery, follow the injected directive to load `stow` against the unswept pre-compact transcript slice and advance its marker only after the sweep completes; `docs/autocompact-recovery.md` owns that boundary and recovery contract.
 
 **Delivery mode (choose at add).** `<mode>` is how a finished change reaches `main`, picked per project when you add it and recorded in the registry line (`fm-project-mode.sh` parses it; `fm-spawn` records it into each task's meta):
 

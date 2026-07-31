@@ -295,9 +295,9 @@ SH
   spec='{"harness":"claude","model":"sonnet"}'
 
   out=$(CDPATH='' builtin cd -- "$ROOT/bin" && \
-    PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh "$spec")
+    PATH="$fakebin:$BASE_PATH" "$FM_TEST_BASH" fm-dispatch-select.sh "$spec")
   stdin_out=$(printf '%s\n' "$spec" | (CDPATH='' builtin cd -- "$ROOT/bin" && \
-    PATH="$fakebin:$BASE_PATH" /bin/bash fm-dispatch-select.sh))
+    PATH="$fakebin:$BASE_PATH" "$FM_TEST_BASH" fm-dispatch-select.sh))
 
   [ "$out" = '{"harness":"claude","model":"sonnet"}' ] \
     || fail "hostile PATH forged dispatch selection: $out"

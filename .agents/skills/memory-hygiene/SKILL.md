@@ -21,6 +21,7 @@ Learnings must live where they are read, so this is the first decision on every 
 
 - A rule that should change behavior belongs in the instruction surface that loads at the moment it applies: `AGENTS.md` when every session needs it, or the skill that loads at the triggering moment.
   Promote it there and do not also keep it here.
+- During `/stow`, `stow/SKILL.md` owns the exception to this routing: file the surfaced rule through that skill's graduation path, and scope any natural skill-owner change separately as deliberate firstmate repository work.
 - Private memory holds only what cannot live in the shared repo: machine-specific and fleet-local facts such as service regions, credential locations, environment drift, and tool quirks specific to this box.
 - Promote or delete is the default outcome for a candidate entry; keeping it is the exception that has to earn itself against those two.
 - A general rule parked in a private file is the failure mode, not a safe backup.

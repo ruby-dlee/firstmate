@@ -2333,7 +2333,10 @@ case "${1:-}" in
     [ -f "$FM_FAKE_KILLED" ] || printf 'fm-task-x1\n'
     exit 0
     ;;
-  display-message) exit 1 ;;
+  display-message)
+    [ -f "$FM_FAKE_KILL_STARTED" ] && exit 1
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -2476,7 +2479,7 @@ SH
   set -e
 
   [ "$updater_rc" -ne 0 ] || fail "concurrent continuation replaced managed child metadata after teardown began"
-  expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation"
+  expect_code 0 "$teardown_rc" "managed child generation teardown should complete with its locked generation: $(cat "$case_dir/stderr")"
   assert_grep 'lease release --task fm-child-old-attempt --force' "$af_log" "child teardown did not release its locked generation"
   assert_grep 'lease release --task fm-child-predecessor --force' "$af_log" "child teardown did not clean its predecessor generation"
   assert_not_contains "$(cat "$af_log")" 'fm-child-new-attempt' "child teardown targeted a concurrent replacement generation"
@@ -2648,7 +2651,7 @@ SH
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
-  expect_code 0 "$rc" "secondmate-parent-quiesce: forced teardown should succeed"
+  expect_code 0 "$rc" "secondmate-parent-quiesce: forced teardown should succeed: $(cat "$case_dir/stderr")"
   assert_present "$parent_quiesced" "forced secondmate teardown did not quiesce its parent endpoint"
   assert_present "$child_quiesced" "forced secondmate teardown did not quiesce its managed child endpoint"
   assert_absent "$case_dir/wt" "forced secondmate teardown retained the retired home"
@@ -2775,7 +2778,8 @@ SH
   rc=$?
   set -e
 
-  expect_code 17 "$rc" "forced secondmate cleanup should preserve the failed Treehouse return status"
+  expect_code 17 "$rc" \
+    "forced secondmate cleanup should preserve the failed Treehouse return status: $(cat "$case_dir/stderr")"
   assert_present "$child_pid_file" "failed Treehouse return did not start its descendant"
   child_pid=$(cat "$child_pid_file")
   ! kill -0 "$child_pid" 2>/dev/null \

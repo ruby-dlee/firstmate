@@ -5000,7 +5000,7 @@ SH
       FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=1 \
       bash -c '
         export LD_PRELOAD=/hostile-loader DYLD_INSERT_LIBRARIES=/hostile-dyld
-        export BASH_ENV=/hostile-bash-env PYTHONPATH=/hostile-python FM_TEST_BASH_ENV_SANITATION_CASE=1
+        export BASH_ENV=/hostile-bash-env PYTHONPATH=/hostile-python
         . "$1"
         if [ "$2" = meta ]; then
           fm_account_meta_lock_acquire "$3" "indeterminate-$2"
@@ -5406,7 +5406,7 @@ SH
     '. "$1"
      export LD_PRELOAD=/tmp/hostile.so DYLD_INSERT_LIBRARIES=/tmp/hostile.dylib
      export NODE_OPTIONS="--require /tmp/hostile-node.js" PYTHONPATH=/tmp/hostile-python
-     export BASH_ENV="$6" FM_LOADER_ENV_LOG="$7" FM_TEST_BASH_ENV_SANITATION_CASE=1
+     export BASH_ENV="$6" FM_LOADER_ENV_LOG="$7"
      binary=$(fm_account_fleet_bin "$2") || exit 1
      selected=$(fm_account_json_field "$3" "$4" selection) || exit 1
      lock=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 fm_account_meta_lock_acquire "$5" hostile-tools) || exit 1
@@ -5518,7 +5518,7 @@ SH
     export QUOTA_AXI_CACHE_DIR=/tmp/hostile-quota
     export QUOTA_AXI_FUTURE_REDIRECT=/tmp/hostile-quota-future
     export XDG_CONFIG_HOME=/tmp/hostile-xdg
-    export BASH_ENV="$4" FM_TEST_BASH_ENV_SANITATION_CASE=1
+    export BASH_ENV="$4"
     export FM_WORKER_SENTINEL=preserved
     fm_account_run_control "$2" --format json contract >/dev/null || exit 1
     fm_account_run_selection "$2" --format json choose --pool claude-crew --task probe --provider claude --workspace "$PWD" --dry-run >/dev/null || exit 1
@@ -5540,7 +5540,7 @@ SH
       DYLD_INSERT_LIBRARIES= DYLD_LIBRARY_PATH= DYLD_FRAMEWORK_PATH= \
       DYLD_FALLBACK_LIBRARY_PATH= DYLD_FALLBACK_FRAMEWORK_PATH= \
       PERL5OPT= PERL5LIB= PERLLIB= NODE_OPTIONS= NODE_PATH= \
-      PYTHONHOME= PYTHONPATH= RUBYOPT= RUBYLIB= BASH_ENV= ENV= GCONV_PATH= FM_TEST_BASH_ENV_SANITATION_CASE=1 \
+      PYTHONHOME= PYTHONPATH= RUBYOPT= RUBYLIB= BASH_ENV= ENV= GCONV_PATH= \
       "$FM_ACCOUNT_SYSTEM_PERL_BIN" -e "$FM_ACCOUNT_WORKER_PERL_PROGRAM" \
       "$FM_ACCOUNT_PASSWD_HOME" "$FM_ACCOUNT_PASSWD_NAME" \
       "$FM_ACCOUNT_CANONICAL_CONFIG" "$2" --format json contract >/dev/null || exit 1

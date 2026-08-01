@@ -188,6 +188,16 @@ spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmat
   fi
 }
 
+spawn_managed_agent_alive() {  # <backend> <target> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} recorded_scoped_target=${6:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_agent_alive "$backend" "$target" "$label" "$recorded_scoped_target" )
+  else
+    fm_backend_agent_alive "$backend" "$target" "$label" "$recorded_scoped_target"
+  fi
+}
+
 git_repository_probe() (
   unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
   unset GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_IMPLICIT_WORK_TREE GIT_PREFIX
@@ -3610,8 +3620,16 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
     sleep 1
   done
   if [ -z "${p:-}" ] || [ "$(real_path_or_raw "$p")" != "$WT_REAL" ]; then
-    echo "error: task endpoint did not start in leased worktree $WT within 60s; inspect window $T" >&2
-    exit 1
+    READINESS_AGENT_STATE=$(spawn_managed_agent_alive "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null)
+    if [ -n "${p:-}" ]; then
+      echo "error: task endpoint reported unexpected path $p instead of leased worktree $WT within 60s (liveness=$READINESS_AGENT_STATE); inspect window $T" >&2
+      exit 1
+    elif [ "$READINESS_AGENT_STATE" = alive ]; then
+      echo "warning: task endpoint path was not readable in leased worktree $WT within 60s, but its harness agent is confidently alive; accepting window $T" >&2
+    else
+      echo "error: task endpoint did not start in leased worktree $WT within 60s and no live harness agent was confirmed (liveness=$READINESS_AGENT_STATE); inspect window $T" >&2
+      exit 1
+    fi
   fi
 fi
 if [ -z "$WT" ] && [ "$BACKEND" = orca ]; then

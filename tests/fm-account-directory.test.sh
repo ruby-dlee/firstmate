@@ -499,7 +499,21 @@ case "$*" in
     printf 'firstmate\t%s\n' "${FM_FAKE_ENDPOINT_LABEL:?}"
     exit 0
     ;;
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    calls=1
+    if [ -n "${FM_FAKE_PANE_PATH_CALLS_FILE:-}" ]; then
+      calls=0
+      [ ! -f "$FM_FAKE_PANE_PATH_CALLS_FILE" ] || calls=$(cat "$FM_FAKE_PANE_PATH_CALLS_FILE")
+      calls=$((calls + 1))
+      printf '%s\n' "$calls" > "$FM_FAKE_PANE_PATH_CALLS_FILE"
+    fi
+    if [ "$calls" -le "${FM_FAKE_PANE_PATH_DELAY_CALLS:-0}" ]; then
+      exit 0
+    fi
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
+  *"#{pane_current_command}"*) printf '%s\n' "${FM_FAKE_PANE_COMMAND:-bash}"; exit 0 ;;
 esac
 case "${1:-}" in
   display-message)
@@ -534,6 +548,12 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${FM_FAKE_SKIP_SLEEP:-0}" = 1 ] || exec /bin/sleep "$@"
+SH
+  chmod +x "$fakebin/sleep"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -571,7 +591,11 @@ run_direct_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="${FM_FAKE_PANE_PATH_OVERRIDE:-$worktree}" TMUX="fake,1,0" \
+    FM_FAKE_PANE_PATH_CALLS_FILE="${FM_FAKE_PANE_PATH_CALLS_FILE:-}" \
+    FM_FAKE_PANE_PATH_DELAY_CALLS="${FM_FAKE_PANE_PATH_DELAY_CALLS:-0}" \
+    FM_FAKE_PANE_COMMAND="${FM_FAKE_PANE_COMMAND:-bash}" \
+    FM_FAKE_SKIP_SLEEP="${FM_FAKE_SKIP_SLEEP:-0}" \
     FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
@@ -1218,6 +1242,105 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   pass "new direct spawn tracks retained endpoint and worktree state"
 }
 
+test_slow_endpoint_readiness_commits_a_confirmed_live_spawn() {
+  local record id meta out status calls_file
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-slow-ready-z8
+  record=$(make_spawn_case direct-slow-ready codex "$id")
+  read_spawn_case "$record"
+  calls_file="$SPAWN_HOME/state/.fake-pane-path-calls"
+
+  if out=$(FM_FAKE_PANE_PATH_CALLS_FILE="$calls_file" \
+    FM_FAKE_PANE_PATH_DELAY_CALLS=60 FM_FAKE_PANE_COMMAND=codex FM_FAKE_SKIP_SLEEP=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -eq 0 ] || fail "confirmed-live slow endpoint was condemned after its readiness timeout: $out"
+  [ "$(cat "$calls_file")" = 60 ] || fail "slow-readiness fixture did not exhaust the bounded path probe"
+  meta="$SPAWN_HOME/state/$id.meta"
+  assert_contains "$out" "spawned $id harness=codex" \
+    "confirmed-live slow endpoint was not recorded as a successful spawn"
+  [ -f "$SPAWN_HOME/state/.fake-endpoint" ] || fail "successful slow spawn lost its live endpoint"
+  [ -f "$meta" ] || fail "successful slow spawn omitted task metadata"
+  assert_no_grep "direct_spawn_cleanup=" "$meta" \
+    "successful slow spawn retained direct-spawn cleanup metadata"
+  assert_no_grep "direct_spawn_artifacts=" "$meta" \
+    "successful slow spawn retained direct-spawn artifact metadata"
+  assert_no_grep "rollback_pending=" "$meta" \
+    "successful slow spawn retained rollback metadata"
+  pass "a readiness timeout commits the spawn when the harness agent is confidently alive"
+}
+
+test_readiness_timeout_rolls_back_a_confirmed_dead_spawn() {
+  local record id out status recorded_worktree calls_file
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-dead-ready-z8
+  record=$(make_spawn_case direct-dead-ready codex "$id")
+  read_spawn_case "$record"
+  recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
+  calls_file="$SPAWN_HOME/state/.fake-pane-path-calls"
+  : > "$TREEHOUSE_LOG"
+
+  if out=$(FM_FAKE_PANE_PATH_CALLS_FILE="$calls_file" \
+    FM_FAKE_PANE_PATH_DELAY_CALLS=60 FM_FAKE_PANE_COMMAND=bash FM_FAKE_SKIP_SLEEP=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "readiness timeout accepted a bare-shell endpoint as a live agent"
+  assert_contains "$out" "task endpoint did not start in leased worktree" \
+    "genuinely failed readiness did not retain its actionable error"
+  if ! grep -Fq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
+    fail "genuinely failed readiness did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
+  fi
+  [ ! -e "$SPAWN_WORKTREE" ] || fail "genuinely failed readiness retained its worktree"
+  [ ! -e "$SPAWN_HOME/state/$id.meta" ] || fail "genuinely failed readiness retained task metadata"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "genuinely failed readiness retained its endpoint"
+  pass "a readiness timeout still rolls back when no live harness agent is confirmed"
+}
+
+test_readiness_rejects_a_live_agent_in_the_wrong_worktree() {
+  local record id out status recorded_worktree
+  reset_accounts
+  set_remaining 1 90,85
+  id=direct-wrong-path-z8
+  record=$(make_spawn_case direct-wrong-path codex "$id")
+  read_spawn_case "$record"
+  recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
+  : > "$TREEHOUSE_LOG"
+
+  if out=$(FM_FAKE_PANE_PATH_OVERRIDE="$SPAWN_PROJECT" \
+    FM_FAKE_PANE_COMMAND=codex FM_FAKE_SKIP_SLEEP=1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] || fail "readiness accepted a live agent in the wrong worktree"
+  assert_contains "$out" "task endpoint reported unexpected path $SPAWN_PROJECT instead of leased worktree $recorded_worktree" \
+    "wrong-worktree readiness failure did not identify both paths"
+  assert_contains "$out" "liveness=alive" \
+    "wrong-worktree readiness failure did not record its independent liveness result"
+  if ! grep -Fq "return --force $recorded_worktree" "$TREEHOUSE_LOG"; then
+    fail "wrong-worktree readiness failure did not return its worktree: output=$out treehouse=$(cat "$TREEHOUSE_LOG")"
+  fi
+  [ ! -e "$SPAWN_WORKTREE" ] || fail "wrong-worktree readiness failure retained its worktree"
+  [ ! -e "$SPAWN_HOME/state/$id.meta" ] || fail "wrong-worktree readiness failure retained task metadata"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "wrong-worktree readiness failure retained its endpoint"
+  pass "a concrete wrong-worktree observation still overrides confirmed agent liveness"
+}
+
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   local record id out status recorded_worktree
   reset_accounts
@@ -1352,6 +1475,13 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = spawn-readiness ]; then
+  test_slow_endpoint_readiness_commits_a_confirmed_live_spawn
+  test_readiness_timeout_rolls_back_a_confirmed_dead_spawn
+  test_readiness_rejects_a_live_agent_in_the_wrong_worktree
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   test_main_home_ship_and_scout_use_managed_treehouse_source
   exit 0
@@ -1386,6 +1516,9 @@ test_direct_recovery_rejects_changed_worktree_identity
 test_direct_recovery_rechecks_identity_after_account_prepare
 test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
+test_slow_endpoint_readiness_commits_a_confirmed_live_spawn
+test_readiness_timeout_rolls_back_a_confirmed_dead_spawn
+test_readiness_rejects_a_live_agent_in_the_wrong_worktree
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
 test_failed_new_direct_spawn_never_records_an_uncreated_endpoint

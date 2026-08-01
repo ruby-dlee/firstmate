@@ -333,6 +333,10 @@ Treehouse-acquired secondmate homes receive the same proof before seeding.
 They use the same locked, bounded acquisition entrypoint as ordinary task worktrees.
 Explicit secondmate homes are refreshed and must independently match the same live upstream or local default tip before seeding and again before launch.
 A stale, dirty, or uninspectable acquisition remains durably leased without forced return and is surfaced for manual recovery.
+After a new direct ship/scout endpoint starts, spawn polls its reported current directory for the leased worktree for up to 60 seconds.
+If that path remains unreadable, a backend liveness probe may independently accept the spawn only when it confidently confirms a real harness-agent process; `dead`, `unknown`, and backends without a verified agent classifier still fail and enter the normal rollback path.
+Any concrete path other than the leased worktree always fails even when the agent is live.
+A confirmed-live path-probe timeout commits ordinary successful task metadata without `direct_spawn_cleanup=`, `direct_spawn_artifacts=`, or `rollback_pending=` markers.
 If an unmanaged spawn fails after publishing metadata or task artifacts, it restores the prior task generation.
 Any failed unmanaged spawn returns its acquired worktree only after its endpoint is confirmed absent or known never to have been created, and only when repository identity, cleanliness, expected detached tip, guarded Treehouse return, and completed removal are all proven.
 Otherwise it retains the worktree and cleanup metadata for explicit teardown.

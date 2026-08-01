@@ -128,6 +128,29 @@ run_ff() {
   FF_OUT=$(cat "$outfile")
 }
 
+# --- T0: CI-style checkout without local default uses the remote default -----
+test_primary_head_commit_without_local_default() {
+  local w default_tip feature_tip resolved
+  w=$(new_world primary-remote-default)
+  default_tip=$(head_of "$w/main")
+  git -C "$w/main" update-ref refs/remotes/origin/main "$default_tip"
+  git -C "$w/main" remote add origin "$w/origin.git"
+  git -C "$w/main" remote set-head origin main
+  git -C "$w/main" checkout -qb feature/ci
+  printf 'feature only\n' >> "$w/main/README.md"
+  git -C "$w/main" add README.md
+  git -C "$w/main" commit -qm feature
+  feature_tip=$(head_of "$w/main")
+  git -C "$w/main" branch -D main >/dev/null
+
+  resolved=$(primary_head_commit "$w/main") \
+    || fail "primary default commit was unresolved without a local default branch"
+
+  [ "$resolved" = "$default_tip" ] \
+    || fail "expected remote default commit $default_tip instead of checked-out feature $feature_tip, got $resolved"
+  pass "T0 a CI-style checkout resolves its remote default commit"
+}
+
 # --- T1: updated - a behind home fast-forwards to the primary's local HEAD ---
 test_ff_updated() {
   local w c1 base
@@ -685,6 +708,7 @@ test_repo_gitignores_seed_marker() {
   pass "T15 the firstmate repo gitignores the secondmate seed marker"
 }
 
+test_primary_head_commit_without_local_default
 test_ff_updated
 test_ff_current
 test_ff_dirty

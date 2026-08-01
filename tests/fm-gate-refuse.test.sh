@@ -10,7 +10,7 @@
 #   2. the current worktree's git-common-dir resolves under a no-mistakes gate
 #      repo (.../.no-mistakes/repos/*.git) - the unspoofable backstop, which
 #      still refuses even if the marker was tampered/unset.
-# A normal firstmate session (real primary, real crew worktree) has NEITHER
+# A normal firstmate session (real primary, real crewmate worktree) has NEITHER
 # signal and is completely unaffected.
 #
 # Each entrypoint is exercised in three scenarios, isolating exactly ONE signal:
@@ -95,7 +95,7 @@ make_gate_worktree() {
 }
 
 # make_normal_repo <dir> -> echoes a plain (non-gate) git repo to stand in for a
-# normal primary/crew checkout: its git-common-dir is <dir>/.git, never a gate.
+# normal primary/crewmate checkout: its git-common-dir is <dir>/.git, never a gate.
 make_normal_repo() {
   local dir=$1
   git init -q -b main "$dir"
@@ -185,7 +185,7 @@ test_helper_normal_is_noop() {
 
 # --- fm-spawn ---------------------------------------------------------------
 
-# A fake tmux/treehouse so fm-spawn resolves the crew worktree from a controlled
+# A fake tmux/treehouse so fm-spawn resolves the crewmate worktree from a controlled
 # pane path and completes without a live terminal (mirrors tests/fm-tangle-guard).
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -204,7 +204,15 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  "get --lease "*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -213,6 +221,8 @@ run_spawn() {
   local cwd=$1 home=$2 id=$3 proj=$4 pane=$5 fakebin=$6; shift 6
   mkdir -p "$home/data/$id"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - gate refusal test (repo: %s)\n\n## Queued\n\n## Done\n' \
+    "$id" "$(basename "$proj")" > "$home/data/backlog.md"
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=" "FM_HOME=$home" \
       "FM_STATE_OVERRIDE=$home/state" "FM_DATA_OVERRIDE=$home/data" \
@@ -332,13 +342,19 @@ test_send_refuses_and_admits() {
 # task (HEAD reachable from origin), so a normal teardown genuinely succeeds and a
 # refused one leaves the task untouched (mirrors tests/fm-teardown make_case).
 make_teardown_case() {
-  local name=$1 case_dir fakebin t
+  local name=$1 case_dir fakebin
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
-  for t in treehouse tmux; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/$t"
-    chmod +x "$fakebin/$t"
-  done
+  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) exit 1 ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
   cat > "$fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -363,12 +379,34 @@ SH
   rm -rf "$case_dir/_seed"
   git clone -q "$case_dir/origin.git" "$case_dir/project"
   git -C "$case_dir/project" remote set-head origin main 2>/dev/null || true
-  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt" main
-  git -C "$case_dir/wt" commit -q --allow-empty -m "shippable work"
-  git -C "$case_dir/wt" push -q origin fm/task-x1
+  mkdir -p "$case_dir/treehouse-pool/1"
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/treehouse-pool/1/wt" main
+  git -C "$case_dir/treehouse-pool/1/wt" commit -q --allow-empty -m "shippable work"
+  git -C "$case_dir/treehouse-pool/1/wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
+  python3 - "$case_dir/treehouse-pool/treehouse-state.json" "$case_dir/treehouse-pool/1/wt" <<'PY'
+import json
+import os
+import sys
+
+state, worktree = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": os.path.realpath(worktree),
+                    "leased": True,
+                    "lease_holder": "firstmate-task-x1",
+                }
+            ]
+        },
+        stream,
+    )
+PY
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=fm-task-x1" "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "window=firstmate:fm-task-x1" "worktree=$case_dir/treehouse-pool/1/wt" "project=$case_dir/project" \
     "kind=ship" "mode=no-mistakes"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"

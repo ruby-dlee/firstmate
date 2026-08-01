@@ -29,7 +29,12 @@
 # them when the selection-specific override is unset. Other control calls keep
 # the 10s FM_ACCOUNT_CONTROL_TIMEOUT default.
 
-FM_ACCOUNT_ROUTING_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${BASH_SOURCE[0]}" in
+  */*) FM_ACCOUNT_ROUTING_LIB_SOURCE_DIR=${BASH_SOURCE[0]%/*} ;;
+  *) FM_ACCOUNT_ROUTING_LIB_SOURCE_DIR=. ;;
+esac
+FM_ACCOUNT_ROUTING_LIB_DIR="$(cd "$FM_ACCOUNT_ROUTING_LIB_SOURCE_DIR" && pwd)"
+unset FM_ACCOUNT_ROUTING_LIB_SOURCE_DIR
 # shellcheck source=bin/fm-checkout-lock-lib.sh
 . "$FM_ACCOUNT_ROUTING_LIB_DIR/fm-checkout-lock-lib.sh"
 
@@ -247,7 +252,7 @@ fm_account_path_uid() {
 fm_account_path_mode() {
   [ -n "$FM_ACCOUNT_SYSTEM_UNAME_BIN" ] && [ -n "$FM_ACCOUNT_SYSTEM_STAT_BIN" ] || return 1
   if [ "$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_UNAME_BIN")" = Darwin ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -f %Lp "$1" 2>/dev/null
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -f %Mp%Lp "$1" 2>/dev/null
   else
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_STAT_BIN" -c %a "$1" 2>/dev/null
   fi
@@ -940,6 +945,14 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
     if fm_account_meta_lock_reclaim "$lock" "$ownerless_grace"; then
       continue
     fi
+    if [ "${FM_ACCOUNT_ROUTING_TEST_LAB:-}" = firstmate-account-routing-test-lab-v1 ] \
+      && [ "${FM_ACCOUNT_TEST_HOOKS:-}" = firstmate-account-tests-v1 ] \
+      && [ -n "${FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED:-}" ]; then
+      printf '%s\n' "$lock" > "$FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED" || {
+        fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$owner_tmp"
+        return 1
+      }
+    fi
     now=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s)
     [ "$now" -lt "$deadline" ] || {
       echo "error: timed out waiting for $label lock for $task" >&2
@@ -986,8 +999,7 @@ fm_secondmate_registry_lock_acquire() {
 
 fm_secondmate_registry_query() {
   local registry=$1 mode=${2:-validate} expected_id=${3:-} key=${4:-}
-  # shellcheck disable=SC2016 # Perl source is intentionally a literal shell argument.
-  fm_account_system_perl -MErrno=ENOENT -e '
+  fm_account_system_perl -MErrno=ENOENT - "$registry" "$mode" "$expected_id" "$key" <<'PERL'
     my ($registry, $mode, $expected_id, $key) = @ARGV;
     if (!lstat($registry)) {
       exit 0 if $! == ENOENT && ($mode eq q{validate} || $mode eq q{list});
@@ -1047,7 +1059,7 @@ fm_secondmate_registry_query() {
     } else {
       exit 1;
     }
-  ' "$registry" "$mode" "$expected_id" "$key"
+PERL
 }
 
 fm_account_lifecycle_lock_owned() {  # <lock-path>
@@ -1085,8 +1097,8 @@ fm_account_meta_lock_release() {  # <lock-path>
     return 1
   }
   if [ -f "$lock" ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock"
-    return
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock" || return 1
+    return 0
   fi
   released=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d "$lock.release.XXXXXX" 2>/dev/null) || return 1
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$released" || return 1
@@ -1104,7 +1116,7 @@ fm_account_safe_lineage_value() {
 
 fm_account_meta_key_owned() {  # <key>
   case "$1" in
-    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|orca_cleanup_pending|orca_cleanup_phase|orca_terminal_proof|orca_repo_id|orca_expected_task|orca_provider_task|orca_discovery_label|orca_provider_scope|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_endpoint|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|orca_cleanup_pending|orca_cleanup_phase|orca_terminal_proof|orca_repo_id|orca_expected_task|orca_provider_task|orca_discovery_label|orca_provider_scope|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
     *) return 1 ;;
   esac
 }

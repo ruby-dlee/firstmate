@@ -11,7 +11,7 @@
 # refused on ANY symlink entry anywhere in the tree, which made every repo
 # whose own committed layout uses symlinks permanently un-reapable: relvino
 # carries 177 of them in every worktree (its CLAUDE.md -> AGENTS.md convention
-# and its symlinked skills), so no crew there could ever be torn down. A
+# and its symlinked skills), so no crewmate there could ever be torn down. A
 # symlink ENTRY cannot redirect this operation - it is inspected with
 # follow_symlinks=False, it is not a directory so it is never queued for
 # descent, and each descent opens with O_NOFOLLOW and re-proves identity,
@@ -73,6 +73,19 @@ run_boundary() {  # <project> <target> [cd-dir] -> exit status
   fm_fake_exit0 "$fakebin" treehouse
   (
     cd "$cd_dir" || exit 70
+    PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$target" "$project"
+  ) >/dev/null 2>&1
+  status=$?
+  printf '%s' "$status"
+}
+
+run_boundary_low_fd() {  # <project> <target> <open-file-limit> -> exit status
+  local project=$1 target=$2 open_file_limit=$3 fakebin status
+  fakebin=$(fm_fakebin "$(dirname "$project")/fake-low-fd")
+  fm_fake_exit0 "$fakebin" treehouse
+  (
+    ulimit -n "$open_file_limit" || exit 70
+    cd "$project" || exit 71
     PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$target" "$project"
   ) >/dev/null 2>&1
   status=$?
@@ -158,9 +171,26 @@ EOF
   pass "a project/cwd mismatch is refused"
 }
 
+test_wide_tree_does_not_exhaust_descriptors() {
+  local rec case_dir project worktree status directory
+  rec=$(make_case wide-tree-low-fd)
+  read -r case_dir project worktree <<EOF
+$rec
+EOF
+  : "$case_dir"
+  for directory in $(seq 1 160); do
+    mkdir -p "$worktree/directory-$directory"
+  done
+  status=$(run_boundary_low_fd "$project" "$worktree" 64)
+  expect_code 0 "$status" \
+    "a wide worktree must not exhaust the Treehouse boundary proof descriptor table"
+  pass "wide Treehouse boundary proof stays within a low descriptor limit"
+}
+
 extract_boundary_program
 test_in_tree_symlinks_are_accepted
 test_symlink_escaping_the_tree_is_still_not_followed
 test_symlinked_ancestor_is_refused
 test_non_directory_target_is_refused
 test_project_cwd_mismatch_is_refused
+test_wide_tree_does_not_exhaust_descriptors

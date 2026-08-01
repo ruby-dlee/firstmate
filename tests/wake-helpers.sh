@@ -88,7 +88,7 @@ SH
 
 # Install a hermetic fake fm-crew-state.sh into <fakebin> and echo its path. The
 # watcher's absorb-only-when-provably-working triage calls this (via
-# FM_CREW_STATE_BIN) to read a crew's current state on no-verb signal and stale
+# FM_CREW_STATE_BIN) to read a crewmate's current state on no-verb signal and stale
 # paths; the fake returns a canned "state: <s> · source: <src> · <detail>"
 # verdict line so a test can fix the provably-working decision without a real
 # worktree or no-mistakes.
@@ -242,7 +242,8 @@ SH
 }
 
 wait_for_exit() {
-  local pid=$1 limit=${2:-50} i=0
+  local pid=$1 limit i=0
+  limit=$(fm_test_liveness_iterations "${2:-50}" 0.1)
   while [ "$i" -lt "$limit" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"

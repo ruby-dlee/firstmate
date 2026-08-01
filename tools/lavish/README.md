@@ -1,9 +1,10 @@
 # Lavish
 
 Lavish is firstmate's durable decision inbox.
-It stores complete requests and answers under `$FM_HOME/data/decisions/` and uses short-lived terminal commands only.
+It stores complete requests and answers under a Firstmate home and uses bounded commands that exit after each local operation.
 
-There is no server, browser, URL, listener, poll, watcher, idle timeout, or resident process.
+The fork runs no server, listener, poller, watcher, idle timeout, or resident process.
+It can emit a self-contained browser board, but opening and supervising that file belongs to Firstmate glue outside the fork.
 An unanswered request remains answerable until the files are deliberately removed.
 
 ## Human commands
@@ -16,6 +17,7 @@ For direct human use, pass the same explicit home to every command, replacing th
 lavish inbox --home '/Users/example/firstmate-home'
 lavish show <decision-id> --home '/Users/example/firstmate-home'
 lavish answer <decision-id> --home '/Users/example/firstmate-home'
+lavish board <decision-id> --home '/Users/example/firstmate-home' --out <board.html>
 ```
 
 `lavish answer` renders the complete request, collects one numbered choice for every ordered question, accepts an optional note, shows the whole batch, and requires one explicit confirmation.
@@ -24,6 +26,22 @@ It then queues a redundant wake pointer and exits without waiting for firstmate.
 
 If wake enqueueing fails, the durable answer remains authoritative.
 The command prints `answer saved; wake not queued`, exits nonzero, and the next ordinary intake scan recovers it.
+
+`lavish board` renders the complete Markdown request, ordered questions and options, inline visual evidence, per-option comments, per-question notes, a final review, and a submit step into one HTML file.
+The HTML includes its CSS, JavaScript, and images and makes no request to a shared board service.
+Its dark default theme inlines the vendored Relvino tokens from `src/relvino-tokens.css`, including Inter, Ruby green, `#007AFF` actions, the semantic aliases, and the 16px card radius.
+
+Submitting the page synchronously starts a JSON file download named `lavish-answer-<decision-id>.json` before it assigns the complete batch to `window.__lavishPayload` and sets `document.title` to `LAVISH-SUBMIT v2`.
+The downloaded file survives page and browser closure, while the browser signals remain a live-page fallback.
+The done screen also exposes the complete formatted JSON in a read-only selectable textarea for browsers that block downloads.
+None of these transports writes an answer until `lavish-axi collect` validates the payload.
+
+`bin/fm-lavish-board.sh` defaults to the shell user's `Downloads` directory and accepts `--downloads <path>` when the browser uses a different one.
+Its one-shot check copies a fresh matching download into the Firstmate home's durable state directory before attempting the live-page marker read.
+It never uses `localStorage`, which is not a reliable transport for `file://` boards.
+
+Every command accepts `--home <path>`.
+A captain command run from a shell that does not export `FM_HOME` must include that option, while `bin/fm-lavish-board.sh` resolves its Firstmate home and supplies the option itself.
 
 ## Agent commands
 
@@ -37,7 +55,8 @@ Create a complete Markdown request and a JSON question definition:
     "options": [
       {"value": "a", "label": "Adopt policy A"},
       {"value": "b", "label": "Adopt policy B"}
-    ]
+    ],
+    "visuals": ["deployment-overview.png"]
   }
 ]
 ```
@@ -50,11 +69,49 @@ lavish-axi create \
   --title "Deployment policy" \
   --request /path/to/request.md \
   --questions /path/to/questions.json \
+  --visuals /path/to/evidence \
   --destination data/deployment-policy/captain-answer.toon
 ```
 
 `request.md` must contain the complete context, recommendation, alternatives, consequences, and next actions.
-`create` computes its digest, validates the ordered question set, and writes the request plus `manifest.toon`.
+`create` computes its digest, validates the ordered question set, copies supported PNG, JPEG, GIF, and WebP files into the decision's `visuals/` directory, records their digests in the manifest, and writes the complete decision atomically.
+Question `visuals` entries name files from that copied directory and place the evidence beside that question on the board.
+For existing schema-version-1 manifests, `board` also discovers supported regular image files already present in the conventional `visuals/` directory and renders them with the request context.
+Copied visual batches are limited to 64 files and 50 MiB total so rendering remains bounded.
+
+Collect a payload captured from a browser board without driving the interactive terminal flow:
+
+```sh
+lavish-axi collect deployment-policy \
+  --payload /absolute/path/to/payload.json \
+  --home /absolute/path/to/firstmate-home
+```
+
+The payload shape is:
+
+```json
+{
+  "schema_version": 2,
+  "decision_id": "deployment-policy",
+  "request_sha256": "sha256:...",
+  "answers": [
+    {
+      "key": "deployment",
+      "value": "a",
+      "question_note": "This applies to the whole policy choice.",
+      "option_comments": {
+        "a": "Keep the rollback guard.",
+        "b": "This is too risky today."
+      }
+    }
+  ],
+  "note": "Optional note on the complete batch."
+}
+```
+
+`collect` validates the decision id, exact request hash, answer count, complete question-key set, selected values, and every annotated option value against the immutable manifest.
+It derives labels from the manifest, writes the same atomic `answer.toon` that `lavish answer` writes, queues the same wake record, and exits.
+Count drift, unknown keys, unknown values, and stale request hashes fail closed with named errors.
 
 At firstmate's existing wake and session-start boundaries:
 
@@ -73,7 +130,8 @@ The firstmate bootstrap install command also records the checkout's narrow wake 
 
 ## Protocol
 
-The protocol has schema version `1`.
+Manifest and receipt records use protocol schema version `1`.
+New answer records use schema version `2`, and readers continue to accept existing schema version `1` answers.
 TOON's strict decoder validates every encoded array count before Lavish applies the schema rules below.
 
 `manifest.toon` contains:
@@ -83,6 +141,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - an `$FM_HOME`-relative durable `destination`
 - `expected_count` and the ordered `questions` array
 - each question's nonempty unique key and ordered nonempty options
+- optional copied visual metadata and question-level visual filename references
 - `request_sha256`, formatted as `sha256:<hex>`
 - optional `legacy_source` provenance for migration-created records
 
@@ -92,6 +151,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - `schema_version`, `decision_id`, `request_sha256`, and `submitted_at`
 - exactly one ordered answer for every expected question key
 - each selected option value and label
+- a question note and option comments keyed by option value for every answer in schema version `2`
 - an optional note
 
 `receipt.toon` contains:
@@ -101,7 +161,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - the declared destination and its content digest
 
 The initial `answer.toon` is write-once.
-Later revisions require a future numbered-revision protocol and are not part of schema version `1`.
+Later revisions require a future numbered-revision protocol and are not part of answer schema version `2`.
 
 ## Legacy migration
 

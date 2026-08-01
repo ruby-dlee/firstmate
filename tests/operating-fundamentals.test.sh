@@ -32,10 +32,11 @@ test_agent_only_folded_frontmatter_and_size() {
 }
 
 test_seven_ordered_principles() {
-  local headings expected skill_text principle_seven
+  local headings expected skill_text principle_seven contract_text
   headings=$(sed -nE 's/^## ([0-9]+\. .*)$/\1/p' "$SKILL")
   skill_text=$(<"$SKILL")
   principle_seven=$(awk '/^## 7\./ { capture=1; next } capture && /^## / { exit } capture' "$SKILL")
+  contract_text=$(git -C "$ROOT" ls-files 'AGENTS.md' '.agents/**/*.md' | sed "s#^#$ROOT/#" | xargs cat)
   expected=$(printf '%s\n' \
     "1. Orchestrate; never work inline" \
     "2. Saturate every available lane" \
@@ -58,8 +59,8 @@ test_seven_ordered_principles() {
   assert_grep "Fill released capacity" "$SKILL" "continuous-reaping principle must refill freed lanes"
   assert_grep "explicit captain order as the governing objective" "$SKILL" "explicit-order principle is missing"
   assert_grep "non-overridable safety and instruction constraints" "$SKILL" "explicit-order principle must retain non-overridable constraints"
-  assert_not_contains "$skill_text" "shallowest level" "obsolete shallow-check wording must be absent"
-  assert_not_contains "$skill_text" "load-bearing assumption" "obsolete one-assumption shortcut must be absent"
+  assert_not_contains "$contract_text" "shallowest level" "obsolete shallow-check wording must be absent repository-wide"
+  assert_not_contains "$contract_text" "one load-bearing assumption" "obsolete one-assumption shortcut must be absent repository-wide"
   for proof in "exact actor, credential" "authoritative reference" "materially independent safe in-scope route" "narrowest supported result"; do assert_contains "$skill_text" "$proof" "blocker proof must retain '$proof'"; done
   for bypass_contract in "target outcome" "critical path" "record the target outcome and critical-path rationale" "operation failing, not noise"; do assert_contains "$principle_seven" "$bypass_contract" "principle 7 must retain '$bypass_contract'"; done
   pass "operating-fundamentals encodes all seven principles in the required order"
@@ -111,8 +112,7 @@ test_crew_steering_contract_and_trigger() {
   assert_grep "Treat \`almost there\` as unfinished" "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
   assert_grep "real evidence because work is not done until proven" "$CREW_SKILL" "crew steering must require evidence before completion"
   assert_grep "review adversarially rather than rubber-stamping" "$CREW_SKILL" "crew steering must require adversarial review"
-  assert_grep "one load-bearing assumption before it acts" "$CREW_SKILL" "crew steering must premise-check before action"
-  assert_grep "rejecting a shallow-false premise without overcorrecting" "$CREW_SKILL" "premise checking must reject false premises without overreach"
+  assert_grep "Reject a shallow-false premise without overcorrecting" "$CREW_SKILL" "premise checking must reject false premises without overreach"
   assert_grep "captain's technical-decision bias" "$CREW_SKILL" "crew steering must apply the captain's quality bar"
   assert_grep "reject preserving a leaky component merely to save development cost or sunk work" "$CREW_SKILL" "crew steering must prefer robustness over development cost or sunk work"
   assert_grep "Reject any quiet reframing of the task into a smaller win" "$CREW_SKILL" "crew steering must reject weakened goals"

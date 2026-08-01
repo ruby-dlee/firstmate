@@ -4093,6 +4093,18 @@ run_partitioned_test() {
   "$@"
 }
 
+run_partitioned_group() {
+  local assigned_part group_size=$# test_function
+  assigned_part=$((FM_TEST_PART_SEQUENCE % FM_TEST_PART_TOTAL + 1))
+  FM_TEST_PART_SEQUENCE=$((FM_TEST_PART_SEQUENCE + group_size))
+  if [ "$FM_TEST_PART_TOTAL" -gt 1 ] && [ "$assigned_part" -ne "$FM_TEST_PART_INDEX" ]; then
+    return 0
+  fi
+  for test_function in "$@"; do
+    "$test_function"
+  done
+}
+
 FM_TEST_PART_INDEX=${FM_TEST_PART_INDEX:-1}
 FM_TEST_PART_TOTAL=${FM_TEST_PART_TOTAL:-1}
 FM_TEST_PART_SEQUENCE=0
@@ -4153,8 +4165,9 @@ run_partitioned_test test_completed_reports_prune_after_minimum_age
 run_partitioned_test test_retention_binds_manifests_to_entry_directories
 run_partitioned_test test_watcher_periodically_owns_idle_report_retention
 run_partitioned_test test_retention_batches_make_interruption_safe_progress
-run_partitioned_test test_persistent_retention_owner_prunes_without_tasks_or_watcher
-run_partitioned_test test_retention_generations_survive_install_interruptions
+run_partitioned_group \
+  test_persistent_retention_owner_prunes_without_tasks_or_watcher \
+  test_retention_generations_survive_install_interruptions
 run_partitioned_test test_retention_error_publication_is_atomic_and_nonfollowing
 run_partitioned_test test_legacy_cutover_preserves_fresh_reports_and_retires_expired_raw_paths
 run_partitioned_test test_retention_owner_advances_pending_legacy_migration

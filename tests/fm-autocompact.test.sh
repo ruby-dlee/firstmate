@@ -26,6 +26,18 @@ capture() {
     | FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" capture
 }
 
+recover() {
+  local root=$1 home=$2
+  printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact","session_id":"session-auto"}' \
+    | FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover
+}
+
+mark_stowed() {
+  local root=$1 home=$2 transcript=$3 end=$4 state=$5
+  shift 5
+  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" mark-stowed "$transcript" "$end" "$state" "$@"
+}
+
 test_tracked_hook_registration_preserves_existing_hooks() {
   local settings="$ROOT/.claude/settings.json" pre recover
   pre=$(jq -r '.hooks.PreCompact[]?.hooks[]?.command // empty' "$settings")
@@ -82,6 +94,26 @@ test_capture_is_inert_in_child_worktree() {
   [ -z "$out" ] || fail "child worktree capture was noisy: $out"
   assert_absent "$home/data/autocompact-resume.md" "child worktree wrote a primary resume anchor"
   pass "tracked hook is a silent no-op in a crewmate worktree"
+}
+
+test_scope_excludes_nonfirstmate_and_includes_secondmate_home() {
+  local plain="$TMP_ROOT/scope/plain" plain_home="$TMP_ROOT/scope/plain-home"
+  local parent="$TMP_ROOT/scope/parent" secondmate="$TMP_ROOT/scope/secondmate" out
+  fm_git_init_commit "$plain"
+  mkdir -p "$plain_home/state" "$plain_home/data"
+  out=$(capture "$plain" "$plain_home" auto 2>&1)
+  [ -z "$out" ] || fail "non-Firstmate capture was noisy: $out"
+  assert_absent "$plain_home/data/autocompact-resume.md" "non-Firstmate repository wrote a resume anchor"
+
+  fm_git_worktree "$parent" "$secondmate" secondmate-branch
+  mkdir -p "$secondmate/bin" "$secondmate/state" "$secondmate/data"
+  printf '# Firstmate secondmate fixture\n' > "$secondmate/AGENTS.md"
+  printf 'probe-sm\n' > "$secondmate/.fm-secondmate-home"
+  printf '%s\n' '{"type":"user","message":"secondmate conversation"}' > "$secondmate/transcript.jsonl"
+  capture "$secondmate" "$secondmate" auto
+  assert_present "$secondmate/data/autocompact-resume.md" "valid secondmate home did not capture a resume anchor"
+  assert_contains "$(recover "$secondmate" "$secondmate")" 'REQUIRED POST-COMPACTION STOW SWEEP' "valid secondmate home did not receive the recovery directive"
+  pass "scope excludes non-Firstmate repositories while preserving valid secondmate homes"
 }
 
 test_capture_failure_blocks_compaction() {
@@ -185,23 +217,204 @@ EOF
 }
 
 test_compact_sessionstart_injects_anchor_and_reconciles() {
-  local rec root home out
+  local rec root home transcript transcript_end out
   rec=$(new_primary recover)
   IFS='|' read -r root home <<EOF
 $rec
 EOF
   printf '%s\n' '# recovery-backlog' > "$home/data/backlog.md"
   fm_write_meta "$home/state/active-1.meta" 'window=firstmate:fm-active-1' 'kind=ship'
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"remember the recovery preference"}' > "$transcript"
+  transcript_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
   capture "$root" "$home" auto
 
-  out=$(printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact","session_id":"session-auto"}' \
-    | FM_ROOT_OVERRIDE="$root" FM_HOME="$home" "$AUTOCOMPACT" recover)
+  out=$(recover "$root" "$home")
   assert_contains "$out" 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT' "recovery context marker is missing"
+  assert_contains "$out" 'REQUIRED POST-COMPACTION STOW SWEEP' "compact recovery omitted the required stow directive"
+  assert_contains "$out" 'load the stow skill and sweep the whole recovered context' "missing marker did not request a full stow sweep"
+  assert_contains "$out" "Pre-compact transcript: $transcript" "stow directive omitted the transcript path"
+  assert_contains "$out" "zero-based byte offset 0 inclusive through $transcript_end exclusive" "stow directive omitted the captured byte boundary"
+  assert_contains "$out" '.agents/skills/stow/SKILL.md' "stow directive did not point at the routing owner"
+  assert_contains "$out" 'fm-autocompact.sh mark-stowed' "stow directive omitted the completion-marker action"
   assert_contains "$out" '# Autocompact resume anchor' "fresh anchor was not re-read"
   assert_contains "$out" 'SESSION START -' "normal session-start reconciliation did not run"
   assert_contains "$out" '# recovery-backlog' "session-start did not read the current backlog"
   assert_contains "$out" 'window=firstmate:fm-active-1' "session-start did not read in-flight metadata"
-  pass "compact SessionStart re-reads the anchor and runs normal durable-state reconciliation"
+  pass "compact SessionStart injects a scoped stow directive, re-reads the anchor, and reconciles durable state"
+}
+
+test_stow_marker_advances_and_suppresses_duplicate_sweeps() {
+  local rec root home transcript first_end second_end out marker mark_out
+  rec=$(new_primary marker-advance)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"first durable preference"}' > "$transcript"
+  first_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+
+  out=$(recover "$root" "$home")
+  assert_contains "$out" 'ACTION REQUIRED' "the first boundary did not request a stow sweep"
+  mark_out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent)
+  assert_contains "$mark_out" 'STOW MARKER ADVANCED' "successful stow acknowledgement did not advance the marker"
+  marker="$home/state/.autocompact-stow.marker"
+  assert_present "$marker" "successful stow acknowledgement did not publish a marker"
+  assert_contains "$(cat "$marker")" "transcript_path=$transcript" "marker recorded the wrong transcript"
+  assert_contains "$(cat "$marker")" "completed_bytes=$first_end" "marker recorded the wrong first boundary"
+
+  out=$(recover "$root" "$home")
+  assert_contains "$out" 'NO STOW SWEEP PENDING' "completed boundary did not suppress a duplicate sweep"
+  assert_not_contains "$out" 'ACTION REQUIRED' "completed boundary repeated the stow directive"
+
+  printf '%s\n' '{"type":"assistant","message":"second conversation-only learning"}' >> "$transcript"
+  second_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+  out=$(recover "$root" "$home")
+  assert_contains "$out" "Read zero-based byte offset $first_end inclusive through $second_end exclusive" "next compaction did not scope the sweep to new transcript bytes"
+  mark_stowed "$root" "$home" "$transcript" "$second_end" present "$transcript" "$first_end" >/dev/null
+  assert_contains "$(cat "$marker")" "completed_bytes=$second_end" "marker did not advance to the second boundary"
+  pass "the durable marker advances only after acknowledgement and suppresses duplicate transcript sweeps"
+}
+
+test_stale_sweep_cannot_advance_a_changed_boundary() {
+  local rec root home transcript first_end second_end out marker rc
+  rec=$(new_primary stale-sweep)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"first boundary"}' > "$transcript"
+  first_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+  recover "$root" "$home" >/dev/null
+  marker="$home/state/.autocompact-stow.marker"
+  printf '%s\n' "transcript_path=$transcript" 'completed_bytes=changed-under-sweep' > "$marker"
+
+  set +e
+  out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "stale sweep after marker change"
+  assert_contains "$out" 'the completion marker changed during the sweep' "stale sweep did not reject the changed marker"
+  assert_contains "$(cat "$marker")" 'completed_bytes=changed-under-sweep' "stale sweep replaced the changed marker"
+  out=$(recover "$root" "$home")
+  assert_contains "$out" 'ACTION REQUIRED' "changed marker suppressed the required re-sweep"
+
+  rm "$marker"
+  printf '%s\n' '{"type":"assistant","message":"new boundary"}' >> "$transcript"
+  second_end=$(LC_ALL=C wc -c < "$transcript" | tr -d '[:space:]')
+  capture "$root" "$home" auto
+
+  set +e
+  out=$(mark_stowed "$root" "$home" "$transcript" "$first_end" absent 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "stale sweep acknowledgement"
+  assert_contains "$out" 'the recovery anchor changed during the sweep' "stale sweep did not reject the changed anchor"
+  assert_absent "$marker" "stale sweep advanced the marker"
+  out=$(recover "$root" "$home")
+  assert_contains "$out" "through $second_end exclusive" "changed boundary did not require a re-sweep"
+  assert_contains "$out" 'ACTION REQUIRED' "changed boundary suppressed its re-sweep"
+  pass "stale sweep acknowledgement fails closed and leaves the new boundary pending"
+}
+
+test_interrupted_lock_owner_does_not_wedge_future_capture() {
+  local rec root home lock holder rc out
+  rec=$(new_primary interrupted-lock)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '{"type":"user","message":"lock recovery"}' > "$home/transcript.jsonl"
+  lock="$home/state/.autocompact-stow.lock"
+  mkdir "$lock"
+  capture "$root" "$home" auto
+  [ -f "$lock" ] && [ ! -L "$lock" ] || fail "legacy stale lock directory was not recovered safely"
+
+  python3 -c '
+import fcntl
+import os
+import sys
+import time
+
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(1, b"locked\n")
+time.sleep(30)
+' "$lock" > "$home/lock-ready" &
+  holder=$!
+  while [ ! -s "$home/lock-ready" ] && kill -0 "$holder" 2>/dev/null; do sleep 0.01; done
+  kill -0 "$holder" 2>/dev/null || fail "synthetic lock owner exited before acquiring the lock"
+
+  set +e
+  out=$(capture "$root" "$home" auto 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "capture while the stow lock is live"
+  assert_contains "$out" 'could not lock the resume anchor for publication' "live lock did not preserve fail-closed capture"
+  kill -KILL "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+
+  capture "$root" "$home" auto
+  assert_present "$home/data/autocompact-resume.md" "killed lock owner permanently wedged capture"
+  pass "kernel-released lock recovers stale state and interrupted owners"
+}
+
+test_missing_or_corrupt_stow_marker_degrades_to_full_sweep() {
+  local rec root home transcript out marker rc
+  rec=$(new_primary marker-fallback)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"unswept knowledge"}' > "$transcript"
+  capture "$root" "$home" auto
+  marker="$home/state/.autocompact-stow.marker"
+
+  out=$(recover "$root" "$home")
+  rc=$?
+  expect_code 0 "$rc" "recovery with a missing stow marker"
+  assert_contains "$out" 'the completion marker is missing' "missing marker reason was not surfaced"
+  assert_contains "$out" 'sweep the whole recovered context' "missing marker did not degrade to a full sweep"
+
+  printf '%s\n' "transcript_path=$transcript" 'completed_bytes=not-a-byte-offset' > "$marker"
+  out=$(recover "$root" "$home")
+  rc=$?
+  expect_code 0 "$rc" "recovery with a corrupt stow marker"
+  assert_contains "$out" 'the completion marker offset is malformed' "corrupt marker reason was not surfaced"
+  assert_contains "$out" 'sweep the whole recovered context' "corrupt marker did not degrade to a full sweep"
+
+  printf '%s\n' "transcript_path=$transcript" 'completed_bytes=99999999999999999999999999999999999999999999999999' > "$marker"
+  out=$(recover "$root" "$home")
+  rc=$?
+  expect_code 0 "$rc" "recovery with an overflowing stow marker offset"
+  assert_contains "$out" 'the completion marker offset exceeds the captured boundary' "overflowing marker offset was not bounded safely"
+  assert_contains "$out" 'sweep the whole recovered context' "overflowing marker offset did not degrade to a full sweep"
+  pass "missing and corrupt stow markers fail open to a whole-context sweep"
+}
+
+test_unreadable_transcript_does_not_block_recovery() {
+  local rec root home transcript out rc
+  rec=$(new_primary unreadable-transcript)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  printf '%s\n' '{"type":"user","message":"knowledge behind an unreadable path"}' > "$transcript"
+  capture "$root" "$home" auto
+  chmod 000 "$transcript"
+
+  set +e
+  out=$(recover "$root" "$home" 2>&1)
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "recovery with an unreadable transcript"
+  assert_contains "$out" 'the pre-compact transcript is unreadable' "unreadable transcript reason was not surfaced"
+  assert_contains "$out" 'sweep the whole recovered context' "unreadable transcript did not degrade to a full sweep"
+  assert_contains "$out" 'leave the marker unchanged so a later recovery retries the sweep' "unreadable transcript could be silently marked complete"
+  chmod 600 "$transcript"
+  pass "an unreadable transcript fails open to recovered context without blocking recovery"
 }
 
 test_recovery_payload_failures_still_emit_durable_context() {
@@ -258,9 +471,15 @@ EOF
 test_tracked_hook_registration_preserves_existing_hooks
 test_capture_writes_fresh_durable_anchor
 test_capture_is_inert_in_child_worktree
+test_scope_excludes_nonfirstmate_and_includes_secondmate_home
 test_capture_failure_blocks_compaction
 test_capture_and_recovery_do_not_require_jq
 test_intermediate_render_failure_preserves_prior_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
+test_stow_marker_advances_and_suppresses_duplicate_sweeps
+test_stale_sweep_cannot_advance_a_changed_boundary
+test_interrupted_lock_owner_does_not_wedge_future_capture
+test_missing_or_corrupt_stow_marker_degrades_to_full_sweep
+test_unreadable_transcript_does_not_block_recovery
 test_recovery_payload_failures_still_emit_durable_context
 test_noncompact_sessionstart_is_inert

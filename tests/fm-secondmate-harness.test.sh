@@ -293,7 +293,8 @@ SH
 make_fixture_clone() {
   local destination=$1
   git clone -q --no-checkout "$ROOT" "$destination"
-  git -C "$destination" checkout -q -b main "$(git -C "$ROOT" rev-parse HEAD)"
+  # Push checkouts may already clone a local main; reset the disposable fixture either way.
+  git -C "$destination" checkout -q -B main "$(git -C "$ROOT" rev-parse HEAD)"
   git -C "$destination" update-ref refs/remotes/origin/main HEAD
   git -C "$destination" remote set-head origin main
 }
@@ -479,7 +480,7 @@ meta_field() { grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-; }
 # capture technique in fm-spawn-dispatch-profile.test.sh so the constructed
 # launch command (not just meta) can be asserted on. Also answers the
 # `#{pane_current_path}` probe from FM_FAKE_PANE_PATH so this same stub works
-# for a crew/scout (non-secondmate) spawn's treehouse-worktree wait loop.
+# for a crewmate/scout (non-secondmate) spawn's treehouse-worktree wait loop.
 make_launch_capturing_tmux() {
   local dir=$1 fakebin="$1/fakebin"
   mkdir -p "$fakebin"
@@ -702,7 +703,7 @@ test_spawn_explicit_harness_uses_explicit_profile_axes() {
 
 # The harness fallback chain (secondmate-harness -> crew-harness -> own) still
 # resolves correctly with no model/effort tokens anywhere in the chain, and a
-# crew/scout (non-secondmate) launch is entirely unaffected by this feature: no
+# crewmate/scout (non-secondmate) launch is entirely unaffected by this feature: no
 # model/effort is invented for it even though its own project has no profile set.
 test_spawn_fallback_chain_and_crew_scout_unaffected() {
   local w sm meta home proj wt fakebin launchlog id launch spawn_err spawn_rc node_bin node_dir
@@ -721,7 +722,7 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   [ "$(meta_field "$meta" model)" = default ] || fail "fallback: meta model should stay default with no tokens anywhere"
   [ "$(meta_field "$meta" effort)" = default ] || fail "fallback: meta effort should stay default with no tokens anywhere"
 
-  # Crew/scout launch: same crew-harness config, no --secondmate. Must resolve
+  # Crewmate/scout launch: same crew-harness config, no --secondmate. Must resolve
   # the crewmate harness and record no model/effort - this codepath must never read
   # config/secondmate-harness's tokens at all.
   id="crew-unaffected-z1"
@@ -734,6 +735,8 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   mkdir -p "$home/data/$id" "$home/projects" "$home/state" \
     "$home/treehouse-pools" "$home/checkout-refresh-state"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - crew harness fallback test (repo: crew-project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$home/data/backlog.md"
   : > "$launchlog"
   spawn_err="$w/crew-spawn.err"
   node_bin=$(command -v node) || fail "crew-unaffected: node is required"

@@ -2240,13 +2240,17 @@ test_enforced_secondmate_requires_routing_inheritance_and_capable_home() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  [ -z "$(git -C "$sm" status --porcelain)" ] \
+    || fail "incapable secondmate fixture was not a clean pre-routing revision"
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -ne 0 ] || fail "enforced secondmate launched from a pre-Agent-Fleet home"
   assert_contains "$out" "$sm" "capability refusal omitted the offending secondmate home"
-  assert_contains "$out" "lacks Agent Fleet routing support" \
-    "capability refusal did not stop at the capability gate"
+  assert_contains "$out" "the home lacks Agent Fleet routing support" \
+    "capability refusal did not reach the capability gate"
+  assert_contains "$out" "Fast-forward or otherwise reconcile the home" \
+    "capability refusal omitted the durable reconciliation action"
   assert_not_grep '^new-window ' "$TMUX_LOG" "capability refusal created an endpoint"
   pass "enforced secondmates require inherited routing policy and Agent Fleet-capable homes"
 }
@@ -2287,12 +2291,66 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
+  [ -z "$(git -C "$sm" status --porcelain)" ] \
+    || fail "off-mode incapable secondmate fixture was not a clean pre-routing revision"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
-  [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"
-  assert_contains "$out" "lacks Agent Fleet routing support" \
-    "routing-off legacy-home launch omitted its capability warning"
-  pass "secondmate launches require authoritative routing policy in every mode"
+  [ "$status" -eq 0 ] || fail "off-mode secondmate rejected a clean pre-routing home (exit $status): $out"
+  assert_contains "$out" "$id" "off-mode capability warning omitted the offending secondmate"
+  assert_contains "$out" "launching because account routing is off" \
+    "off-mode capability warning did not explain the compatibility launch"
+  assert_contains "$out" "spawned $id" "off-mode compatibility launch did not complete"
+  assert_grep 'kind=secondmate' "$HOME_DIR/state/$id.meta" \
+    "off-mode compatibility launch did not publish secondmate metadata"
+  assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" \
+    "off-mode compatibility launch published managed account metadata"
+  [ ! -s "$AF_LOG" ] || fail "off-mode compatibility launch called Agent Fleet"
+  pass "secondmate launches require authoritative routing policy while off mode preserves legacy homes"
+}
+
+test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate() {
+  local id rec sm out status
+  id=account-secondmate-enforce-dirty-incapable-z11i
+  rec=$(make_case secondmate-enforce-dirty-incapable claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id" incapable
+  sm=$(cd "$sm" && pwd -P)
+  printf '\n' >> "$sm/AGENTS.md"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "enforced dirty incapable secondmate launched"
+  assert_contains "$out" "dirty working tree" \
+    "enforced dirty incapable secondmate did not stop at the freshness gate"
+  assert_not_contains "$out" "lacks Agent Fleet routing support" \
+    "enforced dirty incapable secondmate reached capability handling"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "enforced dirty incapable secondmate created an endpoint"
+  pass "enforced dirty incapable secondmates stop at the freshness gate"
+}
+
+test_off_dirty_incapable_secondmate_stops_at_freshness_gate() {
+  local id rec sm out status
+  id=account-secondmate-off-dirty-incapable-z11j
+  rec=$(make_case secondmate-off-dirty-incapable claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id" incapable
+  sm=$(cd "$sm" && pwd -P)
+  printf '\n' >> "$sm/AGENTS.md"
+
+  out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "off-mode dirty incapable secondmate launched"
+  assert_contains "$out" "dirty working tree" \
+    "off-mode dirty incapable secondmate did not stop at the freshness gate"
+  assert_not_contains "$out" "launching because account routing is off" \
+    "off-mode dirty incapable secondmate reached capability handling"
+  assert_not_grep '^new-window ' "$TMUX_LOG" \
+    "off-mode dirty incapable secondmate created an endpoint"
+  pass "off-mode dirty incapable secondmates stop at the freshness gate"
 }
 
 test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope() {
@@ -6170,6 +6228,12 @@ if [ "${FM_TEST_FOCUSED:-}" = secondmate-direct-scope ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = dirty-secondmate-freshness ]; then
+  run_isolated_test test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate
+  run_isolated_test test_off_dirty_incapable_secondmate_stops_at_freshness_gate
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_native_resume_requires_fresh_sessionstart_evidence
@@ -6476,6 +6540,8 @@ run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inh
 run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
 run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
 run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode
+run_isolated_test test_enforced_dirty_incapable_secondmate_stops_at_freshness_gate
+run_isolated_test test_off_dirty_incapable_secondmate_stops_at_freshness_gate
 run_isolated_test test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt

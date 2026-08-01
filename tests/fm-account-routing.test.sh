@@ -437,10 +437,13 @@ make_case() {
       "$wt" "$first_id" > "$case_dir/treehouse-pool/treehouse-state.json"
   fi
   touch "$home/state/.last-watcher-beat"
+  printf '# Backlog\n\n## In flight\n' > "$home/data/backlog.md"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf -- '- [ ] %s - account routing spawn test (repo: project)\n' "$id" >> "$home/data/backlog.md"
   done
+  printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf '%s|%s|%s|%s|%s\n' "$case_dir" "$home" "$proj" "$wt" "$fakebin"
 }
 
@@ -463,6 +466,10 @@ EOF
   : > "$LAUNCH_LOG"
   : > "$NATIVE_LAUNCH_LOG"
   FM_TEST_SPAWN_ROOT=
+}
+
+empty_case_backlog() {
+  printf '# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n' > "$HOME_DIR/data/backlog.md"
 }
 
 run_spawn() {
@@ -561,7 +568,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   [ "$status" -eq 0 ] || fail "default-off spawn should succeed (exit $status): $out"
   [ ! -s "$AF_LOG" ] || fail "routing off invoked Agent Fleet: $(cat "$AF_LOG")"
   launch=$(cat "$LAUNCH_LOG")
-  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
+  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions --model 'claude-opus-5' \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
   [ "$launch" = "$expected" ] || fail "routing off changed the launch bytes"
   assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "routing off wrote account metadata"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" "routing off wrote session metadata"
@@ -570,7 +577,7 @@ test_off_is_byte_compatible_and_never_calls_agent_fleet() {
   assert_grep '# Completion report' "$HOME_DIR/data/$id/brief.md" "post-cutover spawn did not upgrade a legacy unspawned brief"
   # Assert each required section by the exact heading publication demands, not by
   # the sentence that happens to list them. The prose was reworded once already
-  # (to spell out the level-two requirement crews kept getting wrong) and this
+  # (to spell out the level-two requirement crewmates kept getting wrong) and this
   # assertion broke even though the contract still named all six - it was pinned
   # to phrasing rather than to the guarantee.
   for section in '## Summary' '## What changed' '## Verification' \
@@ -1206,6 +1213,7 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   grep -v '^report_required=' "$HOME_DIR/state/$id.meta" > "$HOME_DIR/state/$id.meta.precutover"
   mv "$HOME_DIR/state/$id.meta.precutover" "$HOME_DIR/state/$id.meta"
   rm -f "$CASE_DIR/endpoint-live"
+  empty_case_backlog
   : > "$AF_LOG"
   : > "$TMUX_LOG"
   : > "$LAUNCH_LOG"
@@ -1224,6 +1232,7 @@ test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   assert_not_contains "$launch" 'cat ' "resume started a fresh prompted conversation"
   [ "$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)" = "$before_session" ] || fail "resume changed provider session identity"
   assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover recovery silently activated the report gate"
+  assert_not_grep "$id" "$HOME_DIR/data/backlog.md" "resume recovery fixture retained its backlog row"
 
   : > "$AF_LOG"
   : > "$TMUX_LOG"
@@ -1351,8 +1360,16 @@ test_off_metadata_merge_waits_for_metadata_lock() {
   FM_FAKE_TMUX_NEW_WINDOW_MARKER="$marker" FM_FAKE_TMUX_NEW_WINDOW_GATE="$gate" \
     run_spawn "$id" "$PROJ_DIR" > "$out_file" &
   spawn_pid=$!
-  for _ in $(seq 1 100); do [ -f "$marker" ] && break; sleep 0.05; done
-  [ -f "$marker" ] || { kill "$spawn_pid" 2>/dev/null || true; fail "off metadata-lock test never reached endpoint creation"; }
+  for _ in $(seq 1 600); do
+    [ -f "$marker" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [ ! -f "$marker" ]; then
+    kill "$spawn_pid" 2>/dev/null || true
+    wait "$spawn_pid" 2>/dev/null || true
+    fail "off metadata-lock test never reached endpoint creation: $(cat "$out_file")"
+  fi
   # shellcheck source=bin/fm-account-routing-lib.sh
   . "$ROOT/bin/fm-account-routing-lib.sh"
   held=$(fm_account_meta_lock_acquire "$HOME_DIR/state" "$id") \
@@ -1476,6 +1493,7 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
     "pr=418" \
     "x_request=req-legacy" \
     "custom_extension=preserve-success"
+  empty_case_backlog
   out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
   status=$?
   [ "$status" -eq 0 ] || fail "pre-cutover unmanaged respawn should succeed (exit $status): $out"
@@ -1483,6 +1501,7 @@ test_unmanaged_respawn_preserves_report_cutover_state() {
   assert_grep 'pr=418' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing PR pointer"
   assert_grep 'x_request=req-legacy' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing X-mode link"
   assert_grep 'custom_extension=preserve-success' "$HOME_DIR/state/$id.meta" "managed respawn dropped extension metadata"
+  assert_not_grep "$id" "$HOME_DIR/data/backlog.md" "existing-metadata relaunch fixture retained its backlog row"
   pass "unmanaged respawn preserves a legacy task's report cutover state"
 }
 
@@ -2894,7 +2913,11 @@ test_cross_profile_continuation_for_harness() {
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
-  source_model="$harness-source-model"
+  if [ "$harness" = claude ]; then
+    source_model=claude-opus-5
+  else
+    source_model="$harness-source-model"
+  fi
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
     run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
   status=$?
@@ -2994,11 +3017,20 @@ PY
 }
 
 test_cross_provider_continuation_uses_target_default_pool() {
-  local source=$1 target=$2 id rec old_task out status source_model launch
+  local source=$1 target=$2 id rec old_task out status source_model target_model launch
   id="account-continue-$source-to-$target-z21a"
   rec=$(make_case "continue-$source-to-$target" "$source" "$id")
   read_case "$rec"
-  source_model="$source-source-model"
+  if [ "$source" = claude ]; then
+    source_model=claude-opus-5
+  else
+    source_model="$source-source-model"
+  fi
+  if [ "$target" = claude ]; then
+    target_model=claude-opus-5
+  else
+    target_model=default
+  fi
   out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
     run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort high)
   status=$?
@@ -3017,7 +3049,7 @@ test_cross_provider_continuation_uses_target_default_pool() {
     "$source-to-$target continuation inherited the predecessor provider's pool"
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "$source_model" "$source-to-$target continuation inherited the source provider's model"
-  assert_regex '^model=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target model default"
+  assert_regex "^model=$target_model$" "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not resolve the target model"
   assert_regex '^effort=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target effort default"
   assert_grep "predecessor=$old_task" "$HOME_DIR/data/$id/account-attempts.md" \
     "$source-to-$target continuation lost predecessor lineage"
@@ -3149,6 +3181,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
   assert_grep "account_predecessor_task=$old_task" "$HOME_DIR/state/$id.meta" "failed continuation cleanup lost predecessor identity"
 
   clear_case_logs
+  empty_case_backlog
   out=$(FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit run_spawn "$id" --continue-account --account-profile claude-3)
   status=$?
   [ "$status" -eq 0 ] || fail "continuation retry could not clean and replace its failed generation: $out"
@@ -3158,6 +3191,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
   assert_grep "session remove --task $failed_task" "$AF_LOG" "continuation retry did not clean its failed mapping"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "continuation retry did not clean its restored predecessor"
   assert_not_grep '^account_rollback_' "$HOME_DIR/state/$id.meta" "continuation retry retained rollback metadata"
+  assert_not_grep "$id" "$HOME_DIR/data/backlog.md" "continuation recovery fixture retained its backlog row"
   pass "failed continuation cleanup restores predecessor state before retry"
 }
 
@@ -5922,6 +5956,13 @@ run_isolated_test() {
   status=$?
   [ "$status" -eq 0 ] || exit "$status"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = backlog-row-exemptions ]; then
+  run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
+  run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
+  run_isolated_test test_failed_continuation_cleanup_restores_predecessor_for_retry
+  exit 0
+fi
 
 if [ "${FM_TEST_FOCUSED:-}" = stale-reclaim-generation ]; then
   run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal

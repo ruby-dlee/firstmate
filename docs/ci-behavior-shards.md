@@ -24,18 +24,43 @@ The eight-shard checked-in plan has these estimated serial loads.
 |---:|---:|---:|
 | 1 | 1 | 563637 ms (9m24s) |
 | 2 | 1 | 475500 ms (7m56s) |
-| 3 | 13 | 401927 ms (6m42s) |
-| 4 | 13 | 401942 ms (6m42s) |
-| 5 | 13 | 401927 ms (6m42s) |
-| 6 | 10 | 401979 ms (6m42s) |
-| 7 | 16 | 401935 ms (6m42s) |
-| 8 | 17 | 401936 ms (6m42s) |
-
-The expected healthy behavior-execution critical path is 9 minutes 24 seconds rather than 57 minutes 23 seconds.
+| 3 | 1 | 423936 ms (7m04s) |
+| 4 | 15 | 391516 ms (6m32s) |
+| 5 | 17 | 391524 ms (6m32s) |
+| 6 | 17 | 391519 ms (6m32s) |
+| 7 | 17 | 391519 ms (6m32s) |
+| 8 | 15 | 391517 ms (6m32s) |
 
 The account-routing and report-stack suites keep their original test functions and assertions in shared suite files, while two runner wrappers partition each call list deterministically between isolated runners.
 
+The report-stack partition keeps the persistent-retention-owner setup in the same wrapper as its generation-interruption dependent.
+
 The largest remaining indivisible test file, `tests/fm-teardown.test.sh`, sets the 9-minute-24-second floor.
+
+## Measured GitHub Actions result
+
+[GitHub Actions run 30681093133](https://github.com/ruby-dlee/firstmate/actions/runs/30681093133) ran all eight shards and the executed-union guard from commit `4dcafc2cbc0d81c993e2314a6ad83e4aa1d9e008`.
+
+The behavior check took 9 minutes 57 seconds from workflow creation at 02:59:39 UTC through final guard completion at 03:09:36 UTC.
+
+The slowest matrix job was shard 1 at 9 minutes 25 seconds, and its behavior step took 9 minutes 13 seconds.
+
+The serial baseline was 57 minutes 23 seconds, so the measured behavior check wall-clock fell by 47 minutes 26 seconds while retaining every test file and the final completeness proof.
+
+| Shard | Job wall-clock | Behavior step | Result |
+|---:|---:|---:|---:|
+| 1 | 9m25s | 9m13s | pass |
+| 2 | 8m28s | 8m19s | pass |
+| 3 | 8m32s | 8m20s | pass |
+| 4 | 6m59s | 6m48s | pass |
+| 5 | 6m10s | 6m03s | pass |
+| 6 | 6m18s | 6m11s | pass |
+| 7 | 5m51s | 5m40s | pass |
+| 8 | 8m43s | 8m31s | pass |
+
+The same run measured the split wrappers at 423936 ms for account-routing A, 335548 ms for account-routing B, 261383 ms for report-stack A, and 243164 ms for report-stack B.
+
+Those values replaced the provisional half-suite estimates in `tests/behavior-test-durations.tsv` and produced the checked-in assignment table above.
 
 ## Coverage guard
 
@@ -61,7 +86,7 @@ Scripts remain serial within a shard, so no existing test needed weaker assertio
 
 Each matrix job is named `Behavior tests (shard N/8)`, and the runner emits explicit begin and end markers containing the test path and exit code.
 
-The 15-minute per-shard timeout leaves bounded margin above the 9m24s slowest planned shard while replacing the prior 90-minute blanket.
+The 15-minute per-shard timeout leaves bounded margin above the 9m25s measured slowest job while replacing the prior 90-minute blanket.
 
 ## Teardown child-endpoint investigation
 

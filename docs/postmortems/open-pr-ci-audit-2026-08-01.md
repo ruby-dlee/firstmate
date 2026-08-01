@@ -2,18 +2,19 @@
 
 ## Finding
 
-The 16 red pull requests do not share one failing implementation or one resource-contention failure.
-They share a stale presentation: their checks were recorded against older `main` snapshots and did not rerun after the underlying failures were repaired on `main`.
+The task framing told the captain that 16 red pull requests likely shared one cause.
+This audit corrects that framing: the dashboard is stale multi-cause history, not one shared failure.
+The pull requests share a stale presentation because most checks were recorded against older `main` snapshots and did not rerun after the underlying failures were repaired on `main`.
 The actual logs contain several independent signatures.
 The missing four pull requests from the original abbreviated list are #30, #28, #27, and #26.
 
 ## Check clusters
 
-| Failing check | Pull requests | Count |
-| --- | --- | ---: |
-| Behavior tests | #50, #48, #47, #46, #45, #44, #43, #42, #38, #33, #30, #28, #27, #26 | 14 |
-| PR must be raised via no-mistakes | #56, #55, #50, #47, #30 | 5 pull requests and 6 failed check runs because #56 has two runs on the same head |
-| Lint shell scripts | #56, #30 | 2 |
+| Failing check | Pull requests | Count | Backlog classification |
+| --- | --- | ---: | --- |
+| Behavior tests | #50, #48, #47, #46, #45, #44, #43, #42, #38, #33, #30, #28, #27, #26 | 14 | 13 stale-base failures and 1 real branch defect |
+| PR must be raised via no-mistakes | #56, #55, #50, #47, #30 | 5 pull requests and 6 failed check runs because #56 has two runs on the same head | Real policy violations that require republishing through no-mistakes |
+| Lint shell scripts | #56, #30 | 2 | Real branch defects |
 
 The no-mistakes failures all have the exact signature `This PR was not raised through no-mistakes.`
 They are policy failures caused by the missing deterministic pipeline marker in the pull request body, not test failures.
@@ -22,17 +23,19 @@ The #30 lint failure is a separate group of ShellCheck findings in that branch.
 
 ## Behavior signature clusters
 
-| Signature | Pull requests | Count |
-| --- | --- | ---: |
-| `seed failed` after `refusing explicit secondmate home whose default branch cannot be refreshed safely` | #50, #48, #44 | 3 |
-| `capability refusal omitted the offending secondmate` | #45, #43, #38 | 3 |
-| `teardown failed for the empty secondmate home` | #47, #27 | 2 |
-| Browser cleanup integration retried removal of an already-absent task temp root | #46 | 1 |
-| Backend behavior file returned nonzero after its printed assertions passed | #42 | 1 |
-| Occupied release-drifted Herdr server assertion | #33 | 1 |
-| Successful direct rollback left task metadata | #30 | 1 |
-| Failed direct spawn did not return its worktree | #28 | 1 |
-| Upgraded brief omitted completion-report sections | #26 | 1 |
+| Signature | Pull requests | Count | Backlog classification |
+| --- | --- | ---: | --- |
+| `seed failed` after `refusing explicit secondmate home whose default branch cannot be refreshed safely` | #50, #48, #44 | 3 | Stale base needing rebase |
+| `capability refusal omitted the offending secondmate` | #45, #43, #38 | 3 | Stale base needing rebase |
+| `teardown failed for the empty secondmate home` | #47, #27 | 2 | Stale base needing rebase |
+| Browser cleanup integration retried removal of an already-absent task temp root | #46 | 1 | Real defect in the pull request branch |
+| Backend behavior file returned nonzero after its printed assertions passed | #42 | 1 | Stale base needing rebase |
+| Occupied release-drifted Herdr server assertion | #33 | 1 | Stale base needing rebase; the historical real defect is fixed on `main` |
+| Successful direct rollback left task metadata | #30 | 1 | Stale base needing rebase; the historical real defect is fixed on `main` |
+| Failed direct spawn did not return its worktree | #28 | 1 | Stale base needing rebase; the historical real defect is fixed on `main` |
+| Upgraded brief omitted completion-report sections | #26 | 1 | Stale base needing rebase |
+
+No genuinely flaky check was found, so the flaky classification count is zero.
 
 The eight failures in the first three rows form the largest root-cause family.
 They came from secondmate fixtures and teardown assumptions that had drifted from the hardened default-branch, home-layout, and diagnostic contracts.

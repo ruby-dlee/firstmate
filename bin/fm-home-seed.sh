@@ -465,14 +465,16 @@ ensure_home() {
       | git -C "$home" update-ref --stdin || return 1
     if [ -n "$source_origin" ]; then
       git -C "$home" remote set-url origin "$source_origin" || return 1
-      git -C "$home" config --unset-all remote.origin.fetch || true
-      git -C "$home" config --add remote.origin.fetch \
-        "+refs/heads/$default:refs/remotes/origin/$default" || return 1
-      git -C "$home" update-ref "refs/remotes/origin/$default" "$target" || return 1
-      git -C "$home" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default" || return 1
-    else
-      git -C "$home" remote remove origin || return 1
     fi
+    # A source without its own origin is still a valid local authority. Keep the
+    # explicit home pointed at that source path so preflight and verify-home can
+    # prove its live default tip instead of leaving the detached clone with no
+    # resolvable authority at all.
+    git -C "$home" config --unset-all remote.origin.fetch || true
+    git -C "$home" config --add remote.origin.fetch \
+      "+refs/heads/$default:refs/remotes/origin/$default" || return 1
+    git -C "$home" update-ref "refs/remotes/origin/$default" "$target" || return 1
+    git -C "$home" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default" || return 1
   fi
   verify_firstmate_home "$home"
 }

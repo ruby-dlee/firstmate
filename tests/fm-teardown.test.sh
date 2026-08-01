@@ -3671,6 +3671,12 @@ test_teardown_removes_safe_tasktmp_and_accepts_absence() {
     || fail "teardown rejected its exact task temp root: $(cat "$case_dir/stderr")"
   assert_absent "$tasktmp" "teardown retained its exact task temp root"
 
+  case_dir=$(make_case already-absent-tasktmp)
+  write_meta "$case_dir" local-only ship
+  printf 'tasktmp=%s\n' "$tasktmp" >> "$case_dir/state/task-x1.meta"
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "teardown rejected its already-absent exact task temp root: $(cat "$case_dir/stderr")"
+
   case_dir=$(make_case absent-tasktmp)
   write_meta "$case_dir" local-only ship
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \

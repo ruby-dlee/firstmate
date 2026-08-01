@@ -10,7 +10,7 @@ The source run is [GitHub Actions run 30648119449](https://github.com/ruby-dlee/
 
 `tests/behavior-test-durations.tsv` records the per-script measurements derived from that run.
 
-The runner contract test added with the sharding implementation and the newly landed `tests/lavish.test.sh` are included, so the completeness guard covers both immediately.
+The current inventory contains 87 behavior-test scripts, including the runner contract test and every test added on `main` since the baseline run.
 
 ## Assignment
 
@@ -22,20 +22,20 @@ The eight-shard checked-in plan has these estimated serial loads.
 
 | Shard | Tests | Estimated load |
 |---:|---:|---:|
-| 1 | 1 | 563637 ms (9m24s) |
-| 2 | 1 | 475500 ms (7m56s) |
-| 3 | 1 | 423936 ms (7m04s) |
-| 4 | 15 | 391516 ms (6m32s) |
-| 5 | 17 | 391524 ms (6m32s) |
-| 6 | 17 | 391519 ms (6m32s) |
-| 7 | 17 | 391519 ms (6m32s) |
-| 8 | 15 | 391517 ms (6m32s) |
+| 1 | 1 | 475500 ms (7m56s) |
+| 2 | 11 | 436053 ms (7m16s) |
+| 3 | 15 | 436051 ms (7m16s) |
+| 4 | 13 | 436048 ms (7m16s) |
+| 5 | 12 | 436056 ms (7m16s) |
+| 6 | 10 | 436296 ms (7m16s) |
+| 7 | 10 | 436222 ms (7m16s) |
+| 8 | 15 | 436053 ms (7m16s) |
 
 The account-routing and report-stack suites keep their original test functions and assertions in shared suite files, while two runner wrappers partition each call list deterministically between isolated runners.
 
 The report-stack partition keeps the persistent-retention-owner setup in the same wrapper as its generation-interruption dependent.
 
-The largest remaining indivisible test file, `tests/fm-teardown.test.sh`, sets the 9-minute-24-second floor.
+The largest remaining indivisible test file, `tests/fm-checkout-refresh.test.sh`, sets the 7-minute-56-second floor.
 
 ## Measured GitHub Actions result
 
@@ -60,7 +60,9 @@ The serial baseline was 57 minutes 23 seconds, so the measured behavior check wa
 
 The same run measured the split wrappers at 423936 ms for account-routing A, 335548 ms for account-routing B, 261383 ms for report-stack A, and 243164 ms for report-stack B.
 
-Those values replaced the provisional half-suite estimates in `tests/behavior-test-durations.tsv` and produced the checked-in assignment table above.
+Those values replaced the provisional half-suite estimates in `tests/behavior-test-durations.tsv` and produced the assignment measured in that run.
+
+The checked-in plan above also reflects the later teardown-suite split and tests added on `main`.
 
 ## Coverage guard
 

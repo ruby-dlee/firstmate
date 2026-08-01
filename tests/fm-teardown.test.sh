@@ -4937,6 +4937,41 @@ test_secondmate_registry_updates_are_locked_and_literal() {
   pass "secondmate registry updates are serialized and compare ids literally"
 }
 
+test_fd_leak_under_low_ulimit() {
+  local case_dir rc dir_count i
+  case_dir=$(make_case fd-leak-ulimit)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "fix the thing"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  dir_count=200
+  i=0
+  while [ "$i" -lt "$dir_count" ]; do
+    mkdir -p "$case_dir/wt/deep/dir_$i"
+    : > "$case_dir/wt/deep/dir_$i/.keep"
+    i=$((i + 1))
+  done
+  git -C "$case_dir/wt" add -A
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add dirs"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+
+  set +e
+  (
+    ulimit -n 256 2>/dev/null || exit 99
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  )
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 0 ] || fail "fd-leak-ulimit: teardown failed under low ulimit (rc=$rc): $(cat "$case_dir/stderr")"
+  pass "teardown succeeds under low ulimit -n with many directories (fd leak fix)"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = fd-leak-ulimit ]; then
+  test_fd_leak_under_low_ulimit
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-safety ]; then
   test_teardown_removes_safe_tasktmp_and_accepts_absence
   test_teardown_refuses_unsafe_tasktmp_metadata
@@ -5239,3 +5274,4 @@ test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
 test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
+test_fd_leak_under_low_ulimit

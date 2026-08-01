@@ -93,7 +93,7 @@ jobs:
 
   behavior-tests-complete:
     # Preserve the historical required-check name while proving the union of
-    # what the six runners actually executed, not only the planned inventory.
+    # what the eight runners actually executed, not only the planned inventory.
     name: Behavior tests
     needs: behavior-tests
     if: always()

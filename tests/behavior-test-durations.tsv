@@ -39,6 +39,7 @@
 30	tests/fm-composer-lib.test.sh
 10055	tests/fm-crew-state.test.sh
 13991	tests/fm-daemon.test.sh
+340	tests/fm-decision-pretool-check.test.sh
 685	tests/fm-dispatch-select.test.sh
 156	tests/fm-ensure-agents-md.test.sh
 3009	tests/fm-fleet-snapshot-view.test.sh
@@ -69,6 +70,7 @@
 223	tests/fm-send-settle.test.sh
 18168	tests/fm-send-strict.test.sh
 6911	tests/fm-session-start.test.sh
+28460	tests/fm-spawn-backlog.test.sh
 2094	tests/fm-spawn-batch.test.sh
 42452	tests/fm-spawn-dispatch-profile.test.sh
 42	tests/fm-stow-contract.test.sh

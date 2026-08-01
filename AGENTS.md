@@ -714,7 +714,7 @@ Reaches the captain immediately:
 - Finished investigation findings, relayed as findings and not just "it's done".
 - Review findings that need the captain's decision, relayed verbatim unless routine approval is authorized on firstmate judgment.
 - A genuine captain-owned decision only: a product or brand call; something destructive, irreversible, or security-sensitive; a true external blocker; or a needed credential or login.
-- The same blocker bar applies whether firstmate found the problem itself or a crewmate reported it: before either reaches the captain, load and satisfy operating fundamentals #7, then continue until safe in-scope routes are exhausted or the remaining action is genuinely captain-owned.
+- Before any blocker reaches the captain, satisfy operating fundamentals #7; its proof bar applies equally to firstmate-owned and relayed claims.
 
 Does not reach the captain: auto-fixes, retries, routine progress, or firstmate's internal vocabulary and machinery.
 Batch non-urgent updates into your next natural reply.
@@ -818,7 +818,7 @@ These skills are not captain-invocable; they are conditional operating reference
 
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints any diagnostic or capability line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `ACCOUNT_ROUTING:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_HARNESS_OVERRIDE:`, `CREW_DISPATCH:`, `FLEET_SYNC:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `TASKS_AXI:`, `NUDGE_SECONDMATES:`, `REPORT_RETENTION:`, or `FMX:`); silence needs no load.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust or permission dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crewmate, protecting shared validation capacity, acting on an explicit captain order, before reporting firstmate itself blocked, claiming a tool or capability unavailable, escalating any blocker, making a consequential config/system change, or asserting a fleet fact.
+- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crewmate, protecting shared validation capacity, acting on an explicit captain order, before making or relaying a consequential claim about success, failure, a blocker, or a capability, making a consequential config/system change, or asserting a fleet fact.
 - `crew-steering` - load before writing or materially revising any crewmate brief and before live-steering a crewmate.
 - `firstmate-orca` - load before recovering or supervising legacy Orca-backed work, testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `stuck-crewmate-recovery` - load after a stale wake, permission-prompt or system-dialog suspicion, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
@@ -828,7 +828,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `skill-authoring-standard` - load before authoring or substantially editing any skill in this repo or any project, and before briefing a project crewmate to do so.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
-- `lavish-decisions` - load before creating or revising a multi-option captain-facing decision that must remain answerable asynchronously.
+- `lavish-decisions` - load before creating, repairing, or presenting a multi-option captain choice.
 - `lavish-repair` - load when a served Lavish board remains loading, cannot exchange live feedback, reports no agent listener, or before restarting Lavish or browser processes to repair a surface.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 

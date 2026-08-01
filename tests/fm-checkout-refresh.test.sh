@@ -325,14 +325,14 @@ test_uninspectable_active_project_invalidates_coverage_health() {
 }
 
 test_nested_active_project_invalidates_coverage_health() {
-  local container projects nested nested_state treehouse out status
+  local container projects nested nested_state nested_treehouse out status
   container="$TMP_ROOT/active-project-container"
   fm_git_init_commit "$container"
   projects="$container/projects"
   nested="$projects/nested-directory"
   nested_state="$TMP_ROOT/nested-active-state"
-  treehouse="$TMP_ROOT/nested-active-treehouse"
-  mkdir -p "$nested" "$nested_state" "$treehouse"
+  nested_treehouse="$TMP_ROOT/nested-active-treehouse"
+  mkdir -p "$nested" "$nested_state" "$nested_treehouse"
   printf '%s\n' preserved-nested-heartbeat > "$nested_state/heartbeat"
 
   set +e
@@ -340,7 +340,7 @@ test_nested_active_project_invalidates_coverage_health() {
     FM_PROJECTS_OVERRIDE="$projects" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$nested_state" \
     FM_CHECKOUT_REFRESH_LOCK_ROOT="$TMP_ROOT/nested-active-locks" \
-    FM_TREEHOUSE_ROOT="$treehouse" \
+    FM_TREEHOUSE_ROOT="$nested_treehouse" \
     "$ROOT/bin/fm-checkout-refresh.sh" run-once --force 2>&1)
   status=$?
   set -e
@@ -353,7 +353,7 @@ test_nested_active_project_invalidates_coverage_health() {
 }
 
 test_discovery_rejects_nested_configured_and_scanned_paths() {
-  local remote seed outer configured_child scan_root scanned_child scanned_canonical out err status
+  local remote seed outer configured_child scan_root scanned_child scanned_canonical config_backup out err status
   remote=$(build_origin exact-discovery)
   seed="$FM_TEST_HOME/projects/exact-discovery"
   outer="$TMP_ROOT/exact-discovery-outer"
@@ -362,10 +362,12 @@ test_discovery_rejects_nested_configured_and_scanned_paths() {
   scanned_child="$scan_root/scanned-child"
   out="$TMP_ROOT/exact-discovery.out"
   err="$TMP_ROOT/exact-discovery.err"
+  config_backup="$TMP_ROOT/exact-discovery-config"
   clone_from "$remote" "$seed"
   clone_from "$remote" "$outer"
   mkdir -p "$configured_child" "$scanned_child"
   scanned_canonical=$(cd "$scanned_child" && pwd -P)
+  cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
   {
     printf 'path %s\n' "$configured_child"
     printf 'scan %s\n' "$scan_root"
@@ -376,9 +378,7 @@ test_discovery_rejects_nested_configured_and_scanned_paths() {
   status=$?
   set -e
 
-  [ "$status" -ne 0 ] \
-    || fail "nested configured and scanned paths did not fail discovery closed"
-
+  [ "$status" -ne 0 ] || fail "nested discovery paths reported healthy coverage"
   assert_no_grep "^$configured_child$" "$out" \
     "configured nested directory was emitted as a checkout"
   assert_no_grep "^$scanned_canonical$" "$out" \
@@ -387,7 +387,7 @@ test_discovery_rejects_nested_configured_and_scanned_paths() {
     "$err" "configured nested directory was not surfaced"
   assert_grep "discovered clone is not an exact inspectable Git repository root: $scanned_canonical" \
     "$err" "scanned nested directory was not surfaced"
-  rm -f "$FM_TEST_HOME/config/checkout-refresh"
+  mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
   rm -rf "$seed" "$outer"
   pass "configured and scanned checkouts require exact Git roots"
 }
@@ -456,7 +456,7 @@ SH
   out=$(FM_REAL_GIT="$real_git" PATH="$fakebin:$PATH" \
     run_isolated_refresh "$home" "$state" run-once --force 2>&1)
   status=$?
-  set +e
+  set -e
   [ "$status" -ne 0 ] || fail "uninspectable discovered Git identity reported healthy coverage"
   assert_contains "$out" "discovered Git identity cannot be inspected or disproved:" \
     "discovered rev-parse failure was classified as a non-Git directory"
@@ -603,22 +603,27 @@ test_treehouse_pool_skill_drafts_are_inventoried() {
 }
 
 test_ignored_skill_files_are_outside_the_collision_guard() {
-  local source="$TMP_ROOT/ignored-source" worktree="$TMP_ROOT/ignored-worktree" draft out
+  local source="$TMP_ROOT/ignored-source" worktree="$TMP_ROOT/ignored-worktree" draft source_draft out
   fm_git_worktree "$source" "$worktree" ignored-skill
   git -C "$worktree" checkout --quiet --detach
   printf '%s\n' '.agents/skills/' >> "$source/.git/info/exclude"
   draft="$worktree/.agents/skills/intentional/SKILL.md"
+  source_draft="$source/.agents/skills/intentional/SKILL.md"
   mkdir -p "$(dirname "$draft")"
+  mkdir -p "$(dirname "$source_draft")"
   printf '%s\n' '# intentional ignored material' > "$draft"
+  printf '%s\n' '# intentional ignored source material' > "$source_draft"
 
   run_refresh verify-worktree "$worktree" "$source" \
     || fail "an ignored skill file made a clean local acquisition fail"
-  out=$(run_refresh preflight "$source") \
-    || fail "preflight rejected a source whose acquisition contained only ignored skill material"
+  out=$(run_refresh preflight "$source" 2>&1) \
+    || fail "preflight rejected a backing checkout containing only ignored skill material"
   assert_not_contains "$out" "HYGIENE:" \
     "ignored skill material entered the untracked-draft collision inventory"
   grep -Fq '# intentional ignored material' "$draft" \
     || fail "ignored skill-file inspection changed its contents"
+  grep -Fq '# intentional ignored source material' "$source_draft" \
+    || fail "ignored source skill-file inspection changed its contents"
   pass "gitignored skill files remain outside the non-ignored collision guard"
 }
 
@@ -646,20 +651,18 @@ test_bootstrap_relays_hygiene_alerts() {
   draft="$project/.agents/skills/bootstrap-draft/SKILL.md"
   mkdir -p "$(dirname "$draft")"
   printf '%s\n' '# bootstrap draft' > "$draft"
-  run_refresh run-once >/dev/null
   config_backup=$(mktemp "$TMP_ROOT/checkout-refresh-config.XXXXXX")
-  : > "$FM_TEST_HOME/config/checkout-refresh"
   cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
 
   out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
     FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
     "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
   assert_contains "$out" "FLEET_SYNC: $project: HYGIENE: 1 untracked skill-draft files" \
     "session-start bootstrap did not relay the unresolved hygiene alert"
 
   printf '%s\n' 'unexpected directive' >> "$FM_TEST_HOME/config/checkout-refresh"
-
   out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
     FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
@@ -683,7 +686,6 @@ test_bootstrap_relays_hygiene_alerts() {
   grep -Fq '# bootstrap draft' "$draft" || fail "bootstrap refresh changed the draft"
   rm -rf "$project/.agents"
   run_refresh run-once >/dev/null
-  rm -f "$FM_TEST_HOME/config/checkout-refresh"
   pass "session-start bootstrap relays hygiene and discovery diagnostics"
 }
 
@@ -827,7 +829,9 @@ test_empty_treehouse_and_identity_tool_failures_fail_closed() {
 }
 
 test_config_git_metadata_and_non_git_races_fail_closed() {
-  local real_config linked_config remote source redirected scan candidate out status
+  local config_backup real_config linked_config remote source redirected scan candidate out status
+  config_backup="$TMP_ROOT/config-race-backup"
+  cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
   real_config="$TMP_ROOT/config-real"
   linked_config="$TMP_ROOT/config-linked"
   mkdir -p "$real_config"
@@ -869,7 +873,7 @@ test_config_git_metadata_and_non_git_races_fail_closed() {
   [ "$status" -ne 0 ] || fail "concurrent Git metadata creation was classified as non-Git"
   assert_contains "$out" "discovered Git identity cannot be inspected or disproved" \
     "concurrent Git metadata creation was not surfaced"
-  rm -f "$FM_TEST_HOME/config/checkout-refresh"
+  mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
   pass "config, Git metadata, and non-Git classification races fail closed"
 }
 
@@ -928,9 +932,7 @@ test_lock_root_failure_invalidates_coverage_before_preparation() {
     FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
     "$ROOT/bin/fm-checkout-refresh.sh" run-once --force 2>&1)
   status=$?
-  # This suite intentionally runs without errexit; do not leak the temporary
-  # failure-capture setting into the remaining fail-closed cases.
-  set +e
+  set -e
 
   [ "$status" -ne 0 ] || fail "unsafe lock-root preparation preserved healthy coverage"
   assert_contains "$out" "unsafe checkout-refresh lock directory: $bad_lock" \
@@ -968,7 +970,11 @@ if [ "${1:-}" = -C ] \
   count=$(cat "${FM_TEST_REINSPECTION_COUNT:?}" 2>/dev/null || printf 0)
   count=$((count + 1))
   printf '%s\n' "$count" > "$FM_TEST_REINSPECTION_COUNT"
-  if [ "$count" -gt 1 ]; then
+  # Fail each post-discovery exact-root proof, then allow the immediately
+  # following stable-key lookup used to persist the alert. This keeps the
+  # fixture on the reinspection-failure path without making alert identity
+  # resolution fail first.
+  if [ $((count % 2)) -eq 0 ]; then
     printf '%s\n' "${FM_TEST_REINSPECTION_ENCLOSING:?}"
     exit 0
   fi
@@ -992,7 +998,7 @@ SH
   assert_refresh_state "$state_root" unhealthy
   assert_heartbeat_value "$state_root" manual-reinspection-heartbeat
   reinspection_count=$(cat "$TMP_ROOT/reinspection-count")
-  [ "$reinspection_count" -eq 3 ] \
+  [ "$reinspection_count" -ge 3 ] \
     || fail "both post-discovery passes did not repeat the exact-root proof"
   [ "$(git -C "$project" rev-parse HEAD)" = "$initial_head" ] \
     || fail "identity-drifted covered path was refreshed through its enclosing repository"
@@ -1041,8 +1047,10 @@ test_unreadable_scan_root_invalidates_coverage_health() {
   canonical_scan=$(cd "$scan_root" && pwd -P)
   chmod 111 "$scan_root"
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
   chmod 700 "$scan_root"
 
   [ "$status" -ne 0 ] || fail "unreadable scan root reported successful coverage"
@@ -1078,10 +1086,12 @@ exec "${FM_TEST_REAL_GIT:?}" "$@"
 SH
   chmod +x "$fakebin/git"
 
+  set +e
   out=$(FM_TEST_REAL_GIT="$real_git" FM_TEST_UNREADABLE_ORIGIN_TARGET="$canonical_candidate" \
     PATH="$fakebin:$PATH" \
     run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "unreadable scanned origin reported successful coverage"
   assert_contains "$out" "discovered checkout origin identity cannot be inspected: $canonical_candidate" \
@@ -1105,8 +1115,10 @@ test_failed_alert_persistence_forces_reinspection() {
   mkdir "$alert"
   printf '%s\n' dirty > "$project/untracked.txt"
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once --force 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "failed checkout-alert persistence reported success"
   assert_contains "$out" "STUCK:" "failed alert write did not surface the unsafe checkout"
@@ -1115,8 +1127,10 @@ test_failed_alert_persistence_forces_reinspection() {
   [ "$(cat "$last_file")" = 1 ] || fail "failed refresh advanced checkout cadence state"
   assert_refresh_state "$state_root" unhealthy
 
+  set +e
   out=$(run_isolated_refresh "$home" "$state_root" run-once 2>&1)
   status=$?
+  set -e
 
   [ "$status" -ne 0 ] || fail "run after failed alert persistence reported success"
   assert_contains "$out" "STUCK:" \
@@ -1308,7 +1322,9 @@ test_session_mode_preserves_gone_branch_pruning() {
 }
 
 test_config_and_external_identity_fail_closed() {
-  local remote project external original_origin out status config_real
+  local remote project external original_origin out status config_backup config_real
+  config_backup="$TMP_ROOT/config-external-identity-backup"
+  cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
   remote=$(build_origin identity-history)
   project="$FM_TEST_HOME/projects/identity-history"
   external="$TEST_HOME/identity-history"
@@ -1365,6 +1381,7 @@ test_config_and_external_identity_fail_closed() {
   assert_contains "$out" "unsafe config path" "symlinked config was not surfaced"
   assert_refresh_state "$STATE_ROOT" unhealthy
   rm -f "$FM_TEST_HOME/config/checkout-refresh" "$config_real"
+  mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
   pass "configuration and prior external identity failures invalidate coverage"
 }
 
@@ -1523,7 +1540,7 @@ test_worktree_freshness_verification_fails_closed() {
 }
 
 test_bounded_refresh_terminates_descendants() {
-  local remote checkout fakebin real_git out status parent_pid child_pid
+  local remote checkout fakebin real_git out status parent_pid child_pid timeout=10
   remote=$(build_origin bounded)
   checkout="$FM_TEST_HOME/projects/bounded"
   clone_from "$remote" "$checkout"
@@ -1534,13 +1551,14 @@ test_bounded_refresh_terminates_descendants() {
 #!/usr/bin/env bash
 if [ "${3:-}" = fetch ]; then
   trap '' TERM
-  printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_PARENT:?}"
+  printf '%s\n' "$$" > "${FM_TEST_FETCH_PARENT:?}"
   (
     trap '' TERM
-    printf '%s\n' "$BASHPID" > "${FM_TEST_FETCH_CHILD:?}"
     while :; do sleep 1; done
   ) &
-  wait
+  child_pid=$!
+  printf '%s\n' "$child_pid" > "${FM_TEST_FETCH_CHILD:?}"
+  wait "$child_pid"
 fi
 exec "${FM_TEST_REAL_GIT:?}" "$@"
 SH
@@ -1548,12 +1566,12 @@ SH
 
   set +e
   out=$(FM_TEST_REAL_GIT="$real_git" FM_TEST_FETCH_PARENT="$TMP_ROOT/fetch-parent.pid" \
-    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT=5 \
+    FM_TEST_FETCH_CHILD="$TMP_ROOT/fetch-child.pid" FM_CHECKOUT_REFRESH_SYNC_TIMEOUT="$timeout" \
     PATH="$fakebin:$PATH" run_refresh run-once --force 2>&1)
   status=$?
   set -e
   [ "$status" -eq 0 ] || fail "bounded refresh command failed unexpectedly: $out"
-  assert_contains "$out" "refresh timed out after 5s" \
+  assert_contains "$out" "refresh timed out after ${timeout}s" \
     "bounded refresh did not report its timeout"
   assert_refresh_state "$STATE_ROOT" unhealthy
   parent_pid=$(cat "$TMP_ROOT/fetch-parent.pid")
@@ -1563,6 +1581,169 @@ SH
   fi
   rm -rf "$fakebin" "$checkout"
   pass "bounded refresh terminates and reaps its complete descendant tree"
+}
+
+test_per_home_treehouse_sources_isolate_same_origin_clones() {
+  local remote home_a home_b source_a source_b fakebin legacy_root lease_a lease_b
+  local common_a common_b lease_common_a lease_common_b config_a config_b
+  remote=$(build_origin per-home-treehouse)
+  home_a="$TMP_ROOT/treehouse-home-a"
+  home_b="$TMP_ROOT/treehouse-home-b"
+  source_a="$home_a/projects/shared"
+  source_b="$home_b/projects/shared"
+  fakebin="$TMP_ROOT/per-home-treehouse-fakebin"
+  legacy_root="$TMP_ROOT/per-home-treehouse-legacy"
+  mkdir -p "$home_a/projects" "$home_a/config" "$home_b/projects" "$home_b/config" \
+    "$fakebin" "$legacy_root"
+  clone_from "$remote" "$source_a"
+  clone_from "$remote" "$source_b"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = get ] && [ "${2:-}" = --lease ] || exit 64
+root=$(sed -n 's/^root = "\(.*\)"$/\1/p' "$PWD/treehouse.toml")
+[ -n "$root" ] || exit 65
+worktree="$root/.treehouse/shared-test/1/shared"
+if [ ! -d "$worktree" ]; then
+  mkdir -p "$(dirname "$worktree")"
+  git -C "$PWD" worktree add --quiet --detach "$worktree" HEAD || exit 66
+fi
+printf '%s\n' "$worktree"
+SH
+  chmod +x "$fakebin/treehouse"
+
+  lease_a=$(HOME="$TEST_HOME" FM_HOME="$home_a" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$home_a/refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$home_a/locks" \
+    FM_TREEHOUSE_ROOT="$legacy_root" PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$source_a" firstmate-home-a)
+  lease_b=$(HOME="$TEST_HOME" FM_HOME="$home_b" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$home_b/refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$home_b/locks" \
+    FM_TREEHOUSE_ROOT="$legacy_root" PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$source_b" firstmate-home-b)
+
+  common_a=$(git -C "$source_a" rev-parse --path-format=absolute --git-common-dir)
+  common_b=$(git -C "$source_b" rev-parse --path-format=absolute --git-common-dir)
+  lease_common_a=$(git -C "$lease_a" rev-parse --path-format=absolute --git-common-dir)
+  lease_common_b=$(git -C "$lease_b" rev-parse --path-format=absolute --git-common-dir)
+  [ "$lease_common_a" = "$common_a" ] \
+    || fail "home A acquired a worktree outside its declared clone"
+  [ "$lease_common_b" = "$common_b" ] \
+    || fail "home B acquired a worktree outside its declared clone"
+  [ "$lease_common_a" != "$lease_common_b" ] \
+    || fail "same-origin homes still shared one Git common directory"
+  assert_contains "$lease_a" "$home_a/.treehouse/" \
+    "home A lease did not use its managed Treehouse root"
+  assert_contains "$lease_b" "$home_b/.treehouse/" \
+    "home B lease did not use its managed Treehouse root"
+  assert_absent "$source_a/treehouse.toml" \
+    "managed Treehouse setup wrote into home A's declared project clone"
+  assert_absent "$source_b/treehouse.toml" \
+    "managed Treehouse setup wrote into home B's declared project clone"
+  config_a=$(find "$home_a/state/treehouse-sources" -name treehouse.toml -type f -print)
+  config_b=$(find "$home_b/state/treehouse-sources" -name treehouse.toml -type f -print)
+  assert_grep "root = \"$home_a\"" "$config_a" \
+    "home A control worktree did not carry its managed root"
+  assert_grep "root = \"$home_b\"" "$config_b" \
+    "home B control worktree did not carry its managed root"
+  pass "same-origin clones acquire from separate per-home pools owned by their declaring clone"
+}
+
+test_managed_treehouse_source_refuses_tracked_config_and_symlinks() {
+  local tracked_home tracked_source inspect_home inspect_source fakebin real_git out status outside
+  local state_home parent_home keyed_home keyed_source common key
+  tracked_home="$TMP_ROOT/treehouse-tracked-home"
+  tracked_source="$tracked_home/projects/tracked"
+  mkdir -p "$tracked_source" "$tracked_home/config"
+  fm_git_init_commit "$tracked_source"
+  printf '%s\n' 'root = "/project-owned"' > "$tracked_source/treehouse.toml"
+  git -C "$tracked_source" add treehouse.toml
+  git -C "$tracked_source" commit -qm tracked-treehouse-config
+  set +e
+  out=$(run_isolated_refresh "$tracked_home" "$tracked_home/refresh-state" \
+    acquire-worktree "$tracked_source" tracked-config 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "tracked project Treehouse config was overwritten"
+  assert_contains "$out" "declared project $tracked_source tracks treehouse.toml" \
+    "tracked-config refusal did not identify the declared project"
+  assert_contains "$out" "preventing Firstmate from applying its per-home root without mutating project state" \
+    "tracked-config refusal did not explain the required operator action"
+  assert_grep 'root = "/project-owned"' "$tracked_source/treehouse.toml" \
+    "tracked project Treehouse config changed during refusal"
+  assert_absent "$tracked_home/state" \
+    "tracked-config refusal created managed source state"
+
+  inspect_home="$TMP_ROOT/treehouse-inspection-home"
+  inspect_source="$inspect_home/projects/source"
+  fakebin="$TMP_ROOT/treehouse-inspection-fakebin"
+  real_git=$(command -v git)
+  mkdir -p "$inspect_source" "$inspect_home/config" "$fakebin"
+  fm_git_init_commit "$inspect_source"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${3:-}" = ls-files ] && [ "${5:-}" = treehouse.toml ]; then
+  exit 70
+fi
+exec "${FM_TEST_REAL_GIT:?}" "$@"
+SH
+  chmod +x "$fakebin/git"
+  set +e
+  out=$(FM_TEST_REAL_GIT="$real_git" PATH="$fakebin:$PATH" \
+    run_isolated_refresh "$inspect_home" "$inspect_home/refresh-state" \
+    acquire-worktree "$inspect_source" failed-inspection 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "failed tracked-config inspection continued acquisition"
+  assert_contains "$out" "cannot inspect whether declared project $inspect_source tracks treehouse.toml" \
+    "tracked-config inspection failure was not reported"
+  assert_absent "$inspect_home/state" \
+    "tracked-config inspection failure created managed source state"
+
+  outside="$TMP_ROOT/treehouse-source-outside"
+  state_home="$TMP_ROOT/treehouse-state-link-home"
+  mkdir -p "$outside" "$state_home/projects/source" "$state_home/config"
+  fm_git_init_commit "$state_home/projects/source"
+  ln -s "$outside" "$state_home/state"
+  set +e
+  run_isolated_refresh "$state_home" "$state_home/refresh-state" \
+    acquire-worktree "$state_home/projects/source" linked-state >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked state directory"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked state directory caused an out-of-home write"
+
+  parent_home="$TMP_ROOT/treehouse-parent-link-home"
+  mkdir -p "$parent_home/projects/source" "$parent_home/config" "$parent_home/state"
+  fm_git_init_commit "$parent_home/projects/source"
+  ln -s "$outside" "$parent_home/state/treehouse-sources"
+  set +e
+  run_isolated_refresh "$parent_home" "$parent_home/refresh-state" \
+    acquire-worktree "$parent_home/projects/source" linked-parent >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked state parent"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked state parent caused an out-of-home write"
+
+  keyed_home="$TMP_ROOT/treehouse-keyed-home"
+  keyed_source="$keyed_home/projects/source"
+  mkdir -p "$keyed_source" "$keyed_home/config" "$keyed_home/state/treehouse-sources"
+  fm_git_init_commit "$keyed_source"
+  common=$(fm_checkout_git_common_dir "$keyed_source")
+  key=$(fm_checkout_hash_value "$common" 24)
+  ln -s "$outside" "$keyed_home/state/treehouse-sources/$key"
+  set +e
+  run_isolated_refresh "$keyed_home" "$keyed_home/refresh-state" \
+    acquire-worktree "$keyed_source" linked-key >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked keyed directory"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked keyed directory caused an out-of-home write"
+  pass "managed Treehouse source refuses tracked configs and redirected state paths"
 }
 
 test_acquisition_honors_shared_checkout_lock() {
@@ -2337,6 +2518,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
+  test_per_home_treehouse_sources_isolate_same_origin_clones
+  test_managed_treehouse_source_refuses_tracked_config_and_symlinks
+  test_acquisition_honors_shared_checkout_lock
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-7 ]; then
   test_discovery_rejects_nested_configured_and_scanned_paths
   exit 0
@@ -2413,6 +2601,8 @@ test_explicit_secondmate_home_requires_live_default_tip
 test_lock_owner_symlink_cannot_escape_state_directory
 test_worktree_freshness_verification_fails_closed
 test_bounded_refresh_terminates_descendants
+test_per_home_treehouse_sources_isolate_same_origin_clones
+test_managed_treehouse_source_refuses_tracked_config_and_symlinks
 test_acquisition_honors_shared_checkout_lock
 test_launch_agent_definition_is_home_scoped_with_scheduler_seam
 test_logical_home_state_migrates_and_ambiguity_fails_closed

@@ -869,6 +869,19 @@ refuse_populated_projectless_home() {
   return 1
 }
 
+# refuse_projectless_seed_preconditions: the complete --no-projects destination
+# precondition set, as a pure predicate over <home> and the parent brief. It
+# mutates nothing, so it is safe to evaluate both before the refresher preflight
+# (where it reports the precise reason) and again against the resolved home.
+# A no-op when --no-projects was not requested.
+refuse_projectless_seed_preconditions() {  # <id> <no-projects> <home>
+  local id=$1 no_projects=$2 home=$3
+  [ "$no_projects" -eq 1 ] || return 0
+  refuse_populated_projectless_home "$home" || return 1
+  [ -f "$SEED_PARENT_BRIEF" ] || return 0
+  refuse_projectful_projectless_charter "$id" "$SEED_PARENT_BRIEF"
+}
+
 refuse_projectful_projectless_charter() {
   local id=$1 brief=$2 project_clones
   project_clones=$(brief_section_text "$brief" "Project clones")
@@ -929,6 +942,91 @@ seed_home() {
   SEED_CHARTER_EXISTED=0
   SEED_MARKER_EXISTED=0
   trap seed_exit_cleanup EXIT
+  SEED_PARENT_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FM_HOME") || return 1
+  fm_checkout_trusted_dir "$FM_HOME" >/dev/null || {
+    echo "error: active firstmate home was removed or redirected while seed waited for lifecycle ownership" >&2
+    return 1
+  }
+  if [ -e "$FM_HOME/data/charter.md" ]; then
+    [ -f "$FM_HOME/$SUB_HOME_MARKER" ] && [ ! -L "$FM_HOME/$SUB_HOME_MARKER" ] || {
+      echo "error: active secondmate home changed while seed waited for lifecycle ownership" >&2
+      return 1
+    }
+  fi
+
+  if [ "$requested_home" = "-" ]; then
+    SEED_HOME_ACQUIRED=1
+    home=$(acquire_treehouse_home "$id")
+    SEED_HOME="$home"
+    SEED_HOME_RETAINED=1
+    # Prove the acquired home is a legal destination BEFORE taking its lifecycle
+    # lock, exactly as the explicit-home branch below does. These locks are keyed
+    # on the home path and are not reentrant, so an acquired home that IS the
+    # active firstmate home resolves to the lock this seed already holds for
+    # $FM_HOME above, and the second acquisition could only ever wait out
+    # FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS against itself. Refusing first turns
+    # that self-deadlock into the actionable refusal the caller needs. Retention
+    # is already armed, so the acquired home is still kept for manual recovery.
+    refuse_active_home_path "$home" || return 1
+    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home") || return 1
+    freshness_status=0
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$home" "$FM_ROOT" || freshness_status=$?
+    if [ "$freshness_status" -ne 0 ]; then
+      echo "error: refusing secondmate home acquired from a stale or unverifiable upstream default" >&2
+      return 1
+    fi
+    SEED_HOME_EXPECTED_TIP=$(git -C "$home" rev-parse HEAD) || return 1
+    SEED_HOME_RETAINED=0
+    home=$(verify_firstmate_home "$home")
+  else
+    requested_abs=$(abs_path_for_new "$requested_home")
+    refuse_active_home_path "$requested_abs" || return 1
+    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$requested_abs") || return 1
+    validate_home_assignment "$id" "$requested_abs" || return 1
+    # --no-projects preconditions run BEFORE the refresher preflight below. They
+    # are cheap, local destination-shape checks, and the preflight reads the
+    # destination tree - including projects/ - so an unreadable or otherwise
+    # unusable projects/ made the preflight fail first and reported a generic
+    # "cannot be refreshed safely" instead of the specific, actionable reason.
+    # A caller that explicitly passed --no-projects has said the projects tree is
+    # irrelevant to them, so gating their precondition on a tree read was the
+    # wart. They are pure predicates and are re-run against the resolved home
+    # below, so nothing the later pass proved is weakened.
+    refuse_projectless_seed_preconditions "$id" "$no_projects" "$requested_abs" || return 1
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$FM_ROOT" >/dev/null 2>&1 || true
+    SEED_HOME="$requested_abs"
+    [ -e "$requested_abs" ] || SEED_HOME_CREATED=1
+    home=$(ensure_home "$id" "$requested_abs")
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$home" || {
+      echo "error: refusing explicit secondmate home whose default branch cannot be refreshed safely" >&2
+      return 1
+    }
+    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-home "$home" "$FM_ROOT" || {
+      echo "error: refusing explicit secondmate home whose live default-tip freshness cannot be proved" >&2
+      return 1
+    }
+  fi
+  SEED_HOME="$home"
+  validate_registry_home_text "$home" || return 1
+  validate_home_assignment "$id" "$home"
+  validate_operational_dirs "$home" || return 1
+  validate_seed_leaf_files "$home" || return 1
+  refuse_projectless_seed_preconditions "$id" "$no_projects" "$home" || return 1
+  mkdir -p "$DATA" "$home/data" "$home/state" "$home/config" "$home/projects"
+  if [ -f "$home/data/projects.md" ]; then
+    SEED_SUB_REG_EXISTED=1
+    cp "$home/data/projects.md" "$SEED_BACKUP_DIR/sub-projects.md"
+  fi
+  if [ -f "$home/data/charter.md" ]; then
+    SEED_CHARTER_EXISTED=1
+    cp "$home/data/charter.md" "$SEED_BACKUP_DIR/charter.md"
+  fi
+  if [ -f "$home/$SUB_HOME_MARKER" ]; then
+    SEED_MARKER_EXISTED=1
+    cp "$home/$SUB_HOME_MARKER" "$SEED_BACKUP_DIR/marker"
+  fi
+  SEED_HOME_BACKED_UP=1
+
   if [ ! -f "$SEED_PARENT_BRIEF" ]; then
     [ -n "${FM_SECONDMATE_CHARTER:-}" ] || {
       echo "error: no filled secondmate charter brief at $SEED_PARENT_BRIEF; set FM_SECONDMATE_CHARTER or scaffold one and replace {TASK}" >&2
@@ -956,81 +1054,6 @@ seed_home() {
     echo "error: secondmate charter brief at $SEED_PARENT_BRIEF has an empty Routing scope section; fill it before seeding" >&2
     return 1
   }
-  SEED_PARENT_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$FM_HOME") || return 1
-  fm_checkout_trusted_dir "$FM_HOME" >/dev/null || {
-    echo "error: active firstmate home was removed or redirected while seed waited for lifecycle ownership" >&2
-    return 1
-  }
-  if [ -e "$FM_HOME/data/charter.md" ]; then
-    [ -f "$FM_HOME/$SUB_HOME_MARKER" ] && [ ! -L "$FM_HOME/$SUB_HOME_MARKER" ] || {
-      echo "error: active secondmate home changed while seed waited for lifecycle ownership" >&2
-      return 1
-    }
-  fi
-
-  if [ "$requested_home" = "-" ]; then
-    SEED_HOME_ACQUIRED=1
-    home=$(acquire_treehouse_home "$id")
-    SEED_HOME="$home"
-    SEED_HOME_RETAINED=1
-    refuse_active_home_path "$home" || return 1
-    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home") || return 1
-    freshness_status=0
-    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$home" "$FM_ROOT" || freshness_status=$?
-    if [ "$freshness_status" -ne 0 ]; then
-      echo "error: refusing secondmate home acquired from a stale or unverifiable upstream default" >&2
-      return 1
-    fi
-    SEED_HOME_EXPECTED_TIP=$(git -C "$home" rev-parse HEAD) || return 1
-    SEED_HOME_RETAINED=0
-    home=$(verify_firstmate_home "$home")
-  else
-    requested_abs=$(abs_path_for_new "$requested_home")
-    refuse_active_home_path "$requested_abs" || return 1
-    SEED_HOME_LIFECYCLE_LOCK=$(fm_secondmate_home_lifecycle_lock_acquire "$CHECKOUT_LOCK_ROOT" "$requested_abs") || return 1
-    validate_home_assignment "$id" "$requested_abs" || return 1
-    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$FM_ROOT" >/dev/null 2>&1 || true
-    SEED_HOME="$requested_abs"
-    [ -e "$requested_abs" ] || SEED_HOME_CREATED=1
-    home=$(ensure_home "$id" "$requested_abs")
-    if [ "$no_projects" -eq 1 ]; then
-      refuse_populated_projectless_home "$home" || return 1
-      refuse_projectful_projectless_charter "$id" "$SEED_PARENT_BRIEF" || return 1
-    fi
-    "$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$home" || {
-      echo "error: refusing explicit secondmate home whose default branch cannot be refreshed safely" >&2
-      return 1
-    }
-    "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-home "$home" "$FM_ROOT" || {
-      echo "error: refusing explicit secondmate home whose live default-tip freshness cannot be proved" >&2
-      return 1
-    }
-  fi
-  SEED_HOME="$home"
-  validate_registry_home_text "$home" || return 1
-  validate_home_assignment "$id" "$home"
-  validate_operational_dirs "$home" || return 1
-  validate_seed_leaf_files "$home" || return 1
-  if [ "$no_projects" -eq 1 ]; then
-    refuse_populated_projectless_home "$home" || return 1
-    if [ -f "$SEED_PARENT_BRIEF" ]; then
-      refuse_projectful_projectless_charter "$id" "$SEED_PARENT_BRIEF" || return 1
-    fi
-  fi
-  mkdir -p "$DATA" "$home/data" "$home/state" "$home/config" "$home/projects"
-  if [ -f "$home/data/projects.md" ]; then
-    SEED_SUB_REG_EXISTED=1
-    cp "$home/data/projects.md" "$SEED_BACKUP_DIR/sub-projects.md"
-  fi
-  if [ -f "$home/data/charter.md" ]; then
-    SEED_CHARTER_EXISTED=1
-    cp "$home/data/charter.md" "$SEED_BACKUP_DIR/charter.md"
-  fi
-  if [ -f "$home/$SUB_HOME_MARKER" ]; then
-    SEED_MARKER_EXISTED=1
-    cp "$home/$SUB_HOME_MARKER" "$SEED_BACKUP_DIR/marker"
-  fi
-  SEED_HOME_BACKED_UP=1
 
   for project in "$@"; do
     project_dst=$(validate_project_destination "$home" "$project") || return 1

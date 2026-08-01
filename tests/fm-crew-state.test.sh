@@ -38,7 +38,7 @@ TMP_ROOT=$(fm_test_tmproot fm-crew-state)
 fm_git_identity fmtest fmtest@example.invalid
 
 # A real git repo checked out on <branch>, so the helper's branch attribution
-# (git symbolic-ref) resolves like it would for a live crew worktree.
+# (git symbolic-ref) resolves like it would for a live crewmate worktree.
 make_repo_on_branch() {  # <dir> <branch>
   local dir=$1 branch=$2
   mkdir -p "$dir"
@@ -170,6 +170,8 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 run_crew_state() {  # <case-dir> <id>
   PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
     FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_READSTEER_REACHABLE=1 \
     "$CREW_STATE" "$2"
 }
 

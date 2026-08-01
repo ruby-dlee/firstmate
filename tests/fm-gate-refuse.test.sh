@@ -95,7 +95,7 @@ make_gate_worktree() {
 }
 
 # make_normal_repo <dir> -> echoes a plain (non-gate) git repo to stand in for a
-# normal primary/crew checkout: its git-common-dir is <dir>/.git, never a gate.
+# normal primary/crewmate checkout: its git-common-dir is <dir>/.git, never a gate.
 make_normal_repo() {
   local dir=$1
   git init -q -b main "$dir"
@@ -207,8 +207,8 @@ SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
-case "${1:-}" in
-  get) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+case "$*" in
+  "get --lease "*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 exit 0
 SH
@@ -221,6 +221,8 @@ run_spawn() {
   local cwd=$1 home=$2 id=$3 proj=$4 pane=$5 fakebin=$6; shift 6
   mkdir -p "$home/data/$id"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - gate refusal test (repo: %s)\n\n## Queued\n\n## Done\n' \
+    "$id" "$(basename "$proj")" > "$home/data/backlog.md"
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=" "FM_HOME=$home" \
       "FM_STATE_OVERRIDE=$home/state" "FM_DATA_OVERRIDE=$home/data" \
@@ -343,25 +345,16 @@ make_teardown_case() {
   local name=$1 case_dir fakebin
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" treehouse
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
-state="$(dirname "$0")/.tmux-live"
 case "${1:-}" in
-  display-message)
-    [ -f "$state" ] || exit 1
-    case " $* " in
-      *' #{pane_current_command} '*) printf '%s\n' bash ;;
-    esac
-    exit 0
-    ;;
-  list-windows) [ ! -f "$state" ] || printf '%s\n' fm-task-x1; exit 0 ;;
-  kill-window) rm -f "$state"; exit 0 ;;
+  display-message) exit 1 ;;
+  list-windows) exit 0 ;;
 esac
 exit 0
 SH
-  chmod +x "$fakebin/treehouse" "$fakebin/tmux"
-  touch "$fakebin/.tmux-live"
+  chmod +x "$fakebin/tmux"
   cat > "$fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -386,11 +379,12 @@ SH
   rm -rf "$case_dir/_seed"
   git clone -q "$case_dir/origin.git" "$case_dir/project"
   git -C "$case_dir/project" remote set-head origin main 2>/dev/null || true
-  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt" main
-  git -C "$case_dir/wt" commit -q --allow-empty -m "shippable work"
-  git -C "$case_dir/wt" push -q origin fm/task-x1
+  mkdir -p "$case_dir/treehouse-pool/1"
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/treehouse-pool/1/wt" main
+  git -C "$case_dir/treehouse-pool/1/wt" commit -q --allow-empty -m "shippable work"
+  git -C "$case_dir/treehouse-pool/1/wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
-  python3 - "$TMP/treehouse-state.json" "$case_dir/wt" <<'PY'
+  python3 - "$case_dir/treehouse-pool/treehouse-state.json" "$case_dir/treehouse-pool/1/wt" <<'PY'
 import json
 import os
 import sys
@@ -401,6 +395,7 @@ with open(state, "w", encoding="utf-8") as stream:
         {
             "worktrees": [
                 {
+                    "name": "1",
                     "path": os.path.realpath(worktree),
                     "leased": True,
                     "lease_holder": "firstmate-task-x1",
@@ -411,8 +406,7 @@ with open(state, "w", encoding="utf-8") as stream:
     )
 PY
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=fm-task-x1" "tmux_session_target=firstmate:fm-task-x1" \
-    "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "window=firstmate:fm-task-x1" "worktree=$case_dir/treehouse-pool/1/wt" "project=$case_dir/project" \
     "kind=ship" "mode=no-mistakes"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"

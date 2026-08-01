@@ -985,22 +985,21 @@ SH
   chmod +x "$fb/tmux"
   cat > "$fb/treehouse" <<SH
 #!/usr/bin/env bash
-case "\${1:-}" in
-  get) printf '%s\n' "$wt" ;;
-esac
+set -u
+if [ "\${1:-}" = get ]; then
+  printf '%s\\n' "$wt"
+fi
+exit 0
 SH
   chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
 run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> -- <spawn args...>
-  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7 sandbox_root; shift 7
+  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7; shift 7
   [ "${1:-}" = -- ] && shift
   : > "$log"
-  sandbox_root=$(cd "$TMP_ROOT" && pwd -P)
-  mkdir -p "$sandbox_root/home" "$sandbox_root/treehouse"
-  env PATH="$fb:$PATH" HOME="$sandbox_root/home" FM_TREEHOUSE_ROOT="$sandbox_root/treehouse" \
-    FM_ROOT_OVERRIDE="$bin" \
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
@@ -1064,9 +1063,11 @@ SH
   chmod +x "$fb/tmux"
   cat > "$fb/treehouse" <<SH
 #!/usr/bin/env bash
-case "\${1:-}" in
-  get) printf '%s\n' "$wt" ;;
-esac
+set -u
+if [ "\${1:-}" = get ]; then
+  printf '%s\\n' "$wt"
+fi
+exit 0
 SH
   chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
@@ -1080,8 +1081,8 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   proj="$link_root/proj"
   wt="$TMP_ROOT/symlink-wt-$label"
   id="spawnsymlink$label"
-  fm_git_init_commit "$real_root/proj"
-  git -C "$real_root/proj" worktree add --quiet --detach "$wt"
+  fm_git_worktree "$real_root/proj" "$wt" "fm/$id"
+  git -C "$wt" checkout --detach >/dev/null 2>&1
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
   # /var -> /private/var), so resolve the fakebin's "physical" reply with
   # pwd -P rather than string concatenation - it must match exactly what
@@ -1097,6 +1098,8 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   data="$TMP_ROOT/symlink-data-$label"
   mkdir -p "$data/$id"
   printf 'test brief content\n' > "$data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - backend symlink spawn test (repo: proj)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$data/backlog.md"
   state="$TMP_ROOT/symlink-state-$label"; config="$TMP_ROOT/symlink-config-$label"
   mkdir -p "$state" "$config"
   log="$TMP_ROOT/symlink-spawn-$label.log"
@@ -1276,11 +1279,13 @@ test_spawn_default_backend_writes_no_meta_field() {
   local proj wt data id state config out
   proj="$TMP_ROOT/nobackend-project"; wt="$TMP_ROOT/nobackend-wt"; data="$TMP_ROOT/nobackend-data"
   id="nobackendz3"
-  fm_git_init_commit "$proj"
-  git -C "$proj" worktree add --quiet --detach "$wt"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  git -C "$wt" checkout --detach >/dev/null 2>&1
   local fb
   fb=$(make_spawn_fakebin "$TMP_ROOT/nobackend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - default backend spawn test (repo: project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$data/backlog.md"
   state="$TMP_ROOT/nobackend-state"; config="$TMP_ROOT/nobackend-config"
   mkdir -p "$state" "$config"
 
@@ -1300,10 +1305,12 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   local proj wt data id state config out fb
   proj="$TMP_ROOT/explicit-backend-project"; wt="$TMP_ROOT/explicit-backend-wt"; data="$TMP_ROOT/explicit-backend-data"
   id="explicitbackendz4"
-  fm_git_init_commit "$proj"
-  git -C "$proj" worktree add --quiet --detach "$wt"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  git -C "$wt" checkout --detach >/dev/null 2>&1
   fb=$(make_spawn_fakebin "$TMP_ROOT/explicit-backend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - explicit backend spawn test (repo: project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$data/backlog.md"
   state="$TMP_ROOT/explicit-backend-state"; config="$TMP_ROOT/explicit-backend-config"
   mkdir -p "$state" "$config"
 
@@ -1325,10 +1332,12 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   local proj wt data id state config out fb
   proj="$TMP_ROOT/nest-project"; wt="$TMP_ROOT/nest-wt"; data="$TMP_ROOT/nest-data"
   id="nestbackendz5"
-  fm_git_init_commit "$proj"
-  git -C "$proj" worktree add --quiet --detach "$wt"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  git -C "$wt" checkout --detach >/dev/null 2>&1
   fb=$(make_spawn_fakebin "$TMP_ROOT/nest-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - autodetect backend spawn test (repo: project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$data/backlog.md"
   state="$TMP_ROOT/nest-state"; config="$TMP_ROOT/nest-config"
   mkdir -p "$state" "$config"
 
@@ -1403,11 +1412,6 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
   test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
-  exit 0
-fi
-
-if [ "${FM_TEST_FOCUSED:-}" = spawn-symlinked-project ]; then
-  test_spawn_symlinked_project_prefix_avoids_false_refusal
   exit 0
 fi
 

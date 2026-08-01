@@ -242,6 +242,54 @@ test_version_check_refuses_missing_herdr() {
   pass "fm_backend_herdr_version_check: refuses loudly when herdr is not installed"
 }
 
+test_readsteer_native_server_does_not_require_legacy_certificate() {
+  local dir lock_root log resp fb status
+  dir="$TMP_ROOT/readsteer-native-server"
+  lock_root="$dir/locks"
+  log="$dir/log"
+  resp="$dir/responses"
+  mkdir -p "$lock_root" "$resp"
+  chmod 700 "$lock_root"
+  : > "$log"
+  fb=$(make_herdr_fakebin "$dir")
+
+  # shellcheck disable=SC2016
+  env -u FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE \
+    PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer native' "$ROOT"
+  status=$?
+
+  expect_code 0 "$status" "native read/steer should accept a running server without the retired closed-shell certificate"
+  assert_contains "$(cat "$log")" $'\x1f''status'$'\x1f''--json'$'\x1f''--session'$'\x1f''native' \
+    "native read/steer did not check the exact session's running state"
+  [ -z "$(find "$lock_root" -mindepth 1 -print -quit)" ] \
+    || fail "native read/steer consulted or created retired certificate artifacts"
+  pass "fm_backend_herdr_server_reachable_for_readsteer: native-agent servers need only be running"
+}
+
+test_readsteer_legacy_lab_still_requires_certificate() {
+  local dir lock_root log resp fb status
+  dir="$TMP_ROOT/readsteer-legacy-certificate"
+  lock_root="$dir/locks"
+  log="$dir/log"
+  resp="$dir/responses"
+  mkdir -p "$lock_root" "$resp"
+  chmod 700 "$lock_root"
+  : > "$log"
+  fb=$(make_herdr_fakebin "$dir")
+
+  # shellcheck disable=SC2016
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_TEST_HERDR_REQUIRE_CERT_LIFECYCLE=firstmate-herdr-tests-v1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer legacy' "$ROOT"
+  status=$?
+
+  [ "$status" -ne 0 ] || fail "the explicit legacy lifecycle lab accepted an uncertified server"
+  pass "fm_backend_herdr_server_reachable_for_readsteer: the explicit legacy lab retains certificate enforcement"
+}
+
 test_herdr_binary_revalidates_leaf_and_physical_ancestry() {
   local dir safe bin release unsafe hardlink out status
   dir="$TMP_ROOT/herdr-physical-pin"
@@ -2682,7 +2730,7 @@ test_kill_is_best_effort() {
   printf '1\n' > "$resp/1.exit"
   fb=$(make_herdr_fakebin "$dir")
   PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_kill default:w1:p2' "$ROOT"
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_kill default:w1:p2' "$ROOT"
   expect_code 0 $? "kill must be best-effort (never fail even when the pane close call itself fails)"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f''w1:p2' "kill did not call pane close on the right pane"
   pass "fm_backend_herdr_kill: calls pane close and stays best-effort on failure"
@@ -3432,7 +3480,7 @@ test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmat
   printf '  \xe2\x9d\xaf hello there this is a test message\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source herdr; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_source() { return 0; }; fm_backend_composer_state herdr default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source herdr; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_composer_state herdr default:w1:p2' "$ROOT" )
   [ "$out" = pending ] || fail "the pre-injection empty-box guard must still refuse real unsubmitted composer text after this change, got '$out'"
   pass "fm_backend_composer_state (herdr): the pre-injection empty-box guard still refuses a genuinely non-empty composer, unaffected by the submit-confirmation change"
 }
@@ -3467,7 +3515,7 @@ test_send_text_submit_send_failed() {
   printf '1\n' > "$resp/2.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
   [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the literal send itself fails, got '$out'"
   pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send and the pane-send fallback both error"
 }
@@ -3529,10 +3577,24 @@ test_dispatch_composer_state_routes_by_backend() {
 }
 
 test_scripts_route_explicit_target_through_meta_backend() {
-  local dir state log resp fb neutral out
+  local dir state log resp fb neutral out lock_root owner_pid
   dir="$TMP_ROOT/script-explicit-target"; state="$dir/state"; mkdir -p "$state" "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
   neutral="$dir/neutral-root"; mkdir -p "$neutral"
+  lock_root="$dir/locks"
+  /bin/sleep 30 &
+  owner_pid=$!
+  FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 OWNER_PID="$owner_pid" \
+    /bin/bash --noprofile --norc -c '
+      . "$0/bin/backends/herdr.sh"
+      key=$(fm_backend_herdr_server_lock_key default) || exit 1
+      certificate=$(fm_backend_herdr_server_legacy_env_certificate_path default) || exit 1
+      start=$(fm_backend_herdr_process_start "$OWNER_PID") || exit 1
+      printf "firstmate-herdr-closed-env-v1\n%s\n%s\n%s\n" \
+        "$key" "$OWNER_PID" "$start" > "$certificate" || exit 1
+      chmod 600 "$certificate"
+    ' "$ROOT" || { kill "$owner_pid" 2>/dev/null || true; fail "could not establish adapter ownership for routed script fixture"; }
   fm_write_meta "$state/herdr-stale.meta" \
     "window=default:w1:p2" "backend=herdr" \
     "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
@@ -3552,19 +3614,24 @@ SH
 
   out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     "$ROOT/bin/fm-peek.sh" default:w1:p2 5 2>/dev/null )
-  [ "$out" = "captured herdr pane" ] || fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"
+  [ "$out" = "captured herdr pane" ] \
+    || { kill "$owner_pid" 2>/dev/null || true; fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"; }
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''read'$'\x1f''w1:p2' \
     "fm-peek did not route the explicit stale target through herdr capture"
 
   : > "$log"
   PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_SERVER_LOCK_ROOT="$lock_root" FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     "$ROOT/bin/fm-send.sh" default:w1:p2 --key Escape >/dev/null 2>&1
   expect_code 0 $? "fm-send --key should route an explicit metadata-matched target through herdr"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''escape' \
     "fm-send did not route the explicit stale target through herdr send-key"
 
+  kill "$owner_pid" 2>/dev/null || true
+  wait "$owner_pid" >/dev/null 2>&1 || true
   pass "fm-peek/fm-send: explicit stale targets matching metadata use the recorded backend"
 }
 
@@ -3864,6 +3931,48 @@ SH
   printf '%s\n' "$fb"
 }
 
+make_herdr_schemafake() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  "status --json")
+    printf '{"client":{"version":"0.7.3","protocol":16},"server":{"running":true}}\n'
+    ;;
+  "api schema")
+    printf '{"method":"events.subscribe","event":"pane.agent_status_changed","padding":"'
+    awk 'BEGIN { for (i = 0; i < 20000; i++) printf "0123456789abcdef" }'
+    printf '"}\n'
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+test_events_capable_consumes_schema_without_broken_pipe() {
+  local dir fb err status
+  dir="$TMP_ROOT/events-schema-pipe"
+  mkdir -p "$dir"
+  fb=$(make_herdr_schemafake "$dir")
+  err="$dir/stderr"
+
+  # shellcheck disable=SC2016
+  PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENT_READER=/bin/true \
+    bash -o pipefail -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable native' "$ROOT" \
+    2>"$err"
+  status=$?
+
+  expect_code 0 "$status" "events capability should recognize both required schema values with pipefail enabled"
+  assert_not_contains "$(cat "$err")" "Broken pipe" "events capability emitted a broken-pipe diagnostic"
+  pass "fm_backend_herdr_events_capable: consumes the full schema without a broken pipe"
+}
+
 # make_fake_reader: a stand-in for bin/backends/herdr-eventwait.py. It ignores
 # the socket, streams the TAB-separated lines in $FM_FAKE_READER_LINES to stdout
 # (one projected event per line: pane_id\tworkspace_id\tagent_status\tagent),
@@ -4124,10 +4233,10 @@ test_wait_transition_clean_timeout_returns_1() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
-if [ "${FM_TEST_FOCUSED:-}" = capture ]; then
-  test_capture_calls_pane_read
-  test_capture_works_around_small_lines_bug
-  test_capture_preserves_pane_read_failure
+if [ "${FM_TEST_FOCUSED:-}" = readsteer-native-cutover ]; then
+  test_readsteer_native_server_does_not_require_legacy_certificate
+  test_readsteer_legacy_lab_still_requires_certificate
+  test_events_capable_consumes_schema_without_broken_pipe
   exit 0
 fi
 
@@ -4203,13 +4312,14 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   test_workspace_ensure_prunes_default_tab
-  test_repeated_cycles_reuse_one_workspace_no_orphans
   exit 0
 fi
 
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
+test_readsteer_native_server_does_not_require_legacy_certificate
+test_readsteer_legacy_lab_still_requires_certificate
 test_server_test_hooks_are_inert_without_explicit_opt_in
 test_herdr_binary_revalidates_leaf_and_physical_ancestry
 test_server_launch_scrubs_hostile_perl_and_control_environment
@@ -4313,6 +4423,7 @@ test_dispatch_routes_herdr_backend
 test_dispatch_busy_state_unknown_for_tmux
 test_dispatch_composer_state_routes_by_backend
 test_scripts_route_explicit_target_through_meta_backend
+test_events_capable_consumes_schema_without_broken_pipe
 test_normalize_event_leaves_from_empty
 test_escalation_marker_keys_like_watcher
 test_apply_transition_blocked_requires_commit_to_dedupe

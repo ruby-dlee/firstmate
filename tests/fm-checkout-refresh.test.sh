@@ -659,7 +659,6 @@ test_bootstrap_relays_hygiene_alerts() {
   draft="$project/.agents/skills/bootstrap-draft/SKILL.md"
   mkdir -p "$(dirname "$draft")"
   printf '%s\n' '# bootstrap draft' > "$draft"
-  : > "$FM_TEST_HOME/config/checkout-refresh"
   config_backup=$(mktemp "$TMP_ROOT/checkout-refresh-config.XXXXXX")
   cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
 

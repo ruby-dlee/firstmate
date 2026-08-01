@@ -40,6 +40,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+FM_TEST_REAL_NODE=$(command -v node)
+export FM_TEST_REAL_NODE
 fm_git_identity fmtest fmtest@example.com
 FM_TEST_REAL_NODE=$(command -v node) || fail "node is required"
 export FM_TEST_REAL_NODE
@@ -192,7 +194,12 @@ make_toolchain() {
   fm_fake_exit0 "$fakebin" gh-axi chrome-devtools-axi lavish-axi
   cat > "$fakebin/node" <<'SH'
 #!/usr/bin/env bash
-exec "${FM_TEST_REAL_NODE:?}" "$@"
+case "${1:-}" in
+  */fm-contained-read.cjs)
+    exec "${FM_TEST_REAL_NODE:?}" "$@"
+    ;;
+esac
+exit 0
 SH
   chmod +x "$fakebin/node"
   cat > "$fakebin/gh" <<'SH'
@@ -557,18 +564,29 @@ SH
 }
 
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
-  local w workspace fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
+  local w workspace primary_tip spawn_root fb tmuxfb fake_root fake_af log out meta account_task native_dir_file refreshed
   w=$(new_world sweep-enforced-inherited-lock)
   add_sm_home "$w" sm1 firstmate:fm-sm1 claude
+  primary_tip=$(git -C "$ROOT" rev-parse HEAD)
+  rm -rf "$w/sm1"
+  git clone -q --no-checkout "$ROOT" "$w/sm1"
+  git -C "$w/sm1" branch --force main "$primary_tip"
+  git -C "$w/sm1" checkout -q --detach "$primary_tip"
+  mkdir -p "$w/sm1/bin" "$w/sm1/data" "$w/sm1/state" "$w/sm1/config" "$w/sm1/projects"
+  printf '%s\n' sm1 > "$w/sm1/.fm-secondmate-home"
+  printf 'charter\n' > "$w/sm1/data/charter.md"
   workspace=$(cd "$w/sm1" && pwd -P)
   meta="$w/home/state/sm1.meta"
   account_task=fm-test-sm1-a1234
+  mkdir -p "$w/home/data/sm1"
+  printf -- '- sm1 - test secondmate (home: %s; scope: test; projects: ; added 2026-07-13)\n' \
+    "$workspace" > "$w/home/data/secondmates.md"
   cat >> "$meta" <<EOF
 worktree=$workspace
 project=$workspace
 mode=secondmate
 yolo=off
-tasktmp=$w/home/state/.task-tmp/fm-sm1
+tasktmp=$w/home/state/.task-tmp/fm-sm1-a1234
 account_pool=claude-crew
 account_profile=claude-2
 account_task=$account_task
@@ -576,13 +594,17 @@ account_attempt=a1234
 provider_session_id=sess-$account_task
 generation_id=account:$account_task:a1234
 EOF
-  mkdir -p "$w/home/data/sm1"
   printf 'enforce\n' > "$w/home/config/account-routing-mode"
+  spawn_root="$w/spawn-root"
+  git clone -q --no-checkout "$ROOT" "$spawn_root"
+  git -C "$spawn_root" checkout -q -B main "$primary_tip"
+  git -C "$spawn_root" remote set-url origin "file://$spawn_root"
+  git -C "$w/sm1" remote set-url origin "file://$spawn_root"
   fake_root="$w/fake-root"
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_PRIMARY_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+FM_ROOT_OVERRIDE="$FM_TEST_SPAWN_ROOT" "$FM_TEST_SPAWN_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
 status=$?
 cat "$FM_MANAGED_SPAWN_OUT"
 exit "$status"
@@ -635,7 +657,8 @@ SH
   native_dir_file="$w/native-dir"
   refreshed="$w/session-refreshed"
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
-    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_TEST_PRIMARY_ROOT="$w/primary-root" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
+    FM_TEST_PRIMARY_ROOT="$w/primary-root" FM_TEST_SPAWN_ROOT="$spawn_root" \
     FM_AGENT_FLEET_BIN="$fake_af" FM_ACCOUNT_SESSION_WAIT_SECONDS=2 \
     FM_MANAGED_WORKSPACE="$workspace" \
     FM_MANAGED_NATIVE_DIR_FILE="$native_dir_file" FM_MANAGED_SESSION_REFRESHED="$refreshed" \

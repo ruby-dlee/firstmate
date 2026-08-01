@@ -117,12 +117,17 @@ make_spawn_case() {
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$case_dir/treehouse-root"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
+  printf '# Backlog\n\n## In flight\n' > "$home/data/backlog.md"
   fm_git_worktree "$proj" "$wt" "wt-$name"
+  git -C "$wt" checkout --quiet --detach HEAD
+  git -C "$proj" branch --quiet -D "wt-$name"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf -- '- [ ] %s - spawn profile test (repo: project)\n' "$id" >> "$home/data/backlog.md"
   done
+  printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$launchlog"
 }
 
@@ -132,22 +137,25 @@ enable_dispatch_profile() {
     > "$home/config/crew-dispatch.json"
 }
 
+make_upstream_source() {
+  local source=$1 tip
+  tip=$(git -C "$ROOT" rev-parse HEAD) || return 1
+  git clone -q --no-checkout "$ROOT" "$source"
+  git -C "$source" update-ref refs/heads/main "$tip"
+  git -C "$source" checkout -q main
+  git -C "$source" remote set-url origin "$source"
+  git -C "$source" update-ref refs/remotes/origin/main refs/heads/main
+  git -C "$source" remote set-head origin main
+}
+
 make_seeded_secondmate_home() {
-  local home=$1 id=$2 parent_home=$3 default source_origin target
-  default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD)
-  default=${default#origin/}
-  target=$(git -C "$ROOT" rev-parse "refs/remotes/origin/$default^{commit}")
-  source_origin=$(git -C "$ROOT" remote get-url origin)
-  git clone --quiet --no-checkout "$ROOT" "$home"
-  git -C "$home" checkout --quiet --detach "$target"
-  git -C "$home" remote set-url origin "$source_origin"
-  git -C "$home" update-ref "refs/remotes/origin/$default" "$target"
-  git -C "$home" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default"
-  mkdir -p "$home/config" "$home/data" "$home/projects" "$home/state"
+  local home=$1 id=$2 source=$3
+  git clone -q "$source" "$home"
+  git -C "$home" update-ref refs/remotes/origin/main refs/heads/main
+  git -C "$home" remote set-head origin main
+  mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter for %s\n' "$id" > "$home/data/charter.md"
-  printf '%s\n' '- '"$id"' - profile test (home: '"$home"'; scope: profile test; projects: ; added 2026-07-25)' \
-    > "$parent_home/data/secondmates.md"
 }
 
 run_spawn() {
@@ -155,7 +163,7 @@ run_spawn() {
   shift 4
   case_dir=${home%/home}
   : > "$launchlog"
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$case_dir/checkout-state" \
@@ -163,6 +171,7 @@ run_spawn() {
     FM_FAKE_TREEHOUSE_POOL="$case_dir/treehouse-root/profile" \
     FM_FAKE_TREEHOUSE_CURRENT="$case_dir/acquired-worktree" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -180,7 +189,7 @@ assert_meta_profile() {
   assert_grep "effort=$effort" "$meta" "meta missing effort=$effort"
 }
 
-test_no_profile_keeps_claude_launch_unchanged() {
+test_no_profile_resolves_claude_model_anchor() {
   local rec id out status expected launch
   id=profile-off-z1
   rec=$(make_spawn_case profile-off claude "$id")
@@ -190,12 +199,12 @@ test_no_profile_keeps_claude_launch_unchanged() {
   status=$?
   expect_code 0 "$status" "claude spawn without profile flags should succeed: $out"
   assert_contains "$out" "spawned $id harness=claude" "spawn did not report claude"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude claude-opus-5 default
 
   launch=$(cat "$LAUNCH_LOG")
-  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
-  [ "$launch" = "$expected" ] || fail "no-profile claude launch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
-  pass "no --model/--effort records defaults and keeps the claude launch byte-identical"
+  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions --model 'claude-opus-5' \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
+  [ "$launch" = "$expected" ] || fail "unconfigured Claude launch missed the anchored model"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  pass "Claude spawn without profile flags resolves, records, and launches the Opus 5 anchor"
 }
 
 test_active_dispatch_profile_requires_explicit_harness_for_ship() {
@@ -289,14 +298,30 @@ test_claude_threads_model_and_effort() {
   rec=$(make_spawn_case profile-claude claude "$id")
   read_case_record "$rec"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort high)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model claude-opus-5 --effort high)
   status=$?
   expect_code 0 "$status" "claude spawn with profile flags should succeed"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" claude sonnet high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude claude-opus-5 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "claude --dangerously-skip-permissions --model 'sonnet' --effort 'high'" \
+  assert_contains "$launch" "claude --dangerously-skip-permissions --model 'claude-opus-5' --effort 'high'" \
     "claude launch did not thread model and effort flags"
-  pass "claude receives --model and --effort profile flags"
+  pass "Claude receives the explicit Opus 5 model and effort flags"
+}
+
+test_claude_rejects_mismatched_explicit_model() {
+  local rec id out status
+  id=profile-claude-mismatch-z16
+  rec=$(make_spawn_case profile-claude-mismatch claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort high)
+  status=$?
+  expect_code 1 "$status" "Claude spawn with a mismatched explicit model should fail"
+  assert_contains "$out" "Claude crew/scout model 'sonnet' does not match the installed Opus 5 anchor 'claude-opus-5'" \
+    "Claude mismatch refusal did not name the required and requested models"
+  assert_absent "$HOME_DIR/state/$id.meta" "Claude mismatch should fail before meta is written"
+  [ ! -s "$LAUNCH_LOG" ] || fail "Claude mismatch silently rewrote and launched another model"
+  pass "Claude mismatched explicit models fail closed before endpoint creation"
 }
 
 test_codex_threads_model_and_effort() {
@@ -441,30 +466,38 @@ test_batch_forwards_shared_profile_flags() {
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
-  local rec id sm out status
+  local rec id sm source out status
   id=profile-secondmate-z16
   rec=$(make_spawn_case profile-secondmate codex "$id")
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
+  source="$CASE_DIR/upstream-source"
   sm="$CASE_DIR/secondmate-home"
-  make_seeded_secondmate_home "$sm" "$id" "$HOME_DIR"
+  make_upstream_source "$source"
+  make_seeded_secondmate_home "$sm" "$id" "$source"
+  printf -- '- %s - dispatch profile test (home: %s; scope: test; projects: ; added 2026-07-29)\n' \
+    "$id" "$(cd "$sm" && pwd -P)" > "$HOME_DIR/data/secondmates.md"
+  rm -f "$HOME_DIR/data/backlog.md"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(FM_TEST_ROOT_OVERRIDE="$source" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
-  expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
+  expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement: $out"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
+  assert_absent "$HOME_DIR/data/backlog.md" "secondmate exemption fixture unexpectedly had a backlog row"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
-test_no_profile_keeps_claude_launch_unchanged
+test_no_profile_resolves_claude_model_anchor
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
 test_active_dispatch_profile_allows_explicit_harness
 test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
+test_claude_rejects_mismatched_explicit_model
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
 test_grok_threads_model_and_reasoning_effort

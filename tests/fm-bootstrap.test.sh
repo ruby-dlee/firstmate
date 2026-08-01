@@ -804,7 +804,7 @@ SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "account-routed dispatch profile still required Agent Fleet"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "account-routed dispatch profile did not require the pool-membership registry"
   assert_contains "$out" 'CREW_DISPATCH: active config/crew-dispatch.json' "account dependency preflight suppressed dispatch validation"
 
   case_dir="$TMP_ROOT/account-routing-observe"
@@ -827,8 +827,9 @@ jq() {
 }
 SH
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
-    BASH_ENV="$bash_env" FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "observe mode treated Agent Fleet as a new-launch dependency"
+    BASH_ENV="$bash_env" FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "observe mode did not require the pool-membership registry"
   assert_contains "$out" 'MISSING: jq' "observe mode did not report the direct selector dependency"
   assert_contains "$out" 'MISSING_MANUAL: herdr' "observe mode did not report the direct hook installer"
   case_dir="$TMP_ROOT/account-routing-legacy-recovery"
@@ -860,6 +861,7 @@ SH
   printf '%s\n' 'account_home=/accounts/codex/1' > "$case_dir/home/state/direct.meta"
   fakebin=$(make_fake_toolchain "$case_dir")
   rm -f "$fakebin/herdr"
+  rm -f "$fakebin/agent-fleet"
   bash_env="$case_dir/no-jq.bash"
   cat > "$bash_env" <<'SH'
 command() {
@@ -873,14 +875,15 @@ jq() {
 }
 SH
   out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_PERL_BIN="$case_dir/missing-perl" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" 'MISSING: jq' "direct metadata did not retain the selector dependency when routing was off"
   assert_contains "$out" 'MISSING_MANUAL: herdr' "direct metadata did not retain the hook dependency when routing was off"
   assert_contains "$out" 'MISSING_MANUAL: perl' "direct metadata did not preflight the fixed passwd-home resolver"
-  assert_not_contains "$out" 'MISSING_MANUAL: agent-fleet' "direct metadata incorrectly restored the legacy recovery dependency"
-  pass "bootstrap requires direct launch tools for crews and Agent Fleet for enforced secondmates or legacy recovery"
+  assert_contains "$out" 'MISSING_MANUAL: agent-fleet' "direct metadata did not retain the pool-membership registry dependency"
+  pass "bootstrap requires direct selector tools and the read-only pool registry for routed crews"
 }
 
 test_agent_fleet_install_requires_manual_release() {
@@ -954,6 +957,41 @@ SH
   pass "bootstrap requires Python 3 for contained artifact traversal"
 }
 
+test_lavish_requires_store_forward_fork() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/lavish-store-forward"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  cat > "$fakebin/lavish-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'lavish-axi 0.1.36'
+fi
+exit 0
+SH
+  chmod +x "$fakebin/lavish-axi"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: lavish-axi (install: npm install -g '$case_dir/home/tools/lavish' && lavish-axi configure-wake --home '$case_dir/home' --command '$case_dir/home/bin/fm-lavish-wake.sh')" \
+    "bootstrap accepted the browser-era Lavish binary or omitted wake-adapter setup"
+
+  cat > "$fakebin/lavish-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'lavish-axi 1.0.0 (store-forward protocol 1)'
+fi
+exit 0
+SH
+  chmod +x "$fakebin/lavish-axi"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" "MISSING: lavish-axi" \
+    "bootstrap rejected the firstmate-owned store-and-forward Lavish fork"
+  pass "bootstrap rejects browser-era Lavish and installs the fork with its wake adapter"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
   test_python3_is_required_for_descriptor_relative_artifact_reads
   exit 0
@@ -998,3 +1036,4 @@ test_account_routing_dependency_preflight
 test_agent_fleet_install_requires_manual_release
 test_invalid_account_routing_policy_is_reported
 test_enforced_dispatch_validation_rejects_poolless_quota_rules
+test_lavish_requires_store_forward_fork

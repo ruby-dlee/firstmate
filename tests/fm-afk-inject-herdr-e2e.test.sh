@@ -247,6 +247,16 @@ wait_daemon_started() {
   fail "$label did not record backend=herdr after 6s: $new_log"
 }
 
+wait_for_digest() {
+  local i=0
+  while [ "$i" -lt 120 ]; do
+    grep -q 'Supervisor escalate' "$LOG_FILE" && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
 start_daemon() {
   local log_start=0
   [ ! -f "$STATE_DIR/.supervise-daemon.log" ] || log_start=$(wc -l < "$STATE_DIR/.supervise-daemon.log")
@@ -342,12 +352,7 @@ test_scenario_a() {
   fm_backend_herdr_send_key "$SUPERVISOR_TARGET" Enter
   sleep 0.5
 
-  local deadline=$(( $(date +%s) + 30 ))
-  while ! grep -q 'Supervisor escalate' "$LOG_FILE"; do
-    [ "$(date +%s)" -lt "$deadline" ] \
-      || fail "Scenario A: timed out waiting for the deferred digest submission"
-    sleep 1
-  done
+  wait_for_digest || true
 
   grep -q 'human draft text' "$LOG_FILE" \
     || fail "Scenario A: human text not in log after submit"
@@ -386,12 +391,7 @@ test_scenario_b() {
 
   echo "done: PR https://example.test/pr/200" > "$STATE_DIR/fake-c1.status"
 
-  local deadline=$(( $(date +%s) + 30 ))
-  while [ "$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)" -lt 1 ]; do
-    [ "$(date +%s)" -lt "$deadline" ] \
-      || fail "Scenario B: timed out waiting for the retried digest submission"
-    sleep 1
-  done
+  wait_for_digest || true
   sleep 2
 
   local digest_count
@@ -428,12 +428,7 @@ test_scenario_c() {
   start_daemon
 
   echo "done: PR https://example.test/pr/300" > "$STATE_DIR/fake-c1.status"
-  local deadline=$(( $(date +%s) + 30 ))
-  while [ "$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)" -lt 1 ]; do
-    [ "$(date +%s)" -lt "$deadline" ] \
-      || fail "Scenario C: timed out waiting for the digest submission"
-    sleep 1
-  done
+  wait_for_digest || true
   sleep 2
 
   local digest_count

@@ -244,7 +244,8 @@ SH
 }
 
 wait_for_exit() {
-  local pid=$1 limit=${2:-50} i=0
+  local pid=$1 limit i=0
+  limit=$(fm_test_liveness_iterations "${2:-50}" 0.1)
   while [ "$i" -lt "$limit" ]; do
     # kill -0 also succeeds for an exited child that is waiting to be reaped.
     if ! is_live_non_zombie "$pid"; then

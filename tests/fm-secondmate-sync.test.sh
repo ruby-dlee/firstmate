@@ -405,7 +405,13 @@ case "\$cmd \$sub" in
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
     fi
     ;;
-  "agent send"|"pane send-text"|"pane run"|"pane send-keys")
+  "agent send")
+    if [ "\$arg" = "${stale#*:}" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  "pane send-text"|"pane run"|"pane send-keys")
     if [ "\$arg" = "${stale#*:}" ]; then
       exit 1
     fi
@@ -529,7 +535,8 @@ test_spawn_fast_forwards_before_launch() {
   printf 'sm\n' > "$w/sm/.fm-secondmate-home"
   mkdir -p "$w/sm/data"
   printf 'charter\n' > "$w/sm/data/charter.md"
-  printf '%s\n' '- sm - sync test (home: '"$w/sm"'; scope: sync test; projects: ; added 2026-07-25)' > "$w/home/data/secondmates.md"
+  printf -- '- sm - sync test (home: %s; scope: sync test; projects: ; added 2026-07-27)\n' \
+    "$w/sm" > "$w/home/data/secondmates.md"
   bump_primary "$w" instr
   c2=$(head_of "$w/main")
   [ "$(head_of "$w/sm")" = "$c1" ] || fail "precondition: home should start behind the primary"
@@ -543,12 +550,15 @@ exit 0
 SH
   chmod +x "$fakebin/tmux"
 
-  PATH="$fakebin:$BASE_PATH" TMUX='' \
-    FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" \
-    FM_STATE_OVERRIDE="$w/home/state" FM_DATA_OVERRIDE="$w/home/data" \
-    FM_PROJECTS_OVERRIDE="$w/home/projects" FM_CONFIG_OVERRIDE="$w/home/config" \
-    FM_SPAWN_NO_GUARD=1 \
-    "$ROOT/bin/fm-spawn.sh" sm "$w/sm" codex --secondmate >/dev/null 2>&1 || true
+  (
+    unset NO_MISTAKES_GATE
+    PATH="$fakebin:$BASE_PATH" TMUX='' \
+      FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" \
+      FM_STATE_OVERRIDE="$w/home/state" FM_DATA_OVERRIDE="$w/home/data" \
+      FM_PROJECTS_OVERRIDE="$w/home/projects" FM_CONFIG_OVERRIDE="$w/home/config" \
+      FM_SPAWN_NO_GUARD=1 \
+      "$ROOT/bin/fm-spawn.sh" sm "$w/sm" codex --secondmate >/dev/null 2>&1
+  ) || true
 
   [ "$(head_of "$w/sm")" = "$c2" ] \
     || fail "spawn did not fast-forward the secondmate worktree to the primary's HEAD"
@@ -564,7 +574,8 @@ test_spawn_warns_when_sync_skipped_before_launch() {
   printf 'sm\n' > "$w/sm/.fm-secondmate-home"
   mkdir -p "$w/sm/data"
   printf 'charter\n' > "$w/sm/data/charter.md"
-  printf '%s\n' '- sm - sync test (home: '"$w/sm"'; scope: sync test; projects: ; added 2026-07-25)' > "$w/home/data/secondmates.md"
+  printf -- '- sm - sync test (home: %s; scope: sync test; projects: ; added 2026-07-27)\n' \
+    "$w/sm" > "$w/home/data/secondmates.md"
   bump_primary "$w" instr
   printf 'uncommitted local edit\n' >> "$w/sm/AGENTS.md"
   before=$(head_of "$w/sm")

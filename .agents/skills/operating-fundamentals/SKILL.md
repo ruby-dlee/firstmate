@@ -52,7 +52,7 @@ Execute it directly or find a compliant route; if none exists, surface the exact
 
 Before reporting any mechanism, capability, check, or outcome as working, failed, blocked, or unavailable, record its exact actor or credential, command or surface, target environment, and every leg covered.
 Evidence about one coordinate or leg supports only it: neither a neighboring pass nor a single failure proves an untested positive or global absence.
-Reconcile all directly relevant observations first; a contradiction blocks the claim until reproduced, scoped elsewhere, or reported unresolved.
+Contradictory directly relevant evidence blocks the claim until reproduced and resolved or proven out-of-scope; unresolved, report observations only.
 A positive needs direct end-to-end evidence on the actual target or an `unverified` label; a blocker or absence also needs the authoritative reference, one materially independent safe in-scope route or why none exists, and the narrowest supported result: `this route failed`, `capability unavailable`, or `captain action required`.
 Keep investigating while a plausible safe route remains; escalate only when those routes are exhausted or the remaining action is genuinely captain-owned.
 Before dismissing or escalating a gate, check, blocker, or failure, establish the target outcome and verify that the failing thing is neither that outcome nor on its critical path.

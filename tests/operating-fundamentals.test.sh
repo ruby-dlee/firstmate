@@ -59,7 +59,7 @@ test_seven_ordered_principles() {
   assert_grep "non-overridable safety and instruction constraints" "$SKILL" "safety boundary missing"
   assert_not_contains "$contract_text" "shallowest level" "shallow shortcut remains"
   assert_not_contains "$contract_text" "one load-bearing assumption" "one-assumption shortcut remains"
-  for proof in "every leg covered" "neighboring pass" "single failure" "contradiction blocks the claim" "direct end-to-end evidence" "unverified" "authoritative reference" "materially independent safe in-scope route" "narrowest supported result"; do assert_contains "$principle_seven" "$proof" "missing '$proof'"; done
+  for proof in "every leg covered" "neighboring pass" "single failure" "blocks the claim until reproduced and resolved or proven out-of-scope" "unresolved, report observations only" "direct end-to-end evidence" "unverified" "authoritative reference" "materially independent safe in-scope route" "narrowest supported result"; do assert_contains "$principle_seven" "$proof" "missing '$proof'"; done
   for bypass_contract in "target outcome" "critical path" "record the target outcome and critical-path rationale" "operation failing, not noise"; do assert_contains "$principle_seven" "$bypass_contract" "missing '$bypass_contract'"; done
   pass "seven principles preserved"
 }

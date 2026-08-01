@@ -20,9 +20,9 @@ test_agent_only_folded_frontmatter_and_size() {
   assert_contains "$frontmatter" "user-invocable: false" "skill must remain agent-only"
   assert_contains "$frontmatter" "metadata:" "skill frontmatter is missing internal metadata"
   assert_contains "$frontmatter" "  internal: true" "skill must remain internal"
-  assert_contains "$frontmatter" "Use when intaking any captain ask" "folded metadata must name a concrete intake trigger"
-  assert_contains "$frontmatter" "supervising under load" "folded metadata must name a concrete supervision trigger"
-  assert_contains "$frontmatter" "about to assert a fleet fact" "folded metadata must name a concrete verification trigger"
+  assert_contains "$frontmatter" "before reporting firstmate itself blocked" "folded metadata must cover firstmate's own blocker"
+  assert_contains "$frontmatter" "claiming a tool or capability unavailable" "folded metadata must cover unavailable-capability claims"
+  assert_contains "$frontmatter" "escalating any blocker" "folded metadata must cover every blocker escalation"
 
   delimiter_count=$(grep -c '^---$' "$SKILL")
   [ "$delimiter_count" -eq 2 ] || fail "skill must have one closed YAML frontmatter block"
@@ -32,9 +32,10 @@ test_agent_only_folded_frontmatter_and_size() {
 }
 
 test_seven_ordered_principles() {
-  local headings expected
-
+  local headings expected skill_text principle_seven
   headings=$(sed -nE 's/^## ([0-9]+\. .*)$/\1/p' "$SKILL")
+  skill_text=$(<"$SKILL")
+  principle_seven=$(awk '/^## 7\./ { capture=1; next } capture && /^## / { exit } capture' "$SKILL")
   expected=$(printf '%s\n' \
     "1. Orchestrate; never work inline" \
     "2. Saturate every available lane" \
@@ -42,7 +43,7 @@ test_seven_ordered_principles() {
     "4. Decouple validation from worker budgets" \
     "5. Reap continuously" \
     "6. Obey explicit orders decisively" \
-    "7. Always check before asserting")
+    "7. Prove a blocker at the scope you report")
   [ "$headings" = "$expected" ] || fail "skill must contain exactly seven ordered operating-principle headings"
 
   assert_grep "every captain ask" "$SKILL" "orchestration principle must cover every captain ask"
@@ -57,29 +58,28 @@ test_seven_ordered_principles() {
   assert_grep "Fill released capacity" "$SKILL" "continuous-reaping principle must refill freed lanes"
   assert_grep "explicit captain order as the governing objective" "$SKILL" "explicit-order principle is missing"
   assert_grep "non-overridable safety and instruction constraints" "$SKILL" "explicit-order principle must retain non-overridable constraints"
-  assert_grep "consequential action" "$SKILL" "premise-check principle must cover consequential actions"
-  assert_grep "load-bearing assumption" "$SKILL" "premise-check principle must identify one load-bearing assumption"
-  assert_grep "clearly-false premises" "$SKILL" "premise-check principle must catch clearly-false premises"
-  assert_grep "do not overcorrect" "$SKILL" "premise-check principle must forbid overcorrection"
-  assert_grep "safe to bypass" "$SKILL" "purpose-before-bypass principle must cover bypass classification"
-  assert_grep "target outcome" "$SKILL" "purpose-before-bypass principle must establish the operation's purpose"
-  assert_grep "critical path" "$SKILL" "purpose-before-bypass principle must protect the target's critical path"
-  assert_grep "Before adding a bypass that gates an irreversible or high-stakes action, record the target outcome and the rationale" "$SKILL" "purpose-before-bypass principle must require a written purpose and rationale for consequential bypasses"
-  assert_grep "trivial skips are exempt" "$SKILL" "purpose-before-bypass principle must exempt trivial skips from recorded rationale"
-  assert_grep "operation failing, not noise" "$SKILL" "purpose-before-bypass principle must treat target-capability failure as operation failure"
+  assert_not_contains "$skill_text" "shallowest level" "obsolete shallow-check wording must be absent"
+  assert_not_contains "$skill_text" "load-bearing assumption" "obsolete one-assumption shortcut must be absent"
+  for proof in "exact actor, credential" "authoritative reference" "materially independent safe in-scope route" "narrowest supported result"; do assert_contains "$skill_text" "$proof" "blocker proof must retain '$proof'"; done
+  for bypass_contract in "target outcome" "critical path" "record the target outcome and critical-path rationale" "operation failing, not noise"; do assert_contains "$principle_seven" "$bypass_contract" "principle 7 must retain '$bypass_contract'"; done
   pass "operating-fundamentals encodes all seven principles in the required order"
 }
 
 test_single_conditional_agents_trigger() {
-  local section global_count section_count
-
+  local section blocker_section global_count section_count
   section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
+  blocker_section=$(awk '/^## 9\./ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
   global_count=$(grep -Fc "\`operating-fundamentals\`" "$AGENTS")
   section_count=$(printf '%s\n' "$section" | grep -Fc "\`operating-fundamentals\`")
   [ "$global_count" -eq 1 ] || fail "AGENTS.md must reference operating-fundamentals exactly once"
   [ "$section_count" -eq 1 ] || fail "the sole operating-fundamentals reference must be in section 13"
-  assert_contains "$section" "\`operating-fundamentals\` - load when intaking any captain ask" "section 13 must conditionally load the skill at intake"
-  pass "AGENTS.md contains one conditional section-13 trigger and no every-turn duplicate"
+  assert_contains "$section" "before reporting firstmate itself blocked" "section 13 must trigger on firstmate's own blocker"
+  assert_contains "$section" "claiming a tool or capability unavailable" "section 13 must trigger on unavailable-capability claims"
+  assert_contains "$section" "escalating any blocker" "section 13 must trigger on every blocker escalation"
+  assert_contains "$blocker_section" "whether firstmate found the problem itself or a crewmate reported it" "section 9 must apply the blocker bar symmetrically"
+  assert_not_contains "$blocker_section" "directing the crewmate" "section 9 must remove the crewmate-only blocker bar"
+  assert_not_contains "$blocker_section" "get it working through the crewmate first" "section 9 must remove the crewmate-only stopping rule"
+  pass "AGENTS.md has one event-triggered skill route and an actor-symmetric blocker bar"
 }
 
 test_crew_steering_contract_and_trigger() {

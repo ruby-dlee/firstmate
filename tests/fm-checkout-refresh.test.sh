@@ -1650,6 +1650,75 @@ SH
   pass "same-origin clones acquire from separate per-home pools owned by their declaring clone"
 }
 
+test_managed_treehouse_source_refuses_tracked_config_and_symlinks() {
+  local tracked_home tracked_source out status outside state_home parent_home keyed_home keyed_source common key
+  tracked_home="$TMP_ROOT/treehouse-tracked-home"
+  tracked_source="$tracked_home/projects/tracked"
+  mkdir -p "$tracked_source" "$tracked_home/config"
+  fm_git_init_commit "$tracked_source"
+  printf '%s\n' 'root = "/project-owned"' > "$tracked_source/treehouse.toml"
+  git -C "$tracked_source" add treehouse.toml
+  git -C "$tracked_source" commit -qm tracked-treehouse-config
+  set +e
+  out=$(run_isolated_refresh "$tracked_home" "$tracked_home/refresh-state" \
+    acquire-worktree "$tracked_source" tracked-config 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "tracked project Treehouse config was overwritten"
+  assert_contains "$out" "declared project $tracked_source tracks treehouse.toml" \
+    "tracked-config refusal did not identify the declared project"
+  assert_contains "$out" "preventing Firstmate from applying its per-home root without mutating project state" \
+    "tracked-config refusal did not explain the required operator action"
+  assert_grep 'root = "/project-owned"' "$tracked_source/treehouse.toml" \
+    "tracked project Treehouse config changed during refusal"
+  assert_absent "$tracked_home/state" \
+    "tracked-config refusal created managed source state"
+
+  outside="$TMP_ROOT/treehouse-source-outside"
+  state_home="$TMP_ROOT/treehouse-state-link-home"
+  mkdir -p "$outside" "$state_home/projects/source" "$state_home/config"
+  fm_git_init_commit "$state_home/projects/source"
+  ln -s "$outside" "$state_home/state"
+  set +e
+  run_isolated_refresh "$state_home" "$state_home/refresh-state" \
+    acquire-worktree "$state_home/projects/source" linked-state >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked state directory"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked state directory caused an out-of-home write"
+
+  parent_home="$TMP_ROOT/treehouse-parent-link-home"
+  mkdir -p "$parent_home/projects/source" "$parent_home/config" "$parent_home/state"
+  fm_git_init_commit "$parent_home/projects/source"
+  ln -s "$outside" "$parent_home/state/treehouse-sources"
+  set +e
+  run_isolated_refresh "$parent_home" "$parent_home/refresh-state" \
+    acquire-worktree "$parent_home/projects/source" linked-parent >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked state parent"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked state parent caused an out-of-home write"
+
+  keyed_home="$TMP_ROOT/treehouse-keyed-home"
+  keyed_source="$keyed_home/projects/source"
+  mkdir -p "$keyed_source" "$keyed_home/config" "$keyed_home/state/treehouse-sources"
+  fm_git_init_commit "$keyed_source"
+  common=$(fm_checkout_git_common_dir "$keyed_source")
+  key=$(fm_checkout_hash_value "$common" 24)
+  ln -s "$outside" "$keyed_home/state/treehouse-sources/$key"
+  set +e
+  run_isolated_refresh "$keyed_home" "$keyed_home/refresh-state" \
+    acquire-worktree "$keyed_source" linked-key >/dev/null 2>&1
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "managed Treehouse source accepted a symlinked keyed directory"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "symlinked keyed directory caused an out-of-home write"
+  pass "managed Treehouse source refuses tracked configs and redirected state paths"
+}
+
 test_acquisition_honors_shared_checkout_lock() {
   local source fakebin common key lock out status marker
   source="$TMP_ROOT/acquisition-lock-source"
@@ -2424,6 +2493,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   test_per_home_treehouse_sources_isolate_same_origin_clones
+  test_managed_treehouse_source_refuses_tracked_config_and_symlinks
   test_acquisition_honors_shared_checkout_lock
   exit 0
 fi
@@ -2505,6 +2575,7 @@ test_lock_owner_symlink_cannot_escape_state_directory
 test_worktree_freshness_verification_fails_closed
 test_bounded_refresh_terminates_descendants
 test_per_home_treehouse_sources_isolate_same_origin_clones
+test_managed_treehouse_source_refuses_tracked_config_and_symlinks
 test_acquisition_honors_shared_checkout_lock
 test_launch_agent_definition_is_home_scoped_with_scheduler_seam
 test_logical_home_state_migrates_and_ambiguity_fails_closed

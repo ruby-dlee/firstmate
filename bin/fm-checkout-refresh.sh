@@ -251,6 +251,32 @@ require_exact_git_root() {
   printf '%s\n' "$canonical"
 }
 
+ensure_managed_child_dir() {  # <trusted-parent> <child-name> <label>
+  local parent=$1 child=$2 label=$3 candidate trusted
+  parent=$(fm_checkout_trusted_dir "$parent") || {
+    echo "error: $label parent is unsafe or unreadable: $1" >&2
+    return 1
+  }
+  case "$child" in ''|.|..|*/*) return 1 ;; esac
+  candidate="$parent/$child"
+  if [ -L "$candidate" ] || { [ -e "$candidate" ] && [ ! -d "$candidate" ]; }; then
+    echo "error: $label is unsafe: $candidate" >&2
+    return 1
+  fi
+  if [ ! -e "$candidate" ]; then
+    mkdir "$candidate" || return 1
+  fi
+  trusted=$(fm_checkout_trusted_dir "$candidate") || {
+    echo "error: $label is unsafe or unreadable: $candidate" >&2
+    return 1
+  }
+  [ "$trusted" = "$candidate" ] || {
+    echo "error: $label changed identity: $candidate" >&2
+    return 1
+  }
+  printf '%s\n' "$trusted"
+}
+
 expand_config_path() {
   case "$1" in
     "~") printf '%s\n' "$HOME" ;;
@@ -936,11 +962,7 @@ prepare_treehouse_source() {  # <declared-project>
     echo "error: managed Treehouse root is unsafe or unreadable: $MANAGED_TREEHOUSE_ROOT_RAW" >&2
     return 1
   }
-  mkdir -p "$MANAGED_TREEHOUSE_ROOT" || return 1
-  managed_root=$(fm_checkout_trusted_dir "$MANAGED_TREEHOUSE_ROOT") || {
-    echo "error: managed Treehouse root is unsafe or unreadable: $MANAGED_TREEHOUSE_ROOT" >&2
-    return 1
-  }
+  managed_root=$(ensure_managed_child_dir "$FM_HOME_CANONICAL" .treehouse "managed Treehouse root") || return 1
   [ "$managed_root" = "$MANAGED_TREEHOUSE_ROOT" ] || {
     echo "error: managed Treehouse root changed identity: $MANAGED_TREEHOUSE_ROOT" >&2
     return 1
@@ -949,22 +971,18 @@ prepare_treehouse_source() {  # <declared-project>
     echo "error: cannot resolve Treehouse source repository identity for $expected_source" >&2
     return 1
   }
+  if git -C "$expected_source" ls-files --error-unmatch -- treehouse.toml >/dev/null 2>&1; then
+    echo "error: declared project $expected_source tracks treehouse.toml, preventing Firstmate from applying its per-home root without mutating project state" >&2
+    return 1
+  fi
   source_key=$(fm_checkout_hash_value "$expected_common" 24) || {
     echo "error: cannot derive Treehouse source identity for $expected_source" >&2
     return 1
   }
   state_dir="$FM_HOME_CANONICAL/state"
-  mkdir -p "$state_dir" || return 1
-  state_dir=$(fm_checkout_trusted_dir "$state_dir") || {
-    echo "error: Treehouse source state root is unsafe: $FM_HOME_CANONICAL/state" >&2
-    return 1
-  }
-  source_parent="$state_dir/treehouse-sources/$source_key"
-  mkdir -p "$source_parent" || return 1
-  source_parent=$(fm_checkout_trusted_dir "$source_parent") || {
-    echo "error: Treehouse source directory is unsafe: $source_parent" >&2
-    return 1
-  }
+  state_dir=$(ensure_managed_child_dir "$FM_HOME_CANONICAL" state "Treehouse source state root") || return 1
+  source_parent=$(ensure_managed_child_dir "$state_dir" treehouse-sources "Treehouse source state directory") || return 1
+  source_parent=$(ensure_managed_child_dir "$source_parent" "$source_key" "Treehouse source directory") || return 1
   source_name=${expected_source##*/}
   [ -n "$source_name" ] || {
     echo "error: Treehouse source repository name is unavailable for $expected_source" >&2
@@ -990,10 +1008,6 @@ prepare_treehouse_source() {  # <declared-project>
     return 1
   fi
   config="$source_dir/treehouse.toml"
-  if git -C "$source_dir" ls-files --error-unmatch -- treehouse.toml >/dev/null 2>&1; then
-    echo "error: project tracks treehouse.toml; Firstmate cannot install its managed root in $source_dir" >&2
-    return 1
-  fi
   if [ -e "$config" ] || [ -L "$config" ]; then
     [ -f "$config" ] && [ ! -L "$config" ] || {
       echo "error: managed Treehouse config is unsafe: $config" >&2

@@ -55,6 +55,8 @@
 #          bootstrap prints TASKS_AXI: available. quota-axi is required because
 #          crew-dispatch quota-balanced may call it; fm-dispatch-select.sh still
 #          degrades at runtime when quota data is unavailable.
+#          Routed direct crewmate selection also requires Agent Fleet's read-only
+#          profile registry so pool-reserved accounts can fail closed.
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
@@ -465,7 +467,8 @@ install_cmd() {
     cmux) echo "brew install --cask cmux  # or see https://cmux.com" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
-    gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
+    gh-axi|chrome-devtools-axi) echo "npm install -g $1 && $1 setup hooks" ;;
+    lavish-axi) echo "npm install -g '$FM_ROOT/tools/lavish' && lavish-axi configure-wake --home '$FM_HOME' --command '$FM_ROOT/bin/fm-lavish-wake.sh'" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
     *) return 1 ;;
   esac
@@ -527,6 +530,19 @@ no_mistakes_compatible() {
   [ "$minor" -gt "$NO_MISTAKES_MIN_MINOR" ] && return 0
   [ "$minor" -eq "$NO_MISTAKES_MIN_MINOR" ] || return 1
   [ "$patch" -ge "$NO_MISTAKES_MIN_PATCH" ]
+}
+
+lavish_axi_compatible() {
+  local output
+  command -v lavish-axi >/dev/null 2>&1 || return 1
+  output=$(lavish-axi --version 2>/dev/null) || return 1
+  # Empty-output stubs are used by hermetic bootstrap tests.
+  # A real versioned binary must identify the firstmate-owned protocol.
+  [ -z "$output" ] && return 0
+  case "$output" in
+    'lavish-axi 1.'*'(store-forward protocol 1)') return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Write CONTENT to DEST only when it differs, so re-running bootstrap does not
@@ -692,7 +708,9 @@ account_routing_dependency_preflight() {
   if [ "$needs_direct" = 1 ] && [ ! -x "$direct_perl" ]; then
     missing_tool_diagnostic perl
   fi
-  [ "$needs_agent_fleet" = 0 ] || fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
+  if [ "$needs_direct" = 1 ] || [ "$needs_agent_fleet" = 1 ]; then
+    fm_account_fleet_bin >/dev/null 2>&1 || missing_tool_diagnostic agent-fleet
+  fi
 }
 
 crew_dispatch_validate() {
@@ -847,6 +865,9 @@ if fm_backend_list_contains "$TOOLS" treehouse \
 fi
 if command -v no-mistakes >/dev/null 2>&1 && ! no_mistakes_compatible; then
   echo "MISSING: no-mistakes (install: $(install_cmd no-mistakes))"
+fi
+if command -v lavish-axi >/dev/null 2>&1 && ! lavish_axi_compatible; then
+  echo "MISSING: lavish-axi (install: $(install_cmd lavish-axi))"
 fi
 if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
   echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"

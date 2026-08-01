@@ -33,6 +33,17 @@
 # worktree, and task lease, then quiesces the endpoint before its final safety checks.
 # Each locked Treehouse return repeats repository, lease, and landed-work checks
 # immediately before the destructive return command.
+# A cleanly unleased Treehouse slot means an operator already returned it.
+# Teardown still repeats the landed-work proof under the checkout lock, skips a
+# second return, and clears only the orphaned task bookkeeping.
+# Only the explicit patterns in teardown_path_is_known_tool_artifact are excluded
+# from non-ignored dirty-work detection.
+# Git-ignored files do not block reclaim and are not preserved as scratch.
+# Before returning a leased worktree, teardown reports their directory-collapsed
+# count and deduplicated top-level paths without inventorying or archiving them.
+# --preserve-scratch first proves committed work landed, captures tracked diffs
+# and non-ignored untracked payloads under data/<task-id>/scratch/, then cleans
+# and repeats the ordinary safety proof before reclaim proceeds.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge on the captain's approval) as a fallback
 # for the common case where there is no remote at all.
@@ -45,18 +56,27 @@
 # the handle stale, and remove the recorded worktree under its checkout lock;
 # teardown never substitutes the shared window alias for a missing terminal.
 # Secondmates (kind=secondmate in meta) are retired explicitly. Teardown proves
-# the home clean and every ref and reflog commit landed, then quiesces its endpoint and
-# refuses while the home has in-flight crewmate meta files. --force authorizes
-# recursive retirement only after every child passes the same endpoint, identity,
-# cleanliness, stash, and landed-work proofs. Project retirement also rejects
-# mount boundaries, rewritten history, and landing authorities whose complete Git
-# object storage or network transport may depend on the retiring home or local machine. Removing a
-# leased home releases its durable treehouse lease so the pool slot is freed,
+# the home clean and every ref and reflog commit landed. Without --force it also
+# proves the child-secondmate registry empty before quiescing the endpoint, so a
+# known refusal never stops a live supervisor; the same proof is repeated after
+# quiescence. It still refuses while the home has in-flight crewmate meta files.
+# --force authorizes recursive retirement only after every child passes the same
+# endpoint, identity, cleanliness, stash, and landed-work proofs. A retiring
+# project's linked worktrees are admitted only when attributable to registered
+# child metadata. Project retirement also rejects symlinked operational
+# directories, mount boundaries, rewritten history, and landing authorities whose
+# complete Git object storage or network transport may depend on the retiring home
+# or local machine. Removing a leased home releases its durable treehouse lease so
+# the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
-# Usage: fm-teardown.sh <task-id> [--force]
+# Usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch]
 #   --force permits recursive kind=secondmate retirement. It never bypasses
 #   dirty, untracked, stash, landed-work, endpoint, identity, or report proofs.
+#   --preserve-scratch permits a ship/scout teardown to preserve tracked diffs
+#   and non-ignored untracked files under data/<task-id>/scratch/ before cleaning.
+#   Ignored files remain exempt and are summarized before a leased return.
+#   Committed work must still pass the ordinary landed-work proof first.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crewmate process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
@@ -95,6 +115,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# Same canonical resolution every other script uses (fm-spawn, fm-bootstrap,
+# fm-home-seed, fm-fleet-sync, fm-fleet-snapshot, fm-checkout-refresh): with
+# FM_HOME set, `projects/` is an operational dir of the HOME, not of the repo.
+PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/checkout-refresh}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
@@ -125,8 +149,36 @@ case "$TEARDOWN_UPSTREAM_TIMEOUT" in
     exit 2
     ;;
 esac
+[ "$#" -ge 1 ] || {
+  echo "usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch]" >&2
+  exit 2
+}
 ID=$1
-FORCE=${2:-}
+shift
+FORCE=
+PRESERVE_SCRATCH=0
+for option in "$@"; do
+  case "$option" in
+    --force)
+      [ -z "$FORCE" ] || {
+        echo "error: duplicate teardown option: --force" >&2
+        exit 2
+      }
+      FORCE=--force
+      ;;
+    --preserve-scratch)
+      [ "$PRESERVE_SCRATCH" -eq 0 ] || {
+        echo "error: duplicate teardown option: --preserve-scratch" >&2
+        exit 2
+      }
+      PRESERVE_SCRATCH=1
+      ;;
+    *)
+      echo "error: unknown teardown option: $option" >&2
+      exit 2
+      ;;
+  esac
+done
 
 META="$STATE/$ID.meta"
 
@@ -249,6 +301,10 @@ if [ "$DIRECT_SPAWN_ENDPOINT" = not-created ]; then
       exit 1
     }
 fi
+SPAWN_NEVER_LAUNCHED=0
+if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ "$DIRECT_SPAWN_ENDPOINT" = not-created ]; then
+  SPAWN_NEVER_LAUNCHED=1
+fi
 ORCA_CLEANUP_PENDING_COUNT=$(grep -c '^orca_cleanup_pending=' "$META" 2>/dev/null || true)
 ORCA_CLEANUP_PENDING=0
 if [ "$ORCA_CLEANUP_PENDING_COUNT" -ne 0 ]; then
@@ -285,6 +341,10 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
   echo "error: task kind changed while teardown waited for lifecycle ownership" >&2
   exit 1
 }
+if [ "$PRESERVE_SCRATCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  echo "error: --preserve-scratch is supported only for ship and scout worktrees" >&2
+  exit 2
+fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 REPORT_GATED=0
@@ -304,7 +364,7 @@ fi
 
 managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home] [recorded-scoped-target]
   local backend=$1 target=$2 expected=$3 probe_home=${4:-} recorded_scoped_target=${5:-}
-  local attempt state agent_state last=unknown
+  local attempt state last=unknown
   [ -n "$target" ] || return 2
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$probe_home" ]; then
@@ -314,18 +374,7 @@ managed_endpoint_is_gone() {  # <backend> <target> <expected-label> [probe-home]
     fi
     case "$state" in
       absent) return 0 ;;
-      present)
-        [ "$backend" != zellij ] || return 1
-        if [ -n "$probe_home" ]; then
-          agent_state=$(unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        else
-          agent_state=$(fm_backend_agent_alive "$backend" "$target" "$expected" "$recorded_scoped_target" 2>/dev/null)
-        fi
-        case "$agent_state" in
-          dead|alive) last=present ;;
-          *) last=unknown ;;
-        esac
-        ;;
+      present) last=present ;;
       unknown) last=unknown ;;
       *) last=unknown ;;
     esac
@@ -922,6 +971,10 @@ work_is_landed() {
 backlog_refresh_reminder() {
   local pr done_cmd report_path
   [ "$KIND" = secondmate ] && return 0
+  if [ "$SPAWN_NEVER_LAUNCHED" = 1 ]; then
+    printf '%s\n' "Backlog: $ID never launched. Retry its spawn or move it back to a ready state; no report was required for this cleanup."
+    return 0
+  fi
   if fm_tasks_axi_backend_available "$CONFIG"; then
     case "$KIND" in
       scout)
@@ -1025,7 +1078,7 @@ treehouse_state_for_worktree() {
   printf '%s\n' "$state"
 }
 
-require_treehouse_task_lease() {
+treehouse_task_lease_state() {
   local worktree=$1 expected_holder=$2 state
   state=$(treehouse_state_for_worktree "$worktree") || {
     echo "error: cannot resolve authoritative Treehouse state for $worktree" >&2
@@ -1055,14 +1108,22 @@ try:
     if len(matches) != 1:
         raise ValueError("expected exactly one matching worktree entry")
     entry = matches[0]
-    if entry.get("leased") is not True:
-        raise ValueError("worktree is not durably leased")
-    if entry.get("lease_holder") != expected_holder:
-        raise ValueError(
-            f"lease holder is {entry.get('lease_holder')!r}, expected {expected_holder!r}"
-        )
     if entry.get("destroying") is True:
         raise ValueError("worktree is already being destroyed")
+    if entry.get("leased") is True:
+        if entry.get("lease_holder") != expected_holder:
+            raise ValueError(
+                f"lease holder is {entry.get('lease_holder')!r}, "
+                f"expected {expected_holder!r}"
+            )
+        print("leased")
+    elif entry.get("leased") in (None, False) and entry.get("lease_holder") in (
+        None,
+        "",
+    ):
+        print("returned")
+    else:
+        raise ValueError("worktree lease state is neither owned nor cleanly returned")
 except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
     print(
         f"error: Treehouse ownership for {expected_path} is unprovable: {error}",
@@ -1070,6 +1131,27 @@ except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error
     )
     raise SystemExit(1)
 PY
+}
+
+require_treehouse_task_lease() {
+  local state
+  state=$(treehouse_task_lease_state "$1" "$2") || return 1
+  [ "$state" = leased ] || {
+    echo "error: Treehouse ownership for $1 is unprovable: worktree is not durably leased" >&2
+    return 1
+  }
+}
+
+TREEHOUSE_TARGET_ALREADY_RETURNED=0
+require_treehouse_task_lease_or_returned() {
+  local state
+  TREEHOUSE_TARGET_ALREADY_RETURNED=0
+  state=$(treehouse_task_lease_state "$1" "$2") || return 1
+  case "$state" in
+    leased) ;;
+    returned) TREEHOUSE_TARGET_ALREADY_RETURNED=1 ;;
+    *) return 1 ;;
+  esac
 }
 
 require_treehouse_return_authority() {
@@ -1125,7 +1207,7 @@ validate_teardown_target_identity() {
     echo "error: teardown worktree is not registered to the recorded project: $worktree_root" >&2
     return 1
   }
-  require_treehouse_task_lease "$worktree_root" "firstmate-$ID"
+  require_treehouse_task_lease_or_returned "$worktree_root" "firstmate-$ID"
 }
 
 retry_wait_secs_is_valid() {
@@ -1360,12 +1442,38 @@ cleanup_returned_worktree() {
   remove_worktree_compatibility_artifacts "$worktree" "returned worktree"
 }
 
-validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch stash_list
-  [ -d "$WT" ] || return 0
-  case "$KIND" in
-    secondmate) return 0 ;;
+teardown_path_is_known_tool_artifact() {
+  local path=$1
+  case "$path" in
+    .claude/settings.local.json|.opencode/plugins/fm-turn-end.js|.fm-grok-turnend)
+      return 0
+      ;;
+    .watchman-cookie-*)
+      case "$path" in
+        */*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
   esac
+  return 1
+}
+
+first_actionable_dirty_status() {
+  local line path
+  while IFS= read -r line; do
+    case "$line" in
+      '?? '*)
+        path=${line#?? }
+        teardown_path_is_known_tool_artifact "$path" && continue
+        ;;
+    esac
+    printf '%s\n' "$line"
+    return 0
+  done
+}
+
+validate_worktree_stash_absent() {
+  local stash_list
   stash_list=$(git -C "$WT" stash list 2>/dev/null) || {
     echo "REFUSED: cannot inspect worktree $WT for retained stash history." >&2
     return 1
@@ -1374,19 +1482,10 @@ validate_worktree_teardown_safety() {
     echo "REFUSED: worktree $WT has retained stash history." >&2
     return 1
   }
+}
 
-  if ! dirty_raw=$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>/dev/null); then
-    if worktree_safety_blocked_by_lock "uncommitted changes"; then
-      return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
-    fi
-    echo "REFUSED: cannot inspect worktree $WT for uncommitted changes." >&2
-    echo "Restore the git index state, then retry teardown." >&2
-    return 1
-  fi
-  dirty=$(printf '%s\n' "$dirty_raw" \
-    | grep -vE '^\?\? (\.claude/settings\.local\.json|\.opencode/plugins/fm-turn-end\.js|\.fm-grok-turnend)$' \
-    | head -1 || true)
-
+validate_worktree_committed_landing() {
+  local unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
   if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
     if worktree_safety_blocked_by_lock "commits not on a remote"; then
       return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
@@ -1408,18 +1507,12 @@ validate_worktree_teardown_safety() {
       return 1
     fi
     unmerged=$(printf '%s\n' "$unmerged_raw" | head -5)
-    if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
+    if [ -n "$unmerged" ]; then
       echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
-      [ -n "$dirty" ] && echo "uncommitted changes present" >&2
-      [ -n "$unmerged" ] && printf 'commits not yet on %s:\n%s\n' "$DEFAULT" "$unmerged" >&2
+      printf 'commits not yet on %s:\n%s\n' "$DEFAULT" "$unmerged" >&2
       echo "Merge the branch into local $DEFAULT first (bin/fm-merge-local.sh after the captain approves), or push it to a fork or remote, then retry teardown." >&2
       return 1
     fi
-  elif [ -n "$dirty" ]; then
-    echo "REFUSED: worktree $WT has uncommitted changes." >&2
-    echo "uncommitted changes present" >&2
-    echo "Commit and land them, then retry teardown." >&2
-    return 1
   elif [ -n "$unpushed" ]; then
     branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
     if [ -z "$branch" ]; then
@@ -1433,6 +1526,438 @@ validate_worktree_teardown_safety() {
       return 1
     fi
   fi
+}
+
+validate_worktree_teardown_safety() {
+  local dirty_raw dirty
+  [ -d "$WT" ] || return 0
+  case "$KIND" in
+    secondmate) return 0 ;;
+  esac
+  validate_worktree_stash_absent || return 1
+
+  if ! dirty_raw=$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>/dev/null); then
+    if worktree_safety_blocked_by_lock "uncommitted changes"; then
+      return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
+    fi
+    echo "REFUSED: cannot inspect worktree $WT for uncommitted changes." >&2
+    echo "Restore the git index state, then retry teardown." >&2
+    return 1
+  fi
+  dirty=$(printf '%s\n' "$dirty_raw" | first_actionable_dirty_status || true)
+
+  validate_worktree_committed_landing || return $?
+  if [ -n "$dirty" ]; then
+    echo "REFUSED: worktree $WT has uncommitted changes." >&2
+    echo "uncommitted changes present" >&2
+    if [ "$PRESERVE_SCRATCH" -eq 1 ]; then
+      echo "The requested scratch preservation did not complete; the worktree is unchanged." >&2
+    else
+      echo "Retry with --preserve-scratch to capture the diff and untracked files before cleaning, or commit and land them first." >&2
+    fi
+    return 1
+  fi
+}
+
+summarize_ignored_worktree_paths() {
+  local summary
+  summary=$(
+    set -o pipefail
+    git -C "$WT" ls-files --others --ignored --exclude-standard \
+      --directory --no-empty-directory -z -- |
+      python3 -c '
+import json
+import sys
+
+entries = [
+    item.decode("utf-8", "surrogateescape")
+    for item in sys.stdin.buffer.read().split(b"\0")
+    if item
+]
+top_level = sorted(
+    {
+        entry.rstrip("/").split("/", 1)[0]
+        for entry in entries
+        if entry.rstrip("/")
+    }
+)
+print(
+    "teardown: ignored worktree summary: "
+    f"count={len(entries)}; top-level={json.dumps(top_level, ensure_ascii=True)}"
+)
+'
+  ) || {
+    echo "REFUSED: cannot summarize ignored files in worktree $WT." >&2
+    return 1
+  }
+  printf '%s\n' "$summary"
+}
+
+validate_worktree_teardown_safety_and_summarize_ignored() {
+  validate_worktree_teardown_safety || return 1
+  summarize_ignored_worktree_paths
+}
+
+filter_preservable_untracked_paths() {
+  local source=$1 destination=$2 path
+  while IFS= read -r -d '' path; do
+    teardown_path_is_known_tool_artifact "$path" && continue
+    printf '%s\0' "$path"
+  done < "$source" > "$destination"
+}
+
+capture_worktree_scratch() {
+  local task_dir scratch_root capture_dir all_untracked
+  [ -d "$DATA" ] || mkdir -p "$DATA" || return 1
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] || {
+    echo "REFUSED: scratch data root is not a real directory: $DATA" >&2
+    return 1
+  }
+  task_dir="$DATA/$ID"
+  [ -e "$task_dir" ] || mkdir "$task_dir" || return 1
+  [ -d "$task_dir" ] && [ ! -L "$task_dir" ] || {
+    echo "REFUSED: task report directory is not a real directory: $task_dir" >&2
+    return 1
+  }
+  scratch_root="$task_dir/scratch"
+  [ -e "$scratch_root" ] || mkdir "$scratch_root" || return 1
+  [ -d "$scratch_root" ] && [ ! -L "$scratch_root" ] || {
+    echo "REFUSED: task scratch path is not a real directory: $scratch_root" >&2
+    return 1
+  }
+  capture_dir="$scratch_root/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  [ ! -e "$capture_dir" ] || {
+    echo "REFUSED: scratch capture path already exists: $capture_dir" >&2
+    return 1
+  }
+  umask 077
+  mkdir "$capture_dir" || return 1
+  all_untracked="$capture_dir/.all-untracked.paths"
+
+  git -C "$WT" status --porcelain=v1 --untracked-files=all \
+    > "$capture_dir/status.txt" || return 1
+  git -C "$WT" diff --binary --full-index HEAD -- \
+    > "$capture_dir/tracked.patch" || return 1
+  git -C "$WT" diff --binary --full-index --cached -- \
+    > "$capture_dir/staged.patch" || return 1
+  git -C "$WT" diff --binary --full-index -- \
+    > "$capture_dir/unstaged.patch" || return 1
+  git -C "$WT" ls-files --others --exclude-standard -z -- \
+    > "$all_untracked" || return 1
+  filter_preservable_untracked_paths \
+    "$all_untracked" "$capture_dir/untracked.paths" || return 1
+  rm -f "$all_untracked"
+
+  python3 - "$WT" "$capture_dir" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+import tarfile
+
+root, capture = sys.argv[1:]
+with open(os.path.join(capture, "untracked.paths"), "rb") as stream:
+    paths = [item.decode("utf-8", "surrogateescape") for item in stream.read().split(b"\0") if item]
+
+def snapshot(path):
+    metadata = os.lstat(path)
+    record = {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "size": metadata.st_size,
+    }
+    if stat.S_ISREG(metadata.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise OSError(f"untracked file identity changed: {path}")
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        record["sha256"] = digest.hexdigest()
+    elif stat.S_ISLNK(metadata.st_mode):
+        record["target"] = os.readlink(path)
+    return record
+
+manifest = []
+archive_path = os.path.join(capture, "untracked.tar")
+with tarfile.open(archive_path, "w", dereference=False) as archive:
+    for relative in paths:
+        normalized = os.path.normpath(relative)
+        if (
+            not relative
+            or os.path.isabs(relative)
+            or normalized == os.pardir
+            or normalized.startswith(os.pardir + os.sep)
+        ):
+            raise OSError(f"unsafe untracked path: {relative!r}")
+        source = os.path.join(root, relative)
+        before = snapshot(source)
+        archive.add(source, arcname=relative, recursive=False)
+        after = snapshot(source)
+        if before != after:
+            raise OSError(f"untracked file changed during capture: {relative}")
+        manifest.append({"path": relative, **before})
+
+with open(os.path.join(capture, "untracked.txt"), "w", encoding="utf-8") as stream:
+    for relative in paths:
+        stream.write(json.dumps(relative, ensure_ascii=False) + "\n")
+with open(os.path.join(capture, "untracked-manifest.json"), "w", encoding="utf-8") as stream:
+    json.dump(manifest, stream, indent=2, ensure_ascii=False)
+    stream.write("\n")
+PY
+  capture_preserved_tracked_snapshot "$capture_dir" || return 1
+  verify_preserved_tracked_capture "$capture_dir" || return 1
+  : > "$capture_dir/capture-complete"
+  PRESERVED_SCRATCH_CAPTURE=$capture_dir
+}
+
+capture_preserved_tracked_snapshot() {
+  local capture_dir=$1
+  git -C "$WT" ls-files --stage -v -z -- \
+    > "$capture_dir/tracked-index.snapshot" || return 1
+  git -C "$WT" ls-files -z -- \
+    > "$capture_dir/tracked.paths" || return 1
+  python3 - "$WT" "$capture_dir/tracked.paths" \
+    "$capture_dir/tracked-manifest.json" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root, paths_file, manifest_file = sys.argv[1:]
+with open(paths_file, "rb") as stream:
+    paths = [
+        item.decode("utf-8", "surrogateescape")
+        for item in stream.read().split(b"\0")
+        if item
+    ]
+
+def snapshot(relative):
+    path = os.path.join(root, relative)
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return {"path": relative, "missing": True}
+    record = {
+        "path": relative,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "size": metadata.st_size,
+    }
+    if stat.S_ISREG(metadata.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise OSError(f"tracked file identity changed: {relative}")
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        record["sha256"] = digest.hexdigest()
+    elif stat.S_ISLNK(metadata.st_mode):
+        record["target"] = os.readlink(path)
+    return record
+
+with open(manifest_file, "w", encoding="utf-8") as stream:
+    json.dump([snapshot(path) for path in paths], stream, indent=2)
+    stream.write("\n")
+PY
+}
+
+verify_preserved_tracked_index_snapshot() {
+  local capture_dir=$1 current_index
+  current_index="$capture_dir/.tracked-index.current"
+  git -C "$WT" ls-files --stage -v -z -- > "$current_index" || return 1
+  cmp -s "$capture_dir/tracked-index.snapshot" "$current_index" || {
+    rm -f "$current_index"
+    echo "REFUSED: tracked index changed after scratch capture." >&2
+    return 1
+  }
+  rm -f "$current_index"
+}
+
+verify_preserved_tracked_snapshot() {
+  local capture_dir=$1
+  verify_preserved_tracked_index_snapshot "$capture_dir" || return 1
+  python3 - "$WT" "$capture_dir/tracked-manifest.json" <<'PY' || return 1
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root, manifest_file = sys.argv[1:]
+with open(manifest_file, encoding="utf-8") as stream:
+    manifest = json.load(stream)
+
+def snapshot(relative):
+    path = os.path.join(root, relative)
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return {"path": relative, "missing": True}
+    record = {
+        "path": relative,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "size": metadata.st_size,
+    }
+    if stat.S_ISREG(metadata.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise OSError(f"tracked file identity changed: {relative}")
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        record["sha256"] = digest.hexdigest()
+    elif stat.S_ISLNK(metadata.st_mode):
+        record["target"] = os.readlink(path)
+    return record
+
+for expected in manifest:
+    if snapshot(expected["path"]) != expected:
+        raise OSError(
+            f"tracked working-tree file changed after capture: "
+            f"{expected['path']}"
+        )
+PY
+  verify_preserved_tracked_index_snapshot "$capture_dir"
+}
+
+verify_preserved_tracked_capture() {
+  local capture_dir=$1 candidate patch
+  for patch in tracked staged unstaged; do
+    candidate="$capture_dir/.$patch.current"
+    case "$patch" in
+      tracked)
+        git -C "$WT" diff --binary --full-index HEAD -- > "$candidate" \
+          || return 1
+        ;;
+      staged)
+        git -C "$WT" diff --binary --full-index --cached -- > "$candidate" \
+          || return 1
+        ;;
+      unstaged)
+        git -C "$WT" diff --binary --full-index -- > "$candidate" \
+          || return 1
+        ;;
+    esac
+    cmp -s "$capture_dir/$patch.patch" "$candidate" || {
+      rm -f "$candidate"
+      echo "REFUSED: tracked work changed during scratch capture." >&2
+      return 1
+    }
+    rm -f "$candidate"
+  done
+  verify_preserved_tracked_snapshot "$capture_dir"
+}
+
+verify_preserved_untracked_snapshot() {
+  local capture_dir=$1
+  python3 - "$WT" "$capture_dir/untracked-manifest.json" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root, manifest_path = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as stream:
+    manifest = json.load(stream)
+for expected in manifest:
+    path = os.path.join(root, expected["path"])
+    metadata = os.lstat(path)
+    actual = {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "size": metadata.st_size,
+    }
+    if stat.S_ISREG(metadata.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        actual["sha256"] = digest.hexdigest()
+    elif stat.S_ISLNK(metadata.st_mode):
+        actual["target"] = os.readlink(path)
+    comparison = {key: expected[key] for key in actual}
+    if actual != comparison:
+        raise OSError(f"untracked file changed after capture: {expected['path']}")
+PY
+}
+
+clean_preserved_worktree_scratch() {
+  local capture_dir=$1 path
+  [ -f "$capture_dir/capture-complete" ] || return 1
+  verify_preserved_untracked_snapshot "$capture_dir" || return 1
+  verify_preserved_tracked_snapshot "$capture_dir" || return 1
+  git -C "$WT" reset --hard HEAD >/dev/null || return 1
+  while IFS= read -r -d '' path; do
+    git -C "$WT" clean -fd -- "$path" >/dev/null || return 1
+  done < "$capture_dir/untracked.paths"
+}
+
+prepare_preserved_worktree_scratch_locked() {
+  local dirty_raw dirty
+  validate_teardown_target_identity || return 1
+  [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 0 ] || {
+    echo "REFUSED: --preserve-scratch cannot mutate an already-returned Treehouse worktree." >&2
+    return 1
+  }
+  validate_worktree_stash_absent || return 1
+  dirty_raw=$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>/dev/null) || {
+    echo "REFUSED: cannot inspect worktree $WT before scratch preservation." >&2
+    return 1
+  }
+  dirty=$(printf '%s\n' "$dirty_raw" | first_actionable_dirty_status || true)
+  [ -n "$dirty" ] || return 0
+  validate_worktree_committed_landing || return 1
+  PRESERVED_SCRATCH_CAPTURE=
+  capture_worktree_scratch || {
+    echo "REFUSED: failed to capture worktree scratch; no cleanup was attempted." >&2
+    return 1
+  }
+  clean_preserved_worktree_scratch "$PRESERVED_SCRATCH_CAPTURE" || {
+    echo "REFUSED: preserved scratch but could not safely clean the worktree." >&2
+    echo "Scratch capture: $PRESERVED_SCRATCH_CAPTURE" >&2
+    return 1
+  }
+  validate_worktree_teardown_safety || {
+    echo "REFUSED: worktree changed after scratch preservation; retaining it." >&2
+    echo "Scratch capture: $PRESERVED_SCRATCH_CAPTURE" >&2
+    return 1
+  }
+  echo "teardown: preserved worktree scratch at $PRESERVED_SCRATCH_CAPTURE"
+}
+
+prepare_preserved_worktree_scratch() {
+  fm_checkout_lock_run \
+    "$WT" "$CHECKOUT_LOCK_ROOT" prepare_preserved_worktree_scratch_locked
 }
 
 validate_child_worktree_landed_state() {
@@ -1651,6 +2176,17 @@ validate_firstmate_operational_dirs_for_removal() {
     fi
     if [ -z "$abs_dir" ] || ! path_is_ancestor_of "$abs_home" "$abs_dir"; then
       echo "REFUSED: unsafe $label $name directory $dir resolves outside the secondmate home" >&2
+      return 1
+    fi
+    # Refuse a symlinked operational directory outright, even one resolving inside
+    # the home. Teardown is destructive and proves what it deletes by exact physical
+    # identity - canonical paths and device:inode checks - and a symlink is precisely
+    # what makes the logical path differ from the physical target it would delete.
+    # secondmate_state_metadata already refuses any symlinked state directory for
+    # that reason; this closes the same hole for the other three instead of
+    # permitting a hazardous degree of freedom nothing asks for.
+    if [ -L "$dir" ]; then
+      echo "REFUSED: unsafe $label $name path $dir is a symlink to $abs_dir; teardown removes only physical directories it can prove by identity" >&2
       return 1
     fi
   done
@@ -2372,7 +2908,7 @@ def confined(path):
     except ValueError:
         return False
 
-def retain(path, expected_directory):
+def retain(path, expected_directory, hold_file=False):
     metadata = os.lstat(path)
     if stat.S_ISLNK(metadata.st_mode):
         raise OSError(f"redirected object storage entry: {path}")
@@ -2405,14 +2941,20 @@ def retain(path, expected_directory):
     if confined(os.path.realpath(path)):
         os.close(descriptor)
         raise OSError(f"object storage depends on retiring home: {path}")
+    if not expected_directory and not hold_file:
+        os.close(descriptor)
+        descriptor = None
     held.append((path, descriptor, expected))
     return descriptor, opened
 
 def inspect(objects):
     objects = os.path.normpath(objects)
     directory, metadata = retain(objects, True)
+    held_index = len(held) - 1
     identity = (metadata.st_dev, metadata.st_ino)
     if identity in visited:
+        os.close(directory)
+        held.pop()
         return
     visited.add(identity)
     object_device = metadata.st_dev
@@ -2434,8 +2976,11 @@ def inspect(objects):
     if os.path.lexists(http_alternates):
         raise OSError(f"HTTP alternates are not durable proof: {http_alternates}")
     if not os.path.lexists(alternates):
+        if objects != initial:
+            os.close(directory)
+            held[held_index] = (objects, None, held[held_index][2])
         return
-    alternate_fd, _ = retain(alternates, False)
+    alternate_fd, _ = retain(alternates, False, True)
     with os.fdopen(os.dup(alternate_fd), "r", encoding="utf-8") as stream:
         entries = [line.rstrip("\n") for line in stream]
     if not entries or any(not entry or "\x00" in entry for entry in entries):
@@ -2445,6 +2990,9 @@ def inspect(objects):
             raise OSError(f"quoted alternates are ambiguous: {alternates}")
         candidate = entry if os.path.isabs(entry) else os.path.join(objects, entry)
         inspect(os.path.realpath(candidate))
+    if objects != initial:
+        os.close(directory)
+        held[held_index] = (objects, None, held[held_index][2])
 
 def verify_retained():
     for path, descriptor, expected in held:
@@ -2455,13 +3003,15 @@ def verify_retained():
             stat.S_IFMT(metadata.st_mode),
             metadata.st_size,
         )
-        opened = os.fstat(descriptor)
-        retained = (
-            opened.st_dev,
-            opened.st_ino,
-            stat.S_IFMT(opened.st_mode),
-            opened.st_size,
-        )
+        retained = expected
+        if descriptor is not None:
+            opened = os.fstat(descriptor)
+            retained = (
+                opened.st_dev,
+                opened.st_ino,
+                stat.S_IFMT(opened.st_mode),
+                opened.st_size,
+            )
         if current != expected or retained != expected or stat.S_ISLNK(metadata.st_mode):
             raise OSError(f"object storage identity changed during graph proof: {path}")
 
@@ -2547,7 +3097,8 @@ except (OSError, UnicodeError, subprocess.SubprocessError) as error:
     raise SystemExit(1)
 finally:
     for _, descriptor, _ in reversed(held):
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 PY
 }
 
@@ -2762,13 +3313,24 @@ EOF
 }
 
 validate_surviving_repository_authority() {
-  local repository=$1 bare
+  local repository=$1 container=${3:-$1} bare
   bare=$(git -C "$repository" rev-parse --is-bare-repository 2>/dev/null) || return 1
   if [ "$bare" = true ]; then
     validate_surviving_repository_authority_locked "$@"
     return
   fi
-  fm_checkout_lock_run "$repository" "$CHECKOUT_LOCK_ROOT" \
+  # Serialize on the enclosing CONTAINER checkout, not on the nested repository
+  # itself. The proof below is read-only; the lock exists so a concurrent checkout
+  # mutation cannot invalidate it, and the container is the checkout that
+  # enumeration walked and whose mutation is the hazard. It is also the only shape
+  # that can be keyed: a submodule's .git is a gitlink FILE whose absolute git dir
+  # IS its common dir (verified with git 2.50.1: <super>/.git/modules/<path>), and
+  # `git worktree list` run inside one reports that git dir rather than the working
+  # tree, so fm_checkout_validate_git_metadata's registered-worktree assertion can
+  # never hold for it and the lock identity was simply unresolvable - which refused
+  # every retirement of a home whose project carries a submodule. For a top-level
+  # repository the container IS the repository, so that path is unchanged.
+  fm_checkout_lock_run "$container" "$CHECKOUT_LOCK_ROOT" \
     validate_surviving_repository_authority_locked "$@"
 }
 
@@ -3116,28 +3678,36 @@ except OSError:
 PY
 }
 
-secondmate_linked_worktree_is_recorded_child() {
-  local retiring_home=$1 repository=$2 linked_worktree=$3 child_metas child_meta child_kind child_project child_worktree
-  child_metas=$(secondmate_state_metadata "$retiring_home") || return 1
-  while IFS= read -r child_meta; do
-    [ -n "$child_meta" ] || continue
-    child_kind=$(meta_value "$child_meta" kind)
-    [ -n "$child_kind" ] || child_kind=ship
-    [ "$child_kind" != secondmate ] || continue
-    child_project=$(meta_value "$child_meta" project)
-    child_worktree=$(meta_value "$child_meta" worktree)
-    [ "$(fm_checkout_trusted_dir "$child_project" 2>/dev/null)" = "$repository" ] || continue
-    [ "$(fm_checkout_trusted_dir "$child_worktree" 2>/dev/null)" = "$linked_worktree" ] || continue
-    return 0
+# registered_child_project_worktrees: the canonical worktree path of every child
+# REGISTERED in <retiring-home>'s own state whose recorded project resolves to
+# <repository>, one per line. This is the only thing that may vouch for a linked
+# worktree of a secondmate's project clone (see
+# validate_secondmate_repository_worktree_graph). Attribution is deliberately
+# narrow: a child must record BOTH a worktree and a project, the project must
+# resolve to exactly this repository, and both paths are canonicalized before
+# comparison, so an arbitrary or unattributable worktree can never be admitted.
+# Fails closed - an unenumerable state directory is an error, never an empty set.
+registered_child_project_worktrees() {  # <retiring-home> <repository>
+  local home=$1 repository=$2 metas meta child_worktree child_project canonical
+  metas=$(secondmate_state_metadata "$home") || return 1
+  while IFS= read -r meta; do
+    [ -n "$meta" ] || continue
+    child_worktree=$(meta_value "$meta" worktree)
+    child_project=$(meta_value "$meta" project)
+    [ -n "$child_worktree" ] && [ -n "$child_project" ] || continue
+    child_project=$(fm_checkout_trusted_dir "$child_project" 2>/dev/null) || continue
+    [ "$child_project" = "$repository" ] || continue
+    canonical=$(fm_checkout_trusted_dir "$child_worktree" 2>/dev/null) || continue
+    printf '%s\n' "$canonical"
   done <<EOF
-$child_metas
+$metas
 EOF
-  return 1
 }
 
 validate_secondmate_repository_worktree_graph() {
   local repository=$1 retiring_home=$2 repository_container=${3:-$1}
   local common listed records path kind canonical count=0 bare_repository container_git submodule_admin=0
+  local registered_worktrees
   bare_repository=$(git -C "$repository" rev-parse --is-bare-repository 2>/dev/null) || return 1
   common=$(git -C "$repository" rev-parse --git-common-dir 2>/dev/null) || return 1
   case "$common" in /*) ;; *) common="$repository/$common" ;; esac
@@ -3156,6 +3726,17 @@ validate_secondmate_repository_worktree_graph() {
   fi
   listed=$(git -C "$repository" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || {
     echo "REFUSED: secondmate project linked-worktree graph is uninspectable at $repository" >&2
+    return 1
+  }
+  # A secondmate holds its project CLONES under home/projects while its crewmates'
+  # worktrees live outside in the Treehouse pool as LINKED worktrees of those
+  # clones - the ordinary running state of any secondmate with live crewmates. So
+  # this graph admits a linked worktree that a REGISTERED child of this home owns,
+  # and nothing else. It stays a pre-destruction guard: an unregistered, foreign,
+  # or unattributable worktree still refuses retirement here, before anything is
+  # removed.
+  registered_worktrees=$(registered_child_project_worktrees "$retiring_home" "$repository") || {
+    echo "REFUSED: secondmate child registration is unprovable while proving linked-worktree ownership at $repository" >&2
     return 1
   }
   records=$(printf '%s\n' "$listed" | awk '
@@ -3200,10 +3781,12 @@ validate_secondmate_repository_worktree_graph() {
         fi
         ;;
       worktree)
-        count=$((count + 1))
         if [ "$canonical" = "$repository" ]; then
-          :
+          count=$((count + 1))
         elif [ "$submodule_admin" -eq 1 ] && [ "$canonical" = "$common" ]; then
+          count=$((count + 1))
+        elif [ -n "$registered_worktrees" ] \
+          && printf '%s\n' "$registered_worktrees" | grep -qxF -- "$canonical"; then
           :
         elif secondmate_linked_worktree_is_recorded_child "$retiring_home" "$repository" "$canonical"; then
           count=$((count - 1))
@@ -3369,6 +3952,7 @@ EOF
 
 validate_secondmate_project_clones() {
   local home=$1 registry=$2 expected_id=$3 expected_source=$4 projects_root source_projects_root
+  local source_projects_candidate
   local expected listed project clone source_clone repositories relative repository source_repository
   if ! expected=$(fm_secondmate_registry_query "$registry" query "$expected_id" projects); then
     if [ "$registry" = "$PREPARED_REGISTRY_PATH" ] \
@@ -3415,13 +3999,20 @@ PY
     echo "REFUSED: secondmate project clones do not exactly match the registration for $expected_id" >&2
     return 1
   }
-  if [ "$expected_source" = "$FM_ROOT" ] && [ -n "${FM_PROJECTS_OVERRIDE:-}" ]; then
-    source_projects_root=$FM_PROJECTS_OVERRIDE
+  # When the source IS this firstmate's own repo, its projects live wherever THIS
+  # home puts them, exactly as the registry lookup above resolves through $DATA
+  # rather than "$expected_source/data". Requiring FM_PROJECTS_OVERRIDE to be set
+  # here meant that with FM_HOME pointing at a home outside the repo - the
+  # documented multi-home layout - teardown looked for the parent's clones in the
+  # repo root, found nothing, and refused to retire any secondmate.
+  # A source that is NOT this repo is a foreign home, so it keeps its own layout.
+  if [ "$expected_source" = "$FM_ROOT" ]; then
+    source_projects_candidate=$PROJECTS
   else
-    source_projects_root="$expected_source/projects"
+    source_projects_candidate="$expected_source/projects"
   fi
-  source_projects_root=$(fm_checkout_trusted_dir "$source_projects_root") || {
-    echo "REFUSED: registered source projects are unavailable or redirected at $source_projects_root" >&2
+  source_projects_root=$(fm_checkout_trusted_dir "$source_projects_candidate") || {
+    echo "REFUSED: registered source projects are unavailable or redirected at $source_projects_candidate" >&2
     return 1
   }
   while IFS= read -r project; do
@@ -3489,6 +4080,11 @@ validate_firstmate_home_for_removal() {
     return 1
   }
   validate_firstmate_home_repository_identity "$abs_home_path" "$expected_source" || return 1
+  # The operational-directory proof is the most specific statement available about a
+  # structurally broken home, and it is read-only, so it speaks before the proofs
+  # below - all of which also read the home's state directory and would otherwise
+  # answer first with a vaguer reason for the same underlying fault.
+  validate_firstmate_operational_dirs_for_removal "$abs_home_path" "$label" || return 1
   if [ "$source_authority" -eq 1 ]; then
     validate_surviving_repository_authority \
       "$expected_source" "$abs_home_path" "$expected_source" \
@@ -3497,12 +4093,21 @@ validate_firstmate_home_for_removal() {
   if [ -n "$expected_id" ] && firstmate_home_has_treehouse_slot "$abs_home_path" "$expected_source"; then
     require_treehouse_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
-  validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
+  # Structural proofs run BEFORE the landed-state (cleanliness) proof. Every proof
+  # here is read-only and every one of them already runs before any destruction, so
+  # this only decides which refusal an operator is shown first - not whether any
+  # check happens. It matters because a structural violation manifests as untracked
+  # content: an operational directory symlinked out of the home, or a nested home
+  # inside it, both surface to `git status` as untracked paths, so the cleanliness
+  # proof used to answer first and report "has unlanded changes: ?? state" for a
+  # problem that has nothing to do with unlanded work. The more specific proof now
+  # speaks first. Each still returns non-zero on its own failure, so a home with
+  # both a structural violation and genuinely unlanded work is still refused.
   if [ -n "$expected_id" ]; then
     validate_secondmate_project_clones \
       "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
   fi
-  validate_firstmate_operational_dirs_for_removal "$abs_home_path" "$label" || return 1
+  validate_secondmate_home_landed_state "$abs_home_path" "$expected_source" || return 1
   secondmate_state_metadata "$abs_home_path" >/dev/null || return 1
   fm_secondmate_registry_query "$abs_home_path/data/secondmates.md" validate >/dev/null || {
     echo "REFUSED: child secondmate registry is malformed or uninspectable at $abs_home_path/data/secondmates.md" >&2
@@ -3733,7 +4338,12 @@ cleanup_firstmate_home_children() {
     fi
     if [ "$child_kind" = secondmate ]; then
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home" || return 1
+        # Preserve the nested cleanup's own status: the retry-able checkout
+        # conditions below (75 contention, 76 unverified process cleanup, 124
+        # timeout, 127 Treehouse unavailable, or the return command's own status)
+        # are how an operator tells "retry this" from a safety refusal, and
+        # flattening them all to 1 would erase that distinction at every level.
+        cleanup_firstmate_home_children "$child_home" || return $?
         child_registry_lock=$(fm_secondmate_registry_lock_acquire "$CHECKOUT_LOCK_ROOT" "$home/data/secondmates.md") || return 1
         TEARDOWN_ACCOUNT_LOCKS+=("$child_registry_lock")
         validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" >/dev/null || return 1
@@ -3967,6 +4577,17 @@ if [ "$KIND" = secondmate ]; then
     >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+  else
+    # Prove the home registers no child homes BEFORE stopping its endpoint. Stopping
+    # a supervisor is irreversible - it cannot be un-stopped and its in-flight context
+    # is gone - so a read-only proof that gates it must run first, or an operator loses
+    # a live secondmate to a teardown that was always going to refuse. The same proof
+    # still runs at its original place below, so nothing is skipped.
+    # Non-force only, deliberately: on the --force path cleanup_firstmate_home_children
+    # removes child registry entries before the later check, so that check legitimately
+    # observes post-cleanup state and hoisting it there would change what it observes,
+    # not merely when it runs.
+    require_empty_secondmate_registry "$HOME_PATH" || exit 1
   fi
   quiesce_secondmate_endpoint || exit 1
   if [ "$FORCE" = "--force" ]; then
@@ -3983,7 +4604,7 @@ if [ "$KIND" = secondmate ]; then
   fi
 fi
 
-if [ "$KIND" = scout ]; then
+if [ "$KIND" = scout ] && [ "$SPAWN_NEVER_LAUNCHED" != 1 ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
     echo "REFUSED: scout task $ID has no report at $REPORT." >&2
@@ -4098,6 +4719,18 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
+if [ "$PRESERVE_SCRATCH" -eq 1 ] && [ -d "$WT" ]; then
+  [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 0 ] || {
+    echo "REFUSED: --preserve-scratch cannot mutate an already-returned Treehouse worktree." >&2
+    post_quiescence_safety_refusal
+    exit 1
+  }
+  prepare_preserved_worktree_scratch || {
+    post_quiescence_safety_refusal
+    exit 1
+  }
+fi
+
 if [ -d "$WT" ]; then
   if validate_worktree_teardown_safety; then
     :
@@ -4115,7 +4748,7 @@ fi
 
 # Report-gated tasks restore any pending rollback generation and fail closed on
 # their machine-global completion report before lease release or worktree removal.
-if [ "$REPORT_GATED" = 1 ]; then
+if [ "$REPORT_GATED" = 1 ] && [ "$SPAWN_NEVER_LAUNCHED" != 1 ]; then
   if [ "$MANAGED_ACCOUNT" = 1 ]; then
     reconcile_managed_account_rollback "$META" "$ID" "$DATA" || exit $?
   fi
@@ -4128,7 +4761,7 @@ if [ "$MANAGED_ACCOUNT" = 1 ]; then
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH" || exit 1
+  cleanup_firstmate_home_children "$HOME_PATH" || exit $?
 fi
 
 [ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
@@ -4153,6 +4786,20 @@ remove_orca_worktree_locked() {
   remove_worktree_compatibility_artifacts "$WT" "removed Orca worktree"
 }
 
+validate_returned_worktree_bookkeeping_locked() {
+  validate_teardown_target_identity || return 1
+  [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 1 ] || {
+    echo "error: Treehouse lease state changed before returned-worktree bookkeeping" >&2
+    return 1
+  }
+  validate_worktree_teardown_safety || return 1
+  validate_teardown_target_identity || return 1
+  [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 1 ] || {
+    echo "error: Treehouse lease state changed during returned-worktree bookkeeping" >&2
+    return 1
+  }
+}
+
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
@@ -4160,18 +4807,23 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_orca_worktree_locked || exit 1
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. teardown_treehouse_return tolerates transient and stale git locks
-  # left by a killed crewmate process; see the script header for retry and stale-lock proof.
-  post_lock_cleanup_check=
-  if [ "$KIND" != secondmate ]; then
-    post_lock_cleanup_check=validate_worktree_teardown_safety
+  if [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 1 ]; then
+    fm_checkout_lock_run \
+      "$WT" "$CHECKOUT_LOCK_ROOT" validate_returned_worktree_bookkeeping_locked \
+      || exit 1
+    echo "teardown: worktree lease was already returned; landed-work proof passed and bookkeeping will be cleared"
+  else
+    # Kills remaining processes in the worktree (including the agent), resets,
+    # and returns it to the pool. Treehouse resolves the pool from the working
+    # directory, so run it from the project.
+    # teardown_treehouse_return tolerates transient and stale git locks left by
+    # a killed crewmate process; see the script header for the retry proof.
+    post_lock_cleanup_check=validate_worktree_teardown_safety_and_summarize_ignored
+    teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree || {
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      exit 1
+    }
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-    exit 1
-  }
 fi
 
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then

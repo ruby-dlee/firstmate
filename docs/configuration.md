@@ -195,6 +195,12 @@ Claude's config-directory-specific macOS Keychain credential is not currently di
 For candidates with prior Keychain approval, Claude treats missing quota as unreadable rather than unhealthy, rotates across eligible accounts in stable bytewise order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
 The rotation cursor is persisted under the passwd user's `.local/state/firstmate/account-directory/` and guarded by an advisory lock, so concurrent selectors spread across the same deterministic candidate sequence instead of racing to its first element.
 
+For a direct-account ship or scout that later reaches verified account-scoped capacity, the watcher reuses `--recover-direct-account` and excludes the current account plus every account that task previously exhausted.
+The current account-scoped classifier covers Claude session exhaustion, so rescue advances through unused Claude directories because per-directory quota remains unreadable.
+Codex model capacity instead surfaces once without endpoint removal, account rotation, or account-rescue metadata.
+Account handoff is attempt-capped and stops durably instead of retrying when no unused eligible account remains.
+[Automatic account-capacity rescue](account-capacity-rescue.md) owns the signatures, audit metadata, default bound, and failure transaction.
+
 Account routing remains default-off.
 An unchanged installation does not select an account directory, does not alter the provider launch, and adds no account field to task metadata.
 The production mode resolves in this order: explicit `--account-pool` or `--account-profile` enforces routing for that spawn, emergency `--no-account-routing` disables it for that spawn, the single value in local `config/account-routing-mode`, then `off`.

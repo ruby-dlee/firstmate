@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Select and prepare direct Claude or Codex account-directory launches.
 # Usage:
-#   fm-account-directory.sh select <claude|codex>
+#   fm-account-directory.sh select <claude|codex> [excluded-account-home...]
 #   fm-account-directory.sh install-herdr-hook <claude|codex> <account-home>
-#   fm-account-directory.sh prepare <claude|codex>
+#   fm-account-directory.sh prepare <claude|codex> [excluded-account-home...]
 #
 # This header is the single owner of the direct account-directory contract.
 # FM_ACCOUNT_DIRECTORY_CUTOVER: direct-pool-rotation-v3
@@ -24,7 +24,8 @@
 # Codex selection removes that account's quota-axi window cache immediately
 # before every read, sets CODEX_HOME plus the account-isolated XDG_CACHE_HOME,
 # accepts only a fresh result with at least one numeric five_hour or weekly
-# window, and finds the accounts with the highest minimum remaining percentage.
+# window, excludes task-exhausted and zero-capacity accounts during rescue, and
+# finds the accounts with the highest minimum remaining percentage.
 # Accounts without a freshly readable window do not participate in quota
 # ranking while any readable account remains.
 # If every eligible Codex account lacks a readable window, selection degrades
@@ -313,6 +314,15 @@ valid_account_home() { # <vendor-dir> <candidate>
   case "$name" in
     ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
+}
+
+account_home_is_excluded() { # <candidate> [excluded-account-home...]
+  local candidate=$1 excluded
+  shift
+  for excluded in "$@"; do
+    [ "$candidate" != "$excluded" ] || return 0
+  done
+  return 1
 }
 
 valid_pool_id() {
@@ -645,11 +655,13 @@ $1
 EOF
 }
 
-select_codex() {
+select_codex() { # [excluded-account-home...]
   local pool quota_bin candidate usage score selected eligible
   local best_score=''
   local -a best_homes=()
   local -a candidates=()
+  local -a unavailable_homes=()
+  local excluded_count=$#
   pool=$(crew_pool codex) || return 1
   eligible=$(eligible_account_homes codex "$pool") || return 1
   while IFS= read -r candidate; do
@@ -670,10 +682,19 @@ EOF
   LC_ALL=C
   export LC_ALL
   for candidate in "${candidates[@]}"; do
+    if account_home_is_excluded "$candidate" "$@"; then
+      log "codex account $candidate skipped: exhausted by this task"
+      continue
+    fi
     usage=$(fresh_codex_usage_json "$candidate" "$quota_bin") || usage=
     score=$(codex_score "$usage") || score=
     if [ -z "$score" ]; then
       log "codex account $candidate skipped: no freshly readable usage window"
+      unavailable_homes+=("$candidate")
+      continue
+    fi
+    if ! awk -v candidate_score="$score" 'BEGIN { exit !(candidate_score > 0) }'; then
+      log "codex account $candidate skipped: fresh remaining score=$score has no capacity"
       continue
     fi
     log "codex account $candidate fresh remaining score=$score"
@@ -687,23 +708,32 @@ EOF
     fi
   done
   if [ "${#best_homes[@]}" -eq 0 ]; then
-    selected=$(rotate_account_home codex "$pool" "${candidates[@]}") || return 1
-    log "CODEX USAGE UNAVAILABLE: no eligible account has a freshly readable usage window; round-robin selection across ${#candidates[@]} eligible $pool accounts chose $selected"
-    printf '%s\n' "$selected"
-    return 0
+    if [ "$excluded_count" -eq 0 ] && [ "${#unavailable_homes[@]}" -gt 0 ]; then
+      selected=$(rotate_account_home codex "$pool" "${unavailable_homes[@]}") || return 1
+      log "CODEX USAGE UNAVAILABLE: no eligible account has a freshly readable usage window; round-robin selection across ${#unavailable_homes[@]} eligible $pool accounts chose $selected"
+      printf '%s\n' "$selected"
+      return 0
+    fi
+    echo "CAPACITY_UNAVAILABLE: no unused Codex account has a freshly readable positive usage window" >&2
+    return 1
   fi
   selected=$(rotate_account_home codex "$pool" "${best_homes[@]}") || return 1
   log "selected codex account $selected with fresh remaining score=$best_score; round-robin among ${#best_homes[@]} tied accounts"
   printf '%s\n' "$selected"
 }
 
-select_claude() {
+select_claude() { # [excluded-account-home...]
   local pool fallback_pool selected eligible candidate
   local -a candidates=()
+  local excluded_count=$#
   pool=$(crew_pool claude) || return 1
   eligible=$(eligible_account_homes claude "$pool") || return 1
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
+    if account_home_is_excluded "$candidate" "$@"; then
+      log "claude account $candidate skipped: exhausted by this task"
+      continue
+    fi
     candidates+=("$candidate")
   done <<EOF
 $eligible
@@ -713,6 +743,10 @@ EOF
     eligible=$(eligible_account_homes claude "$fallback_pool") || return 1
     while IFS= read -r candidate; do
       [ -n "$candidate" ] || continue
+      if account_home_is_excluded "$candidate" "$@"; then
+        log "claude account $candidate skipped: exhausted by this task"
+        continue
+      fi
       candidates+=("$candidate")
     done <<EOF
 $eligible
@@ -722,21 +756,27 @@ EOF
       log "CLAUDE LAST RESORT: no usable claude-crew account remains; using the explicitly declared $fallback_pool tier"
     fi
   fi
-  [ "${#candidates[@]}" -gt 0 ] || {
-    echo "error: no usable Claude account directories remain in claude-crew or claude-crew-last-resort; every profile is reserved outside those pools or still needs captain Keychain approval" >&2
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    if [ "$excluded_count" -gt 0 ]; then
+      echo "CAPACITY_UNAVAILABLE: no unused Claude account directories remain in claude-crew or claude-crew-last-resort" >&2
+    else
+      echo "error: no usable Claude account directories remain in claude-crew or claude-crew-last-resort; every profile is reserved outside those pools or still needs captain Keychain approval" >&2
+    fi
     return 1
-  }
+  fi
   selected=$(rotate_account_home claude "$pool" "${candidates[@]}") || return 1
   log "CLAUDE USAGE UNREADABLE: quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS Keychain credential today; round-robin selection across ${#candidates[@]} eligible $pool accounts chose $selected"
   printf '%s\n' "$selected"
 }
 
 select_account() { # <vendor>
-  case "$1" in
-    codex) select_codex ;;
-    claude) select_claude ;;
+  local vendor=$1
+  shift
+  case "$vendor" in
+    codex) select_codex "$@" ;;
+    claude) select_claude "$@" ;;
     *)
-      echo "error: direct account-directory selection supports only claude or codex, not '$1'" >&2
+      echo "error: direct account-directory selection supports only claude or codex, not '$vendor'" >&2
       return 1
       ;;
   esac
@@ -784,17 +824,21 @@ case "${1:-}" in
     exit 0
     ;;
   select)
-    [ "$#" -eq 2 ] || { usage; exit 2; }
-    select_account "$2"
+    [ "$#" -ge 2 ] || { usage; exit 2; }
+    vendor=$2
+    shift 2
+    select_account "$vendor" "$@"
     ;;
   install-herdr-hook)
     [ "$#" -eq 3 ] || { usage; exit 2; }
     install_herdr_hook "$2" "$3"
     ;;
   prepare)
-    [ "$#" -eq 2 ] || { usage; exit 2; }
-    selected_home=$(select_account "$2") || exit 1
-    install_herdr_hook "$2" "$selected_home" || exit 1
+    [ "$#" -ge 2 ] || { usage; exit 2; }
+    vendor=$2
+    shift 2
+    selected_home=$(select_account "$vendor" "$@") || exit 1
+    install_herdr_hook "$vendor" "$selected_home" || exit 1
     printf '%s\n' "$selected_home"
     ;;
   *)

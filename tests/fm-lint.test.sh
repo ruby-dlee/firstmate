@@ -49,6 +49,28 @@ test_owner_defines_canonical_set() {
   pass "fm-lint.sh is the sole authoritative definition at CI-default severity"
 }
 
+test_external_sources_option_uses_explicit_paths() {
+  local tmp fakebin log
+  tmp=$(fm_test_tmproot fm-lint-external)
+  fakebin=$(fm_fakebin "$tmp")
+  log="$tmp/args"
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'version: %s\n' "${FM_TEST_SHELLCHECK_VERSION:?}"
+  exit 0
+fi
+printf '%s\n' "$@" > "${FM_TEST_SHELLCHECK_ARGS:?}"
+SH
+  chmod +x "$fakebin/shellcheck"
+  FM_TEST_SHELLCHECK_VERSION="$REQUIRED" FM_TEST_SHELLCHECK_ARGS="$log" \
+    PATH="$fakebin:$PATH" "$LINT" -x bin/fm-lint.sh tests/fm-lint.test.sh >/dev/null
+  grep -Fqx -- '-x' "$log" || fail "fm-lint.sh -x did not forward external-source analysis"
+  grep -Fqx 'bin/fm-lint.sh' "$log" || fail "fm-lint.sh -x omitted an explicit bin path"
+  grep -Fqx 'tests/fm-lint.test.sh' "$log" || fail "fm-lint.sh -x omitted an explicit test path"
+  pass "fm-lint.sh -x applies external-source analysis to explicit paths"
+}
+
 test_ci_invokes_the_owner() {
   grep -Eq '^      - run: bin/fm-lint\.sh$' "$CI" || fail "CI lint job must invoke the one-owner script as a run step"
   # Guard against regression to an inline re-spelling of the command.
@@ -182,6 +204,7 @@ SH
 
 test_owner_exists_and_executable
 test_owner_defines_canonical_set
+test_external_sources_option_uses_explicit_paths
 test_ci_invokes_the_owner
 test_nomistakes_invokes_the_owner
 test_pins_an_explicit_version

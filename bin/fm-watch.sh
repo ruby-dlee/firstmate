@@ -36,6 +36,11 @@
 #                          status, or turn-end progress surfaces after
 #                          FM_PERMISSION_STALL_ESCALATE_SECS as a possible macOS
 #                          permission/system-dialog block. Unless afk is active.
+#                          A verified Claude/Codex account-capacity pane bypasses
+#                          stale timing: the watcher removes the exhausted
+#                          endpoint and hands the same brief/worktree to a fresh
+#                          direct account automatically. Attempts and exhausted
+#                          accounts are recorded in meta and bounded per task.
 #   check: <script>: <out> per-task check output, always actionable
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
@@ -80,6 +85,11 @@ mkdir -p "$STATE"
 # backstop. See bin/fm-backend.sh and docs/herdr-backend.md.
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# Direct-account recovery serialization and atomic metadata locks. The watcher
+# uses the same task lifecycle lock as spawn/teardown, then hands ownership to
+# fm-spawn.sh for the replacement endpoint.
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # Shared normalized-transition accessors and the single-owner status->action
 # policy table, so the event-wait splice reads transition records the same way
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
@@ -164,6 +174,10 @@ esac
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
 # wedge threshold, but finite so a forgotten pause cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+CAPACITY_RESCUE_MAX_ATTEMPTS=${FM_CAPACITY_RESCUE_MAX_ATTEMPTS:-5}
+case "$CAPACITY_RESCUE_MAX_ATTEMPTS" in
+  ''|*[!0-9]*|0) CAPACITY_RESCUE_MAX_ATTEMPTS=5 ;;
+esac
 case "$PAUSE_RESURFACE_SECS" in
   ''|*[!0-9]*|0) PAUSE_RESURFACE_SECS=$FM_PAUSE_RESURFACE_SECS_DEFAULT ;;
 esac
@@ -446,6 +460,407 @@ surface_nonterminal_stale() {  # <window> <hash>
     clear_pause_state "$win"
   fi
   wake "stale: $win"
+}
+
+# Resolve the spawn entrypoint for an automatic capacity handoff. The override
+# exists only for the hermetic watcher tests; production always invokes the
+# sibling fm-spawn.sh.
+capacity_rescue_spawn_bin() {
+  if [ "${FM_CAPACITY_RESCUE_TEST_LAB:-}" = firstmate-capacity-rescue-test-lab-v1 ] \
+    && [ -n "${FM_CAPACITY_RESCUE_SPAWN_BIN:-}" ]; then
+    printf '%s' "$FM_CAPACITY_RESCUE_SPAWN_BIN"
+  else
+    printf '%s' "$SCRIPT_DIR/fm-spawn.sh"
+  fi
+}
+
+capacity_rescue_meta_begin() {  # <task> <attempt> <harness> <account-home> <failure-kind>
+  local task=$1 attempt=$2 harness=$3 account_home=$4 failure_kind=$5
+  local meta="$STATE/$task.meta" lock tmp timestamp attempt_key
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  tmp=$(mktemp "$STATE/.$task.meta.capacity-rescue.XXXXXX") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  attempt_key="capacity_rescue_attempt_$attempt="
+  if ! awk -v attempt_key="$attempt_key" '
+    index($0, "capacity_rescue_attempts=") == 1 { next }
+    index($0, attempt_key) == 1 { next }
+    { print }
+  ' "$meta" > "$tmp"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! printf 'capacity_rescue_attempts=%s\n' "$attempt" >> "$tmp"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! grep -Fqx "capacity_rescue_exhausted_account=$account_home" "$tmp" \
+    && ! printf 'capacity_rescue_exhausted_account=%s\n' "$account_home" >> "$tmp"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! printf 'capacity_rescue_attempt_%s=%s|harness=%s|account=%s|failure=%s\n' \
+    "$attempt" "$timestamp" "$harness" "$account_home" "$failure_kind" >> "$tmp" \
+    || ! fm_account_safe_file_destination "$meta" \
+    || ! mv "$tmp" "$meta"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  fm_account_meta_lock_release "$lock"
+}
+
+capacity_rescue_meta_result() {  # <task> <attempt> <result>
+  local task=$1 attempt=$2 result=$3
+  local meta="$STATE/$task.meta" lock tmp result_key
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  tmp=$(mktemp "$STATE/.$task.meta.capacity-result.XXXXXX") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  result_key="capacity_rescue_result_$attempt="
+  if ! awk -v result_key="$result_key" '
+      index($0, result_key) == 1 { next }
+      { print }
+    ' "$meta" > "$tmp" \
+    || ! printf 'capacity_rescue_result_%s=%s\n' "$attempt" "$result" >> "$tmp" \
+    || ! fm_account_safe_file_destination "$meta" \
+    || ! mv "$tmp" "$meta"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  fm_account_meta_lock_release "$lock"
+}
+
+capacity_rescue_meta_stop() {  # <task> <reason>
+  local task=$1 reason=$2
+  local meta="$STATE/$task.meta" lock tmp
+  lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || return 1
+  tmp=$(mktemp "$STATE/.$task.meta.capacity-stop.XXXXXX") || {
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! awk 'index($0, "capacity_rescue_stopped=") != 1 { print }' "$meta" > "$tmp" \
+    || ! printf 'capacity_rescue_stopped=%s\n' "$reason" >> "$tmp" \
+    || ! fm_account_safe_file_destination "$meta" \
+    || ! mv "$tmp" "$meta"; then
+    rm -f "$tmp"
+    fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  fi
+  fm_account_meta_lock_release "$lock"
+}
+
+capacity_rescue_append_blocked() {  # <task> <note>
+  local task=$1 note=$2
+  local statusf="$STATE/$task.status"
+  [ ! -L "$statusf" ] && { [ ! -e "$statusf" ] || [ -f "$statusf" ]; } || return 1
+  if [ -f "$statusf" ] \
+    && status_open_decisions "$statusf" | grep -Fq $'capacity-rescue\t'; then
+    return 0
+  fi
+  printf 'blocked [key=capacity-rescue]: %s\n' "$note" >> "$statusf"
+}
+
+model_capacity_append_blocked() {  # <task> <note>
+  local task=$1 note=$2
+  local statusf="$STATE/$task.status"
+  [ ! -L "$statusf" ] && { [ ! -e "$statusf" ] || [ -f "$statusf" ]; } || return 1
+  if [ -f "$statusf" ] \
+    && status_open_decisions "$statusf" | grep -Fq $'model-capacity\t'; then
+    return 1
+  fi
+  printf 'blocked [key=model-capacity]: %s\n' "$note" >> "$statusf"
+}
+
+capacity_rescue_release_lifecycle() {  # <lock>
+  local lock=$1
+  [ -n "$lock" ] || return 0
+  if fm_account_lifecycle_lock_owned "$lock" 2>/dev/null; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+  fi
+}
+
+capacity_rescue_remove_endpoint() {  # <meta> <task>
+  local meta=$1 task=$2 backend target tab scoped endpoint_state
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  tab=$(fm_meta_get "$meta" zellij_tab_id)
+  scoped=$(fm_meta_get "$meta" tmux_session_target)
+  [ -n "$target" ] || return 1
+  fm_backend_kill "$backend" "$target" "$tab" "fm-$task" "$scoped" >/dev/null 2>&1 || true
+  endpoint_state=$(fm_backend_target_state "$backend" "$target" "fm-$task" "$scoped" 2>/dev/null)
+  [ "$endpoint_state" = absent ]
+}
+
+# Reconcile one attempt whose watcher stopped after the durable attempt write but
+# before its terminal stop/result transaction completed. This scans metadata, not
+# live windows, so an interruption after endpoint removal cannot disappear from
+# supervision merely because there is no pane left to classify.
+capacity_rescue_reconcile_terminal_attempt() {
+  local meta task attempts result stopped lock reason note
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    grep -q '^capacity_rescue_attempts=' "$meta" || continue
+    task=${meta##*/}
+    task=${task%.meta}
+    fm_account_valid_id "$task" || continue
+    attempts=$(fm_meta_get "$meta" capacity_rescue_attempts)
+    case "$attempts" in
+      ''|0|*[!0-9]*) continue ;;
+    esac
+    stopped=$(fm_meta_get "$meta" capacity_rescue_stopped)
+    [ -z "$stopped" ] || continue
+    result=$(fm_meta_get "$meta" "capacity_rescue_result_$attempts")
+    case "$result" in
+      rescued\|account=*) continue ;;
+      '')
+        reason=interrupted-attempt
+        note="automatic account rescue stopped because attempt $attempts has no recorded result; inspect the endpoint before any manual recovery"
+        ;;
+      no-capacity|recovery-failed|endpoint-removal-failed|same-account-refused)
+        reason=$result
+        note="automatic account rescue remains stopped after terminal attempt $attempts ($result)"
+        ;;
+      *)
+        reason=invalid-result-metadata
+        note="automatic account rescue stopped because attempt $attempts has invalid result metadata"
+        ;;
+    esac
+
+    lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task" 2>/dev/null || true)
+    [ -n "$lock" ] || continue
+    # Re-read after serialization so a replacement that just committed its
+    # result cannot be mislabeled as interrupted from the earlier snapshot.
+    attempts=$(fm_meta_get "$meta" capacity_rescue_attempts)
+    case "$attempts" in
+      ''|0|*[!0-9]*)
+        capacity_rescue_release_lifecycle "$lock"
+        continue
+        ;;
+    esac
+    stopped=$(fm_meta_get "$meta" capacity_rescue_stopped)
+    result=$(fm_meta_get "$meta" "capacity_rescue_result_$attempts")
+    if [ -n "$stopped" ]; then
+      capacity_rescue_release_lifecycle "$lock"
+      continue
+    fi
+    case "$result" in
+      rescued\|account=*)
+        capacity_rescue_release_lifecycle "$lock"
+        continue
+        ;;
+      '')
+        reason=interrupted-attempt
+        note="automatic account rescue stopped because attempt $attempts has no recorded result; inspect the endpoint before any manual recovery"
+        ;;
+      no-capacity|recovery-failed|endpoint-removal-failed|same-account-refused)
+        reason=$result
+        note="automatic account rescue remains stopped after terminal attempt $attempts ($result)"
+        ;;
+      *)
+        reason=invalid-result-metadata
+        note="automatic account rescue stopped because attempt $attempts has invalid result metadata"
+        ;;
+    esac
+    if ! capacity_rescue_meta_stop "$task" "$reason"; then
+      capacity_rescue_release_lifecycle "$lock"
+      continue
+    fi
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "$note" || true
+    printf '%s\t%s\n' "$task" "$reason"
+    return 0
+  done
+  return 1
+}
+
+# Perform one serialized automatic handoff. Sets CAPACITY_RESCUE_OUTCOME to one
+# of rescued, blocked, already-stopped, or deferred and
+# CAPACITY_RESCUE_REASON to a short audit-safe explanation.
+capacity_rescue_task() {  # <window> <task> <harness> <failure-kind>
+  local win=$1 task=$2 harness=$3 failure_kind=$4
+  local meta="$STATE/$task.meta"
+  local lock='' same_lock='' account_home kind generation attempts stopped attempt spawn_bin out new_account result last_result
+  CAPACITY_RESCUE_OUTCOME=deferred
+  CAPACITY_RESCUE_REASON="capacity rescue could not acquire task ownership"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task") || return 1
+
+  # Re-resolve under lifecycle ownership so a stale pane snapshot cannot mutate
+  # a replacement generation that another lifecycle operation just installed.
+  [ -f "$meta" ] && [ ! -L "$meta" ] || {
+    capacity_rescue_release_lifecycle "$lock"
+    return 1
+  }
+  [ "$(fm_backend_target_of_meta "$meta")" = "$win" ] || {
+    capacity_rescue_release_lifecycle "$lock"
+    CAPACITY_RESCUE_REASON="capacity pane belongs to an obsolete endpoint generation"
+    return 1
+  }
+  kind=$(fm_meta_get "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  account_home=$(fm_meta_get "$meta" account_home)
+  generation=$(fm_meta_get "$meta" generation_id)
+  stopped=$(fm_meta_get "$meta" capacity_rescue_stopped)
+  if [ -n "$stopped" ]; then
+    capacity_rescue_release_lifecycle "$lock"
+    CAPACITY_RESCUE_OUTCOME=already-stopped
+    CAPACITY_RESCUE_REASON=$stopped
+    return 0
+  fi
+  if [ "$kind" != ship ] && [ "$kind" != scout ]; then
+    capacity_rescue_meta_stop "$task" unsupported-kind || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped: task kind '$kind' is not a recoverable ship/scout" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=unsupported-kind
+    return 0
+  fi
+  if [ -z "$account_home" ] || [ -z "$generation" ]; then
+    capacity_rescue_meta_stop "$task" missing-direct-account-metadata || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped: direct account recovery metadata is incomplete" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=missing-direct-account-metadata
+    return 0
+  fi
+  if [ "$failure_kind" = claude-not-logged-in ]; then
+    capacity_rescue_meta_stop "$task" credentials || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue blocked on Claude credentials: run /login for the configured account directories" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=credentials
+    return 0
+  fi
+  attempts=$(fm_meta_get "$meta" capacity_rescue_attempts)
+  case "$attempts" in
+    '') attempts=0 ;;
+    *[!0-9]*)
+      capacity_rescue_meta_stop "$task" invalid-attempt-metadata || true
+      capacity_rescue_remove_endpoint "$meta" "$task" || true
+      capacity_rescue_release_lifecycle "$lock"
+      capacity_rescue_append_blocked "$task" "automatic account rescue stopped: capacity_rescue_attempts metadata is invalid" || true
+      CAPACITY_RESCUE_OUTCOME=blocked
+      CAPACITY_RESCUE_REASON=invalid-attempt-metadata
+      return 0
+      ;;
+  esac
+  if [ "$attempts" -gt 0 ]; then
+    last_result=$(fm_meta_get "$meta" "capacity_rescue_result_$attempts")
+    case "$last_result" in
+      '')
+        capacity_rescue_meta_stop "$task" interrupted-attempt || true
+        capacity_rescue_release_lifecycle "$lock"
+        capacity_rescue_append_blocked "$task" "automatic account rescue stopped because attempt $attempts has no recorded result; inspect the endpoint before any manual recovery" || true
+        CAPACITY_RESCUE_OUTCOME=blocked
+        CAPACITY_RESCUE_REASON=interrupted-attempt
+        return 0
+        ;;
+      no-capacity|recovery-failed|endpoint-removal-failed|same-account-refused)
+        capacity_rescue_meta_stop "$task" "$last_result" || true
+        capacity_rescue_release_lifecycle "$lock"
+        capacity_rescue_append_blocked "$task" "automatic account rescue remains stopped after terminal attempt $attempts ($last_result)" || true
+        CAPACITY_RESCUE_OUTCOME=blocked
+        CAPACITY_RESCUE_REASON=$last_result
+        return 0
+        ;;
+      rescued\|account=*) ;;
+      *)
+        capacity_rescue_meta_stop "$task" invalid-result-metadata || true
+        capacity_rescue_release_lifecycle "$lock"
+        capacity_rescue_append_blocked "$task" "automatic account rescue stopped because attempt $attempts has invalid result metadata" || true
+        CAPACITY_RESCUE_OUTCOME=blocked
+        CAPACITY_RESCUE_REASON=invalid-result-metadata
+        return 0
+        ;;
+    esac
+  fi
+  if [ "$attempts" -ge "$CAPACITY_RESCUE_MAX_ATTEMPTS" ]; then
+    capacity_rescue_meta_stop "$task" max-attempts || true
+    capacity_rescue_remove_endpoint "$meta" "$task" || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped after reaching the per-task cap of $CAPACITY_RESCUE_MAX_ATTEMPTS attempts" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=max-attempts
+    return 0
+  fi
+
+  attempt=$((attempts + 1))
+  capacity_rescue_meta_begin "$task" "$attempt" "$harness" "$account_home" "$failure_kind" || {
+    capacity_rescue_release_lifecycle "$lock"
+    CAPACITY_RESCUE_REASON="capacity rescue could not record attempt $attempt"
+    return 1
+  }
+  if ! capacity_rescue_remove_endpoint "$meta" "$task"; then
+    capacity_rescue_meta_result "$task" "$attempt" endpoint-removal-failed || true
+    capacity_rescue_meta_stop "$task" endpoint-removal-failed || true
+    capacity_rescue_release_lifecycle "$lock"
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped on attempt $attempt because exhausted endpoint removal could not be proved" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=endpoint-removal-failed
+    return 0
+  fi
+
+  spawn_bin=$(capacity_rescue_spawn_bin)
+  if out=$(FM_CAPACITY_RESCUE_RECOVERY=account-exhaustion-v1 \
+    FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$lock" \
+    "$spawn_bin" "$task" --recover-direct-account 2>&1); then
+    result=0
+  else
+    result=$?
+  fi
+  # A real fm-spawn inherits, replaces, and releases the lifecycle lock. A
+  # pre-handoff failure can leave this watcher as owner, so release only when
+  # ownership is still ours.
+  capacity_rescue_release_lifecycle "$lock"
+  lock=
+
+  if [ "$result" -eq 0 ]; then
+    new_account=$(fm_meta_get "$meta" account_home)
+    if [ -z "$new_account" ] || [ "$new_account" = "$account_home" ]; then
+      same_lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task" 2>/dev/null || true)
+      if [ -n "$same_lock" ]; then
+        capacity_rescue_remove_endpoint "$meta" "$task" || true
+        capacity_rescue_release_lifecycle "$same_lock"
+      fi
+      capacity_rescue_meta_result "$task" "$attempt" same-account-refused || true
+      capacity_rescue_meta_stop "$task" same-account-refused || true
+      capacity_rescue_append_blocked "$task" "automatic account rescue stopped on attempt $attempt because replacement did not bind a different account" || true
+      CAPACITY_RESCUE_OUTCOME=blocked
+      CAPACITY_RESCUE_REASON=same-account-refused
+      return 0
+    fi
+    capacity_rescue_meta_result "$task" "$attempt" "rescued|account=$new_account" || {
+      CAPACITY_RESCUE_OUTCOME=deferred
+      CAPACITY_RESCUE_REASON="replacement launched but attempt $attempt result could not be recorded"
+      return 1
+    }
+    CAPACITY_RESCUE_OUTCOME=rescued
+    CAPACITY_RESCUE_REASON="attempt $attempt moved $harness from $account_home to $new_account"
+    return 0
+  fi
+
+  if printf '%s\n' "$out" | grep -Fq 'CAPACITY_UNAVAILABLE:'; then
+    capacity_rescue_meta_result "$task" "$attempt" no-capacity || true
+    capacity_rescue_meta_stop "$task" no-capacity || true
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped on attempt $attempt: no unused $harness account has available capacity" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=no-capacity
+  else
+    capacity_rescue_meta_result "$task" "$attempt" recovery-failed || true
+    capacity_rescue_meta_stop "$task" recovery-failed || true
+    capacity_rescue_append_blocked "$task" "automatic account rescue stopped on attempt $attempt because the guarded direct-account recovery failed" || true
+    CAPACITY_RESCUE_OUTCOME=blocked
+    CAPACITY_RESCUE_REASON=recovery-failed
+  fi
+  return 0
 }
 
 # Recognize the stable confirmation chrome rendered by verified harnesses when a
@@ -1041,6 +1456,16 @@ EOF
     fi
   fi
 
+  terminal_rescue=$(capacity_rescue_reconcile_terminal_attempt || true)
+  if [ -n "$terminal_rescue" ]; then
+    task=${terminal_rescue%%$'\t'*}
+    capacity_failure=${terminal_rescue#*$'\t'}
+    reason="signal: $STATE/$task.status (automatic capacity rescue stopped: $capacity_failure)"
+    fm_wake_append signal "$task.status" "$reason" || exit 1
+    mark_surfaced "$STATE/$task.status"
+    wake "$reason"
+  fi
+
   # Layer 1 backbone: pane staleness. Two consecutive identical hashes with no busy
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
@@ -1067,10 +1492,8 @@ EOF
       mark_brief_processing_started "$task" || true
     fi
     # A declared external wait is its own idle state and must be classified
-    # before every stale fast path. Permission-prompt detection previously ran
-    # first, so a permission-shaped Herdr pane woke on every changing capture
-    # without ever creating .paused-<key>. Authoritative working state still
-    # outranks a stale paused log and falls through to ordinary stale handling.
+    # before every stale fast path. Authoritative working state still outranks
+    # a stale paused log and falls through to ordinary stale handling.
     if ! afk_present && [ "$window_busy" != 1 ] && status_is_paused "$last"; then
       case "$(pause_state_class "$w" "$task")" in
         paused)
@@ -1082,6 +1505,71 @@ EOF
           ;;
         *)
           clear_pause_tracking "$w"
+          ;;
+      esac
+    fi
+    capacity_failure=
+    credential_failure=
+    if [ "$window_busy" != 1 ]; then
+      case "$kind" in
+        ship|scout)
+          credential_failure=$(provider_credential_failure_kind "$(window_harness "$w")" "$tail40" || true)
+          capacity_failure=$(provider_capacity_failure_kind "$(window_harness "$w")" "$tail40" || true)
+          ;;
+      esac
+    fi
+    if [ -n "$credential_failure" ]; then
+      capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$credential_failure" || true
+      case "$CAPACITY_RESCUE_OUTCOME" in
+        already-stopped)
+          triage_log "account rescue remains stopped: $task ($CAPACITY_RESCUE_REASON)"
+          continue
+          ;;
+        blocked)
+          reason="signal: $STATE/$task.status (automatic account rescue stopped: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append signal "$task.status" "$reason" || exit 1
+          mark_surfaced "$STATE/$task.status"
+          wake "$reason"
+          ;;
+        *)
+          reason="stale: $w (provider credential failure detected but automatic rescue was deferred: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append stale "$w" "$reason" || exit 1
+          wake "$reason"
+          ;;
+      esac
+    fi
+    if [ -n "$capacity_failure" ]; then
+      if [ "$capacity_failure" = codex-model-capacity ]; then
+        if model_capacity_append_blocked "$task" \
+          "selected Codex model is at capacity; choose a different model or retry after capacity recovers"; then
+          reason="signal: $STATE/$task.status (Codex model capacity requires a model change; account rotation was not attempted)"
+          fm_wake_append signal "$task.status" "$reason" || exit 1
+          mark_surfaced "$STATE/$task.status"
+          wake "$reason"
+        fi
+        triage_log "Codex model capacity remains surfaced: $task"
+        continue
+      fi
+      capacity_rescue_task "$w" "$task" "$(window_harness "$w")" "$capacity_failure" || true
+      case "$CAPACITY_RESCUE_OUTCOME" in
+        rescued)
+          triage_log "automatic capacity rescue succeeded: $task ($CAPACITY_RESCUE_REASON)"
+          continue
+          ;;
+        already-stopped)
+          triage_log "capacity rescue remains stopped: $task ($CAPACITY_RESCUE_REASON)"
+          continue
+          ;;
+        blocked)
+          reason="signal: $STATE/$task.status (automatic capacity rescue stopped: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append signal "$task.status" "$reason" || exit 1
+          mark_surfaced "$STATE/$task.status"
+          wake "$reason"
+          ;;
+        *)
+          reason="stale: $w (provider capacity failure detected but automatic rescue was deferred: $CAPACITY_RESCUE_REASON)"
+          fm_wake_append stale "$w" "$reason" || exit 1
+          wake "$reason"
           ;;
       esac
     fi

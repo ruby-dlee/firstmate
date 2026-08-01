@@ -13,7 +13,6 @@ set -u
 . "$ROOT/bin/fm-checkout-lock-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-safety)
-ROOT=$(make_refreshable_firstmate_source "$TMP_ROOT/firstmate-source") || fail "could not create refreshable Firstmate source"
 export FM_BACKEND=tmux
 
 make_live_default_firstmate_worktree() {

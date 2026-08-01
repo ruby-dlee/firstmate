@@ -7,7 +7,7 @@
 # and GitHub reports a PR head that contains the current local work, or its content
 # is already in the up-to-date default branch.
 #
-# Covers three fixes:
+# Covers four fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
 #     contribution PRs are teardown-eligible (the pre-fix code false-refused them).
 #   - squash-merge-then-delete-branch: the branch's own commits live nowhere on a
@@ -15,6 +15,9 @@
 #     main. Reachability alone false-refused this common GitHub flow; the check now
 #     recognizes a merged PR head containing the local work (or the content already
 #     in main) as landed.
+#   - default-history rewrite: a stale task branch can lose its merge base with main
+#     even though its task change landed. The branch-creation reflog entry isolates
+#     task work from the stale baseline without treating unrelated content as landed.
 #   - teardown-lock-race: a killed crewmate process can leave a transient worktree
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
@@ -38,17 +41,21 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (r) no-mistakes + rewritten main contains task content      -> ALLOW  (stale branch)
+#   (s) no-mistakes + rewritten main lacks task content         -> REFUSE (safety)
+#   (t) no-mistakes + rewritten main retains task-deleted file  -> REFUSE (deletion safety)
+#   (u) rewritten main lacks non-default task baseline          -> REFUSE (base safety)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crewmate process (bin/fm-teardown.sh's teardown_treehouse_return).
-#   (r) provably-stale index.lock (old mtime, no live holder) -> lock removed, ALLOW
-#   (s) index.lock with a live holder, any age                -> lock kept, REFUSE
-#   (t) lsof error while checking index.lock                  -> lock kept, REFUSE
-#   (u) dirty worktree after stale lock cleanup               -> lock removed, REFUSE
-#   (v) non-linked repo index.lock                            -> lock removed, ALLOW
-#   (w) index.lock mtime read failure                         -> lock kept, REFUSE
-#   (x) transient lock cleared after first failed return      -> retry ALLOW
-#   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#   (v) provably-stale index.lock (old mtime, no live holder) -> lock removed, ALLOW
+#   (w) index.lock with a live holder, any age                -> lock kept, REFUSE
+#   (x) lsof error while checking index.lock                  -> lock kept, REFUSE
+#   (y) dirty worktree after stale lock cleanup               -> lock removed, REFUSE
+#   (z) non-linked repo index.lock                            -> lock removed, ALLOW
+#   (aa) index.lock mtime read failure                        -> lock kept, REFUSE
+#   (ab) transient lock cleared after first failed return     -> retry ALLOW
+#   (ac) persistent lock (never clears, not provably stale)   -> REFUSE loudly
 #
 # Writing a new fake tmux for this suite: teardown proves endpoint state through
 # fm_backend_target_state plus fm_backend_tmux_agent_alive, and releases nothing
@@ -358,6 +365,40 @@ land_on_origin_main() {
   git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "squash $file"
   git -C "$tmp" push -q origin HEAD:main
   rm -rf "$tmp"
+}
+
+# Replace origin/main with an unrelated root commit, simulating a default-branch
+# history rewrite after the task branch was created.
+# Args: case_dir [task-file task-content]
+rewrite_origin_main() {
+  local case_dir=$1 task_file=${2:-} task_content=${3:-} tmp
+  tmp="$case_dir/_rewrite"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  git -C "$tmp" checkout -q --orphan rewritten-main
+  printf '%s\n' "new default history" > "$tmp/main-only.txt"
+  git -C "$tmp" add -- main-only.txt
+  if [ -n "$task_file" ]; then
+    printf '%s\n' "$task_content" > "$tmp/$task_file"
+    git -C "$tmp" add -- "$task_file"
+  fi
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "rewrite main history"
+  git -C "$tmp" push -q --force origin HEAD:main
+  rm -rf "$tmp"
+}
+
+# Recreate the task worktree from a main commit containing baseline.txt so a
+# history-rewrite test can verify that an unlanded deletion remains protected.
+recreate_task_branch_with_baseline_file() {
+  local case_dir=$1
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  git -C "$case_dir/project" branch -D fm/task-x1 >/dev/null
+  printf '%s\n' baseline > "$case_dir/project/baseline.txt"
+  git -C "$case_dir/project" add -- baseline.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "add baseline file"
+  git -C "$case_dir/project" push -q origin main
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt" main
+  write_treehouse_lease "$case_dir/wt" firstmate-task-x1
 }
 
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
@@ -1269,6 +1310,119 @@ test_content_fallback_refreshes_stale_origin_ref() {
   expect_code 0 "$rc" "content-stale-ref: teardown should use the freshly fetched default branch"
   ! grep -q REFUSED "$case_dir/stderr" || fail "content-stale-ref: teardown printed a REFUSED line"
   pass "content fallback refreshes origin default before comparing trees"
+}
+
+test_content_fallback_uses_branch_origin_after_history_rewrite() {
+  local case_dir rc
+  case_dir=$(make_case content-history-rewrite)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  rewrite_origin_main "$case_dir" feature.txt hello
+  git -C "$case_dir/project" fetch -q origin \
+    '+refs/heads/main:refs/remotes/origin/main'
+  ! git -C "$case_dir/wt" merge-base refs/remotes/origin/main HEAD >/dev/null 2>&1 \
+    || fail "history-rewrite fixture unexpectedly retained a merge base"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" \
+    "history-rewrite: teardown should recognize task content in rewritten main"
+  assert_no_grep REFUSED "$case_dir/stderr" \
+    "history-rewrite: teardown falsely refused landed task content"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "history-rewrite: successful teardown retained task metadata"
+  assert_absent "$case_dir/fakebin/.tmux-live" \
+    "history-rewrite: successful teardown retained the task endpoint"
+  pass "content fallback handles a stale task branch after default history rewrite"
+}
+
+test_content_fallback_refuses_unlanded_work_after_history_rewrite() {
+  local case_dir rc
+  case_dir=$(make_case content-history-rewrite-unlanded)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt local-only "add unlanded feature"
+  rewrite_origin_main "$case_dir"
+  git -C "$case_dir/project" fetch -q origin \
+    '+refs/heads/main:refs/remotes/origin/main'
+  ! git -C "$case_dir/wt" merge-base refs/remotes/origin/main HEAD >/dev/null 2>&1 \
+    || fail "history-rewrite safety fixture unexpectedly retained a merge base"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "history-rewrite safety: teardown must refuse content absent from rewritten main"
+  assert_present "$case_dir/wt" "history-rewrite safety discarded the task worktree"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "history-rewrite safety removed task metadata"
+  assert_grep "task content is not present in authoritative refs/remotes/origin/main" \
+    "$case_dir/stderr" "history-rewrite safety did not explain the refusal"
+  pass "content fallback remains fail-closed after default history rewrite"
+}
+
+test_content_fallback_refuses_unlanded_deletion_after_history_rewrite() {
+  local case_dir rc
+  case_dir=$(make_case content-history-rewrite-unlanded-deletion)
+  recreate_task_branch_with_baseline_file "$case_dir"
+  write_meta "$case_dir" no-mistakes ship
+  git -C "$case_dir/wt" rm -q -- baseline.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t \
+    commit -q -m "delete baseline file"
+  rewrite_origin_main "$case_dir" baseline.txt baseline
+  git -C "$case_dir/project" fetch -q origin \
+    '+refs/heads/main:refs/remotes/origin/main'
+  ! git -C "$case_dir/wt" merge-base refs/remotes/origin/main HEAD >/dev/null 2>&1 \
+    || fail "history-rewrite deletion fixture unexpectedly retained a merge base"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "history-rewrite deletion safety: teardown must refuse an unlanded deletion"
+  assert_present "$case_dir/wt" \
+    "history-rewrite deletion safety discarded the task worktree"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "history-rewrite deletion safety removed task metadata"
+  assert_grep "task content is not present in authoritative refs/remotes/origin/main" \
+    "$case_dir/stderr" "history-rewrite deletion safety did not explain the refusal"
+  pass "content fallback protects unlanded deletions after default history rewrite"
+}
+
+test_content_fallback_refuses_nondefault_branch_origin_after_history_rewrite() {
+  local case_dir rc
+  case_dir=$(make_case content-history-rewrite-nondefault-base)
+  wt_commit_file "$case_dir" baseline-only.txt unlanded "add unlanded branch baseline"
+  git -C "$case_dir/wt" branch -m feature-base
+  git -C "$case_dir/wt" checkout -q -b fm/task-x1
+  git -C "$case_dir/project" branch -D feature-base >/dev/null
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add landed task change"
+  rewrite_origin_main "$case_dir" feature.txt hello
+  git -C "$case_dir/project" fetch -q origin \
+    '+refs/heads/main:refs/remotes/origin/main'
+  ! git -C "$case_dir/wt" merge-base refs/remotes/origin/main HEAD >/dev/null 2>&1 \
+    || fail "nondefault-base fixture unexpectedly retained a merge base"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "nondefault-base safety: teardown must retain an unlanded branch baseline"
+  assert_present "$case_dir/wt" "nondefault-base safety discarded the task worktree"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "nondefault-base safety removed task metadata"
+  assert_grep "task content is not present in authoritative refs/remotes/origin/main" \
+    "$case_dir/stderr" "nondefault-base safety did not explain the refusal"
+  pass "content fallback rejects a branch created from a non-default unlanded base"
 }
 
 test_content_fallback_uses_live_default() {
@@ -4948,6 +5102,14 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-force-release ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = stale-branch-history-rewrite ]; then
+  test_content_fallback_uses_branch_origin_after_history_rewrite
+  test_content_fallback_refuses_unlanded_work_after_history_rewrite
+  test_content_fallback_refuses_unlanded_deletion_after_history_rewrite
+  test_content_fallback_refuses_nondefault_branch_origin_after_history_rewrite
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = managed-endpoint-identity ]; then
   test_managed_force_teardown_retains_unlanded_lease_and_session
   test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
@@ -5213,6 +5375,10 @@ test_pr_check_serializes_with_account_session_updates
 test_pr_check_rejects_reused_task_generation
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
+test_content_fallback_uses_branch_origin_after_history_rewrite
+test_content_fallback_refuses_unlanded_work_after_history_rewrite
+test_content_fallback_refuses_unlanded_deletion_after_history_rewrite
+test_content_fallback_refuses_nondefault_branch_origin_after_history_rewrite
 test_content_fallback_uses_live_default
 test_content_fallback_reprobes_live_default_after_fetch
 test_content_fallback_honors_shared_checkout_lock

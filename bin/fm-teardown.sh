@@ -23,6 +23,8 @@
 # teardown refuses rather than risk discarding unlanded work.
 # Origin-backed content checks hold the shared checkout lock and require bounded
 # remote HEAD probes before and after fetch to agree before comparing trees.
+# If the default history was rewritten after task-branch creation, the comparison
+# uses a base recorded by both the branch-creation and default-branch reflogs.
 # Every authorized Treehouse return is process-tree bounded by
 # FM_TREEHOUSE_RETURN_TIMEOUT while holding the same common checkout mutation
 # lock across its retry and stale-index-lock recovery sequence.
@@ -847,20 +849,55 @@ pr_is_merged() {
   unpushed_patches_are_in_pr_head "$head"
 }
 
+# Set TASK_BRANCH_CREATION_BASE only when the task branch's oldest surviving
+# reflog entry is its creation record, remains an ancestor of HEAD, and also
+# appears in the authoritative default ref's reflog.
+task_branch_creation_base() {
+  local authoritative_ref=$1 branch_ref entry base message fork_point
+  TASK_BRANCH_CREATION_BASE=
+  branch_ref=$(git -C "$WT" symbolic-ref --quiet HEAD 2>/dev/null) || return 1
+  entry=$(LC_ALL=C git -C "$WT" reflog show \
+    --format='%H%x09%gs' "$branch_ref" 2>/dev/null | tail -1)
+  [ -n "$entry" ] || return 1
+  base=${entry%%$'\t'*}
+  message=${entry#*$'\t'}
+  [ "$message" != "$entry" ] || return 1
+  case "$message" in
+    "branch: Created from "*) ;;
+    *) return 1 ;;
+  esac
+  git -C "$WT" cat-file -e "$base^{commit}" 2>/dev/null || return 1
+  git -C "$WT" merge-base --is-ancestor "$base" HEAD 2>/dev/null || return 1
+  fork_point=$(git -C "$WT" merge-base \
+    --fork-point "$authoritative_ref" HEAD 2>/dev/null) || return 1
+  [ "$fork_point" = "$base" ] || return 1
+  TASK_BRANCH_CREATION_BASE=$base
+}
+
 # Is the branch's content already present in the up-to-date default branch?
 # Origin-backed proof holds the common checkout lock across probe, fetch,
 # unchanged branch-and-tip re-probe, and tree comparison.
+# The ordinary merge finds the net task change from shared history.
+# When the default was rewritten past the task branch's creation point, an
+# explicit branch-creation base isolates the task change from its stale baseline.
 content_matches_ref() {
-  local ref=$1 default_tree merged_tree
+  local ref=$1 default_tree merged_tree merge_output creation_base
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
-  if [ "$merged_tree" != "$default_tree" ]; then
-    echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2
-    return 1
+  if merge_output=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null); then
+    merged_tree=$(printf '%s\n' "$merge_output" | head -1)
+    [ "$merged_tree" != "$default_tree" ] || return 0
   fi
-  return 0
+  if task_branch_creation_base "$ref"; then
+    creation_base=$TASK_BRANCH_CREATION_BASE
+    if merge_output=$(git -C "$WT" merge-tree --write-tree \
+        --merge-base "$creation_base" "$ref" HEAD 2>/dev/null); then
+      merged_tree=$(printf '%s\n' "$merge_output" | head -1)
+      [ "$merged_tree" != "$default_tree" ] || return 0
+    fi
+  fi
+  echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2
+  return 1
 }
 
 content_in_origin_default() {
@@ -1142,6 +1179,10 @@ validate_teardown_target_identity() {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1
   }
+  if [ "$KIND" = scout ] && [ "$BACKEND" != orca ] &&
+      [ ! -e "$WT" ] && [ ! -L "$WT" ]; then
+    return 0
+  fi
   worktree_root=$(exact_git_worktree_root "$WT") || {
     echo "error: teardown worktree metadata is not an exact inspectable repository root: ${WT:-<missing>}" >&2
     return 1
@@ -3747,6 +3788,8 @@ validate_secondmate_repository_worktree_graph() {
         elif [ -n "$registered_worktrees" ] \
           && printf '%s\n' "$registered_worktrees" | grep -qxF -- "$canonical"; then
           :
+        elif secondmate_linked_worktree_is_recorded_child "$retiring_home" "$repository" "$canonical"; then
+          count=$((count - 1))
         else
           echo "REFUSED: secondmate project common Git directory owns another linked worktree at $canonical" >&2
           return 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavior tests for bin/fm-crew-state.sh - the deterministic crew-current-state
+# Behavior tests for bin/fm-crew-state.sh - the deterministic crewmate-current-state
 # helper.
 #
 # The status file (state/<id>.status) is a best-effort append-only EVENT LOG, so
@@ -12,7 +12,8 @@
 #   (a) active run-step is authoritative                          -> run-step
 #   (b) needs-decision/blocked log + resumed run = SUPERSEDED     -> run-step
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
-#   (d) terminal run-step (passed/failed) is authoritative        -> run-step
+#   (d) terminal run-step is authoritative, while passed PR state is verified
+#       against GitHub rather than inferred from the run outcome  -> run-step
 #   (e) cross-branch attribution: this branch's own run found via list lookup
 #   (f) no run + busy pane                                        -> pane
 #   (g) no run + idle pane falls to the status-log verb           -> status-log
@@ -37,7 +38,7 @@ TMP_ROOT=$(fm_test_tmproot fm-crew-state)
 fm_git_identity fmtest fmtest@example.invalid
 
 # A real git repo checked out on <branch>, so the helper's branch attribution
-# (git symbolic-ref) resolves like it would for a live crew worktree.
+# (git symbolic-ref) resolves like it would for a live crewmate worktree.
 make_repo_on_branch() {  # <dir> <branch>
   local dir=$1 branch=$2
   mkdir -p "$dir"
@@ -90,6 +91,21 @@ case "${1:-}" in
 esac
 exit 0
 SH
+  cat > "$fb/gh-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${FM_FAKE_GH_AXI_FAIL:-0}" = 0 ] || exit 1
+[ "${1:-}" = pr ] || exit 2
+[ "${2:-}" = view ] || exit 2
+[ "${3:-}" = 1 ] || exit 2
+[ "${4:-}" = --repo ] || exit 2
+[ "${5:-}" = o/r ] || exit 2
+cat <<EOF
+pull_request:
+  number: 1
+  state: ${FM_FAKE_PR_STATE:-merged}
+EOF
+SH
   cat > "$fb/herdr" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -134,7 +150,7 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/herdr"
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/herdr"
   printf '%s\n' "$fb"
 }
 
@@ -154,6 +170,8 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 run_crew_state() {  # <case-dir> <id>
   PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
     FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_READSTEER_REACHABLE=1 \
     "$CREW_STATE" "$2"
 }
 
@@ -176,8 +194,11 @@ reset_fakes() {
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
+  FM_FAKE_PR_STATE=merged
+  FM_FAKE_GH_AXI_FAIL=0
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
+  export FM_FAKE_PR_STATE FM_FAKE_GH_AXI_FAIL
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -463,7 +484,7 @@ test_ci_ready_done_log_beats_monitoring_run() {
   pass "ci-ready status log beats monitoring run"
 }
 
-# Regression for the PR #252 incident: the crew's own status log never got a
+# Regression for the PR #252 incident: the crewmate's own status log never got a
 # "done: ... checks green" line (log_reports_ci_ready above does not apply),
 # but the ci step's log tail shows CI is actually green and only waiting on
 # merge/close. fm-crew-state must surface this as done, not "validating
@@ -474,7 +495,7 @@ test_ci_monitoring_checks_green_surfaces_done() {
   make_repo_on_branch "$d/wt" fm/feat-cigreen
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-cigreen.meta" "window=fm:fm-feat-cigreen" "worktree=$d/wt" "kind=ship"
-  # No status-log line at all: the crew never reported its own checks-green line.
+  # No status-log line at all: the crewmate never reported its own checks-green line.
   FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cigreen)"
   FM_FAKE_CI_LOGS=$(cat <<'EOF'
 CI checks running, waiting for results...
@@ -663,8 +684,9 @@ test_top_level_fixing_done_log_stays_working() {
   pass "top-level fixing is not overridden by a stale done log"
 }
 
-# (d) terminal run-step is authoritative
-test_terminal_passed() {
+# (d) terminal run-step is authoritative, but a passed outcome does not prove
+# GitHub merged or closed the PR.
+test_terminal_passed_verifies_merged_pr() {
   reset_fakes
   local d; d=$(new_case passed)
   make_repo_on_branch "$d/wt" fm/feat-d
@@ -674,7 +696,79 @@ test_terminal_passed() {
   local out; out=$(run_crew_state "$d" feat-d)
   assert_contains "$out" "state: done" "passed run -> done"
   assert_contains "$out" "source: run-step" "passed -> run-step source"
-  pass "terminal passed run is authoritative"
+  assert_contains "$out" "PR merged (verified)" "passed run reports verified merged PR state"
+  pass "terminal passed run reports a verified merged PR"
+}
+
+test_terminal_passed_does_not_claim_open_pr_merged() {
+  reset_fakes
+  local d; d=$(new_case passed-open)
+  make_repo_on_branch "$d/wt" fm/feat-do
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-do.meta" "window=fm:fm-feat-do" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-do)"
+  FM_FAKE_PR_STATE=open
+  local out; out=$(run_crew_state "$d" feat-do)
+  assert_contains "$out" "state: done" "passed run with open PR remains terminal"
+  assert_contains "$out" "PR open (not merged)" "open PR is reported from GitHub state"
+  assert_not_contains "$out" "PR merged/closed" "open PR must not inherit merged/closed from outcome"
+  pass "terminal passed run does not claim an open PR merged or closed"
+}
+
+test_terminal_passed_reports_closed_without_merge() {
+  reset_fakes
+  local d; d=$(new_case passed-closed)
+  make_repo_on_branch "$d/wt" fm/feat-dc
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-dc.meta" "window=fm:fm-feat-dc" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-dc)"
+  FM_FAKE_PR_STATE=closed
+  local out; out=$(run_crew_state "$d" feat-dc)
+  assert_contains "$out" "PR closed without merge (verified)" "closed PR is distinguished from merged"
+  pass "terminal passed run distinguishes a closed unmerged PR"
+}
+
+test_terminal_passed_fails_closed_when_pr_state_unavailable() {
+  reset_fakes
+  local d; d=$(new_case passed-unavailable)
+  make_repo_on_branch "$d/wt" fm/feat-du
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-du.meta" "window=fm:fm-feat-du" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-du)"
+  FM_FAKE_GH_AXI_FAIL=1
+  local out; out=$(run_crew_state "$d" feat-du)
+  assert_contains "$out" "PR state unavailable (not verified)" "failed GitHub query is explicit"
+  assert_not_contains "$out" "PR merged/closed" "unknown PR state must not inherit merged/closed from outcome"
+  pass "terminal passed run fails closed when GitHub state is unavailable"
+}
+
+test_terminal_passed_clamps_invalid_gh_timeouts_and_fails_closed() {
+  reset_fakes
+  local d timeout_args out value
+  d=$(new_case passed-zero-timeout)
+  make_repo_on_branch "$d/wt" fm/feat-dz
+  make_fakebin "$d" >/dev/null
+  cat > "$d/fakebin/timeout" <<'SH'
+#!/usr/bin/env bash
+if [ "${2:-}" = gh-axi ]; then
+  printf '%s\n' "$1" > "$FM_FAKE_TIMEOUT_ARGS"
+  exit 124
+fi
+shift
+exec "$@"
+SH
+  chmod +x "$d/fakebin/timeout"
+  timeout_args="$d/timeout-args"
+  fm_write_meta "$d/state/feat-dz.meta" "window=fm:fm-feat-dz" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-dz)"
+  for value in 0 00 000 0.0 +0 -1 ' 0 ' ' ' invalid; do
+    out=$(FM_FAKE_TIMEOUT_ARGS="$timeout_args" FM_CREW_STATE_GH_TIMEOUT="$value" run_crew_state "$d" feat-dz)
+    [ "$(cat "$timeout_args")" = 10 ] || fail "GitHub timeout '$value' did not clamp to ten seconds"
+    assert_contains "$out" "state: done" "timed-out query preserves terminal state"
+    assert_contains "$out" "PR state unavailable (not verified)" "timed-out query fails closed"
+    assert_not_contains "$out" "PR merged/closed" "timed-out query never uses pipeline-inferred PR state"
+  done
+  pass "invalid GitHub timeouts clamp and timed-out queries fail closed"
 }
 
 test_terminal_failed() {
@@ -691,7 +785,7 @@ test_terminal_failed() {
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
-# routine case once more than one crew validates the same underlying repo
+# routine case once more than one crewmate validates the same underlying repo
 # concurrently - they share ONE no-mistakes repo registration), so the helper
 # falls back to the real top-level `no-mistakes runs` listing to learn whether
 # THIS branch has an active run of its own. Regression coverage for the
@@ -699,14 +793,14 @@ test_terminal_failed() {
 # (bare) expecting a `runs[N]{...}:` TOON table that the real CLI never emits
 # (verified against the installed v1.32.2 - the `axi` surface has no
 # runs-listing subcommand at all), so attribution silently failed every time
-# the repo-wide answer was not this crew's own branch.
+# the repo-wide answer was not this crewmate's own branch.
 test_cross_branch_attribution_via_runs_list() {
   reset_fakes
   local d; d=$(new_case crossbranch)
   make_repo_on_branch "$d/wt" fm/feat-f
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-f.meta" "window=fm:fm-feat-f" "worktree=$d/wt" "kind=ship"
-  # The repo-wide active/most-recent run belongs to a different crew's branch.
+  # The repo-wide active/most-recent run belongs to a different crewmate's branch.
   FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
   # Real `no-mistakes runs` shape: plain text, newest-first, no run id, no
   # quoting - "<status> <branch> <short-sha> <date> [<pr-url>]".
@@ -785,7 +879,7 @@ EOF
   pass "another branch's run is ignored, falls back"
 }
 
-# (f) no run for this crew + a busy pane -> working via pane
+# (f) no run for this crewmate + a busy pane -> working via pane
 test_no_run_busy_pane() {
   reset_fakes
   local d; d=$(new_case busy)
@@ -822,7 +916,7 @@ test_no_run_herdr_unknown_uses_backend_capture() {
 
 # Regression: herdr's agent.get reports generation state ("working" only while
 # the model is actively streaming a turn - docs/herdr-backend.md "Busy state"),
-# not "this crew's tool call is still in progress". A crew blocked on its own
+# not "this crewmate's tool call is still in progress". A crewmate blocked on its own
 # long-running foreground `no-mistakes axi run` (no --yes; blocks until a gate
 # or outcome) is not generating for that whole span, so agent.get can read
 # idle while the pane's own rendered text still shows the busy banner
@@ -904,7 +998,7 @@ test_no_run_idle_pane_uses_keyed_log() {
 }
 
 # (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so a
-# supervisor reading the crew sees a distinct pause (and its reason) rather than a
+# supervisor reading the crewmate sees a distinct pause (and its reason) rather than a
 # wedge-suspect idle. This is the reader half the watcher/daemon build on.
 test_no_run_idle_pane_paused() {
   reset_fakes
@@ -993,7 +1087,7 @@ test_dead_window_ignores_stale_status_log() {
 }
 
 # A closed/unreadable pane must NOT mask an authoritative run-step: judge by the
-# run-step, not the shell. The common case is a finished crew whose agent has
+# run-step, not the shell. The common case is a finished crewmate whose agent has
 # exited and closed its window (the normal gap between completion and teardown) -
 # it must still report its terminal run-step state (e.g. done), never unknown.
 test_dead_window_still_reports_terminal_run_step() {
@@ -1004,7 +1098,7 @@ test_dead_window_still_reports_terminal_run_step() {
   fm_write_meta "$d/state/feat-dead-done.meta" "window=fm:fm-feat-dead-done" "worktree=$d/wt" "kind=ship"
   printf 'done: PR https://github.com/o/r/pull/3 checks green\n' > "$d/state/feat-dead-done.status"
   FM_FAKE_AXI_STATUS="$(run_passed fm/feat-dead-done)"
-  FM_FAKE_TMUX_MISSING=1   # the crew's window has closed
+  FM_FAKE_TMUX_MISSING=1   # the crewmate's window has closed
   local out; out=$(run_crew_state "$d" feat-dead-done)
   assert_contains "$out" "state: done" "closed pane still reports terminal run-step done"
   assert_contains "$out" "source: run-step" "closed pane does not mask the run-step"
@@ -1102,9 +1196,9 @@ test_missing_meta() {
 # (k) crew_is_provably_working end-to-end over the REAL fm-crew-state.sh (not a
 # canned fake verdict, unlike tests/fm-watch-triage.test.sh's classifier
 # coverage). This is the direct regression pair for the 2026-07-02 herdr
-# incident: a validating crew whose bare `axi status` answer belongs to
+# incident: a validating crewmate whose bare `axi status` answer belongs to
 # another branch must still be absorbed by the watcher via the runs-list
-# fallback (working), while a crew with genuinely no run anywhere and an idle
+# fallback (working), while a crewmate with genuinely no run anywhere and an idle
 # pane must still surface (the safety property the fix must never widen away).
 test_provably_working_via_runs_list_fallback() {
   reset_fakes
@@ -1170,7 +1264,11 @@ test_ci_ready_done_log_relapse_stays_working
 test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
-test_terminal_passed
+test_terminal_passed_verifies_merged_pr
+test_terminal_passed_does_not_claim_open_pr_merged
+test_terminal_passed_reports_closed_without_merge
+test_terminal_passed_fails_closed_when_pr_state_unavailable
+test_terminal_passed_clamps_invalid_gh_timeouts_and_fails_closed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row

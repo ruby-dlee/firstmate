@@ -16,7 +16,7 @@
 #   captain-relevant escalations and marked from-firstmate replies append to this
 #   home's status file.
 #   --no-projects writes a project-less charter for a domain whose subject is the
-#   firstmate repo itself (its home is a firstmate worktree, its crews take pooled
+#   firstmate repo itself (its home is a firstmate worktree, its crewmates take pooled
 #   worktrees of the same repo). It is mutually exclusive with a project list, and
 #   omitting both still fails loudly so an accidental omission is never silent.
 #   Set FM_SECONDMATE_CHARTER='<charter>' to fill the charter text.
@@ -127,8 +127,8 @@ fi
 SECONDMATE_CHARTER=${FM_SECONDMATE_CHARTER:-"{TASK}"}
 SECONDMATE_SCOPE=${FM_SECONDMATE_SCOPE:-${FM_SECONDMATE_CHARTER:-"{TASK}"}}
 if [ "$NO_PROJECTS" -eq 1 ]; then
-  PROJECT_CLONES_BODY="None. This is a project-less domain: its subject is the firstmate repo this home lives in, so it needs no separate clones under \`projects/\`; its crews take pooled worktrees of that firstmate repo."
-  PROJECT_CLONES_NOTE="This domain has no separate project clones: its subject is the firstmate repo this home lives in, and its crews take pooled worktrees of that repo."
+  PROJECT_CLONES_BODY="None. This is a project-less domain: its subject is the firstmate repo this home lives in, so it needs no separate clones under \`projects/\`; its crewmates take pooled worktrees of that firstmate repo."
+  PROJECT_CLONES_NOTE="This domain has no separate project clones: its subject is the firstmate repo this home lives in, and its crewmates take pooled worktrees of that repo."
 else
   PROJECT_CLONES_BODY=$(printf '%s\n' "$SECONDMATE_PROJECTS" | tr ' ' '\n' | sed 's/^/- /')
   PROJECT_CLONES_NOTE="The projects above are local clones for work you supervise; they are not an exclusive ownership claim."
@@ -285,6 +285,15 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
+**Before you call anything done, USE the feature.** A passing test suite, a green harness run,
+or a rendered screenshot is evidence that code executed - it is NOT evidence that a person can
+use the thing you built. If your change touches something a user does, exercise that whole
+path yourself against a real running stack: the actual flow, start to finish, the way they
+would. Confirm the real outcome exists afterwards, not just that a request returned 200.
+
+If you cannot exercise it, say so in your status and explain what blocked you. Do not
+substitute harness coverage and call it verified, and never report done on a path you have not
+personally watched work.
 When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
@@ -297,6 +306,15 @@ EOF
 # Definition of done
 This project ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
+**Before you call anything done, USE the feature.** A passing test suite, a green harness run,
+or a rendered screenshot is evidence that code executed - it is NOT evidence that a person can
+use the thing you built. If your change touches something a user does, exercise that whole
+path yourself against a real running stack: the actual flow, start to finish, the way they
+would. Confirm the real outcome exists afterwards, not just that a request returned 200.
+
+If you cannot exercise it, say so in your status and explain what blocked you. Do not
+substitute harness coverage and call it verified, and never report done on a path you have not
+personally watched work.
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
 When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
 Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
@@ -310,6 +328,15 @@ EOF
     DOD=$(cat <<EOF
 # Definition of done
 The task is complete only when committed on your branch.
+**Before you call anything done, USE the feature.** A passing test suite, a green harness run,
+or a rendered screenshot is evidence that code executed - it is NOT evidence that a person can
+use the thing you built. If your change touches something a user does, exercise that whole
+path yourself against a real running stack: the actual flow, start to finish, the way they
+would. Confirm the real outcome exists afterwards, not just that a request returned 200.
+
+If you cannot exercise it, say so in your status and explain what blocked you. Do not
+substitute harness coverage and call it verified, and never report done on a path you have not
+personally watched work.
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 

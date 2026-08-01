@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-observe-passwd-home-v2
+# FM_ACCOUNT_DIRECTORY_CUTOVER: direct-pool-rotation-v3
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca direct recovery with empirically verified provider authority,
 # or a secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #        fm-spawn.sh <task-id> --recover-direct-account
 #        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
@@ -32,7 +32,7 @@
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
 #   callers must surface it instead of silently retrying another backend.
-#   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
+#   With no harness arg, a crewmate/scout spawn resolves the crewmate harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
 #   spawns require an explicit harness so firstmate cannot silently skip dispatch
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
@@ -51,6 +51,11 @@
 #   the file governs the spawn, its model/effort tokens are re-resolved on every
 #   respawn exactly like the harness axis, and explicit --model/--effort flags
 #   still win over the file's tokens.
+#   Claude ship/scout launches never inherit the CLI's ambient model.
+#   They resolve config/claude-crew-model (inherited into secondmate homes), whose
+#   absent-file default and only accepted value is claude-opus-5. An explicit
+#   --model must equal that anchor. An empty/default/unresolvable/mismatched model
+#   or a raw Claude launch fails closed before endpoint creation.
 #   Account routing is independently default-off. Its precedence and off/observe/
 #   enforce resolution is owned by fm-account-routing-lib.sh. Direct account-
 #   directory launch currently covers ship/scout crewmates only; secondmate
@@ -66,7 +71,7 @@
 #   their existing default-identity behavior.
 #   config/secondmate-account-pool remains the primary's durable, non-inherited
 #   Agent Fleet selection input for secondmate agents when routing is enabled. A
-#   secondmate's own crewmates use inherited crew dispatch/routing policy, not
+#   secondmate's own crewmates use inherited crewmate dispatch/routing policy, not
 #   this setting.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
@@ -83,6 +88,9 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
+#   A genuinely new ship/scout spawn must already have an In flight or Queued row
+#   in this home's configured backlog. --backlog-row-exemption accepts only
+#   test-fixture or tracking-backend-repair and records the category in metadata.
 #   Before a secondmate launch, the home must fast-forward safely to the primary
 #   default-branch commit and independently match the live default tip.
 #   Any unproven freshness state refuses launch.
@@ -99,7 +107,8 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend/account flags apply to every pair.
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/account
+#   flags and --backlog-row-exemption apply to every pair.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
@@ -149,6 +158,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-report-contract-lib.sh
 . "$SCRIPT_DIR/fm-report-contract-lib.sh"
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -323,13 +334,6 @@ validate_direct_launch_worktree_identity() {
   fi
 }
 
-direct_worktree_return_confirmed() {
-  local project=$1 worktree=$2 listed
-  [ ! -e "$worktree" ] && [ ! -L "$worktree" ] && return 0
-  listed=$(git_repository_probe -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 1
-  ! printf '%s\n' "$listed" | grep -Fqx "worktree $worktree"
-}
-
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -342,6 +346,8 @@ BACKEND_ARG=
 ACCOUNT_POOL=
 ACCOUNT_PROFILE=
 NO_ACCOUNT_ROUTING=0
+BACKLOG_ROW_EXEMPTION=
+BACKLOG_ROW_EXEMPTION_SET=0
 RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
 DIRECT_ACCOUNT_RECOVERY=0
@@ -370,6 +376,7 @@ for a in "$@"; do
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       account-pool) ACCOUNT_POOL=$a; ACCOUNT_POOL_SET=1 ;;
       account-profile) ACCOUNT_PROFILE=$a; ACCOUNT_PROFILE_SET=1 ;;
+      backlog-row-exemption) BACKLOG_ROW_EXEMPTION=$a; BACKLOG_ROW_EXEMPTION_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -391,6 +398,8 @@ for a in "$@"; do
     --account-profile) want_value=account-profile ;;
     --account-profile=*) ACCOUNT_PROFILE=${a#--account-profile=}; ACCOUNT_PROFILE_SET=1 ;;
     --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
+    --backlog-row-exemption) want_value='backlog-row-exemption' ;;
+    --backlog-row-exemption=*) BACKLOG_ROW_EXEMPTION=${a#--backlog-row-exemption=}; BACKLOG_ROW_EXEMPTION_SET=1 ;;
     --resume-account) RESUME_ACCOUNT=1 ;;
     --continue-account) CONTINUE_ACCOUNT=1 ;;
     --recover-direct-account) DIRECT_ACCOUNT_RECOVERY=1 ;;
@@ -404,6 +413,15 @@ done
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$ACCOUNT_POOL_SET" -eq 0 ] || [ -n "$ACCOUNT_POOL" ] || { echo "error: --account-pool requires a non-empty value" >&2; exit 1; }
 [ "$ACCOUNT_PROFILE_SET" -eq 0 ] || [ -n "$ACCOUNT_PROFILE" ] || { echo "error: --account-profile requires a non-empty value" >&2; exit 1; }
+[ "$BACKLOG_ROW_EXEMPTION_SET" -eq 0 ] || [ -n "$BACKLOG_ROW_EXEMPTION" ] \
+  || { echo "error: --backlog-row-exemption requires a non-empty value" >&2; exit 1; }
+case "$BACKLOG_ROW_EXEMPTION" in
+  ''|test-fixture|tracking-backend-repair) ;;
+  *)
+    echo "error: --backlog-row-exemption must be one of test-fixture, tracking-backend-repair" >&2
+    exit 1
+    ;;
+esac
 if [ "$NO_ACCOUNT_ROUTING" = 1 ] && { [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; }; then
   echo "error: --no-account-routing cannot be combined with --account-pool or --account-profile" >&2
   exit 1
@@ -419,7 +437,7 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   if [ "$KIND_SET" = 1 ] || [ "$HARNESS_SET" = 1 ] || [ "$MODEL_SET" = 1 ] \
     || [ "$EFFORT_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
     || [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ] \
-    || [ "$NO_ACCOUNT_ROUTING" = 1 ]; then
+    || [ "$NO_ACCOUNT_ROUTING" = 1 ] || [ "$BACKLOG_ROW_EXEMPTION_SET" = 1 ]; then
     echo "error: --recover-direct-account accepts only a task id; task context comes from metadata" >&2
     exit 1
   fi
@@ -433,6 +451,10 @@ esac
 
 RECOVERY_ACCOUNT=0
 [ "$RESUME_ACCOUNT" = 0 ] && [ "$CONTINUE_ACCOUNT" = 0 ] && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] || RECOVERY_ACCOUNT=1
+[ "$RECOVERY_ACCOUNT" = 0 ] || [ "$BACKLOG_ROW_EXEMPTION_SET" = 0 ] || {
+  echo "error: --backlog-row-exemption applies only to a genuinely new ship or scout task" >&2
+  exit 1
+}
 RESUME_META=
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
@@ -529,6 +551,62 @@ spawn_preflight_kind_value() {
       return 1
       ;;
   esac
+}
+
+spawn_manual_backlog_has_row() {  # <task-id> <backlog-file>
+  local task_id=$1 backlog=$2
+  [ -f "$backlog" ] || return 1
+  awk -v wanted="$task_id" '
+    /^## (In flight|Queued)[[:space:]]*$/ { active = 1; next }
+    /^## / { active = 0 }
+    !active { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/^\[[ xX]\][[:space:]]*/, "", line)
+      if (substr(line, 1, 2) == "**") {
+        line = substr(line, 3)
+        closing_pos = index(line, "**")
+        if (closing_pos == 0) next
+        key = substr(line, 1, closing_pos - 1)
+      } else {
+        key = line
+        sub(/[[:space:]].*$/, "", key)
+      }
+      if (key == wanted) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$backlog"
+}
+
+spawn_backlog_has_row() {  # <task-id>
+  local task_id=$1 backlog task
+  backlog="$DATA/backlog.md"
+  if fm_tasks_axi_backend_available "$CONFIG"; then
+    task=$(tasks-axi show "$task_id" --backend markdown --file "$backlog" 2>/dev/null) || return 1
+    printf '%s\n' "$task" | grep -Eq '^[[:space:]]*state: (in_flight|queued)[[:space:]]*$'
+    return $?
+  fi
+  spawn_manual_backlog_has_row "$task_id" "$backlog"
+}
+
+spawn_shell_quote() {  # <value>
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+spawn_refuse_missing_backlog_row() {  # <task-id> <kind> <project-dir>
+  local task_id=$1 kind=$2 project=$3 repo backlog
+  repo=${project%/}
+  repo=${repo##*/}
+  [ -n "$repo" ] || repo=unknown
+  backlog="$DATA/backlog.md"
+  echo "error: new $kind task $task_id has no In flight or Queued row in $backlog; file it before dispatch." >&2
+  printf 'fix: tasks-axi add %s %s --kind %s --repo %s --start --backend markdown --file %s\n' \
+    "$(spawn_shell_quote "$task_id")" "$(spawn_shell_quote '<one line>')" \
+    "$(spawn_shell_quote "$kind")" "$(spawn_shell_quote "$repo")" \
+    "$(spawn_shell_quote "$backlog")" >&2
 }
 
 spawn_refuse_report_required_orca() {
@@ -978,6 +1056,7 @@ ACCOUNT_PREDECESSOR_POOL=
 ACCOUNT_PREDECESSOR_SESSION=
 CONTINUATION_PACKET=
 ENDPOINT_CREATED=0
+T=
 WORKTREE_CREATED=0
 WORKTREE_RETAIN_ON_ABORT=0
 WORKTREE_EXPECTED_TIP=
@@ -1269,8 +1348,8 @@ persist_failed_direct_recovery() {
     echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
     echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
     echo "tasktmp=${TASK_TMP:-${RECORDED_TASKTMP:-/tmp/fm-$ID}}"
-    echo "model=${RECORDED_MODEL:-${MODEL:-default}}"
-    echo "effort=${RECORDED_EFFORT:-${EFFORT:-default}}"
+    echo "model=${MODEL:-default}"
+    echo "effort=${EFFORT:-default}"
     echo "generation_id=${RECORDED_GENERATION:-${SPAWN_GENERATION_ID:-}}"
     [ "${RECORDED_REPORT_REQUIRED_SET:-0}" != 1 ] || echo "report_required=${RECORDED_REPORT_REQUIRED:-}"
     [ -z "$account_home" ] || echo "account_home=$account_home"
@@ -1306,16 +1385,20 @@ persist_failed_direct_recovery() {
   META_INSTALLED=1
 }
 
-persist_failed_direct_spawn() {
-  local meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo backup_name artifacts_name preserve_extensions=0
-  retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+persist_failed_direct_spawn() {  # <endpoint-created:0|1>
+  local endpoint_created=$1 meta="$STATE/$ID.meta" tmp retained_window retained_tmux_session retained_mode retained_yolo backup_name artifacts_name preserve_extensions=0
+  case "$endpoint_created" in 0|1) ;; *) return 1 ;; esac
+  retained_window=
   retained_tmux_session=
   retained_mode=${MODE:-}
   retained_yolo=${YOLO:-off}
   [ -n "$retained_mode" ] || retained_mode=no-mistakes
-  if [ "${BACKEND:-tmux}" = tmux ]; then
-    retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
-    retained_window=$retained_tmux_session
+  if [ "$endpoint_created" = 1 ]; then
+    retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
+    if [ "${BACKEND:-tmux}" = tmux ]; then
+      retained_tmux_session=${META_WINDOW:-${SES:-firstmate}:${W:-fm-$ID}}
+      retained_window=$retained_tmux_session
+    fi
   fi
   if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
     if [ -z "${WORKTREE_GIT_DIR:-}" ] || [ -z "${WORKTREE_GIT_DIR_IDENTITY:-}" ]; then
@@ -1328,7 +1411,15 @@ persist_failed_direct_spawn() {
   tmp=$(mktemp "$STATE/.$ID.meta.direct-spawn-pending.XXXXXX") || return 1
   if [ "$META_INSTALLED" = 1 ] && [ -f "$meta" ] \
     && [ "$(fm_account_meta_value "$meta" generation_id)" = "$SPAWN_GENERATION_ID" ]; then
-    awk '!/^direct_spawn_cleanup=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ "$endpoint_created" = 1 ]; then
+      awk '!/^direct_spawn_cleanup=/ && !/^direct_spawn_endpoint=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+      awk '
+        !/^(window|tmux_window_id|tmux_session_target|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|cmux_workspace_id|cmux_surface_id)=/ &&
+        !/^direct_spawn_cleanup=/ && !/^direct_spawn_endpoint=/ && !/^direct_spawn_backup=/ && !/^direct_spawn_artifacts=/ && !/^rollback_pending=/
+      ' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+      printf 'window=\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
   else
     [ ! -f "$meta" ] || preserve_extensions=1
     {
@@ -1352,20 +1443,20 @@ persist_failed_direct_spawn() {
       echo "report_required=1"
       [ -z "${DIRECT_ACCOUNT_HOME:-}" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
-      [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
-      [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
-      [ "${BACKEND:-tmux}" != herdr ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != tmux ] || [ -z "${WID:-}" ] || echo "tmux_window_id=$WID"
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != tmux ] || echo "tmux_session_target=$retained_tmux_session"
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != herdr ] || {
         echo "herdr_session=${HERDR_SES:-}"
         echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
         echo "herdr_tab_id=${HERDR_TAB_ID:-}"
         echo "herdr_pane_id=${HERDR_PANE_ID:-}"
       }
-      [ "${BACKEND:-tmux}" != zellij ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != zellij ] || {
         echo "zellij_session=${ZELLIJ_SES:-}"
         echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
         echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
       }
-      [ "${BACKEND:-tmux}" != cmux ] || {
+      [ "$endpoint_created" != 1 ] || [ "${BACKEND:-tmux}" != cmux ] || {
         echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
         echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
       }
@@ -1374,6 +1465,7 @@ persist_failed_direct_spawn() {
   if [ "$preserve_extensions" = 1 ]; then
     fm_account_meta_merge_extensions "$meta" "$tmp" || { rm -f "$tmp"; return 1; }
   fi
+  [ "$endpoint_created" != 0 ] || printf 'direct_spawn_endpoint=not-created\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
   printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
   if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
     backup_name=${META_BACKUP##*/}
@@ -1428,12 +1520,12 @@ spawn_return_created_worktree() {
     return 1
   fi
   if [ -z "$WORKTREE_EXPECTED_TIP" ] \
-    || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
+    || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$WORKTREE_EXPECTED_TIP"; then
     echo "warning: retained acquired worktree $WT because repository identity and its expected detached tip could not be re-proven" >&2
     return 1
   fi
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-  if ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "$PROJ_ABS" "$WORKTREE_EXPECTED_TIP"; then
+  if ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$WORKTREE_EXPECTED_TIP"; then
     echo "warning: retained acquired worktree $WT because post-cleanup repository safety could not be re-proven" >&2
     return 1
   fi
@@ -1570,7 +1662,6 @@ spawn_abort_cleanup() {
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] \
     && [ "${BACKEND:-tmux}" != orca ] \
-    && { [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ] || [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ]; } \
     && [ "$ENDPOINT_CREATED" = 1 ] && [ -n "${T:-}" ]; then
     spawn_managed_endpoint_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null || true
     endpoint_state=$(spawn_managed_endpoint_state "${BACKEND:-tmux}" "$T" "fm-${ID:-unknown}" "${KIND:-ship}" "${PROJ_ABS:-}" "${META_WINDOW:-}" 2>/dev/null)
@@ -1587,12 +1678,15 @@ spawn_abort_cleanup() {
     esac
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$endpoint_gone" = 1 ] \
-    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ]; then
+    && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" != enforce ] \
+    && [ "${DIRECT_ACCOUNT_ROUTING:-0}" != 1 ]; then
     spawn_restore_unmanaged_state "$rollback_lock" || state_clean=0
     if [ "$state_clean" = 1 ]; then
       spawn_return_created_worktree || worktree_clean=0
     else
       worktree_clean=0
+      WORKTREE_RETAIN_ON_ABORT=1
+      spawn_return_created_worktree || true
       echo "warning: retained failed spawn resources for ${ID:-unknown} because prior task state could not be restored" >&2
     fi
     [ "$worktree_clean" = 1 ] || echo "warning: failed to return rollback worktree for ${ID:-unknown}" >&2
@@ -1616,7 +1710,7 @@ spawn_abort_cleanup() {
       rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
     fi
     if [ -n "$rollback_lock" ]; then
-      persist_failed_direct_spawn || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
+      persist_failed_direct_spawn 1 || echo "warning: failed to persist retained direct spawn state for ${ID:-unknown}" >&2
     else
       echo "warning: failed to acquire metadata lock while preserving retained direct spawn for ${ID:-unknown}" >&2
     fi
@@ -1652,12 +1746,7 @@ spawn_abort_cleanup() {
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
     && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
     if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
-      rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-      if ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
-        direct_worktree_return_confirmed "$PROJ_ABS" "$WT" || worktree_clean=0
-      else
-        worktree_clean=0
-      fi
+      spawn_return_created_worktree || worktree_clean=0
       [ "$worktree_clean" = 1 ] || echo "warning: failed to return direct spawn worktree for ${ID:-unknown}; retaining cleanup metadata" >&2
     fi
     if [ -z "$rollback_lock" ]; then
@@ -1692,7 +1781,7 @@ spawn_abort_cleanup() {
     fi
     if [ "$worktree_clean" != 1 ]; then
       if [ -n "$rollback_lock" ]; then
-        persist_failed_direct_spawn || echo "warning: failed to persist direct spawn cleanup state for ${ID:-unknown}" >&2
+        persist_failed_direct_spawn "$ENDPOINT_CREATED" || echo "warning: failed to persist direct spawn cleanup state for ${ID:-unknown}" >&2
       else
         echo "warning: failed to acquire metadata lock while preserving direct spawn cleanup for ${ID:-unknown}" >&2
       fi
@@ -1818,6 +1907,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$ACCOUNT_POOL" ] || shared_args+=(--account-pool "$ACCOUNT_POOL")
   [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
   [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
+  [ -z "$BACKLOG_ROW_EXEMPTION" ] || shared_args+=(--backlog-row-exemption "$BACKLOG_ROW_EXEMPTION")
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     echo "error: batch dispatch does not support account recovery; recover tasks individually" >&2
     exit 1
@@ -1898,6 +1988,21 @@ if [ "$KIND" = secondmate ]; then
 else
   PROJ=${POS[1]:-}
   ARG3=${POS[2]:-}
+fi
+
+if [ "$BACKLOG_ROW_EXEMPTION_SET" = 1 ] \
+  && { [ "$KIND" = secondmate ] || [ "$SPAWN_META_PRESENT" = 1 ]; }; then
+  echo "error: --backlog-row-exemption applies only to a genuinely new ship or scout task" >&2
+  exit 1
+fi
+if [ "$KIND" != secondmate ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$SPAWN_META_PRESENT" = 0 ]; then
+  [ -f "$DATA/$ID/brief.md" ] || { echo "error: no brief at $DATA/$ID/brief.md" >&2; exit 1; }
+  if [ -n "$BACKLOG_ROW_EXEMPTION" ]; then
+    echo "WARNING: backlog row exemption '$BACKLOG_ROW_EXEMPTION' is active for new $KIND task $ID; the category will be recorded in task metadata" >&2
+  elif ! spawn_backlog_has_row "$ID"; then
+    spawn_refuse_missing_backlog_row "$ID" "$KIND" "$PROJ"
+    exit 1
+  fi
 fi
 
 if [ -z "$LIFECYCLE_LOCK" ]; then
@@ -2188,7 +2293,7 @@ case "$ARG3" in
   '')
     # No explicit harness: resolve from config. A secondmate AGENT launches on the
     # secondmate harness (config/secondmate-harness -> config/crew-harness -> own);
-    # every other kind uses the crew harness only when no dispatch profile file is
+    # every other kind uses the crewmate harness only when no dispatch profile file is
     # active. Resolving here on every spawn is what makes the split DURABLE - a
     # respawn (recovery, /updatefirstmate, restart) re-resolves, so
     # config/secondmate-harness keeps governing secondmate launches across restarts.
@@ -2233,6 +2338,21 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
       esac
     fi
   fi
+fi
+
+if [ "$KIND" != secondmate ] && [ "$HARNESS" = claude ]; then
+  CLAUDE_CREW_MODEL=$("$SCRIPT_DIR/fm-harness.sh" claude-crew-model) || exit 1
+  [ "$RAW_LAUNCH" != 1 ] || {
+    echo "error: Claude crew/scout launch does not accept raw launch commands because they cannot prove the resolved model; use --harness claude with an optional explicit --model" >&2
+    exit 1
+  }
+  if [ -z "$MODEL" ] && [ "$MODEL_SET" -eq 0 ]; then
+    MODEL=$CLAUDE_CREW_MODEL
+  fi
+  [ "$MODEL" = "$CLAUDE_CREW_MODEL" ] || {
+    echo "error: Claude crew/scout model '$MODEL' does not match the installed Opus 5 anchor '$CLAUDE_CREW_MODEL'" >&2
+    exit 1
+  }
 fi
 
 ACCOUNT_EXPLICIT=0
@@ -2330,7 +2450,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && [ "$BACKEND" = orca ]; then
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && ! fm_account_test_lab_enabled \
   && [ "$BACKEND" != herdr ]; then
-  echo "error: enforced Agent Fleet routing requires backend=herdr with a process-bound closed-shell certificate; backend=$BACKEND cannot prove that its pane shell was sanitized before startup" >&2
+  echo "error: enforced Agent Fleet routing requires backend=herdr so native agent startup can inject the selected account environment; backend=$BACKEND cannot provide that isolation, so retry with --backend herdr" >&2
   exit 1
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ "$RESUME_ACCOUNT" != 1 ]; then
@@ -2747,7 +2867,7 @@ real_path_or_raw() {  # <path>
 # and resets the selected clean pool worktree from that remote-tracking ref.
 # The post-acquisition verification below is the fail-closed freshness proof.
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
-  if CHECKOUT_PREFLIGHT_OUT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$PROJ_ABS" 2>&1); then
+  if CHECKOUT_PREFLIGHT_OUT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" preflight "$PROJ_ABS_REAL" 2>&1); then
     CHECKOUT_PREFLIGHT_STATUS=0
   else
     CHECKOUT_PREFLIGHT_STATUS=$?
@@ -2835,12 +2955,12 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
 fi
 
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
-  "$SCRIPT_DIR/fm-checkout-refresh.sh" pool-preflight "$PROJ_ABS" || {
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" pool-preflight "$PROJ_ABS_REAL" || {
     echo "error: refusing Treehouse acquisition because pool safety could not be inspected for $PROJ_ABS" >&2
     exit 1
   }
   acquire_status=0
-  WT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$PROJ_ABS" "firstmate-$ID") || acquire_status=$?
+  WT=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$PROJ_ABS_REAL" "firstmate-$ID") || acquire_status=$?
   if [ "$acquire_status" -ne 0 ]; then
     if [ "$acquire_status" -eq 124 ]; then
       echo "error: refusing to spawn $ID after the bounded Treehouse acquisition timed out" >&2
@@ -2857,7 +2977,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   WORKTREE_RETAIN_ON_ABORT=1
   validate_spawn_worktree "treehouse get --lease" "$PROJ_ABS"
   freshness_status=0
-  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$WT" "$PROJ_ABS" || freshness_status=$?
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-worktree "$WT" "$PROJ_ABS_REAL" || freshness_status=$?
   if [ "$freshness_status" -ne 0 ]; then
     echo "error: refusing to launch fm-$ID from a leased worktree whose repository identity, cleanliness, or default-tip freshness could not be proved" >&2
     exit 1
@@ -2930,9 +3050,9 @@ fi
 # The PATH a crewmate's tool commands run with. A harness executes tool commands
 # through a NON-interactive shell, and on this class of host that shell reads only
 # ~/.zshenv - never ~/.zprofile or ~/.zshrc, which is where Homebrew puts itself.
-# zsh's compiled-in default is /bin:/usr/bin:/usr/ucb:/usr/local/bin, so a crew can
+# zsh's compiled-in default is /bin:/usr/bin:/usr/ucb:/usr/local/bin, so a crewmate can
 # end up unable to see gh, node, or the axi tooling even though every one of them is
-# installed and its worktree is perfectly fine. Crews burned whole CI-repair rounds
+# installed and its worktree is perfectly fine. Crewmates burned whole CI-repair rounds
 # on "gh is absent" before this was traced to shell startup rather than the worktree.
 #
 # Firstmate's own PATH is the seed because it is proven by construction: firstmate
@@ -2942,7 +3062,7 @@ fi
 # reach. The standard locations are appended for the case where firstmate itself was
 # launched with a thin PATH; missing directories and duplicates are dropped.
 crew_tool_path() {
-  local seed dir out= brew=/opt/homebrew
+  local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local
   seed="$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   local IFS=:
@@ -3428,11 +3548,11 @@ EOF
       fi
       WORKTREE_CREATED=1
     fi
-    [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-      && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL" || {
-        echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
-        exit 1
-      }
+    if [ "$(fm_backend_orca_terminal_state "$ORCA_TERMINAL" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+      || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$ORCA_TERMINAL"; then
+      echo "error: Orca terminal is not authoritatively bound to worktree $ORCA_WORKTREE_ID and task $W" >&2
+      exit 1
+    fi
     T="$ORCA_TERMINAL"
     ENDPOINT_CREATED=1
     ;;
@@ -3559,6 +3679,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
+  [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"
   [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
@@ -3649,15 +3770,15 @@ META_WRITE_LOCK=
 if [ "$BACKEND" != herdr ]; then
   build_launch_command
 fi
-# Export the crew PATH and GOTMPDIR into the crewmate's pane shell so the agent and
+# Export the crewmate PATH and GOTMPDIR into the crewmate's pane shell so the agent and
 # every child process (go build, go test, ...) inherit them. Sent before the launch
 # command so the env is set when the agent starts; the brief sleep lets it land.
 if [ "$BACKEND" = orca ]; then
-  [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" = present ] \
-    && fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T" || {
-      echo "error: Orca terminal authority changed before launch for $ID" >&2
-      exit 1
-    }
+  if [ "$(fm_backend_orca_terminal_state "$T" "$ORCA_WORKTREE_ID" "$W")" != present ] \
+    || ! fm_backend_orca_worktree_terminal_contains "$ORCA_WORKTREE_ID" "$W" "$T"; then
+    echo "error: Orca terminal authority changed before launch for $ID" >&2
+    exit 1
+  fi
   validate_orca_abort_worktree_identity || {
     echo "error: Orca worktree authority changed before launch for $ID" >&2
     exit 1

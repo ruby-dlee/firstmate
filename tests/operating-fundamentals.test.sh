@@ -131,9 +131,10 @@ test_live_surface_freshness_contract() {
   assert_grep "Reconcile the proposed decision against live fleet state" "$LAVISH_SKILL" "Lavish decisions must use live fleet state"
   assert_grep "Do not edit \`request.md\` or \`manifest.toon\` after surfacing" "$LAVISH_SKILL" "surfaced decision contracts must be immutable"
   assert_grep "The answer file is authoritative; the wake record is only a pointer" "$LAVISH_SKILL" "durable answers must outrank wake pointers"
-  assert_grep "Never start a server, open a browser, create or share a session URL, poll" "$LAVISH_SKILL" "the disqualified browser and polling lifecycle must stay prohibited"
   assert_grep "before creating, repairing, or presenting a multi-option captain choice" "$LAVISH_SKILL" "Lavish frontmatter must trigger when presenting a choice"
   assert_grep "load before creating, repairing, or presenting a multi-option captain choice" "$AGENTS" "AGENTS must route presenting a choice through Lavish"
+  assert_grep "The Lavish fork runs no server, listener, poller, watcher, or resident process" "$LAVISH_SKILL" "the fork must retain its no-resident-process reliability boundary"
+  assert_grep "browser glue must never attach to the captain's main Chrome profile" "$LAVISH_SKILL" "browser surfacing must retain captain-profile isolation"
   pass "live-surface freshness preserves completion history and in-progress answers"
 }
 

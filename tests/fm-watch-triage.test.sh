@@ -27,6 +27,7 @@ set -u
 . "$ROOT/bin/fm-transition-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
+WATCH_CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
@@ -427,12 +428,16 @@ test_turn_ended_not_working_surfaced() {
   local dir state fakebin out drain_out pid
   dir=$(make_case turn-ended-stopped); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
-  : > "$state/task.turn-ended"
   # No running pipeline, no busy pane: the crewmate has stopped (e.g. it finished via
   # an interactive menu and wrote no done: status). Default unknown verdict.
   export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
+  wait_numeric_file "$state/.watch.lock/pid" 30 || {
+    reap "$pid"
+    fail "watcher did not publish readiness before the stopped turn-end signal"
+  }
+  : > "$state/task.turn-ended"
   wait_for_exit "$pid" 40 || fail "watcher did not surface a turn-end whose crew is not provably working"
   grep -F "signal: $state/task.turn-ended" "$out" >/dev/null || fail "watcher did not print the surfaced turn-end signal"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced turn-end failed"
@@ -1727,6 +1732,43 @@ SH
   pass "watcher delegates per-task sync budgets and separately cadences the sweep"
 }
 
+test_checkpoint_reconciles_managed_secondmate_session() {
+  local dir state fakebin fake_root sync_bin meta out status
+  dir=$(make_case checkpoint-account-session-sync); state="$dir/state"; fakebin="$dir/fakebin"
+  fake_root="$dir/root"
+  sync_bin="$fake_root/bin/fm-account-session-sync.sh"
+  meta="$state/managed-secondmate.meta"
+  out="$dir/checkpoint.out"
+  mkdir -p "$fake_root/bin"
+  fm_write_meta "$meta" \
+    "window=firstmate:fm-managed-secondmate" \
+    "kind=secondmate" \
+    "account_task=fleet-managed-secondmate" \
+    "account_attempt=attempt-managed-secondmate"
+  cat > "$sync_bin" <<'SH'
+#!/usr/bin/env bash
+set -u
+meta="$FM_STATE_OVERRIDE/managed-secondmate.meta"
+grep -q '^kind=secondmate$' "$meta" || exit 1
+grep -q '^account_task=' "$meta" || exit 1
+grep -q '^provider_session_id=' "$meta" && exit 0
+printf 'provider_session_id=session-checkpoint\n' >> "$meta"
+SH
+  chmod +x "$sync_bin"
+
+  set +e
+  env PATH="$fakebin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    FM_ROOT_OVERRIDE="$fake_root" FM_STATE_OVERRIDE="$state" \
+    FM_ACCOUNT_SESSION_SYNC_INTERVAL=0 FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 "$WATCH_CHECKPOINT" --seconds 8 > "$out" 2>&1
+  status=$?
+  set -e
+  [ "$status" -eq 124 ] || fail "quiet checkpoint watch returned $status: $(cat "$out")"
+  grep -E '^provider_session_id=session-checkpoint$' "$meta" >/dev/null \
+    || fail "checkpoint watch skipped managed-secondmate session reconciliation"
+  pass "checkpoint watches preserve managed-secondmate provider session reconciliation"
+}
+
 test_watcher_markers_refuse_symlinks() {
   local dir state fake_root sync_bin outside before after
   dir=$(make_case watcher-marker-symlink); state="$dir/state"
@@ -1806,6 +1848,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-23 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = checkpoint-account-session-sync ]; then
+  test_account_session_sync_is_bounded_and_cadenced
+  test_checkpoint_reconciles_managed_secondmate_session
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = managed-tmux-reverse-map ]; then
   test_managed_tmux_window_id_reverse_mapping
   exit 0
@@ -1875,5 +1923,6 @@ test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
 test_account_session_sync_is_bounded_and_cadenced
+test_checkpoint_reconciles_managed_secondmate_session
 test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback

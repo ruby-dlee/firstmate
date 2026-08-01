@@ -11,6 +11,7 @@ ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
+CLAUDE_AUTH_LOG="$TMP_ROOT/claude-auth.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
 ROTATION_STATE="$TMP_ROOT/rotation-state"
 
@@ -80,6 +81,21 @@ fi
 SH
 chmod +x "$FAKEBIN/herdr"
 
+cat > "$FAKEBIN/claude" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = auth ] && [ "${2:-}" = status ] && [ "${3:-}" = --json ] || exit 64
+[ -n "${CLAUDE_CONFIG_DIR:-}" ] || exit 65
+printf '%s\n' "$CLAUDE_CONFIG_DIR" >> "$FM_FAKE_CLAUDE_AUTH_LOG"
+if [ -f "$CLAUDE_CONFIG_DIR/test-authenticated" ]; then
+  printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+  exit 0
+fi
+printf '%s\n' '{"loggedIn":false,"authMethod":"none"}'
+exit 1
+SH
+chmod +x "$FAKEBIN/claude"
+
 cat > "$FAKEBIN/profile-agent-fleet" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -125,7 +141,9 @@ run_selector() {
     FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
+    FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
     FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
     "$SELECTOR" "$@"
 }
 
@@ -134,6 +152,14 @@ set_remaining() {
   mkdir -p "$ACCOUNT_ROOT/codex/$account/.agent-fleet-quota-cache/quota-axi"
   printf '%s\n' "$remaining" > "$ACCOUNT_ROOT/codex/$account/test-remaining"
   printf '{"stale":true}\n' > "$ACCOUNT_ROOT/codex/$account/.agent-fleet-quota-cache/quota-axi/quotas.json"
+  printf '{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}\n' \
+    > "$ACCOUNT_ROOT/codex/$account/auth.json"
+}
+
+set_claude_authenticated() {
+  local account=$1
+  mkdir -p "$ACCOUNT_ROOT/claude/$account"
+  : > "$ACCOUNT_ROOT/claude/$account/test-authenticated"
 }
 
 reset_accounts() {
@@ -142,15 +168,18 @@ reset_accounts() {
   mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
   : > "$QUOTA_LOG"
   : > "$HERDR_LOG"
+  : > "$CLAUDE_AUTH_LOG"
 }
 
 mark_manual_only() {
   local provider=$1 account=$2
+  mkdir -p "$ACCOUNT_ROOT/$provider/$account"
   touch "$ACCOUNT_ROOT/$provider/$account/test-manual-only"
 }
 
 mark_last_resort() {
   local provider=$1 account=$2
+  mkdir -p "$ACCOUNT_ROOT/$provider/$account"
   touch "$ACCOUNT_ROOT/$provider/$account/test-last-resort"
 }
 
@@ -472,11 +501,33 @@ test_default_root_uses_passwd_home_not_ambient_home() {
   pass "default account discovery ignores ambient HOME and stays under the passwd home"
 }
 
+test_claude_credential_check_recovers_from_stale_profile_binary_manifest() {
+  local account_home passwd_home
+  reset_accounts
+  account_home="$ACCOUNT_ROOT/claude/1"
+  passwd_home="$TMP_ROOT/credential-passwd-home"
+  set_claude_authenticated 1
+  mkdir -p "$passwd_home/.local/bin"
+  ln -s "$FAKEBIN/claude" "$passwd_home/.local/bin/claude"
+  printf '{"binary":{"resolved_path":"/missing/claude"}}\n' \
+    > "$account_home/.agent-fleet-provider-binary.json"
+
+  FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
+    FM_ACCOUNT_DIRECTORY_PASSWD_HOME="$passwd_home" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
+    "$SELECTOR" check-credential claude "$account_home" \
+    || fail "Claude credential check did not recover from a stale pinned binary"
+  assert_grep "$account_home" "$CLAUDE_AUTH_LOG" \
+    "Claude credential check did not scope the current provider binary to the selected account"
+  pass "Claude credential preflight resolves the current install when profile binary metadata is stale"
+}
+
 test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   local codex_home claude_home
   reset_accounts
   set_remaining 1 90,80
-  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  set_claude_authenticated 1
   mark_claude_keychain_ready 1
 
   codex_home=$(run_selector prepare codex 2>"$TMP_ROOT/prepare-codex.err")
@@ -486,6 +537,41 @@ test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   assert_grep $'codex\t'"$ACCOUNT_ROOT/codex/1" "$HERDR_LOG" "Herdr installer did not receive CODEX_HOME"
   assert_grep $'claude\t'"$ACCOUNT_ROOT/claude/1" "$HERDR_LOG" "Herdr installer did not receive CLAUDE_CONFIG_DIR"
   pass "prepare uses Herdr's own installer and verifies each selected profile hook"
+}
+
+test_prepare_rejects_missing_credentials_before_hook_install() {
+  local out status codex_home claude_home
+
+  reset_accounts
+  set_remaining 1 90,80
+  codex_home="$ACCOUNT_ROOT/codex/1"
+  rm -f "$codex_home/auth.json"
+  out=$(run_selector prepare codex 2>&1)
+  status=$?
+  expect_code 1 "$status" "Codex prepare without auth.json should fail closed"
+  assert_contains "$out" "selected codex account directory '$codex_home' has no usable on-disk credential" \
+    "Codex credential refusal omitted the selected account directory"
+  assert_contains "$out" "CODEX_HOME='$codex_home'" \
+    "Codex credential refusal omitted the exact scoped login command"
+  [ ! -s "$HERDR_LOG" ] || fail "Codex credential refusal still installed a Herdr hook"
+
+  reset_accounts
+  claude_home="$ACCOUNT_ROOT/claude/1"
+  mkdir -p "$claude_home"
+  mark_claude_keychain_ready 1
+  out=$(run_selector prepare claude 2>&1)
+  status=$?
+  expect_code 1 "$status" "Claude prepare without a usable login should fail closed"
+  assert_contains "$out" "selected claude account directory '$claude_home' has no usable credential" \
+    "Claude credential refusal omitted the selected account directory"
+  assert_contains "$out" "CLAUDE_CONFIG_DIR='$claude_home'" \
+    "Claude credential refusal omitted the exact scoped login command"
+  assert_contains "$out" "auth login" \
+    "Claude credential refusal omitted the provider login command"
+  assert_grep "$claude_home" "$CLAUDE_AUTH_LOG" \
+    "Claude credential preflight did not query the selected config directory"
+  [ ! -s "$HERDR_LOG" ] || fail "Claude credential refusal still installed a Herdr hook"
+  pass "prepare refuses unauthenticated account directories before hook installation"
 }
 
 make_spawn_fakebin() {
@@ -585,7 +671,9 @@ run_direct_spawn() {
     FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
+    FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
     FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_CLAUDE_AUTH_LOG="$CLAUDE_AUTH_LOG" \
     FM_AGENT_FLEET_BIN="$FAKEBIN/forbidden-agent-fleet" \
     FM_FAKE_AGENT_FLEET_LOG="$TMP_ROOT/agent-fleet.log" \
     "$ROOT/bin/fm-spawn.sh" "$@"
@@ -695,7 +783,7 @@ test_spawn_uses_direct_claude_fallback_and_hook() {
   local record id out launch meta
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
-  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  set_claude_authenticated 2
   mark_manual_only claude 1
   mark_claude_keychain_ready 2
   id=direct-claude-z2
@@ -741,7 +829,7 @@ test_claude_spawn_rejects_mismatched_explicit_model() {
 test_direct_claude_recovery_resolves_legacy_default_to_anchor() {
   local record id meta meta_tmp launch
   reset_accounts
-  mkdir -p "$ACCOUNT_ROOT/claude/2"
+  set_claude_authenticated 2
   mark_claude_keychain_ready 2
   id=claude-recovery-model-anchor-z2
   record=$(make_spawn_case claude-recovery-model-anchor claude "$id")
@@ -763,6 +851,28 @@ test_direct_claude_recovery_resolves_legacy_default_to_anchor() {
   assert_grep "model=claude-opus-5" "$meta" \
     "direct Claude recovery metadata did not record the model actually launched"
   pass "direct Claude recovery preserves explicit models and upgrades a legacy default to the Opus 5 anchor"
+}
+
+test_spawn_refuses_unauthenticated_account_before_endpoint_creation() {
+  local record id out status
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  mark_claude_keychain_ready 1
+  id=direct-claude-unauth-z2a
+  record=$(make_spawn_case direct-claude-unauth claude "$id")
+  read_spawn_case "$record"
+
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-claude-pool 2>&1)
+  status=$?
+  expect_code 1 "$status" "unauthenticated direct Claude spawn should fail closed"
+  assert_contains "$out" "selected claude account directory '$ACCOUNT_ROOT/claude/1' has no usable credential" \
+    "spawn credential refusal omitted the selected account directory"
+  assert_contains "$out" "auth login" "spawn credential refusal omitted the exact login command"
+  assert_absent "$SPAWN_HOME/state/.fake-endpoint" \
+    "unauthenticated direct Claude spawn created an endpoint"
+  [ ! -s "$SPAWN_LAUNCH_LOG" ] || fail "unauthenticated direct Claude spawn typed a launch command"
+  pass "fm-spawn refuses an unauthenticated direct account before endpoint creation"
 }
 
 test_observe_spawn_uses_direct_directory_without_agent_fleet() {
@@ -1352,6 +1462,16 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = credential-preflight ]; then
+  test_claude_credential_check_recovers_from_stale_profile_binary_manifest
+  test_prepare_installs_and_verifies_per_account_herdr_hooks
+  test_prepare_rejects_missing_credentials_before_hook_install
+  test_spawn_uses_direct_claude_fallback_and_hook
+  test_spawn_refuses_unauthenticated_account_before_endpoint_creation
+  test_direct_claude_recovery_resolves_legacy_default_to_anchor
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   test_main_home_ship_and_scout_use_managed_treehouse_source
   exit 0
@@ -1370,10 +1490,13 @@ test_claude_fails_closed_when_no_usable_crew_account_exists
 test_claude_uses_only_explicit_last_resort_after_primary_exhaustion
 test_codex_rotates_accounts_tied_for_best_fresh_score
 test_default_root_uses_passwd_home_not_ambient_home
+test_claude_credential_check_recovers_from_stale_profile_binary_manifest
 test_prepare_installs_and_verifies_per_account_herdr_hooks
+test_prepare_rejects_missing_credentials_before_hook_install
 test_main_home_ship_and_scout_use_managed_treehouse_source
 test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
+test_spawn_refuses_unauthenticated_account_before_endpoint_creation
 test_claude_spawn_rejects_mismatched_explicit_model
 test_direct_claude_recovery_resolves_legacy_default_to_anchor
 test_observe_spawn_uses_direct_directory_without_agent_fleet

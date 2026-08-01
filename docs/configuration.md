@@ -186,6 +186,7 @@ Because Claude account identity is not machine-readable per directory, pool memb
 A profile assigned only to `claude-manual` remains a hard exclusion; declaring last-resort behavior requires adding the separate last-resort pool deliberately.
 They invoke Herdr's own integration installer against the selected profile directory and verify its per-profile hook file before launching.
 Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates, logs in, or invokes a model.
+Before installing that hook or creating an endpoint, spawn preflight fails closed when the selected directory lacks a usable credential and prints the exact provider-scoped login command for a human.
 
 Codex health and usage are genuinely readable per account.
 Every selection performs a fresh per-account quota read instead of trusting a prior cache, and a Codex directory with no fresh general usage window is skipped.

@@ -704,6 +704,65 @@ test_required_source_fails_closed() {
   pass "report stack refuses a required ship report with no completion source"
 }
 
+test_required_sections_accept_one_top_heading_level_in_order() {
+  local id source entry manifest out status
+
+  id=report-level-one-b2a
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  cat > "$source" <<'EOF'
+# Summary
+
+Level-one sections are accepted.
+
+# What changed
+
+Recorded work.
+
+# Verification
+
+Evidence checked.
+
+# Visual evidence
+
+None.
+
+# Artifacts
+
+Report.
+
+# Follow-ups
+
+None.
+EOF
+  run_stack publish "$id" >/dev/null || fail "ordered level-one report sections were rejected"
+  entry=$(run_stack path "$id")
+  manifest="$(dirname "$entry")/manifest.json"
+  assert_grep '"summary": "Level one sections are accepted."' "$manifest" \
+    "manifest summary did not follow the accepted level-one section structure"
+
+  id=report-mixed-levels-b2b
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Summary\n\nComplete.\n\n## What changed\n\nChanged.\n\n## Verification\n\nVerified.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nReport.\n\n## Follow-ups\n\nNone.\n' > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "mixed level-one and level-two report sections unexpectedly published"
+  assert_contains "$out" "do not share one top structural level (# or ##)" \
+    "mixed-heading refusal did not explain the common-level requirement"
+
+  id=report-out-of-order-b2c
+  write_task "$id" ship
+  source="$HOME_DIR/data/$id/completion.md"
+  printf '# Summary\n\nComplete.\n\n# Verification\n\nVerified.\n\n# What changed\n\nChanged.\n\n# Visual evidence\n\nNone.\n\n# Artifacts\n\nReport.\n\n# Follow-ups\n\nNone.\n' > "$source"
+  out=$(run_stack publish "$id" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "out-of-order level-one report sections unexpectedly published"
+  assert_contains "$out" "required section headings are out of order" \
+    "out-of-order refusal did not explain the ordering requirement"
+  pass "report stack accepts level one or two while rejecting mixed and out-of-order sections"
+}
+
 test_required_sections_fail_actionably() {
   local id=report-headings-b3 out status before after source heading
   write_task "$id" ship
@@ -4018,6 +4077,12 @@ if [ "${FM_TEST_FOCUSED:-}" = report-fence-enforcement ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = report-heading-levels ]; then
+  test_required_sections_accept_one_top_heading_level_in_order
+  test_required_sections_reject_empty_bodies
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = fenced-report-body-final ]; then
   test_fenced_required_section_bodies_use_scoped_content
   test_nested_short_fences_do_not_satisfy_required_sections
@@ -4097,6 +4162,7 @@ test_metadata_is_bounded_before_reading
 test_report_temps_are_exclusive_and_randomized
 test_visual_inventory_is_count_and_depth_bounded
 test_required_source_fails_closed
+test_required_sections_accept_one_top_heading_level_in_order
 test_required_sections_fail_actionably
 test_required_sections_reject_empty_bodies
 test_required_sections_reject_container_only_markers

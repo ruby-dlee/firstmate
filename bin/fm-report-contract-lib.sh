@@ -3,12 +3,18 @@
 # managed continuation prompts.
 # The durable publication and storage contract lives in docs/report-stack.md.
 
+fm_completion_report_required_headings() {
+  # shellcheck disable=SC2016 # Markdown backticks must remain literal output.
+  printf '%s' '`## Summary`, `## What changed`, `## Verification`, `## Visual evidence`, `## Artifacts`, `## Follow-ups`'
+}
+
 fm_completion_report_contract() {  # <data-dir> <task-id>
-  local data=$1 task=$2
+  local data=$1 task=$2 headings
+  headings=$(fm_completion_report_required_headings)
   printf '%s\n' \
     '# Completion report' \
-    "Before the final \`done:\` status, write \`$data/$task/completion.md\` with these six sections, each as a LEVEL-TWO markdown heading spelled exactly: \`## Summary\`, \`## What changed\`, \`## Verification\`, \`## Visual evidence\`, \`## Artifacts\`, \`## Follow-ups\`." \
-    "Publication rejects the report if any of those headings is missing, spelled differently, or written at another level - a level-one \`# Summary\` fails. Each section needs substantive prose directly under it; if you use sub-headings inside a section, make them \`###\` so they nest rather than ending the section." \
+    "Before the final \`done:\` status, write \`$data/$task/completion.md\` with these six exact level-two headings in this order: $headings." \
+    "Keep all six at level two; publication also accepts a report that consistently uses the level-one equivalents as its section structure, but do not mix heading levels. Each section needs substantive prose directly under it; if you use sub-headings inside a section, make them \`###\` so they nest rather than ending the section." \
     'When a section genuinely does not apply, say so in a sentence under the heading rather than omitting the heading.' \
     'Make it stand alone for the captain: explain the outcome, name important files or links, record the validation performed, and call out remaining risk or decisions.' \
     "Put screenshots, diagrams, or other visual artifacts under \`$data/$task/visuals/\` and reference them from the report when they materially help review." \

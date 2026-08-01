@@ -2,6 +2,7 @@
 # Select and prepare direct Claude or Codex account-directory launches.
 # Usage:
 #   fm-account-directory.sh select <claude|codex>
+#   fm-account-directory.sh check-credential <claude|codex> <account-home>
 #   fm-account-directory.sh install-herdr-hook <claude|codex> <account-home>
 #   fm-account-directory.sh prepare <claude|codex>
 #
@@ -42,8 +43,14 @@
 # to the first candidate.
 # Selection prints only the chosen absolute account home on stdout and logs
 # health, fallback, and choice diagnostics on stderr.
-# prepare selects the account and idempotently runs Herdr's own integration
-# installer with CODEX_HOME or CLAUDE_CONFIG_DIR set to the chosen home.
+# prepare selects the account, verifies a usable credential before endpoint
+# creation can begin, and idempotently runs Herdr's own integration installer
+# with CODEX_HOME or CLAUDE_CONFIG_DIR set to the chosen home.
+# Codex uses a cheap read-only auth.json credential-material check.
+# Claude uses the CLI's local `auth status --json` check, bounded to two seconds
+# and never making a model call.
+# A failed check names the selected account home and prints the exact scoped
+# provider login command a human can run.
 # It verifies the installed per-profile hook before printing the chosen home.
 #
 # Credential and profile-registry state is read-only.
@@ -73,6 +80,12 @@ log() {
 
 test_lab_enabled() {
   [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = "$TEST_LAB_TOKEN" ]
+}
+
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
 }
 
 system_perl() {
@@ -312,6 +325,108 @@ valid_account_home() { # <vendor-dir> <candidate>
   name=${candidate##*/}
   case "$name" in
     ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+provider_binary() { # <vendor> <account-home>
+  local vendor=$1 account_home=$2 override manifest binary install_path home perl_bin
+  if test_lab_enabled; then
+    case "$vendor" in
+      claude) override=${FM_ACCOUNT_DIRECTORY_CLAUDE_BIN:-} ;;
+      codex) override=${FM_ACCOUNT_DIRECTORY_CODEX_BIN:-} ;;
+      *) return 1 ;;
+    esac
+    if [ -n "$override" ]; then
+      [ -f "$override" ] && [ ! -L "$override" ] && [ -x "$override" ] || {
+        echo "error: test $vendor provider binary is not a real executable: $override" >&2
+        return 1
+      }
+      printf '%s\n' "$override"
+      return 0
+    fi
+  fi
+  manifest=$account_home/.agent-fleet-provider-binary.json
+  if [ -f "$manifest" ] && [ ! -L "$manifest" ]; then
+    binary=$(jq -er '.binary.resolved_path | select(type == "string" and startswith("/"))' "$manifest" 2>/dev/null) || binary=
+    if [ -n "$binary" ] && [ -f "$binary" ] && [ ! -L "$binary" ] && [ -x "$binary" ]; then
+      printf '%s\n' "$binary"
+      return 0
+    fi
+  fi
+  home=$(passwd_home) || return 1
+  install_path=$home/.local/bin/$vendor
+  perl_bin=$(system_perl) || return 1
+  # shellcheck disable=SC2016 # Perl source is intentionally single-quoted.
+  binary=$("$perl_bin" -MCwd=realpath -e '
+    my $path = realpath($ARGV[0]);
+    exit 1 unless defined $path && $path =~ m{^/} && $path !~ /[\x00-\x1f\x7f]/;
+    print $path;
+  ' "$install_path" 2>/dev/null) || binary=
+  if [ -n "$binary" ] && [ -f "$binary" ] && [ ! -L "$binary" ] && [ -x "$binary" ]; then
+    printf '%s\n' "$binary"
+    return 0
+  fi
+  echo "error: cannot resolve the $vendor provider binary for account credential verification at $account_home" >&2
+  return 1
+}
+
+credential_login_command() { # <vendor> <account-home> [provider-binary]
+  local vendor=$1 account_home=$2 provider_bin=${3:-$1}
+  case "$vendor" in
+    codex)
+      printf 'CODEX_HOME=%s %s login' "$(shell_quote "$account_home")" "$(shell_quote "$provider_bin")"
+      ;;
+    claude)
+      printf 'CLAUDE_CONFIG_DIR=%s %s auth login' "$(shell_quote "$account_home")" "$(shell_quote "$provider_bin")"
+      ;;
+  esac
+}
+
+check_codex_credential() { # <account-home>
+  local account_home=$1 credential provider_bin login
+  credential=$account_home/auth.json
+  provider_bin=$(provider_binary codex "$account_home" 2>/dev/null || printf 'codex')
+  login=$(credential_login_command codex "$account_home" "$provider_bin")
+  if [ ! -f "$credential" ] || [ -L "$credential" ] || ! jq -e '
+    ((.tokens.access_token? | type) == "string" and (.tokens.access_token | length) > 0
+      and (.tokens.refresh_token? | type) == "string" and (.tokens.refresh_token | length) > 0)
+    or ((.OPENAI_API_KEY? | type) == "string" and (.OPENAI_API_KEY | length) > 0)
+  ' "$credential" >/dev/null 2>&1; then
+    echo "error: selected codex account directory '$account_home' has no usable on-disk credential; run: $login" >&2
+    return 1
+  fi
+}
+
+check_claude_credential() { # <account-home>
+  local account_home=$1 provider_bin status_json login
+  provider_bin=$(provider_binary claude "$account_home") || return 1
+  login=$(credential_login_command claude "$account_home" "$provider_bin")
+  status_json=$(run_bounded 2 /usr/bin/env CLAUDE_CONFIG_DIR="$account_home" \
+    "$provider_bin" auth status --json 2>/dev/null) || status_json=
+  if ! jq -e '.loggedIn == true' >/dev/null 2>&1 <<EOF
+$status_json
+EOF
+  then
+    echo "error: selected claude account directory '$account_home' has no usable credential; run: $login" >&2
+    return 1
+  fi
+}
+
+check_credential() { # <vendor> <account-home>
+  local vendor=$1 account_home=$2 root vendor_dir
+  root=$(account_root) || return 1
+  vendor_dir=$root/$vendor
+  valid_account_home "$vendor_dir" "$account_home" || {
+    echo "error: unsafe $vendor account home for credential verification: $account_home" >&2
+    return 1
+  }
+  case "$vendor" in
+    codex) check_codex_credential "$account_home" ;;
+    claude) check_claude_credential "$account_home" ;;
+    *)
+      echo "error: account credential verification supports only claude or codex, not '$vendor'" >&2
+      return 1
+      ;;
   esac
 }
 
@@ -787,6 +902,10 @@ case "${1:-}" in
     [ "$#" -eq 2 ] || { usage; exit 2; }
     select_account "$2"
     ;;
+  check-credential)
+    [ "$#" -eq 3 ] || { usage; exit 2; }
+    check_credential "$2" "$3"
+    ;;
   install-herdr-hook)
     [ "$#" -eq 3 ] || { usage; exit 2; }
     install_herdr_hook "$2" "$3"
@@ -794,6 +913,7 @@ case "${1:-}" in
   prepare)
     [ "$#" -eq 2 ] || { usage; exit 2; }
     selected_home=$(select_account "$2") || exit 1
+    check_credential "$2" "$selected_home" || exit 1
     install_herdr_hook "$2" "$selected_home" || exit 1
     printf '%s\n' "$selected_home"
     ;;

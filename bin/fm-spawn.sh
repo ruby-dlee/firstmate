@@ -782,6 +782,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     exit 1
   fi
   KIND=$recorded_kind
+  RECOVERY_RECORDED_KIND=$recorded_kind
   if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
     case "$KIND" in
       ship|scout) ;;
@@ -2033,8 +2034,7 @@ if [ -e "$STATE/$ID.grok-turnend-token" ] || [ -L "$STATE/$ID.grok-turnend-token
 if [ -e "/tmp/fm-$ID" ] || [ -L "/tmp/fm-$ID" ]; then ORIGINAL_TASK_TMP_PRESENT=1; else ORIGINAL_TASK_TMP_PRESENT=0; fi
 
 if [ "$RECOVERY_ACCOUNT" = 1 ]; then
-  RECORDED_KIND=$(fm_meta_get "$RESUME_META" kind)
-  [ -n "$RECORDED_KIND" ] || RECORDED_KIND=ship
+  RECORDED_KIND=$RECOVERY_RECORDED_KIND
   if [ "$KIND" != ship ] && [ "$KIND" != "$RECORDED_KIND" ]; then
     echo "error: account recovery kind '$KIND' does not match recorded kind '$RECORDED_KIND'" >&2
     exit 1
@@ -2745,7 +2745,7 @@ else
     [ -n "$PROJ_ABS" ] && [ -d "$PROJ_ABS" ] || { echo "error: recorded project is unavailable for managed recovery: ${PROJ_ABS:-<missing>}" >&2; exit 1; }
     [ -n "$WT" ] && [ -d "$WT" ] || { echo "error: recorded worktree is unavailable for managed recovery: ${WT:-<missing>}" >&2; exit 1; }
   else
-    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+    PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd -P)"
     WT=""
   fi
 fi

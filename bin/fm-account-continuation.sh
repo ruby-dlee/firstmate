@@ -245,6 +245,26 @@ cd "$WORKTREE_REAL" \
 exec 9< . \
   || { echo "error: continuation worktree cannot be pinned for $ID" >&2; exit 1; }
 cd "$ORIGINAL_CWD" || exit 1
+
+if [ "$KIND" = secondmate ]; then
+  BRIEF_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-brief-$ID.XXXXXX") \
+    || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
+  if python3 "$SCRIPT_DIR/fm-contained-read.py" cat-optional-fd data/charter.md "$MAX_PACKET_BYTES" 3<&9 \
+    > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null; then
+    [ -s "$BRIEF_SNAPSHOT_TMP" ] \
+      || { echo "error: secondmate charter is empty for continuation of $ID" >&2; exit 1; }
+  else
+    charter_status=$?
+    if [ "$charter_status" -eq 3 ]; then
+      rm -f "$BRIEF_SNAPSHOT_TMP"
+      BRIEF_SNAPSHOT_TMP=
+    else
+      echo "error: secondmate charter is present but unsafe for continuation of $ID" >&2
+      exit 1
+    fi
+  fi
+fi
+
 git_pinned() {
   python3 "$SCRIPT_DIR/fm-contained-read.py" git-fd "$@" 3<&9
 }
@@ -293,24 +313,7 @@ if ! node "$CONTAINED_READ" snapshot "$TASK_DIR" "$TASK_SNAPSHOT_DIR" 1048576 "$
   exit 1
 fi
 
-if [ "$KIND" = secondmate ]; then
-  BRIEF_SNAPSHOT_TMP=$(mktemp "$STATE/.continuation-brief-$ID.XXXXXX") \
-    || { echo "error: cannot stage original brief or charter for continuation of $ID" >&2; exit 1; }
-  if python3 "$SCRIPT_DIR/fm-contained-read.py" cat-optional-fd data/charter.md "$MAX_PACKET_BYTES" 3<&9 \
-    > "$BRIEF_SNAPSHOT_TMP" 2>/dev/null; then
-    [ -s "$BRIEF_SNAPSHOT_TMP" ] \
-      || { echo "error: secondmate charter is empty for continuation of $ID" >&2; exit 1; }
-  else
-    charter_status=$?
-    if [ "$charter_status" -eq 3 ]; then
-      rm -f "$BRIEF_SNAPSHOT_TMP"
-      BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
-    else
-      echo "error: secondmate charter is present but unsafe for continuation of $ID" >&2
-      exit 1
-    fi
-  fi
-else
+if [ "$KIND" != secondmate ] || [ -z "$BRIEF_SNAPSHOT_TMP" ]; then
   BRIEF_SNAPSHOT_TMP="$TASK_SNAPSHOT_DIR/0.snapshot"
 fi
 [ -s "$BRIEF_SNAPSHOT_TMP" ] \

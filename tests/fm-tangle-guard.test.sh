@@ -179,7 +179,7 @@ SH
 
 run_spawn() {
   local home=$1 id=$2 proj=$3 pane=$4 fakebin=$5
-  mkdir -p "$home/data/$id"
+  mkdir -p "$home/data/$id" "$home/treehouse-pools"
   printf 'brief\n' > "$home/data/$id/brief.md"
   printf '# Backlog\n\n## In flight\n- [ ] %s - isolation guard test (repo: %s)\n\n## Queued\n\n## Done\n' \
     "$id" "$(basename "$proj")" > "$home/data/backlog.md"
@@ -266,7 +266,7 @@ SH
 
 run_spawn_record() {
   local home=$1 id=$2 proj=$3 pane=$4 fakebin=$5 rec=$6
-  mkdir -p "$home/data/$id"
+  mkdir -p "$home/data/$id" "$home/treehouse-pools"
   printf 'brief\n' > "$home/data/$id/brief.md"
   printf '# Backlog\n\n## In flight\n- [ ] %s - tmux construction test (repo: %s)\n\n## Queued\n\n## Done\n' \
     "$id" "$(basename "$proj")" > "$home/data/backlog.md"

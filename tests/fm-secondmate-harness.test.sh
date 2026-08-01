@@ -14,10 +14,11 @@
 #      explicit per-spawn harness arg still wins.
 #   B) Inheritance. The primary pushes a declared, extensible set of LOCAL
 #      (gitignored) config items - config/crew-dispatch.json, config/crew-harness,
-#      and config/backlog-backend - down into each secondmate home's config/, so
-#      the secondmate's OWN crewmates, dispatch profiles, and backlog backend
-#      inherit the primary's settings. It is primary-authoritative (re-pushed at
-#      secondmate spawn, on the bootstrap secondmate sweep, and by config push).
+#      config/claude-crew-model, and config/backlog-backend - down into each
+#      secondmate home's config/, so the secondmate's OWN crewmates, dispatch
+#      profiles, Claude model anchor, and backlog backend inherit the primary's
+#      settings. It is primary-authoritative (re-pushed at secondmate spawn, on
+#      the bootstrap secondmate sweep, and by config push).
 #      config/secondmate-harness is deliberately NOT inherited (secondmates do
 #      not spawn secondmates).
 #   C) Model/effort pin. config/secondmate-harness may carry optional model and
@@ -114,6 +115,37 @@ ROWS
   pass "C1 fm-harness.sh secondmate-model/secondmate-effort resolve the optional tokens; bare harness stays empty (backward-compat)"
 }
 
+test_claude_crew_model_anchor_resolution() {
+  local cfg out err status
+  cfg="$TMP_ROOT/claude-crew-model/config"
+  mkdir -p "$cfg"
+  out=$(FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" claude-crew-model)
+  [ "$out" = claude-opus-5 ] || fail "absent Claude crew model config did not resolve the Opus 5 anchor: $out"
+
+  printf 'claude-opus-5-custom\n' > "$cfg/claude-crew-model"
+  err="$TMP_ROOT/claude-crew-model/mismatch.err"
+  if FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" claude-crew-model > /dev/null 2>"$err"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Claude crew model resolver accepted a non-Opus-5 anchor"
+  assert_contains "$(cat "$err")" "must equal the installed Opus 5 anchor 'claude-opus-5'" \
+    "mismatched Claude anchor error was not actionable"
+
+  printf 'default\n' > "$cfg/claude-crew-model"
+  err="$TMP_ROOT/claude-crew-model/invalid.err"
+  if FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" claude-crew-model > /dev/null 2>"$err"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Claude crew model resolver accepted an inherited-default sentinel"
+  assert_contains "$(cat "$err")" "must contain one explicit Claude model id" \
+    "invalid Claude crew model error was not actionable"
+  pass "C2 fm-harness.sh resolves only the exact installed Opus 5 anchor and rejects mismatches"
+}
+
 # ===========================================================================
 # B) propagate_inheritable_config unit behavior
 # ===========================================================================
@@ -127,6 +159,7 @@ test_propagate_lib() {
   # 1. present source is copied
   printf '{"default":{"harness":"codex"}}\n' > "$src/crew-dispatch.json"
   printf 'codex\n' > "$src/crew-harness"
+  printf 'claude-opus-5\n' > "$src/claude-crew-model"
   printf 'manual\n' > "$src/backlog-backend"
   stdout="$d/clean-copy.out"
   stderr="$d/clean-copy.err"
@@ -135,6 +168,7 @@ test_propagate_lib() {
   [ ! -s "$stderr" ] || fail "clean copy wrote to stderr"
   [ "$(cat "$dest/crew-dispatch.json")" = '{"default":{"harness":"codex"}}' ] || fail "crew-dispatch.json not propagated"
   [ "$(cat "$dest/crew-harness")" = codex ] || fail "crew-harness not propagated"
+  [ "$(cat "$dest/claude-crew-model")" = claude-opus-5 ] || fail "Claude crew model anchor not propagated"
   [ "$(cat "$dest/backlog-backend")" = manual ] || fail "backlog-backend not propagated"
 
   # 2. idempotent: an unchanged re-run does not churn the mtime
@@ -151,10 +185,12 @@ test_propagate_lib() {
   # 3. a changed source value converges downstream
   printf '{"default":{"harness":"claude"}}\n' > "$src/crew-dispatch.json"
   printf 'claude\n' > "$src/crew-harness"
+  printf 'claude-opus-5-custom\n' > "$src/claude-crew-model"
   printf 'tasks-axi\n' > "$src/backlog-backend"
   propagate_inheritable_config "$src" "$dest"
   [ "$(cat "$dest/crew-dispatch.json")" = '{"default":{"harness":"claude"}}' ] || fail "changed dispatch profile did not converge"
   [ "$(cat "$dest/crew-harness")" = claude ] || fail "changed value did not converge"
+  [ "$(cat "$dest/claude-crew-model")" = claude-opus-5-custom ] || fail "changed Claude model anchor did not converge"
   [ "$(cat "$dest/backlog-backend")" = tasks-axi ] || fail "changed backlog backend did not converge"
 
   outside="$d/outside-target"
@@ -168,10 +204,11 @@ test_propagate_lib() {
   [ "$(cat "$outside")" = outside ] || fail "destination symlink target was overwritten"
 
   # 4. removing the source mirrors absence downstream (primary-authoritative)
-  rm -f "$src/crew-dispatch.json" "$src/crew-harness" "$src/backlog-backend"
+  rm -f "$src/crew-dispatch.json" "$src/crew-harness" "$src/claude-crew-model" "$src/backlog-backend"
   propagate_inheritable_config "$src" "$dest"
   [ -e "$dest/crew-dispatch.json" ] && fail "dispatch profile absence not mirrored downstream"
   [ -e "$dest/crew-harness" ] && fail "absence not mirrored downstream"
+  [ -e "$dest/claude-crew-model" ] && fail "Claude model anchor absence not mirrored downstream"
   [ -e "$dest/backlog-backend" ] && fail "backlog-backend absence not mirrored downstream"
 
   rm -f "$dest/crew-harness"
@@ -193,6 +230,7 @@ test_propagate_lib() {
   printf 'grok\n' > "$src/secondmate-harness"
   printf '{"default":{"harness":"codex"}}\n' > "$src/crew-dispatch.json"
   printf 'codex\n' > "$src/crew-harness"
+  printf 'claude-opus-5\n' > "$src/claude-crew-model"
   printf 'manual\n' > "$src/backlog-backend"
   rm -rf "$d/dest2"
   mkdir -p "$d/dest2"
@@ -200,6 +238,7 @@ test_propagate_lib() {
   [ -e "$d/dest2/secondmate-harness" ] && fail "secondmate-harness was inherited (must not be)"
   [ "$(cat "$d/dest2/crew-dispatch.json")" = '{"default":{"harness":"codex"}}' ] || fail "crew-dispatch.json not propagated alongside"
   [ "$(cat "$d/dest2/crew-harness")" = codex ] || fail "crew-harness not propagated alongside"
+  [ "$(cat "$d/dest2/claude-crew-model")" = claude-opus-5 ] || fail "Claude crew model not propagated alongside"
   [ "$(cat "$d/dest2/backlog-backend")" = manual ] || fail "backlog-backend not propagated alongside"
 
   # 6. nothing to propagate -> destination dir is never created (a true no-op)
@@ -212,7 +251,7 @@ test_propagate_lib() {
   # stderr warning and a skip, not a silent miss.
   guard_repo="$d/guard-repo"
   git init -q -b main "$guard_repo"
-  printf 'config/crew-harness\nconfig/backlog-backend\n' > "$guard_repo/.gitignore"
+  printf 'config/crew-harness\nconfig/claude-crew-model\nconfig/backlog-backend\n' > "$guard_repo/.gitignore"
   printf 'guard\n' > "$guard_repo/README.md"
   git -C "$guard_repo" add -A
   git -C "$guard_repo" commit -qm guard
@@ -251,22 +290,46 @@ SH
 # A minimal seeded secondmate home (validate_firstmate_home_for_spawn needs the
 # seed marker, AGENTS.md, bin/, and a charter to launch). config/ is intentionally
 # left absent so the spawn's propagation is what creates it.
+make_fixture_clone() {
+  local destination=$1
+  git clone -q --no-checkout "$ROOT" "$destination"
+  # Push checkouts may already clone a local main; reset the disposable fixture either way.
+  git -C "$destination" checkout -q -B main "$(git -C "$ROOT" rev-parse HEAD)"
+  git -C "$destination" update-ref refs/remotes/origin/main HEAD
+  git -C "$destination" remote set-head origin main
+}
+
 make_seeded_home() {
   local home=$1 id=$2
-  mkdir -p "$home/bin" "$home/data"
-  printf '# Firstmate\n' > "$home/AGENTS.md"
+  make_fixture_clone "$home"
+  printf 'config/claude-crew-model\n' >> "$home/.git/info/exclude"
+  mkdir -p "$home/data"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf 'charter\n' > "$home/data/charter.md"
 }
 
-# spawn_secondmate <world> <id> <home> [explicit-harness]
-# Runs fm-spawn.sh in secondmate mode. FM_ROOT is the real repo (so fm-harness.sh
-# resolves), the primary config dir is <world>/home/config, and CLAUDECODE pins
-# detect_own. stderr is discarded (the local-HEAD ff sync harmlessly skips a
-# non-worktree home). Inspect <world>/home/state/<id>.meta and <home>/config after.
-spawn_secondmate() {
-  local world=$1 id=$2 home=$3 harness=${4:-} fakebin
+prepare_spawn_world() {
+  local world=$1 id=$2 home=$3 home_real primary
   mkdir -p "$world/home/state" "$world/home/data"
+  primary="$world/primary"
+  if [ ! -d "$primary/.git" ]; then
+    make_fixture_clone "$primary"
+    git -C "$primary" remote set-url origin "$primary"
+  fi
+  git -C "$home" remote set-url origin "$primary"
+  git -C "$home" remote set-head origin main
+  home_real=$(cd "$home" && pwd -P)
+  printf -- '- %s - harness test (home: %s; scope: harness test; projects: ; added 2026-07-27)\n' \
+    "$id" "$home_real" > "$world/home/data/secondmates.md"
+  printf '%s\n' "$primary"
+}
+
+# spawn_secondmate <world> <id> <home> [explicit-harness]
+# Runs fm-spawn.sh in secondmate mode. CLAUDECODE pins detect_own. Inspect
+# <world>/home/state/<id>.meta and <home>/config after.
+spawn_secondmate() {
+  local world=$1 id=$2 home=$3 harness=${4:-} fakebin primary
+  primary=$(prepare_spawn_world "$world" "$id" "$home")
   fakebin=$(make_noop_tmux "$world/tmux-$id")
   # An empty harness must contribute zero args, not an empty positional; build the
   # arg list explicitly so the optional harness is omitted cleanly.
@@ -274,7 +337,7 @@ spawn_secondmate() {
   [ -n "$harness" ] && spawn_args+=("$harness")
   spawn_args+=(--secondmate)
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
-    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
+    FM_ROOT_OVERRIDE="$primary" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
     FM_SPAWN_NO_GUARD=1 \
@@ -293,6 +356,7 @@ test_spawn_split_and_inherit() {
   mkdir -p "$w/home/config"
   printf '{"default":{"harness":"claude","model":"haiku","effort":"low"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'claude\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5\n' > "$w/home/config/claude-crew-model"
   printf 'codex\n' > "$w/home/config/secondmate-harness"
   printf 'manual\n' > "$w/home/config/backlog-backend"
   make_seeded_home "$sm" sm
@@ -307,6 +371,8 @@ test_spawn_split_and_inherit() {
     || fail "split: home crew-harness not inherited as claude (got '$(cat "$sm/config/crew-harness" 2>/dev/null)')"
   [ "$(cat "$sm/config/crew-dispatch.json" 2>/dev/null)" = '{"default":{"harness":"claude","model":"haiku","effort":"low"}}' ] \
     || fail "split: home crew-dispatch.json not inherited"
+  [ "$(cat "$sm/config/claude-crew-model" 2>/dev/null)" = claude-opus-5 ] \
+    || fail "split: home Claude crew model anchor not inherited"
   [ "$(cat "$sm/config/backlog-backend" 2>/dev/null)" = manual ] \
     || fail "split: home backlog-backend not inherited as manual"
   [ -e "$sm/config/secondmate-harness" ] \
@@ -374,12 +440,15 @@ test_spawn_explicit_harness_wins() {
 # The unverified-adapter guard holds on the resolved secondmate path: an unknown
 # config/secondmate-harness aborts the spawn (no meta written) and names the source.
 test_spawn_unverified_secondmate_harness_refused() {
-  local w sm fakebin err rc
+  local w sm sm_real fakebin err rc
   w="$TMP_ROOT/spawn-unverified"
   sm="$w/sm"
-  mkdir -p "$w/home/config" "$w/home/state"
+  mkdir -p "$w/home/config" "$w/home/state" "$w/home/data"
   printf 'bogus\n' > "$w/home/config/secondmate-harness"
   make_seeded_home "$sm" sm
+  sm_real=$(cd "$sm" && pwd -P)
+  printf -- '- sm - harness test (home: %s; scope: harness test; projects: ; added 2026-07-27)\n' \
+    "$sm_real" > "$w/home/data/secondmates.md"
   fakebin=$(make_noop_tmux "$w/tmux")
   err="$w/spawn.err"
   rc=0
@@ -411,7 +480,7 @@ meta_field() { grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-; }
 # capture technique in fm-spawn-dispatch-profile.test.sh so the constructed
 # launch command (not just meta) can be asserted on. Also answers the
 # `#{pane_current_path}` probe from FM_FAKE_PANE_PATH so this same stub works
-# for a crew/scout (non-secondmate) spawn's treehouse-worktree wait loop.
+# for a crewmate/scout (non-secondmate) spawn's treehouse-worktree wait loop.
 make_launch_capturing_tmux() {
   local dir=$1 fakebin="$1/fakebin"
   mkdir -p "$fakebin"
@@ -441,6 +510,13 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = get ] || exit 0
+printf '%s\n' "${FM_FAKE_TREEHOUSE_WORKTREE:?}"
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -448,13 +524,13 @@ SH
 # Same shape as spawn_secondmate but captures the launch command into <launchlog>
 # and does not discard stderr, so callers can assert on both.
 spawn_secondmate_capture() {
-  local world=$1 id=$2 home=$3 launchlog=$4 fakebin
+  local world=$1 id=$2 home=$3 launchlog=$4 fakebin primary
   shift 4
-  mkdir -p "$world/home/state" "$world/home/data"
+  primary=$(prepare_spawn_world "$world" "$id" "$home")
   fakebin=$(make_launch_capturing_tmux "$world/tmux-$id")
   : > "$launchlog"
   PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
-    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
+    FM_ROOT_OVERRIDE="$primary" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_LAUNCH_LOG="$launchlog" \
@@ -627,7 +703,7 @@ test_spawn_explicit_harness_uses_explicit_profile_axes() {
 
 # The harness fallback chain (secondmate-harness -> crew-harness -> own) still
 # resolves correctly with no model/effort tokens anywhere in the chain, and a
-# crew/scout (non-secondmate) launch is entirely unaffected by this feature: no
+# crewmate/scout (non-secondmate) launch is entirely unaffected by this feature: no
 # model/effort is invented for it even though its own project has no profile set.
 test_spawn_fallback_chain_and_crew_scout_unaffected() {
   local w sm meta home proj wt fakebin launchlog id launch spawn_err spawn_rc node_bin node_dir
@@ -646,7 +722,7 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   [ "$(meta_field "$meta" model)" = default ] || fail "fallback: meta model should stay default with no tokens anywhere"
   [ "$(meta_field "$meta" effort)" = default ] || fail "fallback: meta effort should stay default with no tokens anywhere"
 
-  # Crew/scout launch: same crew-harness config, no --secondmate. Must resolve
+  # Crewmate/scout launch: same crew-harness config, no --secondmate. Must resolve
   # the crewmate harness and record no model/effort - this codepath must never read
   # config/secondmate-harness's tokens at all.
   id="crew-unaffected-z1"
@@ -654,9 +730,13 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   proj="$w/crew-project"
   wt="$w/crew-wt"
   fakebin=$(make_launch_capturing_tmux "$w/tmux-crew")
-  fm_git_worktree "$proj" "$wt" "wt-crew"
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state"
+  fm_git_init_commit "$proj"
+  git -C "$proj" worktree add --quiet --detach "$wt" HEAD
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" \
+    "$home/treehouse-pools" "$home/checkout-refresh-state"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - crew harness fallback test (repo: crew-project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$home/data/backlog.md"
   : > "$launchlog"
   spawn_err="$w/crew-spawn.err"
   node_bin=$(command -v node) || fail "crew-unaffected: node is required"
@@ -665,7 +745,10 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_TREEHOUSE_ROOT="$home/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" FM_FAKE_LAUNCH_LOG="$launchlog" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" >/dev/null 2>"$spawn_err"
   spawn_rc=$?
   expect_code 0 "$spawn_rc" "crew-unaffected spawn should succeed: $(cat "$spawn_err")"
@@ -697,7 +780,7 @@ new_world() {
   {
     printf 'projects/\nstate/\ndata/\n.no-mistakes/\n'
     [ "$dispatch_ignore" = no ] || printf 'config/crew-dispatch.json\n'
-    printf 'config/crew-harness\nconfig/secondmate-harness\nconfig/backlog-backend\n'
+    printf 'config/crew-harness\nconfig/claude-crew-model\nconfig/secondmate-harness\nconfig/backlog-backend\n'
   } > "$w/main/.gitignore"
   printf 'v1\n' > "$w/main/AGENTS.md"
   printf 'r1\n' > "$w/main/README.md"
@@ -776,6 +859,7 @@ test_bootstrap_sweep_propagates_and_reconverges() {
   # Initial push: primary crew-harness=codex, secondmate-harness=grok (must NOT flow).
   printf '{"default":{"harness":"codex"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'codex\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5\n' > "$w/home/config/claude-crew-model"
   printf 'manual\n' > "$w/home/config/backlog-backend"
   printf 'grok\n' > "$w/home/config/secondmate-harness"
   run_bootstrap "$w" >/dev/null
@@ -783,6 +867,8 @@ test_bootstrap_sweep_propagates_and_reconverges() {
     || fail "sweep: crew-harness not pushed into the live home"
   [ "$(cat "$w/sm/config/crew-dispatch.json" 2>/dev/null)" = '{"default":{"harness":"codex"}}' ] \
     || fail "sweep: crew-dispatch.json not pushed into the live home"
+  [ "$(cat "$w/sm/config/claude-crew-model" 2>/dev/null)" = claude-opus-5 ] \
+    || fail "sweep: Claude crew model anchor not pushed into the live home"
   [ "$(cat "$w/sm/config/backlog-backend" 2>/dev/null)" = manual ] \
     || fail "sweep: backlog-backend not pushed into the live home"
   [ -e "$w/sm/config/secondmate-harness" ] \
@@ -791,22 +877,28 @@ test_bootstrap_sweep_propagates_and_reconverges() {
   # Re-converge: primary changes inheritable values; the home follows on the next sweep.
   printf '{"default":{"harness":"claude"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'claude\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5-custom\n' > "$w/home/config/claude-crew-model"
   printf 'tasks-axi\n' > "$w/home/config/backlog-backend"
   run_bootstrap "$w" >/dev/null
   [ "$(cat "$w/sm/config/crew-harness" 2>/dev/null)" = claude ] \
     || fail "sweep: home did not re-converge to the primary's new crew-harness"
   [ "$(cat "$w/sm/config/crew-dispatch.json" 2>/dev/null)" = '{"default":{"harness":"claude"}}' ] \
     || fail "sweep: home did not re-converge to the primary's new crew-dispatch.json"
+  [ "$(cat "$w/sm/config/claude-crew-model" 2>/dev/null)" = claude-opus-5-custom ] \
+    || fail "sweep: home did not re-converge to the primary's new Claude crew model anchor"
   [ "$(cat "$w/sm/config/backlog-backend" 2>/dev/null)" = tasks-axi ] \
     || fail "sweep: home did not re-converge to the primary's new backlog-backend"
 
   # Mirror absence: primary clears inheritable config; the home's copies are removed.
-  rm -f "$w/home/config/crew-dispatch.json" "$w/home/config/crew-harness" "$w/home/config/backlog-backend"
+  rm -f "$w/home/config/crew-dispatch.json" "$w/home/config/crew-harness" \
+    "$w/home/config/claude-crew-model" "$w/home/config/backlog-backend"
   run_bootstrap "$w" >/dev/null
   [ -e "$w/sm/config/crew-dispatch.json" ] \
     && fail "sweep: home crew-dispatch.json not removed after the primary cleared it"
   [ -e "$w/sm/config/crew-harness" ] \
     && fail "sweep: home crew-harness not removed after the primary cleared it"
+  [ -e "$w/sm/config/claude-crew-model" ] \
+    && fail "sweep: home Claude crew model anchor not removed after the primary cleared it"
   [ -e "$w/sm/config/backlog-backend" ] \
     && fail "sweep: home backlog-backend not removed after the primary cleared it"
   pass "B7 bootstrap sweep pushes, re-converges, and mirrors absence; never inherits secondmate-harness"
@@ -822,12 +914,15 @@ test_bootstrap_sweep_propagates_when_tracked_current() {
 
   printf '{"default":{"harness":"codex"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'codex\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5\n' > "$w/home/config/claude-crew-model"
   printf 'manual\n' > "$w/home/config/backlog-backend"
   run_bootstrap "$w" >/dev/null
   [ "$(cat "$w/sm/config/crew-dispatch.json" 2>/dev/null)" = '{"default":{"harness":"codex"}}' ] \
     || fail "crew-dispatch.json did not propagate to a tracked-current home"
   [ "$(cat "$w/sm/config/crew-harness" 2>/dev/null)" = codex ] \
     || fail "config did not propagate to a tracked-current home"
+  [ "$(cat "$w/sm/config/claude-crew-model" 2>/dev/null)" = claude-opus-5 ] \
+    || fail "Claude model anchor did not propagate to a tracked-current home"
   [ "$(cat "$w/sm/config/backlog-backend" 2>/dev/null)" = manual ] \
     || fail "backlog-backend did not propagate to a tracked-current home"
   pass "B8 bootstrap sweep propagates config even when the home's tracked files are already current"
@@ -846,6 +941,7 @@ test_bootstrap_sweep_defers_dispatch_on_stale_unignored_home() {
 
   printf '{"default":{"harness":"codex"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'codex\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5\n' > "$w/home/config/claude-crew-model"
   printf 'manual\n' > "$w/home/config/backlog-backend"
   out=$(run_bootstrap "$w")
 
@@ -855,6 +951,8 @@ test_bootstrap_sweep_defers_dispatch_on_stale_unignored_home() {
     || fail "stale dispatch: crew-dispatch.json was copied before the home ignored it"
   [ "$(cat "$w/sm/config/crew-harness" 2>/dev/null)" = codex ] \
     || fail "stale dispatch: existing ignored config stopped propagating"
+  [ "$(cat "$w/sm/config/claude-crew-model" 2>/dev/null)" = claude-opus-5 ] \
+    || fail "stale dispatch: Claude model anchor stopped propagating"
   [ "$(cat "$w/sm/config/backlog-backend" 2>/dev/null)" = manual ] \
     || fail "stale dispatch: backlog backend stopped propagating"
   status=$(git -C "$w/sm" status --porcelain -- config/crew-dispatch.json)
@@ -920,6 +1018,7 @@ test_config_push_propagates_reports_without_ff_or_nudge() {
 
   printf '{"default":{"harness":"codex"}}\n' > "$w/home/config/crew-dispatch.json"
   printf 'codex\n' > "$w/home/config/crew-harness"
+  printf 'claude-opus-5\n' > "$w/home/config/claude-crew-model"
   printf 'manual\n' > "$w/home/config/backlog-backend"
   err="$w/config-push-basic.err"
   out=$(run_config_push "$w" 2>"$err"); status=$?
@@ -933,6 +1032,8 @@ test_config_push_propagates_reports_without_ff_or_nudge() {
     "config push did not report crew-dispatch as pushed"
   assert_contains "$out" "crew-harness: pushed" \
     "config push did not report crew-harness as pushed"
+  assert_contains "$out" "claude-crew-model: pushed" \
+    "config push did not report Claude crew model as pushed"
   assert_contains "$out" "backlog-backend: pushed" \
     "config push did not report backlog-backend as pushed"
   assert_not_contains "$out" "NUDGE_SECONDMATES" \
@@ -947,6 +1048,8 @@ test_config_push_propagates_reports_without_ff_or_nudge() {
     "idempotent config push did not report crew-dispatch as unchanged"
   assert_contains "$out2" "crew-harness: unchanged" \
     "idempotent config push did not report crew-harness as unchanged"
+  assert_contains "$out2" "claude-crew-model: unchanged" \
+    "idempotent config push did not report Claude crew model as unchanged"
   assert_contains "$out2" "backlog-backend: unchanged" \
     "idempotent config push did not report backlog-backend as unchanged"
   pass "B12 config-push propagates via shared live discovery, reports items, and does not fast-forward or nudge"
@@ -1022,6 +1125,7 @@ test_config_push_exits_nonzero_on_copy_error() {
 
 test_harness_resolution
 test_secondmate_model_effort_tokens
+test_claude_crew_model_anchor_resolution
 test_propagate_lib
 test_spawn_split_and_inherit
 test_spawn_backward_compat_crew_fallback

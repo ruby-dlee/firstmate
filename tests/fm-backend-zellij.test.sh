@@ -913,7 +913,7 @@ test_kill_is_noop_when_session_absent() {
   pass "fm_backend_zellij_kill: never fails when the target session no longer exists"
 }
 
-test_teardown_passes_recorded_tab_id_to_zellij_kill() {
+test_teardown_rejects_uninspectable_project_before_zellij_kill() {
   local dir state data config project fb out status
   dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
   mkdir -p "$state" "$data/zghost" "$config" "$project" "$dir/responses"
@@ -934,14 +934,12 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     FM_ZELLIJ_CLOSE_REMOVES_SESSION=1 \
     "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
   status=$?
-  expect_code 0 "$status" "fm-teardown should succeed for a zellij scout whose worktree is already gone: $out"
-  zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
-    "fm-teardown did not verify the recorded zellij_tab_id against the task label"
-  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \
-    "fm-teardown did not pass a verified recorded zellij_tab_id through to kill"
-  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-pane' \
-    "fm-teardown should close the recorded tab id instead of falling back to close-pane"
-  pass "fm-teardown.sh: passes recorded zellij_tab_id with the expected task label"
+  expect_code 1 "$status" "fm-teardown must reject an uninspectable project before Zellij cleanup: $out"
+  assert_contains "$out" "teardown project metadata is not an exact inspectable repository root" \
+    "fm-teardown did not explain the project-identity refusal"
+  [ ! -e "$dir/log" ] || [ ! -s "$dir/log" ] \
+    || fail "fm-teardown touched Zellij before validating project identity: $(cat "$dir/log")"
+  pass "fm-teardown.sh: rejects uninspectable project metadata before touching Zellij"
 }
 
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
@@ -1240,8 +1238,8 @@ test_kill_falls_back_to_close_pane_when_tab_lookup_empty
 test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
-test_teardown_passes_recorded_tab_id_to_zellij_kill
-test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
+test_teardown_rejects_uninspectable_project_before_zellij_kill
+test_forced_secondmate_teardown_rejects_uninspectable_home_before_zellij_cleanup
 test_send_text_submit_detects_landed_send
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_send_failed_when_session_absent

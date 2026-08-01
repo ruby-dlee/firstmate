@@ -27,6 +27,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-arm-command-policy.mjs` | Semantic owner of the watcher-arm PreToolUse policy (docs/arm-pretool-check.md)   |
 | `fm-cd-pretool-check.sh` | Stable PreToolUse transport for the primary cd-guard command policy (docs/cd-guard.md) |
 | `fm-cd-command-policy.mjs` | Semantic owner of the cd-guard's persistent-directory-change decision (docs/cd-guard.md) |
+| `fm-decision-pretool-check.sh` | Exact-identity gate that routes structured captain decisions to Lavish (docs/decision-pretool-check.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
 | `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crewmates while recording pre-metadata Treehouse acquisition ownership |
@@ -68,7 +69,9 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-process-tree-lib.sh` | Shared bounded command runner that terminates and reaps complete process trees         |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
-| `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, then assert watcher liveness                  |
+| `fm-lavish-intake.sh`    | Invoke compatible store-and-forward Lavish intake at an existing turn boundary       |
+| `fm-lavish-wake.sh`      | Append one durable Lavish answer pointer through the canonical wake queue lock        |
+| `fm-wake-drain.sh`       | Intake Lavish answers, atomically drain queued wakes, then assert watcher liveness    |
 | `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-transition-lib.sh`   | Shared backend-neutral transition record shape and single-owner status->action policy table |

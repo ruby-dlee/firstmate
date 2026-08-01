@@ -95,7 +95,7 @@ make_gate_worktree() {
 }
 
 # make_normal_repo <dir> -> echoes a plain (non-gate) git repo to stand in for a
-# normal primary/crew checkout: its git-common-dir is <dir>/.git, never a gate.
+# normal primary/crewmate checkout: its git-common-dir is <dir>/.git, never a gate.
 make_normal_repo() {
   local dir=$1
   git init -q -b main "$dir"
@@ -206,7 +206,11 @@ SH
   chmod +x "$fakebin/tmux"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "${FM_FAKE_TREEHOUSE_PATH:?}"
+set -u
+case "$*" in
+  "get --lease "*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+exit 0
 SH
   chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
@@ -215,15 +219,15 @@ SH
 # run_spawn <cwd> <home> <id> <proj> <pane> <fakebin> [ASSIGN...] -> combined output
 run_spawn() {
   local cwd=$1 home=$2 id=$3 proj=$4 pane=$5 fakebin=$6; shift 6
-  mkdir -p "$home/data/$id" "$home/treehouse-pools"
+  mkdir -p "$home/data/$id"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - gate refusal test (repo: %s)\n\n## Queued\n\n## Done\n' \
+    "$id" "$(basename "$proj")" > "$home/data/backlog.md"
   ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
       "FM_ROOT_OVERRIDE=" "FM_HOME=$home" \
       "FM_STATE_OVERRIDE=$home/state" "FM_DATA_OVERRIDE=$home/data" \
       "FM_PROJECTS_OVERRIDE=$home/projects" "FM_CONFIG_OVERRIDE=$home/config" \
-      "FM_TREEHOUSE_ROOT=$home/treehouse-pools" \
       "FM_SPAWN_NO_GUARD=1" "FM_FAKE_PANE_PATH=$pane" "TMUX=fake,1,0" \
-      "FM_FAKE_TREEHOUSE_PATH=$pane" \
       "PATH=$fakebin:$PATH" "$@" \
       "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex ) 2>&1
 }
@@ -338,18 +342,10 @@ test_send_refuses_and_admits() {
 # task (HEAD reachable from origin), so a normal teardown genuinely succeeds and a
 # refused one leaves the task untouched (mirrors tests/fm-teardown make_case).
 make_teardown_case() {
-  local name=$1 case_dir fakebin wt
+  local name=$1 case_dir fakebin
   case_dir="$TMP/$name"; fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
-  cat > "$fakebin/treehouse" <<'SH'
-#!/usr/bin/env bash
-if [ "${1:-}" = return ]; then
-  target=${!#}
-  git -C "$target" worktree remove --force "$target"
-fi
-exit 0
-SH
-  chmod +x "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" treehouse
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -383,17 +379,34 @@ SH
   rm -rf "$case_dir/_seed"
   git clone -q "$case_dir/origin.git" "$case_dir/project"
   git -C "$case_dir/project" remote set-head origin main 2>/dev/null || true
-  wt="$case_dir/pool/1/project"
-  mkdir -p "$case_dir/pool/1"
-  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$wt" main
-  git -C "$wt" commit -q --allow-empty -m "shippable work"
-  git -C "$wt" push -q origin fm/task-x1
+  mkdir -p "$case_dir/treehouse-pool/1"
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/treehouse-pool/1/wt" main
+  git -C "$case_dir/treehouse-pool/1/wt" commit -q --allow-empty -m "shippable work"
+  git -C "$case_dir/treehouse-pool/1/wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
-  printf '{"worktrees":[{"name":"1","path":"%s","leased":true,"lease_holder":"firstmate-task-x1"}]}\n' \
-    "$wt" > "$case_dir/pool/treehouse-state.json"
+  python3 - "$case_dir/treehouse-pool/treehouse-state.json" "$case_dir/treehouse-pool/1/wt" <<'PY'
+import json
+import os
+import sys
+
+state, worktree = sys.argv[1:]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump(
+        {
+            "worktrees": [
+                {
+                    "name": "1",
+                    "path": os.path.realpath(worktree),
+                    "leased": True,
+                    "lease_holder": "firstmate-task-x1",
+                }
+            ]
+        },
+        stream,
+    )
+PY
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=firstmate:fm-task-x1" "tmux_session_target=firstmate:fm-task-x1" \
-    "worktree=$wt" "project=$case_dir/project" \
+    "window=firstmate:fm-task-x1" "worktree=$case_dir/treehouse-pool/1/wt" "project=$case_dir/project" \
     "kind=ship" "mode=no-mistakes"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"
@@ -428,7 +441,7 @@ test_teardown_refuses_and_admits() {
   # no-regression: a normal session tears down the landed task.
   case_dir=$(make_teardown_case teardown-ok)
   out=$(run_teardown "$NORMAL_CWD" "$case_dir"); rc=$?
-  expect_code 0 "$rc" "teardown: a normal session must still tear down landed work: $out"
+  expect_code 0 "$rc" "teardown: a normal session must still tear down landed work"
   assert_not_contains "$out" "$ENV_MSG" "teardown: normal teardown must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "teardown: normal teardown must not print the backstop refusal"
   assert_not_contains "$out" "REFUSED" "teardown: normal teardown of landed work must not refuse"

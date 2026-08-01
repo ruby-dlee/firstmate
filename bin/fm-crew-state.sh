@@ -11,9 +11,9 @@
 # no-mistakes run-step attributed to this crewmate's branch, else the pane
 # busy-signature) and reconciles the possibly-stale log against it.
 #
-# The determinism lives entirely here - only run-step / pane / log reads plus
-# fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
-# token-tight line firstmate can read every heartbeat:
+# The determinism lives entirely here - bounded run-step, GitHub PR-state, pane,
+# and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
+# stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
@@ -23,11 +23,13 @@
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
-#      the active step is ci, `axi status` alone cannot tell "still waiting on
-#      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
-#      a ci-step log-tail check overrides working -> done once checks read
-#      green, so a green PR is never silently read as still-validating.
+#      passed/checks-passed -> done, failed/cancelled -> failed. A passed
+#      outcome's PR detail is cross-checked against GitHub through gh-axi rather
+#      than inferred from the pipeline outcome. EXCEPT: while the active step is
+#      ci, `axi status` alone cannot tell "still waiting on checks" from "checks
+#      green, waiting on merge" (see nm_ci_checks_state) - a ci-step log-tail
+#      check overrides working -> done once checks read green, so a green PR is
+#      never silently read as still-validating.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
@@ -63,6 +65,11 @@ META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
+GH_TIMEOUT=${FM_CREW_STATE_GH_TIMEOUT:-10}
+case "$GH_TIMEOUT" in
+  ''|*[!0-9]*) GH_TIMEOUT=10 ;;
+  *) case "$GH_TIMEOUT" in *[1-9]*) ;; *) GH_TIMEOUT=10 ;; esac ;;
+esac
 # How many of the most recent `no-mistakes runs` rows the cross-branch fallback
 # (nm_runs_status_for_branch, below) scans. Generous enough to still find a
 # branch's own run on a busy multi-crewmate fleet without listing the entire
@@ -107,10 +114,17 @@ log_last_line() {
 # the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
 # a crewmate with no active run and an idle pane that declared a known external wait
 # reports `paused` distinctly, so a supervisor reading this sees a declared pause
-# and its reason rather than a wedge-suspect idle.
+# and its reason rather than a wedge-suspect idle. A line that uses the pause verb to
+# report a FAILURE is not a pause (fm-classify-lib.sh's status_pause_is_failure); it
+# maps to `failed` so a supervisor reads the failure it actually is, and so
+# crew_absorb_class refuses to absorb it, instead of falling through to `unknown`.
 map_log_state() {  # <line>
   if status_is_paused "$1"; then
     echo paused
+    return
+  fi
+  if status_pause_is_failure "$1"; then
+    echo failed
     return
   fi
   case "$(status_line_verb "$1")" in
@@ -208,6 +222,17 @@ nm_run() {  # <args...>
   esac
 }
 
+# Bounded, read-only GitHub query in the worktree; stdout only, never fails the
+# script. gh-axi is the repository's required GitHub interface.
+gh_axi_run() {  # <args...>
+  case "$HAVE_TIMEOUT" in
+    timeout)  ( cd "$WT" && timeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
+    gtimeout) ( cd "$WT" && gtimeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
+    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
+    *)        true ;;
+  esac
+}
+
 # Scalar value of a TOON key in the captured run output ($RUN_OUT).
 RUN_OUT=""
 nm_field() {  # <key>
@@ -270,6 +295,33 @@ nm_gate_findings_count() {
   case "$rest" in ''|*[!0-9]*) return 0 ;; esac
   printf '%s' "$rest"
 }
+
+# Query the PR URL emitted by no-mistakes and return one normalized state:
+# open, closed, merged, missing, or unknown. A terminal pipeline outcome is not
+# itself evidence of GitHub state.
+nm_pr_state() {  # <pr-url>
+  local pr_url=$1 owner repo number out state
+  [ -n "$pr_url" ] || { printf 'missing'; return; }
+  command -v gh-axi >/dev/null 2>&1 || { printf 'unknown'; return; }
+  if [[ "$pr_url" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)/?$ ]]; then
+    owner=${BASH_REMATCH[1]}
+    repo=${BASH_REMATCH[2]}
+    number=${BASH_REMATCH[3]}
+  else
+    printf 'unknown'
+    return
+  fi
+  out=$(gh_axi_run pr view "$number" --repo "$owner/$repo")
+  state=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*state:[[:space:]]*\(.*\)/\1/p' | head -1)
+  state=$(strip_quotes "$state")
+  case "$state" in
+    open|OPEN)     printf 'open' ;;
+    closed|CLOSED) printf 'closed' ;;
+    merged|MERGED) printf 'merged' ;;
+    *)             printf 'unknown' ;;
+  esac
+}
+
 log_reports_ci_ready() {
   [ "$LOG_VERB" = "done" ] || return 1
   case "$(status_line_note "$LOG_LINE")" in
@@ -451,7 +503,18 @@ if [ "$HAVE_RUN" = 1 ]; then
 
     if [ -n "$outcome" ]; then
       case "$outcome" in
-        passed)        RUN_STATE="done"; RUN_DETAIL="run passed: PR merged/closed" ;;
+        passed)
+          RUN_STATE="done"
+          pr_url=$(strip_quotes "$(nm_field pr)")
+          pr_state=$(nm_pr_state "$pr_url")
+          case "$pr_state" in
+            merged)  RUN_DETAIL="run passed: PR merged (verified)" ;;
+            closed)  RUN_DETAIL="run passed: PR closed without merge (verified)" ;;
+            open)    RUN_DETAIL="run passed: PR open (not merged)" ;;
+            missing) RUN_DETAIL="run passed: no PR to verify" ;;
+            *)       RUN_DETAIL="run passed: PR state unavailable (not verified)" ;;
+          esac
+          ;;
         checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
         failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
         cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;

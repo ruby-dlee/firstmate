@@ -7,7 +7,8 @@ Herdr is [an agent-native terminal multiplexer](https://herdr.dev) with a socket
 Originally verified against herdr 0.7.1, protocol 14, on macOS aarch64; the latest dated evidence below uses herdr 0.7.3, protocol 16.
 Current real-herdr verification uses isolated `HERDR_SESSION` names plus the guarded teardown helper in `tests/herdr-test-safety.sh`.
 A 2026-07-02 cleanup bug proved that `HERDR_SESSION` alone is not a safe way to target destructive session cleanup; see "Session targeting: the `--session` flag, not `HERDR_SESSION` alone" below.
-All real-herdr verification in this document uses isolated sessions and guarded cleanup; the captain's default herdr session and live tmux fleet were never intended targets.
+Real-herdr lifecycle verification in this document uses isolated sessions and guarded cleanup.
+The 2026-07-29 read/steer incident was instead verified without lifecycle mutation against the fixing task's own pane in the already-running default session.
 
 ## Setup
 
@@ -201,7 +202,7 @@ The pre-fix production path was invoked from a Bash driver in a throwaway tmux w
 Before destroying the parent window, the lab server PID 78507 and dummy agent PID 78625 shared session id 0 with the driver and the server retained process group 78149 from the driver.
 After `tmux kill-window -t firstmate:bridge-herdr-parent-16255` and 30 seconds, the server and dummy agent were dead and the scoped CLI returned `server.running=false` and connection refused.
 The fixed path uses `nohup` around a portable Perl double-fork: the first child calls `POSIX::setsid()`, forks once more, and execs only `herdr server --session <name>` with stdin redirected from `/dev/null` and output discarded.
-The adapter remains the single Herdr lifecycle owner, and captain launchers do not start or stop Herdr.
+The adapter owns servers it launches, while production may reuse an already-running server without claiming its lifecycle; captain launchers do not start or stop Herdr as part of the Firstmate workflow.
 The same lab shape was rerun from the fixed branch with isolated session `fm-lab-bridge-fix-91917` and throwaway window `firstmate:bridge-herdr-fix-91917`.
 Before the kill, driver PID 16023 was in process group 16023 while server PID 16206 was already reparented to PID 1 in process group 16205.
 After the parent window was absent for 84 seconds, server PID 16206 and dummy agent PID 16413 remained alive, `status --json` reported the scoped server running and compatible, and `pane get` plus `agent get` returned pane `w1:p2` with `agent_status=working`.
@@ -220,7 +221,7 @@ That worker path physically resolves each absolute caller entry, accepts only cu
 This preserves safe Homebrew and user toolchains (for example `node`, `npm`, and `uv`) for pane descendants without allowing a writable caller path to become server execution authority; Herdr's own control operations still use their fixed absolute binaries rather than this worker path.
 That envelope applies to both the double-fork Perl process and the exec'd Herdr grandchild, so ambient `PERL5OPT`, `PERLLIB`, loader injection, and tool shadows cannot alter startup.
 The per-session lifecycle lock lives at `/tmp/firstmate-herdr-server-locks-<uid>` regardless of `TMPDIR`; its physical parent ancestry is validated and its leaf must remain a current-user `0700` directory.
-It serializes current-certificate reuse, release-drift classification, any exact-session stop, recertified launch, and readiness before a caller can inspect or create a workspace.
+In the explicit certified-lifecycle lab path, it serializes current-certificate reuse, release-drift classification, any exact-session stop, recertified launch, and readiness before a caller can inspect or create a workspace.
 Lock candidates and owner records are inode-, mode-, link-, owner-, PID-, and process-start-checked around atomic link/rename operations.
 
 The managed per-session Herdr config is a private, helper-content-addressed exact-content file in that lock root.
@@ -230,9 +231,8 @@ Sanitization therefore happens before Bash can import `BASH_ENV`, `SHELLOPTS=xtr
 
 The detached grandchild durably publishes a private schema-v2 certificate containing the session hash, PID/process-start token, exact content-addressed helper path plus SHA-256 and file identity, and exact managed-config path plus SHA-256 and file identity before it execs the verified Herdr server.
 Certificate, helper, and config verification opens with `O_NOFOLLOW`, hashes through the descriptor, and rechecks descriptor/path identity after the read.
-An enforced spawn accepts Herdr only when those recorded objects still match, the reviewed source helper still has the recorded digest, the config bytes still pin that exact helper, and the certified process identity is live.
-The check runs after server ensure and immediately before any routed tab is created.
-A manual, restored, pre-upgrade, dead, PID-reused, helper-replaced, config-replaced, or post-update server has no valid proof and fails closed.
+The explicit certified-lifecycle test lab accepts Herdr only when those recorded objects still match, the reviewed source helper still has the recorded digest, the config bytes still pin that exact helper, and the certified process identity is live.
+Production native-agent spawning no longer requires this server certificate because `agent start --env` supplies each new agent's environment directly.
 
 Helper, config, certificate, and lifecycle-lock publication use private candidate files.
 Recovery removes only a current-user, exact-mode candidate whose numeric owner PID is proven absent and whose age exceeds the startup stale threshold; foreign, live, malformed, or otherwise indeterminate candidates are never deleted.
@@ -242,12 +242,93 @@ A last-check substitution is preserved in quarantine and the operation fails clo
 These controls defend against other users, ambient shell configuration, accidental Desktop/provider activity, and ordinary release switches.
 They do not claim to defeat a malicious process already running as the same Unix uid: portable shell cannot atomically bind an already-validated executable inode to the later `exec`, and a same-uid attacker can race user-owned paths between checks.
 That residual is explicit; the adapter revalidates immediately before use and keeps the verified install and lock paths private to make normal non-hostile mutation fail closed.
-The regression suite covers hostile `PATH`, Perl/loader variables, unsafe ancestry, hardlinks, cached-leaf mutation, unsafe lock parents, hostile `TMPDIR`, a detached descendant that retains a safe user tool while excluding a writable search directory, inherited `BASH_ENV` plus `SHELLOPTS=xtrace`, exact managed-config shape, certificate liveness, helper/config replacement and source-update drift, guarded helper/config/certificate candidate recovery, last-check substitution quarantine, serialized exact-empty drift restart, occupied/indeterminate refusal before workspace mutation, and refusal of every uncertified production backend before Fleet, lease, or endpoint mutation.
+The regression suite covers hostile `PATH`, Perl/loader variables, unsafe ancestry, hardlinks, cached-leaf mutation, unsafe lock parents, hostile `TMPDIR`, a detached descendant that retains a safe user tool while excluding a writable search directory, inherited `BASH_ENV` plus `SHELLOPTS=xtrace`, exact managed-config shape, certificate liveness, helper/config replacement and source-update drift, guarded helper/config/certificate candidate recovery, last-check substitution quarantine, serialized exact-empty drift restart, occupied drift routing without restart, indeterminate drift refusal before workspace mutation, and refusal of every uncertified legacy-lab backend before Fleet, lease, or endpoint mutation.
 
-`fm_backend_herdr_server_ensure` reuses a server only when its full current-release process/helper/config certificate verifies under the lifecycle lock.
-For an older adapter-owned certificate, it queries the explicitly named session's workspace, tab, and pane collections and stops only that exact session after two complete empty proofs plus repeated process-ownership proof; it then performs the detached launch and current-release recertification before releasing the lock.
-Occupied, unreadable/indeterminate, manual, or uncertified servers are never stopped or routed.
+In production, `fm_backend_herdr_server_ensure` reuses any running server because native `agent start --env` owns new-agent environment isolation independently of the server shell.
+Under the explicit legacy certified-lifecycle lab path, a full current-release process/helper/config certificate is reused under the lifecycle lock.
+For an older adapter-owned certificate, the adapter queries the explicitly named session's workspace, tab, and pane collections.
+An exact-empty session is stopped only after two complete empty proofs plus repeated process-ownership proof, then detached-launched and recertified before the lock is released.
+An occupied session - one reporting any workspace, tab, or pane - is not restarted; routing continues in that same running session and may create the workspace for the native-agent spawn path.
+Unreadable or indeterminate state still refuses before workspace mutation, and the explicit legacy lab still rejects manual or uncertified ownership.
 This convergence path never uses ambient `herdr server stop`, never deletes session state (including `default`), and never moves Herdr ownership into a captain launcher.
+
+## Incident (2026-07-29): native cutover left read and steer behind the retired certificate gate
+
+Every `fm-send.sh` steer to a live Herdr crewmate failed even though Herdr reported the exact recorded pane ids as live and direct `herdr agent send`, `herdr pane send-text`, `herdr pane send-keys`, and `herdr pane read` calls succeeded.
+The same stale precondition made `fm-peek.sh` return zero pane lines.
+The earlier peek report was therefore reproducible, not stale.
+
+The regression was reproduced against Herdr 0.7.3, protocol 16, and the fixing codex task's own live pane `default:w6:pFZ`.
+No Herdr session, workspace, tab, pane, or agent lifecycle command was run.
+A task-local `FM_HOME` fixture recorded the live pane and label so the public selector paths were exercised without reading or mutating another firstmate home's files.
+
+Pre-fix `fm-send.sh` evidence:
+
+```text
+$ FM_HOME=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home \
+    FM_SEND_SETTLE=0 bin/fm-send.sh fm-herdr-send-fix-h7 \
+    '[pre-fix live verification probe: do not alter task direction]'
+error: text not sent to default:w6:pFZ (herdr send failed; tried meta=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home/state/fm-herdr-send-fix-h7.meta; backend=from-meta)
+exit 1
+
+$ herdr agent get w6:pFZ
+{"result":{"agent":{"agent":"codex","agent_status":"working","name":"fm-fm-herdr-send-fix-h7","pane_id":"w6:pFZ",...}}}
+```
+
+Pre-fix `fm-peek.sh` returned exit 1 and zero stdout lines against the same recorded target.
+Tracing stopped in `fm_backend_herdr_server_adapter_owned`: the default server had no closed-shell certificate, so neither path reached its Herdr read or mutation call.
+
+The root cause was an incomplete native-agent cutover.
+Commit `cc0c56c` correctly made `fm_backend_herdr_server_ensure` reuse any running production server because `agent start --env` owns new-agent environment isolation, but `fm_backend_herdr_server_reachable_for_readsteer` still required the retired server certificate added before that cutover.
+Production read and steer now require the exact requested session to report running, matching spawn, while the explicitly enabled legacy certificate lab retains the old ownership proof.
+
+The separate `printf: write error: Broken pipe` lead was real but not the read/steer root cause.
+`fm_backend_herdr_events_capable` piped the approximately 220 KB schema string into two early-exit `grep -q` calls.
+With inherited `pipefail`, the first match closed the consumer before `printf` finished and made a capable Herdr build return false.
+The probe now parses the complete schema once with `jq`, eliminating the early close and the diagnostic.
+
+The focused regression fails against the pre-fix adapter:
+
+```text
+$ FM_TEST_FOCUSED=readsteer-native-cutover tests/fm-backend-herdr.test.sh
+not ok - native read/steer should accept a running server without the retired closed-shell certificate: expected exit 0, got 1
+```
+
+The same regression passes after the fix:
+
+```text
+$ FM_TEST_FOCUSED=readsteer-native-cutover tests/fm-backend-herdr.test.sh
+ok - fm_backend_herdr_server_reachable_for_readsteer: native-agent servers need only be running
+ok - fm_backend_herdr_server_reachable_for_readsteer: the explicit legacy lab retains certificate enforcement
+ok - fm_backend_herdr_events_capable: consumes the full schema without a broken pipe
+```
+
+The repaired public paths were then exercised against that same live pane:
+
+```text
+$ FM_HOME=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home \
+    bin/fm-peek.sh fm-herdr-send-fix-h7 12
+exit 0
+stdout lines: 11
+
+$ FM_HOME=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home \
+    FM_SEND_SETTLE=0 bin/fm-send.sh fm-herdr-send-fix-h7 \
+    'LIVE_E2E_H7: continue the current herdr send-fix task without changing scope; preserve this token in the transcript.'
+exit 0
+
+$ FM_HOME=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home \
+    bin/fm-peek.sh fm-herdr-send-fix-h7 24 \
+    > /Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home/peek-after-send.out
+$ grep -F LIVE_E2E_H7 /Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home/peek-after-send.out
+  ↳ LIVE_E2E_H7: continue the current herdr send-fix task without changing scope; preserve this token in the
+
+$ FM_HOME=/Users/dongkeun/.treehouse/firstmate-21f368/6/firstmate/.task-home \
+    bash -o pipefail -c '. bin/backends/herdr.sh; fm_backend_herdr_events_capable default; printf "events_rc=%s\n" "$?"'
+events_rc=0
+stderr bytes: 0
+```
+
+The existing submission regressions still cover first-Enter autocomplete swallowing, Enter-only retry, native `working` or `blocked` confirmation, and preservation of unsubmitted text on exhausted retries.
 
 ## Incident (2026-07-13): the ASCII request separator erased the secondmate marker
 

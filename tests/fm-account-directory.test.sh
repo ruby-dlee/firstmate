@@ -13,6 +13,7 @@ QUOTA_LOG="$TMP_ROOT/quota.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
 CLAUDE_AUTH_LOG="$TMP_ROOT/claude-auth.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
+ROTATION_STATE="$TMP_ROOT/rotation-state"
 
 mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
 
@@ -95,9 +96,49 @@ exit 1
 SH
 chmod +x "$FAKEBIN/claude"
 
+cat > "$FAKEBIN/profile-agent-fleet" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "$#" -eq 4 ] && [ "$1" = --format ] && [ "$2" = json ] \
+  && [ "$3" = profile ] && [ "$4" = list ] || exit 64
+root=${FM_ACCOUNT_DIRECTORY_ROOT:-${FM_ACCOUNT_DIRECTORY_PASSWD_HOME:?}/.local/share/agent-fleet/accounts}
+separator=
+printf '{"profiles":['
+for provider in claude codex; do
+  vendor_dir=$root/$provider
+  [ -d "$vendor_dir" ] || continue
+  for home in "$vendor_dir"/*; do
+    [ -d "$home" ] && [ ! -L "$home" ] || continue
+    account=${home##*/}
+    case "$account" in
+      ''|.*|*[!A-Za-z0-9._-]*) continue ;;
+    esac
+    if [ -f "$home/test-last-resort" ]; then
+      pools="[\"$provider-crew-last-resort\",\"$provider-manual\"]"
+    elif [ -f "$home/test-manual-only" ]; then
+      pools="[\"$provider-manual\"]"
+    else
+      pools="[\"$provider-crew\",\"$provider-manual\"]"
+    fi
+    enabled=true
+    safety_policy=worker
+    [ ! -f "$home/test-disabled" ] || enabled=false
+    [ ! -f "$home/test-non-worker" ] || safety_policy=manual_only
+    printf '%s{"id":"%s-%s","provider":"%s","home":"%s","pools":%s,"enabled":%s,"safety_policy":"%s"}' \
+      "$separator" "$provider" "$account" "$provider" "$home" "$pools" \
+      "$enabled" "$safety_policy"
+    separator=,
+  done
+done
+printf ']}\n'
+SH
+chmod +x "$FAKEBIN/profile-agent-fleet"
+
 run_selector() {
   FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
+    FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
+    FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
     FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
@@ -123,10 +164,126 @@ set_claude_authenticated() {
 
 reset_accounts() {
   rm -rf "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
+  rm -rf "$ROTATION_STATE"
   mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
   : > "$QUOTA_LOG"
   : > "$HERDR_LOG"
   : > "$CLAUDE_AUTH_LOG"
+}
+
+mark_manual_only() {
+  local provider=$1 account=$2
+  touch "$ACCOUNT_ROOT/$provider/$account/test-manual-only"
+}
+
+mark_last_resort() {
+  local provider=$1 account=$2
+  touch "$ACCOUNT_ROOT/$provider/$account/test-last-resort"
+}
+
+mark_claude_keychain_ready() {
+  local account=$1
+  mkdir -p "$ACCOUNT_ROOT/claude/$account/.agent-fleet-quota-cache/quota-axi"
+  printf 'granted\n' > "$ACCOUNT_ROOT/claude/$account/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
+  chmod 600 "$ACCOUNT_ROOT/claude/$account/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
+}
+
+test_profile_eligibility_requires_enabled_worker() {
+  local out err expected
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2" "$ACCOUNT_ROOT/codex/3"
+  touch "$ACCOUNT_ROOT/codex/1/test-disabled"
+  touch "$ACCOUNT_ROOT/codex/2/test-non-worker"
+  set_remaining 1 100,100
+  set_remaining 2 100,100
+  set_remaining 3 80,80
+  out=$(run_selector select codex 2>"$TMP_ROOT/profile-eligibility.err")
+  err=$(cat "$TMP_ROOT/profile-eligibility.err")
+  expected="$ACCOUNT_ROOT/codex/3"
+  [ "$out" = "$expected" ] || fail "disabled or non-worker profile entered crew selection: $out"
+  assert_contains "$err" "$ACCOUNT_ROOT/codex/1 excluded from codex-crew: profile is disabled" \
+    "disabled profile exclusion was not explicit"
+  assert_contains "$err" "$ACCOUNT_ROOT/codex/2 excluded from codex-crew: safety policy is not worker" \
+    "non-worker profile exclusion was not explicit"
+  pass "crew selection hard-excludes disabled and non-worker profiles with explicit diagnostics"
+}
+
+test_claude_approval_marker_contract() {
+  local account cache_dir marker marker_dir out race_hook status
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/1/.agent-fleet-quota-cache/quota-axi"
+  account="$ACCOUNT_ROOT/claude/1"
+  cache_dir="$account/.agent-fleet-quota-cache"
+  marker_dir="$cache_dir/quota-axi"
+  marker="$marker_dir/claude-keychain-access-granted"
+  printf 'granted' > "$marker"
+  chmod 600 "$marker"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a marker without the exact granted newline payload"
+  assert_contains "$out" "invalid quota-axi Keychain approval marker" \
+    "malformed approval payload did not fail with a clear diagnostic"
+
+  printf 'granted\n' > "$marker"
+  chmod 644 "$marker"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted an insecure approval marker mode"
+
+  chmod 600 "$marker"
+  ln "$marker" "$marker.link"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a multiply linked approval marker"
+  rm "$marker.link"
+
+  chmod 770 "$account"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a group-writable account directory"
+  chmod 700 "$account"
+
+  chmod 707 "$cache_dir"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a world-writable marker ancestor"
+  chmod 700 "$cache_dir"
+
+  chmod 770 "$marker_dir"
+  if out=$(run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a group-writable marker parent"
+  chmod 700 "$marker_dir"
+
+  race_hook="$TMP_ROOT/replace-marker-parent"
+  cat > "$race_hook" <<SH
+#!/usr/bin/env bash
+set -u
+mv "$marker_dir" "$marker_dir.replaced"
+mkdir "$marker_dir"
+printf 'granted\\n' > "$marker"
+chmod 600 "$marker"
+SH
+  chmod +x "$race_hook"
+  if out=$(FM_ACCOUNT_DIRECTORY_MARKER_RACE_HOOK="$race_hook" \
+    run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a replaced marker parent"
+  pass "Claude approval marker requires secure stable parents and leaf metadata"
+}
+
+test_openat_binding_failure_is_a_setup_error() {
+  local cpp out status
+  reset_accounts
+  mark_claude_keychain_ready 1
+  cpp="$FAKEBIN/unsupported-openat-cpp"
+  cat > "$cpp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$cpp"
+  if out=$(FM_ACCOUNT_DIRECTORY_OPENAT_CPP="$cpp" \
+    run_selector select claude 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Claude selection accepted a platform without an openat binding"
+  assert_contains "$out" \
+    "error: descriptor-relative approval validation is unsupported: system openat binding unavailable" \
+    "unsupported openat platform did not fail at selector setup"
+  assert_not_contains "$out" "invalid quota-axi Keychain approval marker" \
+    "unsupported openat platform was misclassified as an invalid account marker"
+  pass "missing system openat binding fails once at selector setup"
 }
 
 test_codex_picks_highest_fresh_minimum_and_skips_no_window() {
@@ -163,17 +320,27 @@ test_codex_rechecks_health_on_every_selection() {
   pass "Codex health is read fresh at selection time so a newly authenticated account is immediately eligible"
 }
 
-test_codex_fails_when_no_account_has_a_fresh_window() {
-  local out status
+test_codex_rotates_when_no_account_has_a_fresh_window() {
+  local out expected
   reset_accounts
   set_remaining 1 none
   set_remaining 2 none
-  out=$(run_selector select codex 2>&1)
-  status=$?
-  expect_code 1 "$status" "Codex selection with no healthy accounts should fail closed"
-  assert_contains "$out" "no healthy Codex account has a freshly readable usage window" \
-    "Codex all-unhealthy failure was not actionable"
-  pass "Codex refuses selection when every discovered account lacks fresh readable usage"
+  out=$({
+    run_selector select codex
+    run_selector select codex
+    run_selector select codex
+    run_selector select codex
+  } 2>"$TMP_ROOT/codex-unavailable.err")
+  expected=$(printf '%s\n' \
+    "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2" \
+    "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2")
+  [ "$out" = "$expected" ] || fail "Codex unavailable-usage fallback did not rotate: $out"
+  assert_contains "$(cat "$TMP_ROOT/codex-unavailable.err")" "CODEX USAGE UNAVAILABLE" \
+    "Codex unavailable-usage fallback did not identify the degraded signal"
+  assert_contains "$(cat "$TMP_ROOT/codex-unavailable.err")" \
+    "round-robin selection across 2 eligible codex-crew accounts" \
+    "Codex unavailable-usage fallback did not report its rotation"
+  pass "Codex rotates eligible accounts when every quota signal is unavailable"
 }
 
 test_codex_timeout_skips_wedged_account() {
@@ -190,18 +357,127 @@ test_codex_timeout_skips_wedged_account() {
   pass "Codex bounds each usage read and continues to later healthy accounts"
 }
 
-test_claude_uses_stable_first_without_treating_usage_as_health() {
-  local out err
+test_claude_rotates_eligible_accounts_without_treating_usage_as_health() {
+  local out err expected
   reset_accounts
-  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
-  out=$(run_selector select claude 2>"$TMP_ROOT/claude-select.err")
+  mkdir -p "$ACCOUNT_ROOT/claude/3" "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mark_manual_only claude 1
+  mark_claude_keychain_ready 2
+  mark_claude_keychain_ready 3
+  out=$({
+    run_selector select claude
+    run_selector select claude
+    run_selector select claude
+    run_selector select claude
+  } 2>"$TMP_ROOT/claude-select.err")
   err=$(cat "$TMP_ROOT/claude-select.err")
-  [ "$out" = "$ACCOUNT_ROOT/claude/1" ] || fail "Claude fallback did not use stable bytewise directory order: $out"
+  expected=$(printf '%s\n' \
+    "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/3" \
+    "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/3")
+  [ "$out" = "$expected" ] || fail "Claude unreadable-usage fallback did not round-robin across eligible accounts: $out"
   assert_contains "$err" "CLAUDE USAGE UNREADABLE" "Claude fallback did not carry the required obvious warning"
   assert_contains "$err" "config-dir-specific macOS Keychain credential" \
     "Claude fallback did not explain the keychain/quota-read gap"
+  assert_contains "$err" "excluded from claude-crew" \
+    "Claude fallback did not report the reserved account's pool exclusion"
+  assert_not_contains "$out" "$ACCOUNT_ROOT/claude/1" \
+    "Claude fallback selected an account reserved to the manual-only pool"
   [ ! -s "$QUOTA_LOG" ] || fail "Claude fallback called quota-axi even though per-directory usage is known unreadable"
-  pass "Claude deterministically selects the first directory and explains why usage is not a health signal"
+  pass "Claude deterministically rotates across crew-pool accounts and excludes manual-only accounts when usage is unreadable"
+}
+
+test_concurrent_claude_selections_spread_without_usage() {
+  local output_dir i status counts expected pid
+  local -a pids=()
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/3" "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mark_manual_only claude 1
+  mark_claude_keychain_ready 2
+  mark_claude_keychain_ready 3
+  output_dir="$TMP_ROOT/concurrent-claude"
+  rm -rf "$output_dir"
+  mkdir -p "$output_dir"
+  status=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    run_selector select claude > "$output_dir/$i.out" 2> "$output_dir/$i.err" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  [ "$status" = 0 ] || fail "one or more concurrent Claude selections failed"
+  if grep -Fqx "$ACCOUNT_ROOT/claude/1" "$output_dir"/*.out; then
+    fail "concurrent Claude selection used the reserved manual-only account"
+  fi
+  counts=$(sort "$output_dir"/*.out | uniq -c | sed 's/^[[:space:]]*//')
+  expected=$(printf '%s\n' \
+    "6 $ACCOUNT_ROOT/claude/2" \
+    "6 $ACCOUNT_ROOT/claude/3")
+  [ "$counts" = "$expected" ] || fail "concurrent Claude selections did not spread evenly: $counts"
+  [ ! -s "$QUOTA_LOG" ] || fail "concurrent Claude fallback unexpectedly called quota-axi"
+  pass "concurrent unreadable-usage Claude selections serialize into an even deterministic rotation"
+}
+
+test_claude_fails_closed_when_no_usable_crew_account_exists() {
+  local out status
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mark_manual_only claude 1
+  if out=$(run_selector select claude 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Claude selection silently used a reserved or unapproved account"
+  assert_contains "$out" "$ACCOUNT_ROOT/claude/1 excluded from claude-crew" \
+    "zero-eligible Claude refusal did not identify the reserved account"
+  assert_contains "$out" "$ACCOUNT_ROOT/claude/2 excluded from claude-crew: missing quota-axi's non-secret Keychain access marker" \
+    "zero-eligible Claude refusal did not identify the account awaiting approval"
+  assert_contains "$out" "no usable Claude account directories remain in claude-crew or claude-crew-last-resort" \
+    "zero-eligible Claude refusal was not actionable"
+  pass "Claude fails closed and names the reserved and unapproved reasons when no usable crew account exists"
+}
+
+test_claude_uses_only_explicit_last_resort_after_primary_exhaustion() {
+  local out err
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/2" "$ACCOUNT_ROOT/claude/1"
+  mark_last_resort claude 1
+  mark_claude_keychain_ready 1
+  out=$(run_selector select claude 2>"$TMP_ROOT/claude-last-resort.err")
+  err=$(cat "$TMP_ROOT/claude-last-resort.err")
+  [ "$out" = "$ACCOUNT_ROOT/claude/1" ] || fail "Claude did not select the declared last-resort account: $out"
+  assert_contains "$err" "CLAUDE LAST RESORT" \
+    "Claude last-resort selection was not explicit"
+  assert_contains "$err" "using the explicitly declared claude-crew-last-resort tier" \
+    "Claude last-resort selection did not name its declared policy"
+  pass "Claude consults an explicitly declared last-resort tier only after no primary crew account remains"
+}
+
+test_codex_rotates_accounts_tied_for_best_fresh_score() {
+  local out expected
+  reset_accounts
+  set_remaining 1 98,98
+  set_remaining 2 98,98
+  set_remaining 3 100,100
+  set_remaining 4 100,100
+  set_remaining 5 100,100
+  mark_manual_only codex 5
+  out=$({
+    run_selector select codex
+    run_selector select codex
+    run_selector select codex
+    run_selector select codex
+  } 2>"$TMP_ROOT/codex-tie.err")
+  expected=$(printf '%s\n' \
+    "$ACCOUNT_ROOT/codex/3" "$ACCOUNT_ROOT/codex/4" \
+    "$ACCOUNT_ROOT/codex/3" "$ACCOUNT_ROOT/codex/4")
+  [ "$out" = "$expected" ] || fail "Codex best-score ties concentrated instead of rotating: $out"
+  assert_not_contains "$out" "$ACCOUNT_ROOT/codex/5" \
+    "Codex tie rotation selected an account reserved to the manual-only pool"
+  assert_contains "$(cat "$TMP_ROOT/codex-tie.err")" "round-robin among 2 tied accounts" \
+    "Codex tie rotation did not report its deterministic tie-break"
+  pass "Codex preserves fresh usage scoring and round-robins accounts tied for the best score"
 }
 
 test_default_root_uses_passwd_home_not_ambient_home() {
@@ -210,9 +486,14 @@ test_default_root_uses_passwd_home_not_ambient_home() {
   hostile_home="$TMP_ROOT/hostile-home"
   expected="$passwd_home/.local/share/agent-fleet/accounts/claude/1"
   mkdir -p "$expected" "$hostile_home/.local/share/agent-fleet/accounts/claude/0"
+  mkdir -p "$expected/.agent-fleet-quota-cache/quota-axi"
+  printf 'granted\n' > "$expected/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
+  chmod 600 "$expected/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
   out=$(HOME="$hostile_home" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_PASSWD_HOME="$passwd_home" \
+    FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
+    FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     "$SELECTOR" select claude 2>"$TMP_ROOT/passwd-home.err")
   [ "$out" = "$expected" ] || fail "ambient HOME redirected account discovery away from the passwd home: $out"
   pass "default account discovery ignores ambient HOME and stays under the passwd home"
@@ -245,6 +526,7 @@ test_prepare_installs_and_verifies_per_account_herdr_hooks() {
   reset_accounts
   set_remaining 1 90,80
   set_claude_authenticated 1
+  mark_claude_keychain_ready 1
 
   codex_home=$(run_selector prepare codex 2>"$TMP_ROOT/prepare-codex.err")
   claude_home=$(run_selector prepare claude 2>"$TMP_ROOT/prepare-claude.err")
@@ -274,6 +556,7 @@ test_prepare_rejects_missing_credentials_before_hook_install() {
   reset_accounts
   claude_home="$ACCOUNT_ROOT/claude/1"
   mkdir -p "$claude_home"
+  mark_claude_keychain_ready 1
   out=$(run_selector prepare claude 2>&1)
   status=$?
   expect_code 1 "$status" "Claude prepare without a usable login should fail closed"
@@ -341,7 +624,7 @@ set -u
 # `treehouse get --lease` reports the leased worktree on stdout, and fm-spawn
 # refuses to launch without it. The stub has to answer that the same way.
 [ "${1:-}" != get ] || {
-  printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
+  printf '%s\tcwd=%s\n' "$*" "$PWD" >> "${FM_FAKE_TREEHOUSE_LOG:?}"
   printf '%s\n' "${FM_FAKE_TREEHOUSE_WORKTREE:?}"
   exit 0
 }
@@ -382,6 +665,8 @@ run_direct_spawn() {
     PATH="$FAKEBIN:$PATH" \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
+    FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
+    FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
     FM_ACCOUNT_DIRECTORY_CLAUDE_BIN="$FAKEBIN/claude" \
@@ -403,10 +688,12 @@ make_spawn_case() {
     "$home/treehouse-pools"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  printf '# Backlog\n\n## In flight\n- [ ] %s - account directory spawn test (repo: project)\n\n## Queued\n\n## Done\n' \
+    "$id" > "$home/data/backlog.md"
   touch "$home/state/.last-watcher-beat"
   # A leased Treehouse worktree is handed over at detached HEAD on a clean
   # default branch, and fm-spawn refuses one that is still attached to a branch
-  # (the crew creates its own). Reproduce that shape, not a generic worktree.
+  # (the crewmate creates its own). Reproduce that shape, not a generic worktree.
   fm_git_worktree "$project" "$worktree" "wt-$name"
   git -C "$worktree" checkout --quiet --detach HEAD
   git -C "$project" branch --quiet -D "wt-$name"
@@ -442,36 +729,133 @@ test_spawn_uses_direct_codex_home_without_agent_fleet() {
   if grep -q '^account_profile=' "$meta"; then fail "new direct spawn wrote legacy managed profile metadata"; fi
   if grep -q '^account_pool=' "$meta"; then fail "new direct spawn wrote legacy managed pool metadata"; fi
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "new direct spawn invoked Agent Fleet"
-  pass "new enforced Codex spawn uses CODEX_HOME and never enters Agent Fleet"
+  pass "new enforced Codex spawn uses CODEX_HOME and never enters Agent Fleet lease selection"
+}
+
+test_main_home_ship_and_scout_use_managed_treehouse_source() {
+  local record id out meta source_config treehouse_log
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+
+  id=main-home-ship-z1
+  record=$(make_spawn_case main-home-ship codex "$id")
+  read_spawn_case "$record"
+  : > "$TREEHOUSE_LOG"
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" 2>&1)
+  meta="$SPAWN_HOME/state/$id.meta"
+  treehouse_log=$(cat "$TREEHOUSE_LOG")
+  assert_contains "$out" "spawned $id harness=codex kind=ship" \
+    "main-home ship spawn regressed"
+  assert_grep 'kind=ship' "$meta" "main-home ship metadata changed kind"
+  assert_absent "$SPAWN_PROJECT/treehouse.toml" \
+    "main-home ship spawn wrote Treehouse config into the project clone"
+  assert_contains "$treehouse_log" "cwd=$SPAWN_HOME/state/treehouse-sources/" \
+    "main-home ship spawn did not acquire from its managed control worktree"
+  source_config=$(find "$SPAWN_HOME/state/treehouse-sources" -name treehouse.toml -type f -print)
+  assert_grep "root = \"$SPAWN_HOME\"" "$source_config" \
+    "main-home ship control worktree did not select the home pool"
+
+  id=main-home-scout-z1
+  record=$(make_spawn_case main-home-scout codex "$id")
+  read_spawn_case "$record"
+  : > "$TREEHOUSE_LOG"
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --scout 2>&1)
+  meta="$SPAWN_HOME/state/$id.meta"
+  treehouse_log=$(cat "$TREEHOUSE_LOG")
+  assert_contains "$out" "spawned $id harness=codex kind=scout" \
+    "main-home scout spawn regressed"
+  assert_grep 'kind=scout' "$meta" "main-home scout metadata changed kind"
+  assert_absent "$SPAWN_PROJECT/treehouse.toml" \
+    "main-home scout spawn wrote Treehouse config into the project clone"
+  assert_contains "$treehouse_log" "cwd=$SPAWN_HOME/state/treehouse-sources/" \
+    "main-home scout spawn did not acquire from its managed control worktree"
+  source_config=$(find "$SPAWN_HOME/state/treehouse-sources" -name treehouse.toml -type f -print)
+  assert_grep "root = \"$SPAWN_HOME\"" "$source_config" \
+    "main-home scout control worktree did not select the home pool"
+  pass "main-home ship and scout spawns acquire through their managed per-home Treehouse source"
 }
 
 test_spawn_uses_direct_claude_fallback_and_hook() {
   local record id out launch meta
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
-  mkdir -p "$ACCOUNT_ROOT/claude/2"
-  set_claude_authenticated 1
+  set_claude_authenticated 2
+  mark_manual_only claude 1
+  mark_claude_keychain_ready 2
   id=direct-claude-z2
   record=$(make_spawn_case direct-claude claude "$id")
   read_spawn_case "$record"
 
   out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" "$SPAWN_PROJECT" --account-pool legacy-claude-pool 2>&1)
+    "$id" "$SPAWN_PROJECT" --account-pool claude-crew 2>&1)
   launch=$(cat "$SPAWN_LAUNCH_LOG")
   meta=$SPAWN_HOME/state/$id.meta
   assert_contains "$out" "CLAUDE USAGE UNREADABLE" "spawn hid the required Claude quota-read warning"
-  assert_contains "$launch" "CLAUDE_CONFIG_DIR='$ACCOUNT_ROOT/claude/1' claude" \
-    "spawn did not scope Claude to the deterministic first account home"
-  assert_grep "account_home=$ACCOUNT_ROOT/claude/1" "$meta" "Claude spawn metadata omitted account_home"
-  [ -f "$ACCOUNT_ROOT/claude/1/hooks/herdr-agent-state.sh" ] || fail "Claude spawn did not install its per-account Herdr hook"
+  assert_contains "$launch" "CLAUDE_CONFIG_DIR='$ACCOUNT_ROOT/claude/2' claude" \
+    "spawn did not scope Claude to the eligible rotated account home"
+  assert_contains "$launch" "--model 'claude-opus-5'" \
+    "Claude spawn did not carry the anchored Opus 5 model"
+  assert_grep "account_home=$ACCOUNT_ROOT/claude/2" "$meta" "Claude spawn metadata omitted account_home"
+  assert_grep "model=claude-opus-5" "$meta" "Claude spawn metadata omitted the resolved Opus 5 model"
+  [ -f "$ACCOUNT_ROOT/claude/2/hooks/herdr-agent-state.sh" ] || fail "Claude spawn did not install its per-account Herdr hook"
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "new direct Claude spawn invoked Agent Fleet"
-  pass "new account-flagged Claude spawn uses deterministic CLAUDE_CONFIG_DIR with an explicit warning"
+  pass "new account-flagged Claude spawn excludes reserved profiles and launches on the anchored Opus 5 model"
+}
+
+test_claude_spawn_rejects_mismatched_explicit_model() {
+  local record id out status
+  reset_accounts
+  id=claude-model-mismatch-refused-z2
+  record=$(make_spawn_case claude-model-mismatch-refused claude "$id")
+  read_spawn_case "$record"
+
+  if out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --model sonnet 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Claude crew launch accepted a non-Opus-5 explicit model"
+  assert_contains "$out" "model 'sonnet' does not match the installed Opus 5 anchor 'claude-opus-5'" \
+    "Claude model mismatch refusal was not actionable"
+  [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "Claude model mismatch created an endpoint"
+  pass "Claude crew/scout launch rejects an explicit model that differs from the Opus 5 anchor"
+}
+
+test_direct_claude_recovery_resolves_legacy_default_to_anchor() {
+  local record id meta meta_tmp launch
+  reset_accounts
+  mkdir -p "$ACCOUNT_ROOT/claude/2"
+  mark_claude_keychain_ready 2
+  id=claude-recovery-model-anchor-z2
+  record=$(make_spawn_case claude-recovery-model-anchor claude "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool claude-crew >/dev/null 2>&1
+  meta=$SPAWN_HOME/state/$id.meta
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.claude-recovery-model.XXXXXX")
+  awk '/^model=/ { print "model=default"; next } { print }' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account >/dev/null 2>&1
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$launch" "--model 'claude-opus-5'" \
+    "direct Claude recovery inherited the legacy default model"
+  assert_grep "model=claude-opus-5" "$meta" \
+    "direct Claude recovery metadata did not record the model actually launched"
+  pass "direct Claude recovery preserves explicit models and upgrades a legacy default to the Opus 5 anchor"
 }
 
 test_spawn_refuses_unauthenticated_account_before_endpoint_creation() {
   local record id out status
   reset_accounts
   mkdir -p "$ACCOUNT_ROOT/claude/1"
+  mark_claude_keychain_ready 1
   id=direct-claude-unauth-z2a
   record=$(make_spawn_case direct-claude-unauth claude "$id")
   read_spawn_case "$record"
@@ -508,7 +892,7 @@ test_observe_spawn_uses_direct_directory_without_agent_fleet() {
   assert_grep "account_home=$ACCOUNT_ROOT/codex/1" "$meta" "observe metadata omitted the direct account home"
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "observe launch invoked Agent Fleet"
   assert_not_contains "$out" "fm-account-routing: observe" "observe launch entered the legacy dry-run selector"
-  pass "observe mode uses direct account-directory routing without Agent Fleet"
+  pass "observe mode uses direct account-directory routing without Agent Fleet leases"
 }
 
 test_direct_spawn_and_recovery_support_detached_worktree() {
@@ -578,6 +962,7 @@ test_direct_recovery_preserves_recorded_task_context() {
   set_remaining 1 20,15
   set_remaining 2 90,85
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  printf '# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n' > "$SPAWN_HOME/data/backlog.md"
 
   out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" --recover-direct-account 2>&1)
@@ -607,6 +992,9 @@ test_direct_recovery_preserves_recorded_task_context() {
   assert_grep "generation_id=$generation" "$meta" "direct recovery replaced the task generation identity"
   assert_grep "dispatch_profile_required=1" "$meta" "direct recovery dropped dispatch-profile metadata"
   assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" "direct recovery did not update account_home"
+  if grep -q "$id" "$SPAWN_HOME/data/backlog.md"; then
+    fail "direct recovery fixture unexpectedly retained its historical backlog row"
+  fi
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "direct recovery invoked Agent Fleet"
   pass "direct recovery preserves recorded task context while refreshing account selection"
 }
@@ -840,12 +1228,13 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 90,85
   set_remaining 2 20,15
-  id=direct-retained-endpoint-z7
+  id="direct-retained-endpoint-z7-$$"
   record=$(make_spawn_case direct-retained-endpoint codex "$id")
   read_spawn_case "$record"
 
   run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1 \
+    || fail "retained-endpoint fixture could not create its initial managed spawn"
   meta="$SPAWN_HOME/state/$id.meta"
   set_remaining 1 20,15
   set_remaining 2 95,90
@@ -1054,6 +1443,13 @@ test_routing_off_keeps_default_provider_launch() {
 
 make_spawn_fakebin "$FAKEBIN"
 
+if [ "${FM_TEST_FOCUSED:-}" = account-directory-trust ]; then
+  test_profile_eligibility_requires_enabled_worker
+  test_claude_approval_marker_contract
+  test_openat_binding_failure_is_a_setup_error
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
@@ -1072,18 +1468,33 @@ if [ "${FM_TEST_FOCUSED:-}" = credential-preflight ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
+  test_main_home_ship_and_scout_use_managed_treehouse_source
+  exit 0
+fi
+
 test_codex_picks_highest_fresh_minimum_and_skips_no_window
+test_profile_eligibility_requires_enabled_worker
+test_claude_approval_marker_contract
+test_openat_binding_failure_is_a_setup_error
 test_codex_rechecks_health_on_every_selection
-test_codex_fails_when_no_account_has_a_fresh_window
+test_codex_rotates_when_no_account_has_a_fresh_window
 test_codex_timeout_skips_wedged_account
-test_claude_uses_stable_first_without_treating_usage_as_health
+test_claude_rotates_eligible_accounts_without_treating_usage_as_health
+test_concurrent_claude_selections_spread_without_usage
+test_claude_fails_closed_when_no_usable_crew_account_exists
+test_claude_uses_only_explicit_last_resort_after_primary_exhaustion
+test_codex_rotates_accounts_tied_for_best_fresh_score
 test_default_root_uses_passwd_home_not_ambient_home
 test_claude_credential_check_recovers_from_stale_profile_binary_manifest
 test_prepare_installs_and_verifies_per_account_herdr_hooks
 test_prepare_rejects_missing_credentials_before_hook_install
+test_main_home_ship_and_scout_use_managed_treehouse_source
 test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
 test_spawn_refuses_unauthenticated_account_before_endpoint_creation
+test_claude_spawn_rejects_mismatched_explicit_model
+test_direct_claude_recovery_resolves_legacy_default_to_anchor
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context

@@ -94,9 +94,10 @@
 #   Before a secondmate launch, the home must fast-forward safely to the primary
 #   default-branch commit and independently match the live default tip.
 #   Any unproven freshness state refuses launch.
-#   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
-#   surface dirty pool entries, and durably lease one available worktree before
-#   creating the endpoint. They refuse to create that endpoint unless the leased
+#   Ship/scout spawns canonicalize a symlinked project path before exact-root
+#   refresh and pool preflight, surface dirty pool entries, and durably lease
+#   one available worktree before creating the endpoint. They refuse to create
+#   that endpoint unless the leased
 #   path is a clean isolated worktree from the requested repository whose HEAD
 #   matches its live upstream or local default-branch tip. Dirty acquisitions
 #   remain under their durable lease for manual recovery. Other pre-commit
@@ -2848,9 +2849,11 @@ fi
 # still-symlinked PROJ_ABS can misfire both ways: false-negative (the poll
 # below never notices the pane left the project) or false-positive (the
 # isolation guard refuses a spawn that never actually tangled). Canonicalize
-# once here so every downstream comparison uses the same physical form
+# once here so exact-root preflight and every downstream comparison use the
+# same physical form
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
+PROJ_ABS=$PROJ_ABS_REAL
 
 real_path_or_raw() {  # <path>
   local path=$1 real

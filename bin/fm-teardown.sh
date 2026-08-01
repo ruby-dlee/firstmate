@@ -26,6 +26,9 @@
 # Every authorized Treehouse return is process-tree bounded by
 # FM_TREEHOUSE_RETURN_TIMEOUT while holding the same common checkout mutation
 # lock across its retry and stale-index-lock recovery sequence.
+# Per-task temp cleanup accepts only the exact /tmp/fm-<id> root, treats that
+# exact root as already clean when absent, and still refuses wrong paths,
+# symlinks, or traversal.
 # Uncommitted changes are never landed.
 # Ordinary teardown first proves that metadata names the exact registered project,
 # worktree, and task lease, then quiesces the endpoint before its final safety checks.
@@ -2386,6 +2389,7 @@ if not stat.S_ISDIR(os.lstat(base).st_mode):
 print(base)
 PY
   ) || return 1
+  [ -e "$base/fm-$ID" ] || [ -L "$base/fm-$ID" ] || return 0
   removal_tree_operation "$base/fm-$ID" "task temp root" remove
 }
 
@@ -4855,7 +4859,8 @@ fi
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
-# Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
+# Read before the state-file rm below; empty metadata and an already-absent
+# exact root are no-ops.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true

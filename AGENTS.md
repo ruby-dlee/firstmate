@@ -111,7 +111,7 @@ state/               volatile runtime signals; gitignored
   Direct ship and scout launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD. Their metadata may temporarily carry worktree_git_setup_ref= and worktree_git_setup_head= while the brief's required `fm/<id>` branch transition is pending; recovery accepts only that exact setup state or the authoritative `fm/<id>` ref and removes the setup fields after adoption.
   Direct recovery validates the canonical worktree path, exact physical Git-dir identity, and authoritative final state before account preparation and again immediately before endpoint creation; any drift fails closed without launching.
   If endpoint removal after a failed new direct spawn cannot be confirmed, direct_spawn_cleanup=pending and rollback_pending=1 retain the endpoint and worktree identity for explicit teardown.
-  A failed new direct spawn that never created an endpoint records direct_spawn_endpoint=not-created and an empty window= so teardown skips endpoint quiescence without skipping worktree safety.
+  A failed new direct spawn that never created an endpoint records direct_spawn_endpoint=not-created and an empty window= so teardown skips endpoint quiescence and, for a scout that never ran, the report gate without skipping worktree safety.
   Secondmate Agent Fleet routing and legacy managed recovery own account_pool=, account_profile=, account_task=, account_attempt=, and provider_session_id= (docs/configuration.md "Agent Fleet account routing").
   kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
@@ -220,8 +220,8 @@ Secondmate launches are exempt because they resolve through `fm-harness.sh secon
 
 `quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; every real new ship/scout launch uses direct account-directory selection.
 When candidates carry account pools, the selector chooses the ordered first profile and passes its pool to spawn only as a compatibility activation input, never as an account choice or lease request.
-Direct selection reads Agent Fleet's profile registry only for pool membership, excludes profiles outside the provider's crew pool, and requires Claude's non-secret per-directory quota-axi Keychain approval marker before any fallback or rotation.
-When no usable Claude crew account survives those checks, selection fails closed and names the reserved or approval-required reasons.
+Direct selection reads Agent Fleet's profile registry only for pool membership, excludes profiles outside the provider's worker pool, and requires Claude's non-secret per-directory quota-axi Keychain approval marker before any fallback or rotation.
+When no usable Claude account for crewmates survives those checks, selection fails closed and names the reserved or approval-required reasons.
 An explicitly declared `claude-crew-last-resort` pool is consulted only after `claude-crew` has no usable account; manual-only profiles remain excluded, and selector code never guesses account ownership from unreadable identity data.
 Fresh Codex quota is an opportunistic ranking signal.
 Exact best-score Codex ties and an all-unavailable quota result rotate across eligible accounts under a serialized persistent cursor; Claude always uses that rotation because its per-directory quota signal is unreadable.
@@ -469,8 +469,8 @@ A backend spawn refusal - a missing dependency, an unauthenticated socket, or a 
 For ship and scout tasks, the script asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout, aborting the spawn otherwise to prevent the worktree tangle of section 8.
 For `kind=secondmate`, it launches in the registered or explicit firstmate home with the charter brief as the launch prompt, after the guarded home sync and inheritable-config propagation owned by `secondmate-provisioning`.
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
+For a genuinely new ship or scout task, `bin/fm-spawn.sh` asserts an In flight or Queued backlog row before endpoint creation.
 After spawning, peek the endpoint to confirm the crewmate is processing the brief and handle any trust dialog with `harness-adapters`.
-For a ship or scout task, add the task to `data/backlog.md` under In flight.
 A secondmate spawn adds no backlog row: its identity and scope live in `data/secondmates.md`, its runtime lives in `state/<id>.meta`, and section 10 owns the backlog contract.
 
 ### Supervise
@@ -576,7 +576,7 @@ A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold th
 
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
 - Relay the findings to the captain: plain chat for a focused answer, and a durable Lavish decision when multiple genuine choices need structured input.
-- Tear down immediately - no merge gate. For a post-cutover scout, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product.
+- Tear down immediately - no merge gate. For a post-cutover scout that ran, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product. A failed direct spawn whose endpoint was never created may clear its bookkeeping without a report because no scout ran.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 When the captain invokes `/reports` or asks to browse, open, search, or summarize completed work, load the `reports` skill.

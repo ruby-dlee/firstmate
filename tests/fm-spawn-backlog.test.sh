@@ -140,13 +140,14 @@ test_rows_in_manual_backlog_allow_ship_and_scout() {
 }
 
 test_missing_tasks_axi_falls_back_to_manual_read() {
-  local record id out status node_dir
+  local record id out status node_path
   id=backlog-no-axi-z3b
   record=$(make_spawn_case no-tasks-axi "$id")
   read_spawn_case "$record"
   rm -f "$HOME_DIR/config/backlog-backend"
-  node_dir=$(dirname "$(command -v node)")
-  export FM_TEST_PATH_OVERRIDE="$FAKEBIN_DIR:$node_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+  node_path=$(command -v node)
+  ln -s "$node_path" "$FAKEBIN_DIR/node"
+  export FM_TEST_PATH_OVERRIDE="$FAKEBIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
   if PATH="$FM_TEST_PATH_OVERRIDE" command -v tasks-axi >/dev/null 2>&1; then
     fail "tasks-axi absence fixture still resolves tasks-axi"
   fi

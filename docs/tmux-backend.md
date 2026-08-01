@@ -12,7 +12,7 @@ Pick tmux unless you have a specific reason to try a new-task-capable experiment
 ## Prerequisites
 
 - tmux itself: `brew install tmux` (or your platform's package manager).
-- The universal firstmate prerequisites: a verified crew harness plus the required toolchain, detected at session start and installed only after you approve; [`docs/configuration.md`](configuration.md) owns both lists ("Harness support", "Toolchain").
+- The universal firstmate prerequisites: a verified crewmate harness plus the required toolchain, detected at session start and installed only after you approve; [`docs/configuration.md`](configuration.md) owns both lists ("Harness support", "Toolchain").
 
 ## Selecting it
 
@@ -29,7 +29,7 @@ The first crewmate spawn creates whatever tmux session and window it needs.
 ## Run inside tmux for the best experience
 
 Launch your harness from inside a tmux session (`tmux new -s firstmate` or similar, then start your agent).
-Every crewmate window then lands in that same session, where you can watch the crew work in real time or type into any window to intervene.
+Every crewmate window then lands in that same session, where you can watch the crewmate work in real time or type into any window to intervene.
 When following the commands below, use that session's actual name.
 Inside tmux, `tmux display-message -p '#S'` prints it.
 
@@ -42,18 +42,18 @@ Attach to it any time with:
 tmux attach -t firstmate
 ```
 
-## Watching and typing into crew windows
+## Watching and typing into crewmate windows
 
 Once attached, each crewmate is its own window named `fm-<id>`:
 
 ```sh
-tmux list-windows -t <session-name>          # see every crew window
+tmux list-windows -t <session-name>          # see every crewmate window
 tmux select-window -t <session-name>:fm-<id> # jump to one, or use ctrl-b <n>
 ```
 
 Use the current tmux session name when firstmate was launched inside tmux; use `firstmate` only for the detached outside-tmux path.
 Typing directly into an attached window is authoritative direct intervention - the first mate treats it the same as any other captain instruction and reconciles at the next heartbeat.
-You do not need to attach at all for routine supervision: from an active firstmate session, the first mate reads crew windows itself with `bin/fm-peek.sh fm-<id>` (a bounded, read-only capture) and steers a crew with `FM_HOME=<this-firstmate-home> bin/fm-send.sh fm-<id> "<text>"` unless `FM_HOME` is already set to the active firstmate home.
+You do not need to attach at all for routine supervision: from an active firstmate session, the first mate reads crewmate windows itself with `bin/fm-peek.sh fm-<id>` (a bounded, read-only capture) and steers a crewmate with `FM_HOME=<this-firstmate-home> bin/fm-send.sh fm-<id> "<text>"` unless `FM_HOME` is already set to the active firstmate home.
 
 ## Verifying it works
 
@@ -110,6 +110,13 @@ Since `node` is also the generic name for a plain interpreter session, any futur
 The classifier deliberately reports `unknown` for `node`/`python`/`python3` rather than guess - per the secondmate-liveness sweep's correctness bar, a wrong `alive` is harmless but a wrong `dead` spins up a duplicate agent, so an unresolvable case must never be treated as confidently dead.
 Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
 Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
+
+## Proving absence needs a session-scoped handle
+
+`fm_backend_target_state` can only answer `absent` for tmux when it can derive a session to scope `tmux list-windows` to.
+It takes that session from `tmux_session_target=` when the metadata records one, otherwise from the `session:window` form of the target itself; a bare unscoped window name yields `unknown`, never `absent`.
+That matters because the managed-lifecycle callers release nothing on `unknown` - `bin/fm-teardown.sh` retains the worktree, lease, and metadata instead.
+A real spawn always records a scoped handle (`bin/fm-spawn.sh` builds `T="$SES:$W"` and persists it as `window=`), so this is not a gap in the product path; it is the shape any tmux task metadata must have, fixtures included.
 
 ## Limitations
 

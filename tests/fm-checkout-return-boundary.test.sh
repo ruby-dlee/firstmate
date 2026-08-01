@@ -14,8 +14,8 @@
 # refused on ANY symlink entry anywhere in the tree, which made every repo
 # whose own committed layout uses symlinks permanently un-reapable: relvino
 # carries 177 of them in every worktree (its CLAUDE.md -> AGENTS.md convention
-# and its symlinked skills), so no crew there could ever be torn down. A
-# symlink ENTRY cannot redirect this validation walk - it is inspected with
+# and its symlinked skills), so no crewmate there could ever be torn down. A
+# symlink ENTRY cannot redirect this operation - it is inspected with
 # follow_symlinks=False, it is not a directory so it is never queued for
 # descent, and each descent opens with O_NOFOLLOW and re-proves identity,
 # single-device, and non-mount. Only a symlinked ANCESTOR redirects, and that
@@ -79,6 +79,19 @@ run_boundary() {  # <project> <target> [cd-dir] [fd-limit] -> exit status
       ulimit -n "$fd_limit" || exit 71
     fi
     cd "$cd_dir" || exit 70
+    PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$target" "$project"
+  ) >/dev/null 2>&1
+  status=$?
+  printf '%s' "$status"
+}
+
+run_boundary_low_fd() {  # <project> <target> <open-file-limit> -> exit status
+  local project=$1 target=$2 open_file_limit=$3 fakebin status
+  fakebin=$(fm_fakebin "$(dirname "$project")/fake-low-fd")
+  fm_fake_exit0 "$fakebin" treehouse
+  (
+    ulimit -n "$open_file_limit" || exit 70
+    cd "$project" || exit 71
     PATH="$fakebin:$PATH" python3 "$BOUNDARY_PY" "$target" "$project"
   ) >/dev/null 2>&1
   status=$?

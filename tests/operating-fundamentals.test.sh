@@ -7,7 +7,7 @@ set -u
 
 SKILL="$ROOT/.agents/skills/operating-fundamentals/SKILL.md"
 CREW_SKILL="$ROOT/.agents/skills/crew-steering/SKILL.md"
-LAVISH_SKILL="$ROOT/.agents/skills/lavish-decision-boards/SKILL.md"
+LAVISH_SKILL="$ROOT/.agents/skills/lavish-decisions/SKILL.md"
 AGENTS="$ROOT/AGENTS.md"
 
 test_agent_only_folded_frontmatter_and_size() {
@@ -47,7 +47,7 @@ test_seven_ordered_principles() {
 
   assert_grep "every captain ask" "$SKILL" "orchestration principle must cover every captain ask"
   assert_grep "durable backlog item" "$SKILL" "orchestration principle must require durable backlog tracking"
-  assert_grep "tracked crew assignment" "$SKILL" "orchestration principle must require a tracked owner"
+  assert_grep "tracked crewmate assignment" "$SKILL" "orchestration principle must require a tracked owner"
   assert_grep "never perform project investigation, planning, implementation, or deliverable production inline" "$SKILL" "orchestration principle must forbid inline project and deliverable work"
   assert_grep "every healthy lane" "$SKILL" "lane-saturation principle is missing"
   assert_grep "blocker as a routing problem" "$SKILL" "blocker-routing principle is missing"
@@ -119,13 +119,13 @@ test_crew_steering_contract_and_trigger() {
   assert_grep "fixed-goal guardrail" "$CREW_SKILL" "crew steering must retain the fixed-goal authority"
   assert_grep "specific, un-bloated briefs and steers" "$CREW_SKILL" "crew steering must remain direct"
   assert_grep "correct a wrong path before it is built" "$CREW_SKILL" "crew steering must correct wrong paths early"
-  assert_grep "concrete result the crew must produce" "$CREW_SKILL" "a steer must end with the required result"
+  assert_grep "concrete result the crewmate must produce" "$CREW_SKILL" "a steer must end with the required result"
   assert_grep "evidence that will prove it" "$CREW_SKILL" "a steer must end with required proof"
   assert_grep "next action it should take" "$CREW_SKILL" "a steer must end with the next action"
   assert_grep "Do not add motivational padding, duplicate background, or a second copy of an existing procedure" "$CREW_SKILL" "crew steering must avoid padding and duplicate contracts"
 
   section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
-  assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crew brief and before live-steering a crew" "section 13 must trigger crew-steering for briefs and live steers"
+  assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crewmate brief and before live-steering a crewmate" "section 13 must trigger crew-steering for briefs and live steers"
   pass "crew-steering retains its behavioral guardrails and conditional trigger"
 }
 
@@ -133,10 +133,10 @@ test_live_surface_freshness_contract() {
   assert_grep "reconcile it against live fleet state" "$AGENTS" "captain-facing surfaces must reconcile against live state"
   assert_grep "removing resolved actionable or decision items" "$AGENTS" "serve-fresh removal must cover resolved actionable and decision items"
   assert_grep "Recently Landed section of \`/bearings\` and \`/reports\`" "$AGENTS" "completion-oriented surfaces must retain relevant history"
-  assert_grep "never render it from a remembered snapshot" "$LAVISH_SKILL" "Lavish boards must use live fleet state"
-  assert_grep "Answer preservation takes precedence over the serve-fresh rule" "$LAVISH_SKILL" "answer preservation must take precedence while input is unsubmitted"
-  assert_grep "Never edit, refresh, or reload a served board while the captain is answering" "$LAVISH_SKILL" "served boards must preserve in-progress answers"
-  assert_grep "After submission, reconcile and refresh before continuing" "$LAVISH_SKILL" "served boards must refresh safely after answer submission"
+  assert_grep "Reconcile the proposed decision against live fleet state" "$LAVISH_SKILL" "Lavish decisions must use live fleet state"
+  assert_grep "Do not edit \`request.md\` or \`manifest.toon\` after surfacing" "$LAVISH_SKILL" "surfaced decision contracts must be immutable"
+  assert_grep "The answer file is authoritative; the wake record is only a pointer" "$LAVISH_SKILL" "durable answers must outrank wake pointers"
+  assert_grep "Never start a server, open a browser, create or share a session URL, poll" "$LAVISH_SKILL" "the disqualified browser and polling lifecycle must stay prohibited"
   pass "live-surface freshness preserves completion history and in-progress answers"
 }
 

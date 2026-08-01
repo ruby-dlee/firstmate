@@ -50,30 +50,75 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+# --- bounded liveness waits -------------------------------------------------
+#
+# These waits synchronize fixtures; they are not performance assertions.
+# Keep their ceiling generous on a loaded machine while still guaranteeing
+# that a broken test fails instead of hanging forever. Callers may lower or
+# raise the shared ceiling for local diagnosis.
+
+FM_TEST_LIVENESS_TIMEOUT_SECONDS=${FM_TEST_LIVENESS_TIMEOUT_SECONDS:-30}
+
+fm_test_liveness_iterations() {
+  local requested=${1:-1} interval=${2:-0.1} minimum
+  minimum=$(awk -v seconds="$FM_TEST_LIVENESS_TIMEOUT_SECONDS" -v tick="$interval" \
+    'BEGIN { value = int((seconds / tick) + 0.999999); if (value > 0) print value; else print 1 }')
+  if [ "$requested" -gt "$minimum" ]; then
+    printf '%s\n' "$requested"
+  else
+    printf '%s\n' "$minimum"
+  fi
+}
+
+fm_test_wait_for_file() {
+  local path=$1 pid=${2:-} interval=${3:-0.05} limit i=0
+  limit=$(fm_test_liveness_iterations 1 "$interval")
+  while [ "$i" -lt "$limit" ]; do
+    [ -e "$path" ] && return 0
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      printf 'background process %s exited before %s appeared\n' "$pid" "$path" >&2
+      return 125
+    fi
+    sleep "$interval"
+    i=$((i + 1))
+  done
+  printf 'timed out after %ss waiting for %s\n' "$FM_TEST_LIVENESS_TIMEOUT_SECONDS" "$path" >&2
+  return 124
+}
+
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal
-# on EXIT. The first call installs the cleanup trap. A test file that needs
-# extra teardown (e.g. killing a daemon) should define its own EXIT trap and
-# call fm_test_cleanup from inside it so registered dirs are still removed.
+# on EXIT. Most callers use command substitution, whose subshell cannot update
+# a parent array and whose inherited EXIT trap runs on Bash 3, so a manifest
+# carries registrations back to the parent without deleting fixtures early.
+# A test file that needs extra teardown (e.g. killing a daemon) should define
+# its own EXIT trap and call fm_test_cleanup from inside it.
 
 FM_TEST_CLEANUP_DIRS=()
+FM_TEST_CLEANUP_MANIFEST=$(mktemp "${TMPDIR:-/tmp}/fm-test-cleanup.XXXXXX")
+trap fm_test_cleanup EXIT
 
 fm_test_cleanup() {
   local d
+  [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return 0
+  if [ -f "$FM_TEST_CLEANUP_MANIFEST" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] && rm -rf "$d"
+    done < "$FM_TEST_CLEANUP_MANIFEST"
+    rm -f "$FM_TEST_CLEANUP_MANIFEST"
+  fi
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  return 0
 }
 
 fm_test_tmproot() {
   local prefix=${1:-fm-test} root
   root=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
   root=$(cd "$root" && pwd -P)
-  if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
-    trap fm_test_cleanup EXIT
-  fi
-  FM_TEST_CLEANUP_DIRS+=("$root")
+  printf '%s\n' "$root" >> "$FM_TEST_CLEANUP_MANIFEST"
   printf '%s\n' "$root"
 }
 

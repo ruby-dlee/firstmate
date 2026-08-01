@@ -27,9 +27,10 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-arm-command-policy.mjs` | Semantic owner of the watcher-arm PreToolUse policy (docs/arm-pretool-check.md)   |
 | `fm-cd-pretool-check.sh` | Stable PreToolUse transport for the primary cd-guard command policy (docs/cd-guard.md) |
 | `fm-cd-command-policy.mjs` | Semantic owner of the cd-guard's persistent-directory-change decision (docs/cd-guard.md) |
+| `fm-decision-pretool-check.sh` | Exact-identity gate that routes structured captain decisions to Lavish (docs/decision-pretool-check.md) |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
-| `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crews on the resolved account and runtime backend |
+| `fm-spawn.sh`            | Spawn, native-resume, or provider-neutrally continue crewmates on the resolved account and runtime backend |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule through quota or the deferred legacy pool-summary branch |
 | `fm-account-directory.sh` | Select a direct Claude/Codex account directory and install its per-profile Herdr hook |
 | `fm-account-routing-lib.sh` | Own routing mode plus legacy Agent Fleet lease, exec, resume, and release recovery |
@@ -57,7 +58,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-afk-launch.sh`       | Own away-mode entry, exit, rollback, and any backend terminal lifecycle                 |
 | `fm-supervisor-target-lib.sh` | Resolve the compatibility injection target and backend for the daemon and launcher |
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, complete native tasks or inject compatibility digests |
-| `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
+| `fm-crew-state.sh`       | Print one deterministic current-state line for a crewmate                            |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
@@ -66,7 +67,9 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-process-tree-lib.sh` | Shared bounded command runner that terminates and reaps complete process trees         |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
-| `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, then assert watcher liveness                  |
+| `fm-lavish-intake.sh`    | Invoke compatible store-and-forward Lavish intake at an existing turn boundary       |
+| `fm-lavish-wake.sh`      | Append one durable Lavish answer pointer through the canonical wake queue lock        |
+| `fm-wake-drain.sh`       | Intake Lavish answers, atomically drain queued wakes, then assert watcher liveness    |
 | `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-transition-lib.sh`   | Shared backend-neutral transition record shape and single-owner status->action policy table |
@@ -80,7 +83,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |
 | `fm-report-retention.sh` | Maintain bounded, interruption-safe 30-day report retention independently of tasks   |
 | `fm-teardown.sh`         | Fail-closed teardown of worktrees, endpoints, secondmate homes, and managed account leases |
-| `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
+| `fm-harness.sh`          | Detect the running harness and resolve crewmate or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
 | `fm-lint.sh`             | Single owner of the shell-lint definition that CI and the no-mistakes gate both run  |
 | `fm-install-shellcheck.sh` | Install CI's pinned, checksum-verified ShellCheck build                            |

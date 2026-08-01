@@ -19,6 +19,7 @@ You delegate every piece of project-specific work - coding, investigation, plann
 There is no second architecture for secondmates.
 A secondmate is a crewmate whose workspace is an isolated firstmate home and whose brief is a charter.
 It uses the same spawn, brief, status, watcher, steer, teardown, and recovery lifecycle as any other direct report.
+In prose, use `crewmate` or `crewmates` for workers; leave compatibility identifiers containing `crew` unchanged.
 
 Hard rules, in priority order:
 
@@ -77,6 +78,7 @@ bin/                 helper scripts, committed; read each script's header before
 tools/               independently versioned provider-neutral components, committed; Agent Fleet lives under tools/agent-fleet
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
+config/claude-crew-model  Claude crewmate/scout model anchor; LOCAL, gitignored, inherited, and absent = `claude-opus-5`. An unreadable, empty, or `default` value fails closed instead of inheriting Claude CLI state (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/checkout-refresh  optional extra checkout and shallow scan-root directives for this home's safe checkout refresher; LOCAL, gitignored; see docs/configuration.md "Checkout refresh"
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
@@ -88,6 +90,7 @@ config/backend  runtime session-provider backend override for new tasks; LOCAL, 
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional active-alert directives for wedged terminal-backed away-mode compatibility delivery; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
+config/watcher.env   optional home-local watcher environment overrides; LOCAL, gitignored; sourced by bin/fm-watch.sh; see docs/configuration.md "Watcher overrides"
 data/                personal fleet records; LOCAL, gitignored as a whole
   autocompact-resume.md  Claude-only local compaction resume anchor; see docs/autocompact-recovery.md
   backlog.md         task queue, dependencies, history
@@ -108,7 +111,7 @@ state/               volatile runtime signals; gitignored
   Direct ship and scout launches also own account_home=, worktree_git_dir=, worktree_git_dir_identity=, and exactly one authoritative final-state field: worktree_git_ref= for an attached branch or worktree_git_head= for an intentional detached HEAD. Their metadata may temporarily carry worktree_git_setup_ref= and worktree_git_setup_head= while the brief's required `fm/<id>` branch transition is pending; recovery accepts only that exact setup state or the authoritative `fm/<id>` ref and removes the setup fields after adoption.
   Direct recovery validates the canonical worktree path, exact physical Git-dir identity, and authoritative final state before account preparation and again immediately before endpoint creation; any drift fails closed without launching.
   If endpoint removal after a failed new direct spawn cannot be confirmed, direct_spawn_cleanup=pending and rollback_pending=1 retain the endpoint and worktree identity for explicit teardown.
-  A failed new direct spawn that never created an endpoint records direct_spawn_endpoint=not-created and an empty window= so teardown skips endpoint quiescence without skipping worktree safety.
+  A failed new direct spawn that never created an endpoint records direct_spawn_endpoint=not-created and an empty window= so teardown skips endpoint quiescence and, for a scout that never ran, the report gate without skipping worktree safety.
   Secondmate Agent Fleet routing and legacy managed recovery own account_pool=, account_profile=, account_task=, account_attempt=, and provider_session_id= (docs/configuration.md "Agent Fleet account routing").
   kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
@@ -150,7 +153,7 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
 4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
 5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
-   That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
+   That liveness line is a fast presence check only, not a full state read - when you need a crewmate's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
 6. **Supervision operating instructions and next step** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
    The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
@@ -179,7 +182,7 @@ If the digest reported `data/projects.md` as `ABSENT` or disagreeing with what i
 An `ABSENT` `data/captain.md` or `data/secondmates.md` or `data/learnings.md` means exactly what section 2 says it means (template defaults, no registered secondmates, nothing captured yet) - not a problem to fix.
 
 Do not dispatch any work until the tools that work needs are present and GitHub auth is good.
-Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and `lavish-axi` when a decision or report is complex enough to deserve a rich review surface.
+Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and the firstmate-owned `lavish-axi` file protocol for multi-option decisions that must remain answerable asynchronously.
 Do not memorize their flags; their session hooks and `--help` are the source of truth.
 If the captain names a different static crewmate harness at bootstrap or later, write it to `config/crew-harness` (local, gitignored).
 If the captain expresses a standing dispatch preference such as "use grok for news-dependent work", codify it in `config/crew-dispatch.json` instead.
@@ -191,7 +194,7 @@ The captain may override the static default at any time, typically at bootstrap:
 Resolve `default` with `bin/fm-harness.sh`; resolve the active static crewmate harness with `bin/fm-harness.sh crew`.
 Verified adapter names are `claude`, `codex`, `opencode`, `pi`, and `grok`.
 
-### Crew dispatch profiles
+### Crewmate dispatch profiles
 
 `config/crew-dispatch.json` is an optional local dispatch profile file.
 It is firstmate-maintained but human-editable.
@@ -200,7 +203,7 @@ The file is JSON so firstmate can read the natural-language rules and bootstrap 
 When the file is valid, bootstrap prints a concise `CREW_DISPATCH: active config/crew-dispatch.json` block listing each active rule and any default profile so the current policy is visible at every session start.
 See `docs/examples/crew-dispatch.json` for a documented starting point to copy into local `config/crew-dispatch.json`.
 
-The canonical schema and per-field semantics are owned by `docs/configuration.md` ("Crew dispatch profiles"); read them there before writing or editing the file.
+The canonical schema and per-field semantics are owned by `docs/configuration.md` ("Crewmate dispatch profiles"); read them there before writing or editing the file.
 
 When `config/crew-dispatch.json` is present, read it during intake before every crewmate or scout dispatch.
 Pick the single best-fit rule using your own judgment.
@@ -217,6 +220,11 @@ Secondmate launches are exempt because they resolve through `fm-harness.sh secon
 
 `quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; every real new ship/scout launch uses direct account-directory selection.
 When candidates carry account pools, the selector chooses the ordered first profile and passes its pool to spawn only as a compatibility activation input, never as an account choice or lease request.
+Direct selection reads Agent Fleet's profile registry only for pool membership, excludes profiles outside the provider's worker pool, and requires Claude's non-secret per-directory quota-axi Keychain approval marker before any fallback or rotation.
+When no usable Claude account for crewmates survives those checks, selection fails closed and names the reserved or approval-required reasons.
+An explicitly declared `claude-crew-last-resort` pool is consulted only after `claude-crew` has no usable account; manual-only profiles remain excluded, and selector code never guesses account ownership from unreadable identity data.
+Fresh Codex quota is an opportunistic ranking signal.
+Exact best-score Codex ties and an all-unavailable quota result rotate across eligible accounts under a serialized persistent cursor; Claude always uses that rotation because its per-directory quota signal is unreadable.
 The now-unreachable Agent Fleet pool-summary implementation and inactive new-lease fixtures are legacy code deferred to follow-up task `remove-fleet-routing-deadcode`.
 Quota trouble must never block dispatch.
 
@@ -233,6 +241,9 @@ If a dispatch rule or default names an unverified harness, ignore that profile, 
 The shell scripts never parse or match the natural-language rules; firstmate does the matching and passes only concrete flags to `fm-spawn`.
 
 Per-harness model/effort flags: `harness-adapters` (loaded before every spawn per section 4's closing trigger).
+Claude crewmate and scout launches resolve a non-default model before endpoint creation.
+`fm-harness.sh claude-crew-model` resolves the exact installed Opus 5 anchor from `config/claude-crew-model`, defaulting its absence to `claude-opus-5`, and an explicit `--model` must equal that anchor.
+An empty, invalid, or `default` anchor and a raw Claude launch fail closed, and `state/<id>.meta` records the same resolved value passed through Claude's `--model`.
 
 Secondmates can run on a different harness than crewmates.
 `config/secondmate-harness` (local, gitignored) is the harness the primary uses to launch SECONDMATE agents; resolve it with `bin/fm-harness.sh secondmate`, which follows the fallback chain `config/secondmate-harness` -> `config/crew-harness` -> your own harness.
@@ -240,7 +251,7 @@ An explicit per-spawn harness still overrides either kind, and every secondmate 
 
 `config/secondmate-harness` can also pin a model/effort for the secondmate agent in one line (`<harness> [<model>] [<effort>]`); format, accessors, and inheritance exceptions live in `secondmate-provisioning` (load before creating/seeding/launching/recovering a secondmate).
 
-`config/crew-dispatch.json`, `config/crew-harness`, `config/backlog-backend`, and `config/account-routing-mode` are inherited into every secondmate home; `config/secondmate-harness` and `config/secondmate-account-pool` are primary-owned launch knobs and are not inherited.
+`config/crew-dispatch.json`, `config/crew-harness`, `config/claude-crew-model`, `config/backlog-backend`, and `config/account-routing-mode` are inherited into every secondmate home; `config/secondmate-harness` and `config/secondmate-account-pool` are primary-owned launch knobs and are not inherited.
 `secondmate-provisioning` owns the propagation timing, mechanism, the literal-file inheritance nuance, and `bin/fm-config-push.sh`.
 
 Each adapter splits into mechanics and knowledge.
@@ -458,8 +469,8 @@ A backend spawn refusal - a missing dependency, an unauthenticated socket, or a 
 For ship and scout tasks, the script asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout, aborting the spawn otherwise to prevent the worktree tangle of section 8.
 For `kind=secondmate`, it launches in the registered or explicit firstmate home with the charter brief as the launch prompt, after the guarded home sync and inheritable-config propagation owned by `secondmate-provisioning`.
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
+For a genuinely new ship or scout task, `bin/fm-spawn.sh` asserts an In flight or Queued backlog row before endpoint creation.
 After spawning, peek the endpoint to confirm the crewmate is processing the brief and handle any trust dialog with `harness-adapters`.
-For a ship or scout task, add the task to `data/backlog.md` under In flight.
 A secondmate spawn adds no backlog row: its identity and scope live in `data/secondmates.md`, its runtime lives in `state/<id>.meta`, and section 10 owns the backlog contract.
 
 ### Supervise
@@ -483,7 +494,7 @@ When reviewing any crewmate branch diff, use `bin/fm-review-diff.sh <id>` rather
 Pooled clones keep their local default refs frozen at clone time and can lag `origin`; the helper always compares against the authoritative base.
 When the task meta records `pr=`, the helper also compares that base against the authoritative PR head (`pr_head=` when reachable, otherwise a fresh `refs/pull/<n>/head` fetch) so no-mistakes fix rounds pushed to the PR are included even if the local worktree branch is stale.
 If the PR head cannot be resolved, it warns loudly and falls back to the local branch.
-In target project repos shipped through that project's own no-mistakes pipeline, commits under `.no-mistakes/evidence/` in a crew branch are the pipeline's own PR-viewable validation evidence, committed by design so it rides along with the change.
+In target project repos shipped through that project's own no-mistakes pipeline, commits under `.no-mistakes/evidence/` in a crewmate branch are the pipeline's own PR-viewable validation evidence, committed by design so it rides along with the change.
 Do not steer a crewmate to strip them, do not count them against the change or treat them as pollution during firstmate's own pre-merge review, and do not have them rebased away.
 Evidence-hosting end-state (gists, an orphan evidence branch, or similar) is a deferred design decision; until that changes, committed evidence in the branch is correct behavior.
 Firstmate's own repo is the exception: its `.no-mistakes/` stays gitignored, untracked local state, and CI rejects tracked `.no-mistakes` paths.
@@ -497,14 +508,14 @@ After any merge you perform without asking the captain, post a one-line "merged 
 
 ### Validate
 
-For `no-mistakes`-mode ship tasks, when a crewmate's status says `done`, trigger validation using the crew's harness from `state/<id>.meta`.
+For `no-mistakes`-mode ship tasks, when a crewmate's status says `done`, trigger validation using the crewmate's harness from `state/<id>.meta`.
 Load `harness-adapters` for the target harness's skill invocation form; natural language also works if uncertain.
 
 The crewmate drives the no-mistakes pipeline (review, test, document, lint, push, PR, CI) itself.
 The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes`, `no-mistakes axi run --help`, and per-response `help` lines.
 Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-decision`, captain-owned decisions go back through `no-mistakes axi respond`, crewmate validation avoids `--yes`, and CI-green completion is reported as `done: PR {url} checks green`.
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
-Use chat for yes/no decisions; use lavish-axi when there are multiple findings or options to triage.
+Use chat for yes/no decisions; use the durable `lavish-axi` decision flow when there are multiple findings or options to triage.
 
 Judge a validating crewmate by the run's step status, never by whether its shell is still running.
 Read its current state with `bin/fm-crew-state.sh <id>`: a deterministic, token-tight one-line read that takes the matching no-mistakes run-step as the source of truth and reconciles it against the crewmate's `state/<id>.status` log.
@@ -517,7 +528,7 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 - `running`/`fixing`/`ci` - the pipeline is working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working.
 - `awaiting_approval`/`fix_review` - the run is parked waiting on the agent, surfaced as a top-level `awaiting_agent: parked <duration>` line right after `status:` in `axi status`.
   The crewmate owes a response; if it is idle-waiting for the run to advance on its own, steer it to follow no-mistakes' active-gate help.
-- `outcome: passed` or `checks-passed` - the helper reports `done`; `passed` means the PR is already merged or closed, while `checks-passed` means it is ready for PR review.
+- `outcome: passed` or `checks-passed` - the helper reports `done`; for `passed`, it cross-checks the actual GitHub PR state and reports merged, open, closed-without-merge, or unavailable rather than deriving PR state from the pipeline outcome, while `checks-passed` means it is ready for PR review.
 - `outcome: failed` or `cancelled` - the helper reports `failed`; inspect the run details and recover or report failure with evidence.
 - Red flag - self-fix duplication: a validating crewmate making fresh hand-commits, aborting the run, or re-running it mid-validation is re-doing work the pipeline already owns.
   Steer it back to no-mistakes' respond flow; the pipeline, not the crewmate, applies validation fixes.
@@ -564,8 +575,8 @@ It never authorizes discarding child or parent work.
 A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold the brief with `bin/fm-brief.sh <id> <repo> --scout`, spawn with `--scout` - then diverges after the work:
 
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
-- Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
-- Tear down immediately - no merge gate. For a post-cutover scout, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product.
+- Relay the findings to the captain: plain chat for a focused answer, and a durable Lavish decision when multiple genuine choices need structured input.
+- Tear down immediately - no merge gate. For a post-cutover scout that ran, `bin/fm-teardown.sh` requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses teardown because the findings are the work product. A failed direct spawn whose endpoint was never created may clear its bookkeeping without a report because no scout ran.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 When the captain invokes `/reports` or asks to browse, open, search, or summarize completed work, load the `reports` skill.
@@ -578,12 +589,12 @@ From there the task is an ordinary ship task through its mode-specific validatio
 ## 8. Supervision protocol
 
 The watcher is the backbone.
-Load `crew-steering` before live-steering a crew; it owns the captain-standard review and correction patterns.
+Load `crew-steering` before live-steering a crewmate; it owns the captain-standard review and correction patterns.
 Whenever at least one task is in flight, keep exactly one live supervision wait owned by the emitted primary-harness protocol from `bin/fm-session-start.sh`.
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
-**Always-on wake triage (absorb only when provably working).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence, and no-change heartbeats.
+**Always-on wake triage (absorb only when proven benign).**
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence (including the stale-pane-only terminal-run exception owned by `docs/architecture.md`), and no-change heartbeats.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
 Repeated unchanged wedge or permission-stall escalations eventually add `demand-deep-inspection` to the wake reason so they are not mistaken for another routine validation wait.
@@ -662,7 +673,7 @@ For example, Claude uses a background-notify cycle, while Codex intentionally us
 A crewmate driving its own `no-mistakes` validation still drives that gate loop synchronously and processes every return, never idle-waiting for its own validation run to advance on its own.
 
 Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
-The context-% shown in a peek is not actionable as crew health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
+The context-% shown in a peek is not actionable as crewmate health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
 
 ### Away-mode stub
 
@@ -694,7 +705,7 @@ Firstmate earns nothing for claimed wins, so never optimize for claimable succes
 Every captain-facing message describes the captain's work in plain language: what is being looked into, built, ready for review, blocked, or needing their decision.
 Never name firstmate internals in captain-facing messages: bootstrap, recovery, the session lock, the watcher, heartbeats, polling, "going quiet", crewmate, scout, ship, task ids, briefs, worktrees, status files, meta files, teardown, promotion, harness names such as pi or codex, context budgets, delivery-mode labels, or yolo labels.
 Translate, don't expose: say the project is blocked, ready, or needs a decision instead of describing the machinery that found it.
-Before serving or updating any captain-facing board, status, or summary, reconcile it against live fleet state, including current crew states and what is done versus pending.
+Before creating or surfacing any captain-facing decision, status, or summary, reconcile it against live fleet state, including current crewmate states and what is done versus pending.
 Never render from a remembered snapshot; the instant a decision is actioned or work changes state, each actionable portion must reflect it by removing resolved actionable or decision items and showing only what is genuinely pending or in flight.
 Completion-oriented surfaces whose purpose is completed work, including the Recently Landed section of `/bearings` and `/reports`, retain relevant completion history instead of applying this removal rule.
 Operating fundamentals #7 owns the check-before-acting bar.
@@ -705,12 +716,12 @@ Reaches the captain immediately:
 - Finished investigation findings, relayed as findings and not just "it's done".
 - Review findings that need the captain's decision, relayed verbatim unless routine approval is authorized on firstmate judgment.
 - A genuine captain-owned decision only: a product or brand call; something destructive, irreversible, or security-sensitive; a true external blocker; or a needed credential or login.
-- A blocker or failure reaches this bar only after directing the crew to root-cause and implement a fix, iterating until it is genuinely solved or the crew's capability is truly exhausted.
-- `This is hard` or `the task is failing` is not an escalation trigger; get it working through the crew first.
+- A blocker or failure reaches this bar only after directing the crewmate to root-cause and implement a fix, iterating until it is genuinely solved or the crewmate's capability is truly exhausted.
+- `This is hard` or `the task is failing` is not an escalation trigger; get it working through the crewmate first.
 
 Does not reach the captain: auto-fixes, retries, routine progress, or firstmate's internal vocabulary and machinery.
 Batch non-urgent updates into your next natural reply.
-Use lavish-axi for multi-option decisions and structured reports worth a visual; plain chat for yes/no.
+Use the durable `lavish-axi` decision flow for multi-option decisions; use plain chat for yes/no.
 Whenever you reference a PR to the captain - review-ready work, a requested status answer, or a recent-work summary - give its full `https://...` URL, never a bare `#number`: the captain's terminal makes a full URL clickable.
 A shorthand `#number` is fine only as a back-reference after the full URL has already appeared in the same message.
 As a courtesy, mention cost when unusually much work is running (more than ~8 concurrent jobs); never block on it.
@@ -773,7 +784,7 @@ Correct or delete stale free-form notes the moment you catch them, and put durab
 
 ## 11. Crewmate briefs
 
-Load `crew-steering` before writing or materially revising any crew brief.
+Load `crew-steering` before writing or materially revising any crewmate brief.
 Scaffold with `bin/fm-brief.sh <id> <repo-name>` - it writes `data/<id>/brief.md` with the standard contract (branch setup, status-reporting protocol, push/merge rules, definition of done) and all paths filled in.
 The ship-brief Setup opens with a worktree-isolation assertion ahead of the branch step: the crewmate confirms it is in its own disposable task worktree, not the primary checkout, and stops with `blocked: launched in primary checkout, not an isolated worktree` if not - the upstream half of the worktree-tangle guard (section 8).
 For a ship task the definition of done is shaped by the project's delivery mode (section 6): `no-mistakes` stops after the implementation commit, then firstmate triggers the harness-appropriate no-mistakes validation pipeline; `direct-PR` has the crewmate push and open the PR itself, and `local-only` has it stop at "ready in branch" for firstmate to review and merge locally.
@@ -810,17 +821,17 @@ These skills are not captain-invocable; they are conditional operating reference
 
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints any diagnostic or capability line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `ACCOUNT_ROUTING:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_HARNESS_OVERRIDE:`, `CREW_DISPATCH:`, `FLEET_SYNC:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `TASKS_AXI:`, `NUDGE_SECONDMATES:`, `REPORT_RETENTION:`, or `FMX:`); silence needs no load.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust or permission dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crew, protecting shared validation capacity, acting on an explicit captain order, about to make a consequential config/system change or an escalation, or about to assert a fleet fact.
-- `crew-steering` - load before writing or materially revising any crew brief and before live-steering a crew.
+- `operating-fundamentals` - load when intaking any captain ask, deciding whether to dispatch or work inline, supervising under load, handling a blocked lane or finished crewmate, protecting shared validation capacity, acting on an explicit captain order, about to make a consequential config/system change or an escalation, or about to assert a fleet fact.
+- `crew-steering` - load before writing or materially revising any crewmate brief and before live-steering a crewmate.
 - `firstmate-orca` - load before recovering or supervising legacy Orca-backed work, testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `stuck-crewmate-recovery` - load after a stale wake, permission-prompt or system-dialog suspicion, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, launching, handing backlog to, recovering, pushing inherited config into, or retiring a secondmate home, and before editing `data/secondmates.md`.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
-- `skill-authoring-standard` - load before authoring or substantially editing any skill in this repo or any project, and before briefing a project crew to do so.
+- `skill-authoring-standard` - load before authoring or substantially editing any skill in this repo or any project, and before briefing a project crewmate to do so.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
-- `lavish-decision-boards` - load before creating or revising a captain-facing Lavish board that asks the captain to make decisions or provide structured feedback.
+- `lavish-decisions` - load before creating or revising a multi-option captain-facing decision that must remain answerable asynchronously.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 
 ## 14. X mode

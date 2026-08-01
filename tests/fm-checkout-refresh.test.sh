@@ -654,7 +654,7 @@ test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() 
 }
 
 test_bootstrap_relays_hygiene_alerts() {
-  local project draft out diagnostic_out config_backup config_real
+  local project draft out config_backup config_real
   project=$(cd "$FM_TEST_HOME/projects/relvino" && pwd -P)
   draft="$project/.agents/skills/bootstrap-draft/SKILL.md"
   mkdir -p "$(dirname "$draft")"

@@ -924,7 +924,7 @@ test_teardown_rejects_uninspectable_project_before_zellij_kill() {
     "backend=zellij" \
     "zellij_tab_id=3" \
     "worktree=$dir/missing-worktree" \
-    "project=$project" \
+    "project=$dir/missing-project" \
     "kind=scout"
   printf '[]\n' > "$dir/responses/1.out"
   printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"

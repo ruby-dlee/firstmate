@@ -3,7 +3,7 @@ name: lavish-repair
 description: >-
   Agent-only recovery playbook for diagnosing and repairing served Lavish Editor boards that remain loading, lose live feedback, report that the agent is not listening, or prompt consideration of a Lavish or browser process restart.
   Use before touching Lavish, Chrome, or chrome-devtools-axi processes during a surface incident.
-  Do not use it to design or revise a working decision board; use `lavish-decision-boards` for that.
+  Do not use it to design or revise a working decision; use `lavish-decisions` for that.
 user-invocable: false
 metadata:
   internal: true

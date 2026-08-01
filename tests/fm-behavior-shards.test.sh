@@ -9,6 +9,7 @@ set -u
 SHARDER="$ROOT/bin/fm-behavior-shards.sh"
 DURATIONS="$ROOT/tests/behavior-test-durations.tsv"
 CI="$ROOT/.github/workflows/ci.yml"
+TEARDOWN_SUITE="$ROOT/tests/fm-teardown-suite.sh"
 SHARD_COUNT=8
 
 test_checked_in_plan_is_complete_balanced_and_deterministic() {
@@ -21,8 +22,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
 
   out=$("$SHARDER" --check "$SHARD_COUNT") \
     || fail "checked-in behavior shard plan failed its coverage guard"
-  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=84 shards=8" \
-    "coverage guard did not report the complete 84-test inventory"
+  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=85 shards=8" \
+    "coverage guard did not report the complete 85-test inventory"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_a"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_b"
   cmp -s "$plan_a" "$plan_b" || fail "same durations produced different shard plans"
@@ -164,7 +165,7 @@ test_post_run_guard_requires_the_exact_executed_union() {
   write_complete_manifests "$plan" "$good"
   out=$("$SHARDER" --verify "$SHARD_COUNT" "$good") \
     || fail "post-run guard rejected the exact complete manifest union"
-  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=84 shards=8" \
+  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=85 shards=8" \
     "post-run guard did not report complete execution"
 
   cp -R "$good" "$missing"
@@ -223,9 +224,55 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   pass "CI wires eight named isolated shards, a tight timeout, and executed-union verification"
 }
 
+test_teardown_partition_preserves_every_full_suite_case() {
+  local tmp definitions listed focused expected_focused wrapper_a wrapper_b
+  tmp=$(fm_test_tmproot fm-teardown-partition)
+  definitions="$tmp/definitions.txt"
+  listed="$tmp/listed.txt"
+  focused="$tmp/focused.txt"
+  expected_focused="$tmp/expected-focused.txt"
+  wrapper_a="$ROOT/tests/fm-teardown-a.test.sh"
+  wrapper_b="$ROOT/tests/fm-teardown-b.test.sh"
+
+  sed -n 's/^\(test_[A-Za-z0-9_]*\)() {.*/\1/p' "$TEARDOWN_SUITE" \
+    | LC_ALL=C sort > "$definitions"
+  awk '
+    /^TEARDOWN_FULL_SUITE_CASES=\($/ { in_cases = 1; next }
+    in_cases && /^\)$/ { exit }
+    in_cases && $1 ~ /^test_[A-Za-z0-9_]+$/ { print $1 }
+  ' "$TEARDOWN_SUITE" > "$listed"
+  [ "$(wc -l < "$listed" | tr -d ' ')" -eq 106 ] \
+    || fail "teardown partition does not retain all 106 normal-run cases"
+  [ "$(LC_ALL=C sort "$listed" | uniq -d | wc -l | tr -d ' ')" -eq 0 ] \
+    || fail "teardown partition lists a normal-run case more than once"
+  comm -13 "$definitions" <(LC_ALL=C sort "$listed") > "$tmp/undefined.txt"
+  [ ! -s "$tmp/undefined.txt" ] \
+    || fail "teardown partition lists an undefined test function"
+  comm -23 "$definitions" <(LC_ALL=C sort "$listed") > "$focused"
+  printf '%s\n' \
+    test_bounded_runner_preserves_command_status_125 \
+    test_pr_check_backfills_legacy_generation_and_records_state \
+    test_pr_check_backfills_legacy_generation_before_race_check \
+    | LC_ALL=C sort > "$expected_focused"
+  cmp -s "$expected_focused" "$focused" \
+    || fail "teardown partition dropped or absorbed a focused-only case"
+  [ "$(awk 'NR % 2 == 1 { count++ } END { print count + 0 }' "$listed")" -eq 53 ] \
+    || fail "teardown partition A does not own exactly 53 cases"
+  [ "$(awk 'NR % 2 == 0 { count++ } END { print count + 0 }' "$listed")" -eq 53 ] \
+    || fail "teardown partition B does not own exactly 53 cases"
+  assert_grep 'FM_TEST_PART_INDEX=1 FM_TEST_PART_TOTAL=2' "$wrapper_a" \
+    "teardown wrapper A does not select partition 1/2"
+  assert_grep 'FM_TEST_PART_INDEX=2 FM_TEST_PART_TOTAL=2' "$wrapper_b" \
+    "teardown wrapper B does not select partition 2/2"
+  [ ! -e "$ROOT/tests/fm-teardown.test.sh" ] \
+    || fail "the unsplit teardown test remains in the behavior inventory"
+  pass "teardown wrappers preserve all 106 normal cases and three focused-only cases"
+}
+
 test_checked_in_plan_is_complete_balanced_and_deterministic
 test_plan_refuses_missing_and_duplicate_duration_entries
 test_runner_executes_every_assigned_test_and_records_failures
 test_record_refreshes_complete_fixture_timings
 test_post_run_guard_requires_the_exact_executed_union
 test_ci_wires_matrix_isolation_timeout_and_union_verification
+test_teardown_partition_preserves_every_full_suite_case

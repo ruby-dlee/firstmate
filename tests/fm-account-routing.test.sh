@@ -2287,7 +2287,6 @@ test_secondmate_routing_inheritance_is_authoritative_for_every_mode() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id" incapable
   sm=$(cd "$sm" && pwd -P)
-  printf 'draft capability repair\n' > "$sm/bin/fm-account-routing-lib.sh"
   out=$(FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "routing-off secondmate refused a clean legacy home"

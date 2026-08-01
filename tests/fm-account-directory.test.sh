@@ -173,11 +173,13 @@ reset_accounts() {
 
 mark_manual_only() {
   local provider=$1 account=$2
+  mkdir -p "$ACCOUNT_ROOT/$provider/$account"
   touch "$ACCOUNT_ROOT/$provider/$account/test-manual-only"
 }
 
 mark_last_resort() {
   local provider=$1 account=$2
+  mkdir -p "$ACCOUNT_ROOT/$provider/$account"
   touch "$ACCOUNT_ROOT/$provider/$account/test-last-resort"
 }
 
@@ -827,7 +829,7 @@ test_claude_spawn_rejects_mismatched_explicit_model() {
 test_direct_claude_recovery_resolves_legacy_default_to_anchor() {
   local record id meta meta_tmp launch
   reset_accounts
-  mkdir -p "$ACCOUNT_ROOT/claude/2"
+  set_claude_authenticated 2
   mark_claude_keychain_ready 2
   id=claude-recovery-model-anchor-z2
   record=$(make_spawn_case claude-recovery-model-anchor claude "$id")
@@ -1464,7 +1466,9 @@ if [ "${FM_TEST_FOCUSED:-}" = credential-preflight ]; then
   test_claude_credential_check_recovers_from_stale_profile_binary_manifest
   test_prepare_installs_and_verifies_per_account_herdr_hooks
   test_prepare_rejects_missing_credentials_before_hook_install
+  test_spawn_uses_direct_claude_fallback_and_hook
   test_spawn_refuses_unauthenticated_account_before_endpoint_creation
+  test_direct_claude_recovery_resolves_legacy_default_to_anchor
   exit 0
 fi
 

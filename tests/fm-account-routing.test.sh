@@ -437,10 +437,13 @@ make_case() {
       "$wt" "$first_id" > "$case_dir/treehouse-pool/treehouse-state.json"
   fi
   touch "$home/state/.last-watcher-beat"
+  printf '# Backlog\n\n## In flight\n' > "$home/data/backlog.md"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf -- '- [ ] %s - account routing spawn test (repo: project)\n' "$id" >> "$home/data/backlog.md"
   done
+  printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf '%s|%s|%s|%s|%s\n' "$case_dir" "$home" "$proj" "$wt" "$fakebin"
 }
 

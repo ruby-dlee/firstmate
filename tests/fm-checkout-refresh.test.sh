@@ -1651,7 +1651,8 @@ SH
 }
 
 test_managed_treehouse_source_refuses_tracked_config_and_symlinks() {
-  local tracked_home tracked_source out status outside state_home parent_home keyed_home keyed_source common key
+  local tracked_home tracked_source inspect_home inspect_source fakebin real_git out status outside
+  local state_home parent_home keyed_home keyed_source common key
   tracked_home="$TMP_ROOT/treehouse-tracked-home"
   tracked_source="$tracked_home/projects/tracked"
   mkdir -p "$tracked_source" "$tracked_home/config"
@@ -1673,6 +1674,32 @@ test_managed_treehouse_source_refuses_tracked_config_and_symlinks() {
     "tracked project Treehouse config changed during refusal"
   assert_absent "$tracked_home/state" \
     "tracked-config refusal created managed source state"
+
+  inspect_home="$TMP_ROOT/treehouse-inspection-home"
+  inspect_source="$inspect_home/projects/source"
+  fakebin="$TMP_ROOT/treehouse-inspection-fakebin"
+  real_git=$(command -v git)
+  mkdir -p "$inspect_source" "$inspect_home/config" "$fakebin"
+  fm_git_init_commit "$inspect_source"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${3:-}" = ls-files ] && [ "${5:-}" = treehouse.toml ]; then
+  exit 70
+fi
+exec "${FM_TEST_REAL_GIT:?}" "$@"
+SH
+  chmod +x "$fakebin/git"
+  set +e
+  out=$(FM_TEST_REAL_GIT="$real_git" PATH="$fakebin:$PATH" \
+    run_isolated_refresh "$inspect_home" "$inspect_home/refresh-state" \
+    acquire-worktree "$inspect_source" failed-inspection 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "failed tracked-config inspection continued acquisition"
+  assert_contains "$out" "cannot inspect whether declared project $inspect_source tracks treehouse.toml" \
+    "tracked-config inspection failure was not reported"
+  assert_absent "$inspect_home/state" \
+    "tracked-config inspection failure created managed source state"
 
   outside="$TMP_ROOT/treehouse-source-outside"
   state_home="$TMP_ROOT/treehouse-state-link-home"

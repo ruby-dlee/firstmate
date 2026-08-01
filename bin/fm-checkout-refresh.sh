@@ -957,7 +957,7 @@ EOF
 
 prepare_treehouse_source() {  # <declared-project>
   local expected_source=$1 expected_common source_key source_parent source_dir source_common
-  local source_name config config_tmp config_value dirty state_dir managed_root
+  local source_name config config_tmp config_value dirty state_dir managed_root tracked_config
   [ "$MANAGED_TREEHOUSE_ROOT_INVALID" = 0 ] || {
     echo "error: managed Treehouse root is unsafe or unreadable: $MANAGED_TREEHOUSE_ROOT_RAW" >&2
     return 1
@@ -971,7 +971,11 @@ prepare_treehouse_source() {  # <declared-project>
     echo "error: cannot resolve Treehouse source repository identity for $expected_source" >&2
     return 1
   }
-  if git -C "$expected_source" ls-files --error-unmatch -- treehouse.toml >/dev/null 2>&1; then
+  tracked_config=$(git -C "$expected_source" ls-files -- treehouse.toml) || {
+    echo "error: cannot inspect whether declared project $expected_source tracks treehouse.toml" >&2
+    return 1
+  }
+  if [ -n "$tracked_config" ]; then
     echo "error: declared project $expected_source tracks treehouse.toml, preventing Firstmate from applying its per-home root without mutating project state" >&2
     return 1
   fi

@@ -9,7 +9,7 @@ set -u
 SHARDER="$ROOT/bin/fm-behavior-shards.sh"
 DURATIONS="$ROOT/tests/behavior-test-durations.tsv"
 CI="$ROOT/.github/workflows/ci.yml"
-SHARD_COUNT=6
+SHARD_COUNT=8
 
 test_checked_in_plan_is_complete_balanced_and_deterministic() {
   local tmp plan_a plan_b inventory planned out
@@ -21,8 +21,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
 
   out=$("$SHARDER" --check "$SHARD_COUNT") \
     || fail "checked-in behavior shard plan failed its coverage guard"
-  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=82 shards=6" \
-    "coverage guard did not report the complete 82-test inventory"
+  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=84 shards=8" \
+    "coverage guard did not report the complete 84-test inventory"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_a"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_b"
   cmp -s "$plan_a" "$plan_b" || fail "same durations produced different shard plans"
@@ -164,7 +164,7 @@ test_post_run_guard_requires_the_exact_executed_union() {
   write_complete_manifests "$plan" "$good"
   out=$("$SHARDER" --verify "$SHARD_COUNT" "$good") \
     || fail "post-run guard rejected the exact complete manifest union"
-  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=82 shards=6" \
+  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=84 shards=8" \
     "post-run guard did not report complete execution"
 
   cp -R "$good" "$missing"
@@ -201,9 +201,9 @@ test_post_run_guard_requires_the_exact_executed_union() {
 
 test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   # shellcheck disable=SC2016  # The GitHub expression is a literal YAML needle.
-  assert_grep 'name: Behavior tests (shard ${{ matrix.shard }}/6)' "$CI" \
+  assert_grep 'name: Behavior tests (shard ${{ matrix.shard }}/8)' "$CI" \
     "CI does not expose the failing shard in the job name"
-  assert_grep 'shard: [1, 2, 3, 4, 5, 6]' "$CI" \
+  assert_grep 'shard: [1, 2, 3, 4, 5, 6, 7, 8]' "$CI" \
     "CI does not launch every deterministic shard"
   [ "$(grep -Fc 'timeout-minutes: 15' "$CI")" -eq 1 ] \
     || fail "behavior matrix must have one 15-minute per-shard timeout"
@@ -214,13 +214,13 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   assert_grep 'echo "TMUX_TMPDIR=$shard_root/tmux"' "$CI" \
     "CI does not give each shard a private tmux socket root"
   # shellcheck disable=SC2016  # Workflow shell variables must remain literal.
-  assert_grep 'bin/fm-behavior-shards.sh --verify 6 "$RUNNER_TEMP/behavior-manifests"' "$CI" \
+  assert_grep 'bin/fm-behavior-shards.sh --verify 8 "$RUNNER_TEMP/behavior-manifests"' "$CI" \
     "CI does not verify the union of executed manifests"
   assert_grep 'overwrite: true' "$CI" \
     "CI cannot refresh a failed shard manifest during a failed-jobs rerun"
   assert_no_grep 'for test_script in tests/*.test.sh' "$CI" \
     "CI retained the 57-minute serial behavior loop"
-  pass "CI wires six named isolated shards, a tight timeout, and executed-union verification"
+  pass "CI wires eight named isolated shards, a tight timeout, and executed-union verification"
 }
 
 test_checked_in_plan_is_complete_balanced_and_deterministic

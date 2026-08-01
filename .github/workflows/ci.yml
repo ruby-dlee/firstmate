@@ -30,17 +30,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Prove complete, disjoint shard coverage
-        run: bin/fm-behavior-shards.sh --check 6
+        run: bin/fm-behavior-shards.sh --check 8
 
   behavior-tests:
-    name: Behavior tests (shard ${{ matrix.shard }}/6)
+    name: Behavior tests (shard ${{ matrix.shard }}/8)
     needs: behavior-test-plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -77,11 +77,11 @@ jobs:
             echo "TEMP=$shard_root/tmp"
             echo "TMUX_TMPDIR=$shard_root/tmux"
           } >> "$GITHUB_ENV"
-      - name: Run behavior shard ${{ matrix.shard }}/6
+      - name: Run behavior shard ${{ matrix.shard }}/8
         run: |
           set -eu
           manifest="$RUNNER_TEMP/executed-${{ matrix.shard }}.tsv"
-          bin/fm-behavior-shards.sh --run "${{ matrix.shard }}" 6 "$manifest"
+          bin/fm-behavior-shards.sh --run "${{ matrix.shard }}" 8 "$manifest"
       - name: Upload executed-test manifest
         if: always()
         uses: actions/upload-artifact@v4
@@ -108,7 +108,7 @@ jobs:
           path: ${{ runner.temp }}/behavior-manifests
           merge-multiple: true
       - name: Verify complete execution union
-        run: bin/fm-behavior-shards.sh --verify 6 "$RUNNER_TEMP/behavior-manifests"
+        run: bin/fm-behavior-shards.sh --verify 8 "$RUNNER_TEMP/behavior-manifests"
 
   agent-fleet:
     name: Agent Fleet package

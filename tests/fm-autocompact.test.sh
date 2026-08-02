@@ -385,6 +385,42 @@ EOF
   pass "an older worker cannot mark a newer failed anchor complete"
 }
 
+test_killed_lock_holder_cannot_block_future_anchor() {
+  local rec root home anchor ready holder_pid attempts=0
+  rec=$(new_primary killed-anchor-lock)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  ready="$home/lock-ready"
+  python3 -c '
+import fcntl
+import os
+import sys
+import time
+descriptor = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(30)
+' "$home/data/.autocompact-anchor.lock" "$ready" &
+  holder_pid=$!
+  while [ ! -f "$ready" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 500 ] || fail "anchor lock holder did not reach the synchronization point"
+    sleep 0.01
+  done
+  kill -9 "$holder_pid"
+  wait "$holder_pid" 2>/dev/null || true
+
+  printf '%s\n' '# after-killed-lock' > "$home/data/backlog.md"
+  capture "$root" "$home" manual
+
+  anchor="$home/data/autocompact-resume.md"
+  assert_grep 'Session: `session-manual`' "$anchor" "capture after a killed lock holder did not publish a fresh anchor"
+  assert_grep '# after-killed-lock' "$anchor" "capture after a killed lock holder retained stale deterministic state"
+  assert_grep 'Judgment capture: FAILED - judgment capture was disabled' "$anchor" "capture after a killed lock holder claimed dishonest judgment status"
+  pass "a killed coordination holder cannot block the next deterministic anchor"
+}
+
 test_compact_sessionstart_injects_anchor_and_reconciles() {
   local rec root home out
   rec=$(new_primary recover)
@@ -467,6 +503,7 @@ test_judgment_failure_degrades_to_loud_deterministic_anchor
 test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
 test_older_worker_cannot_complete_newer_failed_anchor
+test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
 test_recovery_payload_failures_still_emit_durable_context
 test_noncompact_sessionstart_is_inert

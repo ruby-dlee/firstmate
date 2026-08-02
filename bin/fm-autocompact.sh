@@ -52,27 +52,7 @@ STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 DATA=${FM_DATA_OVERRIDE:-$FM_HOME/data}
 ANCHOR=$DATA/autocompact-resume.md
 ANCHOR_LOCK=$DATA/.autocompact-anchor.lock
-ANCHOR_LOCK_HELD=0
 MODE=${1:-}
-
-release_anchor_lock() {
-  if [ "$ANCHOR_LOCK_HELD" -eq 1 ]; then
-    rmdir "$ANCHOR_LOCK" 2>/dev/null || true
-    ANCHOR_LOCK_HELD=0
-  fi
-}
-
-acquire_anchor_lock() {
-  local attempts=0
-  while ! mkdir "$ANCHOR_LOCK" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || return 1
-    sleep 0.01
-  done
-  ANCHOR_LOCK_HELD=1
-}
-
-trap release_anchor_lock EXIT
 
 usage() {
   cat <<'EOF'
@@ -340,22 +320,25 @@ capture_anchor() {
     rm -f "$tmp" || capture_failed 'could not clean the incomplete temporary anchor'
     capture_failed 'could not render the resume anchor'
   }
-  acquire_anchor_lock || {
-    rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
-    capture_failed 'could not serialize deterministic anchor publication'
-  }
-  mv -f "$tmp" "$ANCHOR" || {
-    release_anchor_lock
-    rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
-    capture_failed 'could not publish the resume anchor atomically'
-  }
-  release_anchor_lock
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$SCRIPT_DIR/fm-autocompact-anchor.py" \
+      --lock "$ANCHOR_LOCK" publish --candidate "$tmp" --anchor "$ANCHOR" || {
+      rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
+      capture_failed 'could not serialize deterministic anchor publication'
+    }
+  else
+    mv -f "$tmp" "$ANCHOR" || {
+      rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
+      capture_failed 'could not publish the resume anchor atomically'
+    }
+  fi
 
   if [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
     judgment_status='Judgment capture: FAILED - judgment capture was disabled; conversation-only durable knowledge may have been lost.'
   elif ! command -v python3 >/dev/null 2>&1; then
     judgment_status='Judgment capture: FAILED - python3 is unavailable, so conversation-only durable knowledge may have been lost.'
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable.' >&2
+    return 0
   else
     judgment_status=$(
       python3 "$SCRIPT_DIR/fm-autocompact-judgment.py" \
@@ -385,33 +368,20 @@ capture_anchor() {
     fi
   fi
 
-  tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") || {
-    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not allocate a status-update anchor; the existing loud incomplete status remains authoritative.' >&2
-    return 0
-  }
-  if ! acquire_anchor_lock; then
-    rm -f "$tmp"
-    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not serialize the anchor status update; the existing anchor remains authoritative.' >&2
-    return 0
-  fi
-  if ! awk -v status="$judgment_status" -v capture_id="$capture_id" '
-      NR == 5 && $0 == "Capture ID: `" capture_id "`" { owned = 1 }
-      NR == 3 && /^Judgment capture:/ { $0 = status; replaced = 1 }
-      { print }
-      END { if (!owned || !replaced) exit 1 }
-    ' "$ANCHOR" > "$tmp"; then
-    release_anchor_lock
-    rm -f "$tmp"
+  python3 "$SCRIPT_DIR/fm-autocompact-anchor.py" \
+    --lock "$ANCHOR_LOCK" update \
+    --anchor "$ANCHOR" \
+    --capture-id "$capture_id" \
+    --status "$judgment_status"
+  judgment_rc=$?
+  if [ "$judgment_rc" -eq 3 ]; then
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: the anchor changed before its status update; the newer anchor remains authoritative.' >&2
     return 0
   fi
-  if ! mv -f "$tmp" "$ANCHOR"; then
-    release_anchor_lock
-    rm -f "$tmp"
+  if [ "$judgment_rc" -ne 0 ]; then
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not publish the anchor status; the existing loud incomplete status remains authoritative.' >&2
     return 0
   fi
-  release_anchor_lock
 }
 
 recover_context() {

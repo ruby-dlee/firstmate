@@ -3854,6 +3854,28 @@ SH
   pass "retained direct-spawn teardown requires confirmed endpoint quiescence"
 }
 
+test_missing_ship_worktree_retains_endpoint_and_metadata() {
+  local case_dir rc
+  case_dir=$(make_case missing-ship-worktree)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unlanded ship work"
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "missing ship worktree must block teardown before quiescence"
+  assert_present "$case_dir/fakebin/.tmux-live" \
+    "missing ship worktree teardown stopped the task endpoint without landing proof"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "missing ship worktree teardown erased task metadata without landing proof"
+  assert_grep 'not an exact inspectable repository root' "$case_dir/stderr" \
+    "missing ship worktree refusal did not identify the absent safety proof"
+  pass "a missing ship worktree cannot bypass landing proof or endpoint safety"
+}
+
 test_never_created_direct_spawn_endpoint_is_not_quiesced() {
   local case_dir meta_tmp rc
   case_dir=$(make_case never-created-direct-spawn-endpoint)
@@ -5180,6 +5202,11 @@ if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = missing-ship-worktree ]; then
+  test_missing_ship_worktree_retains_endpoint_and_metadata
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = already-returned ]; then
   test_already_returned_worktree_finishes_bookkeeping
   exit 0
@@ -5263,6 +5290,7 @@ test_secondmate_state_enumeration_fails_closed
 test_secondmate_missing_treehouse_child_is_retained
 test_secondmate_registry_home_drift_blocks_removal
 test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+test_missing_ship_worktree_retains_endpoint_and_metadata
 test_never_created_direct_spawn_endpoint_is_not_quiesced
 test_never_created_scout_without_report_cleans_bookkeeping
 test_squash_merged_branch_deleted_allows

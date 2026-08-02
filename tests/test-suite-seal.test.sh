@@ -141,13 +141,48 @@ assert_contains "$direct_out" "declares real Herdr lifecycle; --skip-herdr selec
   "direct lifecycle-capable invocation did not hit the same admission control"
 pass "direct lifecycle-capable invocation reaches the same preflight and explicit skip path"
 
-for route in .no-mistakes.yaml .github/workflows/ci.yml CONTRIBUTING.md; do
+shard_fixture=$TMP_ROOT/shard-route
+shard_admissions=$TMP_ROOT/shard-admissions.log
+mkdir -p "$shard_fixture/bin" "$shard_fixture/tests"
+cp "$ROOT/bin/fm-behavior-shards.sh" "$shard_fixture/bin/fm-behavior-shards.sh"
+chmod +x "$shard_fixture/bin/fm-behavior-shards.sh"
+cat > "$shard_fixture/tests/one.test.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'ok - shard fixture\n'
+SH
+chmod +x "$shard_fixture/tests/one.test.sh"
+printf '1\ttests/one.test.sh\n' > "$shard_fixture/tests/behavior-test-durations.tsv"
+cat > "$shard_fixture/tests/run.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${FM_SHARD_ADMISSION_LOG:?}"
+exec bash "$@"
+SH
+chmod +x "$shard_fixture/tests/run.sh"
+: > "$shard_admissions"
+FM_SHARD_ADMISSION_LOG="$shard_admissions" \
+  "$shard_fixture/bin/fm-behavior-shards.sh" --run 1 1 "$TMP_ROOT/shard-manifest.tsv" \
+    > "$TMP_ROOT/shard-run.out" \
+  || fail "shard execution route did not cross its runner fixture"
+FM_SHARD_ADMISSION_LOG="$shard_admissions" \
+  "$shard_fixture/bin/fm-behavior-shards.sh" --record "$TMP_ROOT/shard-recorded.tsv" \
+    > "$TMP_ROOT/shard-record.out" \
+  || fail "timing refresh route did not cross its runner fixture"
+[ "$(grep -Fxc "$shard_fixture/tests/one.test.sh" "$shard_admissions")" -eq 2 ] \
+  || fail "shard execution and timing refresh did not each cross tests/run.sh"
+pass "shard execution and timing refresh routes cross the authoritative runner"
+
+for route in .no-mistakes.yaml CONTRIBUTING.md; do
   grep -F 'tests/run.sh' "$ROOT/$route" >/dev/null \
     || fail "$route does not route behavior tests through tests/run.sh"
 done
-grep -F 'tests/run.sh --skip-herdr' "$ROOT/.github/workflows/ci.yml" >/dev/null \
+grep -F 'bin/fm-behavior-shards.sh --run' "$ROOT/.github/workflows/ci.yml" >/dev/null \
+  || fail "CI does not route behavior tests through the sealed shard runner"
+grep -F 'FM_TEST_SKIP_HERDR=1' "$ROOT/.github/workflows/ci.yml" >/dev/null \
   || fail "CI does not select the explicit non-Herdr path"
+# shellcheck disable=SC2016  # The runner variables are a literal shell source needle.
+grep -F '"$ROOT/tests/run.sh" "$ROOT/$path"' "$ROOT/bin/fm-behavior-shards.sh" >/dev/null \
+  || fail "the shard runner bypasses tests/run.sh"
 if grep -F 'tests/run.sh --skip-herdr' "$ROOT/.no-mistakes.yaml" >/dev/null; then
   fail "no-mistakes silently skips the real-Herdr admission path"
 fi
-pass "no-mistakes, CI, and documented local execution name the authoritative runner"
+pass "no-mistakes, sharded CI, and documented local execution cross the authoritative runner"

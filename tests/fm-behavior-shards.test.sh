@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # Behavior tests for deterministic duration-balanced CI sharding and the
 # post-execution completeness guard.
 set -u
@@ -22,8 +24,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
 
   out=$("$SHARDER" --check "$SHARD_COUNT") \
     || fail "checked-in behavior shard plan failed its coverage guard"
-  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=91 shards=8" \
-    "coverage guard did not report the complete 91-test inventory"
+  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=93 shards=8" \
+    "coverage guard did not report the complete 93-test inventory"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_a"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_b"
   cmp -s "$plan_a" "$plan_b" || fail "same durations produced different shard plans"
@@ -79,6 +81,14 @@ printf 'two\n' >> "${FM_FIXTURE_EXECUTED:?}"
 printf 'ok - fixture two\n'
 SH
   chmod +x "$root/tests/one.test.sh" "$root/tests/two.test.sh"
+  cat > "$root/tests/run.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_FIXTURE_ADMISSIONS:-}" ]; then
+  printf '%s\n' "$1" >> "$FM_FIXTURE_ADMISSIONS"
+fi
+exec bash "$@"
+SH
+  chmod +x "$root/tests/run.sh"
   cat > "$root/tests/behavior-test-durations.tsv" <<'EOF_DURATIONS'
 10	tests/one.test.sh
 20	tests/two.test.sh
@@ -165,7 +175,7 @@ test_post_run_guard_requires_the_exact_executed_union() {
   write_complete_manifests "$plan" "$good"
   out=$("$SHARDER" --verify "$SHARD_COUNT" "$good") \
     || fail "post-run guard rejected the exact complete manifest union"
-  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=91 shards=8" \
+  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=93 shards=8" \
     "post-run guard did not report complete execution"
 
   cp -R "$good" "$missing"
@@ -217,6 +227,8 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   # shellcheck disable=SC2016  # Workflow shell variables must remain literal.
   assert_grep 'bin/fm-behavior-shards.sh --verify 8 "$RUNNER_TEMP/behavior-manifests"' "$CI" \
     "CI does not verify the union of executed manifests"
+  assert_grep 'FM_TEST_SKIP_HERDR=1' "$CI" \
+    "CI does not explicitly select the non-Herdr path"
   assert_grep 'overwrite: true' "$CI" \
     "CI cannot refresh a failed shard manifest during a failed-jobs rerun"
   assert_no_grep 'for test_script in tests/*.test.sh' "$CI" \

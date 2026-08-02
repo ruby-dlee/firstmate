@@ -10,7 +10,7 @@ The source run is [GitHub Actions run 30648119449](https://github.com/ruby-dlee/
 
 `tests/behavior-test-durations.tsv` records the per-script measurements derived from that run.
 
-The current inventory contains 87 behavior-test scripts, including the runner contract test and every test added on `main` since the baseline run.
+The current inventory contains 93 behavior-test scripts, including the runner contract tests and every test added on `main` since the baseline run.
 
 ## Assignment
 
@@ -23,13 +23,13 @@ The eight-shard checked-in plan has these estimated serial loads.
 | Shard | Tests | Estimated load |
 |---:|---:|---:|
 | 1 | 1 | 475500 ms (7m56s) |
-| 2 | 11 | 436053 ms (7m16s) |
-| 3 | 15 | 436051 ms (7m16s) |
-| 4 | 13 | 436048 ms (7m16s) |
-| 5 | 12 | 436056 ms (7m16s) |
-| 6 | 10 | 436296 ms (7m16s) |
-| 7 | 10 | 436222 ms (7m16s) |
-| 8 | 15 | 436053 ms (7m16s) |
+| 2 | 9 | 439540 ms (7m20s) |
+| 3 | 13 | 439534 ms (7m20s) |
+| 4 | 12 | 439538 ms (7m20s) |
+| 5 | 15 | 439537 ms (7m20s) |
+| 6 | 14 | 439539 ms (7m20s) |
+| 7 | 16 | 439540 ms (7m20s) |
+| 8 | 13 | 439541 ms (7m20s) |
 
 The account-routing and report-stack suites keep their original test functions and assertions in shared suite files, while two runner wrappers partition each call list deterministically between isolated runners.
 
@@ -69,6 +69,9 @@ The checked-in plan above also reflects the later teardown-suite split and tests
 `bin/fm-behavior-shards.sh --check 8` fails when the duration inventory has a missing path, duplicate path, malformed duration, or any difference from the complete `tests/*.test.sh` inventory.
 
 Every matrix runner writes an executed manifest while continuing through all assigned scripts and preserving each exit code.
+
+Both shard execution and timing refresh invoke each selected path through `tests/run.sh`, so their planning layer cannot bypass lifecycle admission.
+CI sets `FM_TEST_SKIP_HERDR=1` on the shard command because its disposable image does not provide Herdr; this is the runner's explicit non-Herdr path, not an ambient missing-tool fallback.
 
 The final `Behavior tests` job downloads all eight manifests and runs `bin/fm-behavior-shards.sh --verify 8 <manifest-dir>`.
 

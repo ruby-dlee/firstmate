@@ -18,13 +18,16 @@
 # parse a full https://github.com/<owner>/<repo>/pull/<n> URL. This script
 # parses the URL and invokes gh-axi in the form it accepts.
 #
-# Merge method: defaults to --squash when the caller passes none of --squash,
-# --merge, --rebase, or --method after the optional -- separator. An explicit
-# caller method is never overridden.
+# Merge method: when the caller passes none of --squash, --merge, --rebase, or
+# --method after the optional -- separator, no method is added. This lets a
+# GitHub merge queue select its configured strategy. An explicit caller method
+# is forwarded unchanged.
 # Merge success means GitHub independently reports the PR state as merged after
 # the merge command returns.
 # Merge queue acceptance, auto-merge enablement, or any other still-open state
 # exits non-zero and reports the observed state instead of success.
+# Draft status is checked only after fm-pr-check.sh records the PR and available
+# head, then drafts are refused with an actionable error before merge is called.
 # Extra args must not include --repo or -R because the repo is parsed from the
 # PR URL.
 #
@@ -48,16 +51,6 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META; refusing to merge without recording pr=" >&2; exit 1; }
 
-caller_has_merge_method() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --squash|--merge|--rebase|--method|--method=*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
 merge_method_label() {
   local arg previous=
   for arg in "$@"; do
@@ -74,7 +67,7 @@ merge_method_label() {
       *) previous= ;;
     esac
   done
-  printf '%s\n' squash
+  printf '%s\n' default
 }
 
 parse_pr_url() {
@@ -104,8 +97,54 @@ reject_repo_overrides() {
   return 0
 }
 
+toon_scalar() {
+  local field=$1 input=$2 value
+  value=$(printf '%s\n' "$input" | sed -n "s/^[[:space:]]*$field:[[:space:]]*//p" | head -1)
+  value=${value#\"}
+  value=${value%\"}
+  printf '%s\n' "$value"
+}
+
+refuse_draft_pr() {
+  local view draft
+  if ! view=$(gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" 2>&1); then
+    echo "error: could not inspect $PR_OWNER/$PR_REPO#$PR_NUMBER for draft status; refusing to merge" >&2
+    printf '%s\n' "$view" >&2
+    return 1
+  fi
+  draft=$(toon_scalar draft "$view")
+  case "$draft" in
+    yes|YES|true|TRUE)
+      echo "error: refusing to merge $PR_OWNER/$PR_REPO#$PR_NUMBER because it is a draft; run gh-axi pr ready $PR_NUMBER --repo $PR_OWNER/$PR_REPO once it is ready for review" >&2
+      return 1
+      ;;
+    no|NO|false|FALSE) return 0 ;;
+    *)
+      echo "error: gh-axi pr view did not report draft status for $PR_OWNER/$PR_REPO#$PR_NUMBER; refusing to merge" >&2
+      return 1
+      ;;
+  esac
+}
+
+pending_merge_status() {
+  local output=$1 status kind
+  status=$(toon_scalar status "$output")
+  kind=$(printf '%s\n' "$output" | sed -n 's/^\([[:alpha:]_-]*\):[[:space:]]*$/\1/p' | head -1)
+  case "$status" in
+    enqueued|ENQUEUED) printf '%s\n' enqueued; return 0 ;;
+    accepted|ACCEPTED) printf '%s\n' accepted; return 0 ;;
+    queued|QUEUED) printf '%s\n' queued; return 0 ;;
+  esac
+  case "$kind" in
+    enqueued|ENQUEUED) printf '%s\n' enqueued ;;
+    accepted|ACCEPTED) printf '%s\n' accepted ;;
+    queued|QUEUED) printf '%s\n' queued ;;
+    *) printf '%s\n' enqueued ;;
+  esac
+}
+
 verify_pr_merged() {
-  local view state
+  local view state pending_status
   if ! view=$(gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" 2>&1); then
     printf 'merge:\n  number: %s\n  status: unknown\n  observed_state: unavailable\n  method: %s\n' \
       "$PR_NUMBER" "$MERGE_METHOD_LABEL"
@@ -113,9 +152,7 @@ verify_pr_merged() {
     printf '%s\n' "$view" >&2
     return 1
   fi
-  state=$(printf '%s\n' "$view" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)
-  state=${state#\"}
-  state=${state%\"}
+  state=$(toon_scalar state "$view")
   case "$state" in
     merged|MERGED)
       printf 'merged:\n  number: %s\n  status: ok\n  method: %s\n  observed_state: merged\n' \
@@ -123,9 +160,10 @@ verify_pr_merged() {
       return 0
       ;;
     open|OPEN)
-      printf 'merge:\n  number: %s\n  status: enqueued\n  observed_state: open\n  method: %s\n' \
-        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
-      echo "error: gh-axi pr merge returned success, but GitHub still reports $PR_OWNER/$PR_REPO#$PR_NUMBER as open; treating it as enqueued/unconfirmed, not merged" >&2
+      pending_status=$(pending_merge_status "$MERGE_OUTPUT")
+      printf 'merge:\n  number: %s\n  status: %s\n  observed_state: open\n  method: %s\n' \
+        "$PR_NUMBER" "$pending_status" "$MERGE_METHOD_LABEL"
+      echo "error: merge request was $pending_status, but GitHub still reports $PR_OWNER/$PR_REPO#$PR_NUMBER as open; it is not verified merged" >&2
       return 1
       ;;
     closed|CLOSED)
@@ -154,14 +192,11 @@ reject_repo_overrides "$@" || exit 1
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || { echo "error: fm-pr-check did not record pr=$URL in $META; refusing to merge" >&2; exit 1; }
+refuse_draft_pr || exit 1
 
-merge_args=()
-if ! caller_has_merge_method "$@"; then
-  merge_args=(--squash)
-fi
-MERGE_METHOD_LABEL=$(merge_method_label ${merge_args[@]+"${merge_args[@]}"} "$@")
+MERGE_METHOD_LABEL=$(merge_method_label "$@")
 
-if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@" 2>&1); then
+if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "$@" 2>&1); then
   printf '%s\n' "$MERGE_OUTPUT"
   exit 1
 fi

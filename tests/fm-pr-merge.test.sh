@@ -84,6 +84,7 @@ case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
       *" title,body "*|*"--json title,body"*) printf 'Test PR\n\nTest body\n' ; exit 0 ;;
+      *" baseRefName,baseRefOid "*|*"--json baseRefName,baseRefOid"*) printf 'main\t%s\n' "$FM_TEST_PR_BASE_HEAD" ; exit 0 ;;
       *) printf '%s\n' "$FM_TEST_PR_HEAD" ; exit 0 ;;
     esac
     ;;
@@ -117,6 +118,7 @@ case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
       *" title,body "*|*"--json title,body"*) printf 'Test PR\n\nTest body\n' ; exit 0 ;;
+      *" baseRefName,baseRefOid "*|*"--json baseRefName,baseRefOid"*) printf 'main\t%s\n' "$FM_TEST_PR_BASE_HEAD" ; exit 0 ;;
       *) printf '%s\n' "$FM_TEST_PR_HEAD" ; exit 0 ;;
     esac
     ;;
@@ -142,6 +144,7 @@ run_pr_merge() {
   FM_ADVERSARIAL_REVIEW_MODEL=gpt-test \
   FM_ADVERSARIAL_REVIEW_RUNNER="$case_dir/reviewer.sh" \
   FM_TEST_PR_HEAD="$(cat "$case_dir/pr-head" 2>/dev/null || true)" \
+  FM_TEST_PR_BASE_HEAD="$(git -C "$case_dir/project" rev-parse origin/main 2>/dev/null || true)" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
@@ -168,7 +171,7 @@ test_records_pr_and_head_before_merging() {
     "records-before-merge: adversarial review head was not recorded"
   assert_grep 'adversarial_review_verdict=CLEAN' "$case_dir/state/task-x1.meta" \
     "records-before-merge: clean adversarial verdict was not recorded"
-  grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+  grep -qxF "pr merge 9 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash" "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
   pass "fm-pr-merge records pr=, pr_head=, and a clean adversarial verdict before invoking gh-axi pr merge"
 }
@@ -200,7 +203,7 @@ test_extra_merge_args_forwarded() {
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/15 -- --squash --delete-branch \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "extra-args: fm-pr-merge failed"
 
-  grep -qxF 'pr merge 15 --repo example/repo --squash --delete-branch' "$case_dir/gh-axi.log" \
+  grep -qxF "pr merge 15 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash --delete-branch" "$case_dir/gh-axi.log" \
     || fail "extra-args: extra gh-axi pr merge flags were not forwarded"
   pass "fm-pr-merge forwards extra flags to gh-axi pr merge after the -- separator"
 }
@@ -311,7 +314,7 @@ test_explicit_merge_method_not_overridden() {
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/22 -- --merge \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "explicit-merge-method: fm-pr-merge failed"
 
-  grep -qxF 'pr merge 22 --repo example/repo --merge' "$case_dir/gh-axi.log" \
+  grep -qxF "pr merge 22 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --merge" "$case_dir/gh-axi.log" \
     || fail "explicit-merge-method: caller --merge was not forwarded without an extra default --squash"
   pass "fm-pr-merge does not add default --squash when the caller passes an explicit merge method"
 }
@@ -325,7 +328,7 @@ test_method_equals_merge_method_not_overridden() {
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/23 -- --method=merge \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "method-equals-merge-method: fm-pr-merge failed"
 
-  grep -qxF 'pr merge 23 --repo example/repo --method=merge' "$case_dir/gh-axi.log" \
+  grep -qxF "pr merge 23 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --method=merge" "$case_dir/gh-axi.log" \
     || fail "method-equals-merge-method: caller --method=merge was not forwarded without an extra default --squash"
   pass "fm-pr-merge respects --method=<value> as an explicit merge method"
 }
@@ -339,7 +342,7 @@ test_parses_pr_url_for_gh_axi() {
   run_pr_merge "$case_dir" task-x1 https://github.com/my-org/my-repo/pull/126/ \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "url-parsing: fm-pr-merge failed"
 
-  grep -qxF 'pr merge 126 --repo my-org/my-repo --squash' "$case_dir/gh-axi.log" \
+  grep -qxF "pr merge 126 --repo my-org/my-repo --match-head-commit $(cat "$case_dir/pr-head") --squash" "$case_dir/gh-axi.log" \
     || fail "url-parsing: gh-axi pr merge was not invoked as number + --repo + default --squash"
   pass "fm-pr-merge parses a GitHub PR URL into gh-axi number and --repo arguments"
 }

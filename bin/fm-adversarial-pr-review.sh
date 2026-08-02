@@ -74,27 +74,10 @@ require_meta() {
   AUTHOR_HARNESS=$(fm_account_meta_value "$META" harness)
   AUTHOR_MODEL=$(fm_account_meta_value "$META" model)
   AUTHOR_ACCOUNT_HOME=$(fm_account_meta_value "$META" account_home)
-  AUTHOR_ACCOUNT_PROFILE=$(fm_account_meta_value "$META" account_profile)
   [ -n "$WT" ] || die "meta for $ID is missing worktree="
   [ -n "$PROJ" ] || die "meta for $ID is missing project="
   [ -d "$WT" ] || die "worktree for $ID is missing: $WT"
   [ -d "$PROJ" ] || die "project for $ID is missing: $PROJ"
-}
-
-default_branch() {
-  local ref branch
-  ref=$(git -C "$PROJ" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  if [ -n "$ref" ]; then
-    echo "${ref#origin/}"
-    return 0
-  fi
-  for branch in main master; do
-    if git -C "$PROJ" show-ref --verify --quiet "refs/heads/$branch"; then
-      echo "$branch"
-      return 0
-    fi
-  done
-  return 1
 }
 
 current_pr_head() {
@@ -102,6 +85,16 @@ current_pr_head() {
     gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --json headRefOid -q .headRefOid 2>/dev/null || true
   elif test_lab_enabled && command -v gh >/dev/null 2>&1; then
     gh pr view "$PR_URL" --json headRefOid -q .headRefOid 2>/dev/null || true
+  fi
+}
+
+current_pr_base() {
+  if command -v gh-axi >/dev/null 2>&1; then
+    gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --json baseRefName,baseRefOid \
+      -q '[.baseRefName, .baseRefOid] | @tsv' 2>/dev/null || true
+  elif test_lab_enabled && command -v gh >/dev/null 2>&1; then
+    gh pr view "$PR_URL" --json baseRefName,baseRefOid \
+      -q '[.baseRefName, .baseRefOid] | @tsv' 2>/dev/null || true
   fi
 }
 
@@ -115,21 +108,30 @@ pr_claims() {
 }
 
 fetch_review_refs() {
-  DEFAULT=$(default_branch) || die "cannot determine default branch for $PROJ"
+  local base_metadata resolved_base
+  base_metadata=$(current_pr_base)
+  IFS=$'\t' read -r BASE_NAME BASE_HEAD <<EOF
+$base_metadata
+EOF
+  [ -n "$BASE_NAME" ] || die "could not resolve PR base ref for $PR_URL"
+  safe_sha "$BASE_HEAD" || die "could not resolve exact PR base OID for $PR_URL"
+  git check-ref-format "refs/heads/$BASE_NAME" >/dev/null 2>&1 \
+    || die "PR base ref is invalid: $BASE_NAME"
   git -C "$WT" remote get-url origin >/dev/null 2>&1 || die "adversarial review requires an origin remote"
-  git -C "$WT" fetch origin "+refs/heads/$DEFAULT:refs/remotes/origin/$DEFAULT" --quiet
+  BASE_REF="refs/remotes/origin/$BASE_NAME"
+  git -C "$WT" fetch origin "+refs/heads/$BASE_NAME:$BASE_REF" --quiet
+  resolved_base=$(git -C "$WT" rev-parse --verify --quiet "$BASE_REF^{commit}") \
+    || die "base $BASE_REF does not exist in $WT"
+  [ "$resolved_base" = "$BASE_HEAD" ] \
+    || die "PR base moved while preparing review: expected $BASE_HEAD, fetched $resolved_base"
   if ! git -C "$WT" cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null; then
     git -C "$WT" fetch --quiet origin "refs/pull/$PR_NUMBER/head" >/dev/null 2>&1 \
       || die "cannot fetch PR head for $PR_URL"
   fi
   git -C "$WT" cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
     || die "PR head $HEAD_SHA is not present after fetch"
-  BASE_REF="origin/$DEFAULT"
-  git -C "$WT" rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null \
-    || die "base $BASE_REF does not exist in $WT"
   MERGE_BASE=$(git -C "$WT" merge-base "$BASE_REF" "$HEAD_SHA") \
     || die "cannot compute merge base for $BASE_REF and $HEAD_SHA"
-  BASE_HEAD=$(git -C "$WT" rev-parse "$BASE_REF^{commit}")
 }
 
 choose_reviewer_harnesses() {
@@ -176,16 +178,11 @@ EOF
   [ -n "${REVIEWER_HARNESS:-}" ] || die "no independent reviewer account was available"
   [ -n "$REVIEWER_ACCOUNT_HOME" ] || die "reviewer account selection did not return an account home"
 
-  ISOLATION_PROOF=
-  if [ -n "$AUTHOR_HARNESS" ] && [ "$AUTHOR_HARNESS" != "$REVIEWER_HARNESS" ]; then
-    ISOLATION_PROOF="different_harness author=$AUTHOR_HARNESS reviewer=$REVIEWER_HARNESS"
-  elif [ -n "$AUTHOR_ACCOUNT_HOME" ] && [ "$AUTHOR_ACCOUNT_HOME" != "$REVIEWER_ACCOUNT_HOME" ]; then
-    ISOLATION_PROOF="different_account_home author=$AUTHOR_ACCOUNT_HOME reviewer=$REVIEWER_ACCOUNT_HOME"
-  elif [ -n "$AUTHOR_ACCOUNT_PROFILE" ]; then
-    ISOLATION_PROOF="legacy_author_profile author_profile=$AUTHOR_ACCOUNT_PROFILE reviewer_home=$REVIEWER_ACCOUNT_HOME"
-  else
-    die "cannot prove reviewer is isolated from author; author_harness=${AUTHOR_HARNESS:-unknown} author_account_home=${AUTHOR_ACCOUNT_HOME:-absent}"
-  fi
+  [ -n "$AUTHOR_ACCOUNT_HOME" ] \
+    || die "cannot prove reviewer is isolated from author; author account_home is absent"
+  [ "$AUTHOR_ACCOUNT_HOME" != "$REVIEWER_ACCOUNT_HOME" ] \
+    || die "cannot prove reviewer is isolated from author; author and reviewer account_home are identical"
+  ISOLATION_PROOF="different_account_home author=$AUTHOR_ACCOUNT_HOME reviewer=$REVIEWER_ACCOUNT_HOME author_harness=${AUTHOR_HARNESS:-unknown} author_model=${AUTHOR_MODEL:-unknown} reviewer_harness=$REVIEWER_HARNESS reviewer_model=$REVIEWER_MODEL"
 }
 
 make_prompt() {
@@ -314,7 +311,6 @@ verdict: $VERDICT
 author_harness: ${AUTHOR_HARNESS:-unknown}
 author_model: ${AUTHOR_MODEL:-unknown}
 author_account_home: ${AUTHOR_ACCOUNT_HOME:-unknown}
-author_account_profile: ${AUTHOR_ACCOUNT_PROFILE:-unknown}
 reviewer_harness: $REVIEWER_HARNESS
 reviewer_model: $REVIEWER_MODEL
 reviewer_account_home: $REVIEWER_ACCOUNT_HOME

@@ -46,6 +46,7 @@ case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
       *" title,body "*|*"--json title,body"*) printf 'Review lane test\n\nClaims to be safe.\n' ; exit 0 ;;
+      *" baseRefName,baseRefOid "*|*"--json baseRefName,baseRefOid"*) printf 'main\t%s\n' "$FM_TEST_PR_BASE_HEAD" ; exit 0 ;;
       *) cat "$FM_TEST_PR_HEAD_FILE" ; exit 0 ;;
     esac
     ;;
@@ -94,6 +95,7 @@ run_review() {
   FM_ADVERSARIAL_REVIEW_RUNNER="$case_dir/reviewer.sh" \
   FM_ADVERSARIAL_REVIEW_NOW=2026-08-02T00:00:00Z \
   FM_TEST_PR_HEAD_FILE="$case_dir/pr-head" \
+  FM_TEST_PR_BASE_HEAD="$(git -C "$case_dir/project" rev-parse origin/main)" \
   PATH="$case_dir/fakebin:$PATH" \
     "$REVIEW" "$@"
 }
@@ -113,7 +115,7 @@ test_clean_verdict_records_and_verifies() {
     "clean: meta did not record CLEAN verdict"
   assert_grep 'verdict: CLEAN' "$case_dir/data/task-x1/adversarial-review.md" \
     "clean: report did not record CLEAN verdict"
-  assert_grep 'isolation_proof: different_harness author=claude reviewer=codex' \
+  assert_grep 'isolation_proof: different_account_home' \
     "$case_dir/data/task-x1/adversarial-review.md" \
     "clean: report did not prove reviewer isolation"
 

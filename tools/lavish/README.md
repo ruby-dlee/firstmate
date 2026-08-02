@@ -33,6 +33,8 @@ The armed check recovers the record from the same profile even after the visible
 After an answer is committed, the Firstmate wake adapter appends the durable wake pointer and may attempt visible prompt delivery only when the session lock proves a live supervisor route belongs to the same canonical `FM_HOME`.
 It never falls back to ambient terminal state, and a visible prompt names the manifest's declared destination rather than assuming a conventional path.
 If visible delivery is refused, the durable answer and wake pointer remain authoritative.
+Before it opens Chrome or arms the pickup check, the helper refuses rendered HTML that lacks radio choices, per-option and per-question annotations, or a submit path that emits the schema-version-2 JSON payload.
+A hand-authored HTML page cannot arm this pickup path, so it cannot serve as an alternate decision route.
 
 ## Agent commands
 

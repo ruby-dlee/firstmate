@@ -267,6 +267,19 @@ is_live_non_zombie() {
   return 0
 }
 
+# Read-only liveness probe for a child that may have become orphaned while the
+# lifecycle path under test was shutting it down. The sealed kill guard must
+# reject that now-outside process tree, even for signal 0, so post-exit tests
+# use pinned ps rather than weakening the signal boundary.
+is_running_non_zombie_readonly() {
+  local pid=$1 stat
+  stat=$("$FM_TEST_GUARD_PS" -p "$pid" -o stat= 2>/dev/null || true)
+  case "$stat" in
+    ''|[Zz]*) return 1 ;;
+  esac
+  return 0
+}
+
 hash_text() {
   if command -v md5 >/dev/null 2>&1; then
     printf '%s' "$1" | md5 -q

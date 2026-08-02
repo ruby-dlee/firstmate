@@ -3015,6 +3015,39 @@ CREW_PATH=$(crew_tool_path)
 if [ "$BACKEND" = herdr ]; then
   HERDR_AGENT_ENV+=("GOTMPDIR=$TASK_TMP/gotmp")
   HERDR_AGENT_ENV+=("PATH=$CREW_PATH")
+  # A real-Herdr behavior test launches the native agent from a suite-owned
+  # server whose own HOME is deliberately outside the disposable per-test
+  # sandbox.  Inject the complete sealed envelope explicitly through Herdr's
+  # native --env channel so the agent resolves operational state exactly like
+  # the invoking test, and so every Bash descendant retains the hard guard.
+  # This branch is unreachable in production: both exact opt-in tokens are set
+  # only by tests/run-test.sh plus tests/herdr-test-safety.sh.
+  if [ "${FM_TEST_SEALED:-}" = firstmate-test-v1 ] \
+    && [ "${FM_BACKEND_HERDR_TEST_LAB:-}" = firstmate-herdr-test-lab-v1 ]; then
+    local test_env_name test_env_value
+    for test_env_name in \
+      HOME FM_HOME FM_STATE_OVERRIDE FM_TREEHOUSE_ROOT TMPDIR TMUX_TMPDIR \
+      TREEHOUSE_NO_UPDATE_CHECK BASH_ENV HERDR_SESSION \
+      FM_TEST_SEALED FM_TEST_SANDBOX_ROOT FM_TEST_REPO_ROOT \
+      FM_TEST_PROCESS_ROOT_PID FM_TEST_OUTSIDE_PID FM_TEST_ISOLATION_LOG \
+      FM_TEST_INITIAL_STATE_OVERRIDE FM_TEST_GUARD_PS FM_TEST_GUARD_AWK \
+      FM_TEST_GUARD_TR FM_TEST_GUARD_PYTHON FM_TEST_GUARD_REAL_KILL \
+      FM_TEST_GUARD_KILL_WRAPPER FM_TEST_GUARD_ENV FM_TEST_REAL_BASH \
+      FM_TEST_BASH FM_TEST_SUITE_ACTIVE FM_TEST_HERDR_LAB_SESSION \
+      FM_TEST_HERDR_LAB_HELPER FM_TEST_HERDR_LAB_STATE_DIR \
+      FM_TEST_HERDR_CLIENT_BIN FM_TEST_HERDR_CLIENT_HOME \
+      FM_TEST_HERDR_WRAPPER FM_TEST_REAL_HERDR FM_TEST_ORIGINAL_PATH \
+      FM_BACKEND_HERDR_TEST_LAB; do
+      if declare -p "$test_env_name" >/dev/null 2>&1; then
+        test_env_value=${!test_env_name}
+        case "$test_env_value" in *$'\n'*)
+          echo "error: sealed Herdr environment contains a newline in $test_env_name" >&2
+          exit 1
+        esac
+        HERDR_AGENT_ENV+=("$test_env_name=$test_env_value")
+      fi
+    done
+  fi
 fi
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the

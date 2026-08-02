@@ -36,7 +36,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
-SESSION="fm-lab-prune-safety-e2e-$$"
+SESSION=$(herdr_test_session prune-safety-e2e)
 export HERDR_SESSION="$SESSION"
 herdr_test_lab_available "$SESSION" || exit 0
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-prune-safety.XXXXXX")
@@ -45,7 +45,7 @@ cleanup_all() {
   rm -rf "$SCRATCH"
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
+herdr_test_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"

@@ -18,9 +18,9 @@ case "$test_script" in
   *) printf 'refusing test outside %s: %s\n' "$TEST_DIR" "$test_script" >&2; exit 64 ;;
 esac
 
-ambient_tmp=${TMPDIR:-/tmp}
+ambient_tmp=${FM_TEST_SANDBOX_PARENT:-/tmp}
 [ -d "$ambient_tmp" ] || { printf 'temporary directory is unavailable: %s\n' "$ambient_tmp" >&2; exit 73; }
-sandbox=$(mktemp -d "$ambient_tmp/firstmate-$(basename "$test_script" .test.sh).XXXXXX")
+sandbox=$(mktemp -d "$ambient_tmp/firstmate-test.XXXXXX")
 sandbox="$(cd "$sandbox" && pwd -P)"
 
 cleanup() {
@@ -32,11 +32,12 @@ trap cleanup EXIT INT TERM
 user_home="$sandbox/home"
 fm_home="$sandbox/fm-home"
 mkdir -p "$user_home/.treehouse" "$fm_home/state" "$fm_home/data" \
-  "$fm_home/projects" "$fm_home/config" "$sandbox/tmp"
+  "$fm_home/projects" "$fm_home/config" "$sandbox/tmp" "$sandbox/tmux"
 
 guard_ps=$(command -v ps) || { printf 'test isolation requires ps\n' >&2; exit 69; }
 guard_awk=$(command -v awk) || { printf 'test isolation requires awk\n' >&2; exit 69; }
 guard_tr=$(command -v tr) || { printf 'test isolation requires tr\n' >&2; exit 69; }
+guard_python=$(command -v python3) || { printf 'test isolation requires python3\n' >&2; exit 69; }
 case "$(uname -s)" in
   Darwin)
     guard_real_bash=/bin/bash
@@ -51,32 +52,50 @@ esac
 [ -x "$guard_real_kill" ] || { printf 'test isolation requires a fixed system kill\n' >&2; exit 69; }
 
 export FM_TEST_SEALED=firstmate-test-v1
-export FM_TEST_SANDBOX_ROOT=$sandbox
-export FM_TEST_REPO_ROOT=$ROOT
+export FM_TEST_SANDBOX_ROOT="$sandbox"
+export FM_TEST_REPO_ROOT="$ROOT"
 export FM_TEST_PROCESS_ROOT_PID=$$
 export FM_TEST_OUTSIDE_PID=$PPID
-export HOME=$user_home
-export FM_HOME=$fm_home
-export FM_STATE_OVERRIDE=$fm_home/state
-export FM_TREEHOUSE_ROOT=$user_home/.treehouse
-export TMPDIR=$sandbox/tmp
+export FM_TEST_ISOLATION_LOG="$sandbox/isolation-violations.log"
+: > "$FM_TEST_ISOLATION_LOG"
+export HOME="$user_home"
+export FM_HOME="$fm_home"
+export FM_STATE_OVERRIDE="$fm_home/state"
+export FM_TREEHOUSE_ROOT="$user_home/.treehouse"
+export TMPDIR="$sandbox/tmp"
+export TMUX_TMPDIR="$sandbox/tmux"
 export TREEHOUSE_NO_UPDATE_CHECK=1
-export FM_TEST_INITIAL_STATE_OVERRIDE=$FM_STATE_OVERRIDE
-export FM_TEST_GUARD_PS=$guard_ps
-export FM_TEST_GUARD_AWK=$guard_awk
-export FM_TEST_GUARD_TR=$guard_tr
+export FM_TEST_INITIAL_STATE_OVERRIDE="$FM_STATE_OVERRIDE"
+export FM_TEST_GUARD_PS="$guard_ps"
+export FM_TEST_GUARD_AWK="$guard_awk"
+export FM_TEST_GUARD_TR="$guard_tr"
+export FM_TEST_GUARD_PYTHON="$guard_python"
 export FM_TEST_GUARD_REAL_KILL=$guard_real_kill
-export FM_TEST_GUARD_KILL_WRAPPER=$TEST_DIR/test-kill-guard.sh
-export FM_TEST_GUARD_ENV=$TEST_DIR/test-env-guard.sh
+export FM_TEST_GUARD_KILL_WRAPPER="$TEST_DIR/test-kill-guard.sh"
+export FM_TEST_GUARD_ENV="$TEST_DIR/test-env-guard.sh"
 export FM_TEST_REAL_BASH=$guard_real_bash
-export FM_TEST_BASH=$TEST_DIR/test-bash.sh
-export BASH_ENV=$FM_TEST_GUARD_ENV
-export PATH=$TEST_DIR/sealed-bin:$PATH
+export FM_TEST_BASH="$TEST_DIR/test-bash.sh"
+export BASH_ENV="$FM_TEST_GUARD_ENV"
+if [ -n "${FM_TEST_HERDR_LAB_SESSION:-}" ]; then
+  export HERDR_SESSION="$FM_TEST_HERDR_LAB_SESSION"
+  export FM_TEST_HERDR_WRAPPER="$TEST_DIR/test-herdr.sh"
+  export PATH="$TEST_DIR/sealed-herdr-bin:$TEST_DIR/sealed-bin:$PATH"
+else
+  export PATH="$TEST_DIR/sealed-bin:$PATH"
+fi
 unset FM_ROOT_OVERRIDE FM_DATA_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE \
   FM_CHECKOUT_REFRESH_STATE_ROOT FM_CHECKOUT_REFRESH_LOCK_ROOT FM_REPORT_STACK_ROOT \
   FM_ACCOUNT_DIRECTORY_ROOT FM_ACCOUNT_DIRECTORY_STATE_ROOT \
   XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME \
   FM_BACKEND FM_SUPERVISOR_BACKEND FM_SUPERVISOR_TARGET \
-  TMUX HERDR_ENV HERDR_SESSION ZELLIJ ZELLIJ_SESSION_NAME CMUX_WORKSPACE_ID
+  TMUX HERDR_ENV ZELLIJ ZELLIJ_SESSION_NAME CMUX_WORKSPACE_ID
+unset FM_TEST_CLEANUP_OWNER_PID FM_TEST_LIB_SOURCED
 
-"$test_script"
+status=0
+"$test_script" || status=$?
+if [ -s "$FM_TEST_ISOLATION_LOG" ]; then
+  printf 'test isolation violation log (guard output may also appear at the original call site):\n' >&2
+  cat "$FM_TEST_ISOLATION_LOG" >&2
+  exit 97
+fi
+exit "$status"

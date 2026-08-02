@@ -143,6 +143,19 @@ fm_backend_herdr_scrubbed_exec() {
   "$@"
 }
 
+# Background readers need their recorded shell PID to remain the actual reader
+# PID. A backgrounded shell function otherwise stays as a wrapper process;
+# terminating that wrapper can orphan the Python socket subscriber it launched.
+# This exec-replacing variant keeps the same scrubbed environment while making
+# `$!` an exact, killable, waitable reader identity.
+fm_backend_herdr_scrubbed_replace() {
+  local -x LD_PRELOAD='' LD_LIBRARY_PATH='' LD_AUDIT='' LD_DEBUG=''
+  local -x DYLD_INSERT_LIBRARIES='' DYLD_LIBRARY_PATH='' DYLD_FRAMEWORK_PATH=''
+  local -x DYLD_FALLBACK_LIBRARY_PATH='' DYLD_FALLBACK_FRAMEWORK_PATH=''
+  local -x PERL5OPT='' PERL5LIB='' PERLLIB='' NODE_OPTIONS='' NODE_PATH=''
+  exec "$@"
+}
+
 # Resolve ordinary control utilities only from the fixed system PATH, bypassing
 # same-name shell functions, then launch the resolved absolute binary through
 # the same loader/runtime scrub as Herdr itself. This keeps lock, marker, and
@@ -339,11 +352,17 @@ fm_backend_herdr_session() {
 # macOS, where the util-linux `setsid` executable is absent. The adapter stays
 # the single lifecycle owner; captain launchers never start or stop Herdr.
 fm_backend_herdr_server_launch_detached() {  # <session>
-  local session=$1 herdr_bin perl_bin passwd_home worker_path certificate certificate_key managed_config managed_shell ps_bin name value launch_env=()
+  local session=$1 herdr_bin perl_bin passwd_home worker_path certificate certificate_key managed_config managed_shell ps_bin name value keep_process_group=0 launch_env=()
   local managed_shell_proof managed_shell_digest managed_shell_identity managed_config_proof managed_config_digest managed_config_identity
   herdr_bin=$(fm_backend_herdr_bin) || return 1
   perl_bin=$FM_BACKEND_HERDR_PERL_BIN
-  passwd_home=$(fm_backend_herdr_passwd_home 2>/dev/null) || return 1
+  if [ -n "${FM_TEST_HERDR_KEEP_PROCESS_GROUP:-}" ]; then
+    fm_backend_herdr_test_keep_process_group_enabled || return 1
+    keep_process_group=1
+    passwd_home=${HOME:-}
+  else
+    passwd_home=$(fm_backend_herdr_passwd_home 2>/dev/null) || return 1
+  fi
   case "$passwd_home" in /*) ;; *) return 1 ;; esac
   worker_path=$(fm_backend_herdr_worker_path "${PATH:-}") || return 1
   certificate=
@@ -387,21 +406,40 @@ fm_backend_herdr_server_launch_detached() {  # <session>
       [ -z "$value" ] || launch_env+=("$name=$value")
     done
   fi
+  # A group-owned fake server is still a sealed test process. Preserve the
+  # exact guard envelope that its Bash shebang must validate, along with the
+  # private operational roots it is allowed to resolve. Production launch is
+  # unchanged and never inherits these test-only values.
+  if [ "$keep_process_group" -eq 1 ]; then
+    for name in FM_TEST_SEALED FM_TEST_SANDBOX_ROOT FM_TEST_REPO_ROOT \
+      FM_TEST_PROCESS_ROOT_PID FM_TEST_OUTSIDE_PID FM_TEST_ISOLATION_LOG \
+      FM_HOME FM_STATE_OVERRIDE FM_TREEHOUSE_ROOT TMPDIR TMUX_TMPDIR \
+      TREEHOUSE_NO_UPDATE_CHECK FM_TEST_INITIAL_STATE_OVERRIDE \
+      FM_TEST_GUARD_PS FM_TEST_GUARD_AWK FM_TEST_GUARD_TR \
+      FM_TEST_GUARD_PYTHON FM_TEST_GUARD_REAL_KILL \
+      FM_TEST_GUARD_KILL_WRAPPER FM_TEST_GUARD_ENV FM_TEST_REAL_BASH \
+      FM_TEST_BASH BASH_ENV; do
+      value=${!name:-}
+      [ -z "$value" ] || launch_env+=("$name=$value")
+    done
+  fi
   (
     # Dollar expressions in the single-quoted program below belong to Perl.
     # shellcheck disable=SC2016
     "$FM_BACKEND_HERDR_ENV_BIN" -i "${launch_env[@]}" \
       "$FM_BACKEND_HERDR_NOHUP_BIN" "$perl_bin" -MFcntl=:DEFAULT -MIO::Handle -MPOSIX -e '
-      my ($certificate, $certificate_key, $ps, $managed_shell,
+      my ($keep_process_group, $certificate, $certificate_key, $ps, $managed_shell,
           $managed_shell_digest, $managed_shell_identity, $managed_config,
           $managed_config_digest, $managed_config_identity, @command) = @ARGV;
-      my $pid = fork();
-      defined $pid or die "first fork: $!";
-      exit 0 if $pid;
-      POSIX::setsid() >= 0 or die "setsid: $!";
-      $pid = fork();
-      defined $pid or die "second fork: $!";
-      exit 0 if $pid;
+      unless ($keep_process_group eq "1") {
+        my $pid = fork();
+        defined $pid or die "first fork: $!";
+        exit 0 if $pid;
+        POSIX::setsid() >= 0 or die "setsid: $!";
+        $pid = fork();
+        defined $pid or die "second fork: $!";
+        exit 0 if $pid;
+      }
       if (length $certificate) {
         open my $process, "-|", $ps, "-o", "lstart=", "-p", "$$"
           or die "process-start probe: $!";
@@ -427,7 +465,7 @@ fm_backend_herdr_server_launch_detached() {  # <session>
       }
       exec { $command[0] } @command;
       die "exec $command[0]: $!";
-    ' -- "$certificate" "$certificate_key" "${ps_bin:-}" \
+    ' -- "$keep_process_group" "$certificate" "$certificate_key" "${ps_bin:-}" \
       "${managed_shell:-}" "${managed_shell_digest:-}" "${managed_shell_identity:-}" \
       "${managed_config:-}" "${managed_config_digest:-}" "${managed_config_identity:-}" \
       "$herdr_bin" server --session "$session" </dev/null >/dev/null 2>&1 &
@@ -572,6 +610,20 @@ fm_backend_herdr_worker_path() {  # [candidate-path]
 fm_backend_herdr_test_hooks_enabled() {
   fm_backend_herdr_test_lab_enabled \
     && [ "${FM_BACKEND_HERDR_TEST_HOOKS:-}" = firstmate-herdr-tests-v1 ]
+}
+
+# Long-lived fake servers in the sealed behavior suite must remain attributable
+# to that suite even after their launching shell exits. Production servers use
+# the double-fork/setsid path below; this exact test-only opt-in keeps a fake in
+# the already isolated test process group so the suite's PID guard and shared
+# cleanup can prove ownership. A partial or inherited opt-in fails closed.
+fm_backend_herdr_test_keep_process_group_enabled() {
+  [ "${FM_TEST_HERDR_KEEP_PROCESS_GROUP:-}" = firstmate-herdr-test-process-group-v1 ] \
+    && [ "${FM_TEST_SEALED:-}" = firstmate-test-v1 ] \
+    && [ -n "${FM_TEST_SANDBOX_ROOT:-}" ] \
+    && [ -n "${HOME:-}" ] \
+    && case "$HOME" in "$FM_TEST_SANDBOX_ROOT"/*) true ;; *) false ;; esac \
+    && fm_backend_herdr_test_hooks_enabled
 }
 
 fm_backend_herdr_ps_bin() {
@@ -3400,14 +3452,14 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   done < <(fm_backend_herdr_event_reader_cmd)
   [ "${#reader[@]}" -gt 0 ] || return 2
 
-  local fifo_dir fifo reader_pid line ws status agent raw record hit rc=1 reader_rc=0
+  local fifo_dir fifo reader_pid reader_job line ws status agent raw record hit rc=1 reader_rc=0 reader_running=0
   fifo_dir=$(fm_backend_herdr_control_exec mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
   fifo="$fifo_dir/events"
   if ! fm_backend_herdr_control_exec mkfifo "$fifo" 2>/dev/null; then
     fm_backend_herdr_control_exec rm -rf "$fifo_dir" 2>/dev/null || true
     return 2
   fi
-  fm_backend_herdr_scrubbed_exec "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
+  fm_backend_herdr_scrubbed_replace "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
   reader_pid=$!
   if ! exec 9< "$fifo"; then
     kill "$reader_pid" 2>/dev/null || true
@@ -3461,11 +3513,18 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
       break
     fi
   done
-  if [ "$rc" -eq 0 ]; then
-    kill "$reader_pid" 2>/dev/null || true
-  fi
-  if [ "$rc" -eq 2 ]; then
-    kill "$reader_pid" 2>/dev/null || true
+  # Consult Bash's child-job table before signalling. The reader may have
+  # already exited after a malformed acknowledgement or final stream line;
+  # blindly signalling its stale numeric PID risks hitting an unrelated
+  # process if the kernel has already reused that identity.
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+    for reader_job in $(jobs -pr); do
+      if [ "$reader_job" = "$reader_pid" ]; then
+        reader_running=1
+        break
+      fi
+    done
+    [ "$reader_running" -eq 0 ] || kill "$reader_pid" 2>/dev/null || true
   fi
   # No actionable edge: distinguish a clean full-budget wait (reader exit 0 ->
   # return 1, caller already waited) from a reader error (connect/subscribe

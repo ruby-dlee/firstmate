@@ -690,7 +690,8 @@ test_bootstrap_relays_hygiene_alerts() {
 }
 
 test_treehouse_discovery_failure_invalidates_coverage_health() {
-  local treehouse_root pool_dir bad_state missing_path="$TMP_ROOT/missing-treehouse-worktree" out status
+  local treehouse_root pool_dir bad_state root_unreadable_payload
+  local missing_path="$TMP_ROOT/missing-treehouse-worktree" out status
   treehouse_root=$(cd "$TEST_HOME/.treehouse" && pwd -P)
   pool_dir="$treehouse_root/relvino-test"
   bad_state="$treehouse_root/broken/treehouse-state.json"
@@ -731,11 +732,16 @@ test_treehouse_discovery_failure_invalidates_coverage_health() {
   assert_refresh_state "$STATE_ROOT" unhealthy
   rm -rf "$(dirname "$bad_state")"
 
-  chmod 000 "$treehouse_root"
+  root_unreadable_payload="$TMP_ROOT/make-treehouse-root-unreadable.sh"
+  # shellcheck disable=SC2016  # The sealed child expands FM_TREEHOUSE_ROOT after its entry guard.
+  printf '%s\n' 'chmod 000 "$FM_TREEHOUSE_ROOT"' 'unset FM_TEST_BASH_ENV_PAYLOAD' \
+    > "$root_unreadable_payload"
   printf '%s\n' preserved-root-heartbeat > "$STATE_ROOT/heartbeat"
   set +e
+  export FM_TEST_BASH_ENV_PAYLOAD="$root_unreadable_payload"
   out=$(run_refresh run-once --force 2>&1)
   status=$?
+  unset FM_TEST_BASH_ENV_PAYLOAD
   set -e
   chmod 700 "$treehouse_root"
   [ "$status" -ne 0 ] || fail "unreadable Treehouse root reported healthy coverage"

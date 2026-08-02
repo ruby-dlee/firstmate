@@ -64,7 +64,7 @@ command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found (requi
 # canonicalized project and backend cwd comparisons in the worktree-discovery
 # poll.
 TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-herdr-e2e.XXXXXX")
-SESSION="fm-lab-herdr-e2e-$$"
+SESSION=$(herdr_test_session workspace-per-home-e2e)
 export HERDR_SESSION="$SESSION"
 herdr_test_lab_available "$SESSION" || exit 0
 WT1=; WT2=
@@ -75,7 +75,7 @@ cleanup_all() {
   rm -rf "$TMP_ROOT"
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
+herdr_test_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
@@ -88,11 +88,16 @@ mkdir -p "$PRIMARY_HOME/state" "$PRIMARY_HOME/data/cm1" "$PRIMARY_HOME/config"
 printf 'trivial e2e primary crewmate brief: nothing to do.\n' > "$PRIMARY_HOME/data/cm1/brief.md"
 
 SM_HOME="$TMP_ROOT/secondmate-home"
-mkdir -p "$SM_HOME/state" "$SM_HOME/data/cm2" "$SM_HOME/config" "$SM_HOME/projects" "$SM_HOME/bin"
-printf '# scratch secondmate home AGENTS.md placeholder\n' > "$SM_HOME/AGENTS.md"
+git clone -q --no-local --branch main "$ROOT" "$SM_HOME" \
+  || fail "could not create an inspectable secondmate-home fixture"
+git -C "$SM_HOME" remote set-head origin main \
+  || fail "could not pin the secondmate fixture's default branch"
+mkdir -p "$SM_HOME/state" "$SM_HOME/data/cm2" "$SM_HOME/config" "$SM_HOME/projects"
 printf 'e2esm1\n' > "$SM_HOME/.fm-secondmate-home"
 printf 'trivial e2e secondmate charter: nothing to do.\n' > "$SM_HOME/data/charter.md"
 printf 'trivial e2e secondmate-owned crewmate brief: nothing to do.\n' > "$SM_HOME/data/cm2/brief.md"
+printf -- '- e2esm1 - Herdr workspace fixture (home: %s; scope: test; projects: ; added 2026-08-01)\n' \
+  "$SM_HOME" > "$PRIMARY_HOME/data/secondmates.md"
 
 write_completion_report() {  # <path> <summary>
   printf '# Completion\n\n## Summary\n\n%s\n\n## What changed\n\nNo project files changed.\n\n## Verification\n\nThe task command ran in its isolated Herdr pane.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nThe captured pane output is the test artifact.\n\n## Follow-ups\n\nNone.\n' "$2" > "$1"
@@ -118,7 +123,9 @@ PROJ2="$TMP_ROOT/scratch-project-2"; make_scratch_project "$PROJ2"
 
 CM1_OUT="$TMP_ROOT/cm1.out"; CM1_ERR="$TMP_ROOT/cm1.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-  "$ROOT/bin/fm-spawn.sh" cm1 "$PROJ1" "sh -c 'echo primary-crew-ok'" --backend herdr \
+  "$ROOT/bin/fm-spawn.sh" cm1 "$PROJ1" \
+    "sh -c 'printf \"%s\\n\" \"\$HOME\" \"\$FM_HOME\" \"\$FM_TEST_SEALED\" > \"$TMP_ROOT/cm1.env\"; echo primary-crew-ok; exec sleep 300'" \
+    --backend herdr \
   >"$CM1_OUT" 2>"$CM1_ERR"
 rc=$?
 [ "$rc" -eq 0 ] || fail "primary-shaped crewmate spawn failed"$'\n'"--- stdout ---"$'\n'"$(cat "$CM1_OUT")"$'\n'"--- stderr ---"$'\n'"$(cat "$CM1_ERR")"
@@ -134,6 +141,17 @@ pass "real herdr E2E: a primary-shaped home spawns a crewmate on the herdr backe
 sleep 1
 CM1_CAPTURE=$(fm_backend_herdr_capture "$SESSION:$CM1_PANE" 30) || fail "capture failed on cm1's pane"
 assert_contains_local "$CM1_CAPTURE" "primary-crew-ok" "cm1's raw launch command did not run in its herdr pane"
+fm_test_wait_for_file "$TMP_ROOT/cm1.env" || fail "cm1 did not record its native-agent environment"
+CM1_AGENT_HOME=$(sed -n '1p' "$TMP_ROOT/cm1.env")
+CM1_AGENT_FM_HOME=$(sed -n '2p' "$TMP_ROOT/cm1.env")
+CM1_AGENT_SEALED=$(sed -n '3p' "$TMP_ROOT/cm1.env")
+[ "$CM1_AGENT_HOME" = "$HOME" ] \
+  || fail "cm1 inherited the lab server HOME instead of the sealed test HOME"
+[ "$CM1_AGENT_FM_HOME" = "$PRIMARY_HOME" ] \
+  || fail "cm1 did not retain its explicit fixture FM_HOME"
+[ "$CM1_AGENT_SEALED" = firstmate-test-v1 ] \
+  || fail "cm1 native agent did not receive the sealed guard envelope"
+pass "real herdr E2E: the native agent inherits sealed HOME/FM_HOME and the hard guard, never the lab server's home"
 
 CM1_WSID=$(herdr pane get "$CM1_PANE" --session "$SESSION" 2>/dev/null | jq -r '.result.pane.workspace_id // empty')
 [ -n "$CM1_WSID" ] || fail "could not read cm1's pane workspace_id"
@@ -147,7 +165,7 @@ pass "real herdr E2E: the primary-shaped home's crewmate landed in the 'firstmat
 
 SM_OUT="$TMP_ROOT/sm.out"; SM_ERR="$TMP_ROOT/sm.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-  "$ROOT/bin/fm-spawn.sh" e2esm1 "$SM_HOME" "sh -c 'echo secondmate-launch-ok'" --secondmate --backend herdr \
+  "$ROOT/bin/fm-spawn.sh" e2esm1 "$SM_HOME" "sh -c 'echo secondmate-launch-ok; exec sleep 300'" --secondmate --backend herdr \
   >"$SM_OUT" 2>"$SM_ERR"
 rc=$?
 [ "$rc" -eq 0 ] || fail "the primary's --secondmate spawn of e2esm1 failed"$'\n'"--- stdout ---"$'\n'"$(cat "$SM_OUT")"$'\n'"--- stderr ---"$'\n'"$(cat "$SM_ERR")"
@@ -173,7 +191,7 @@ pass "real herdr E2E: a --secondmate spawn by the PRIMARY lands in the SECONDMAT
 
 CM2_OUT="$TMP_ROOT/cm2.out"; CM2_ERR="$TMP_ROOT/cm2.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$SM_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-  "$ROOT/bin/fm-spawn.sh" cm2 "$PROJ2" "sh -c 'echo sm-crew-ok'" --backend herdr \
+  "$ROOT/bin/fm-spawn.sh" cm2 "$PROJ2" "sh -c 'echo sm-crew-ok; exec sleep 300'" --backend herdr \
   >"$CM2_OUT" 2>"$CM2_ERR"
 rc=$?
 [ "$rc" -eq 0 ] || fail "a crewmate spawned FROM the secondmate-shaped home failed"$'\n'"--- stdout ---"$'\n'"$(cat "$CM2_OUT")"$'\n'"--- stderr ---"$'\n'"$(cat "$CM2_ERR")"

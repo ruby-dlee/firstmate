@@ -39,8 +39,10 @@
 #                              injection may perform its final guarded flush
 #                              during cleanup. An inherited or defaulted FM_HOME
 #                              never authorizes a stop.
-#   fm-afk-launch.sh reconcile Close a recorded-but-dead daemon terminal by exact
-#                              id and drop the record (recovery after a crash).
+#   fm-afk-launch.sh reconcile --home <path>
+#                              Close a recorded-but-dead daemon terminal by exact
+#                              id and drop the record (recovery after a crash),
+#                              bound to the same explicit-home authority as stop.
 #
 # Supported backends: herdr, tmux. Others (zellij, orca, cmux) have no verified
 # non-visible-launch primitive here yet and refuse loudly.
@@ -50,27 +52,31 @@
 # placeholder instead of a real daemon. FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND
 # override the captured captain pane/backend (an isolated lab pane in tests).
 set -u
-FM_AFK_LAUNCH_STOP_HOME_NAMED=0
+FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED=0
 
 # A terminating lifecycle action must bind its authority before any state or
 # daemon helpers resolve paths. Parse only when executed: tests source this file
 # for pure helpers and must not have their positional parameters reinterpreted.
-if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-start}" = stop ]; then
-  if [ "$#" -ne 3 ] || [ "${2:-}" != --home ] || [ -z "${3:-}" ]; then
-    printf 'fm-afk-launch: refusing ambiguous stop; use stop --home <path>\n' >&2
-    exit 64
-  fi
-  case "$3" in *$'\t'*|*$'\n'*) printf 'fm-afk-launch: explicit stop home contains a control character: %s\n' "$3" >&2; exit 64 ;; esac
-  if [ ! -d "$3" ] || [ -L "$3" ]; then
-    printf 'fm-afk-launch: explicit stop home is not a real directory: %s\n' "$3" >&2
-    exit 64
-  fi
-  FM_HOME=$(cd "$3" 2>/dev/null && pwd -P) || {
-    printf 'fm-afk-launch: explicit stop home cannot be resolved: %s\n' "$3" >&2
-    exit 64
-  }
-  export FM_HOME
-  FM_AFK_LAUNCH_STOP_HOME_NAMED=1
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-start}" in
+    stop|reconcile)
+      if [ "$#" -ne 3 ] || [ "${2:-}" != --home ] || [ -z "${3:-}" ]; then
+        printf 'fm-afk-launch: refusing ambiguous %s; use %s --home <path>\n' "$1" "$1" >&2
+        exit 64
+      fi
+      case "$3" in *$'\t'*|*$'\n'*) printf 'fm-afk-launch: explicit %s home contains a control character: %s\n' "$1" "$3" >&2; exit 64 ;; esac
+      if [ ! -d "$3" ] || [ -L "$3" ]; then
+        printf 'fm-afk-launch: explicit %s home is not a real directory: %s\n' "$1" "$3" >&2
+        exit 64
+      fi
+      FM_HOME=$(cd "$3" 2>/dev/null && pwd -P) || {
+        printf 'fm-afk-launch: explicit %s home cannot be resolved: %s\n' "$1" "$3" >&2
+        exit 64
+      }
+      export FM_HOME
+      FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED=1
+      ;;
+  esac
 fi
 
 FM_AFK_LAUNCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,6 +86,13 @@ FM_AFK_LAUNCH_HOME="$(cd "$FM_HOME" 2>/dev/null && pwd -P)" || {
   printf 'fm-afk-launch: Firstmate home cannot be resolved: %s\n' "$FM_HOME" >&2
   exit 64
 }
+if [ "$FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED" -eq 1 ]; then
+  # Explicit lifecycle authority names one complete operational home. Never
+  # let an inherited state override redirect its lock/record lookup to a
+  # second home after that authority has been established.
+  FM_STATE_OVERRIDE="$FM_AFK_LAUNCH_HOME/state"
+  export FM_STATE_OVERRIDE
+fi
 FM_AFK_LAUNCH_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LAUNCH_RECORD="$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal"
 FM_AFK_LAUNCH_LOCK="$FM_AFK_LAUNCH_STATE/.afk-launch.lock"
@@ -665,7 +678,7 @@ fm_afk_launch_lock_release() {
 }
 
 fm_afk_launch_usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The command run inside the created terminal. Real launch runs the shared
@@ -1360,7 +1373,7 @@ fm_afk_launch_main() {
     start) fm_afk_launch_start; result=$? ;;
     start-native) fm_afk_launch_start_native; result=$? ;;
     stop)
-      if [ "$FM_AFK_LAUNCH_STOP_HOME_NAMED" -ne 1 ]; then
+      if [ "$FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED" -ne 1 ]; then
         fm_afk_launch_log "refusing ambiguous stop; use stop --home <path>"
         result=64
       else
@@ -1368,7 +1381,15 @@ fm_afk_launch_main() {
         result=$?
       fi
       ;;
-    reconcile) fm_afk_launch_reconcile; result=$? ;;
+    reconcile)
+      if [ "$FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED" -ne 1 ]; then
+        fm_afk_launch_log "refusing ambiguous reconcile; use reconcile --home <path>"
+        result=64
+      else
+        fm_afk_launch_reconcile
+        result=$?
+      fi
+      ;;
     -h|--help|help) fm_afk_launch_usage; result=$? ;;
     *) fm_afk_launch_usage >&2; return 2 ;;
   esac

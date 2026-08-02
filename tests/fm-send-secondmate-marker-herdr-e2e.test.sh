@@ -33,15 +33,15 @@ for tool in git herdr jq pi python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "skip: $tool not found"; exit 0; }
 done
 
-LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
-SESSION=$("$LAB_HELPER" name fm-send-secondmate-marker-v7)
+LAB_HELPER=${FM_TEST_HERDR_LAB_HELPER:-${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}}
+SESSION=$(herdr_test_session fm-send-secondmate-marker-v7)
 herdr_test_lab_available "$SESSION" || exit 0
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-send-marker-herdr-e2e.XXXXXX")
 SENDER_HOME="$TMP_ROOT/sender-home"
 SECOND_HOME="$TMP_ROOT/secondmate-home"
 CAPTURE="$TMP_ROOT/pi-before-agent.jsonl"
 FAKEBIN="$TMP_ROOT/fakebin"
-ORIGINAL_PATH=$PATH
+ORIGINAL_PATH=${FM_TEST_ORIGINAL_PATH:-$PATH}
 ID='marker-pi-sm'
 REQUEST='FM_MARKER_HERDR_E2E exact-id request'
 DIRECT='FM_MARKER_HERDR_DIRECT captain input'
@@ -49,7 +49,7 @@ DIRECT='FM_MARKER_HERDR_DIRECT captain input'
 cleanup() {
   local rc=$?
   trap - EXIT
-  if ! "$LAB_HELPER" teardown "$SESSION"; then
+  if ! herdr_safe_stop_and_delete "$SESSION"; then
     rc=1
   fi
   rm -rf "$TMP_ROOT"
@@ -129,7 +129,7 @@ if import_anchor not in source or factory_anchor not in source:
 path.write_text(source.replace(factory_anchor, replacement, 1))
 PY
 
-"$LAB_HELPER" provision "$SESSION"
+herdr_test_prepare "$SESSION"
 PATH="$FAKEBIN:$ORIGINAL_PATH" FM_GATE_REFUSE_BYPASS=1 FM_HOME="$SENDER_HOME" HERDR_SESSION="$SESSION" \
   "$ROOT/bin/fm-spawn.sh" "$ID" "$SECOND_HOME" --secondmate --harness pi --backend herdr >/dev/null
 

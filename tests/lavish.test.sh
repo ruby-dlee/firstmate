@@ -1,13 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Durable Lavish protocol, failure recovery, migration, and no-resident-resource
 # behavior.
 set -eu
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 test_intake_requires_store_forward_protocol() {
-  test_root=$(mktemp -d)
-  trap 'rm -rf "$test_root"' EXIT INT TERM
+  test_root=$(fm_test_tmproot lavish-tests)
   mkdir -p "$test_root/bin" "$test_root/home"
   cat > "$test_root/bin/lavish-axi" <<'SH'
 #!/bin/sh
@@ -32,9 +32,6 @@ SH
     LAVISH_TEST_CALL_LOG="$test_root/calls" \
     "$ROOT/bin/fm-lavish-intake.sh"
   [ "$(cat "$test_root/calls")" = "intake --home $test_root/home" ]
-
-  rm -rf "$test_root"
-  trap - EXIT INT TERM
 }
 
 test_intake_requires_store_forward_protocol

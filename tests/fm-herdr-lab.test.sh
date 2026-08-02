@@ -21,12 +21,29 @@ set -eu
 printf '%s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
 state=$FM_FAKE_HERDR_STATE
 last=
-for arg in "$@"; do
-  previous=$last
-  last=$arg
-done
-[ "${previous:-}" = --session ] || { echo "fake herdr: missing trailing --session" >&2; exit 90; }
-session=$last
+session=
+if [ "$1 ${2:-}" = "agent start" ]; then
+  previous=
+  before_previous=
+  for arg in "$@"; do
+    if [ "$arg" = -- ]; then
+      [ "$before_previous" = --session ] \
+        || { echo "fake herdr: agent start lacks a pre-argv --session" >&2; exit 90; }
+      session=$previous
+      break
+    fi
+    before_previous=$previous
+    previous=$arg
+  done
+  [ -n "$session" ] || { echo "fake herdr: agent start lacks an argv separator" >&2; exit 90; }
+else
+  for arg in "$@"; do
+    previous=$last
+    last=$arg
+  done
+  [ "${previous:-}" = --session ] || { echo "fake herdr: missing trailing --session" >&2; exit 90; }
+  session=$last
+fi
 default_socket=$(cat "$state/default-socket")
 default_running=${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}
 lab_state=absent
@@ -47,7 +64,12 @@ case "$1 ${2:-}" in
     ;;
   "server --session")
     if [ "${FM_FAKE_HERDR_SERVER_DELAY:-0}" != 0 ]; then
-      "$FM_FAKE_HERDR_REAL_SLEEP" "$FM_FAKE_HERDR_SERVER_DELAY"
+      "$FM_FAKE_HERDR_REAL_SLEEP" "$FM_FAKE_HERDR_SERVER_DELAY" &
+      delay_pid=$!
+      if [ -n "${FM_FAKE_HERDR_CHILD_PID_FILE:-}" ]; then
+        printf '%s\n' "$delay_pid" > "$FM_FAKE_HERDR_CHILD_PID_FILE"
+      fi
+      wait "$delay_pid"
     fi
     printf '%s\n' running > "$state/$session"
     ;;
@@ -83,6 +105,7 @@ run_with_fake() {
     FM_FAKE_HERDR_LOG="$FAKE_LOG" \
     FM_FAKE_HERDR_REAL_SLEEP="$REAL_SLEEP" \
     FM_FAKE_HERDR_SERVER_DELAY="${FM_FAKE_HERDR_SERVER_DELAY:-0}" \
+    FM_FAKE_HERDR_CHILD_PID_FILE="${FM_FAKE_HERDR_CHILD_PID_FILE:-}" \
     FM_FAKE_HERDR_FAST_POLL="${FM_FAKE_HERDR_FAST_POLL:-}" \
     FM_FAKE_HERDR_DELETE_FAIL="${FM_FAKE_HERDR_DELETE_FAIL:-}" \
     FM_FAKE_HERDR_DEFAULT_RUNNING="${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}" \
@@ -101,6 +124,26 @@ test_refuses_unsafe_names() {
   pass "fm-herdr-lab: names fail closed and require the lab prefix"
 }
 
+test_provision_timeout_is_load_tolerant_and_bounded() {
+  local name="fm-lab-loaded-start-$$" status=0 out
+  [ "$(fm_herdr_lab_provision_timeout)" = 120 ] \
+    || fail "lab provision timeout did not default to 120 seconds"
+  [ "$(FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=3 fm_herdr_lab_provision_timeout)" = 3 ] \
+    || fail "lab provision timeout rejected a bounded override"
+  out=$(FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=0 fm_herdr_lab_provision_timeout 2>&1) \
+    || status=$?
+  expect_code 1 "$status" "zero lab provision timeout must be refused"
+  assert_contains "$out" 'whole number from 1 through 600' \
+    "invalid timeout diagnostic omitted the bounded contract"
+
+  FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=3 FM_FAKE_HERDR_SERVER_DELAY=1 \
+    run_with_fake fm_herdr_lab_provision "$name" \
+    || fail "load-tolerant provision did not wait for a delayed lab"
+  run_with_fake fm_herdr_lab_teardown "$name" \
+    || fail "delayed-provision fixture teardown failed"
+  pass "fm-herdr-lab: provisioning waits up to a configurable bounded load-tolerant deadline"
+}
+
 test_provision_run_and_guarded_teardown() {
   local name='' line_count status=0 stop_line delete_line
   name="fm-lab-behavior-$$"
@@ -110,6 +153,16 @@ test_provision_run_and_guarded_teardown() {
   assert_present "$TRIPWIRES/$name.fleet-state.json" "provision did not record the fleet-state tripwire"
 
   run_with_fake fm_herdr_lab_cli "$name" workspace list >/dev/null || fail "safe run command failed"
+  run_with_fake fm_herdr_lab_cli_argv "$name" agent start fm-probe --tab t1 -- /bin/sh -c 'exit 0' >/dev/null \
+    || fail "safe argv-bearing agent start failed"
+  grep -F "agent start fm-probe --tab t1 --session $name -- /bin/sh -c exit 0" "$FAKE_LOG" >/dev/null \
+    || fail "argv-bearing agent start did not insert the owned session immediately before --"
+  status=0
+  run_with_fake fm_herdr_lab_cli_argv "$name" pane run p1 -- /bin/true >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "run-argv must reject commands other than agent start"
+  status=0
+  run_with_fake fm_herdr_lab_cli_argv "$name" agent start fm-probe --session default -- /bin/true >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "run-argv must reject a caller-supplied session"
   run_with_fake fm_herdr_lab_cli "$name" server >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "bare server start outside provision must be refused"
   status=0
@@ -140,8 +193,14 @@ test_provision_run_and_guarded_teardown() {
 
   while IFS= read -r line; do
     case "$line" in
+      "agent start "*)
+        case "$line" in
+          *"--session $name -- "*) : ;;
+          *) fail "Herdr agent start lacks its pre-argv lab session: $line" ;;
+        esac
+        ;;
       *"--session $name") : ;;
-      *) fail "Herdr call lacks a trailing lab session: $line" ;;
+      *) fail "Herdr call lacks its lab session: $line" ;;
     esac
   done < "$FAKE_LOG"
   line_count=$(wc -l < "$FAKE_LOG" | tr -d ' ')
@@ -257,7 +316,8 @@ test_failed_delete_retains_tripwire() {
 }
 
 test_timed_out_provision_cancels_late_launch() {
-  local name="fm-lab-late-launch-$$" status=0
+  local name="fm-lab-late-launch-$$" status=0 child_file child_pid child_state
+  child_file="$TMP_ROOT/late-launch-child.pid"
   cat > "$FAKEBIN/sleep" <<'SH'
 #!/usr/bin/env bash
 if [ "${FM_FAKE_HERDR_FAST_POLL:-}" = 1 ]; then
@@ -267,11 +327,20 @@ exec "$FM_FAKE_HERDR_REAL_SLEEP" "$@"
 SH
   chmod +x "$FAKEBIN/sleep"
   : > "$FAKE_LOG"
-  FM_FAKE_HERDR_FAST_POLL=1 FM_FAKE_HERDR_SERVER_DELAY=30 \
+  FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=1 \
+    FM_FAKE_HERDR_FAST_POLL=1 FM_FAKE_HERDR_SERVER_DELAY=30 \
+    FM_FAKE_HERDR_CHILD_PID_FILE="$child_file" \
     run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "timed-out provision must fail"
   assert_present "$TRIPWIRES/$name.fleet-state.json" \
     "timed-out provision must retain its tripwire until teardown"
+  assert_present "$child_file" "timed-out provision fixture did not start its descendant"
+  child_pid=$(cat "$child_file")
+  child_state=$(ps -o state= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+  case "$child_state" in
+    ''|Z*) ;;
+    *) fail "timed-out provision left its descendant alive (pid $child_pid, state $child_state)" ;;
+  esac
   run_with_fake fm_herdr_lab_teardown "$name" || fail "teardown after timed-out provision failed"
   assert_absent "$TRIPWIRES/$name.fleet-state.json" \
     "teardown after timed-out provision did not remove its tripwire"
@@ -283,6 +352,7 @@ SH
 }
 
 test_refuses_unsafe_names
+test_provision_timeout_is_load_tolerant_and_bounded
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown

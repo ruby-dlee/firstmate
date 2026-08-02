@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # Single-quoted snippets run in sealed child Bash.
 # Deterministic Agent Fleet integration tests for spawn, recovery, and rollback.
 # A fake Agent Fleet and fake tmux capture every command; no profile home,
 # credential, real endpoint, global config, or live worker is touched.
@@ -5424,7 +5425,7 @@ SH
     || fail "session-sync could not self-locate under hostile PATH"
   [ ! -s "$log" ] || fail "Agent Fleet validation executed ambient system-tool shadows: $(cat "$log")"
   [ ! -e "$perl_marker" ] || fail "Agent Fleet validation honored ambient PERL5OPT/PERLLIB injection"
-  [ "$(cat "$loader_env")" = '||||' ] \
+  [ "$(cat "$loader_env")" = "||||$FM_TEST_GUARD_ENV" ] \
     || fail "fixed system control inherited loader/runtime injection: $(cat "$loader_env")"
   [ ! -e "$stale_lock" ] || fail "hostile-path lock lifecycle did not reclaim and release its stale generation"
   pass "Agent Fleet validation and lock recovery pin system tools and scrub Perl injection"

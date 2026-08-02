@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # Single-quoted snippets run in sealed child Bash.
 # Test fixtures deliberately scope PATH changes to subshells; no parent-shell
 # mutation is expected or subsequently consumed.
 # shellcheck disable=SC2031
@@ -1602,11 +1603,13 @@ test_cli_helper_scrubs_loader_and_runtime_injection() {
 printf 'injected\n' > '$marker'
 SH
   cat > "$fb/herdr" <<'SH'
-#!/usr/bin/env bash
-printf '%s|%s|%s|%s|%s\n' \
-  "${LD_PRELOAD-}" "${DYLD_INSERT_LIBRARIES-}" "${NODE_OPTIONS-}" \
-  "${PERL5OPT-}" "${BASH_ENV-}" > "$FM_HERDR_LOADER_LOG"
-printf '{"result":{"workspaces":[]}}\n'
+#!/usr/bin/env python3
+import os
+
+names = ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "PERL5OPT", "BASH_ENV")
+with open(os.environ["FM_HERDR_LOADER_LOG"], "w", encoding="utf-8") as output:
+    output.write("|".join(os.environ.get(name, "") for name in names) + "\n")
+print('{"result":{"workspaces":[]}}')
 SH
   cat > "$fb/id" <<SH
 #!/usr/bin/env bash
@@ -1634,7 +1637,7 @@ SH
 }
 
 test_server_launch_detaches_from_callers_session() {
-  local dir fb marker result parent child parent_pid parent_pgid child_pid child_ppid child_pgid child_tty child_args
+  local dir fb marker result parent child parent_pid parent_pgid child_pid child_ppid child_pgid child_tty child_args child_state attempt
   dir="$TMP_ROOT/server-detach"; fb="$dir/fakebin"; marker="$dir/detached.tsv"
   mkdir -p "$fb"
   cat > "$fb/herdr" <<'SH'
@@ -1648,7 +1651,7 @@ printf 'child\t%s\t%s\t%s\t%s\t%s\n' \
   "$(ps -o pgid= -p $$ | tr -d ' ')" \
   "$tty_state" \
   "$*" > "${FM_HERDR_DETACH_MARKER:?}"
-exec sleep 20
+exec sleep 2
 SH
   chmod +x "$fb/herdr"
 
@@ -1672,7 +1675,8 @@ SH
   IFS=$'\t' read -r _parent parent_pid parent_pgid <<< "$parent"
   IFS=$'\t' read -r _child child_pid child_ppid child_pgid child_tty child_args <<< "$child"
 
-  if [ -z "$child_pid" ] || ! kill -0 "$child_pid" 2>/dev/null; then
+  child_state=$(ps -o state= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$child_pid" ] || [ -z "$child_state" ] || [ "${child_state#Z}" != "$child_state" ]; then
     fail "the detached fake server did not survive its launching shell"
   fi
   [ "$child_pgid" != "$parent_pgid" ] \
@@ -1683,7 +1687,15 @@ SH
     || fail "the detached fake server retained a terminal on stdin"
   [ "$child_args" = "server --session fmtest" ] \
     || fail "the detached launcher changed the scoped server command: $child_args"
-  kill "$child_pid" 2>/dev/null || true
+  attempt=0
+  while [ "$attempt" -lt 80 ]; do
+    child_state=$(ps -o state= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$child_state" ] || [ "${child_state#Z}" != "$child_state" ] && break
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  [ -z "$child_state" ] || [ "${child_state#Z}" != "$child_state" ] \
+    || fail "detached fake server did not self-terminate inside its fixture deadline"
   pass "fm_backend_herdr_server_launch_detached: server survives caller exit reparented in a distinct process group with closed stdin"
 }
 
@@ -2141,8 +2153,22 @@ test_server_test_hooks_are_inert_without_explicit_opt_in() {
       _ "$ROOT/bin/backends/herdr.sh"; then
     fail "the Herdr test-hook opt-in worked without the exact test-lab opt-in"
   fi
+  # shellcheck disable=SC2016 # The function is evaluated by the child shell.
+  hook_probe='. "$1"; fm_backend_herdr_test_keep_process_group_enabled'
+  if FM_TEST_HERDR_KEEP_PROCESS_GROUP=firstmate-herdr-test-process-group-v1 \
+    bash -c "$hook_probe" _ "$ROOT/bin/backends/herdr.sh"; then
+    fail "group-owned fake-server mode worked without the validated lab and hook opt-ins"
+  fi
   assert_no_server_transients "$lock_root" "inert test-hook check"
   pass "Herdr launch-lock fault hooks are inert unless the validated test-only opt-in is present"
+}
+
+enable_group_owned_fake_servers() {
+  export FM_TEST_HERDR_KEEP_PROCESS_GROUP=firstmate-herdr-test-process-group-v1
+}
+
+disable_group_owned_fake_servers() {
+  unset FM_TEST_HERDR_KEEP_PROCESS_GROUP
 }
 
 test_server_ensure_waits_for_inflight_launch_after_owner_kill() {
@@ -2227,7 +2253,7 @@ SH
 # --- container_ensure / create_task ------------------------------------------
 
 test_container_ensure_starts_server_and_workspace() {
-  local dir log resp fb out
+  local dir log resp fb out status attempt=0
   dir="$TMP_ROOT/container"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # 1: version_check status --json (server not running yet, irrelevant to client check)
   printf '{"client":{"version":"0.7.1","protocol":14}}\n' > "$resp/1.out"
@@ -2245,8 +2271,18 @@ test_container_ensure_starts_server_and_workspace() {
   printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"},"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 HERDR_SESSION=fmtest \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" )
+    FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
+    FM_TEST_HERDR_KEEP_PROCESS_GROUP=firstmate-herdr-test-process-group-v1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" 2> "$dir/stderr" )
+  status=$?
+  [ "$status" -eq 0 ] \
+    || fail "container_ensure failed while starting its sealed fake server: $(cat "$dir/stderr"); calls: $(cat "$log")"
   [ "$out" = $'fmtest:w1\tw1:t9' ] || fail "container_ensure should echo '<session>:<workspace_id>\\t<seeded_default_tab_id>', got '$out'"
+  while [ "$attempt" -lt 100 ]; do
+    grep -F "HERDR_SESSION=fmtest"$'\x1f''server' "$log" >/dev/null 2>&1 && break
+    sleep 0.02
+    attempt=$((attempt + 1))
+  done
   assert_contains "$(cat "$log")" "HERDR_SESSION=fmtest"$'\x1f''server' "container_ensure did not start the herdr server"
   assert_contains "$(cat "$log")" $'\x1f''workspace'$'\x1f''create'$'\x1f''--cwd'$'\x1f''/tmp'$'\x1f''--label'$'\x1f''firstmate' \
     "container_ensure did not create the firstmate workspace with the given cwd"
@@ -4272,9 +4308,11 @@ if [ "${FM_TEST_FOCUSED:-}" = server-startup ]; then
   test_herdr_binary_revalidates_leaf_and_physical_ancestry
   test_server_launch_scrubs_hostile_perl_and_control_environment
   test_server_launch_preserves_only_safe_worker_tool_paths
+  test_server_launch_detaches_from_callers_session
+  enable_group_owned_fake_servers
   test_managed_shell_and_server_certificate_close_startup_before_bash
   test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
-  test_server_launch_detaches_from_callers_session
+  disable_group_owned_fake_servers
   test_concurrent_server_ensure_launches_exactly_one_server
   test_server_ensure_reclaims_killed_owner_and_rejects_public_root
   test_server_ensure_never_steals_indeterminate_live_owner
@@ -4286,11 +4324,13 @@ if [ "${FM_TEST_FOCUSED:-}" = server-startup ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-shell-cert ]; then
+  enable_group_owned_fake_servers
   test_managed_shell_and_server_certificate_close_startup_before_bash
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
+  enable_group_owned_fake_servers
   test_managed_shell_and_server_certificate_close_startup_before_bash
   test_managed_shell_certificate_rejects_release_and_artifact_drift
   test_managed_artifact_candidate_recovery_is_guarded
@@ -4300,13 +4340,34 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-shell-hardening ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = published-pair ]; then
+  enable_group_owned_fake_servers
   test_managed_artifact_recovers_every_published_pair_crash_boundary
   test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = server-cert-lifecycle ]; then
+  enable_group_owned_fake_servers
   test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = container-start ]; then
+  test_container_ensure_starts_server_and_workspace
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = event-wait ]; then
+  test_wait_transition_no_panes_returns_2
+  test_wait_transition_not_capable_returns_2
+  test_wait_transition_reconcile_blocked_returns_record
+  test_wait_transition_subscribes_before_reconcile
+  test_wait_transition_reconcile_dedupes_when_marked
+  test_wait_transition_stream_blocked_returns_record
+  test_wait_transition_stream_absorb_clears_then_timeout
+  test_wait_transition_reader_failure_returns_2
+  test_wait_transition_bad_ack_returns_2_and_cleans_up
+  test_wait_transition_clean_timeout_returns_1
   exit 0
 fi
 
@@ -4324,6 +4385,8 @@ test_server_test_hooks_are_inert_without_explicit_opt_in
 test_herdr_binary_revalidates_leaf_and_physical_ancestry
 test_server_launch_scrubs_hostile_perl_and_control_environment
 test_server_launch_preserves_only_safe_worker_tool_paths
+test_server_launch_detaches_from_callers_session
+enable_group_owned_fake_servers
 test_managed_shell_and_server_certificate_close_startup_before_bash
 test_managed_shell_certificate_rejects_release_and_artifact_drift
 test_managed_artifact_candidate_recovery_is_guarded
@@ -4331,6 +4394,7 @@ test_managed_artifact_recovers_every_published_pair_crash_boundary
 test_attributed_cleanup_recovers_nlink1_and_exact_lock_release_phases
 test_server_ensure_routes_occupied_adapter_owned_release_drift_without_restart
 test_server_lock_root_rejects_unsafe_parent_and_ignores_tmpdir
+disable_group_owned_fake_servers
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id
 test_workspace_label_secondmate_marker_trims_whitespace
@@ -4338,7 +4402,6 @@ test_workspace_label_empty_marker_falls_back_to_primary
 test_workspace_label_different_secondmates_get_different_labels
 test_cli_helper_sets_env_and_appends_trailing_session_flag
 test_cli_helper_scrubs_loader_and_runtime_injection
-test_server_launch_detaches_from_callers_session
 test_concurrent_server_ensure_launches_exactly_one_server
 test_server_ensure_reclaims_killed_owner_and_rejects_public_root
 test_server_ensure_never_steals_indeterminate_live_owner

@@ -159,7 +159,7 @@ unit_stop_rejects_reused_pid() {
   printf '%s' "$sleeper_pid" > "$lock/pid"
   printf 'different-process-identity' > "$lock/pid-identity"
   FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1
-  if kill -0 "$sleeper_pid" 2>/dev/null; then
+  if fm_test_job_is_running "$sleeper_pid"; then
     pass "stop identity: stale lock cannot signal an unrelated live process"
   else
     fail "stop identity: stale lock signaled an unrelated live process"
@@ -183,7 +183,7 @@ unit_stop_requires_explicit_home() {
   status=0
   out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop 2>&1) || status=$?
   if [ "$status" -eq 64 ] && [[ "$out" == *'refusing ambiguous stop'* ]] \
-    && kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$st/state/.afk" ]; then
+    && fm_test_job_is_running "$sleeper_pid" && [ -e "$st/state/.afk" ]; then
     pass "stop authority: inherited FM_HOME cannot authorize a daemon signal"
   else
     fail "stop authority: ambiguous stop was not refused before signaling (exit $status): $out"
@@ -197,19 +197,19 @@ unit_stop_requires_recorded_home_match() {
   local caller_home recorded_home lock sleeper_pid out status
   caller_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-caller-home.XXXXXX")
   recorded_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-recorded-home.XXXXXX")
-  mkdir -p "$recorded_home/state"
-  : > "$recorded_home/state/.afk"
-  printf 'none\t-\tnative\t%s\n' "$recorded_home" > "$recorded_home/state/.afk-daemon-terminal"
+  mkdir -p "$caller_home/state"
+  : > "$caller_home/state/.afk"
+  printf 'none\t-\tnative\t%s\n' "$recorded_home" > "$caller_home/state/.afk-daemon-terminal"
   sleep 30 & sleeper_pid=$!
-  lock="$recorded_home/state/.supervise-daemon.lock"
+  lock="$caller_home/state/.supervise-daemon.lock"
   mkdir -p "$lock"
   printf '%s' "$sleeper_pid" > "$lock/pid"
   ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$lock/pid-identity" )
   status=0
-  out=$(FM_STATE_OVERRIDE="$recorded_home/state" "$LAUNCH" stop --home "$caller_home" 2>&1) || status=$?
+  out=$("$LAUNCH" stop --home "$caller_home" 2>&1) || status=$?
   if [ "$status" -ne 0 ] && [[ "$out" == *"recorded daemon home '$recorded_home'"* ]] \
     && [[ "$out" == *"caller-named home '$caller_home'"* ]] \
-    && kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$recorded_home/state/.afk" ]; then
+    && fm_test_job_is_running "$sleeper_pid" && [ -e "$caller_home/state/.afk" ]; then
     pass "stop authority: record home must match the explicit caller home"
   else
     fail "stop authority: mismatched record home did not fail before signaling (exit $status): $out"
@@ -217,6 +217,53 @@ unit_stop_requires_recorded_home_match() {
   kill "$sleeper_pid" 2>/dev/null || true
   wait "$sleeper_pid" 2>/dev/null || true
   rm -rf "$caller_home" "$recorded_home"
+}
+
+unit_stop_ignores_foreign_state_override() {
+  local named_home foreign_home lock sleeper_pid
+  named_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-named-home.XXXXXX")
+  foreign_home=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-foreign-state.XXXXXX")
+  mkdir -p "$named_home/state" "$foreign_home/state"
+  : > "$named_home/state/.afk"
+  printf 'none\t-\tnative\t%s\n' "$named_home" > "$named_home/state/.afk-daemon-terminal"
+  : > "$foreign_home/state/.afk"
+  # Deliberately forge the named home into the foreign record: state-root
+  # binding, not the mutable record alone, must prevent this lookup.
+  printf 'none\t-\tnative\t%s\n' "$named_home" > "$foreign_home/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  lock="$foreign_home/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$sleeper_pid" > "$lock/pid"
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$lock/pid-identity" )
+  FM_STATE_OVERRIDE="$foreign_home/state" "$LAUNCH" stop --home "$named_home" >/dev/null 2>&1 \
+    || fail "explicit-home stop failed against its own valid state"
+  if fm_test_job_is_running "$sleeper_pid" \
+    && [ -e "$foreign_home/state/.afk" ] \
+    && [ ! -e "$named_home/state/.afk" ]; then
+    pass "stop authority: explicit home overrides inherited foreign state resolution"
+  else
+    fail "stop authority: inherited FM_STATE_OVERRIDE redirected explicit-home lifecycle state"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$named_home" "$foreign_home"
+}
+
+unit_reconcile_requires_explicit_home() {
+  local st out status=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-reconcile-explicit.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'none\t-\tnative\t%s\n' "$st" > "$st/state/.afk-daemon-terminal"
+  out=$(FM_HOME="$st" "$LAUNCH" reconcile 2>&1) || status=$?
+  [ "$status" -eq 64 ] && [[ "$out" == *'refusing ambiguous reconcile'* ]] \
+    && [ -e "$st/state/.afk-daemon-terminal" ] \
+    || fail "reconcile authority: inherited FM_HOME was accepted (status $status): $out"
+  "$LAUNCH" reconcile --home "$st" >/dev/null 2>&1 \
+    || fail "reconcile authority: explicit home was rejected"
+  [ ! -e "$st/state/.afk-daemon-terminal" ] \
+    || fail "reconcile authority: explicit owned record was not cleared"
+  rm -rf "$st"
+  pass "reconcile authority: standalone endpoint cleanup requires an explicit home"
 }
 
 unit_stop_rejects_native_marker_for_unrelated_command() {
@@ -230,7 +277,7 @@ unit_stop_rejects_native_marker_for_unrelated_command() {
   printf '%s\n%s\n' "$sleeper_pid" "$identity" > "$st/state/.afk-native-process"
   if ! FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1 \
     && ! FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1 \
-    && kill -0 "$sleeper_pid" 2>/dev/null \
+    && fm_test_job_is_running "$sleeper_pid" \
     && [ -e "$st/state/.afk" ] && [ -e "$st/state/.afk-native-process" ]; then
     pass "native process identity: matching PID start time cannot authorize an unrelated command"
   else
@@ -1321,7 +1368,7 @@ SH
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
-      FM_AFK_LAUNCH_STOP_HOME_NAMED=1
+      FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED=1
       fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
       fm_afk_launch_main stop
     ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
@@ -1375,7 +1422,7 @@ SH
 
   ( FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" STARTER="$starter" bash -c '
       . "$1"
-      FM_AFK_LAUNCH_STOP_HOME_NAMED=1
+      FM_AFK_LAUNCH_EXPLICIT_HOME_NAMED=1
       fm_afk_native_process_command_matches() { [ "$1" = "$STARTER" ]; }
       fm_afk_launch_main stop
     ' _ "$LAUNCH" >/dev/null 2>&1; : > "$st/stop-done" ) &
@@ -1610,7 +1657,7 @@ unit_stop_validates_before_signal() {
   printf '%s' "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid"
   ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid-identity" )
   FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop --home "$st" >/dev/null 2>&1 || true
-  if kill -0 "$sleeper_pid" 2>/dev/null && [ -e "$st/state/.afk" ]; then
+  if fm_test_job_is_running "$sleeper_pid" && [ -e "$st/state/.afk" ]; then
     pass "stop validation: malformed record causes no daemon or state side effects"
   else
     fail "stop validation: malformed record signaled daemon or cleared state"
@@ -1674,7 +1721,7 @@ unit_stop_confirms_daemon_exit() {
       fi
     }
     ! fm_afk_launch_stop
-  ' _ "$LAUNCH" && kill -0 "$daemon_pid" 2>/dev/null \
+  ' _ "$LAUNCH" && fm_test_job_is_running "$daemon_pid" \
     && [ ! -e "$st/state/.supervise-daemon.lock" ] \
     && [ -e "$st/state/.afk" ] && [ -e "$st/state/.afk-daemon-terminal" ]; then
     pass "stop liveness: captured live daemon preserves lifecycle state after lock release"
@@ -1903,8 +1950,8 @@ unit_afk_control_reads_are_nonblocking_and_generation_pinned() {
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c \
     '. "$1"; fm_afk_safe_control_read "$2" 4096' _ "$START" "$control" >/dev/null 2>&1 &
   pid=$!
-  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.01; done
-  if kill -0 "$pid" 2>/dev/null; then
+  for _ in $(seq 1 50); do fm_test_job_is_running "$pid" || break; sleep 0.01; done
+  if fm_test_job_is_running "$pid"; then
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     fail "AFK control reader blocked while opening a FIFO"
@@ -2030,7 +2077,7 @@ e2e_herdr() {
 
   local SESSION home_tmp cap_ws cap_tab cap_pane target
   local before during after ws_before ws_during ws_after out dtgt dtab
-  SESSION="fm-lab-afk-launch-e2e-$$"
+  SESSION=$(herdr_test_session afk-launch-e2e)
   export HERDR_SESSION="$SESSION"
   herdr_test_lab_available "$SESSION" || return 0
   home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-e2e-home.XXXXXX")
@@ -2040,7 +2087,7 @@ e2e_herdr() {
     herdr_safe_stop_and_delete "$SESSION" >/dev/null 2>&1 || true
     rm -rf "$home_tmp" 2>/dev/null || true
   }
-  fm_herdr_lab_prepare "$SESSION" || { fail "herdr e2e: could not prepare isolated lab session"; return 0; }
+  herdr_test_prepare "$SESSION" || { fail "herdr e2e: could not prepare isolated lab session"; return 0; }
   fm_backend_source herdr || { E2E_HERDR_CLEANUP; fail "herdr e2e: fm_backend_source herdr failed"; return 0; }
   fm_backend_herdr_server_ensure "$SESSION" || { E2E_HERDR_CLEANUP; fail "herdr e2e: lab server did not start"; return 0; }
 
@@ -2201,6 +2248,8 @@ unit_stop_ordering
 unit_stop_rejects_reused_pid
 unit_stop_requires_explicit_home
 unit_stop_requires_recorded_home_match
+unit_stop_ignores_foreign_state_override
+unit_reconcile_requires_explicit_home
 unit_stop_rejects_native_marker_for_unrelated_command
 unit_native_command_identity_is_anchored
 unit_native_process_marker_is_one_bounded_snapshot

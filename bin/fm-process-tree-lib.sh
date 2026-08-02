@@ -4,6 +4,9 @@
 # Usage: fm_run_bounded <positive-seconds> <command> [args...]
 # After every call, FM_PROCESS_TREE_CLEANUP_STATUS is verified, unverified, or
 # not-started, while the function return preserves the wrapped command status.
+# FM_PROCESS_TREE_WAIT_FOR_DESCENDANTS=1 keeps an anchored background descendant
+# alive until the same deadline instead of cleaning it immediately when its
+# direct command exits; the deadline then returns 124 after verified cleanup.
 
 FM_PROCESS_TREE_SETUP_FAILURE_STATUS=126
 FM_PROCESS_TREE_CLEANUP_STATUS=not-started
@@ -260,6 +263,15 @@ fm_run_bounded() {
       last if defined $count && $count == 0;
       next if !defined $count && $! == EINTR;
       last;
+    }
+    if (($ENV{FM_PROCESS_TREE_WAIT_FOR_DESCENDANTS} || "") eq "1"
+        && !$requested_status && $status_text =~ /^(\d+)\n/) {
+      while (!$requested_status) {
+        my $members = anchored_members($anchor, $anchor);
+        last if defined $members && !@$members;
+        last if !defined $members;
+        select undef, undef, undef, 0.1;
+      }
     }
     alarm 0;
     my $command_status;

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${FM_TEST_HERDR_WRAPPER:?test isolation violation: sealed Herdr launcher is unset}" "$@"

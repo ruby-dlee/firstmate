@@ -1,0 +1,5 @@
+#!/bin/sh
+# Give only the native Herdr client its account-level socket resolution.
+HOME=${FM_TEST_HERDR_CLIENT_HOME:?test isolation violation: Herdr client home is unset}
+export HOME
+exec "${FM_TEST_REAL_HERDR:?test isolation violation: real Herdr client is unset}" "$@"

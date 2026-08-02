@@ -19,8 +19,8 @@ export FM_BACKEND=tmux
 # Clear ambient firstmate overrides so the behavior test owns its environment.
 run_spawn() {
   FM_ROOT_OVERRIDE='' \
-    FM_HOME='' \
-    FM_STATE_OVERRIDE='' \
+    FM_HOME="$FM_TEST_SANDBOX_ROOT/fm-home" \
+    FM_STATE_OVERRIDE="$FM_TEST_SANDBOX_ROOT/fm-home/state" \
     FM_DATA_OVERRIDE='' \
     FM_PROJECTS_OVERRIDE='' \
     FM_CONFIG_OVERRIDE='' \

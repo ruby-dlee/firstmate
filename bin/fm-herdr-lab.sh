@@ -7,11 +7,15 @@
 #   fm-herdr-lab.sh prepare <session>
 #   fm-herdr-lab.sh provision <session>
 #   fm-herdr-lab.sh run <session> <herdr arguments...>
+#   fm-herdr-lab.sh run-argv <session> agent start <flags...> -- <agent argv...>
 #   fm-herdr-lab.sh stop <session>
 #   fm-herdr-lab.sh teardown <session>
 #
 # Session names must begin with "fm-lab-" and can never be "default".
-# Every Herdr call made here carries a trailing --session <session>.
+# Every ordinary Herdr call made here carries a trailing --session <session>.
+# The sole argv-bearing exception is `agent start`: Herdr requires its session
+# selector before the literal `--` that begins the launched agent's argv, so
+# run-argv inserts the owned session immediately before that separator.
 # The run command rejects caller-supplied --session flags, any leading option
 # before the subcommand, all session lifecycle operations, and every server
 # operation.
@@ -25,6 +29,9 @@
 # loudly on a stopped or unreadable default.
 # Provision records the running default session as a fleet-state tripwire and
 # teardown requires that record to be identical afterward.
+# FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS is a strictly positive whole number,
+# defaults to 120, and is capped at 600 so a loaded fleet gets a fair bounded
+# startup window without allowing an indefinitely wedged provision.
 set -u
 
 fm_herdr_lab_error() {
@@ -54,6 +61,22 @@ fm_herdr_lab_raw() { # <session> <herdr arguments...>
   local name=$1
   shift
   HERDR_SESSION="$name" herdr "$@" --session "$name"
+}
+
+fm_herdr_lab_raw_argv() { # <session> agent start <flags...> -- <agent argv...>
+  local name=$1 arg
+  local -a pre=() post=()
+  local seen_sep=0
+  shift
+  for arg in "$@"; do
+    if [ "$seen_sep" = 0 ] && [ "$arg" = -- ]; then
+      seen_sep=1
+      continue
+    fi
+    if [ "$seen_sep" = 1 ]; then post+=("$arg"); else pre+=("$arg"); fi
+  done
+  [ "$seen_sep" = 1 ] && [ "${#post[@]}" -gt 0 ] || return 1
+  HERDR_SESSION="$name" herdr "${pre[@]}" --session "$name" -- "${post[@]}"
 }
 
 fm_herdr_lab_session_list() { # <session>
@@ -187,23 +210,90 @@ fm_herdr_lab_cli() { # <session> <herdr arguments...>
   fm_herdr_lab_raw "$name" "$@"
 }
 
-fm_herdr_lab_cancel_provision() { # <pid>
-  local pid=$1 attempt=0
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 10 ]; do
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
+fm_herdr_lab_cli_argv() { # <session> agent start <flags...> -- <agent argv...>
+  local name=$1 arg seen_sep=0 post_count=0
+  shift
+  fm_herdr_lab_validate_name "$name" || return 1
+  [ "${1:-} ${2:-}" = "agent start" ] || {
+    fm_herdr_lab_error "run-argv permits only agent start"
+    return 1
+  }
+  for arg in "$@"; do
+    case "$arg" in
+      --session|--session=*)
+        fm_herdr_lab_error "run-argv forbids caller-supplied --session; the helper inserts the lab session before the argv separator"
+        return 1
+        ;;
+    esac
+    if [ "$seen_sep" = 1 ]; then
+      post_count=$((post_count + 1))
+    elif [ "$arg" = -- ]; then
+      seen_sep=1
     fi
-  fi
+  done
+  [ "$seen_sep" = 1 ] && [ "$post_count" -gt 0 ] || {
+    fm_herdr_lab_error "run-argv requires a literal -- followed by the agent argv"
+    return 1
+  }
+  fm_herdr_lab_require_default_running "$name" run-argv || return 1
+  fm_herdr_lab_raw_argv "$name" "$@"
+}
+
+fm_herdr_lab_descendants() { # <root-pid>; deepest descendants first
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2; count += 1 }
+    END {
+      for (pid in parent) {
+        current = pid
+        for (step = 0; step <= count; step += 1) {
+          if (!(current in parent) || parent[current] == current) break
+          if (parent[current] == root) { print step + 1, pid; break }
+          current = parent[current]
+        }
+      }
+    }
+  ' | sort -rn -k1,1 | awk '{ print $2 }'
+}
+
+fm_herdr_lab_pid_live() { # <pid>
+  local state
+  state=$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]') || return 1
+  [ -n "$state" ] && [[ "$state" != Z* ]]
+}
+
+fm_herdr_lab_provision_timeout() {
+  local timeout=${FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS:-120}
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] && [ "$timeout" -le 600 ] || {
+    fm_herdr_lab_error "FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS must be a whole number from 1 through 600 (got '${timeout:-<empty>}')"
+    return 1
+  }
+  printf '%s\n' "$timeout"
+}
+
+fm_herdr_lab_cancel_provision() { # <pid>
+  local pid=$1 attempt=0 descendants targets target any_live
+  descendants=$(fm_herdr_lab_descendants "$pid") || descendants=
+  targets="$descendants $pid"
+  for target in $targets; do
+    fm_herdr_lab_pid_live "$target" && kill -TERM "$target" 2>/dev/null || true
+  done
+  while [ "$attempt" -lt 10 ]; do
+    any_live=0
+    for target in $targets; do
+      fm_herdr_lab_pid_live "$target" && any_live=1
+    done
+    [ "$any_live" = 1 ] || break
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  for target in $targets; do
+    fm_herdr_lab_pid_live "$target" && kill -KILL "$target" 2>/dev/null || true
+  done
   wait "$pid" 2>/dev/null || true
 }
 
 fm_herdr_lab_provision() { # <session>
-  local name=$1 sessions tripwire running attempt server_pid
+  local name=$1 sessions tripwire running attempt server_pid timeout max_attempts
   fm_herdr_lab_validate_name "$name" || return 1
   command -v herdr >/dev/null 2>&1 || { fm_herdr_lab_error "herdr is required"; return 1; }
   command -v jq >/dev/null 2>&1 || { fm_herdr_lab_error "jq is required"; return 1; }
@@ -230,10 +320,12 @@ fm_herdr_lab_provision() { # <session>
     fm_herdr_lab_prepare "$name" || return 1
   fi
   fm_herdr_lab_require_default_running "$name" provision || return 1
+  timeout=$(fm_herdr_lab_provision_timeout) || return 1
+  max_attempts=$((timeout * 5))
   fm_herdr_lab_raw "$name" server >/dev/null 2>&1 &
   server_pid=$!
   attempt=0
-  while [ "$attempt" -lt 50 ]; do
+  while [ "$attempt" -lt "$max_attempts" ]; do
     running=$(fm_herdr_lab_cli "$name" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null) || running=false
     if [ "$running" = true ]; then
       fm_herdr_lab_refuse_if_default "$name" || {
@@ -246,7 +338,7 @@ fm_herdr_lab_provision() { # <session>
     attempt=$((attempt + 1))
   done
   fm_herdr_lab_cancel_provision "$server_pid"
-  fm_herdr_lab_error "lab session '$name' did not report running within 10 seconds"
+  fm_herdr_lab_error "lab session '$name' did not report running within $timeout seconds"
   return 1
 }
 
@@ -353,6 +445,11 @@ fm_herdr_lab_main() {
       [ "$#" -ge 3 ] || { fm_herdr_lab_usage >&2; return 2; }
       shift
       fm_herdr_lab_cli "$@"
+      ;;
+    run-argv)
+      [ "$#" -ge 6 ] || { fm_herdr_lab_usage >&2; return 2; }
+      shift
+      fm_herdr_lab_cli_argv "$@"
       ;;
     stop)
       [ "$#" -eq 2 ] || { fm_herdr_lab_usage >&2; return 2; }

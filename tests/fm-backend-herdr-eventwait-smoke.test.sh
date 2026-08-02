@@ -28,7 +28,7 @@ command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found (required 
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
-SESSION="fm-lab-eventwait-smoke-$$"
+SESSION=$(herdr_test_session eventwait-smoke)
 export HERDR_SESSION="$SESSION"
 herdr_test_lab_available "$SESSION" || exit 0
 SCRATCH=
@@ -37,13 +37,14 @@ cleanup_all() {
   herdr_safe_stop_and_delete "$SESSION"
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare the isolated Herdr lab session"
+herdr_test_prepare "$SESSION" || fail "could not prepare the isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 fm_backend_source herdr || fail "fm_backend_source herdr failed"
 
-HERDR_VERSION=$(herdr --version 2>/dev/null | head -1)
+HERDR_VERSION=$(fm_backend_herdr_cli "$SESSION" status --json 2>/dev/null \
+  | jq -r '.client.version // "unknown"')
 
 # --- real capability gate ----------------------------------------------------
 

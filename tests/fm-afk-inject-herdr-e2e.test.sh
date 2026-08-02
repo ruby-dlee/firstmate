@@ -47,7 +47,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-SESSION="fm-lab-afk-herdr-e2e-$$"
+SESSION=$(herdr_test_session afk-herdr-e2e)
 export HERDR_SESSION="$SESSION"
 export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 herdr_test_lab_available "$SESSION" || exit 0
@@ -70,7 +70,7 @@ cleanup_all() {
   rm -rf "${STATE_DIR:-}" 2>/dev/null || true
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
+herdr_test_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # --- source the daemon (for afk_enter/afk_exit/FM_INJECT_MARK) + the backend -
 # shellcheck source=bin/fm-supervise-daemon.sh

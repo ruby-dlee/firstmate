@@ -504,7 +504,7 @@ SH
 }
 
 test_sweep_parent_skips_release_after_spawn_handoff() {
-  local w fb tmuxfb log out fake_root sleeper_pid lock
+  local w fb tmuxfb log out fake_root sleeper_pid lock release_file
   w=$(new_world sweep-parent-skip-release)
   add_sm_home "$w" sm1 firstmate:fm-sm1
   printf 'account_profile=claude-1\n' >> "$w/home/state/sm1.meta"
@@ -519,7 +519,8 @@ SH
 set -u
 . "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
 lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
-sleep 30 </dev/null >/dev/null 2>&1 &
+bash -c 'while [ ! -f "$1" ]; do sleep 0.05; done' \
+  _ "$FM_PARENT_SKIP_RELEASE" </dev/null >/dev/null 2>&1 &
 pid=$!
 start=$(fm_account_process_start_time "$pid") || exit 1
 handoff=$(mktemp "$FM_HOME/state/.parent-skip-handoff.XXXXXX") || exit 1
@@ -535,19 +536,27 @@ SH
   chmod +x "$fake_root/bin/"*.sh
   fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
   log="$w/calls.log"; : > "$log"
+  release_file="$w/sleeper-release"
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
-    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_PARENT_SKIP_PID="$w/sleeper-pid")
+    FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" \
+    FM_PARENT_SKIP_PID="$w/sleeper-pid" FM_PARENT_SKIP_RELEASE="$release_file")
   sleeper_pid=$(cat "$w/sleeper-pid" 2>/dev/null || true)
   lock="$w/home/state/.account-lifecycle-sm1.lock"
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "parent treated a successfully handed-off lock as its own release failure"
-  if [ -z "$sleeper_pid" ] || ! kill -0 "$sleeper_pid" 2>/dev/null; then
+  if [ -z "$sleeper_pid" ] \
+    || ! "$FM_TEST_GUARD_PS" -p "$sleeper_pid" -o pid= >/dev/null 2>&1; then
     fail "handoff simulation did not leave its child owner alive"
   fi
   [ "$(sed -n '1p' "$lock" 2>/dev/null)" = "$sleeper_pid" ] \
     || fail "parent released or replaced the child-owned lifecycle lock"
-  kill "$sleeper_pid" 2>/dev/null || true
-  wait "$sleeper_pid" 2>/dev/null || true
+  touch "$release_file"
+  for _ in $(seq 1 100); do
+    "$FM_TEST_GUARD_PS" -p "$sleeper_pid" -o pid= >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  "$FM_TEST_GUARD_PS" -p "$sleeper_pid" -o pid= >/dev/null 2>&1 \
+    && fail "handoff simulation child did not exit after its release signal"
   rm -f "$lock"
   pass "sweep: parent skips release after lifecycle ownership handoff"
 }

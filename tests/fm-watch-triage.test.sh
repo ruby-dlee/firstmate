@@ -50,7 +50,7 @@ watch_bg() {  # <state> <fakebin> <out> [extra env assignments...]
 wait_live() {
   local pid=$1 limit=${2:-30} i=0
   while [ "$i" -lt "$limit" ]; do
-    kill -0 "$pid" 2>/dev/null || return 1
+    fm_test_job_is_running "$pid" || return 1
     sleep 0.1
     i=$((i + 1))
   done
@@ -93,7 +93,10 @@ seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+reap() {
+  local pid=$1
+  fm_test_reap_job "$pid"
+}
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -1491,7 +1494,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_numeric_file "$state/.stale-since-$key" 30 || { reap "$pid"; fail "matching stale suppressor with missing timer did not initialize stale-since"; }
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! fm_test_job_is_running "$pid"; then
     wait "$pid" 2>/dev/null || true
     fail "watcher exited while repairing a missing stale-since timer: $(cat "$out")"
   fi

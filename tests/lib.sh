@@ -27,6 +27,16 @@
 # let state follow the fixture home unless the fixture names its own override.
 unset FM_STATE_OVERRIDE
 
+# The first test process to load this library owns suite cleanup. Nested Bash
+# processes deliberately source the same helpers (and therefore install their
+# own EXIT trap), but must never interpret the shared sealed process group as
+# theirs to terminate. The owner token is exported before any test can launch a
+# child; descendants load all functions normally and their trap becomes inert.
+if [ -z "${FM_TEST_CLEANUP_OWNER_PID:-}" ]; then
+  FM_TEST_CLEANUP_OWNER_PID=$$
+  export FM_TEST_CLEANUP_OWNER_PID
+fi
+
 # Idempotent guard: behavior-area helper files (secondmate-helpers.sh,
 # wake-helpers.sh) source this library for ROOT/fail/pass, and the test that
 # includes them may also source it directly. Re-sourcing must not wipe the
@@ -97,6 +107,49 @@ fm_test_wait_for_file() {
   return 124
 }
 
+# Query Bash's own child-job table before treating a numeric PID as one of this
+# test's live processes. `kill -0 "$pid"` can race a short-lived fixture exit
+# and inspect an unrelated process after PID reuse; the suite guard correctly
+# rejects that ambiguity, so test synchronization must not create it.
+fm_test_job_is_running() {  # <pid returned by $!>
+  local expected=$1 job_pid
+  for job_pid in $(jobs -pr); do
+    [ "$job_pid" = "$expected" ] && return 0
+  done
+  return 1
+}
+
+fm_test_job_spec() {  # <pid returned by $!>
+  jobs -l | awk -v expected="$1" '
+    $1 ~ /^\[[0-9]+\][+-]?$/ && $2 == expected {
+      spec = $1
+      sub(/^\[/, "%", spec)
+      sub(/\][+-]?$/, "", spec)
+      print spec
+      exit
+    }
+  '
+}
+
+fm_test_signal_job() {  # <pid returned by $!> [signal]
+  local pid=$1 signal=${2:--TERM} job_spec status=0
+  job_spec=$(fm_test_job_spec "$pid")
+  [ -n "$job_spec" ] || return 1
+  # The ordinary kill builtin stays disabled so `command kill` cannot bypass
+  # the suite guard. Temporarily expose it only inside this validated helper
+  # and address Bash's job object, not a reusable numeric PID.
+  enable kill
+  builtin kill "$signal" "$job_spec" 2>/dev/null || status=$?
+  enable -n kill
+  return "$status"
+}
+
+fm_test_reap_job() {  # <pid returned by $!> [signal]
+  local pid=$1 signal=${2:--TERM}
+  fm_test_signal_job "$pid" "$signal" || true
+  wait "$pid" 2>/dev/null || true
+}
+
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal
@@ -113,6 +166,8 @@ trap fm_test_cleanup EXIT
 fm_test_cleanup() {
   local d
   [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return 0
+  [ "$$" = "$FM_TEST_CLEANUP_OWNER_PID" ] || return 0
+  fm_test_cleanup_owned_processes
   if [ -f "$FM_TEST_CLEANUP_MANIFEST" ]; then
     while IFS= read -r d; do
       [ -n "$d" ] && rm -rf "$d"
@@ -123,6 +178,67 @@ fm_test_cleanup() {
     [ -n "$d" ] && rm -rf "$d"
   done
   return 0
+}
+
+fm_test_owned_processes() {
+  local root=$1 self=$2 output=$3 raw scan_pid
+  raw=$(mktemp "${TMPDIR:?sealed test TMPDIR is required}/fm-test-process-scan.XXXXXX")
+  "$FM_TEST_GUARD_PS" -axo pid=,pgid=,state= > "$raw" &
+  scan_pid=$!
+  wait "$scan_pid" \
+    || fail "test isolation: could not inspect the sealed process group"
+  # shellcheck disable=SC2016 # awk fields, not shell parameters.
+  "$FM_TEST_GUARD_AWK" -v root="$root" -v self="$self" -v scan="$scan_pid" '
+      $1 ~ /^[0-9]+$/ && $2 == root && $1 != root && $1 != self && $1 != scan && $3 !~ /^Z/ {
+        print $1, $2, $3
+      }
+    ' "$raw" > "$output"
+  rm -f "$raw"
+}
+
+fm_test_cleanup_owned_processes() {
+  local root=${FM_TEST_PROCESS_ROOT_PID:-} self=$$ line pid i survivors remaining
+  [ -n "$root" ] || fail "test isolation: sealed process root PID is missing during cleanup"
+  line=$("$FM_TEST_GUARD_PS" -p "$root" -o pid=,pgid= 2>/dev/null || true)
+  # shellcheck disable=SC2086 # Deliberately split the two numeric ps fields.
+  set -- $line
+  [ "${1:-}" = "$root" ] && [ "${2:-}" = "$root" ] \
+    || fail "test isolation: refusing process cleanup because $root is not the sealed process-group leader"
+
+  survivors=$(mktemp "${TMPDIR:?sealed test TMPDIR is required}/fm-test-processes.XXXXXX")
+  fm_test_owned_processes "$root" "$self" "$survivors"
+  if [ -s "$survivors" ]; then
+    while IFS=' ' read -r pid _; do
+      [ -n "$pid" ] && "$FM_TEST_GUARD_REAL_KILL" -TERM "$pid" 2>/dev/null || true
+    done < "$survivors"
+    i=0
+    while [ "$i" -lt 20 ]; do
+      fm_test_owned_processes "$root" "$self" "$survivors"
+      [ ! -s "$survivors" ] && break
+      sleep 0.05
+      i=$((i + 1))
+    done
+  fi
+
+  if [ -s "$survivors" ]; then
+    while IFS=' ' read -r pid _; do
+      [ -n "$pid" ] && "$FM_TEST_GUARD_REAL_KILL" -KILL "$pid" 2>/dev/null || true
+    done < "$survivors"
+    i=0
+    while [ "$i" -lt 20 ]; do
+      fm_test_owned_processes "$root" "$self" "$survivors"
+      [ ! -s "$survivors" ] && break
+      sleep 0.05
+      i=$((i + 1))
+    done
+  fi
+
+  if [ -s "$survivors" ]; then
+    remaining=$(cat "$survivors")
+    rm -f "$survivors"
+    fail "test isolation: owned processes survived shared cleanup: $remaining"
+  fi
+  rm -f "$survivors"
 }
 
 fm_test_tmproot() {

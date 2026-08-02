@@ -2866,7 +2866,6 @@ SH
   FM_FAKE_PARENT_LIVE="$FORCED_CHILD_PARENT_LIVE" \
   FM_FAKE_PS_BROKEN="$ps_broken" \
   TREEHOUSE_RETURN_CHILD_PID_FILE="$child_pid_file" \
-  TREEHOUSE_RETURN_PS_FAIL_MARKER="$ps_fail_marker" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
@@ -4836,7 +4835,8 @@ SH
   expect_code 1 "$spawn_rc" "child spawn during secondmate retirement exit"
   assert_grep 'secondmate home lifecycle lock' "$case_dir/spawn-stderr" \
     "child spawn did not contend on the retiring secondmate home"
-  expect_code 0 "$rc" "serialized secondmate retirement exit"
+  [ "$rc" -eq 0 ] || fail \
+    "serialized secondmate retirement exit: expected exit 0, got $rc: $(cat "$case_dir/stderr")"
   assert_absent "$case_dir/wt" "serialized secondmate retirement retained the home"
   assert_absent "$case_dir/state/task-x1.meta" "serialized secondmate retirement retained metadata"
   pass "secondmate retirement serializes child spawn through removal"

@@ -3,8 +3,40 @@
 Firstmate behavior tests must run through `tests/run.sh`.
 
 That POSIX-shell suite entry discards ambient `BASH_ENV`, creates a fresh sandbox for each `tests/*.test.sh` file, and delegates to the internal `tests/run-test.sh` helper.
-The per-test runner exports a private `HOME`, `FM_HOME`, `FM_STATE_OVERRIDE`, `FM_TREEHOUSE_ROOT`, and `TMPDIR` before the test process starts.
+The per-test runner exports a private `HOME`, `FM_HOME`, `FM_STATE_OVERRIDE`, `FM_TREEHOUSE_ROOT`, `TMPDIR`, and `TMUX_TMPDIR` before the test process starts.
+It also clears inherited `TMUX`, so lifecycle tests create a private tmux server and socket inside the sandbox instead of reaching the operator's server.
+When Herdr is installed, the public suite entry provisions or adopts one owned `fm-lab-*` session through `bin/fm-herdr-lab.sh` and rotates that lab between test files.
+The sealed Herdr launcher rejects foreign sessions and sends every real CLI call through the lab helper.
+Provisioning failure still invokes guarded teardown and records the default-session after snapshot before the proof driver returns the primary error.
+Lab startup waits up to 120 seconds by default so ordinary fleet load does not become a false provisioning failure; `FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS` may select a bounded 1-to-600-second deadline.
+Neither the helper nor the suite adopts a lab from a successful create/start return code alone: both poll the named session until status reports that exact session as running, with `FM_TEST_HERDR_ADOPTION_TIMEOUT_SECONDS` providing a bounded 1-to-600-second deadline.
+Failed adoption preserves the session listing and bounded server-log tail before guarded teardown, so a stale stopped directory or server-side startup refusal remains diagnosable.
+Fleet proofs may pass `--reuse-lab` to provision one owned lab and serialize multiple checks inside it.
+The suite then closes every exact owned-lab workspace and proves the workspace inventory empty between test files; without reuse it tears down and re-provisions the owned lab between entries.
+Ordinary calls get the required trailing session argument; the helper's narrowly validated `run-argv` route inserts it immediately before `agent start`'s `-- <agent argv>` boundary, where Herdr requires it.
+Each test runner is also launched in a detached process group by `tests/run-detached.py`.
+The shared library verifies that the sealed runner is its process-group leader and reaps every remaining group member during cleanup.
+The detached runner keeps a caller-fatal lifecycle test from terminating the suite driver, remains a hard-fail backstop if shared cleanup leaves descendants behind, and writes combined stdout/stderr to `FM_TEST_OUTPUT_DIR` when the caller requests durable artifacts.
 CI and the no-mistakes test command both use this same entry point.
+
+Native Herdr agents are a special process boundary: the lab server, not the test runner, becomes their OS parent.
+The backend injects the complete sealed operational environment through Herdr's native `agent start --env` channel.
+Only a process carrying the owned lab session, a valid Herdr pane identity, and the authenticated test-lab marker may rebase itself as a new guarded subtree root; a foreign or default session cannot claim that authority.
+
+Live-fleet verification uses `tests/fleet-proof.py` with the external lab helper, the default Herdr server PID, and an explicit set of stable pane PIDs.
+Pass the default session's persisted state file with `--default-session-state`; the proof records its logical workspace/pane identities before and after without copying pane launch arguments.
+It also records the complete default-session process identity inventory before and after the run, while continuously aborting only if the server or a declared stable identity changes or disappears.
+Ordinary task panes are deliberately not count-based abort conditions: they may complete and be reaped during a long suite run.
+Their disappearance remains visible in `default-diff.json` with `lifecycle_reconciliation_required: true` and must be reconciled against a known completion or teardown event before the proof is accepted.
+This avoids both unsafe silent loss and a raw-count alarm that routinely cries wolf.
+When given the real Treehouse root, watcher lock, and away-mode flag, the same driver also records the pool/control manifest, follows and hashes every watcher-lock owner record, and inventories every watcher/daemon process.
+Root supervisor and watcher identities are compared as the stable lifecycle set; nested watcher subprocess churn remains visible but does not cause a false failure.
+If a stable lifecycle identity or away-mode state changes, the proof requires reconciliation against the corresponding known away-mode or teardown event.
+Pass the real supervisor log with `--supervise-log`; the proof driver accepts a PID/lock rotation only when the append-only log records the reap-wake completion, clean shutdown, exact replacement PID, and a wake under the same logical watcher home/path.
+Pass `--watch-home` and `--watcher-path` to declare the operator watcher's stable ownership set; idle-to-active, active-to-idle, and PID rotations are then reconciled only when every present lock and watcher command matches that exact home and tracked script.
+It distinguishes the timestamp stored inside a still-present `.afk` marker from an actual away-mode presence change.
+`host_unchanged` remains the strict byte/identity result, while `host_unchanged_or_reconciled` is the acceptance result after those narrow lifecycle proofs.
+Pool mutation, away-mode presence changes, watcher owner changes, and unexplained process rotations remain hard failures.
 
 `tests/lib.sh` sources `tests/test-env-guard.sh` before exposing any fixture helper.
 Direct execution therefore fails before a behavior test can resolve operational state.
@@ -26,9 +58,10 @@ The parent shell cannot intercept that child startup before Bash reads `BASH_ENV
 
 ## Lifecycle stops
 
-`bin/fm-afk-launch.sh stop` is intentionally invalid.
-Callers must use `bin/fm-afk-launch.sh stop --home <path>`.
+Bare `bin/fm-afk-launch.sh stop` and `reconcile` are intentionally invalid.
+Callers must use `bin/fm-afk-launch.sh stop --home <path>` or `reconcile --home <path>`.
 The launcher canonicalizes that explicitly named home before resolving lifecycle state and refuses to act unless the daemon-terminal record names the same home.
+Explicit lifecycle authority also pins state to `<home>/state`; an inherited `FM_STATE_OVERRIDE` cannot redirect the record lookup to a different fleet.
 The record check happens before any daemon signal or terminal teardown.
 
 Other home-scoped lifecycle paths retain their existing identity proofs.

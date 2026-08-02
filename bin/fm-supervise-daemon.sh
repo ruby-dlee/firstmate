@@ -697,13 +697,40 @@ wedge_alarm_platform_default() {
 }
 
 wedge_alarm_run_bounded() {
-  local channel=$1 timeout monitor_was_on=0 pid start elapsed rc
+  local channel=$1 timeout monitor_was_on=0 pid start elapsed rc guard
   shift
   timeout=${FM_WEDGE_ALARM_TIMEOUT_SECS:-$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT}
   case "$timeout" in
     ''|*[!0-9]*) timeout=$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT ;;
     *) [ "$timeout" -gt 0 ] 2>/dev/null || timeout=$WEDGE_ALARM_TIMEOUT_SECS_DEFAULT ;;
   esac
+  # The behavior suite runs each test as an isolated OS session and rejects any
+  # lifecycle process whose ownership cannot be proved. A notifier may create
+  # its own job-control session, so ancestry/session checks alone are not a
+  # durable certificate after reparenting. Reuse Firstmate's production-grade
+  # bounded process-tree anchor in exact sealed-test mode: it records the owned
+  # group before the command starts and does not return until every descendant
+  # is reaped. The executed daemon retains the interruptible watchdog below.
+  if [ "${FM_TEST_SEALED:-}" = firstmate-test-v1 ]; then
+    # shellcheck source=bin/fm-process-tree-lib.sh
+    . "$FM_DAEMON_DIR/fm-process-tree-lib.sh"
+    guard=$(mktemp "${TMPDIR:?sealed test TMPDIR is required}/fm-wedge-alarm-group.XXXXXX") \
+      || return 126
+    rm -f "$guard"
+    local FM_PROCESS_TREE_GUARD_FILE=$guard
+    local FM_PROCESS_TREE_WAIT_FOR_DESCENDANTS=1
+    export FM_PROCESS_TREE_GUARD_FILE FM_PROCESS_TREE_WAIT_FOR_DESCENDANTS
+    start=$SECONDS
+    fm_run_bounded "$timeout" "$@"
+    rc=$?
+    elapsed=$((SECONDS - start))
+    rm -f "$guard"
+    [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] || return 126
+    if [ "$rc" -eq 124 ] && [ "$elapsed" -ge "$timeout" ]; then
+      log "wedge alarm: ${channel} notifier timed out after ${elapsed}s (limit ${timeout}s)"
+    fi
+    return "$rc"
+  fi
   case $- in *m*) monitor_was_on=1 ;; esac
   set -m 2>/dev/null || true
   case $- in

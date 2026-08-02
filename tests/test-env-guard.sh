@@ -8,8 +8,38 @@
 # the test body can run.
 
 fm_test_isolation_fail() {
-  printf 'test isolation violation: %s\n' "$1" >&2
+  local message="test isolation violation: $1"
+  printf '%s\n' "$message" >&2
+  if [ -n "${FM_TEST_ISOLATION_LOG:-}" ]; then
+    case "$FM_TEST_ISOLATION_LOG" in
+      "${FM_TEST_SANDBOX_ROOT:-<unset>}"/*)
+        printf '%s\n' "$message" >> "$FM_TEST_ISOLATION_LOG" 2>/dev/null || true
+        ;;
+    esac
+  fi
   exit 97
+}
+
+fm_test_isolation_adopt_native_herdr_root() {
+  # Herdr's server, not the detached test runner, is the OS parent of a native
+  # agent.  The exact owned-lab envelope and server-injected pane identity are
+  # the authority to rebase this Bash process as a new sealed subtree root.
+  # Descendant Bash processes may rebase again; that narrows their authority to
+  # their own subtree and never permits signaling the server or live fleet.
+  local pane_id workspace_id public_pane_id
+  [ "${FM_TEST_SEALED:-}" = firstmate-test-v1 ] || return 0
+  [ "${FM_BACKEND_HERDR_TEST_LAB:-}" = firstmate-herdr-test-lab-v1 ] || return 0
+  [ "${HERDR_ENV:-}" = 1 ] || return 0
+  [ -n "${FM_TEST_HERDR_LAB_SESSION:-}" ] \
+    && [ "${HERDR_SESSION:-}" = "$FM_TEST_HERDR_LAB_SESSION" ] || return 0
+  pane_id=${HERDR_PANE_ID:-}
+  case "$pane_id" in w?*:p?*) ;; *) return 0 ;; esac
+  workspace_id=${pane_id%%:*}
+  public_pane_id=${pane_id#*:}
+  case "${workspace_id#w}" in *[!0-9A-Za-z]*|'') return 0 ;; esac
+  case "${public_pane_id#p}" in *[!0-9]*|'') return 0 ;; esac
+  FM_TEST_PROCESS_ROOT_PID=$$
+  export FM_TEST_PROCESS_ROOT_PID
 }
 
 fm_test_isolation_assert_path() {  # <label> <path> [directory|entry]
@@ -67,6 +97,34 @@ fm_test_isolation_pid_is_descendant() {  # <pid>
   return 1
 }
 
+fm_test_isolation_pid_in_owned_group() {  # <pid>
+  local pid=$1 root=$FM_TEST_PROCESS_ROOT_PID root_line target_line root_pid root_group target_pid target_group
+  [ "$pid" != "$root" ] || return 1
+  root_line=$("$FM_TEST_GUARD_PS" -p "$root" -o pid= -o pgid= 2>/dev/null) || return 1
+  # shellcheck disable=SC2086 # Deliberately split the two numeric ps fields.
+  set -- $root_line
+  root_pid=${1:-}
+  root_group=${2:-}
+  [ "$root_pid" = "$root" ] && [ "$root_group" = "$root" ] || return 1
+  target_line=$("$FM_TEST_GUARD_PS" -p "$pid" -o pid= -o pgid= 2>/dev/null) || return 1
+  # shellcheck disable=SC2086 # Deliberately split the two numeric ps fields.
+  set -- $target_line
+  target_pid=${1:-}
+  target_group=${2:-}
+  [ "$target_pid" = "$pid" ] && [ "$target_group" = "$root" ]
+}
+
+fm_test_isolation_pid_in_owned_session() {  # <pid>
+  local pid=$1 root=$FM_TEST_PROCESS_ROOT_PID root_session target_session
+  [ "$pid" != "$root" ] || return 1
+  root_session=$("$FM_TEST_GUARD_PYTHON" -c \
+    'import os, sys; print(os.getsid(int(sys.argv[1])))' "$root" 2>/dev/null) || return 1
+  [ "$root_session" = "$root" ] || return 1
+  target_session=$("$FM_TEST_GUARD_PYTHON" -c \
+    'import os, sys; print(os.getsid(int(sys.argv[1])))' "$pid" 2>/dev/null) || return 1
+  [ "$target_session" = "$root" ]
+}
+
 fm_test_isolation_group_has_owned_anchor() {  # <positive-pgid>
   local group=$1 guard_file=${FM_PROCESS_TREE_GUARD_FILE:-} recorded anchor_line anchor_pid anchor_group
   [ -n "$guard_file" ] || return 1
@@ -99,7 +157,9 @@ fm_test_isolation_assert_pid_target() {  # <pid-or-negative-pgid>
         || fm_test_isolation_fail "cannot inspect process group targeted by test: $target"
       [ -n "$members" ] || return 0
       for member in $members; do
-        fm_test_isolation_pid_is_descendant "$member" \
+        { fm_test_isolation_pid_is_descendant "$member" \
+          || fm_test_isolation_pid_in_owned_group "$member" \
+          || fm_test_isolation_pid_in_owned_session "$member"; } \
           || fm_test_isolation_fail "daemon/watcher PID resolves outside sandbox process tree: $member (target group: $target; test root PID: $FM_TEST_PROCESS_ROOT_PID)"
       done
       ;;
@@ -108,7 +168,9 @@ fm_test_isolation_assert_pid_target() {  # <pid-or-negative-pgid>
         return 0
       fi
       fm_test_isolation_group_has_owned_anchor "$target" && return 0
-      fm_test_isolation_pid_is_descendant "$target" \
+      { fm_test_isolation_pid_is_descendant "$target" \
+        || fm_test_isolation_pid_in_owned_group "$target" \
+        || fm_test_isolation_pid_in_owned_session "$target"; } \
         || fm_test_isolation_fail "daemon/watcher PID resolves outside sandbox process tree: $target (test root PID: $FM_TEST_PROCESS_ROOT_PID)"
       ;;
     *) return 0 ;;
@@ -145,19 +207,26 @@ fm_test_isolation_guard_environment() {
   [ "$(cd "$FM_TEST_SANDBOX_ROOT" && pwd -P)" = "$FM_TEST_SANDBOX_ROOT" ] \
     || fm_test_isolation_fail "sandbox root is not canonical: $FM_TEST_SANDBOX_ROOT"
   case "${FM_TEST_PROCESS_ROOT_PID:-}" in ''|*[!0-9]*) fm_test_isolation_fail 'test process-root PID is unset or malformed' ;; esac
-  for label in FM_TEST_GUARD_PS FM_TEST_GUARD_AWK FM_TEST_GUARD_TR \
+  for label in FM_TEST_GUARD_PS FM_TEST_GUARD_AWK FM_TEST_GUARD_TR FM_TEST_GUARD_PYTHON \
     FM_TEST_GUARD_REAL_KILL FM_TEST_GUARD_KILL_WRAPPER FM_TEST_GUARD_ENV \
     FM_TEST_REAL_BASH FM_TEST_BASH; do
     eval "value=\${$label:-}"
     [ -x "$value" ] || fm_test_isolation_fail "$label is not a pinned executable: ${value:-<unset>}"
   done
+  [ -n "${FM_TEST_ISOLATION_LOG:-}" ] \
+    || fm_test_isolation_fail 'FM_TEST_ISOLATION_LOG is unset; use tests/run-test.sh'
+  fm_test_isolation_assert_path FM_TEST_ISOLATION_LOG "$FM_TEST_ISOLATION_LOG" entry
   [ "${BASH_ENV:-}" = "$FM_TEST_GUARD_ENV" ] \
     || fm_test_isolation_fail "BASH_ENV bypassed the sealed launcher: ${BASH_ENV:-<unset>}"
   "$FM_TEST_GUARD_PS" -p "$FM_TEST_PROCESS_ROOT_PID" -o pid= >/dev/null 2>&1 \
     || fm_test_isolation_fail "test process-root PID is not alive: $FM_TEST_PROCESS_ROOT_PID"
 
-  fm_test_isolation_assert_path HOME "${HOME:-}"
-  fm_test_isolation_assert_path TMPDIR "${TMPDIR:-}"
+  [ -n "${HOME:-}" ] || fm_test_isolation_fail 'HOME is unset in the sealed test'
+  [ -n "${TMPDIR:-}" ] || fm_test_isolation_fail 'TMPDIR is unset in the sealed test'
+  [ -n "${TMUX_TMPDIR:-}" ] || fm_test_isolation_fail 'TMUX_TMPDIR is unset in the sealed test'
+  fm_test_isolation_assert_path HOME "$HOME"
+  fm_test_isolation_assert_path TMPDIR "$TMPDIR"
+  fm_test_isolation_assert_path TMUX_TMPDIR "$TMUX_TMPDIR"
 
   effective_home=${FM_HOME:-${FM_ROOT_OVERRIDE:-${FM_TEST_REPO_ROOT:-}}}
   [ -n "$effective_home" ] \
@@ -171,15 +240,25 @@ fm_test_isolation_guard_environment() {
   effective_pool=${FM_TREEHOUSE_ROOT:-${HOME:-}/.treehouse}
   fm_test_isolation_assert_path FM_TREEHOUSE_ROOT "$effective_pool"
 
-  for label in FM_DATA_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE \
-    FM_CHECKOUT_REFRESH_STATE_ROOT FM_CHECKOUT_REFRESH_LOCK_ROOT \
+  for label in FM_DATA_OVERRIDE FM_PROJECTS_OVERRIDE \
+    FM_CHECKOUT_REFRESH_STATE_ROOT \
     FM_REPORT_STACK_ROOT FM_ACCOUNT_DIRECTORY_ROOT FM_ACCOUNT_DIRECTORY_STATE_ROOT \
     XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME; do
     eval "value=\${$label:-}"
     [ -z "$value" ] || fm_test_isolation_assert_path "$label" "$value"
   done
+  # Product tests deliberately exercise malformed files at these directory
+  # boundaries. Containment is the harness invariant; the product remains
+  # responsible for rejecting an in-sandbox entry of the wrong type.
+  [ -z "${FM_CONFIG_OVERRIDE:-}" ] \
+    || fm_test_isolation_assert_path FM_CONFIG_OVERRIDE \
+      "$FM_CONFIG_OVERRIDE" entry
+  [ -z "${FM_CHECKOUT_REFRESH_LOCK_ROOT:-}" ] \
+    || fm_test_isolation_assert_path FM_CHECKOUT_REFRESH_LOCK_ROOT \
+      "$FM_CHECKOUT_REFRESH_LOCK_ROOT" entry
 }
 
+fm_test_isolation_adopt_native_herdr_root
 fm_test_isolation_guard_environment
 enable -n kill 2>/dev/null \
   || fm_test_isolation_fail 'the Bash kill builtin could not be disabled'
@@ -189,5 +268,6 @@ if [ -n "${FM_TEST_BASH_ENV_PAYLOAD:-}" ]; then
   fm_test_isolation_assert_path FM_TEST_BASH_ENV_PAYLOAD "$FM_TEST_BASH_ENV_PAYLOAD" entry
   [ -f "$FM_TEST_BASH_ENV_PAYLOAD" ] && [ ! -L "$FM_TEST_BASH_ENV_PAYLOAD" ] \
     || fm_test_isolation_fail "FM_TEST_BASH_ENV_PAYLOAD is not a regular sandbox file: $FM_TEST_BASH_ENV_PAYLOAD"
+  # shellcheck disable=SC1090  # The payload is a guard-validated sandbox fixture.
   . "$FM_TEST_BASH_ENV_PAYLOAD"
 fi

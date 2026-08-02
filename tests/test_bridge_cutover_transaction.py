@@ -4,6 +4,7 @@ import hashlib
 import fcntl
 import json
 import os
+import pwd
 import stat
 import sys
 import tempfile
@@ -922,7 +923,8 @@ class BridgeCutoverTransactionTests(unittest.TestCase):
     def test_broad_root_and_home_are_refused(self) -> None:
         fixture = Fixture()
         self.addCleanup(fixture.close)
-        for broad in ("/", str(Path.home())):
+        account_home = pwd.getpwuid(os.getuid()).pw_dir
+        for broad in ("/", account_home):
             with self.subTest(root=broad):
                 fixture.manifest_data["allowed_roots"] = [broad]
                 fixture.write_manifest()

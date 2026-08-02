@@ -352,10 +352,11 @@ status_log_pr_url() {
 
 # A PR-ready result is merge input, so branch equality is insufficient: a
 # branch can have a newer PR head while `axi status` still renders an earlier
-# completed run for that branch. Compare the run's rendered head (a short SHA)
-# to the live PR head and fail closed when currentness is unavailable.
+# completed run for that branch. Resolve the run's rendered head to one full
+# local commit, compare exact identities, and fail closed when either proof is
+# unavailable.
 verify_ready_head_or_emit() {  # <validated-head> <pr-url>
-  local validated_head=$1 pr_url=$2 live_head
+  local validated_head=$1 pr_url=$2 live_head resolved_head
   if [ -z "$validated_head" ] || [ -z "$pr_url" ]; then
     emit unknown run-step "PR-ready run-step currentness is unavailable; do not merge"
   fi
@@ -363,10 +364,13 @@ verify_ready_head_or_emit() {  # <validated-head> <pr-url>
   if [ -z "$live_head" ]; then
     emit unknown run-step "PR-ready run-step could not verify the live PR head; do not merge"
   fi
-  case "$live_head" in
-    "$validated_head"*) return 0 ;;
-    *) emit stale run-step "stale run-step: validated head $validated_head no longer matches PR head ${live_head:0:8}; do not merge" ;;
-  esac
+  resolved_head=$(git -C "$WT" rev-parse --verify "$validated_head^{commit}" 2>/dev/null || true)
+  if ! [[ "$resolved_head" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+    emit unknown run-step "PR-ready run-step could not resolve validated head $validated_head unambiguously; do not merge"
+  fi
+  if [ "$resolved_head" != "$live_head" ]; then
+    emit stale run-step "stale run-step: validated head $validated_head resolves to ${resolved_head:0:8}, not PR head ${live_head:0:8}; do not merge"
+  fi
 }
 
 # `axi status` may return an earlier completed run even after another run has
@@ -577,7 +581,13 @@ if [ "$HAVE_RUN" = 1 ]; then
     # coarse-vs-full distinction, so a real gate is never silently missed.
     case "$COARSE_STATUS" in
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
-      completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
+      completed)
+        RUN_STATE="done"
+        RUN_DETAIL="run completed"
+        RUN_HEAD=$COARSE_HEAD
+        RUN_PR=$COARSE_PR
+        READY_CLAIM=1
+        ;;
       failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
       cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
       *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
@@ -602,7 +612,7 @@ if [ "$HAVE_RUN" = 1 ]; then
           case "$pr_state" in
             merged)  RUN_DETAIL="run passed: PR merged (verified)" ;;
             closed)  RUN_DETAIL="run passed: PR closed without merge (verified)" ;;
-            open)    RUN_DETAIL="run passed: PR open (not merged)" ;;
+            open)    RUN_DETAIL="run passed: PR open (not merged)"; READY_CLAIM=1 ;;
             missing) RUN_DETAIL="run passed: no PR to verify" ;;
             *)       RUN_DETAIL="run passed: PR state unavailable (not verified)" ;;
           esac

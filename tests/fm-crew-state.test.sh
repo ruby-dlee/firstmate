@@ -121,6 +121,17 @@ EOF
 *) exit 2 ;;
 esac
 SH
+  cat > "$fb/git" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${FM_FAKE_GIT_RESOLVE:-}" != "" ] && [ "${3:-}" = rev-parse ] && [ "${4:-}" = --verify ]; then
+  case "$FM_FAKE_GIT_RESOLVE" in
+    fail) exit 1 ;;
+    *) printf '%s\n' "$FM_FAKE_GIT_RESOLVE"; exit 0 ;;
+  esac
+fi
+exec /usr/bin/git "$@"
+SH
   cat > "$fb/herdr" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -165,7 +176,7 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/herdr"
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/git" "$fb/herdr"
   printf '%s\n' "$fb"
 }
 
@@ -210,11 +221,13 @@ reset_fakes() {
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
   FM_FAKE_PR_STATE=merged
-  FM_FAKE_PR_HEAD=abc1234deadbeef
+  FM_FAKE_PR_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_GH_AXI_FAIL=0
+  FM_FAKE_GIT_RESOLVE=abc1234cafebabeabc1234cafebabeabc1234caf
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
+  export FM_FAKE_GIT_RESOLVE
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -567,7 +580,7 @@ test_checks_passed_for_older_pr_head_is_stale() {
   fm_write_meta "$d/state/feat-stale-head.meta" "window=fm:fm-feat-stale-head" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-stale-head)"
   FM_FAKE_RUNS_LIST='completed fm/feat-stale-head abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
-  FM_FAKE_PR_HEAD=def5678cafebabe
+  FM_FAKE_PR_HEAD=def5678cafebabedef5678cafebabedef5678caf
   local out; out=$(run_crew_state "$d" feat-stale-head)
   assert_contains "$out" "state: stale" "older completed run -> stale"
   assert_contains "$out" "source: run-step" "stale verdict identifies the run-step"
@@ -586,12 +599,45 @@ test_checks_passed_for_current_pr_head_is_done() {
   fm_write_meta "$d/state/feat-current-head.meta" "window=fm:fm-feat-current-head" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-current-head)"
   FM_FAKE_RUNS_LIST='completed fm/feat-current-head abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
-  FM_FAKE_PR_HEAD=abc1234cafebabe
+  FM_FAKE_PR_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   local out; out=$(run_crew_state "$d" feat-current-head)
   assert_contains "$out" "state: done" "current completed run -> done"
   assert_contains "$out" "checks green" "current completed run retains ready detail"
   assert_not_contains "$out" "state: stale" "matching PR head is not stale"
   pass "checks-passed run whose PR head matches remains done"
+}
+
+test_checks_passed_requires_unambiguous_local_head() {
+  reset_fakes
+  local d; d=$(new_case unresolved-run-head)
+  make_repo_on_branch "$d/wt" fm/feat-unresolved-head
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-unresolved-head.meta" "window=fm:fm-feat-unresolved-head" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-unresolved-head)"
+  FM_FAKE_RUNS_LIST='completed fm/feat-unresolved-head abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
+  FM_FAKE_GIT_RESOLVE=fail
+  local out; out=$(run_crew_state "$d" feat-unresolved-head)
+  assert_contains "$out" "state: unknown" "unresolved validated head -> unknown"
+  assert_contains "$out" "unambiguously" "resolution failure names the missing proof"
+  assert_contains "$out" "do not merge" "resolution failure is merge-safe"
+  assert_not_contains "$out" "state: done" "unresolved validated head must not read done"
+  pass "checks-passed run fails closed when its short head is unresolved"
+}
+
+test_checks_passed_rejects_same_prefix_different_full_head() {
+  reset_fakes
+  local d; d=$(new_case prefix-collision-head)
+  make_repo_on_branch "$d/wt" fm/feat-prefix-collision
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-prefix-collision.meta" "window=fm:fm-feat-prefix-collision" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-prefix-collision)"
+  FM_FAKE_RUNS_LIST='completed fm/feat-prefix-collision abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
+  FM_FAKE_PR_HEAD=abc1234fffffffffffffffffffffffffffffffff
+  local out; out=$(run_crew_state "$d" feat-prefix-collision)
+  assert_contains "$out" "state: stale" "same short prefix with different full head -> stale"
+  assert_contains "$out" "do not merge" "exact-identity mismatch is merge-safe"
+  assert_not_contains "$out" "state: done" "prefix similarity must not authorize done"
+  pass "checks-passed run requires exact full-head equality"
 }
 
 test_earlier_completed_run_is_stale_while_newer_run_active() {
@@ -601,7 +647,7 @@ test_earlier_completed_run_is_stale_while_newer_run_active() {
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-earlier-run.meta" "window=fm:fm-feat-earlier-run" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-earlier-run)"
-  FM_FAKE_PR_HEAD=abc1234cafebabe
+  FM_FAKE_PR_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_RUNS_LIST='running fm/feat-earlier-run abc1234 2026-08-01 23:59 https://github.com/o/r/pull/2'
   local out; out=$(run_crew_state "$d" feat-earlier-run)
   assert_contains "$out" "state: stale" "earlier completed run -> stale"
@@ -618,7 +664,7 @@ test_completed_run_fails_closed_when_newest_run_is_unavailable() {
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-unavailable-newest.meta" "window=fm:fm-feat-unavailable-newest" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-unavailable-newest)"
-  FM_FAKE_PR_HEAD=abc1234cafebabe
+  FM_FAKE_PR_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_RUNS_LIST=""
   local out; out=$(run_crew_state "$d" feat-unavailable-newest)
   assert_contains "$out" "state: unknown" "unverifiable newest run -> unknown"
@@ -810,6 +856,7 @@ test_terminal_passed_does_not_claim_open_pr_merged() {
   fm_write_meta "$d/state/feat-do.meta" "window=fm:fm-feat-do" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_passed fm/feat-do)"
   FM_FAKE_PR_STATE=open
+  FM_FAKE_RUNS_LIST='completed fm/feat-do abc1234 2026-08-01 23:58 https://github.com/o/r/pull/1'
   local out; out=$(run_crew_state "$d" feat-do)
   assert_contains "$out" "state: done" "passed run with open PR remains terminal"
   assert_contains "$out" "PR open (not merged)" "open PR is reported from GitHub state"
@@ -938,6 +985,22 @@ EOF
   pass "cross-branch attribution picks the branch's most recent row"
 }
 
+test_coarse_completed_run_verifies_live_pr_head() {
+  reset_fakes
+  local d; d=$(new_case coarse-completed-stale)
+  make_repo_on_branch "$d/wt" fm/feat-coarse-completed
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-coarse-completed.meta" "window=fm:fm-feat-coarse-completed" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST='completed fm/feat-coarse-completed abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
+  FM_FAKE_PR_HEAD=def5678cafebabedef5678cafebabedef5678caf
+  local out; out=$(run_crew_state "$d" feat-coarse-completed)
+  assert_contains "$out" "state: stale" "coarse completed run with moved PR head -> stale"
+  assert_contains "$out" "do not merge" "coarse currentness failure is merge-safe"
+  assert_not_contains "$out" "state: done" "coarse completion alone must not authorize done"
+  pass "coarse completed run verifies the live PR head"
+}
+
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
   reset_fakes
   local d; d=$(new_case coarse-ready-other-log)
@@ -951,7 +1014,8 @@ test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
   running    fm/feat-coarseready bbbbbbb  2026-07-02 22:05
 EOF
 )"
-  FM_FAKE_PR_HEAD=bbbbbbbcafebabe
+  FM_FAKE_PR_HEAD=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
+  FM_FAKE_GIT_RESOLVE=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
   FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
   local out; out=$(run_crew_state "$d" feat-coarseready)
   assert_contains "$out" "state: done" "coarse ready status -> done"
@@ -1360,6 +1424,8 @@ test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_checks_passed_for_older_pr_head_is_stale
 test_checks_passed_for_current_pr_head_is_done
+test_checks_passed_requires_unambiguous_local_head
+test_checks_passed_rejects_same_prefix_different_full_head
 test_earlier_completed_run_is_stale_while_newer_run_active
 test_completed_run_fails_closed_when_newest_run_is_unavailable
 test_ci_monitoring_no_checks_terminal_surfaces_done
@@ -1379,6 +1445,7 @@ test_terminal_passed_clamps_invalid_gh_timeouts_and_fails_closed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
+test_coarse_completed_run_verifies_live_pr_head
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane

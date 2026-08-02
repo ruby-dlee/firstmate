@@ -33,7 +33,7 @@ It retries only the exact reconciliation socket-read timeout with bounded expone
 It never calls daemon start, stop, restart, update, abort, or rerun.
 Any other error returns immediately, and exhaustion preserves the final error while explicitly reporting that the shared daemon was left untouched.
 
-`bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when its validated head matches the live GitHub PR head read through `gh-axi`.
+`bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when its rendered head resolves unambiguously to one full local commit and that exact identity matches the full live GitHub PR head read through `gh-axi`.
 A mismatch returns `state: stale`, names both heads, and says `do not merge` instead of reporting checks green.
 An unavailable PR-head read returns `unknown` with the same merge prohibition.
 For a completed snapshot, it also requires the newest-first run list to report that branch's newest run as completed.

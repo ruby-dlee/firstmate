@@ -14,6 +14,7 @@
 #   (f) malformed PR URL fails fast without calling gh-axi
 #   (g) explicit merge method is not overridden by the default --squash
 #   (h) repo override args fail fast because the repo comes from the URL
+#   (i) reviewed-head override args fail fast before crosscheck or merge
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -320,6 +321,37 @@ test_repo_override_args_refuse_before_recording() {
   pass "fm-pr-merge refuses repo override args before recording state"
 }
 
+test_head_override_args_refuse_before_recording() {
+  local case_dir rc form
+  for form in separate equals; do
+    case_dir=$(make_case "head-override-$form")
+    add_gh_mocks "$case_dir" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    : > "$case_dir/gh-axi.log"
+
+    set +e
+    if [ "$form" = separate ]; then
+      run_pr_merge "$case_dir" task-x1 https://github.com/right/repo/pull/5 -- \
+        --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        > "$case_dir/stdout" 2> "$case_dir/stderr"
+    else
+      run_pr_merge "$case_dir" task-x1 https://github.com/right/repo/pull/5 -- \
+        --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        > "$case_dir/stdout" 2> "$case_dir/stderr"
+    fi
+    rc=$?
+    set -e
+
+    expect_code 1 "$rc" "head-override-$form: fm-pr-merge should refuse reviewed-head overrides"
+    assert_grep 'must not override the crosscheck-reviewed head' "$case_dir/stderr" \
+      "head-override-$form: refusal did not explain the protected head"
+    assert_no_grep 'pr=https://github.com/right/repo/pull/5' "$case_dir/state/task-x1.meta" \
+      "head-override-$form: PR URL was recorded before rejecting head override"
+    assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
+      "head-override-$form: gh-axi pr merge was invoked despite head override"
+  done
+  pass "fm-pr-merge refuses both reviewed-head override argument forms"
+}
+
 test_explicit_merge_method_not_overridden() {
   local case_dir
   case_dir=$(make_case explicit-merge-method)
@@ -389,6 +421,7 @@ test_missing_meta_refuses_before_merge
 test_malformed_url_refuses_before_merge
 test_rejects_unsafe_url_segments_before_recording
 test_repo_override_args_refuse_before_recording
+test_head_override_args_refuse_before_recording
 test_explicit_merge_method_not_overridden
 test_method_equals_merge_method_not_overridden
 test_parses_pr_url_for_gh_axi

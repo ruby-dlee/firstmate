@@ -22,8 +22,7 @@
 # Merge method: defaults to --squash when the caller passes none of --squash,
 # --merge, --rebase, or --method after the optional -- separator. An explicit
 # caller method is never overridden.
-# Extra args must not include --repo or -R because the repo is parsed from the
-# PR URL.
+# Extra args must not override the parsed repository or reviewed head.
 #
 # Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
 set -eu
@@ -69,12 +68,16 @@ parse_pr_url() {
   return 1
 }
 
-reject_repo_overrides() {
+reject_protected_overrides() {
   local arg
   for arg in "$@"; do
     case "$arg" in
       --repo|--repo=*|-R|-R?*)
         echo "error: extra merge args must not override --repo parsed from PR URL (got: $arg)" >&2
+        return 1
+        ;;
+      --match-head-commit|--match-head-commit=*)
+        echo "error: extra merge args must not override the crosscheck-reviewed head (got: $arg)" >&2
         return 1
         ;;
     esac
@@ -83,7 +86,7 @@ reject_repo_overrides() {
 }
 
 parse_pr_url "$URL" || exit 1
-reject_repo_overrides "$@" || exit 1
+reject_protected_overrides "$@" || exit 1
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || { echo "error: fm-pr-check did not record pr=$URL in $META; refusing to merge" >&2; exit 1; }

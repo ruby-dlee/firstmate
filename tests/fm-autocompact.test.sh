@@ -52,6 +52,13 @@ case "$FM_FAKE_JUDGMENT_MODE" in
   failure)
     exit 41
     ;;
+  delayed-success)
+    : > "$FM_FAKE_JUDGMENT_READY"
+    while [ ! -f "$FM_FAKE_JUDGMENT_RELEASE" ]; do
+      sleep 0.01
+    done
+    printf '%s\n' '{"is_error":false,"structured_output":{"result":"no_changes","summary":"nothing durable","edits":[]}}'
+    ;;
   *)
     printf '%s\n' '{"is_error":false,"structured_output":{"result":"no_changes","summary":"nothing durable","edits":[]}}'
     ;;
@@ -334,6 +341,50 @@ EOF
   pass "compare-before-replace refuses to corrupt a concurrent private-memory write"
 }
 
+test_older_worker_cannot_complete_newer_failed_anchor() {
+  local rec root home transcript fake anchor ready release older_pid attempts=0
+  rec=$(new_primary anchor-status-race)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  write_transcript "$transcript" 'Remember this overlapping capture fact.'
+  printf '%s\n' '# overlap-fallback' > "$home/data/backlog.md"
+  fake=$(fake_judgment_claude "$home/fake-overlap" delayed-success)
+  ready="$home/older-ready"
+  release="$home/release-older"
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-older\",\"transcript_path\":\"$transcript\"}" \
+    | FM_FAKE_JUDGMENT_MODE=delayed-success \
+      FM_FAKE_JUDGMENT_READY="$ready" \
+      FM_FAKE_JUDGMENT_RELEASE="$release" \
+      FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1 &
+  older_pid=$!
+  while [ ! -f "$ready" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 500 ] || fail "older judgment worker did not reach the synchronization point"
+    sleep 0.01
+  done
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"manual\",\"session_id\":\"session-newer\",\"transcript_path\":\"$transcript\"}" \
+    | FM_FAKE_JUDGMENT_MODE=failure \
+      FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1
+  : > "$release"
+  wait "$older_pid"
+
+  anchor="$home/data/autocompact-resume.md"
+  assert_grep 'Session: `session-newer`' "$anchor" "older worker replaced the newer deterministic anchor"
+  assert_grep 'Judgment capture: FAILED' "$anchor" "older worker marked the newer failed anchor complete"
+  assert_not_contains "$(cat "$anchor")" 'Judgment capture: COMPLETE' "older worker upgraded a newer failed anchor"
+  pass "an older worker cannot mark a newer failed anchor complete"
+}
+
 test_compact_sessionstart_injects_anchor_and_reconciles() {
   local rec root home out
   rec=$(new_primary recover)
@@ -415,6 +466,7 @@ test_judgment_capture_routes_conversation_only_preference
 test_judgment_failure_degrades_to_loud_deterministic_anchor
 test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
+test_older_worker_cannot_complete_newer_failed_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles
 test_recovery_payload_failures_still_emit_durable_context
 test_noncompact_sessionstart_is_inert

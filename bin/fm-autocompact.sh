@@ -51,7 +51,28 @@ FM_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}
 STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 DATA=${FM_DATA_OVERRIDE:-$FM_HOME/data}
 ANCHOR=$DATA/autocompact-resume.md
+ANCHOR_LOCK=$DATA/.autocompact-anchor.lock
+ANCHOR_LOCK_HELD=0
 MODE=${1:-}
+
+release_anchor_lock() {
+  if [ "$ANCHOR_LOCK_HELD" -eq 1 ]; then
+    rmdir "$ANCHOR_LOCK" 2>/dev/null || true
+    ANCHOR_LOCK_HELD=0
+  fi
+}
+
+acquire_anchor_lock() {
+  local attempts=0
+  while ! mkdir "$ANCHOR_LOCK" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || return 1
+    sleep 0.01
+  done
+  ANCHOR_LOCK_HELD=1
+}
+
+trap release_anchor_lock EXIT
 
 usage() {
   cat <<'EOF'
@@ -238,6 +259,7 @@ render_anchor() {
   local judgment_status=$1 meta id meta_found=0
   printf '# Autocompact resume anchor\n\n' || return 1
   printf '%s\n\n' "$judgment_status" || return 1
+  printf "Capture ID: \`%s\`\n" "$capture_id" || return 1
   printf "Generated: \`%s\`\n" "$generated" || return 1
   printf "Trigger: \`%s\`\n" "$trigger" || return 1
   printf "Session: \`%s\`\n" "$session_id" || return 1
@@ -265,7 +287,7 @@ render_anchor() {
 }
 
 capture_anchor() {
-  local trigger session_id transcript generated snapshot tmp judgment_status judgment_rc
+  local trigger session_id transcript generated snapshot tmp capture_id judgment_status judgment_rc
   trigger=$(json_string_field trigger "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   case "$trigger" in
@@ -312,15 +334,22 @@ capture_anchor() {
   umask 077
   tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") \
     || capture_failed 'could not allocate a temporary anchor'
+  capture_id=${tmp##*.autocompact-resume.md.}
   judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, conversation-only durable knowledge may have been lost.'
   render_anchor "$judgment_status" > "$tmp" || {
     rm -f "$tmp" || capture_failed 'could not clean the incomplete temporary anchor'
     capture_failed 'could not render the resume anchor'
   }
+  acquire_anchor_lock || {
+    rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
+    capture_failed 'could not serialize deterministic anchor publication'
+  }
   mv -f "$tmp" "$ANCHOR" || {
+    release_anchor_lock
     rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
     capture_failed 'could not publish the resume anchor atomically'
   }
+  release_anchor_lock
 
   if [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
     judgment_status='Judgment capture: FAILED - judgment capture was disabled; conversation-only durable knowledge may have been lost.'
@@ -360,19 +389,29 @@ capture_anchor() {
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not allocate a status-update anchor; the existing loud incomplete status remains authoritative.' >&2
     return 0
   }
-  if ! awk -v status="$judgment_status" '
+  if ! acquire_anchor_lock; then
+    rm -f "$tmp"
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not serialize the anchor status update; the existing anchor remains authoritative.' >&2
+    return 0
+  fi
+  if ! awk -v status="$judgment_status" -v capture_id="$capture_id" '
+      NR == 5 && $0 == "Capture ID: `" capture_id "`" { owned = 1 }
       NR == 3 && /^Judgment capture:/ { $0 = status; replaced = 1 }
       { print }
-      END { if (!replaced) exit 1 }
+      END { if (!owned || !replaced) exit 1 }
     ' "$ANCHOR" > "$tmp"; then
+    release_anchor_lock
     rm -f "$tmp"
-    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not update the anchor status; the existing loud incomplete status remains authoritative.' >&2
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: the anchor changed before its status update; the newer anchor remains authoritative.' >&2
     return 0
   fi
   if ! mv -f "$tmp" "$ANCHOR"; then
+    release_anchor_lock
     rm -f "$tmp"
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not publish the anchor status; the existing loud incomplete status remains authoritative.' >&2
+    return 0
   fi
+  release_anchor_lock
 }
 
 recover_context() {

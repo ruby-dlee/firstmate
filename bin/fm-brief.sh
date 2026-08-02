@@ -112,6 +112,13 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+ATTRIBUTION_SECTION=$(printf '%s\n' \
+'# Attribution and claim discipline' \
+'In status lines, commit messages, PR bodies, completion reports, and any other durable work record, attribute a decision to the captain only when the captain personally decided that specific thing.' \
+"For supervisor instructions, scaffold requirements, and any case where you are unsure, write \`firstmate directed\`." \
+'Under-claiming authority is always safe; over-claiming it is not.' \
+'Apply the same discipline to certainty and severity: relay an observation with only the certainty or severity the source established, and label any extra framing as your own assessment instead of attaching it to the source claim.')
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -162,6 +169,8 @@ When a message carries that marker, do the work, then respond via the STATUS/ESC
 For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
+
+$ATTRIBUTION_SECTION
 
 # Escalation to main firstmate
 Handle routine work yourself.
@@ -229,6 +238,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$ATTRIBUTION_SECTION
 
 $HERDR_SECTION
 
@@ -362,6 +373,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$ATTRIBUTION_SECTION
 
 $HERDR_SECTION
 

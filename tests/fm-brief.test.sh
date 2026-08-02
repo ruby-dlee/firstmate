@@ -100,6 +100,39 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+test_attribution_and_claim_discipline_renders_all_brief_scaffolds() {
+  local home kind id brief
+  home="$TMP_ROOT/attribution-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout secondmate; do
+    id="brief-attribution-$kind"
+    case "$kind" in
+      ship)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
+        ;;
+      scout)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+        ;;
+      secondmate)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
+        ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    assert_grep "# Attribution and claim discipline" "$brief" \
+      "$kind brief missing the attribution section"
+    assert_grep "attribute a decision to the captain only when the captain personally decided that specific thing" "$brief" \
+      "$kind brief does not reserve captain attribution for personal captain decisions"
+    assert_grep "write \`firstmate directed\`" "$brief" \
+      "$kind brief does not require the firstmate-directed fallback"
+    assert_grep "Under-claiming authority is always safe; over-claiming it is not." "$brief" \
+      "$kind brief lost the uncertainty rule"
+    assert_grep "Apply the same discipline to certainty and severity" "$brief" \
+      "$kind brief does not cover certainty and severity framing"
+  done
+  pass "fm-brief.sh: attribution and claim discipline renders in every scaffold"
+}
+
 test_ship_completion_report_contract() {
   local home id brief
   home="$TMP_ROOT/completion-report-home"
@@ -452,6 +485,7 @@ test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_attribution_and_claim_discipline_renders_all_brief_scaffolds
 test_ship_completion_report_contract
 test_scout_completion_report_contract
 test_promoted_scout_receives_completion_contract

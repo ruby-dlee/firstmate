@@ -36,7 +36,9 @@ It retries only the exact reconciliation socket-read timeout with bounded expone
 It never directly calls daemon start, stop, restart, update, abort, or rerun.
 Any other error returns immediately. This is containment, not a strict no-start guarantee: ordinary `axi run` calls `EnsureDaemon`, so a daemon that stops after the read-only preflight can be started during the check-to-use race. Only an upstream attach-only operation that never starts, stops, restarts, or updates the daemon can close that race.
 
-`bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when its rendered head resolves unambiguously to one full local commit and that exact identity matches the full live GitHub PR head read through `gh-axi`.
+`bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when GitHub resolves its rendered head to one full commit in the PR repository and that exact remote identity matches the full live GitHub PR head read through `gh-axi`.
+It never uses local Git object availability as evidence of a remote publication fact, so an unrelated fetch cannot change the verdict.
+A missing or ambiguous remote commit resolution returns `unknown` and `do not merge`, and a PR URL found only in the append-only status log is never promoted to current run identity.
 A mismatch returns `state: stale`, names both heads, and says `do not merge` instead of reporting checks green.
 An unavailable PR-head read returns `unknown` with the same merge prohibition.
 For a completed snapshot, it also requires the newest-first run list to report that branch's newest run as completed.
@@ -50,6 +52,8 @@ The same suite observed a stopped-daemon preflight refuse without invoking `axi 
 
 `bash tests/fm-crew-state.test.sh` supplied a completed run at head `abc1234` and a live PR at `def5678...`, then observed `state: stale`, `source: run-step`, both head values, and `do not merge`.
 The paired matching-head case remained `state: done`.
+The suite also created a real remote commit absent from the lane worktree, observed the healthy remote run and PR report `state: done`, fetched that commit into the worktree, and observed byte-for-byte identical output afterward.
+It separately observed an unavailable GitHub commit resolution and a status-log-only PR URL both fail closed as `state: unknown` with `do not merge`.
 The suite also supplied an earlier completed snapshot while the newest run-list row for the same branch was running and observed `state: stale` with `newer active run exists` and `do not merge`.
 
 The helpers were also exercised directly outside the test harness against throwaway homes.

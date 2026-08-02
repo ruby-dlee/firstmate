@@ -344,17 +344,30 @@ nm_pr_head() {  # <pr-url>
   strip_quotes "$head"
 }
 
-status_log_pr_url() {
-  printf '%s\n' "$LOG_LINE" \
-    | grep -oE 'https://github\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+' \
-    | head -1
+# Resolve no-mistakes' rendered run head in the PR's remote repository and
+# return GitHub's full commit identity. The rendered head may be abbreviated,
+# so comparing it directly would be a prefix test rather than an identity test.
+# Local Git objects are intentionally irrelevant here: fetching an unrelated
+# remote must never change a publication-currentness verdict.
+nm_remote_commit_head() {  # <pr-url> <commit-ref>
+  local pr_url=$1 commit_ref=$2 owner repo out head
+  [ -n "$pr_url" ] && [[ "$commit_ref" =~ ^[0-9a-fA-F]{7,64}$ ]] || return 0
+  command -v gh-axi >/dev/null 2>&1 || return 0
+  if [[ "$pr_url" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/[0-9]+/?$ ]]; then
+    owner=${BASH_REMATCH[1]}
+    repo=${BASH_REMATCH[2]}
+  else
+    return 0
+  fi
+  out=$(gh_axi_run api "/repos/$owner/$repo/commits/$commit_ref")
+  head=$(printf '%s\n' "$out" | sed -n 's/^sha:[[:space:]]*\(.*\)/\1/p' | head -1)
+  strip_quotes "$head"
 }
 
 # A PR-ready result is merge input, so branch equality is insufficient: a
 # branch can have a newer PR head while `axi status` still renders an earlier
-# completed run for that branch. Resolve the run's rendered head to one full
-# local commit, compare exact identities, and fail closed when either proof is
-# unavailable.
+# completed run for that branch. Resolve both facts through GitHub, compare
+# exact full identities, and fail closed when either remote proof is unavailable.
 verify_ready_head_or_emit() {  # <run-id> <validated-head> <pr-url>
   local run_id=$1 validated_head=$2 pr_url=$3 live_head resolved_head
   if [ -z "$run_id" ]; then
@@ -367,12 +380,15 @@ verify_ready_head_or_emit() {  # <run-id> <validated-head> <pr-url>
   if [ -z "$live_head" ]; then
     emit unknown run-step "PR-ready run-step could not verify the live PR head; do not merge"
   fi
-  resolved_head=$(git -C "$WT" rev-parse --verify "$validated_head^{commit}" 2>/dev/null || true)
+  resolved_head=$(nm_remote_commit_head "$pr_url" "$validated_head")
   if ! [[ "$resolved_head" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
-    emit unknown run-step "PR-ready run-step could not resolve validated head $validated_head unambiguously; do not merge"
+    emit unknown run-step "PR-ready run-step could not resolve validated head $validated_head through GitHub; do not merge"
+  fi
+  if ! [[ "$live_head" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+    emit unknown run-step "PR-ready run-step received an invalid live PR head; do not merge"
   fi
   if [ "$resolved_head" != "$live_head" ]; then
-    emit stale run-step "stale run-step: validated head $validated_head resolves to ${resolved_head:0:8}, not PR head ${live_head:0:8}; do not merge"
+    emit stale run-step "stale run-step: validated head $validated_head resolves remotely to ${resolved_head:0:8}, not PR head ${live_head:0:8}; do not merge"
   fi
 }
 
@@ -683,7 +699,6 @@ if [ "$HAVE_RUN" = 1 ]; then
       CI_LOG_STATE=not-ready
     fi
     if [ "$CI_LOG_STATE" != not-ready ]; then
-      [ -n "$RUN_PR" ] || RUN_PR=$(status_log_pr_url)
       verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
       emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi

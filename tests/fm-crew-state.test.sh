@@ -108,8 +108,8 @@ pull_request:
 EOF
   ;;
 api)
-  case "${2:-}" in /repos/o/r/pulls/[0-9]*) ;; *) exit 2 ;; esac
-  cat <<EOF
+  case "${2:-}" in
+  /repos/o/r/pulls/[0-9]*) cat <<EOF
 state: open
 head:
   ref: fm/test
@@ -117,6 +117,18 @@ head:
 base:
   ref: main
 EOF
+    ;;
+  /repos/o/r/commits/*)
+    [ "${FM_FAKE_REMOTE_COMMIT_FAIL:-0}" = 0 ] || exit 1
+    cat <<EOF
+sha: ${FM_FAKE_REMOTE_COMMIT_HEAD:-abc1234cafebabeabc1234cafebabeabc1234caf}
+commit:
+  tree:
+    sha: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+EOF
+    ;;
+  *) exit 2 ;;
+  esac
   ;;
 *) exit 2 ;;
 esac
@@ -124,11 +136,8 @@ SH
   cat > "$fb/git" <<'SH'
 #!/usr/bin/env bash
 set -u
-if [ "${FM_FAKE_GIT_RESOLVE:-}" != "" ] && [ "${3:-}" = rev-parse ] && [ "${4:-}" = --verify ]; then
-  case "$FM_FAKE_GIT_RESOLVE" in
-    fail) exit 1 ;;
-    *) printf '%s\n' "$FM_FAKE_GIT_RESOLVE"; exit 0 ;;
-  esac
+if [ "${FM_FAIL_ON_LOCAL_COMMIT_LOOKUP:-0}" = 1 ] && [ "${3:-}" = rev-parse ] && [ "${4:-}" = --verify ]; then
+  exit 99
 fi
 exec /usr/bin/git "$@"
 SH
@@ -223,11 +232,13 @@ reset_fakes() {
   FM_FAKE_PR_STATE=merged
   FM_FAKE_PR_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_GH_AXI_FAIL=0
-  FM_FAKE_GIT_RESOLVE=abc1234cafebabeabc1234cafebabeabc1234caf
+  FM_FAKE_REMOTE_COMMIT_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
+  FM_FAKE_REMOTE_COMMIT_FAIL=0
+  FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
-  export FM_FAKE_GIT_RESOLVE
+  export FM_FAKE_REMOTE_COMMIT_HEAD FM_FAKE_REMOTE_COMMIT_FAIL FM_FAIL_ON_LOCAL_COMMIT_LOOKUP
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -538,6 +549,28 @@ test_ci_ready_done_log_beats_monitoring_run() {
   pass "ci-ready status log beats monitoring run"
 }
 
+# A status-log URL is an event-log detail, not evidence that it belongs to the
+# current no-mistakes run. Without a PR URL on the exact run object, currentness
+# is unknown even when the log claims checks are green.
+test_ci_ready_log_pr_url_does_not_supply_run_identity() {
+  reset_fakes
+  local d out
+  d=$(new_case ci-ready-log-pr-only)
+  make_repo_on_branch "$d/wt" fm/feat-ci-log-pr-only
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-ci-log-pr-only.meta" \
+    "window=fm:fm-feat-ci-log-pr-only" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\n' > "$d/state/feat-ci-log-pr-only.status"
+  FM_FAKE_AXI_STATUS=$(run_ci_monitoring fm/feat-ci-log-pr-only | sed 's#pr: "https://github.com/o/r/pull/2"#pr: ""#')
+  FM_FAKE_CI_LOGS="all CI checks passed - still monitoring until merged or closed"
+  out=$(run_crew_state "$d" feat-ci-log-pr-only)
+  assert_contains "$out" "state: unknown" "log-only PR URL -> unknown"
+  assert_contains "$out" "currentness is unavailable" "log-only PR URL names missing run evidence"
+  assert_contains "$out" "do not merge" "log-only PR URL is merge-safe"
+  assert_not_contains "$out" "state: done" "event-log PR URL must not authorize done"
+  pass "status-log PR URL is never promoted to current run identity"
+}
+
 # Regression for the PR #252 incident: the crewmate's own status log never got a
 # "done: ... checks green" line (log_reports_ci_ready above does not apply),
 # but the ci step's log tail shows CI is actually green and only waiting on
@@ -619,7 +652,7 @@ test_checks_passed_for_current_pr_head_is_done() {
   pass "checks-passed run whose PR head matches remains done"
 }
 
-test_checks_passed_requires_unambiguous_local_head() {
+test_checks_passed_requires_remote_head_resolution() {
   reset_fakes
   local d; d=$(new_case unresolved-run-head)
   make_repo_on_branch "$d/wt" fm/feat-unresolved-head
@@ -627,13 +660,13 @@ test_checks_passed_requires_unambiguous_local_head() {
   fm_write_meta "$d/state/feat-unresolved-head.meta" "window=fm:fm-feat-unresolved-head" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-unresolved-head)"
   FM_FAKE_RUNS_LIST='completed fm/feat-unresolved-head abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
-  FM_FAKE_GIT_RESOLVE=fail
+  FM_FAKE_REMOTE_COMMIT_FAIL=1
   local out; out=$(run_crew_state "$d" feat-unresolved-head)
   assert_contains "$out" "state: unknown" "unresolved validated head -> unknown"
-  assert_contains "$out" "unambiguously" "resolution failure names the missing proof"
+  assert_contains "$out" "through GitHub" "resolution failure names the missing remote proof"
   assert_contains "$out" "do not merge" "resolution failure is merge-safe"
   assert_not_contains "$out" "state: done" "unresolved validated head must not read done"
-  pass "checks-passed run fails closed when its short head is unresolved"
+  pass "checks-passed run fails closed when GitHub cannot resolve its head"
 }
 
 test_checks_passed_rejects_same_prefix_different_full_head() {
@@ -650,6 +683,42 @@ test_checks_passed_rejects_same_prefix_different_full_head() {
   assert_contains "$out" "do not merge" "exact-identity mismatch is merge-safe"
   assert_not_contains "$out" "state: done" "prefix similarity must not authorize done"
   pass "checks-passed run requires exact full-head equality"
+}
+
+# Regression for PR #71's adversarial review: publication currentness is a
+# remote fact. The exact same remote run and PR state must produce the exact
+# same verdict before and after the worktree happens to fetch that commit.
+test_remote_currentness_is_independent_of_local_fetch() {
+  reset_fakes
+  local d remote_head before after
+  d=$(new_case remote-currentness)
+  make_repo_on_branch "$d/wt" fm/feat-remote-currentness
+  git init -q --bare "$d/remote.git"
+  git -C "$d/wt" remote add origin "$d/remote.git"
+  git -C "$d/wt" push -q -u origin fm/feat-remote-currentness
+  git clone -q --branch fm/feat-remote-currentness "$d/remote.git" "$d/publisher"
+  git -C "$d/publisher" commit -q --allow-empty -m remote-head
+  git -C "$d/publisher" push -q origin fm/feat-remote-currentness
+  remote_head=$(git -C "$d/publisher" rev-parse HEAD)
+  git -C "$d/wt" cat-file -e "$remote_head^{commit}" 2>/dev/null \
+    && fail "remote-only fixture commit unexpectedly exists locally before fetch"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-remote-currentness.meta" \
+    "window=fm:fm-feat-remote-currentness" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS=$(run_checks_passed fm/feat-remote-currentness | sed "s/head: \"abc1234\"/head: \"${remote_head:0:7}\"/")
+  FM_FAKE_RUNS_LIST="completed fm/feat-remote-currentness ${remote_head:0:7} 2026-08-01 23:58 https://github.com/o/r/pull/2"
+  FM_FAKE_PR_HEAD=$remote_head
+  FM_FAKE_REMOTE_COMMIT_HEAD=$remote_head
+  FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=1
+  before=$(run_crew_state "$d" feat-remote-currentness)
+  assert_contains "$before" "state: done" "remote current head is done before local fetch"
+  git -C "$d/wt" fetch -q origin fm/feat-remote-currentness
+  git -C "$d/wt" cat-file -e "$remote_head^{commit}" \
+    || fail "remote fixture commit still absent locally after fetch"
+  after=$(run_crew_state "$d" feat-remote-currentness)
+  [ "$before" = "$after" ] \
+    || fail "local fetch changed remote currentness verdict: before=[$before] after=[$after]"
+  pass "PR-ready currentness depends on remote identity, not incidental local fetch state"
 }
 
 test_earlier_completed_run_is_stale_while_newer_run_active() {
@@ -1044,7 +1113,7 @@ test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
 EOF
 )"
   FM_FAKE_PR_HEAD=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
-  FM_FAKE_GIT_RESOLVE=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
+  FM_FAKE_REMOTE_COMMIT_HEAD=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
   FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
   local out; out=$(run_crew_state "$d" feat-coarseready)
   assert_contains "$out" "state: unknown" "coarse ready status without run identity -> unknown"
@@ -1485,12 +1554,14 @@ test_genuine_parked_not_superseded
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
+test_ci_ready_log_pr_url_does_not_supply_run_identity
 test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_checks_passed_for_older_pr_head_is_stale
 test_checks_passed_for_current_pr_head_is_done
-test_checks_passed_requires_unambiguous_local_head
+test_checks_passed_requires_remote_head_resolution
 test_checks_passed_rejects_same_prefix_different_full_head
+test_remote_currentness_is_independent_of_local_fetch
 test_earlier_completed_run_is_stale_while_newer_run_active
 test_completed_run_fails_closed_when_newest_run_is_unavailable
 test_completed_run_without_outcome_fails_closed

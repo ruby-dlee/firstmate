@@ -122,6 +122,8 @@ test_clean_verdict_records_and_verifies() {
   run_review "$case_dir" verify task-x1 https://github.com/example/repo/pull/9 \
     > "$case_dir/verify.stdout" 2> "$case_dir/verify.stderr" \
     || fail "clean: verify should accept the exact same head"
+  grep -qxF "$head" "$case_dir/verify.stdout" \
+    || fail "clean: verify did not return the exact validated head"
   pass "adversarial review records a clean exact-head verdict and verifies it"
 }
 

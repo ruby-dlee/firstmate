@@ -171,6 +171,8 @@ test_records_pr_and_head_before_merging() {
     "records-before-merge: adversarial review head was not recorded"
   assert_grep 'adversarial_review_verdict=CLEAN' "$case_dir/state/task-x1.meta" \
     "records-before-merge: clean adversarial verdict was not recorded"
+  assert_no_grep 'grep.*adversarial_review_head' "$PR_MERGE" \
+    "records-before-merge: merge reconstructed the verified head from mutable metadata"
   grep -qxF "pr merge 9 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash" "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
   pass "fm-pr-merge records pr=, pr_head=, and a clean adversarial verdict before invoking gh-axi pr merge"

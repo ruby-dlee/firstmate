@@ -87,8 +87,7 @@ reject_repo_overrides "$@" || exit 1
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || { echo "error: fm-pr-check did not record pr=$URL in $META; refusing to merge" >&2; exit 1; }
-"$SCRIPT_DIR/fm-adversarial-pr-review.sh" verify "$ID" "$URL"
-VERIFIED_HEAD=$(grep '^adversarial_review_head=' "$META" | tail -1 | cut -d= -f2-)
+VERIFIED_HEAD=$("$SCRIPT_DIR/fm-adversarial-pr-review.sh" verify "$ID" "$URL")
 case "$VERIFIED_HEAD" in
   [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
   *) echo "error: adversarial review did not record a valid verified head; refusing to merge" >&2; exit 1 ;;

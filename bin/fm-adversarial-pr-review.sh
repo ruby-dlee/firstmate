@@ -410,7 +410,8 @@ verify_mode() {
   if ! grep -q "^head_sha: $current$" "$report" || ! grep -q '^verdict: CLEAN$' "$report"; then
     die "adversarial review report does not prove CLEAN for current head $current"
   fi
-  echo "adversarial review verified: $PR_URL head=$current report=$report"
+  echo "$current"
+  echo "adversarial review verified: $PR_URL head=$current report=$report" >&2
 }
 
 MODE=${1:-}

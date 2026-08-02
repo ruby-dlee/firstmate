@@ -33,7 +33,8 @@ make_live_default_firstmate_worktree() {
 
 make_live_default_firstmate_clone() {
   local destination=$1 default source_origin target
-  default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD)
+  # actions/checkout may leave a detached PR head without origin/HEAD.
+  default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')
   default=${default#origin/}
   target=$(git -C "$ROOT" rev-parse "refs/remotes/origin/$default^{commit}")
   source_origin=$(git -C "$ROOT" remote get-url origin)

@@ -204,7 +204,7 @@ The valid modes are `off`, `observe`, and `enforce`.
 Bootstrap reports an `ACCOUNT_ROUTING` diagnostic when the configured policy is unreadable, contains multiple values, or names any other mode.
 `observe` and `enforce` both activate direct account-directory selection for a new Claude or Codex ship/scout launch on any supported runtime backend.
 Neither mode invokes Agent Fleet selection or leases for a new ship/scout launch; the profile-list read is eligibility enforcement only.
-The existing `--account-pool`, `--account-profile`, and dispatch-profile fields remain compatibility activation inputs for those crewmates while the inactive-code removal is handled separately.
+The existing `--account-pool`, `--account-profile`, and dispatch-profile fields remain compatibility activation inputs for those crewmates.
 Their legacy aliases do not constrain the new usage-based account choice.
 Secondmate integration is deferred: secondmate launches retain their pre-cutover Agent Fleet selection and lease behavior, including `config/secondmate-account-pool`.
 Firstmate's spawn flags and `config/secondmate-account-pool` continue to accept aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
@@ -233,7 +233,6 @@ Off and observe mode support the tmux, Herdr, zellij, and cmux session backends.
 An explicit per-spawn account pool or profile overrides that secondmate pool.
 `config/account-routing-mode` is inherited, so a secondmate can apply the same off/observe/enforce policy to its own crewmates while resolving its own pools from dispatch profiles or the standard provider defaults.
 The legacy secondmate and recovery implementation resolves Agent Fleet through its sealed production front door and keeps its environment overrides behind `FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1`.
-Its remaining crew-dispatch pool-summary branch and isolated new-crewmate fixture path are deferred to follow-up task `remove-fleet-routing-deadcode`; neither is a real new ship/scout launch path.
 The direct account-directory module has a separate unmistakable `FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1` opt-in for deterministic filesystem, quota, and installer fixtures.
 
 ## Crewmate dispatch profiles (config/crew-dispatch.json)
@@ -524,7 +523,6 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_FILES=100000  # maximum repository entries v
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository content bytes verified for a provider-neutral continuation
 FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
-FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
 FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
 FM_REPORT_RETENTION_COHORT_MS=300000  # retention cohort width; this plus the owner interval may not exceed 15 days

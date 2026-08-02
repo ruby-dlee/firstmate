@@ -4,7 +4,6 @@
 # credential, real endpoint, global config, or live worker is touched.
 set -u
 export FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1
-export FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST=firstmate-remove-fleet-routing-deadcode-fixture-v1
 export FM_ORCA_TEST_LAB=firstmate-orca-test-lab-v1
 export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 
@@ -508,6 +507,7 @@ run_teardown() {
   FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_REPORT_STACK_ROOT="$CASE_DIR/report-stack" \
     FM_FAKE_TMUX_LOG="$TMUX_LOG" FM_FAKE_AF_LOG="$AF_LOG" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
@@ -543,6 +543,39 @@ clear_case_logs() {
   : > "$LAUNCH_LOG"
   : > "$NATIVE_LAUNCH_LOG"
   rm -f "$CASE_DIR/resume-arm" "$CASE_DIR/resume-arm.native-dir" "$CASE_DIR/session-refreshed"
+}
+
+seed_managed_ship() {
+  local id=$1 harness=${2:-claude} pool=${3:-claude-crew} profile=${4:-claude-2}
+  local model=${5:-default} effort=${6:-default} account_task="managed-$id" attempt=seed
+  local tasktmp="/tmp/fm-$id"
+  mkdir -p "$HOME_DIR/data/$id" "$tasktmp"
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$WT_DIR" \
+    "project=$PROJ_DIR" \
+    "harness=$harness" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "tasktmp=$tasktmp" \
+    "model=$model" \
+    "effort=$effort" \
+    "generation_id=account:$account_task:$attempt" \
+    "report_required=1" \
+    "account_pool=$pool" \
+    "account_profile=$profile" \
+    "account_task=$account_task" \
+    "account_attempt=$attempt" \
+    "provider_session_id=sess-$account_task" \
+    "tmux_window_id=%77" \
+    "tmux_session_target=firstmate:fm-$id"
+  printf '# Account attempt lineage\n\n- 2026-07-13T00:00:00Z event=reserved attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=pending predecessor=none.\n- 2026-07-13T00:00:01Z event=session-bound attempt=%s agent_fleet_task=%s provider=%s pool=%s profile=%s session=sess-%s predecessor=none.\n' \
+    "$attempt" "$account_task" "$harness" "$pool" "$profile" \
+    "$attempt" "$account_task" "$harness" "$pool" "$profile" "$account_task" \
+    > "$HOME_DIR/data/$id/account-attempts.md"
+  printf 'fm-%s\n' "$id" > "$CASE_DIR/tmux-label"
+  touch "$CASE_DIR/endpoint-live"
 }
 
 write_teardown_completion_report() {
@@ -1088,125 +1121,12 @@ EOF
   pass "completion-contract injection ignores raw HTML headings"
 }
 
-test_observe_is_dry_run_only() {
-  local id rec out status launch
-  id=account-observe-z2
-  rec=$(make_case observe claude "$id")
-  read_case "$rec"
-  out=$(FM_ACCOUNT_ROUTING=observe run_spawn "$id" "$PROJ_DIR")
-  status=$?
-  expect_code 0 "$status" "observe spawn should preserve legacy launch"
-  assert_regex "choose --pool claude-crew --task fm-[0-9a-f]+-account-observe-z2-a[0-9a-f]+ --provider claude --workspace $WT_DIR --dry-run" "$AF_LOG" "observe did not use the task worktree for its namespaced dry-run choice"
-  assert_not_grep 'lease choose\|lease acquire' "$AF_LOG" "observe created a lease"
-  launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" ' claude --dangerously-skip-permissions ' "observe changed the provider command"
-  assert_not_contains "$launch" 'agent-fleet' "observe wrapped the provider launch"
-  assert_not_grep '^account_' "$HOME_DIR/state/$id.meta" "observe wrote account metadata"
-  assert_contains "$out" 'observe pool=claude-crew provider=claude profile=claude-2' "observe did not surface its non-secret shadow choice"
-  pass "observe performs only a dry run and leaves launch/meta unchanged"
-}
-
-test_enforce_pool_wraps_backend_and_records_real_session() {
-  local id rec out status launch meta account_task account_attempt af_bin
-  id=account-enforce-z3
-  rec=$(make_case enforce claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  expect_code 0 "$status" "explicit pool spawn should enforce routing"
-  account_task=$(meta_account_task "$id")
-  account_attempt=$(sed -n 's/^account_attempt=//p' "$HOME_DIR/state/$id.meta" | tail -1)
-  af_bin="$(cd "$FAKEBIN_DIR" && pwd -P)/agent-fleet"
-  assert_grep "lease choose --pool claude-crew --task $account_task --provider claude" "$AF_LOG" "enforce did not atomically choose a namespaced lease"
-  launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "'$af_bin' --format json exec --profile 'claude-2' --task '$account_task' --pool 'claude-crew' --workspace '$WT_DIR'" "enforce did not build the task-worktree-bound Agent Fleet wrapper"
-  assert_contains "$launch" "-- --dangerously-skip-permissions" "enforce did not preserve provider arguments after the Agent Fleet wrapper"
-  meta="$HOME_DIR/state/$id.meta"
-  grep -q '^account_pool=' "$meta" || fail "meta missing account pool; contents: $(tr '\n' '|' < "$meta")"
-  assert_grep 'account_pool=claude-crew' "$meta" "meta missing account pool"
-  assert_grep 'account_profile=claude-2' "$meta" "meta missing selected profile"
-  assert_grep "account_task=$account_task" "$meta" "meta missing namespaced Agent Fleet task"
-  assert_grep "generation_id=account:$account_task:$account_attempt" "$meta" "managed meta did not bind the report generation to its account attempt"
-  assert_grep "provider_session_id=sess-$account_task" "$meta" "meta missing real provider session id"
-  assert_contains "$out" "spawned $id" "enforced spawn did not complete"
-  pass "enforce leases before spawn, wraps any backend launch, and records the real session id"
-}
-
-test_explicit_profile_uses_explicit_pool() {
-  local id rec out status account_task
-  id=account-profile-z4
-  rec=$(make_case profile claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_POOL=explicit FM_FAKE_AF_PROFILE=claude-3 run_spawn "$id" "$PROJ_DIR" --account-profile claude-3)
-  status=$?
-  [ "$status" -eq 0 ] || fail "explicit profile spawn should succeed: $out"
-  account_task=$(meta_account_task "$id")
-  assert_grep "lease acquire --profile claude-3 --task $account_task --pool explicit" "$AF_LOG" "explicit profile did not use explicit acquire"
-  assert_grep 'account_pool=explicit' "$HOME_DIR/state/$id.meta" "explicit profile meta missing explicit pool"
-  assert_grep 'account_profile=claude-3' "$HOME_DIR/state/$id.meta" "explicit profile meta mismatch"
-  pass "an explicit profile is acquired and persisted without a silent default account"
-}
-
-test_enforce_failure_rolls_back_prepared_endpoint() {
-  local id rec out status
-  id=account-select-fail-z5
-  rec=$(make_case select-fail claude "$id")
-  read_case "$rec"
-  if out=$(FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then
-    status=0
-  else
-    status=$?
-  fi
-  [ "$status" -ne 0 ] || fail "failed Agent Fleet selection should block spawn"
-  assert_regex '^new-window ' "$TMUX_LOG" "selection did not happen after endpoint preparation"
-  assert_regex '^kill-window ' "$TMUX_LOG" "selection failure did not remove its prepared endpoint"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" \
-    "selection failure did not return its prepared worktree (spawn: $out; lifecycle: $(tr '\n' '|' < "$LIFECYCLE_LOG"))"
-  assert_absent "$HOME_DIR/state/$id.meta" "selection failure wrote task meta"
-  [ -n "$out" ] || true
-  pass "enforce reserves immediately before binding and rolls back prepared runtime state"
-}
-
-test_pane_failure_happens_before_account_reservation() {
-  local id rec out status
-  id=account-pane-fail-z6
-  rec=$(make_case pane-fail claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_TMUX_FAIL_LABEL="fm-$id" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "pane creation failure should fail spawn"
-  [ ! -s "$AF_LOG" ] || fail "pane failure touched Agent Fleet before endpoint preparation completed: $(cat "$AF_LOG")"
-  assert_absent "$HOME_DIR/state/$id.meta" "pane failure left task meta"
-  [ -n "$out" ] || true
-  pass "endpoint preparation failures happen before any Agent Fleet reservation"
-}
-
-test_batch_partial_failure_releases_only_failed_item() {
-  local id1 id2 rec out status
-  id1=account-batch-ok-z7
-  id2=account-batch-fail-z8
-  rec=$(make_case batch claude "$id1" "$id2")
-  read_case "$rec"
-  out=$(FM_FAKE_TMUX_FAIL_LABEL="fm-$id2" run_spawn "$id1=$PROJ_DIR" "$id2=$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "partial batch failure should exit non-zero"
-  assert_regex "lease choose --pool claude-crew --task .*-$id1-" "$AF_LOG" "batch first item was not leased"
-  assert_not_grep "lease choose --pool claude-crew --task .*-$id2-" "$AF_LOG" "failed batch item reserved before endpoint preparation"
-  assert_not_grep 'lease release' "$AF_LOG" "batch pane failure released another task's lease"
-  assert_present "$HOME_DIR/state/$id1.meta" "successful batch item lost its meta"
-  assert_absent "$HOME_DIR/state/$id2.meta" "failed batch item left meta"
-  assert_contains "$out" "batch: FAILED to spawn $id2" "partial batch failure was not reported"
-  pass "partial batch failure retains launched leases and releases every unconsumed reservation"
-}
-
 test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure() {
   local id rec status launch before_session out account_task
   id=account-resume-z9
   rec=$(make_case resume claude "$id")
   read_case "$rec"
-  FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null
-  status=$?
-  expect_code 0 "$status" "initial managed spawn for resume should succeed"
+  seed_managed_ship "$id"
   assert_grep 'report_required=1' "$HOME_DIR/state/$id.meta" "fresh spawn did not require a completion report"
   before_session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   account_task=$(meta_account_task "$id")
@@ -1252,9 +1172,7 @@ test_recovered_secondmate_kind_blocks_unsupported_cmux_backend_early() {
   rec=$(make_case recovered-cmux-secondmate claude "$id")
   read_case "$rec"
   mkdir -p "$CASE_DIR/treehouse-pools"
-  out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -eq 0 ] || fail "recovered cmux secondmate precondition spawn failed: $out"
+  seed_managed_ship "$id"
   meta="$HOME_DIR/state/$id.meta"
   replacement="$meta.replacement"
   sed 's/^kind=.*/kind=secondmate/;/^backend=/d' "$meta" > "$replacement"
@@ -1280,9 +1198,7 @@ test_managed_recovery_rejects_duplicate_kind_metadata() {
   rec=$(make_case duplicate-kind-recovery claude "$id")
   read_case "$rec"
   mkdir -p "$CASE_DIR/treehouse-pools"
-  out=$(FM_FAKE_AF_POOL=claude-crew run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -eq 0 ] || fail "duplicate-kind recovery precondition spawn failed: $out"
+  seed_managed_ship "$id"
   meta="$HOME_DIR/state/$id.meta"
   replacement="$meta.replacement"
   sed '/^kind=/d;/^backend=/d' "$meta" > "$replacement"
@@ -1307,8 +1223,7 @@ test_managed_recovery_accepts_inherited_lifecycle_lock() {
   id=account-inherited-recovery-z9d
   rec=$(make_case inherited-recovery claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "inherited-lock recovery precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -1332,8 +1247,7 @@ test_inherited_lifecycle_handoff_releases_on_child_abort() {
   id=account-inherited-handoff-abort-z9h
   rec=$(make_case inherited-handoff-abort claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "inherited handoff abort precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   # shellcheck source=bin/fm-account-routing-lib.sh
@@ -1385,42 +1299,13 @@ test_off_metadata_merge_waits_for_metadata_lock() {
 }
 
 test_inherited_lifecycle_lock_rejects_owner_aba() {
-  local id sync_id rec held owner original replacement_pid replacement_start out status meta_tmp
-  id=account-inherited-aba-z9f
+  local sync_id rec held owner original replacement_pid replacement_start out status meta_tmp
   sync_id=account-sync-aba-z9g
-  rec=$(make_case inherited-aba claude "$id" "$sync_id")
+  rec=$(make_case inherited-aba claude "$sync_id")
   read_case "$rec"
   # shellcheck source=bin/fm-account-routing-lib.sh
   . "$ROOT/bin/fm-account-routing-lib.sh"
-  held=$(fm_account_lifecycle_lock_acquire "$HOME_DIR/state" "$id") \
-    || fail "inherited-lock ABA test could not acquire the parent lock"
-  owner=$held
-  [ ! -d "$held" ] || owner="$held/owner"
-  original=$(fm_account_lifecycle_lock_identity "$held") \
-    || fail "inherited-lock ABA test could not read the parent identity"
-  sleep 30 &
-  replacement_pid=$!
-  replacement_start=$(fm_account_process_start_time "$replacement_pid") \
-    || { kill "$replacement_pid" 2>/dev/null || true; fail "inherited-lock ABA test could not read the replacement identity"; }
-
-  out=$(FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$held" \
-    FM_FAKE_AF_REPLACE_LOCK_OWNER_FILE="$owner" \
-    FM_FAKE_AF_REPLACE_LOCK_OWNER_PID="$replacement_pid" \
-    FM_FAKE_AF_REPLACE_LOCK_OWNER_START="$replacement_start" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  printf '%s\n' "$original" > "$owner"
-  fm_account_lifecycle_lock_release "$held" \
-    || fail "inherited-lock ABA test could not release the restored parent lock"
-  kill "$replacement_pid" 2>/dev/null || true
-  wait "$replacement_pid" 2>/dev/null || true
-  [ "$status" -ne 0 ] || fail "spawn accepted a lifecycle lock reclaimed by another live owner"
-  assert_contains "$out" 'managed lifecycle lock was lost before metadata install' \
-    "spawn did not use the lost-lock failure path after inherited-lock ABA"
-  assert_absent "$CASE_DIR/endpoint-live" "lost inherited lock left a prepared endpoint alive"
-
-  run_spawn "$sync_id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "session-sync ABA precondition spawn failed"
+  seed_managed_ship "$sync_id"
   meta_tmp="$HOME_DIR/state/.$sync_id.meta.aba"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$sync_id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$sync_id.meta"
@@ -1478,102 +1363,12 @@ test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held() {
   pass "default-off spawns refuse while teardown's lifecycle lock is held"
 }
 
-test_unmanaged_respawn_preserves_report_cutover_state() {
-  local id rec out status
-  id=account-legacy-respawn-z9b
-  rec=$(make_case legacy-respawn claude "$id")
-  read_case "$rec"
-  fm_write_meta "$HOME_DIR/state/$id.meta" \
-    "window=firstmate:fm-$id" \
-    "worktree=$WT_DIR" \
-    "project=$PROJ_DIR" \
-    "harness=claude" \
-    "kind=ship" \
-    "mode=no-mistakes" \
-    "pr=418" \
-    "x_request=req-legacy" \
-    "custom_extension=preserve-success"
-  empty_case_backlog
-  out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -eq 0 ] || fail "pre-cutover unmanaged respawn should succeed (exit $status): $out"
-  assert_not_grep '^report_required=' "$HOME_DIR/state/$id.meta" "pre-cutover unmanaged respawn silently activated the report gate"
-  assert_grep 'pr=418' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing PR pointer"
-  assert_grep 'x_request=req-legacy' "$HOME_DIR/state/$id.meta" "managed respawn dropped the existing X-mode link"
-  assert_grep 'custom_extension=preserve-success' "$HOME_DIR/state/$id.meta" "managed respawn dropped extension metadata"
-  assert_not_grep "$id" "$HOME_DIR/data/backlog.md" "existing-metadata relaunch fixture retained its backlog row"
-  pass "unmanaged respawn preserves a legacy task's report cutover state"
-}
-
-test_failed_managed_respawn_restores_unmanaged_metadata() {
-  local id rec expected out status artifact
-  id=account-unmanaged-rollback-z9c
-  rec=$(make_case unmanaged-rollback claude "$id")
-  read_case "$rec"
-  fm_write_meta "$HOME_DIR/state/$id.meta" \
-    "window=firstmate:fm-$id" \
-    "worktree=$WT_DIR" \
-    "project=$PROJ_DIR" \
-    "harness=claude" \
-    "kind=ship" \
-    "mode=no-mistakes" \
-    "pr=417" \
-    "custom_extension=preserve-me"
-  expected="$CASE_DIR/original.meta"
-  cp "$HOME_DIR/state/$id.meta" "$expected"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
-    printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
-  done
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "managed respawn without a session mapping unexpectedly succeeded"
-  if ! cmp -s "$HOME_DIR/state/$id.meta" "$expected"; then
-    printf '%s\n' "$out" >&2
-    sed 's/^/agent-fleet: /' "$AF_LOG" >&2
-    diff -u "$expected" "$HOME_DIR/state/$id.meta" >&2 || true
-    fail "failed managed respawn did not restore the original unmanaged metadata"
-  fi
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
-    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
-      || fail "failed managed respawn did not restore prior $artifact state"
-  done
-  assert_grep 'lease release ' "$AF_LOG" "failed managed respawn leaked its acquired reservation"
-  [ -n "$out" ] || true
-  pass "failed managed respawn restores every field from existing unmanaged metadata"
-}
-
-test_preinstall_managed_failure_restores_artifact_snapshot() {
-  local id rec expected out status artifact
-  id=account-preinstall-rollback-z9f
-  rec=$(make_case preinstall-rollback claude "$id")
-  read_case "$rec"
-  fm_write_meta "$HOME_DIR/state/$id.meta" \
-    "window=firstmate:fm-$id" \
-    "worktree=$WT_DIR" \
-    "project=$PROJ_DIR" \
-    "harness=claude" \
-    "kind=ship" \
-    "mode=no-mistakes"
-  artifact="$HOME_DIR/state/$id.pi-ext.ts"
-  printf 'prior-state\n' > "$artifact"
-  expected="$CASE_DIR/original.meta"
-  cp "$HOME_DIR/state/$id.meta" "$expected"
-  out=$(FM_FAKE_AF_SELECT_MUTATE_FILE="$artifact" FM_FAKE_AF_BAD_SELECTION=1 \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "pre-install account selection failure unexpectedly spawned"
-  cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "pre-install failure changed retained unmanaged metadata"
-  [ "$(cat "$artifact" 2>/dev/null)" = prior-state ] || fail "pre-install failure discarded the retained artifact snapshot"
-  [ -n "$out" ] || true
-  pass "pre-install managed failures restore retained task artifacts"
-}
-
 test_session_sync_bounds_agent_fleet_queries() {
   local id rec meta_tmp out status account_task
   id=account-sync-timeout-z9d
   rec=$(make_case sync-timeout claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session timeout precondition spawn failed"
+  seed_managed_ship "$id"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
@@ -1606,8 +1401,7 @@ test_session_sync_rejects_workspace_mismatch_without_metadata_change() {
   id=account-sync-workspace-z9e
   rec=$(make_case sync-workspace claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "workspace mismatch precondition spawn failed"
+  seed_managed_ship "$id"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
@@ -1835,7 +1629,7 @@ test_session_sync_releases_metadata_lock_during_provider_query() {
   id=account-sync-lock-z9e
   rec=$(make_case sync-lock claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session lock precondition spawn failed"
+  seed_managed_ship "$id"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
@@ -1928,7 +1722,7 @@ test_recovered_reservations_are_owned_only_after_validated_recovery() {
   id=account-recover-owned-z9b
   rec=$(make_case recover-owned claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "recovered reservation precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   rm -f "$CASE_DIR/endpoint-live"
@@ -1973,7 +1767,7 @@ test_native_resume_requires_fresh_sessionstart_evidence() {
   id=account-resume-fresh-z9c
   rec=$(make_case resume-fresh claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "fresh resume precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   rm -f "$CASE_DIR/endpoint-live"
@@ -1995,7 +1789,7 @@ test_native_resume_rejects_prelaunch_sessionstart_evidence() {
   id=account-resume-launch-z9d
   rec=$(make_case resume-launch claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "launch-specific resume precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   session=$(sed -n 's/^provider_session_id=//p' "$HOME_DIR/state/$id.meta" | tail -1)
   rm -f "$CASE_DIR/endpoint-live"
@@ -2015,8 +1809,7 @@ test_native_resume_accepts_same_wallclock_sessionstart_evidence() {
   id=account-resume-whole-second-z9e
   rec=$(make_case resume-whole-second claude "$id")
   read_case "$rec"
-  if out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew 2>&1); then status=0; else status=$?; fi
-  [ "$status" -eq 0 ] || fail "whole-second resume precondition spawn failed: $out"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
   clear_case_logs
   timestamp=2026-07-13T00:00:00Z
@@ -2033,8 +1826,7 @@ test_native_resume_migrates_legacy_session_mapping_after_launch_gate() {
   id=account-resume-legacy-seq-z9g
   rec=$(make_case resume-legacy-seq claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "legacy-sequence resume precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
   clear_case_logs
 
@@ -2053,8 +1845,7 @@ test_native_resume_rejects_zero_sequence_on_current_schema() {
   id=account-resume-current-zero-z9h
   rec=$(make_case resume-current-zero claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "current-schema zero-sequence precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live" "$CASE_DIR/session-refreshed"
   clear_case_logs
 
@@ -2075,8 +1866,7 @@ test_native_resume_accepts_agent_fleet_utc_offset_timestamps() {
   read_case "$rec"
   before=2026-07-13T00:00:00.100000+00:00
   after=2026-07-13T00:00:00.200000+00:00
-  FM_FAKE_AF_UPDATED_AT_BEFORE="$before" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "Agent Fleet timestamp resume precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
@@ -2094,7 +1884,7 @@ test_native_resume_uses_private_launch_directory_and_cleans_it() {
   id=account-resume-private-z9e
   rec=$(make_case resume-private claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "private resume precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   sentinel="$CASE_DIR/native-launch-sentinel"
@@ -2183,8 +1973,7 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
   printf 'claude-captains\n' > "$HOME_DIR/config/secondmate-account-pool"
 
-  out=$(FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST='' \
-    FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" \
+  out=$(FM_FAKE_AF_POOL=claude-captains FM_TEST_PANE_PATH="$sm" \
     run_spawn "$id" "$sm" --secondmate)
   status=$?
   [ "$status" -eq 0 ] || fail "enforced secondmate spawn should succeed (exit $status): $out"
@@ -2391,128 +2180,22 @@ test_unused_secondmate_pool_never_blocks_unmanaged_spawn() {
 }
 
 test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt() {
-  local id rec task_one task_two
+  local id rec attempt_one attempt_two task_one task_two
   id=account-namespace-z12
   rec=$(make_case namespace-one claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "first namespaced spawn failed"
-  task_one=$(meta_account_task "$id")
+  # shellcheck source=bin/fm-account-routing-lib.sh
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  attempt_one=$(fm_account_attempt_id "$HOME_DIR" "$id") || fail "first attempt id failed"
+  task_one=$(fm_account_task_key "$HOME_DIR" "$id" "$attempt_one") || fail "first task key failed"
   rec=$(make_case namespace-two claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "second namespaced spawn failed"
-  task_two=$(meta_account_task "$id")
+  attempt_two=$(fm_account_attempt_id "$HOME_DIR" "$id") || fail "second attempt id failed"
+  task_two=$(fm_account_task_key "$HOME_DIR" "$id" "$attempt_two") || fail "second task key failed"
   [ "$task_one" != "$task_two" ] || fail "two firstmate homes shared Agent Fleet task key $task_one"
   assert_contains "$task_one" "-$id-a" "first Agent Fleet task did not retain local task identity"
   assert_contains "$task_two" "-$id-a" "second Agent Fleet task did not retain local task identity"
   pass "Agent Fleet task keys namespace every home-local task and launch generation"
-}
-
-test_duplicate_spawn_preserves_original_endpoint_and_lease() {
-  local id rec out status artifact
-  id=account-duplicate-z13
-  rec=$(make_case duplicate claude "$id")
-  read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "initial duplicate test spawn failed"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
-    printf 'existing-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
-  done
-  clear_case_logs
-  out=$(run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "duplicate managed spawn unexpectedly succeeded"
-  [ ! -s "$AF_LOG" ] || fail "duplicate managed spawn touched the original lease: $(cat "$AF_LOG")"
-  assert_not_grep '^kill-window ' "$TMUX_LOG" "duplicate managed spawn killed the original endpoint"
-  assert_present "$CASE_DIR/endpoint-live" "duplicate managed spawn removed the original endpoint marker"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
-    [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "existing-$artifact" ] \
-      || fail "duplicate managed spawn removed the existing $artifact sidecar"
-  done
-  assert_contains "$out" "managed metadata already exists" "duplicate managed spawn did not fail at ownership guard"
-  pass "duplicate spawn cannot release or kill an existing managed task"
-}
-
-test_reservation_occurs_after_worktree_preparation() {
-  local id rec treehouse_line lease_line
-  id=account-order-z14
-  rec=$(make_case order claude "$id")
-  read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "reservation order spawn failed"
-  treehouse_line=$(grep -n '^treehouse get --lease --lease-holder firstmate-account-order-z14$' "$LIFECYCLE_LOG" | head -1 | cut -d: -f1)
-  lease_line=$(grep -n 'agent-fleet .* lease choose ' "$LIFECYCLE_LOG" | head -1 | cut -d: -f1)
-  [ -n "$treehouse_line" ] && [ -n "$lease_line" ] && [ "$lease_line" -gt "$treehouse_line" ] \
-    || fail "Agent Fleet reservation did not follow worktree preparation: $(tr '\n' '|' < "$LIFECYCLE_LOG")"
-  pass "account capacity is reserved only when the prepared endpoint can bind"
-}
-
-test_reserved_generation_is_durable_before_lease_mutation() {
-  local id rec real_mv marker gate installed_marker installed_gate spawn_pid status meta task
-  id=account-durable-lease-z14b
-  rec=$(make_case durable-lease claude "$id")
-  read_case "$rec"
-  real_mv=$(command -v mv)
-  marker="$CASE_DIR/provisional-meta-persisted"
-  gate="$CASE_DIR/continue-after-provisional-meta"
-  installed_marker="$CASE_DIR/endpoint-meta-installed"
-  installed_gate="$CASE_DIR/continue-after-endpoint-meta"
-  cat > "$FAKEBIN_DIR/mv" <<'SH'
-#!/usr/bin/env bash
-set -u
-case "${1:-}" in
-  *.meta.rollback-pending.*)
-    "$FM_FAKE_REAL_MV" "$@" || exit $?
-    touch "$FM_FAKE_PROVISIONAL_META_MARKER"
-    while [ ! -f "$FM_FAKE_PROVISIONAL_META_GATE" ]; do sleep 0.05; done
-    exit 0
-    ;;
-  *.meta.*)
-    "$FM_FAKE_REAL_MV" "$@" || exit $?
-    touch "$FM_FAKE_INSTALLED_META_MARKER"
-    while [ ! -f "$FM_FAKE_INSTALLED_META_GATE" ]; do sleep 0.05; done
-    exit 0
-    ;;
-esac
-exec "$FM_FAKE_REAL_MV" "$@"
-SH
-  chmod +x "$FAKEBIN_DIR/mv"
-
-  FM_FAKE_REAL_MV="$real_mv" FM_FAKE_PROVISIONAL_META_MARKER="$marker" \
-    FM_FAKE_PROVISIONAL_META_GATE="$gate" FM_FAKE_INSTALLED_META_MARKER="$installed_marker" \
-    FM_FAKE_INSTALLED_META_GATE="$installed_gate" FM_FAKE_AF_REQUIRE_PRELEASE_META="$HOME_DIR/state/$id.meta" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew \
-    > "$CASE_DIR/spawn-stdout" 2> "$CASE_DIR/spawn-stderr" &
-  spawn_pid=$!
-  for _ in $(seq 1 600); do
-    [ -f "$marker" ] && break
-    kill -0 "$spawn_pid" 2>/dev/null || break
-    sleep 0.05
-  done
-  [ -f "$marker" ] || { touch "$gate" "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never persisted provisional managed metadata"; }
-  meta="$HOME_DIR/state/$id.meta"
-  task=$(meta_account_task "$id")
-  assert_grep 'account_rollback_cleanup=pending' "$meta" "provisional metadata was not marked for rollback recovery"
-  assert_grep "account_task=$task" "$meta" "provisional metadata lost the pending Agent Fleet task"
-  assert_not_grep '^account_profile=' "$meta" "provisional metadata invented a profile before Agent Fleet selection"
-  assert_grep "window=firstmate:fm-$id" "$meta" "provisional metadata lost the prepared endpoint"
-  assert_regex '^tmux_window_id=%77$' "$meta" "provisional metadata lost the stable replacement endpoint identity"
-  assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" \
-    "provisional metadata lost the scoped tmux session identity"
-  touch "$gate"
-  for _ in $(seq 1 600); do
-    [ -f "$installed_marker" ] && break
-    kill -0 "$spawn_pid" 2>/dev/null || break
-    sleep 0.05
-  done
-  [ -f "$installed_marker" ] || { touch "$installed_gate"; wait "$spawn_pid" 2>/dev/null || true; fail "spawn never installed endpoint metadata"; }
-  assert_grep 'account_rollback_cleanup=pending' "$meta" "endpoint metadata cleared rollback recovery before launch commit"
-  assert_grep 'account_profile=claude-2' "$meta" "endpoint metadata lost the selected account profile"
-  assert_grep "tmux_session_target=firstmate:fm-$id" "$meta" \
-    "endpoint metadata lost the scoped tmux session identity"
-  touch "$installed_gate"
-  status=0
-  wait "$spawn_pid" || status=$?
-  expect_code 0 "$status" "spawn should continue after its provisional generation is durable"
-  assert_not_grep 'account_rollback_cleanup=pending' "$meta" "committed metadata retained the provisional rollback marker"
-  pass "managed account identity is durable before lease mutation and through launch commit"
 }
 
 test_raw_enforced_launch_is_rejected_before_mutation() {
@@ -2581,127 +2264,6 @@ test_malformed_routing_mode_fails_closed() {
   assert_not_grep '^new-window ' "$TMUX_LOG" "unreadable routing mode created an endpoint"
   assert_contains "$out" "cannot read" "unreadable routing mode error was suppressed"
   pass "malformed or unreadable account-routing policy never collapses to default-off"
-}
-
-test_invalid_selection_response_releases_reservation() {
-  local id rec out status task release_count retained_id retained_rec retained_task
-  id=account-invalid-select-z17
-  rec=$(make_case invalid-select claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "malformed lease response unexpectedly succeeded"
-  task=$(logged_account_task)
-  assert_grep "lease release --task $task --force" "$AF_LOG" "malformed lease response leaked its reservation"
-  assert_absent "$HOME_DIR/state/$id.meta" "malformed lease response left managed metadata"
-  [ -n "$out" ] || true
-  : > "$AF_LOG"
-  rm -f "$CASE_DIR/release-failed-once"
-  out=$(FM_FAKE_AF_BAD_SELECTION=1 FM_FAKE_AF_RELEASE_FAIL_ONCE="$CASE_DIR/release-failed-once" run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "malformed lease response with a transient release failure unexpectedly succeeded"
-  release_count=$(grep -c 'lease release .* --force' "$AF_LOG" || true)
-  [ "$release_count" -eq 2 ] || fail "malformed lease rollback did not retry the owned reservation after release failure"
-
-  retained_id=account-invalid-select-retained-z17b
-  retained_rec=$(make_case invalid-select-retained claude "$retained_id")
-  read_case "$retained_rec"
-  out=$(FM_FAKE_AF_BAD_SELECTION=1 FM_FAKE_AF_RELEASE_FAIL=1 \
-    run_spawn "$retained_id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "malformed lease response with persistent release failure unexpectedly succeeded"
-  retained_task=$(logged_account_task)
-  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$retained_id.meta" \
-    "unreleased invalid selection did not persist rollback metadata"
-  assert_grep "account_task=$retained_task" "$HOME_DIR/state/$retained_id.meta" \
-    "unreleased invalid selection lost its Agent Fleet task identity"
-  pass "post-acquisition response validation always releases the reservation"
-}
-
-test_fresh_launch_requires_session_binding_and_fully_rolls_back() {
-  local id rec out status task
-  id=account-bind-z18
-  rec=$(make_case bind claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "managed launch without SessionStart mapping unexpectedly succeeded"
-  task=$(logged_account_task)
-  assert_grep "lease release --task $task --force" "$AF_LOG" "unbound launch did not release its lease"
-  assert_grep "session remove --task $task" "$AF_LOG" "unbound launch did not remove its attempt mapping"
-  assert_regex '^kill-window ' "$TMUX_LOG" "unbound launch did not kill its endpoint"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" "unbound launch did not return its worktree"
-  assert_absent "$HOME_DIR/state/$id.meta" "unbound launch left phantom recovery metadata"
-  assert_contains "$out" "did not bind a fresh SessionStart mapping" "unbound launch did not report its binding failure"
-  pass "fresh managed launches commit only after provider binding and otherwise unwind"
-}
-
-test_failed_cleanup_persists_retryable_metadata() {
-  local id rec out status task
-  id=account-rollback-retry-z18b
-  rec=$(make_case rollback-retry claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "failed launch with failed cleanup unexpectedly succeeded"
-  task=$(logged_account_task)
-  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "failed cleanup did not persist a retry marker"
-  assert_grep "account_task=$task" "$HOME_DIR/state/$id.meta" "failed cleanup lost its Agent Fleet task identity"
-  assert_not_grep 'return --force' "$TREEHOUSE_LOG" "failed cleanup recycled its retained worktree"
-
-  clear_case_logs
-  write_teardown_completion_report "$id"
-  run_teardown "$id" --force >/dev/null || fail "teardown could not retry failed Agent Fleet cleanup"
-  assert_grep "lease release --task $task --force" "$AF_LOG" "teardown did not retry the failed lease release"
-  assert_grep "session remove --task $task" "$AF_LOG" "teardown did not retry the failed session cleanup"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" "teardown did not recycle the worktree after account cleanup"
-  assert_absent "$HOME_DIR/state/$id.meta" "teardown left failed-attempt metadata after cleanup"
-  pass "failed Agent Fleet cleanup leaves durable teardown-retry state"
-}
-
-test_unknown_spawn_endpoint_retains_lease_for_retry() {
-  local id rec out status task
-  id=account-unknown-rollback-z18c
-  rec=$(make_case unknown-rollback claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_TARGET_STATE=unknown FM_FAKE_TMUX_LIST_WINDOWS_UNKNOWN=1 FM_FAKE_TMUX_KILL_FAIL=1 \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "unknown failed endpoint unexpectedly committed"
-  task=$(logged_account_task)
-  assert_not_grep "lease release --task $task" "$AF_LOG" "unknown endpoint state released its lease"
-  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "unknown endpoint state lost retry metadata"
-  assert_contains "$out" "endpoint state is unknown" "unknown endpoint retention was not reported"
-  rm -f "$CASE_DIR/endpoint-live"
-  clear_case_logs
-  write_teardown_completion_report "$id"
-  run_teardown "$id" --force >/dev/null || fail "unknown endpoint retry state could not be torn down after absence was confirmed"
-  pass "spawn rollback retains leases while endpoint state is unknown"
-}
-
-test_rollback_retry_rechecks_live_endpoint_before_release() {
-  local id rec out status task
-  id=account-live-rollback-retry-z18d
-  rec=$(make_case live-rollback-retry claude "$id")
-  read_case "$rec"
-  out=$(FM_FAKE_AF_SESSION_MISSING=1 FM_FAKE_AF_RELEASE_FAIL=1 \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "rollback retry precondition unexpectedly succeeded"
-  task=$(logged_account_task)
-  touch "$CASE_DIR/endpoint-live"
-  clear_case_logs
-  out=$(FM_FAKE_TMUX_KILL_FAIL=1 run_spawn "$id" --continue-account --account-profile claude-3)
-  status=$?
-  [ "$status" -ne 0 ] || fail "rollback retry released a live endpoint"
-  assert_not_grep "lease release --task $task" "$AF_LOG" "rollback retry released the lease before killing the endpoint"
-  assert_grep 'account_rollback_cleanup=pending' "$HOME_DIR/state/$id.meta" "live rollback retry lost retry metadata"
-  assert_contains "$out" "endpoint is still alive" "live rollback retry blocker was unclear"
-  rm -f "$CASE_DIR/endpoint-live"
-  clear_case_logs
-  write_teardown_completion_report "$id"
-  run_teardown "$id" --force >/dev/null || fail "live rollback retry state could not be torn down after endpoint removal"
-  pass "rollback cleanup retries prove the retained endpoint is dead"
 }
 
 test_failed_secondmate_rollback_preserves_home_for_relaunch() {
@@ -2854,21 +2416,6 @@ test_failed_secondmate_respawn_rollback_restores_prior_state() {
   pass "failed secondmate respawn rollback preserves restored metadata and sidecars"
 }
 
-test_observe_invalid_response_remains_advisory() {
-  local id rec out status launch
-  id=account-observe-invalid-z19
-  rec=$(make_case observe-invalid claude "$id")
-  read_case "$rec"
-  out=$(FM_ACCOUNT_ROUTING=observe FM_FAKE_AF_BAD_SELECTION=1 run_spawn "$id" "$PROJ_DIR")
-  status=$?
-  expect_code 0 "$status" "invalid observe response should preserve legacy spawn"
-  launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" ' claude --dangerously-skip-permissions ' "invalid observe response changed launch"
-  assert_not_grep 'lease release' "$AF_LOG" "observe response attempted lease cleanup"
-  assert_contains "$out" "observe decision invalid" "observe validation failure was not surfaced"
-  pass "observe mode remains non-blocking on malformed decisions"
-}
-
 test_explicit_secondmate_profile_ignores_configured_pool() {
   local id rec sm out status
   id=account-secondmate-profile-z20
@@ -2885,29 +2432,6 @@ test_explicit_secondmate_profile_ignores_configured_pool() {
   pass "an explicit secondmate profile fully overrides pool policy"
 }
 
-test_enforced_orca_is_rejected_before_owned_resource_creation() {
-  local id rec out status
-  id=account-orca-z20b
-  rec=$(make_case orca claude "$id")
-  read_case "$rec"
-  mkdir -p "$CASE_DIR/legacy-wt"
-  fm_write_meta "$HOME_DIR/state/$id.meta" \
-    "window=legacy:fm-$id" \
-    "worktree=$CASE_DIR/legacy-wt" \
-    "project=$PROJ_DIR" \
-    "harness=claude" \
-    "kind=ship" \
-    "mode=no-mistakes" \
-    "yolo=off"
-  out=$(run_spawn "$id" "$PROJ_DIR" --backend orca --account-pool claude-crew)
-  status=$?
-  [ "$status" -ne 0 ] || fail "enforced Orca spawn unexpectedly succeeded"
-  [ ! -s "$AF_LOG" ] || fail "enforced Orca spawn acquired an Agent Fleet lease"
-  assert_not_grep '^worktree ' "$ORCA_LOG" "enforced Orca spawn created a worktree"
-  assert_contains "$out" "does not support backend=orca" "enforced Orca blocker was unclear"
-  pass "enforced account routing refuses Orca before creating owned resources"
-}
-
 test_cross_profile_continuation_for_harness() {
   local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
   id="account-continue-$harness-z21"
@@ -2918,10 +2442,7 @@ test_cross_profile_continuation_for_harness() {
   else
     source_model="$harness-source-model"
   fi
-  out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
-  status=$?
-  [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
+  seed_managed_ship "$id" "$harness" "$harness-crew" "$old_profile" "$source_model" high
   old_task=$(meta_account_task "$id")
   printf 'done: external side effect alpha; do not rerun\nnext: verify beta\n' > "$HOME_DIR/state/$id.status"
   printf '# Completion\n\nShip completion evidence for %s.\n' "$harness" > "$HOME_DIR/data/$id/completion.md"
@@ -3031,10 +2552,7 @@ test_cross_provider_continuation_uses_target_default_pool() {
   else
     target_model=default
   fi
-  out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort high)
-  status=$?
-  [ "$status" -eq 0 ] || fail "$source initial managed spawn failed: $out"
+  seed_managed_ship "$id" "$source" "$source-crew" "$source-2" "$source_model" high
   old_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -3061,7 +2579,7 @@ test_continuation_refuses_unknown_endpoint_state() {
   id=account-continuation-unknown-z21aa
   rec=$(make_case continuation-unknown claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "unknown continuation precondition spawn failed"
+  seed_managed_ship "$id"
   old_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -3108,7 +2626,7 @@ test_missing_endpoint_target_retains_managed_lease() {
   id=account-missing-endpoint-z21ab
   rec=$(make_case missing-endpoint claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "missing endpoint teardown precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   meta_tmp="$HOME_DIR/state/.$id.meta.missing-target"
@@ -3130,7 +2648,7 @@ test_predecessor_cleanup_failure_preserves_replacement_for_retry() {
   id=account-predecessor-retry-z21b
   rec=$(make_case predecessor-retry claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "predecessor cleanup precondition spawn failed"
+  seed_managed_ship "$id"
   old_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -3166,7 +2684,7 @@ test_failed_continuation_cleanup_restores_predecessor_for_retry() {
   id=account-continuation-rollback-z21c
   rec=$(make_case continuation-rollback claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation rollback precondition spawn failed"
+  seed_managed_ship "$id"
   old_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -3200,7 +2718,7 @@ test_concurrent_continuations_serialize_before_mutation() {
   id=account-continuation-race-z21d
   rec=$(make_case continuation-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation race precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
   marker="$CASE_DIR/first-endpoint-started"
@@ -3307,7 +2825,7 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   git -C "$primary" checkout --quiet main
   git -C "$primary" remote remove origin
   FM_TEST_ROOT_OVERRIDE=$primary
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session sync race precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
@@ -3351,7 +2869,7 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
   id=account-steering-audit-z24
   rec=$(make_case steering-audit claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "steering audit precondition spawn failed"
+  seed_managed_ship "$id"
   mkdir "$HOME_DIR/data/$id/steering.md"
   clear_case_logs
   touch "$CASE_DIR/endpoint-live"
@@ -3371,7 +2889,7 @@ test_managed_tmux_identity_survives_window_rename() {
   id=account-tmux-identity-z25
   rec=$(make_case tmux-identity claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "stable tmux identity precondition spawn failed"
+  seed_managed_ship "$id"
   assert_regex '^window=firstmate:fm-account-tmux-identity-z25$' "$HOME_DIR/state/$id.meta" "managed tmux metadata lost its user-facing window label"
   assert_regex '^tmux_window_id=%77$' "$HOME_DIR/state/$id.meta" "managed tmux metadata did not persist the stable window id"
   clear_case_logs
@@ -3392,7 +2910,7 @@ test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances() {
   id=account-resume-regressed-z26
   rec=$(make_case resume-regressed claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "regressed resume precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
 
@@ -3409,7 +2927,7 @@ test_session_sync_metadata_publish_failure_is_closed() {
   id=account-sync-publish-z27
   rec=$(make_case sync-publish claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session publish precondition spawn failed"
+  seed_managed_ship "$id"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
@@ -3445,7 +2963,7 @@ test_session_sync_lineage_failure_restores_unbound_metadata() {
   id=account-sync-lineage-z27a
   rec=$(make_case sync-lineage claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "session lineage precondition spawn failed"
+  seed_managed_ship "$id"
   meta_tmp="$HOME_DIR/state/.$id.meta.test"
   grep -v '^provider_session_id=' "$HOME_DIR/state/$id.meta" > "$meta_tmp"
   mv "$meta_tmp" "$HOME_DIR/state/$id.meta"
@@ -3486,7 +3004,7 @@ test_oversized_continuation_stops_before_mutation() {
   id=account-continuation-size-z28
   rec=$(make_case continuation-size claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation size precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
 
   # Sentinel control: the wake-status source is assembled after the brief, and
@@ -3546,7 +3064,7 @@ test_continuation_bounds_no_mistakes_status_snapshot() {
   id=account-continuation-status-timeout-z28a
   rec=$(make_case continuation-status-timeout claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation timeout precondition spawn failed"
+  seed_managed_ship "$id"
   cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 printf 'partial status that must not survive timeout\n'
@@ -3578,7 +3096,7 @@ test_continuation_caps_informational_snapshots_only() {
   id=account-continuation-snapshot-cap-z28b
   rec=$(make_case continuation-snapshot-cap claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation snapshot cap precondition spawn failed"
+  seed_managed_ship "$id"
   cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 trap '' PIPE
@@ -3622,7 +3140,7 @@ test_continuation_rejects_symlinked_packet_destination() {
   id=account-continuation-destination-z28c
   rec=$(make_case continuation-destination claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation destination precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   outside="$CASE_DIR/outside-packets"
   packet="$HOME_DIR/data/$id/continuation-symlink-destination.md"
@@ -3648,7 +3166,7 @@ test_continuation_pins_packet_destination_directory() {
   id=account-continuation-destination-race-z28f
   rec=$(make_case continuation-destination-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "continuation destination-race precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-destination.ready"
   proceed="$CASE_DIR/continuation-destination.proceed"
@@ -3687,8 +3205,7 @@ test_continuation_revalidates_repository_anchor_before_install() {
   id=account-continuation-repository-race-z28g
   rec=$(make_case continuation-repository-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "continuation repository-race precondition spawn failed"
+  seed_managed_ship "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-repository.ready"
@@ -3719,8 +3236,7 @@ test_continuation_revalidates_exact_repository_status_before_install() {
   id=account-continuation-status-race-z28h
   rec=$(make_case continuation-status-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "continuation status-race precondition spawn failed"
+  seed_managed_ship "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-status.ready"
@@ -3751,8 +3267,7 @@ test_continuation_revalidates_dirty_tracked_content_before_install() {
   id=account-cont-tracked-z28k
   rec=$(make_case continuation-tracked-content claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "tracked-content continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   printf 'first dirty tracked generation\n' > "$worktree/README.md"
@@ -3785,8 +3300,7 @@ test_continuation_revalidates_dirty_untracked_content_before_install() {
   id=account-cont-untracked-z28m
   rec=$(make_case continuation-untracked-content claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "untracked-content continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   dirty="$worktree/already-untracked.txt"
@@ -3820,8 +3334,7 @@ test_continuation_accepts_stable_tracked_deletion() {
   id=account-cont-deleted-z28q
   rec=$(make_case continuation-deleted claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "deleted-file continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm "$worktree/README.md" "$CASE_DIR/endpoint-live"
@@ -3841,8 +3354,7 @@ test_continuation_revalidates_dirty_submodule_content() {
   id=account-cont-submodule-z29a
   rec=$(make_case continuation-submodule claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "submodule continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   subrepo="$CASE_DIR/submodule-source"
@@ -3879,8 +3391,7 @@ test_continuation_submodule_fingerprint_excludes_ignored_caches() {
   id=account-cont-submodule-cache-z33a
   rec=$(make_case continuation-submodule-cache claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "submodule-cache continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   subrepo="$CASE_DIR/submodule-cache-source"
@@ -3925,8 +3436,7 @@ test_continuation_repository_fingerprint_uses_pinned_root() {
   id=account-cont-root-pin-z29b
   rec=$(make_case continuation-root-pin claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "root-pin continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   printf 'inside pinned repository\n' > "$worktree/README.md"
@@ -3977,8 +3487,7 @@ test_continuation_packet_publication_is_generation_owned() {
   id=account-cont-cas-z29c
   rec=$(make_case continuation-cas claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "continuation CAS precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-cas.ready"; proceed="$CASE_DIR/continuation-cas.proceed"
@@ -4011,7 +3520,7 @@ test_continuation_rejects_root_swap_before_descriptor_open() {
   id=account-cont-root-preopen-z29d
   rec=$(make_case continuation-root-preopen claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "root pre-open precondition failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   moved="$CASE_DIR/worktree-before-open"; outside="$CASE_DIR/outside-before-open"
@@ -4041,7 +3550,7 @@ test_continuation_prepublish_cas_preserves_unowned_replacement() {
   id=account-cont-prepublish-z29e
   rec=$(make_case continuation-prepublish claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "prepublish CAS precondition failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   packet="$HOME_DIR/data/$id/continuation-prepublish.md"; replacement="$CASE_DIR/unowned-replacement"
@@ -4071,7 +3580,7 @@ test_continuation_reclaims_only_positively_stale_publish_lock() {
   id=account-cont-stale-lock-z29f
   rec=$(make_case continuation-stale-lock claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "stale publish-lock precondition failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   lock="$HOME_DIR/data/$id/.continuation-stale-lock.publish-lock"
@@ -4090,7 +3599,7 @@ test_continuation_recovers_abandoned_reclaim_owner() {
   id=account-cont-reclaim-z30a
   rec=$(make_case continuation-reclaim claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "reclaim precondition failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   lock="$HOME_DIR/data/$id/.continuation-reclaim.publish-lock"
@@ -4112,7 +3621,7 @@ test_continuation_no_prior_rollback_preserves_raced_replacement() {
   id=account-cont-remove-z30b
   rec=$(make_case continuation-remove claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "rollback race precondition failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
@@ -4349,8 +3858,7 @@ test_continuation_fingerprint_deadline_covers_ordinary_paths() {
   id=account-cont-path-timeout-z36a
   rec=$(make_case continuation-path-timeout claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "ordinary-path timeout precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/path-timeout.ready"; proceed="$CASE_DIR/path-timeout.proceed"
@@ -4377,8 +3885,7 @@ test_continuation_deadline_starts_before_repository_enumeration() {
   id=account-cont-enumeration-timeout-z38a
   rec=$(make_case continuation-enumeration-timeout claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "enumeration timeout precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/enumeration-timeout.ready"; proceed="$CASE_DIR/enumeration-timeout.proceed"
@@ -4419,8 +3926,7 @@ test_continuation_caps_repository_enumeration_output() {
   id=account-cont-enumeration-limit-z38b
   rec=$(make_case continuation-enumeration-limit claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "enumeration output precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   output="$CASE_DIR/enumeration-limit.out"
@@ -4457,8 +3963,7 @@ test_continuation_deadline_covers_repository_parsing() {
   id=account-cont-parse-timeout-z38c
   rec=$(make_case continuation-parse-timeout claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "repository parsing timeout precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/parse-timeout.ready"; proceed="$CASE_DIR/parse-timeout.proceed"
@@ -4512,8 +4017,7 @@ test_continuation_removes_packet_when_repository_changes_during_install() {
   id=account-continuation-install-race-z28j
   rec=$(make_case continuation-install-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "continuation install-race precondition spawn failed"
+  seed_managed_ship "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
   ready="$CASE_DIR/continuation-install.ready"
@@ -4545,8 +4049,7 @@ test_continuation_restores_prior_packet_after_failed_postcheck() {
   id=account-cont-prior-z28n
   rec=$(make_case continuation-prior-restore claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "prior-restore continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
@@ -4580,8 +4083,7 @@ test_continuation_rollback_preserves_concurrent_packet_replacement() {
   id=account-cont-owned-z28p
   rec=$(make_case continuation-owned-rollback claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "owned-rollback continuation precondition spawn failed"
+  seed_managed_ship "$id"
   use_named_fake_tmux_target "$id"
   worktree=$(sed -n 's/^worktree=//p' "$HOME_DIR/state/$id.meta")
   rm -f "$CASE_DIR/endpoint-live"
@@ -4624,8 +4126,7 @@ test_continuation_rejects_load_bearing_source_replacement_during_open() {
   id=account-continuation-copy-race-z28d
   rec=$(make_case continuation-copy-race claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "continuation copy-race precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   source="$(cd "$HOME_DIR/data/$id" && pwd -P)/checkpoint.md"
   printf 'load-bearing checkpoint\n' > "$source"
@@ -4673,8 +4174,7 @@ test_continuation_appends_the_validated_brief_snapshot() {
   id=account-continuation-brief-snapshot-z28g
   rec=$(make_case continuation-brief-snapshot claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "brief snapshot continuation precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   brief="$HOME_DIR/data/$id/brief.md"
   printf 'validated original brief bytes\n' > "$brief"
@@ -4700,8 +4200,7 @@ test_continuation_reads_descendants_through_the_pinned_root() {
   id=account-continuation-openat-z28h
   rec=$(make_case continuation-openat claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "descriptor-relative continuation precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
   moved="$CASE_DIR/pinned-openat-task"
@@ -4756,8 +4255,7 @@ test_continuation_pins_one_root_for_the_complete_task_snapshot() {
   id=account-continuation-one-root-z28i
   rec=$(make_case continuation-one-root claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "single-root continuation precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
   moved="$CASE_DIR/pinned-one-root-task"
@@ -4817,8 +4315,7 @@ test_continuation_rejects_task_source_ancestor_swap() {
   id=account-continuation-task-parent-z28e
   rec=$(make_case continuation-task-parent claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "task-parent continuation precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   task_dir=$(cd "$HOME_DIR/data/$id" && pwd -P)
   moved="$CASE_DIR/pinned-task-source"
@@ -4855,8 +4352,7 @@ test_continuation_rejects_metadata_ancestor_swap() {
   id=account-continuation-meta-parent-z28f
   rec=$(make_case continuation-meta-parent claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "metadata-parent continuation precondition spawn failed"
+  seed_managed_ship "$id"
   rm -f "$CASE_DIR/endpoint-live"
   state_dir=$(cd "$HOME_DIR/state" && pwd -P)
   moved="$CASE_DIR/pinned-state-source"
@@ -5179,7 +4675,7 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   id=account-symlink-safety-z29
   rec=$(make_case symlink-safety claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "symlink safety precondition spawn failed"
+  seed_managed_ship "$id"
   original="$HOME_DIR/data/$id"
   outside="$CASE_DIR/outside-task"
   mv "$original" "$outside"
@@ -5277,15 +4773,18 @@ test_account_lineage_rejects_parent_swap_during_transaction() {
 }
 
 test_agent_fleet_contract_is_validated_before_routing() {
-  local id rec out status
+  local id rec sm out status
   id=account-contract-z26
   rec=$(make_case contract claude "$id")
   read_case "$rec"
-  if out=$(FM_FAKE_AF_CONTRACT_VERSION=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  if out=$(FM_FAKE_AF_CONTRACT_VERSION=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "incompatible Agent Fleet contract unexpectedly enforced routing"
   assert_not_grep 'lease (choose|acquire)' "$AF_LOG" "incompatible Agent Fleet contract mutated a lease"
   assert_contains "$out" "unsupported Agent Fleet contract version 1" "contract mismatch was not actionable"
-  pass "Agent Fleet contract v2 is required before legacy fixture enforcement"
+  pass "Agent Fleet contract v2 is required before secondmate routing"
 }
 
 test_agent_fleet_entrypoint_is_physically_pinned_per_operation() {
@@ -5590,13 +5089,16 @@ SH
 }
 
 test_agent_fleet_lifecycle_calls_are_bounded() {
-  local id rec out status select_completed release_completed
+  local id rec sm out status select_completed release_completed
   id=account-control-timeout-z27
   rec=$(make_case control-timeout claude "$id")
   read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
   select_completed="$CASE_DIR/select-completed"
   if out=$(FM_FAKE_AF_SELECT_SLEEP=10 FM_FAKE_AF_SELECT_COMPLETED="$select_completed" \
-    FM_ACCOUNT_CONTROL_TIMEOUT=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+    FM_ACCOUNT_CONTROL_TIMEOUT=1 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew); then status=0; else status=$?; fi
   [ "$status" -eq 0 ] || fail "timed-out lease choice was not reconciled through recovery: $out"
   assert_absent "$select_completed" "lease choice timeout allowed the slow operation to complete"
   assert_grep 'lease recover ' "$AF_LOG" "timed-out lease choice did not reconcile ownership"
@@ -5700,11 +5202,14 @@ test_agent_fleet_selection_timeout_is_scoped_and_backward_compatible() {
 }
 
 test_unsuccessful_lease_mutations_always_reconcile() {
-  local id rec out status
+  local id rec sm out status
   id=account-reconcile-failure-z27a
   rec=$(make_case reconcile-failure claude "$id")
   read_case "$rec"
-  if out=$(FM_FAKE_AF_CHOOSE_FAIL_STATUS=42 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  if out=$(FM_FAKE_AF_CHOOSE_FAIL_STATUS=42 FM_TEST_PANE_PATH="$sm" \
+    run_spawn "$id" "$sm" --secondmate --account-pool claude-crew); then status=0; else status=$?; fi
   [ "$status" -eq 0 ] || fail "non-timeout lease failure was not recovered: $out"
   assert_grep 'lease choose ' "$AF_LOG" "non-timeout lease failure never attempted selection"
   assert_grep 'lease recover ' "$AF_LOG" "non-timeout lease failure skipped ownership reconciliation"
@@ -5712,8 +5217,10 @@ test_unsuccessful_lease_mutations_always_reconcile() {
   id=account-reconcile-ambiguous-z27b
   rec=$(make_case reconcile-ambiguous claude "$id")
   read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
   if out=$(FM_FAKE_AF_SELECT_FAIL=1 FM_FAKE_AF_RELEASE_FAIL=1 \
-    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew); then status=0; else status=$?; fi
+    FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate --account-pool claude-crew); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "unreconciled lease mutation unexpectedly spawned"
   assert_grep 'lease recover ' "$AF_LOG" "failed lease mutation skipped recovery"
   assert_present "$HOME_DIR/state/$id.meta" "ambiguous lease mutation discarded rollback identity"
@@ -5727,8 +5234,7 @@ test_unsuccessful_recovery_mutation_is_retried() {
   id=account-recover-reconcile-z27c
   rec=$(make_case recover-reconcile claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null \
-    || fail "recovery reconciliation precondition spawn failed"
+  seed_managed_ship "$id"
   account_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -5879,7 +5385,7 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   id=account-teardown-restore-z28
   rec=$(make_case teardown-restore claude "$id")
   read_case "$rec"
-  run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "rollback restore precondition spawn failed"
+  seed_managed_ship "$id"
   old_task=$(meta_account_task "$id")
   rm -f "$CASE_DIR/endpoint-live"
   clear_case_logs
@@ -5897,7 +5403,6 @@ test_teardown_stops_after_rollback_restores_predecessor() {
   assert_not_grep "lease release --task $old_task" "$AF_LOG" "teardown released the restored predecessor in the stale generation pass"
   assert_contains "$out" "rerun teardown against the restored task generation" "rollback restoration retry guidance was not surfaced"
 
-  write_test_completion_report "$id"
   clear_case_logs
   write_teardown_completion_report "$id"
   run_teardown "$id" --force >/dev/null || fail "restored predecessor could not be torn down on a fresh pass"
@@ -5959,7 +5464,6 @@ run_isolated_test() {
 
 if [ "${FM_TEST_FOCUSED:-}" = backlog-row-exemptions ]; then
   run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
-  run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
   run_isolated_test test_failed_continuation_cleanup_restores_predecessor_for_retry
   exit 0
 fi
@@ -5983,7 +5487,6 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-40 ]; then
   run_isolated_test test_dirty_acquisition_is_retained_without_force_return
   run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
   run_isolated_test test_unmanaged_rollback_waits_for_metadata_lock
-  run_isolated_test test_reservation_occurs_after_worktree_preparation
   exit 0
 fi
 
@@ -6132,18 +5635,6 @@ if [ "${FM_TEST_FOCUSED:-}" = account-lifecycle-timeouts ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = unknown-endpoint-rollback ]; then
-  run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
-  exit 0
-fi
-
-if [ "${FM_TEST_FOCUSED:-}" = rollback-cleanup-retry ]; then
-  run_isolated_test test_failed_cleanup_persists_retryable_metadata
-  run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
-  run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
-  exit 0
-fi
-
 if [ "${FM_TEST_FOCUSED:-}" = session-sync-teardown-race ]; then
   run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
   exit 0
@@ -6152,11 +5643,6 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = rollback-safety ]; then
   run_isolated_test test_secondmate_rollback_refuses_unsafe_tasktmp
   run_isolated_test test_rollback_backup_rejects_symlink_and_rechecks_under_lock
-  exit 0
-fi
-
-if [ "${FM_TEST_FOCUSED:-}" = enforce-select-failure ]; then
-  run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
   exit 0
 fi
 
@@ -6297,7 +5783,6 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-28 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-29 ]; then
-  run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
   run_isolated_test test_continuation_revalidates_dirty_submodule_content
   run_isolated_test test_continuation_repository_fingerprint_uses_pinned_root
   run_isolated_test test_continuation_rejects_root_swap_before_descriptor_open
@@ -6408,7 +5893,6 @@ if [ "${FM_TEST_FOCUSED:-}" = signal-handoff ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = gate-e-workspace ]; then
-  run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
   run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
   run_isolated_test test_lease_signal_handoff_publishes_cleanup_ownership
   run_isolated_test test_recovery_signal_handoff_publishes_cleanup_ownership
@@ -6430,7 +5914,6 @@ if [ "${FM_TEST_FOCUSED:-}" = production-fleet-environment ]; then
   exit 0
 fi
 
-run_isolated_test test_reserved_generation_is_durable_before_lease_mutation
 run_isolated_test test_off_is_byte_compatible_and_never_calls_agent_fleet
 run_isolated_test test_failed_freshness_proof_rolls_back_unmanaged_resources
 run_isolated_test test_local_only_spawn_uses_local_default_tip
@@ -6440,11 +5923,6 @@ run_isolated_test test_changed_acquisition_is_retained_during_unmanaged_rollback
 run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
 run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
 run_isolated_test test_completion_contract_ignores_raw_html_headings
-run_isolated_test test_enforce_pool_wraps_backend_and_records_real_session
-run_isolated_test test_explicit_profile_uses_explicit_pool
-run_isolated_test test_enforce_failure_rolls_back_prepared_endpoint
-run_isolated_test test_pane_failure_happens_before_account_reservation
-run_isolated_test test_batch_partial_failure_releases_only_failed_item
 run_isolated_test test_resume_uses_sticky_recovery_and_preserves_mapping_on_failure
 run_isolated_test test_recovered_secondmate_kind_blocks_unsupported_cmux_backend_early
 run_isolated_test test_managed_recovery_rejects_duplicate_kind_metadata
@@ -6453,9 +5931,6 @@ run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
 run_isolated_test test_inherited_lifecycle_lock_rejects_owner_aba
 run_isolated_test test_unmanaged_spawn_refuses_while_teardown_lifecycle_is_held
 run_isolated_test test_off_metadata_merge_waits_for_metadata_lock
-run_isolated_test test_unmanaged_respawn_preserves_report_cutover_state
-run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
-run_isolated_test test_preinstall_managed_failure_restores_artifact_snapshot
 run_isolated_test test_session_sync_bounds_agent_fleet_queries
 run_isolated_test test_session_sync_rejects_workspace_mismatch_without_metadata_change
 run_isolated_test test_session_sync_all_bounds_each_task_and_reaches_later_mappings
@@ -6479,20 +5954,12 @@ run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every
 run_isolated_test test_managed_shared_namespace_secondmate_uses_primary_endpoint_scope
 run_isolated_test test_unused_secondmate_pool_never_blocks_unmanaged_spawn
 run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
-run_isolated_test test_duplicate_spawn_preserves_original_endpoint_and_lease
-run_isolated_test test_reservation_occurs_after_worktree_preparation
 run_isolated_test test_raw_enforced_launch_is_rejected_before_mutation
 run_isolated_test test_global_enforce_refuses_unsupported_harnesses
 run_isolated_test test_malformed_routing_mode_fails_closed
-run_isolated_test test_invalid_selection_response_releases_reservation
-run_isolated_test test_fresh_launch_requires_session_binding_and_fully_rolls_back
-run_isolated_test test_failed_cleanup_persists_retryable_metadata
-run_isolated_test test_unknown_spawn_endpoint_retains_lease_for_retry
-run_isolated_test test_rollback_retry_rechecks_live_endpoint_before_release
 run_isolated_test test_failed_secondmate_rollback_preserves_home_for_relaunch
 run_isolated_test test_failed_secondmate_respawn_rollback_restores_prior_state
 run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
-run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
 run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
 run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex

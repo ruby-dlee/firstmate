@@ -2404,31 +2404,25 @@ esac
 if { [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
     || { [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$KIND" != secondmate ]; }; } \
   && [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
-  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] && fm_account_test_lab_enabled \
-    && [ "$DIRECT_ACCOUNT_RECOVERY" = 0 ] \
-    && [ "${FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST:-}" = firstmate-remove-fleet-routing-deadcode-fixture-v1 ]; then
-    :
-  else
-    [ "$RAW_LAUNCH" != 1 ] || {
-      echo "error: direct account-directory routing does not accept raw launch commands" >&2
-      exit 1
-    }
-    DIRECT_ACCOUNT_ROUTING=1
-    if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
-      echo "fm-spawn: --account-pool/--account-profile now activate direct account-directory selection for new launches; the legacy alias does not pin the selected account" >&2
-    elif [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
-      echo "fm-spawn: recorded direct account metadata activates fresh account-directory selection for this respawn" >&2
-    fi
-    if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-      DIRECT_ACCOUNT_PREPARE_DEFERRED=1
-    else
-      DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
-      echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
-    fi
-    # Every Agent Fleet branch below is guarded by enforce. New direct crewmate
-    # launches deliberately rejoin the ordinary unmanaged spawn path after selection.
-    ACCOUNT_EFFECTIVE_MODE=off
+  [ "$RAW_LAUNCH" != 1 ] || {
+    echo "error: direct account-directory routing does not accept raw launch commands" >&2
+    exit 1
+  }
+  DIRECT_ACCOUNT_ROUTING=1
+  if [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ]; then
+    echo "fm-spawn: --account-pool/--account-profile now activate direct account-directory selection for new launches; the legacy alias does not pin the selected account" >&2
+  elif [ "$DIRECT_ACCOUNT_RESPAWN" = 1 ]; then
+    echo "fm-spawn: recorded direct account metadata activates fresh account-directory selection for this respawn" >&2
   fi
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    DIRECT_ACCOUNT_PREPARE_DEFERRED=1
+  else
+    DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+    echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+  fi
+  # Every Agent Fleet branch below is guarded by enforce. New direct crewmate
+  # launches deliberately rejoin the ordinary unmanaged spawn path after selection.
+  ACCOUNT_EFFECTIVE_MODE=off
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
   if [ -n "$ACCOUNT_PROFILE" ]; then

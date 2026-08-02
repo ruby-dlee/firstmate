@@ -17,8 +17,8 @@
 # Valid modes are off, observe, and enforce.
 # New observe and enforce launches use bin/fm-account-directory.sh and do not
 # invoke Agent Fleet.
-# Agent Fleet selection and lease helpers remain as legacy recovery support and
-# isolated dead-code fixtures pending remove-fleet-routing-deadcode.
+# Agent Fleet selection and lease helpers remain for secondmate launches and
+# legacy managed recovery.
 #
 # FM_AGENT_FLEET_BIN may name a deterministic fake only in tests/labs.
 # Production always opens the current passwd user's fixed regular front door at

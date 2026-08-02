@@ -143,7 +143,6 @@ If no usable Claude account for crewmates survives eligibility, the launch fails
 Claude can declare a separate last-resort worker pool, consulted only after its primary worker pool is empty; no identity inference participates in either tier.
 It serializes round-robin fallback and exact-score tie-breaking so unavailable usage and concurrent launches cannot collapse onto the stable first account.
 For quota-balanced account-pool candidates, new dispatch deterministically uses the ordered first profile and passes its compatibility alias to spawn only as the activation signal for direct per-account selection.
-The legacy Agent Fleet pool-summary selector is inactive deferred code tracked by `remove-fleet-routing-deadcode`; it is not available to new dispatches.
 
 ## Optional secondmates
 

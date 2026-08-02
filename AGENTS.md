@@ -225,7 +225,6 @@ When no usable Claude account for crewmates survives those checks, selection fai
 An explicitly declared `claude-crew-last-resort` pool is consulted only after `claude-crew` has no usable account; manual-only profiles remain excluded, and selector code never guesses account ownership from unreadable identity data.
 Fresh Codex quota is an opportunistic ranking signal.
 Exact best-score Codex ties and an all-unavailable quota result rotate across eligible accounts under a serialized persistent cursor; Claude always uses that rotation because its per-directory quota signal is unreadable.
-The now-unreachable Agent Fleet pool-summary implementation and inactive new-lease fixtures are legacy code deferred to follow-up task `remove-fleet-routing-deadcode`.
 Quota trouble must never block dispatch.
 
 Precedence, highest first:

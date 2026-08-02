@@ -2339,19 +2339,7 @@ case "${1:-}" in
     : > "$FM_FAKE_KILL_STARTED"
     while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
     : > "$FM_FAKE_KILLED"
-    exit 0
-    ;;
-  list-windows)
-    # Teardown only performs endpoint cleanup for an endpoint it can still see,
-    # and then requires confirmed absence, so a stub pinned to either state
-    # cannot exercise this: reported absent, kill-window is skipped and the
-    # generation-lock race below never happens; reported present forever,
-    # teardown refuses. Observable until the kill lands, gone after it.
-    [ -f "$FM_FAKE_KILLED" ] || printf 'fm-task-x1\n'
-    exit 0
-    ;;
-  display-message)
-    [ -f "$FM_FAKE_KILL_STARTED" ] && exit 1
+    rm -f "$state"
     exit 0
     ;;
 esac
@@ -2467,15 +2455,11 @@ case "${1:-}" in
         : > "$FM_FAKE_KILL_STARTED"
         while [ ! -f "$FM_FAKE_ALLOW_KILL" ]; do sleep 0.01; done
         : > "$FM_FAKE_KILLED"
+        rm -f "$child_state"
         ;;
       *) rm -f "$parent_state" ;;
     esac
     ;;
-  list-windows)
-    [ -f "$FM_FAKE_KILLED" ] || printf 'fm-child-lock-x3\n'
-    exit 0
-    ;;
-  display-message) exit 1 ;;
 esac
 exit 0
 SH
@@ -4996,6 +4980,16 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = managed-endpoint-identity ]; then
   test_managed_force_teardown_retains_unlanded_lease_and_session
   test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-generation-lock ]; then
+  test_managed_teardown_locks_generation_before_endpoint_cleanup
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = managed-child-generation-lock ]; then
+  test_managed_child_teardown_locks_generation_before_snapshot
   exit 0
 fi
 

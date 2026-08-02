@@ -80,6 +80,10 @@ test_no_mistakes_dod_wording() {
     "no-mistakes DOD lost its guidance-reference sentence"
   assert_no_grep "no-mistakes' own guidance" "$brief" \
     "no-mistakes DOD regressed to the apostrophe form that breaks bash -n"
+  assert_grep "FM_HOME='$home' '$ROOT/bin/fm-no-mistakes-reattach.sh' $id" "$brief" \
+    "no-mistakes brief does not route the transient reconciliation timeout through the task-scoped helper"
+  assert_grep "retries only that transient read timeout without daemon lifecycle changes" "$brief" \
+    "no-mistakes brief lost the safe retry boundary"
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
 }
 

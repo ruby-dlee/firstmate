@@ -706,6 +706,7 @@ Inline facts that must survive without a loaded skill:
 ### Stuck-crewmate recovery
 
 On `stale`, `permission-prompt detected`, `permission/system-dialog suspected`, looping, repeated confusion, an answered-by-brief question, an unresponsive pane, or a failed steer, load `stuck-crewmate-recovery`.
+Also load it when no-mistakes reattach reports `drive run: reconcile run ... read response ... socket: i/o timeout`; its home-scoped helper owns the retry and forbids shared-daemon lifecycle changes.
 That playbook escalates from peek, to one-line steer, to harness-specific interrupt, to relaunch with a progress note, to `failed` with evidence.
 
 ## 9. Escalation and captain etiquette

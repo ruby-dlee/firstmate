@@ -15,7 +15,7 @@
 # and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -322,6 +322,77 @@ nm_pr_state() {  # <pr-url>
   esac
 }
 
+# Resolve the live head SHA for a GitHub PR through gh-axi's API surface.
+# `gh-axi pr view` deliberately omits the head SHA, so this targeted read is the
+# only way to prove that a completed run-step still describes the code currently
+# published in the open PR.
+nm_pr_head() {  # <pr-url>
+  local pr_url=$1 owner repo number out head
+  [ -n "$pr_url" ] || return 0
+  command -v gh-axi >/dev/null 2>&1 || return 0
+  if [[ "$pr_url" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)/?$ ]]; then
+    owner=${BASH_REMATCH[1]}
+    repo=${BASH_REMATCH[2]}
+    number=${BASH_REMATCH[3]}
+  else
+    return 0
+  fi
+  out=$(gh_axi_run api "/repos/$owner/$repo/pulls/$number")
+  head=$(printf '%s\n' "$out" \
+    | sed -n '/^[[:space:]]*head:[[:space:]]*$/,/^[[:space:]]*base:[[:space:]]*$/s/^[[:space:]]*sha:[[:space:]]*\(.*\)/\1/p' \
+    | head -1)
+  strip_quotes "$head"
+}
+
+status_log_pr_url() {
+  printf '%s\n' "$LOG_LINE" \
+    | grep -oE 'https://github\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+' \
+    | head -1
+}
+
+# A PR-ready result is merge input, so branch equality is insufficient: a
+# branch can have a newer PR head while `axi status` still renders an earlier
+# completed run for that branch. Compare the run's rendered head (a short SHA)
+# to the live PR head and fail closed when currentness is unavailable.
+verify_ready_head_or_emit() {  # <validated-head> <pr-url>
+  local validated_head=$1 pr_url=$2 live_head
+  if [ -z "$validated_head" ] || [ -z "$pr_url" ]; then
+    emit unknown run-step "PR-ready run-step currentness is unavailable; do not merge"
+  fi
+  live_head=$(nm_pr_head "$pr_url")
+  if [ -z "$live_head" ]; then
+    emit unknown run-step "PR-ready run-step could not verify the live PR head; do not merge"
+  fi
+  case "$live_head" in
+    "$validated_head"*) return 0 ;;
+    *) emit stale run-step "stale run-step: validated head $validated_head no longer matches PR head ${live_head:0:8}; do not merge" ;;
+  esac
+}
+
+# `axi status` may return an earlier completed run even after another run has
+# started for the same branch. The newest-first `no-mistakes runs` view is the
+# independent currentness check for that case. A completed result must never be
+# treated as merge input while the newest branch run is still active, even when
+# both runs validate the same commit and the live PR-head comparison therefore
+# cannot distinguish them.
+verify_no_newer_active_run_or_emit() {  # <branch>
+  local branch=$1 newest newest_status newest_rest newest_head
+  newest=$(nm_runs_status_for_branch "$branch")
+  if [ -z "$newest" ]; then
+    emit unknown run-step "PR-ready run-step could not verify the newest branch run; do not merge"
+  fi
+  newest_status=${newest%%|*}
+  newest_rest=${newest#*|}
+  newest_head=${newest_rest%%|*}
+  [ -n "$newest_head" ] || newest_head=unknown
+  case "$newest_status" in
+    completed) return 0 ;;
+    running) emit stale run-step "stale run-step: a newer active run exists for $branch at $newest_head; do not merge" ;;
+    failed|cancelled) emit stale run-step "stale run-step: the newest run for $branch is $newest_status at $newest_head; do not merge" ;;
+    *) emit unknown run-step "PR-ready run-step has unverifiable newest-run status $newest_status; do not merge" ;;
+  esac
+}
+
 log_reports_ci_ready() {
   [ "$LOG_VERB" = "done" ] || return 1
   case "$(status_line_note "$LOG_LINE")" in
@@ -416,7 +487,7 @@ nm_ci_checks_state() {
 # matching row's status word (running/completed/cancelled/failed), or empty
 # when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br
+  local branch=$1 out row st rest br head pr field
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
   while IFS= read -r row; do
@@ -427,7 +498,17 @@ nm_runs_status_for_branch() {  # <branch>
     rest=$(trim "$rest")
     br=${rest%% *}
     if [ "$br" = "$branch" ]; then
-      printf '%s' "$st"
+      # The human-oriented runs row is whitespace-delimited and always starts
+      # with status, branch, and short head. Preserve the optional PR URL so a
+      # coarse branch match can still verify a checks-green status-log event.
+      # shellcheck disable=SC2086 # Intentional whitespace tokenization of CLI output.
+      set -- $row
+      head=${3:-}
+      pr=
+      for field in "$@"; do
+        case "$field" in https://github.com/*/*/pull/[0-9]*) pr=$field ;; esac
+      done
+      printf '%s|%s|%s' "$st" "$head" "$pr"
       return 0
     fi
   done <<< "$out"
@@ -445,6 +526,8 @@ HAVE_RUN=0
 # run-step block below skips the TOON field parsing entirely for this crewmate.
 RUN_SOURCE=full
 COARSE_STATUS=""
+COARSE_HEAD=""
+COARSE_PR=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -460,8 +543,12 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$COARSE_STATUS" ]; then
+      coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH")
+      if [ -n "$coarse_run" ]; then
+        COARSE_STATUS=${coarse_run%%|*}
+        coarse_rest=${coarse_run#*|}
+        COARSE_HEAD=${coarse_rest%%|*}
+        COARSE_PR=${coarse_rest#*|}
         HAVE_RUN=1
         RUN_SOURCE=coarse
       fi
@@ -477,6 +564,9 @@ if [ "$HAVE_RUN" = 1 ]; then
   CI_STEP_STATUS=""
   CI_LOG_STATE=""
   RUN_STATUS=""
+  RUN_HEAD=""
+  RUN_PR=""
+  READY_CLAIM=0
   if [ "$RUN_SOURCE" = coarse ]; then
     # No step/gate detail is available from the plain runs list - only ever
     # true/working, done, or failed. A crewmate genuinely parked at a gate still
@@ -495,6 +585,8 @@ if [ "$HAVE_RUN" = 1 ]; then
   else
     status=$(strip_quotes "$(nm_field status)")
     RUN_STATUS=$status
+    RUN_HEAD=$(strip_quotes "$(nm_field head)")
+    RUN_PR=$(strip_quotes "$(nm_field pr)")
     outcome=$(strip_quotes "$(nm_field outcome)")
     awaiting=$(printf '%s\n' "$RUN_OUT" | grep -E '^[[:space:]]*awaiting_agent:' | head -1 || true)
     gate_status=$(nm_gate_status)
@@ -515,7 +607,7 @@ if [ "$HAVE_RUN" = 1 ]; then
             *)       RUN_DETAIL="run passed: PR state unavailable (not verified)" ;;
           esac
           ;;
-        checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
+        checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review"; READY_CLAIM=1 ;;
         failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
         cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;
         *)             RUN_STATE=unknown; RUN_DETAIL="outcome: $outcome" ;;
@@ -553,6 +645,7 @@ if [ "$HAVE_RUN" = 1 ]; then
             if [ "$CI_LOG_STATE" = green ]; then
               RUN_STATE="done"
               RUN_DETAIL="checks green: PR ready for review (still monitoring for merge/close)"
+              READY_CLAIM=1
             fi
             ;;
           fixing)
@@ -563,8 +656,17 @@ if [ "$HAVE_RUN" = 1 ]; then
     fi
   fi
 
+  if [ "$RUN_STATE" = "done" ] && [ "$READY_CLAIM" = 1 ]; then
+    if [ "$RUN_SOURCE" = full ] && [ "$RUN_STATUS" = completed ]; then
+      verify_no_newer_active_run_or_emit "$CREW_BRANCH"
+    fi
+    verify_ready_head_or_emit "$RUN_HEAD" "$RUN_PR"
+  fi
+
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
+      [ -n "$COARSE_PR" ] || COARSE_PR=$(status_log_pr_url)
+      verify_ready_head_or_emit "$COARSE_HEAD" "$COARSE_PR"
       emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
     [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
@@ -576,6 +678,8 @@ if [ "$HAVE_RUN" = 1 ]; then
       CI_LOG_STATE=not-ready
     fi
     if [ "$CI_LOG_STATE" != not-ready ]; then
+      [ -n "$RUN_PR" ] || RUN_PR=$(status_log_pr_url)
+      verify_ready_head_or_emit "$RUN_HEAD" "$RUN_PR"
       emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
   fi

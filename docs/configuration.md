@@ -287,7 +287,8 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 
 `bin/fm-checkout-refresh.sh` keeps worktree seed checkouts current independently of Firstmate's own PR lifecycle.
 Its header owns the exact discovery, configuration-file, cadence, state, and command contracts.
-The default covered set is every clone under the active home's `projects/`, every backing checkout referenced by that home's managed `$FM_HOME/.treehouse` pool or the legacy user-level `~/.treehouse` pool, and every top-level clone under `$HOME` whose `origin` URL matches one of those tracked checkouts.
+The default covered set is every clone under the active home's `projects/`, every backing checkout referenced by that home's managed `$FM_HOME/.treehouse` pool, every legacy user-level pool backing already registered directly to the active home, and every top-level clone under `$HOME` whose `origin` URL matches one of those tracked checkouts.
+Foreign and ownerless legacy pools are reported but never enter this home's refresh or pool-worktree hygiene set.
 Matching by origin discovers parallel clones such as `~/relvino` without embedding a captain-specific path in shared code.
 Optional `path` and shallow `scan` directives in the gitignored `config/checkout-refresh` file extend that set.
 Every declared checkout and matching-origin scan result must resolve to its exact canonical Git worktree root, so nested directories can never redirect refresh to an enclosing repository.
@@ -316,7 +317,8 @@ The ordinary safe-refresh warning separately quantifies every non-ignored untrac
 These checks inspect paths only and never delete, move, stash, reset, or edit a draft.
 The signal interval and backstop are configurable through `FM_CHECKOUT_REFRESH_INTERVAL` and `FM_CHECKOUT_REFRESH_BACKSTOP`.
 Every cadence and spawn-preflight refresh disables gone-branch pruning and retains `fm-fleet-sync.sh`'s fail-safe behavior: a dirty, diverged, or non-default checkout is left untouched and recorded as an alert.
-Registered `local-only` checkouts and repositories without `origin` are fully inspected against their proven local `main` or `master` tip without fetching, including when a local-only checkout still has a remote configured.
+Only checkouts whose exact active-home `projects/<name>` registration is explicitly `local-only` may use a local `main` or `master` tip without fetching, including when that checkout still has a remote configured.
+Any remote-free checkout without that exact proof is skipped and makes coverage unhealthy.
 The forced session-start mode prunes a gone branch only when its tip is reachable from a surviving remote ref or its content is already present in the live default branch.
 An unproven branch is retained and surfaced as `STUCK:`.
 
@@ -331,6 +333,7 @@ The accepted lease must be clean, belong to the requested repository, have the s
 Remote-free `local-only` acquisitions use the same repository and cleanliness proof, with the requested checkout's local `main` or `master` tip as their freshness authority.
 Treehouse-acquired secondmate homes receive the same proof before seeding.
 They use the same locked, bounded acquisition entrypoint as ordinary task worktrees.
+Secondmate acquisition also runs the managed home pool preflight before invoking Treehouse, so an uninspectable owned pool is skipped before the provider can act on it.
 Explicit secondmate homes are refreshed and must independently match the same live upstream or local default tip before seeding and again before launch.
 A stale, dirty, or uninspectable acquisition remains durably leased without forced return and is surfaced for manual recovery.
 If an unmanaged spawn fails after publishing metadata or task artifacts, it restores the prior task generation.
@@ -341,11 +344,9 @@ Orca is an explicit legacy-recovery-only exception because this change creates n
 
 ### Limitations / deferred
 
-- A checkout without `origin` still uses the local default-tip proof without first proving that its registered project mode is explicitly `local-only`.
-- Secondmate home acquisition still relies on Treehouse's dirty-entry skip and does not run Firstmate's `pool-preflight` before requesting its durable lease.
 - The rare SIGKILL lock-to-guard handoff race, exact wrapped-exit-code fidelity, and setup-failure diagnostic precision remain deferred under `clone-refresh-followup-edges`; current fail-safe behavior may retain or refuse work or require retry, but must not claim healthy coverage or discard unlanded work.
 
-The consolidated `clone-refresh-followup-edges` follow-up should tighten explicit local-only mode proof, add home-filtered pool ownership, apply pool preflight to secondmate acquisition, and close the three process-ownership edges above.
+The three process-ownership edges above remain separate follow-up work.
 These are bounded completeness limitations: coverage health fails closed when Treehouse enumeration cannot be proved, and rollback retains any worktree whose repository identity and expected detached tip cannot be re-proven, so the deferred formalization does not create a false healthy-coverage signal or a destructive data-loss path.
 
 On macOS, bootstrap reports `MISSING: checkout-refresh` until that home's per-user LaunchAgent is installed.

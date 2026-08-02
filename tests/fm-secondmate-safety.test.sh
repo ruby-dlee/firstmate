@@ -280,6 +280,41 @@ test_home_seed_acquisition_honors_shared_checkout_lock() {
   pass "secondmate acquisition uses the common locked entrypoint"
 }
 
+test_home_seed_preflights_managed_pool_before_treehouse() {
+  local home acquired fakebin log err source broken_state
+  home="$TMP_ROOT/dash-preflight-home"
+  acquired="$TMP_ROOT/dash-preflight-acquired-home"
+  err="$TMP_ROOT/dash-preflight.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state" "$home/.treehouse/broken"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/dash-preflight-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  source=$(make_live_default_firstmate_worktree "$acquired" dash-preflight-firstmate)
+  fakebin=$(make_fake_tmux "$TMP_ROOT/dash-preflight-fake")
+  log="$TMP_ROOT/dash-preflight-fake/tmux.log"
+  broken_state="$home/.treehouse/broken/treehouse-state.json"
+  printf '%s\n' '{"worktrees":[' > "$broken_state"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$acquired" \
+    FM_FAKE_TMUX_LOG="$log" FM_ROOT_OVERRIDE="$source" \
+    FM_SECONDMATE_CHARTER='dash preflight scope' FM_SECONDMATE_SCOPE='dash preflight scope' \
+    "$ROOT/bin/fm-home-seed.sh" dash-preflight - alpha >/dev/null 2>"$err"; then
+    fail "secondmate acquisition acted on an uninspectable managed pool"
+  fi
+
+  grep -F "incomplete Treehouse coverage at $broken_state" "$err" >/dev/null \
+    || fail "secondmate pool preflight did not surface malformed owned state"
+  grep -F 'refusing secondmate Treehouse acquisition because its active-home pool state is not safely inspectable' "$err" >/dev/null \
+    || fail "secondmate seed did not diagnose its pre-acquisition refusal"
+  if [ -f "$log" ] && grep -F 'treehouse get --lease' "$log" >/dev/null; then
+    fail "secondmate seed invoked Treehouse after pool preflight failed"
+  fi
+  [ ! -f "$home/data/secondmates.md" ] \
+    || ! grep -F -- '- dash-preflight ' "$home/data/secondmates.md" >/dev/null \
+    || fail "failed secondmate pool preflight wrote a registry route"
+  pass "secondmate acquisition preflights owned pool state before Treehouse can act"
+}
+
 test_home_seed_rejects_stale_treehouse_acquired_home() {
   local home acquired acquired_abs fakebin log err source before
   home="$TMP_ROOT/dash-stale-home"
@@ -2745,6 +2780,12 @@ if [ "${FM_TEST_FOCUSED:-}" = checkout-freshness ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = clone-refresh-followup-edges ]; then
+  test_home_seed_uses_treehouse_acquired_home
+  test_home_seed_preflights_managed_pool_before_treehouse
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
   test_home_seed_acquisition_honors_shared_checkout_lock
   exit 0
@@ -2780,6 +2821,7 @@ test_home_seed_validate_rejects_duplicate_ids
 test_home_seed_validate_rejects_nested_homes
 test_home_seed_validate_rejects_partial_registry_rows
 test_home_seed_uses_treehouse_acquired_home
+test_home_seed_preflights_managed_pool_before_treehouse
 test_home_seed_acquisition_honors_shared_checkout_lock
 test_home_seed_rejects_stale_treehouse_acquired_home
 test_home_seed_retains_dirty_treehouse_acquired_home

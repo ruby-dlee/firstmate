@@ -7,7 +7,8 @@
 #
 #   - projects/* under the active FM_HOME;
 #   - backing checkouts discovered from the active home's managed Treehouse pool
-#     and the legacy user-level pool under ~/.treehouse;
+#     and from legacy user-level pools whose backing checkout is explicitly
+#     registered to this home;
 #   - exact Git worktree roots from `path <checkout>` entries in config/checkout-refresh;
 #   - top-level clones under $HOME, plus explicit `scan <directory>` roots, whose
 #     origin URL matches one of the checkouts above.
@@ -50,12 +51,13 @@
 # Every probe also inventories non-ignored untracked files in both the covered seed
 # checkouts and the Treehouse pool worktrees under repository skill directories
 # (`.agents/skills`, `.claude/skills`, `.codex/skills`, and `skills`).
-# Unreadable or malformed Treehouse state invalidates coverage health while the
-# heartbeat records scheduler liveness independently.
+# Unreadable or malformed home-owned Treehouse state invalidates coverage health,
+# while foreign or ownerless legacy pools are skipped and reported without their
+# checkouts entering this home's refresh or hygiene set.
 # Every scan root must be readable and successfully enumerable, and every covered
 # checkout retains its actual origin identity across runs.
-# Registered local-only checkouts and remote-free repositories use their proven
-# local default tip while still surfacing dirty, stale, or non-default states.
+# Only checkouts registered explicitly as local-only may use a local default tip;
+# a remote-free checkout without that exact home registration is skipped.
 # A new or changed inventory is surfaced immediately and persisted as a separate
 # hygiene alert, even when no upstream change or backstop refresh is due.
 # Forced/operator-visible runs repeat unresolved hygiene alerts.
@@ -350,12 +352,13 @@ parse_config() {
 }
 
 treehouse_worktree_paths() {
-  local roots=()
+  local scope=${1:-all} roots=()
+  case "$scope" in all|managed-only) ;; *) return 2 ;; esac
   if [ "$MANAGED_TREEHOUSE_ROOT_INVALID" = 1 ]; then
     echo "checkout-refresh: skipped: incomplete Treehouse coverage because the managed home root is unsafe or unreadable: $MANAGED_TREEHOUSE_ROOT_RAW" >&2
     return 1
   fi
-  if [ "$TREEHOUSE_ROOT_INVALID" = 1 ]; then
+  if [ "$scope" = all ] && [ "$TREEHOUSE_ROOT_INVALID" = 1 ]; then
     echo "checkout-refresh: skipped: incomplete Treehouse coverage because the configured root is unsafe or unreadable: $TREEHOUSE_ROOT_RAW" >&2
     return 1
   fi
@@ -366,7 +369,7 @@ treehouse_worktree_paths() {
     }
     roots+=("$MANAGED_TREEHOUSE_ROOT")
   fi
-  if [ -e "$TREEHOUSE_ROOT" ] || [ -L "$TREEHOUSE_ROOT" ]; then
+  if [ "$scope" = all ] && { [ -e "$TREEHOUSE_ROOT" ] || [ -L "$TREEHOUSE_ROOT" ]; }; then
     [ -d "$TREEHOUSE_ROOT" ] || {
       echo "checkout-refresh: skipped: incomplete Treehouse coverage because the root is not a directory: $TREEHOUSE_ROOT" >&2
       return 1
@@ -476,6 +479,15 @@ for state_path in state_paths:
 if failed:
     raise SystemExit(1)
 PY
+}
+
+pool_is_managed_by_active_home() {
+  local pool=$1 canonical
+  canonical=$(canonical_dir "$pool") || return 1
+  case "$canonical" in
+    "$MANAGED_TREEHOUSE_ROOT"/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 active_project_paths() {
@@ -803,11 +815,13 @@ cleanup_discovery_tmp() {
   rm -rf "$1"
 }
 
+DISCOVERY_POOL_WORKTREES=
 discover() {
-  local tmp seeds origins scans scan_candidates configured_paths configured_scans treehouse_paths project_paths
-  local path project worktree pool treehouse_state main root candidate candidate_output url failed=0
+  local tmp seeds ownership_roots origins scans scan_candidates configured_paths configured_scans treehouse_paths project_paths
+  local path project worktree pool treehouse_state main root candidate candidate_output url canonical failed=0
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-checkout-refresh-discover.XXXXXX") || return 1
   seeds="$tmp/seeds"
+  ownership_roots="$tmp/ownership-roots"
   origins="$tmp/origins"
   scans="$tmp/scans"
   scan_candidates="$tmp/scan-candidates"
@@ -816,6 +830,7 @@ discover() {
   treehouse_paths="$tmp/treehouse-worktrees"
   project_paths="$tmp/active-projects"
   manifest_create "$seeds" || { cleanup_discovery_tmp "$tmp" || true; return 1; }
+  manifest_create "$ownership_roots" || { cleanup_discovery_tmp "$tmp" || true; return 1; }
   manifest_create "$origins" || { cleanup_discovery_tmp "$tmp" || true; return 1; }
   manifest_create "$scans" || { cleanup_discovery_tmp "$tmp" || true; return 1; }
   manifest_create "$scan_candidates" || { cleanup_discovery_tmp "$tmp" || true; return 1; }
@@ -835,6 +850,7 @@ discover() {
     [ -n "$project" ] || continue
     if main=$(exact_git_root "$project"); then
       manifest_append "$seeds" "$main" || failed=1
+      manifest_append "$ownership_roots" "$main" || failed=1
     else
       echo "checkout-refresh: skipped: active-home project is not an exact inspectable Git repository root: $project" >&2
       failed=1
@@ -845,19 +861,41 @@ discover() {
     [ -n "$path" ] || continue
     if main=$(exact_git_root "$path"); then
       manifest_append "$seeds" "$main" || failed=1
+      manifest_append "$ownership_roots" "$main" || failed=1
     else
       echo "checkout-refresh: skipped: configured checkout is not an exact inspectable Git repository root: $path" >&2
       failed=1
     fi
   done < "$configured_paths"
 
+  if main=$(exact_git_root "$FM_HOME_CANONICAL" 2>/dev/null); then
+    manifest_append "$ownership_roots" "$main" || failed=1
+  fi
+  manifest_sort_unique "$ownership_roots" || failed=1
+
   while IFS=$'\t' read -r treehouse_state pool worktree; do
     [ -n "$worktree" ] || continue
     if main=$(backing_checkout "$worktree" "$pool" "$treehouse_state" 2>/dev/null); then
-      manifest_append "$seeds" "$main" || failed=1
+      if pool_is_managed_by_active_home "$pool" || grep -Fxq -- "$main" "$ownership_roots"; then
+        manifest_append "$seeds" "$main" || failed=1
+        canonical=$(exact_git_root "$worktree") || {
+          echo "checkout-refresh: skipped: home-owned Treehouse worktree is not an exact inspectable Git root: $worktree" >&2
+          failed=1
+          continue
+        }
+        DISCOVERY_POOL_WORKTREES="${DISCOVERY_POOL_WORKTREES}${canonical}"$'\n'
+      else
+        echo "checkout-refresh: skipped: legacy Treehouse pool is foreign or has no active-home ownership proof: $pool (backing checkout $main)" >&2
+      fi
     else
-      echo "checkout-refresh: skipped: Treehouse worktree identity or registration is not inspectable: $worktree" >&2
-      failed=1
+      canonical=$(exact_git_root "$worktree" 2>/dev/null || true)
+      if pool_is_managed_by_active_home "$pool" \
+          || { [ -n "$canonical" ] && grep -Fxq -- "$canonical" "$ownership_roots"; }; then
+        echo "checkout-refresh: skipped: home-owned Treehouse worktree identity or registration is not inspectable: $worktree" >&2
+        failed=1
+      else
+        echo "checkout-refresh: skipped: legacy Treehouse worktree is foreign or has no active-home ownership proof: $worktree" >&2
+      fi
     fi
   done < "$treehouse_paths"
   manifest_sort_unique "$seeds" || failed=1
@@ -1948,29 +1986,14 @@ surface_skill_drafts() {
 }
 
 prepare_hygiene_discovery() {
-  local seed_file=$1 hygiene_file=$2 treehouse_paths treehouse_state pool worktree canonical failed=0
+  local seed_file=$1 hygiene_file=$2 worktree failed=0
   cp "$seed_file" "$hygiene_file" || return 1
-  treehouse_paths=$(mktemp "$STATE_ROOT/.treehouse-worktrees.XXXXXX") || return 1
-  if ! treehouse_worktree_paths > "$treehouse_paths"; then
-    rm -f "$treehouse_paths"
-    return 1
-  fi
-  while IFS=$'\t' read -r treehouse_state pool worktree; do
+  while IFS= read -r worktree; do
     [ -n "$worktree" ] || continue
-    if backing_checkout "$worktree" "$pool" "$treehouse_state" >/dev/null 2>&1 \
-        && canonical=$(exact_git_root "$worktree" 2>/dev/null); then
-      manifest_append "$hygiene_file" "$canonical" || failed=1
-    else
-      echo "checkout-refresh: skipped: Treehouse worktree identity or registration is not inspectable: $worktree" >&2
-      failed=1
-    fi
-  done < "$treehouse_paths"
-  BACKING_CHECKOUT_POOL_CACHE=0
-  BC_CACHE_POOL=''
-  BC_CACHE_MAIN=''
-  BC_CACHE_MAIN_COMMON=''
-  BC_CACHE_LISTED_ROOTS=''
-  rm -f "$treehouse_paths" || failed=1
+    manifest_append "$hygiene_file" "$worktree" || failed=1
+  done <<EOF
+$DISCOVERY_POOL_WORKTREES
+EOF
   [ "$failed" -eq 0 ] || return 1
   manifest_sort_unique "$hygiene_file"
 }
@@ -2032,15 +2055,27 @@ record_reinspection_failure() {
 }
 
 CHECKOUT_REFRESH_AUTHORITY=
-resolve_checkout_refresh_authority() {
-  local checkout=$1 mode_line mode
-  CHECKOUT_REFRESH_AUTHORITY=
-  mode_line=$("$FM_ROOT/bin/fm-project-mode.sh" "$(basename "$checkout")" 2>/dev/null) || return 1
+checkout_has_explicit_local_only_authority() {
+  local checkout=$1 projects_root registered mode_line mode
+  projects_root=$(canonical_dir "$PROJECTS" 2>/dev/null) || return 1
+  registered="$projects_root/${checkout##*/}"
+  registered=$(exact_git_root "$registered" 2>/dev/null) || return 1
+  [ "$registered" = "$checkout" ] || return 1
+  mode_line=$("$FM_ROOT/bin/fm-project-mode.sh" "${checkout##*/}" 2>/dev/null) || return 1
   mode=${mode_line%% *}
-  if [ "$mode" = local-only ] || [ "$CHECKOUT_ORIGIN_KIND" = no-origin ]; then
+  [ "$mode" = local-only ]
+}
+
+resolve_checkout_refresh_authority() {
+  local checkout=$1
+  CHECKOUT_REFRESH_AUTHORITY=
+  if checkout_has_explicit_local_only_authority "$checkout"; then
     CHECKOUT_REFRESH_AUTHORITY=local
-  else
+  elif [ "$CHECKOUT_ORIGIN_KIND" = origin ]; then
     CHECKOUT_REFRESH_AUTHORITY=upstream
+  else
+    echo "$checkout: skipped: remote-free checkout is not explicitly registered local-only in this Firstmate home" >&2
+    return 1
   fi
 }
 
@@ -2496,6 +2531,7 @@ run_once() {
   local prior_tip previous_coverage retry_unhealthy now last due probe_ok output_file output line reinspected identity_output
   local state_persisted hygiene_failed=0 coverage_failed=0 status=0
   local coverage=healthy
+  DISCOVERY_POOL_WORKTREES=
   for arg in "$@"; do
     case "$arg" in
       --force) force=1 ;;
@@ -2803,14 +2839,13 @@ pool_preflight() {
     return 1
   }
   treehouse_paths=$(mktemp "${TMPDIR:-/tmp}/fm-checkout-refresh-pool.XXXXXX") || return 1
-  if ! treehouse_worktree_paths > "$treehouse_paths"; then
+  if ! treehouse_worktree_paths managed-only > "$treehouse_paths"; then
     rm -f "$treehouse_paths"
     return 1
   fi
-  # This sweep walks one pool's worktrees, all of which share a repository, so
-  # let backing_checkout reuse its pool-scoped facts across them instead of
-  # recomputing per worktree. Scoped to this loop and cleared straight after, so
-  # no other caller inherits a cache. See backing_checkout for the rationale.
+  # This sweep walks every pool under this home's managed root. Let
+  # backing_checkout reuse its pool-scoped facts for adjacent entries instead of
+  # recomputing them per worktree. See backing_checkout for the rationale.
   BACKING_CHECKOUT_POOL_CACHE=1
   BC_CACHE_POOL=''
   BC_CACHE_MAIN=''
@@ -2818,17 +2853,17 @@ pool_preflight() {
   BC_CACHE_LISTED_ROOTS=''
   while IFS=$'\t' read -r treehouse_state pool worktree; do
     [ -n "$worktree" ] || continue
-    # FOREIGN-POOL SHORT CIRCUIT. This loop visits every Treehouse worktree on the
-    # machine, but the checks below only ever report on worktrees belonging to
-    # THIS repository - the `common = expected_common` test further down discards
-    # every other one after the expensive work has already been paid for.
+    # FOREIGN-POOL SHORT CIRCUIT. This loop visits every worktree in this home's
+    # managed pools, but the checks below only ever report dirty entries for THIS
+    # repository - the `common = expected_common` test further down discards every
+    # other one after the expensive work has already been paid for.
     #
     # That was the whole spawn cost. `backing_checkout` runs `git worktree list`
     # and then calls exact_git_root on EVERY listed worktree, so across a pool it
     # is quadratic in registered worktrees; run over unrelated multi-gigabyte
-    # pools it dominated everything. Measured before this change: 343 seconds of
-    # preflight to spawn into a 12 MB repository, paid on every single launch and
-    # growing with total fleet size rather than with the repo being spawned into.
+    # pools it dominated everything. Measured before the optimization: 343
+    # seconds of preflight to spawn into a 12 MB repository, paid on every launch
+    # and growing with the home's pool size rather than with the target repo.
     #
     # So ask the cheap question first: does this worktree even belong to the
     # repository we are preflighting? fm_checkout_git_common_dir is a metadata
@@ -2844,29 +2879,28 @@ pool_preflight() {
     if [ -n "$probe_common" ] && [ "$probe_common" != "$expected_common" ]; then
       continue
     fi
-    # A worktree we cannot fully inspect is SKIPPED, not fatal. The preflight
-    # iterates every Treehouse worktree in every pool, so a single busy,
-    # foreign, or half-torn-down worktree anywhere (including unrelated pools)
-    # must not cap acquisition for THIS pool - Treehouse pools grow, and acquire
-    # creates a fresh clean slot when no existing one is reusable. This mirrors
-    # the dirty-worktree case below, which already skips without failing. We can
-    # only confirm a worktree belongs to the target pool AFTER inspecting it, so
-    # an uninspectable one is by definition not provably ours to block on.
+    # This command enumerates only the active home's managed root. A worktree
+    # whose identity cannot be inspected is therefore an ambiguous owned-pool
+    # entry, so report it and fail the preflight before Treehouse can act.
     backing_checkout "$worktree" "$pool" "$treehouse_state" >/dev/null 2>&1 || {
       echo "checkout-refresh: skipped: Treehouse worktree identity or registration is not inspectable: $worktree" >&2
+      failed=1
       continue
     }
     canonical=$(exact_git_root "$worktree" 2>/dev/null) || {
       echo "checkout-refresh: skipped: Treehouse worktree is not an exact Git root: $worktree" >&2
+      failed=1
       continue
     }
     common=$(fm_checkout_git_common_dir "$canonical") || {
       echo "checkout-refresh: skipped: Treehouse repository identity is not inspectable: $canonical" >&2
+      failed=1
       continue
     }
     [ "$common" = "$expected_common" ] || continue
     dirty=$(GIT_OPTIONAL_LOCKS=0 git -C "$canonical" status --porcelain=v1 --untracked-files=all 2>/dev/null) || {
       echo "checkout-refresh: skipped: Treehouse worktree cleanliness is not inspectable: $canonical" >&2
+      failed=1
       continue
     }
     [ -n "$dirty" ] || continue
@@ -2874,8 +2908,6 @@ pool_preflight() {
     echo "$canonical: skipped: dirty Treehouse pool worktree remains unavailable for acquisition ($example)" >&2
   done < "$treehouse_paths"
   rm -f "$treehouse_paths"
-  # 'failed' is retained for future in-pool-fatal conditions; today no inspection
-  # skip is fatal, so preflight succeeds and lets acquire find or grow a slot.
   [ "$failed" -eq 0 ]
 }
 
@@ -2979,8 +3011,12 @@ verify_home() {
       return 1
     fi
   fi
-  source_origin=$(origin_url "$expected_source" || true)
-  if [ -n "$source_origin" ]; then
+  if ! inspect_checkout_origin "$expected_source"; then
+    echo "error: secondmate source origin identity cannot be inspected at $expected_source" >&2
+    return 1
+  fi
+  source_origin=$CHECKOUT_ORIGIN_VALUE
+  if [ "$CHECKOUT_ORIGIN_KIND" = origin ]; then
     probe_upstream "$expected_source" || {
       echo "error: cannot verify the live upstream default-branch tip for $expected_source" >&2
       return 1
@@ -2989,6 +3025,10 @@ verify_home() {
     tip=$PROBE_TIP
     expected="origin/$branch"
   else
+    checkout_has_explicit_local_only_authority "$expected_source" || {
+      echo "error: remote-free secondmate source is not explicitly registered local-only in this Firstmate home: $expected_source" >&2
+      return 1
+    }
     branch=$(local_default_branch "$expected_source") || {
       echo "error: cannot determine the local default branch for $expected_source" >&2
       return 1
@@ -3010,10 +3050,13 @@ verify_home() {
 }
 
 verify_worktree() {
-  local worktree=$1 expected_source=$2 source_origin default tip head expected
+  local worktree=$1 expected_source=$2 default tip head expected
   verify_worktree_safety "$worktree" "$expected_source" || return $?
-  source_origin=$(git -C "$expected_source" remote get-url origin 2>/dev/null || true)
-  if [ -n "$source_origin" ]; then
+  if ! inspect_checkout_origin "$expected_source"; then
+    echo "error: expected worktree source origin identity cannot be inspected at $expected_source" >&2
+    return 1
+  fi
+  if [ "$CHECKOUT_ORIGIN_KIND" = origin ]; then
     probe_upstream "$expected_source" || {
       echo "error: cannot verify the upstream default-branch tip for $expected_source" >&2
       return 1
@@ -3021,6 +3064,10 @@ verify_worktree() {
     tip=$PROBE_TIP
     expected="origin/$PROBE_BRANCH"
   else
+    checkout_has_explicit_local_only_authority "$expected_source" || {
+      echo "error: remote-free worktree source is not explicitly registered local-only in this Firstmate home: $expected_source" >&2
+      return 1
+    }
     default=$(local_default_branch "$expected_source") || {
       echo "error: cannot determine the local default branch for $expected_source" >&2
       return 1

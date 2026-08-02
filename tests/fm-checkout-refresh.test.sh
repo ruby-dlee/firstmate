@@ -605,6 +605,7 @@ test_treehouse_pool_skill_drafts_are_inventoried() {
 test_ignored_skill_files_are_outside_the_collision_guard() {
   local source="$TMP_ROOT/ignored-source" worktree="$TMP_ROOT/ignored-worktree" draft source_draft out
   fm_git_worktree "$source" "$worktree" ignored-skill
+  fm_git_add_origin "$source" "$TMP_ROOT/remotes/ignored-source.git"
   git -C "$worktree" checkout --quiet --detach
   printf '%s\n' '.agents/skills/' >> "$source/.git/info/exclude"
   draft="$worktree/.agents/skills/intentional/SKILL.md"
@@ -628,9 +629,18 @@ test_ignored_skill_files_are_outside_the_collision_guard() {
 }
 
 test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() {
-  local project pool_worktree before out
-  project=$(cd "$FM_TEST_HOME/projects/relvino" && pwd -P)
-  pool_worktree="$TEST_HOME/.treehouse/relvino-test/1/relvino"
+  local remote project pool_worktree before out
+  project="$FM_TEST_HOME/projects/relvino"
+  if [ ! -d "$project/.git" ]; then
+    remote=$(build_origin pool-preflight)
+    clone_from "$remote" "$project"
+  fi
+  project=$(cd "$project" && pwd -P)
+  pool_worktree="$FM_TEST_HOME/.treehouse/relvino-managed/1/relvino"
+  mkdir -p "$(dirname "$pool_worktree")"
+  git -C "$project" worktree add --quiet --detach "$pool_worktree" main
+  printf '{"worktrees":[{"name":"1","path":"%s"}]}\n' "$pool_worktree" \
+    > "$FM_TEST_HOME/.treehouse/relvino-managed/treehouse-state.json"
   pool_worktree=$(cd "$pool_worktree" && pwd -P)
   before=$(cat "$pool_worktree/file.txt")
   printf '%s\n' dirty-pool-change >> "$pool_worktree/file.txt"
@@ -725,10 +735,9 @@ test_treehouse_discovery_failure_invalidates_coverage_health() {
   out=$(run_refresh run-once --force 2>&1)
   status=$?
   set -e
-  [ "$status" -ne 0 ] || fail "uninspectable declared Treehouse worktree reported healthy coverage"
-  assert_contains "$out" "Treehouse worktree identity or registration is not inspectable: $missing_path" \
-    "uninspectable declared Treehouse worktree was not surfaced"
-  assert_refresh_state "$STATE_ROOT" unhealthy
+  [ "$status" -eq 0 ] || fail "ownerless legacy Treehouse worktree blocked active-home coverage"
+  assert_contains "$out" "legacy Treehouse worktree is foreign or has no active-home ownership proof: $missing_path" \
+    "ownerless legacy Treehouse worktree skip was not surfaced"
   rm -rf "$(dirname "$bad_state")"
 
   chmod 000 "$treehouse_root"
@@ -754,7 +763,7 @@ test_treehouse_discovery_failure_invalidates_coverage_health() {
   assert_contains "$out" "Treehouse pool is unreadable" \
     "unreadable Treehouse pool was not surfaced"
   assert_refresh_state "$STATE_ROOT" unhealthy
-  pass "unreadable roots, malformed schemas, and uninspectable paths invalidate coverage health"
+  pass "home-owned Treehouse failures invalidate coverage while ownerless legacy entries are skipped"
 }
 
 test_raw_treehouse_root_symlink_invalidates_coverage_health() {
@@ -1014,8 +1023,10 @@ test_scheduler_liveness_is_scheduler_owned() {
   local lock_root="$TMP_ROOT/scheduler-owned-locks" treehouse="$TMP_ROOT/scheduler-owned-treehouse"
   local project heartbeat
   project="$home/projects/local"
-  mkdir -p "$home/projects" "$home/config" "$state_root" "$treehouse"
+  mkdir -p "$home/projects" "$home/config" "$home/data" "$state_root" "$treehouse"
   fm_git_init_commit "$project"
+  printf '%s\n' '- local [local-only] - scheduler fixture (added 2026-08-01)' \
+    > "$home/data/projects.md"
   printf '%s\n' manual-sentinel > "$state_root/heartbeat"
 
   HOME="$TEST_HOME" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
@@ -1221,6 +1232,57 @@ SH
   pass "local authority inspects safety and preserves origin identity"
 }
 
+test_remote_free_authority_requires_exact_local_only_registration() {
+  local allowed_home="$TMP_ROOT/remote-free-allowed-home" allowed_state="$TMP_ROOT/remote-free-allowed-state"
+  local denied_home="$TMP_ROOT/remote-free-denied-home" denied_state="$TMP_ROOT/remote-free-denied-state"
+  local allowed allowed_worktree denied denied_worktree out status denied_head
+  allowed="$allowed_home/projects/allowed"
+  denied="$denied_home/projects/denied"
+  mkdir -p "$allowed_home/projects" "$allowed_home/config" "$allowed_home/data" "$allowed_state"
+  mkdir -p "$denied_home/projects" "$denied_home/config" "$denied_home/data" "$denied_state"
+  fm_git_init_commit "$allowed"
+  fm_git_init_commit "$denied"
+  git -C "$allowed" branch -M main
+  git -C "$denied" branch -M main
+  printf '%s\n' '- allowed [local-only] - local checkout (added 2026-08-01)' \
+    > "$allowed_home/data/projects.md"
+  printf '%s\n' '- denied [direct-PR] - remote-backed checkout (added 2026-08-01)' \
+    > "$denied_home/data/projects.md"
+  allowed_worktree="$TMP_ROOT/remote-free-allowed-worktree"
+  denied_worktree="$TMP_ROOT/remote-free-denied-worktree"
+  git -C "$allowed" worktree add --quiet --detach "$allowed_worktree" main
+  git -C "$denied" worktree add --quiet --detach "$denied_worktree" main
+
+  out=$(run_isolated_refresh "$allowed_home" "$allowed_state" run-once --force --verbose 2>&1) \
+    || fail "explicit local-only checkout was rejected: $out"
+  assert_contains "$out" "$allowed: already current at local main" \
+    "explicit local-only checkout did not use its proven local tip"
+  assert_refresh_state "$allowed_state" healthy
+  run_isolated_refresh "$allowed_home" "$allowed_state" verify-worktree "$allowed_worktree" "$allowed" \
+    || fail "explicit local-only worktree freshness proof was rejected"
+
+  denied_head=$(git -C "$denied" rev-parse HEAD)
+  set +e
+  out=$(run_isolated_refresh "$denied_home" "$denied_state" run-once --force --verbose 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "remote-free authority refusal could not publish its unhealthy coverage result"
+  assert_contains "$out" "remote-free checkout is not explicitly registered local-only" \
+    "remote-free checkout refusal did not name the missing authority proof"
+  assert_refresh_state "$denied_state" unhealthy
+  [ "$(git -C "$denied" rev-parse HEAD)" = "$denied_head" ] \
+    || fail "remote-free checkout changed while its authority was ambiguous"
+  if run_isolated_refresh "$denied_home" "$denied_state" preflight "$denied" >/dev/null 2>&1; then
+    fail "remote-free direct-PR checkout passed refresh preflight"
+  fi
+  if run_isolated_refresh "$denied_home" "$denied_state" verify-worktree "$denied_worktree" "$denied" >/dev/null 2>&1; then
+    fail "remote-free direct-PR acquisition passed worktree freshness proof"
+  fi
+  [ "$(git -C "$denied_worktree" rev-parse HEAD)" = "$denied_head" ] \
+    || fail "ambiguous remote-free acquisition was changed during refusal"
+  pass "remote-free authority acts only on exact explicit local-only registrations"
+}
+
 test_dirty_nondefault_and_diverged_checkouts_are_untouched() {
   local remote dirty feature diverged dirty_head feature_head diverged_head out
   remote=$(build_origin safety)
@@ -1390,6 +1452,7 @@ test_public_entrypoints_reject_nested_repository_paths() {
   source="$TMP_ROOT/exact-entry-source"
   worktree="$TMP_ROOT/exact-entry-worktree"
   fm_git_worktree "$source" "$worktree" exact-entry
+  fm_git_add_origin "$source" "$TMP_ROOT/remotes/exact-entry-source.git"
   nested="$source/nested"
   mkdir -p "$nested"
   set +e
@@ -1513,8 +1576,11 @@ test_worktree_freshness_verification_fails_closed() {
   set -e
   [ "$status" -ne 0 ] || fail "an unrelated repository passed worktree identity verification"
 
-  local_source="$TMP_ROOT/verify-local-source"
+  local_source="$FM_TEST_HOME/projects/verify-local-source"
   local_worktree="$TMP_ROOT/verify-local-worktree"
+  mkdir -p "$FM_TEST_HOME/data"
+  printf '%s\n' '- verify-local-source [local-only] - acquisition fixture (added 2026-08-01)' \
+    >> "$FM_TEST_HOME/data/projects.md"
   fm_git_worktree "$local_source" "$local_worktree" local-acquisition
   git -C "$local_worktree" checkout --quiet --detach
   run_refresh verify-worktree "$local_worktree" "$local_source" \
@@ -1650,6 +1716,83 @@ SH
   pass "same-origin clones acquire from separate per-home pools owned by their declaring clone"
 }
 
+test_legacy_pool_discovery_filters_foreign_home_ownership() {
+  local fixture="$TMP_ROOT/legacy-pool-home-filter" user home foreign state lock_root legacy_root
+  local active_remote foreign_remote active_pool foreign_pool active_worktree foreign_worktree
+  local out err active_before foreign_before active_draft foreign_draft
+  fixture="$TMP_ROOT/legacy-pool-home-filter"
+  user="$fixture/user"
+  home="$fixture/active-home"
+  foreign="$fixture/foreign-home"
+  state="$fixture/state"
+  lock_root="$fixture/locks"
+  legacy_root="$user/.treehouse"
+  active_remote=$(build_origin legacy-owned-active)
+  foreign_remote=$(build_origin legacy-owned-foreign)
+  mkdir -p "$user" "$state" "$legacy_root"
+  clone_from "$active_remote" "$home"
+  clone_from "$foreign_remote" "$foreign"
+  mkdir -p "$home/projects" "$home/config" "$home/data"
+  printf '%s\n' 'projects/' 'config/' 'data/' >> "$home/.git/info/exclude"
+  active_pool="$legacy_root/active"
+  foreign_pool="$legacy_root/foreign"
+  active_worktree="$active_pool/1/active"
+  foreign_worktree="$foreign_pool/1/foreign"
+  mkdir -p "$(dirname "$active_worktree")" "$(dirname "$foreign_worktree")"
+  git -C "$home" worktree add --quiet --detach "$active_worktree" main
+  git -C "$foreign" worktree add --quiet --detach "$foreign_worktree" main
+  printf '{"worktrees":[{"name":"1","path":"%s"}]}\n' "$active_worktree" \
+    > "$active_pool/treehouse-state.json"
+  printf '{"worktrees":[{"name":"1","path":"%s"}]}\n' "$foreign_worktree" \
+    > "$foreign_pool/treehouse-state.json"
+  err="$fixture/discover.err"
+
+  out=$(HOME="$user" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$state" FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_TREEHOUSE_ROOT="$legacy_root" FM_CHECKOUT_REFRESH_TEST=1 \
+    "$ROOT/bin/fm-checkout-refresh.sh" discover 2>"$err") \
+    || fail "home-filtered legacy pool discovery failed"
+  assert_contains "$out" "$(cd "$home" && pwd -P)" \
+    "active home's legacy pool backing was not discovered"
+  assert_not_contains "$out" "$(cd "$foreign" && pwd -P)" \
+    "foreign home's legacy pool backing entered active-home discovery"
+  assert_grep "legacy Treehouse pool is foreign or has no active-home ownership proof: $foreign_pool" "$err" \
+    "foreign legacy pool skip was not diagnosed"
+
+  active_before=$(git -C "$home" rev-parse HEAD)
+  foreign_before=$(git -C "$foreign" rev-parse HEAD)
+  advance_origin legacy-owned-active active-home-advance
+  advance_origin legacy-owned-foreign foreign-home-advance
+  HOME="$user" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$state" FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_TREEHOUSE_ROOT="$legacy_root" FM_CHECKOUT_REFRESH_TEST=1 \
+    "$ROOT/bin/fm-checkout-refresh.sh" run-once --force --verbose >/dev/null 2>"$err" \
+    || fail "home-filtered legacy pool refresh failed"
+  [ "$(git -C "$home" rev-parse HEAD)" != "$active_before" ] \
+    || fail "active home's proven legacy pool backing was not refreshed"
+  assert_head_matches_origin "$home"
+  [ "$(git -C "$foreign" rev-parse HEAD)" = "$foreign_before" ] \
+    || fail "active home refreshed a foreign home's pool backing"
+
+  active_draft="$active_worktree/.agents/skills/owned/SKILL.md"
+  foreign_draft="$foreign_worktree/.agents/skills/foreign/SKILL.md"
+  mkdir -p "$(dirname "$active_draft")" "$(dirname "$foreign_draft")"
+  printf '%s\n' '# owned draft' > "$active_draft"
+  printf '%s\n' '# foreign draft' > "$foreign_draft"
+  out=$(HOME="$user" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$state" FM_CHECKOUT_REFRESH_LOCK_ROOT="$lock_root" \
+    FM_TREEHOUSE_ROOT="$legacy_root" FM_CHECKOUT_REFRESH_TEST=1 \
+    "$ROOT/bin/fm-checkout-refresh.sh" run-once --force 2>"$err") \
+    || fail "owned legacy pool hygiene run failed"
+  assert_contains "$out" "$active_worktree: HYGIENE:" \
+    "active home's proven pool worktree was not inventoried"
+  assert_not_contains "$out" "$foreign_worktree: HYGIENE:" \
+    "foreign home's pool worktree entered active-home hygiene"
+  grep -Fq '# foreign draft' "$foreign_draft" \
+    || fail "foreign-home pool filtering changed the skipped draft"
+  pass "legacy pool coverage refreshes owned backings and skips foreign-home state"
+}
+
 test_managed_treehouse_source_refuses_tracked_config_and_symlinks() {
   local tracked_home tracked_source inspect_home inspect_source fakebin real_git out status outside
   local state_home parent_home keyed_home keyed_source common key
@@ -1783,7 +1926,7 @@ SH
 
 test_launch_agent_definition_is_home_scoped_with_scheduler_seam() {
   local fakebin fake_state agents log plist second_home second_plist key second_key install_state_base install_state_root
-  local loaded_drift
+  local loaded_drift persisted_plist_hash persisted_generation
   local custom_treehouse="$TMP_ROOT/custom-treehouse" other_treehouse="$TMP_ROOT/other-treehouse" out status now generation
   fakebin="$TMP_ROOT/fakebin"
   fake_state="$TMP_ROOT/fake-launchctl-state"
@@ -1842,6 +1985,22 @@ test_launch_agent_definition_is_home_scoped_with_scheduler_seam() {
     FM_FAKE_LAUNCHCTL_LOG="$log" \
     "$ROOT/bin/fm-checkout-refresh.sh" ensure \
     || fail "matching LaunchAgent scheduler configuration was reported unhealthy"
+  persisted_plist_hash=$(shasum -a 256 "$plist" | awk '{ print $1 }')
+  persisted_generation=$(cat "$install_state_root/scheduler-generation")
+  HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_TREEHOUSE_ROOT="$custom_treehouse" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$install_state_base" \
+    FM_CHECKOUT_REFRESH_PLATFORM=Darwin \
+    FM_CHECKOUT_REFRESH_LAUNCH_AGENTS_DIR="$agents" \
+    FM_CHECKOUT_REFRESH_LAUNCHCTL="$fakebin/launchctl" \
+    FM_FAKE_LAUNCHCTL_STATE="$fake_state" \
+    FM_FAKE_LAUNCHCTL_LOG="$log" \
+    "$ROOT/bin/fm-checkout-refresh.sh" ensure \
+    || fail "persisted scheduler state was lost on a later process invocation"
+  [ "$(shasum -a 256 "$plist" | awk '{ print $1 }')" = "$persisted_plist_hash" ] \
+    || fail "scheduler definition was re-derived or rewritten during health inspection"
+  [ "$(cat "$install_state_root/scheduler-generation")" = "$persisted_generation" ] \
+    || fail "scheduler generation state did not survive a later process invocation"
 
   printf '%s\n%s\n' "$now" unhealthy > "$install_state_root/coverage-health"
   set +e
@@ -2481,6 +2640,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-14 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = clone-refresh-followup-edges ]; then
+  test_remote_free_authority_requires_exact_local_only_registration
+  test_legacy_pool_discovery_filters_foreign_home_ownership
+  test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection
+  test_launch_agent_definition_is_home_scoped_with_scheduler_seam
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-durable-identity ]; then
   test_launch_agent_definition_is_home_scoped_with_scheduler_seam
   test_logical_home_state_migrates_and_ambiguity_fails_closed
@@ -2592,6 +2759,7 @@ test_unreadable_scanned_origin_invalidates_coverage_health
 test_discovery_provenance_failures_invalidate_coverage
 test_failed_alert_persistence_forces_reinspection
 test_local_authority_is_fully_inspected_and_tracks_origin_identity
+test_remote_free_authority_requires_exact_local_only_registration
 test_dirty_nondefault_and_diverged_checkouts_are_untouched
 test_refresh_locks_recover_stale_owners_and_surface_contention
 test_session_mode_preserves_gone_branch_pruning
@@ -2602,6 +2770,7 @@ test_lock_owner_symlink_cannot_escape_state_directory
 test_worktree_freshness_verification_fails_closed
 test_bounded_refresh_terminates_descendants
 test_per_home_treehouse_sources_isolate_same_origin_clones
+test_legacy_pool_discovery_filters_foreign_home_ownership
 test_managed_treehouse_source_refuses_tracked_config_and_symlinks
 test_acquisition_honors_shared_checkout_lock
 test_launch_agent_definition_is_home_scoped_with_scheduler_seam

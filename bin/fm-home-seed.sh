@@ -422,6 +422,10 @@ acquire_treehouse_home() {
   # live process and is skipped by later get/prune, so the home survives restarts
   # until teardown or rollback returns it. treehouse prints only the worktree path
   # to stdout (banners go to stderr), so command substitution captures the path.
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" pool-preflight "$FM_ROOT" || {
+    echo "error: refusing secondmate Treehouse acquisition because its active-home pool state is not safely inspectable" >&2
+    return 1
+  }
   home=$("$SCRIPT_DIR/fm-checkout-refresh.sh" acquire-worktree "$FM_ROOT" "$id") || {
     echo "error: treehouse get --lease failed to lease a firstmate home" >&2
     return 1

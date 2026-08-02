@@ -355,8 +355,11 @@ status_log_pr_url() {
 # completed run for that branch. Resolve the run's rendered head to one full
 # local commit, compare exact identities, and fail closed when either proof is
 # unavailable.
-verify_ready_head_or_emit() {  # <validated-head> <pr-url>
-  local validated_head=$1 pr_url=$2 live_head resolved_head
+verify_ready_head_or_emit() {  # <run-id> <validated-head> <pr-url>
+  local run_id=$1 validated_head=$2 pr_url=$3 live_head resolved_head
+  if [ -z "$run_id" ]; then
+    emit unknown run-step "PR-ready current run identity is unavailable; do not merge"
+  fi
   if [ -z "$validated_head" ] || [ -z "$pr_url" ]; then
     emit unknown run-step "PR-ready run-step currentness is unavailable; do not merge"
   fi
@@ -568,6 +571,7 @@ if [ "$HAVE_RUN" = 1 ]; then
   CI_STEP_STATUS=""
   CI_LOG_STATE=""
   RUN_STATUS=""
+  RUN_ID=""
   RUN_HEAD=""
   RUN_PR=""
   READY_CLAIM=0
@@ -582,11 +586,8 @@ if [ "$HAVE_RUN" = 1 ]; then
     case "$COARSE_STATUS" in
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
       completed)
-        RUN_STATE="done"
-        RUN_DETAIL="run completed"
-        RUN_HEAD=$COARSE_HEAD
-        RUN_PR=$COARSE_PR
-        READY_CLAIM=1
+        RUN_STATE=unknown
+        RUN_DETAIL="completed runs-list result lacks exact current run identity; do not merge"
         ;;
       failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
       cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
@@ -595,6 +596,7 @@ if [ "$HAVE_RUN" = 1 ]; then
   else
     status=$(strip_quotes "$(nm_field status)")
     RUN_STATUS=$status
+    RUN_ID=$(strip_quotes "$(nm_field id)")
     RUN_HEAD=$(strip_quotes "$(nm_field head)")
     RUN_PR=$(strip_quotes "$(nm_field pr)")
     outcome=$(strip_quotes "$(nm_field outcome)")
@@ -670,14 +672,12 @@ if [ "$HAVE_RUN" = 1 ]; then
     if [ "$RUN_SOURCE" = full ] && [ "$RUN_STATUS" = completed ]; then
       verify_no_newer_active_run_or_emit "$CREW_BRANCH"
     fi
-    verify_ready_head_or_emit "$RUN_HEAD" "$RUN_PR"
+    verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
   fi
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
-      [ -n "$COARSE_PR" ] || COARSE_PR=$(status_log_pr_url)
-      verify_ready_head_or_emit "$COARSE_HEAD" "$COARSE_PR"
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+      emit unknown status-log "checks-green runs-list result lacks exact current run identity; do not merge"
     fi
     [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
     if [ "$RUN_STATUS" = fixing ]; then
@@ -689,7 +689,7 @@ if [ "$HAVE_RUN" = 1 ]; then
     fi
     if [ "$CI_LOG_STATE" != not-ready ]; then
       [ -n "$RUN_PR" ] || RUN_PR=$(status_log_pr_url)
-      verify_ready_head_or_emit "$RUN_HEAD" "$RUN_PR"
+      verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
       emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
   fi

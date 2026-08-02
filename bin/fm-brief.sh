@@ -397,7 +397,7 @@ $RULE1
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs.
-   If reattach returns \`drive run: reconcile run ... read response ... socket: i/o timeout\`, run \`FM_HOME=$FM_HOME_ARG $NM_REATTACH_HELPER $ID\`; it retries only that transient read timeout without daemon lifecycle changes.
+   If reattach returns \`drive run: reconcile run ... read response ... socket: i/o timeout\`, run \`FM_HOME=$FM_HOME_ARG $NM_REATTACH_HELPER $ID\`; it retries only that transient read timeout after a read-only running-daemon preflight. Ordinary \`axi run\` calls \`EnsureDaemon\`, so this narrows risk but cannot guarantee that a daemon stopping after preflight will not be started; strict no-start behavior requires an upstream attach-only operation.
    Append \`blocked: {the daemon error}\` only if that helper exhausts its retries or for any other daemon error, then stop; only firstmate manages the daemon.
 
 $REPORT_CONTRACT

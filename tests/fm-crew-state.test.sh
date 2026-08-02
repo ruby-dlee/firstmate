@@ -1013,7 +1013,7 @@ EOF
   pass "cross-branch attribution picks the branch's most recent row"
 }
 
-test_coarse_completed_run_verifies_live_pr_head() {
+test_coarse_completed_run_without_identity_fails_closed() {
   reset_fakes
   local d; d=$(new_case coarse-completed-stale)
   make_repo_on_branch "$d/wt" fm/feat-coarse-completed
@@ -1023,10 +1023,11 @@ test_coarse_completed_run_verifies_live_pr_head() {
   FM_FAKE_RUNS_LIST='completed fm/feat-coarse-completed abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
   FM_FAKE_PR_HEAD=def5678cafebabedef5678cafebabedef5678caf
   local out; out=$(run_crew_state "$d" feat-coarse-completed)
-  assert_contains "$out" "state: stale" "coarse completed run with moved PR head -> stale"
+  assert_contains "$out" "state: unknown" "coarse completed run without exact identity -> unknown"
+  assert_contains "$out" "lacks exact current run identity" "coarse completion names the missing proof"
   assert_contains "$out" "do not merge" "coarse currentness failure is merge-safe"
   assert_not_contains "$out" "state: done" "coarse completion alone must not authorize done"
-  pass "coarse completed run verifies the live PR head"
+  pass "coarse completed run without identity fails closed"
 }
 
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
@@ -1046,10 +1047,11 @@ EOF
   FM_FAKE_GIT_RESOLVE=bbbbbbbcafebabebbbbbbbcafebabebbbbbbbcaf
   FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
   local out; out=$(run_crew_state "$d" feat-coarseready)
-  assert_contains "$out" "state: done" "coarse ready status -> done"
+  assert_contains "$out" "state: unknown" "coarse ready status without run identity -> unknown"
   assert_contains "$out" "source: status-log" "coarse ready status remains status-log sourced"
-  assert_not_contains "$out" "state: working" "coarse ready status must not be suppressed by another branch log"
-  pass "coarse run does not probe another branch's ci log"
+  assert_contains "$out" "do not merge" "coarse ready status is merge-safe"
+  assert_not_contains "$out" "state: done" "coarse ready status must not authorize done"
+  pass "coarse checks-green status without identity fails closed"
 }
 
 # A different-branch run with NO matching runs-list row must NOT be
@@ -1509,7 +1511,7 @@ test_terminal_passed_clamps_invalid_gh_timeouts_and_fails_closed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
-test_coarse_completed_run_verifies_live_pr_head
+test_coarse_completed_run_without_identity_fails_closed
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane

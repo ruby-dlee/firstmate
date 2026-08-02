@@ -23,7 +23,7 @@ That signature means an established daemon connection missed the bounded run-sna
 
 1. Run `FM_HOME=<this-firstmate-home> bin/fm-no-mistakes-reattach.sh <id>` from the active firstmate repository unless `FM_HOME` already names the active home.
 2. Let the helper own retry timing and task identity checks.
-   It retries only the observed transient signature, requires the daemon to report running before every attempt, and never deliberately starts, stops, or restarts it.
+   It retries only the observed transient signature and requires the daemon to report running before every attempt. This read-only preflight narrows risk but cannot guarantee no start because ordinary `axi run` calls `EnsureDaemon` after the check; strict protection requires an upstream attach-only operation.
 3. Treat a returned gate or outcome as the current run result and continue the ordinary validation decision or completion workflow.
 4. If the helper exhausts its retries, preserve its exact final error and escalate the lane as blocked without changing daemon lifecycle state.
 5. Do not use this branch for another daemon error.

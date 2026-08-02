@@ -66,8 +66,9 @@ test_transient_timeout_recovers() {
   assert_contains "$out" "outcome: checks-passed" "recovered reattach returns the live outcome"
   run_calls=$(awk 'END { print NR + 0 }' "$dir/run-calls")
   [ "$run_calls" -eq 2 ] || fail "reattach used $run_calls run attempts, want 2"
-  assert_not_contains "$(cat "$dir/calls")" "daemon restart" "reattach never restarts the daemon"
-  assert_not_contains "$(cat "$dir/calls")" "daemon stop" "reattach never stops the daemon"
+  assert_not_contains "$(cat "$dir/calls")" "daemon restart" "helper issues no explicit daemon restart"
+  assert_not_contains "$(cat "$dir/calls")" "daemon stop" "helper issues no explicit daemon stop"
+  assert_contains "$out" "outcome: checks-passed" "test claims recovery, not lifecycle immunity"
   pass "an induced reconciliation timeout recovers on reattach"
 }
 
@@ -113,7 +114,7 @@ test_stopped_daemon_is_not_started() {
   expect_code 1 "$rc" "stopped daemon refusal exit"
   assert_contains "$out" "refusing to start or restart" "stopped daemon refusal is explicit"
   [ ! -s "$dir/run-calls" ] || fail "stopped daemon path invoked axi run"
-  assert_not_contains "$(cat "$dir/calls")" "daemon start" "stopped daemon path never starts it"
+  assert_not_contains "$(cat "$dir/calls")" "daemon start" "stopped preflight issues no daemon start"
   pass "the local remedy refuses to start a stopped shared daemon"
 }
 

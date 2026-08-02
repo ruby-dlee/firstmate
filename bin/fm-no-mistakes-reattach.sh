@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fm-no-mistakes-reattach.sh - retry one task's existing AXI run without
-# touching no-mistakes daemon lifecycle state.
+# deliberately requesting no-mistakes daemon lifecycle changes.
 #
 # Usage:
 #   FM_HOME=<firstmate-home> bin/fm-no-mistakes-reattach.sh <task-id>
@@ -12,8 +12,9 @@
 #   drive run: reconcile run ...: read response: ... socket: i/o timeout
 # Other failures return immediately.
 # Before every attempt it uses the read-only AXI home view to require a running
-# daemon, so it never deliberately starts, stops, or restarts the machine-wide
-# daemon.
+# daemon. Ordinary `axi run` calls EnsureDaemon after that preflight, leaving a
+# check-to-use race in which a daemon that stops between the two calls may be
+# started. A strict no-start guarantee requires an upstream attach-only mode.
 # Task metadata, canonical worktree, and branch identity are resolved from the
 # selected FM_HOME, which confines the remedy to that home's recorded lane.
 set -u
@@ -107,7 +108,7 @@ last_output=
 last_rc=1
 while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
   home_output=$(cd "$WT" && no-mistakes axi 2>/dev/null) || {
-    echo "error: could not read no-mistakes AXI home state; no daemon lifecycle action was attempted" >&2
+    echo "error: could not read no-mistakes AXI home state; refusing reattach" >&2
     exit 1
   }
   daemon=$(daemon_state "$home_output")
@@ -135,11 +136,11 @@ while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
   fi
   if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
     printf '%s\n' "$last_output"
-    echo "error: reattach exhausted $MAX_ATTEMPTS transient reconciliation attempts; the shared daemon was left untouched" >&2
+    echo "error: reattach exhausted $MAX_ATTEMPTS transient reconciliation attempts; preflight cannot guarantee no daemon start because axi run calls EnsureDaemon" >&2
     exit "$last_rc"
   fi
   delay=$(retry_delay "$attempt")
-  echo "reattach attempt $attempt/$MAX_ATTEMPTS hit a transient socket read timeout; retrying in ${delay}s without daemon lifecycle changes" >&2
+  echo "reattach attempt $attempt/$MAX_ATTEMPTS hit a transient socket read timeout; retrying in ${delay}s after read-only daemon preflight (strict no-start guarantee unavailable)" >&2
   [ "$delay" -eq 0 ] || sleep "$delay"
   attempt=$((attempt + 1))
 done

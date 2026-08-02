@@ -30,8 +30,8 @@ It does not establish that descriptor pressure was absent elsewhere in the daemo
 `bin/fm-no-mistakes-reattach.sh <id>` resolves the lane exclusively from the selected `FM_HOME`, verifies its canonical worktree and branch identity, and invokes reattach without an intent so it cannot create a fresh run.
 Before each attempt it uses the read-only AXI home view to require the daemon to report running.
 It retries only the exact reconciliation socket-read timeout with bounded exponential backoff and deterministic per-task jitter.
-It never calls daemon start, stop, restart, update, abort, or rerun.
-Any other error returns immediately, and exhaustion preserves the final error while explicitly reporting that the shared daemon was left untouched.
+It never directly calls daemon start, stop, restart, update, abort, or rerun.
+Any other error returns immediately. This is containment, not a strict no-start guarantee: ordinary `axi run` calls `EnsureDaemon`, so a daemon that stops after the read-only preflight can be started during the check-to-use race. Only an upstream attach-only operation that never starts, stops, restarts, or updates the daemon can close that race.
 
 `bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when its rendered head resolves unambiguously to one full local commit and that exact identity matches the full live GitHub PR head read through `gh-axi`.
 A mismatch returns `state: stale`, names both heads, and says `do not merge` instead of reporting checks green.
@@ -41,7 +41,7 @@ A newer running, failed, or cancelled run makes the earlier completed snapshot `
 
 ## Verification
 
-`bash tests/fm-no-mistakes-reattach.test.sh` induced the exact first-attempt socket timeout, observed a second `axi run` reattach return `outcome: checks-passed`, and confirmed that no daemon lifecycle command was invoked.
+`bash tests/fm-no-mistakes-reattach.test.sh` induced the exact first-attempt socket timeout, observed a second `axi run` reattach return `outcome: checks-passed`, and confirmed that the helper issued no explicit daemon lifecycle subcommand; it does not claim that `EnsureDaemon` inside `axi run` is lifecycle-free.
 It separately induced three consecutive timeouts and observed recovery on attempt four, proving recovery is not tied to the second attempt.
 The same suite observed a stopped-daemon preflight refuse without invoking `axi run`, a non-transient error return without retry, and a mismatched task branch refuse before contacting no-mistakes.
 

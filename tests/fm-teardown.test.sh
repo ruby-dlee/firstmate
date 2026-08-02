@@ -45,7 +45,7 @@
 #   (s) index.lock with a live holder, any age                -> lock kept, REFUSE
 #   (t) lsof error while checking index.lock                  -> lock kept, REFUSE
 #   (u) dirty worktree after stale lock cleanup               -> lock removed, REFUSE
-#   (v) non-linked repo presented as a task worktree          -> lock kept, REFUSE
+#   (v) non-linked repo index.lock                            -> lock removed, ALLOW
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
@@ -1922,7 +1922,7 @@ test_stale_index_lock_cleanup_rechecks_dirty_worktree() {
   pass "stale lock cleanup rechecks and refuses dirty worktree before return"
 }
 
-test_non_linked_repository_is_rejected_before_lock_cleanup() {
+test_non_linked_index_lock_path_is_checked_from_worktree() {
   local case_dir rc lock
   case_dir=$(make_case non-linked-index-lock)
   # Only a non-linked checkout makes `git rev-parse --git-path index.lock` answer with
@@ -1956,14 +1956,11 @@ test_non_linked_repository_is_rejected_before_lock_cleanup() {
   rc=$?
   set -e
 
-  expect_code 1 "$rc" \
-    "non-linked-index-lock: teardown should reject a clone outside the recorded project's worktree graph"
-  assert_grep "does not belong to the recorded project" "$case_dir/stderr" \
-    "non-linked-index-lock: teardown did not report the repository-identity mismatch"
-  assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
-    "non-linked-index-lock: teardown touched a lock outside the validated worktree graph"
-  [ -e "$lock" ] || fail "non-linked-index-lock: lock outside the validated worktree graph was removed"
-  pass "non-linked repositories are rejected before task lock cleanup"
+  expect_code 0 "$rc" "non-linked-index-lock: teardown should clear a normal repo index.lock"
+  assert_grep "removed provably-stale git lock" "$case_dir/stderr" \
+    "non-linked-index-lock: teardown did not report clearing the stale lock"
+  assert_absent "$lock" "non-linked-index-lock: stale lock file should have been removed"
+  pass "normal repo index.lock is resolved from the worktree and cleared when stale"
 }
 
 test_index_lock_mtime_read_failure_refuses() {
@@ -4993,6 +4990,11 @@ if [ "${FM_TEST_FOCUSED:-}" = managed-child-generation-lock ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = non-linked-index-lock ]; then
+  test_non_linked_index_lock_path_is_checked_from_worktree
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-report-required ]; then
   test_teardown_rejects_malformed_report_requirement
   exit 0
@@ -5294,7 +5296,7 @@ test_stale_index_lock_cleared_and_teardown_succeeds
 test_live_index_lock_is_never_removed_and_teardown_refuses
 test_lsof_error_never_clears_index_lock
 test_stale_index_lock_cleanup_rechecks_dirty_worktree
-test_non_linked_repository_is_rejected_before_lock_cleanup
+test_non_linked_index_lock_path_is_checked_from_worktree
 test_index_lock_mtime_read_failure_refuses
 test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
 test_persistent_index_lock_exhausts_retries_and_refuses_loudly

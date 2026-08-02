@@ -21,6 +21,10 @@
 # Merge method: defaults to --squash when the caller passes none of --squash,
 # --merge, --rebase, or --method after the optional -- separator. An explicit
 # caller method is never overridden.
+# Merge success means GitHub independently reports the PR state as merged after
+# the merge command returns.
+# Merge queue acceptance, auto-merge enablement, or any other still-open state
+# exits non-zero and reports the observed state instead of success.
 # Extra args must not include --repo or -R because the repo is parsed from the
 # PR URL.
 #
@@ -54,6 +58,25 @@ caller_has_merge_method() {
   return 1
 }
 
+merge_method_label() {
+  local arg previous=
+  for arg in "$@"; do
+    if [ "$previous" = method ]; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+    case "$arg" in
+      --squash) printf '%s\n' squash; return 0 ;;
+      --merge) printf '%s\n' merge; return 0 ;;
+      --rebase) printf '%s\n' rebase; return 0 ;;
+      --method=*) printf '%s\n' "${arg#--method=}"; return 0 ;;
+      --method) previous=method ;;
+      *) previous= ;;
+    esac
+  done
+  printf '%s\n' squash
+}
+
 parse_pr_url() {
   local url=$1
   if [[ "$url" =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)/pull/([0-9]+)/?$ ]]; then
@@ -81,6 +104,51 @@ reject_repo_overrides() {
   return 0
 }
 
+verify_pr_merged() {
+  local view state
+  if ! view=$(gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" 2>&1); then
+    printf 'merge:\n  number: %s\n  status: unknown\n  observed_state: unavailable\n  method: %s\n' \
+      "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+    echo "error: gh-axi pr merge returned success, but GitHub merge verification failed for $PR_OWNER/$PR_REPO#$PR_NUMBER" >&2
+    printf '%s\n' "$view" >&2
+    return 1
+  fi
+  state=$(printf '%s\n' "$view" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)
+  state=${state#\"}
+  state=${state%\"}
+  case "$state" in
+    merged|MERGED)
+      printf 'merged:\n  number: %s\n  status: ok\n  method: %s\n  observed_state: merged\n' \
+        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+      return 0
+      ;;
+    open|OPEN)
+      printf 'merge:\n  number: %s\n  status: enqueued\n  observed_state: open\n  method: %s\n' \
+        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+      echo "error: gh-axi pr merge returned success, but GitHub still reports $PR_OWNER/$PR_REPO#$PR_NUMBER as open; treating it as enqueued/unconfirmed, not merged" >&2
+      return 1
+      ;;
+    closed|CLOSED)
+      printf 'merge:\n  number: %s\n  status: closed\n  observed_state: closed\n  method: %s\n' \
+        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+      echo "error: gh-axi pr merge returned success, but GitHub reports $PR_OWNER/$PR_REPO#$PR_NUMBER as closed without a confirmed merge" >&2
+      return 1
+      ;;
+    "")
+      printf 'merge:\n  number: %s\n  status: unknown\n  observed_state: unavailable\n  method: %s\n' \
+        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+      echo "error: gh-axi pr merge returned success, but gh-axi pr view did not report a PR state for $PR_OWNER/$PR_REPO#$PR_NUMBER" >&2
+      return 1
+      ;;
+    *)
+      printf 'merge:\n  number: %s\n  status: unconfirmed\n  observed_state: %s\n  method: %s\n' \
+        "$PR_NUMBER" "$state" "$MERGE_METHOD_LABEL"
+      echo "error: gh-axi pr merge returned success, but GitHub did not confirm $PR_OWNER/$PR_REPO#$PR_NUMBER as merged" >&2
+      return 1
+      ;;
+  esac
+}
+
 parse_pr_url "$URL" || exit 1
 reject_repo_overrides "$@" || exit 1
 
@@ -91,5 +159,10 @@ merge_args=()
 if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
 fi
+MERGE_METHOD_LABEL=$(merge_method_label ${merge_args[@]+"${merge_args[@]}"} "$@")
 
-gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@"
+if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@" 2>&1); then
+  printf '%s\n' "$MERGE_OUTPUT"
+  exit 1
+fi
+verify_pr_merged

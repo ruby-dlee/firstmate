@@ -83,6 +83,30 @@ kill -0 "$FIXTURE_ONE" 2>/dev/null || fail "runtime refusal touched the first li
 kill -0 "$FIXTURE_TWO" 2>/dev/null || fail "runtime refusal touched the second live fixture"
 pass "runtime Herdr proxy refuses raw lifecycle before live fixtures can be touched"
 
+hermetic_test=$ROOT/tests/runner-entry-probe.test.sh
+python3 - "$probe_token" "$FM_TEST_RUNNER_PID" "$hermetic_test" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path, runner_pid, test = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    "runner_pid": int(runner_pid),
+    "test": test,
+    "capability": "hermetic",
+}) + "\n", encoding="utf-8")
+PY
+status=0
+FM_TEST_RUNNER_TOKEN="$probe_token" \
+FM_TEST_CURRENT_TEST="$hermetic_test" \
+FM_TEST_HERDR_CAPABILITY=hermetic \
+  "$ROOT/tests/herdr-guard-bin/herdr" status --json \
+    >"$TMP_ROOT/hermetic-herdr.out" 2>"$TMP_ROOT/hermetic-herdr.err" || status=$?
+expect_code 97 "$status" "hermetic real-Herdr negative control"
+assert_contains "$(cat "$TMP_ROOT/hermetic-herdr.err")" "hermetic test attempted real Herdr" \
+  "hermetic runtime refusal did not identify the capability violation"
+pass "hermetic admission cannot execute any real Herdr command"
+
 no_herdr_bin=$TMP_ROOT/no-herdr-bin
 mkdir -p "$no_herdr_bin"
 for command_name in basename chmod dirname find grep mkdir mktemp python3 rm; do

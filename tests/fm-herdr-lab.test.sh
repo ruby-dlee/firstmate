@@ -15,6 +15,7 @@ TRIPWIRES="$TMP_ROOT/tripwires"
 REAL_SLEEP=$(command -v sleep)
 mkdir -p "$FAKE_STATE"
 printf '%s\n' '/Users/test/.config/herdr/herdr.sock' > "$FAKE_STATE/default-socket"
+printf '%s\n' captain crewmate-1 crewmate-2 > "$FAKE_STATE/default-agents"
 : > "$FAKE_LOG"
 
 cat > "$FAKEBIN/herdr" <<'SH'
@@ -56,6 +57,20 @@ case "$1 ${2:-}" in
         --argjson default_running "$default_running" \
         '{sessions:[{default:true,name:"default",running:$default_running,socket_path:$socket},{default:false,name:$name,running:$running,socket_path:("/tmp/" + $name + ".sock")}]}'
     fi
+    ;;
+  "workspace list")
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}'
+    ;;
+  "tab list")
+    printf '%s\n' '{"result":{"tabs":[{"workspace_id":"w1","tab_id":"t1","label":"fleet"}]}}'
+    ;;
+  "pane list")
+    jq -Rsc '{result:{panes:(split("\n")[:-1] | map({workspace_id:"w1",tab_id:"t1",pane_id:.}))}}' \
+      "$state/default-agents"
+    ;;
+  "agent list")
+    jq -Rsc '{result:{agents:(split("\n")[:-1] | map({pane_id:.,name:.,agent_session:{value:(. + "-session")},agent_status:"idle"}))}}' \
+      "$state/default-agents"
     ;;
   "server --session")
     if [ "${FM_FAKE_HERDR_SERVER_DELAY:-0}" != 0 ]; then
@@ -167,6 +182,8 @@ test_provision_run_and_guarded_teardown() {
   while IFS= read -r line; do
     case "$line" in
       *"--session $name") : ;;
+      "workspace list --session default"|"tab list --session default"|\
+      "pane list --session default"|"agent list --session default") : ;;
       *) fail "Herdr call lacks a trailing lab session: $line" ;;
     esac
   done < "$FAKE_LOG"
@@ -231,6 +248,19 @@ test_changed_default_trips_after_teardown() {
   printf '%s\n' '/Users/test/.config/herdr/herdr.sock' > "$FAKE_STATE/default-socket"
   rm -f "$TRIPWIRES/$name.fleet-state.json"
   pass "fm-herdr-lab: changed default fleet state is a hard failure"
+}
+
+test_changed_default_fleet_members_trip_after_teardown() {
+  local name="fm-lab-tripwire-members-$$" status=0
+  : > "$FAKE_LOG"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "fleet-member tripwire fixture provision failed"
+  printf '%s\n' captain > "$FAKE_STATE/default-agents"
+  run_with_fake fm_herdr_lab_teardown "$name" >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "lost default fleet members must fail teardown"
+  assert_present "$TRIPWIRES/$name.fleet-state.json" "fleet-member tripwire failure should retain evidence"
+  printf '%s\n' captain crewmate-1 crewmate-2 > "$FAKE_STATE/default-agents"
+  rm -f "$TRIPWIRES/$name.fleet-state.json"
+  pass "fm-herdr-lab: default pane and agent deaths trip the fleet-state guard"
 }
 
 test_stopped_default_refuses_provision() {
@@ -340,6 +370,7 @@ test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_agent_argv_inserts_session_before_separator
 test_changed_default_trips_after_teardown
+test_changed_default_fleet_members_trip_after_teardown
 test_stopped_default_refuses_provision
 test_malformed_default_running_refuses_provision
 test_stopped_default_blocks_destructive_boundaries

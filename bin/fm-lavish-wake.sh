@@ -78,3 +78,19 @@ fm_wake_append \
   signal \
   "lavish:$DECISION" \
   "decision-answer: $relative $DIGEST"
+
+if [ "${FM_LAVISH_QUEUE_DISABLE:-}" = 1 ]; then
+  printf 'lavish-delivery: prompt queue disabled for %s\n' "$DECISION"
+  exit 0
+fi
+
+queue_out=$("$SCRIPT_DIR/fm-lavish-queue.sh" \
+  --home "$FM_HOME" \
+  --decision "$DECISION" \
+  --answer "$ANSWER_CANONICAL" \
+  --digest "$DIGEST" 2>&1) || queue_status=$?
+if [ "${queue_status:-0}" -eq 0 ]; then
+  printf '%s\n' "$queue_out"
+else
+  printf 'lavish-delivery: prompt not queued for %s: %s\n' "$DECISION" "$queue_out"
+fi

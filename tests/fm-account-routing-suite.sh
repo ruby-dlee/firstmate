@@ -312,6 +312,11 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$*" in
+  '--format json profile list')
+    root=${FM_ACCOUNT_DIRECTORY_ROOT:?}
+    printf '{"profiles":[{"provider":"%s","home":"%s/%s/account-1","pools":["%s-crew"],"enabled":true,"safety_policy":"worker"}]}\n' \
+      "$provider" "$root" "$provider" "$provider"
+    ;;
   '--format json contract')
     [ -z "${FM_FAKE_AF_CONTRACT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_CONTRACT_SLEEP"
     printf '{"contract_version":%s}\n' "${FM_FAKE_AF_CONTRACT_VERSION:-2}"
@@ -1681,7 +1686,9 @@ test_spawn_rollback_task_tmp_refusal_is_retryable() {
     mkdir -p "$outside"
 
     if [ "$mode" = direct ]; then
-      mkdir -p "$CASE_DIR/accounts/claude/account-1"
+      mkdir -p "$CASE_DIR/accounts/claude/account-1/.agent-fleet-quota-cache/quota-axi"
+      printf 'granted\n' > "$CASE_DIR/accounts/claude/account-1/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
+      chmod 600 "$CASE_DIR/accounts/claude/account-1/.agent-fleet-quota-cache/quota-axi/claude-keychain-access-granted"
       cat > "$FAKEBIN_DIR/herdr" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -1693,6 +1700,7 @@ SH
       FM_ACCOUNT_ROUTING_LEGACY_NEW_LAUNCH_TEST='' \
         FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
         FM_ACCOUNT_DIRECTORY_ROOT="$CASE_DIR/accounts" \
+        FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN_DIR/agent-fleet" \
         FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN_DIR/herdr" \
         FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
         FM_SAFE_TASK_TMP_SWAP_ANCESTOR="$ancestor" \
@@ -1725,7 +1733,7 @@ SH
     if [ ! -f "$marker" ]; then
       touch "$release"
       wait "$spawn_pid" 2>/dev/null || true
-      fail "$mode rollback task temp test never reached its post-metadata failure"
+      fail "$mode rollback task temp test never reached its post-metadata failure: $(cat "$output" 2>/dev/null || true)"
     fi
     tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta" | tail -1)
     [ -n "$tasktmp" ] || {

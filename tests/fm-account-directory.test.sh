@@ -578,6 +578,8 @@ run_direct_spawn() {
     FM_FAKE_ENDPOINT_LABEL="fm-${1:-unknown}" FM_FAKE_KILL_RETAIN="${FM_FAKE_KILL_RETAIN:-0}" \
     FM_FAKE_NEW_WINDOW_FAIL="${FM_FAKE_NEW_WINDOW_FAIL:-0}" \
     FM_FAKE_SEND_KEYS_FAIL="${FM_FAKE_SEND_KEYS_FAIL:-0}" \
+    FM_TEST_FAIL_AFTER_ENDPOINT="${FM_TEST_FAIL_AFTER_ENDPOINT:-0}" \
+    FM_TEST_TASKTMP_CREATE_FAIL="${FM_TEST_TASKTMP_CREATE_FAIL:-0}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     T="${T:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
@@ -1135,8 +1137,7 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   set_remaining 1 20,15
   set_remaining 2 95,90
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
-
-  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 \
+  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 FM_TEST_FAIL_AFTER_ENDPOINT=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" --recover-direct-account 2>&1); then
     status=0
@@ -1173,11 +1174,10 @@ test_new_direct_spawn_tracks_retained_endpoint_and_worktree() {
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 90,85
-  id=direct-new-retained-z8
+  id=direct-new-retained-z8-$$
   record=$(make_spawn_case direct-new-retained codex "$id")
   read_spawn_case "$record"
-
-  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 \
+  if out=$(FM_FAKE_KILL_RETAIN=1 FM_FAKE_SEND_KEYS_FAIL=1 FM_TEST_FAIL_AFTER_ENDPOINT=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
@@ -1222,13 +1222,12 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   local record id out status recorded_worktree
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-rollback-z9
+  id=direct-new-rollback-z9-$$
   record=$(make_spawn_case direct-new-rollback codex "$id")
   read_spawn_case "$record"
   recorded_worktree=$(cd "$SPAWN_WORKTREE" && pwd -P)
   : > "$TREEHOUSE_LOG"
-
-  if out=$(FM_FAKE_SEND_KEYS_FAIL=1 \
+  if out=$(FM_FAKE_SEND_KEYS_FAIL=1 FM_TEST_FAIL_AFTER_ENDPOINT=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
@@ -1249,12 +1248,11 @@ test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   local record id out status meta
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-return-fail-z9
+  id=direct-new-return-fail-z9-$$
   record=$(make_spawn_case direct-new-return-fail codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
-
-  if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 FM_FAKE_SEND_KEYS_FAIL=1 \
+  if out=$(FM_FAKE_TREEHOUSE_RETURN_FAIL=1 FM_FAKE_SEND_KEYS_FAIL=1 FM_TEST_FAIL_AFTER_ENDPOINT=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
       "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
     status=0
@@ -1276,15 +1274,13 @@ test_failed_new_direct_spawn_never_records_an_uncreated_endpoint() {
   local record id out status meta
   reset_accounts
   set_remaining 1 90,85
-  id=direct-new-no-endpoint-z9
+  id=direct-new-no-endpoint-z9-$$
   record=$(make_spawn_case direct-new-no-endpoint codex "$id")
   read_spawn_case "$record"
   : > "$TREEHOUSE_LOG"
-
-  if out=$(T=default:captain-pane FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
-    FM_FAKE_NEW_WINDOW_FAIL=1 \
+  if out=$(T=default:captain-pane FM_FAKE_TREEHOUSE_RETURN_FAIL=1 FM_TEST_TASKTMP_CREATE_FAIL=1 \
     run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-      "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool 2>&1); then
+      "$id" "$SPAWN_PROJECT" --backend herdr --account-pool legacy-codex-pool 2>&1); then
     status=0
   else
     status=$?
@@ -1295,7 +1291,7 @@ test_failed_new_direct_spawn_never_records_an_uncreated_endpoint() {
   assert_grep "direct_spawn_cleanup=pending" "$meta" \
     "pre-endpoint failure did not record pending worktree cleanup"
   assert_grep "direct_spawn_endpoint=not-created" "$meta" \
-    "pre-endpoint failure did not distinguish an uncreated endpoint"
+    "pre-endpoint failure did not distinguish an uncreated endpoint: output=$out meta=$(cat "$meta")"
   assert_grep "window=" "$meta" \
     "pre-endpoint failure did not retain the metadata schema's empty window field"
   assert_no_grep "window=default:captain-pane" "$meta" \

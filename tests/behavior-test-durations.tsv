@@ -12,6 +12,8 @@
 16500	tests/fm-afk-launch.test.sh
 6900	tests/fm-afk-reap-wake-e2e.test.sh
 26565	tests/fm-arm-pretool-check.test.sh
+180	tests/fm-auto-reap-herdr-e2e.test.sh
+22300	tests/fm-auto-reap.test.sh
 5950	tests/fm-autocompact.test.sh
 20	tests/fm-backend-autodetect-smoke.test.sh
 20	tests/fm-backend-cmux-smoke.test.sh
@@ -88,6 +90,6 @@
 95645	tests/fm-watch-triage.test.sh
 20435	tests/fm-watcher-lock.test.sh
 23744	tests/fm-x-mode.test.sh
-230	tests/lavish-repair.test.sh
+250	tests/lavish-repair.test.sh
 6200	tests/lavish.test.sh
 92	tests/operating-fundamentals.test.sh

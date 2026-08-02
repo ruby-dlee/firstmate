@@ -3676,7 +3676,8 @@ test_teardown_refuses_unsafe_tasktmp_metadata() {
   expect_code 1 "$rc" "unsafe tasktmp teardown exit"
   assert_present "$sentinel/marker" "teardown deleted a metadata-selected arbitrary directory"
   assert_present "$case_dir/state/task-x1.meta" "unsafe tasktmp refusal removed task metadata"
-  assert_grep 'unsafe task temp path' "$case_dir/stderr" "unsafe teardown tasktmp refusal was unclear"
+  assert_grep 'unsafe task temp path' "$case_dir/stderr" \
+    "unsafe teardown tasktmp refusal was unclear"
   pass "teardown only removes its exact task temp root"
 }
 
@@ -3692,6 +3693,7 @@ test_teardown_removes_safe_tasktmp_and_accepts_absence() {
     "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
   printf 'tasktmp=%s\n' "$tasktmp" >> "$case_dir/state/task-x1.meta"
+  printf 'tasktmp_phase=created\n' >> "$case_dir/state/task-x1.meta"
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
     || fail "teardown rejected its exact task temp root: $(cat "$case_dir/stderr")"
   assert_absent "$tasktmp" "teardown retained its exact task temp root"

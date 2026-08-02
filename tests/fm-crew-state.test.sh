@@ -1194,6 +1194,24 @@ test_empty_run_lookup_rejects_checks_green_log() {
   pass "empty run lookup rejects a stale checks-green log"
 }
 
+test_skipped_run_lookup_rejects_checks_green_log() {
+  reset_fakes
+  local d; d=$(new_case skipped-run-ready-log)
+  make_repo_on_branch "$d/wt" fm/feat-detached-ready
+  git -C "$d/wt" checkout -q --detach
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-detached-ready.meta" "window=fm:fm-feat-detached-ready" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\n' > "$d/state/feat-detached-ready.status"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-detached-ready)"
+  FM_FAKE_BUSY=0
+  local out; out=$(run_crew_state "$d" feat-detached-ready)
+  assert_contains "$out" "state: unknown" "skipped run lookup with ready log -> unknown"
+  assert_contains "$out" "currentness is unavailable" "skipped lookup names missing currentness"
+  assert_contains "$out" "do not merge" "skipped lookup is merge-safe"
+  assert_not_contains "$out" "state: done" "skipped lookup must not authorize done"
+  pass "skipped run lookup rejects a stale checks-green log"
+}
+
 test_no_run_idle_pane_uses_keyed_log() {
   reset_fakes
   local d; d=$(new_case keyed-idle)
@@ -1500,6 +1518,7 @@ test_no_run_herdr_idle_agent_status_corroborated_by_busy_pane
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle
 test_no_run_idle_pane_uses_log
 test_empty_run_lookup_rejects_checks_green_log
+test_skipped_run_lookup_rejects_checks_green_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
 test_no_run_idle_pane_custom_paused_verb

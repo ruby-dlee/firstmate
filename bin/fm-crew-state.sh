@@ -524,7 +524,6 @@ nm_runs_status_for_branch() {  # <branch>
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
 HAVE_RUN=0
-RUN_LOOKUP_ATTEMPTED=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
 # a bare status word came back from the runs-list fallback above, so the
@@ -536,7 +535,6 @@ COARSE_PR=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
-  RUN_LOOKUP_ATTEMPTED=1
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
@@ -728,7 +726,7 @@ if [ "$KIND" != secondmate ] && crew_pane_is_busy "$BACKEND_TARGET"; then
   emit working pane "harness busy"
 fi
 
-if [ "$RUN_LOOKUP_ATTEMPTED" = 1 ] && log_reports_ci_ready; then
+if log_reports_ci_ready; then
   emit unknown status-log "checks-green currentness is unavailable; do not merge"
 fi
 

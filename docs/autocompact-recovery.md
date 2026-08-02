@@ -19,7 +19,7 @@ The model may propose exact inspect-then-update edits only for `data/captain.md`
 Knowledge that belongs in a project `AGENTS.md` or shared tracked Firstmate material is routed to backlog work for later normal delivery; the hook never writes a project or tracked Firstmate file.
 
 The worker validates the path allowlist, edit count, edit sizes, exact old text, uniqueness, final file sizes, and result consistency before publication.
-It takes a nonblocking home-local judgment lock and compares every changed destination with the snapshot immediately before staging and again immediately before publication.
+It takes a nonblocking home-local judgment lock, then compares every changed destination with its original snapshot under the shared data-writer lock immediately before staging the transaction journal and publishing the replacements.
 If a destination changed while the model was running, no proposed change is published.
 Accepted destination files are written to same-directory mode-0600 temporary files, fsynced, and atomically replaced.
 This prevents a concurrent Firstmate write from being overwritten or a partial destination file from being exposed.
@@ -51,6 +51,8 @@ The judgment subprocess gets 120 seconds and is launched in its own process grou
 That leaves 60 seconds of explicit outer headroom for the deterministic bearings capture, transcript extraction, validation, atomic publication, and anchor-status update.
 The transcript scan is capped at 100 MiB, individual records at 1 MiB, the complete model input at 600,000 bytes, the result at 12 edits, and every destination at a type-specific size limit.
 When transcript content must be truncated to fit that bound, accepted findings may still be routed but the anchor says `LIMITED` and warns that knowledge may have been lost.
+Tool and thinking content is not captured, and conversation beyond the scan, input, record, or edit limits can be lost.
+If the worker, runtime, model, validation, timeout, or concurrency path fails, all otherwise uncaptured judgment can be lost; the deterministic anchor remains available with its top-line failure warning.
 
 The timeout values are grounded in the installed harness and the current [Claude Code hook timeout contract](https://code.claude.com/docs/en/hooks-guide), not an assumed shell lifetime.
 The 2026-08-02 real-worker reproduction below completed judgment capture in 7 seconds inside the 120-second inner budget.

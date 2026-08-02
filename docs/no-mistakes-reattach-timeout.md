@@ -7,6 +7,9 @@ This note records the 2026-08-01 characterization of three reattach failures und
 The three affected lanes were `audit-evidence-m7`, `retention-erasure-d8`, and `kafka-isolation-p6`.
 The captured failure was `drive run: reconcile run <id>: read response: read unix -><NM_HOME>/socket: i/o timeout` on no-mistakes v1.41.2 (`867d64d`).
 The first two lanes recovered after another attach and the third stopped, proving that the run remained attachable after at least two occurrences but that the client performed no reliable outer retry.
+An independently repeated machine-level load measurement found an operational ceiling of about five concurrent no-mistakes pipeline runs.
+During the incident, five lanes across two firstmate homes were parked; `docs/stalled-lane-recovery-2026-08-01.md` owns their inventory and recovery disposition.
+That measured ceiling establishes the shared-contention symptom, not the exact query responsible for any individual timeout.
 
 At tag v1.41.2, `internal/cli/run_reconciler.go` retries subscription connection failures for up to 30 seconds, but `reconcile` returns the first `get_run` failure immediately.
 `internal/ipc/client.go` applies a 30-second read deadline to that `get_run` call and renders a missed response as `read response: ... i/o timeout`.

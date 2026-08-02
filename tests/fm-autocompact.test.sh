@@ -32,6 +32,15 @@ write_transcript() {
     '{type:"user",isMeta:false,message:{role:"user",content:$message}}' > "$path"
 }
 
+seed_pending_memory_transaction() {
+  local home=$1 before
+  before=$(printf '%s\n' '# Captain preferences' '- Before transaction.')
+  printf '%s\n' '# Captain preferences' '- Partially published value.' > "$home/data/captain.md"
+  jq -cn --arg content "$before" \
+    '{version:1,before:{"captain.md":{present:true,content:($content + "\n")}}}' \
+    > "$home/data/.firstmate-data-transaction.json"
+}
+
 fake_judgment_claude() {
   local dir=$1 mode=$2 fake
   fake="$dir/claude"
@@ -458,6 +467,65 @@ EOF
   pass "recovery failure returns zero with a top partial alarm"
 }
 
+test_startup_recovery_failure_preserves_deterministic_capture() {
+  local rec root home transcript anchor first_line rc
+  rec=$(new_primary startup-recovery-failure)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  write_transcript "$transcript" 'Remember this startup recovery fixture.'
+  printf '%s\n' '# startup-recovery-backlog' > "$home/data/backlog.md"
+  seed_pending_memory_transaction "$home"
+
+  set +e
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-startup-recovery\",\"transcript_path\":\"$transcript\"}" \
+    | FM_AUTOCOMPACT_TEST_FAIL_RECOVERY_WITH_JOURNAL=1 \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "startup judgment recovery failure must not block compaction"
+  anchor="$home/data/autocompact-resume.md"
+  first_line=$(sed -n '1p' "$anchor")
+  assert_contains "$first_line" 'Judgment capture: FAILED - PARTIAL' "startup recovery failure lacked a top partial alarm"
+  assert_grep '# startup-recovery-backlog' "$anchor" "startup recovery failure suppressed deterministic backlog capture"
+  assert_present "$home/data/.firstmate-data-transaction.json" "startup recovery failure hid its pending transaction"
+  pass "startup recovery failure preserves a zero-exit deterministic anchor"
+}
+
+test_sessionstart_recovery_failure_keeps_deterministic_reconciliation() {
+  local rec root home out anchor first_line rc
+  rec=$(new_primary sessionstart-recovery-failure)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  printf '%s\n' '# sessionstart-recovery-backlog' > "$home/data/backlog.md"
+  capture "$root" "$home" auto >/dev/null
+  seed_pending_memory_transaction "$home"
+
+  set +e
+  out=$(printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact","session_id":"session-recovery-failure"}' \
+    | FM_AUTOCOMPACT_TEST_FAIL_RECOVERY_WITH_JOURNAL=1 \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" recover 2>/dev/null)
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "SessionStart judgment recovery failure must return zero"
+  anchor="$home/data/autocompact-resume.md"
+  first_line=$(sed -n '1p' "$anchor")
+  assert_contains "$first_line" 'Judgment capture: FAILED - PARTIAL' "SessionStart recovery failure did not update the anchor alarm"
+  assert_contains "$out" 'Judgment capture: FAILED - PARTIAL' "SessionStart recovery output omitted the partial alarm"
+  assert_contains "$out" 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT' "SessionStart recovery failure suppressed the anchor surface"
+  assert_contains "$out" 'NORMAL SESSION-START RECONCILIATION' "SessionStart recovery failure suppressed normal reconciliation"
+  assert_contains "$out" '# sessionstart-recovery-backlog' "SessionStart recovery failure suppressed durable backlog context"
+  pass "SessionStart recovery failure preserves deterministic reconciliation"
+}
+
 test_older_worker_cannot_complete_newer_failed_anchor() {
   local rec root home transcript fake anchor ready release older_pid attempts=0
   rec=$(new_primary anchor-status-race)
@@ -622,6 +690,8 @@ test_concurrent_memory_change_is_never_overwritten
 test_partial_publication_failure_rolls_back_every_file
 test_killed_publication_is_recovered_before_hook_return
 test_recovery_failure_surfaces_top_partial_alarm
+test_startup_recovery_failure_preserves_deterministic_capture
+test_sessionstart_recovery_failure_keeps_deterministic_reconciliation
 test_older_worker_cannot_complete_newer_failed_anchor
 test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles

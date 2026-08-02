@@ -64,6 +64,33 @@ def update(args: argparse.Namespace) -> int:
     return 0
 
 
+def alarm(args: argparse.Namespace) -> int:
+    descriptor = locked(args.lock)
+    temporary: Optional[str] = None
+    try:
+        lines = args.anchor.read_text().splitlines(keepends=True)
+        if lines and lines[0].startswith("Judgment capture:"):
+            lines[0] = f"{args.status}\n"
+        elif len(lines) > 2 and lines[2].startswith("Judgment capture:"):
+            del lines[2]
+            lines.insert(0, f"{args.status}\n\n")
+        else:
+            lines.insert(0, f"{args.status}\n\n")
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=args.anchor.parent, prefix=".autocompact-resume.md.", delete=False
+        ) as output:
+            temporary = output.name
+            output.writelines(lines)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, args.anchor)
+        temporary = None
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+        os.close(descriptor)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", required=True, type=Path)
@@ -79,6 +106,11 @@ def main() -> int:
     update_parser.add_argument("--capture-id", required=True)
     update_parser.add_argument("--status", required=True)
     update_parser.set_defaults(handler=update)
+
+    alarm_parser = subparsers.add_parser("alarm")
+    alarm_parser.add_argument("--anchor", required=True, type=Path)
+    alarm_parser.add_argument("--status", required=True)
+    alarm_parser.set_defaults(handler=alarm)
 
     args = parser.parse_args()
     try:

@@ -52,6 +52,7 @@ STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 DATA=${FM_DATA_OVERRIDE:-$FM_HOME/data}
 ANCHOR=$DATA/autocompact-resume.md
 ANCHOR_LOCK=$DATA/.autocompact-anchor.lock
+PARTIAL_RECOVERY_STATUS='Judgment capture: FAILED - PARTIAL durable-memory publication; recovery did not complete, so captain preferences, corrections, and operational learnings may have been lost and the memory files may be inconsistent.'
 MODE=${1:-}
 
 usage() {
@@ -266,8 +267,34 @@ render_anchor() {
   [ "$meta_found" -eq 1 ] || printf '\n(none)\n' || return 1
 }
 
+publish_partial_alarm_without_python() {
+  local tmp first third
+  [ -f "$ANCHOR" ] && [ ! -L "$ANCHOR" ] || return 1
+  first=$(sed -n '1p' "$ANCHOR") || return 1
+  third=$(sed -n '3p' "$ANCHOR") || return 1
+  tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") || return 1
+  {
+    printf '%s\n\n' "$PARTIAL_RECOVERY_STATUS"
+    if [[ "$first" = "Judgment capture:"* ]]; then
+      sed '1d' "$ANCHOR"
+    elif [[ "$third" = "Judgment capture:"* ]]; then
+      awk 'NR != 3' "$ANCHOR"
+    else
+      cat "$ANCHOR"
+    fi
+  } > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  chmod 600 "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv -f "$tmp" "$ANCHOR"
+}
+
 capture_anchor() {
-  local trigger session_id transcript generated snapshot tmp capture_id judgment_status judgment_rc judgment_partial=0
+  local trigger session_id transcript generated snapshot tmp capture_id judgment_status judgment_rc judgment_partial=0 startup_recovery_failed=0
   trigger=$(json_string_field trigger "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   case "$trigger" in
@@ -286,10 +313,15 @@ capture_anchor() {
   [ -d "$DATA" ] && [ ! -L "$DATA" ] \
     || capture_failed "unsafe data directory at $DATA"
   if command -v python3 >/dev/null 2>&1; then
-    python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only \
-      || capture_failed 'could not reconcile a pending durable-memory transaction'
+    if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
+      startup_recovery_failed=1
+      judgment_partial=1
+      printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: a pending durable-memory transaction could not be reconciled before deterministic capture.' >&2
+    fi
   elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
-    capture_failed 'python3 is unavailable and a durable-memory transaction needs recovery'
+    startup_recovery_failed=1
+    judgment_partial=1
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable and a pending durable-memory transaction could not be reconciled before deterministic capture.' >&2
   fi
 
   if command -v jq >/dev/null 2>&1; then
@@ -322,7 +354,11 @@ capture_anchor() {
   tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") \
     || capture_failed 'could not allocate a temporary anchor'
   capture_id=${tmp##*.autocompact-resume.md.}
-  judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, captain preferences, corrections, and operational learnings may have been lost.'
+  if [ "$startup_recovery_failed" -eq 1 ]; then
+    judgment_status=$PARTIAL_RECOVERY_STATUS
+  else
+    judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, captain preferences, corrections, and operational learnings may have been lost.'
+  fi
   render_anchor "$judgment_status" > "$tmp" || {
     rm -f "$tmp" || capture_failed 'could not clean the incomplete temporary anchor'
     capture_failed 'could not render the resume anchor'
@@ -340,7 +376,9 @@ capture_anchor() {
     }
   fi
 
-  if [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
+  if [ "$startup_recovery_failed" -eq 1 ]; then
+    judgment_status=$PARTIAL_RECOVERY_STATUS
+  elif [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
     judgment_status='Judgment capture: FAILED - judgment capture was disabled; captain preferences, corrections, and operational learnings may have been lost.'
   elif ! command -v python3 >/dev/null 2>&1; then
     judgment_status='Judgment capture: FAILED - python3 is unavailable, so captain preferences, corrections, and operational learnings may have been lost.'
@@ -384,7 +422,7 @@ capture_anchor() {
   fi
   if command -v python3 >/dev/null 2>&1; then
     if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
-      judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication; recovery did not complete, so captain preferences, corrections, and operational learnings may have been lost and the memory files may be inconsistent.'
+      judgment_status=$PARTIAL_RECOVERY_STATUS
       printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: the pending durable-memory transaction could not be reconciled before anchor finalization.' >&2
     elif [ "$judgment_partial" -eq 1 ]; then
       judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication stopped before all judgment updates completed; captain preferences, corrections, and operational learnings may have been lost.'
@@ -411,15 +449,23 @@ capture_anchor() {
 }
 
 recover_context() {
-  local digest digest_rc
+  local digest digest_rc recovery_failed=0
   if command -v python3 >/dev/null 2>&1; then
     if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
-      printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY FAILED: a pending durable-memory transaction could not be reconciled, so no potentially partial memory state will be presented.'
-      return 1
+      recovery_failed=1
     fi
   elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
-    printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY FAILED: python3 is unavailable and a durable-memory transaction needs recovery, so no potentially partial memory state will be presented.'
-    return 1
+    recovery_failed=1
+  fi
+  if [ "$recovery_failed" -eq 1 ]; then
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING: a pending durable-memory transaction could not be reconciled; deterministic recovery will continue with a top-of-anchor PARTIAL alarm.' >&2
+    if command -v python3 >/dev/null 2>&1 && [ -f "$ANCHOR" ] && [ ! -L "$ANCHOR" ]; then
+      python3 "$SCRIPT_DIR/fm-autocompact-anchor.py" \
+        --lock "$ANCHOR_LOCK" alarm --anchor "$ANCHOR" --status "$PARTIAL_RECOVERY_STATUS" \
+        || printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING: the durable anchor could not be updated with the PARTIAL alarm; the recovery output will carry it inline.' >&2
+    elif ! publish_partial_alarm_without_python; then
+      printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING: the durable anchor could not be updated with the PARTIAL alarm; the recovery output will carry it inline.' >&2
+    fi
   fi
   digest=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
@@ -431,6 +477,9 @@ recover_context() {
   digest_rc=$?
 
   printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY CONTEXT'
+  if [ "$recovery_failed" -eq 1 ]; then
+    printf '%s\n' "$PARTIAL_RECOVERY_STATUS"
+  fi
   if [ -n "$RECOVERY_WARNING" ]; then
     printf 'FIRSTMATE AUTOCOMPACT RECOVERY WARNING: %s\n' "$RECOVERY_WARNING"
   fi

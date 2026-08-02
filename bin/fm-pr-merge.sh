@@ -19,9 +19,10 @@
 # parses the URL and invokes gh-axi in the form it accepts.
 #
 # Merge method: when the caller passes none of --squash, --merge, --rebase, or
-# --method after the optional -- separator, no method is added. This lets a
-# GitHub merge queue select its configured strategy. An explicit caller method
-# is forwarded unchanged.
+# --method after the optional -- separator, --squash is attempted first. If
+# GitHub reports that the base branch's merge queue owns the strategy, the
+# command is retried without a method so GitHub can enqueue it. An explicit
+# caller method is forwarded unchanged and never retried without that method.
 # Merge success means GitHub independently reports the PR state as merged after
 # the merge command returns.
 # Merge queue acceptance, auto-merge enablement, or any other still-open state
@@ -67,7 +68,35 @@ merge_method_label() {
       *) previous= ;;
     esac
   done
-  printf '%s\n' default
+  printf '%s\n' squash
+}
+
+caller_has_merge_method() {
+  local arg previous=
+  for arg in "$@"; do
+    if [ "$previous" = method ]; then
+      return 0
+    fi
+    case "$arg" in
+      --squash|--merge|--rebase|--method=*) return 0 ;;
+      --method) previous=method ;;
+      *) previous= ;;
+    esac
+  done
+  return 1
+}
+
+merge_queue_owns_strategy() {
+  local output
+  output=$(printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$output" in
+    *"merge queue"*) ;;
+    *) return 1 ;;
+  esac
+  case "$output" in
+    *strategy*|*method*|*"base branch"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 parse_pr_url() {
@@ -196,8 +225,22 @@ refuse_draft_pr || exit 1
 
 MERGE_METHOD_LABEL=$(merge_method_label "$@")
 
-if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "$@" 2>&1); then
-  printf '%s\n' "$MERGE_OUTPUT"
-  exit 1
+if caller_has_merge_method "$@"; then
+  if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "$@" 2>&1); then
+    printf '%s\n' "$MERGE_OUTPUT"
+    exit 1
+  fi
+else
+  if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --squash "$@" 2>&1); then
+    if ! merge_queue_owns_strategy "$MERGE_OUTPUT"; then
+      printf '%s\n' "$MERGE_OUTPUT"
+      exit 1
+    fi
+    MERGE_METHOD_LABEL=default
+    if ! MERGE_OUTPUT=$(gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "$@" 2>&1); then
+      printf '%s\n' "$MERGE_OUTPUT"
+      exit 1
+    fi
+  fi
 fi
 verify_pr_merged

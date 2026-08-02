@@ -46,6 +46,7 @@ EXIT_TRANSCRIPT = 66
 EXIT_WORKER = 69
 EXIT_APPLY = 70
 EXIT_CONCURRENT = 75
+EXIT_PARTIAL = 76
 EXIT_TIMEOUT = 124
 
 
@@ -437,7 +438,10 @@ def publish_changes(
         publish_transaction(data, snapshots, changes, current_bytes_match)
     except TransactionError as exc:
         message = str(exc)
-        exit_code = EXIT_CONCURRENT if "changed before" in message else EXIT_APPLY
+        if exc.partial:
+            exit_code = EXIT_PARTIAL
+        else:
+            exit_code = EXIT_CONCURRENT if "changed before" in message else EXIT_APPLY
         raise CaptureError(message, exit_code) from exc
 
 

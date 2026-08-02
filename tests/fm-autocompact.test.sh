@@ -285,7 +285,7 @@ EOF
   expect_code 0 "$rc" "judgment worker failure should preserve deterministic compaction"
   anchor="$home/data/autocompact-resume.md"
   assert_grep 'Judgment capture: FAILED' "$anchor" "judgment failure was silent in the anchor"
-  assert_grep 'conversation-only durable knowledge may have been lost' "$anchor" "judgment failure did not name the knowledge-loss risk"
+  assert_grep 'captain preferences, corrections, and operational learnings may have been lost' "$anchor" "judgment failure did not name the knowledge-loss categories"
   assert_grep '# deterministic-fallback' "$anchor" "judgment failure lost the deterministic anchor"
   assert_contains "$out" 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED' "judgment failure emitted no hook diagnostic"
   pass "judgment failure degrades loudly without regressing deterministic capture"
@@ -373,7 +373,8 @@ EOF
   [ "$(cat "$home/data/captain.md")" = "$captain_before" ] || fail "partial failure did not roll captain.md back"
   [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "partial failure changed learnings.md"
   anchor="$home/data/autocompact-resume.md"
-  assert_grep 'Judgment capture: FAILED' "$anchor" "partial publication failure was not loud"
+  assert_grep 'Judgment capture: FAILED - PARTIAL' "$anchor" "partial publication failure was not labeled partial"
+  assert_not_contains "$(cat "$anchor")" 'Judgment capture: COMPLETE' "partial publication failure was mislabeled complete"
   pass "a partial multi-file publication failure rolls every destination back"
 }
 
@@ -411,8 +412,50 @@ EOF
   [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "hook return changed learnings.md"
   assert_absent "$home/data/.firstmate-data-transaction.json" "hook return left a transaction journal pending"
   anchor="$home/data/autocompact-resume.md"
-  assert_grep 'Judgment capture: FAILED' "$anchor" "killed publication was presented as complete"
+  assert_grep 'Judgment capture: FAILED - PARTIAL' "$anchor" "killed publication was not labeled partial"
+  assert_not_contains "$(cat "$anchor")" 'Judgment capture: COMPLETE' "killed publication was presented as complete"
   pass "a killed multi-file publication is recovered before hook return"
+}
+
+test_recovery_failure_surfaces_top_partial_alarm() {
+  local rec root home transcript fake ready capture_pid worker_pid anchor first_line rc
+  rec=$(new_primary judgment-recovery-failure)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  ready="$home/publish-ready"
+  write_transcript "$transcript" 'Remember my preference correction and the operational learning.'
+  printf '%s\n' '# Captain preferences' > "$home/data/captain.md"
+  printf '%s\n' '# Fleet learnings' > "$home/data/learnings.md"
+  printf '%s\n' '# Backlog' '## In flight' '## Queued' '## Done' > "$home/data/backlog.md"
+  fake=$(fake_judgment_claude "$home/fake-recovery-failure" multi)
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-recovery-failure\",\"transcript_path\":\"$transcript\"}" \
+    | FM_FAKE_JUDGMENT_MODE=multi \
+      FM_AUTOCOMPACT_TEST_PAUSE_PUBLISH_AFTER=1 \
+      FM_AUTOCOMPACT_TEST_PUBLISH_READY="$ready" \
+      FM_AUTOCOMPACT_TEST_FAIL_RECOVERY_WITH_JOURNAL=1 \
+      FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1 &
+  capture_pid=$!
+  fm_test_wait_for_file "$ready" "$capture_pid" || fail "recovery-failure publication did not reach the kill point"
+  worker_pid=$(cat "$ready")
+  kill -9 "$worker_pid"
+  wait "$capture_pid"
+  rc=$?
+
+  expect_code 0 "$rc" "judgment recovery failure must degrade without blocking compaction"
+  anchor="$home/data/autocompact-resume.md"
+  first_line=$(sed -n '1p' "$anchor")
+  assert_contains "$first_line" 'Judgment capture: FAILED - PARTIAL' "recovery failure was not the absolute top-line partial alarm"
+  assert_contains "$first_line" 'captain preferences, corrections, and operational learnings may have been lost' "recovery failure omitted durable-knowledge categories"
+  assert_not_contains "$(cat "$anchor")" 'Judgment capture: COMPLETE' "partial recovery failure was mislabeled complete"
+  assert_grep '# Backlog' "$anchor" "partial alarm replaced the deterministic anchor content"
+  assert_present "$home/data/.firstmate-data-transaction.json" "failed recovery hid its pending transaction"
+  pass "recovery failure returns zero with a top partial alarm"
 }
 
 test_older_worker_cannot_complete_newer_failed_anchor() {
@@ -578,6 +621,7 @@ test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
 test_partial_publication_failure_rolls_back_every_file
 test_killed_publication_is_recovered_before_hook_return
+test_recovery_failure_surfaces_top_partial_alarm
 test_older_worker_cannot_complete_newer_failed_anchor
 test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles

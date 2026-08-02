@@ -24,9 +24,10 @@ If a destination changed while the model was running, no proposed change is publ
 Accepted destination files are written to same-directory mode-0600 temporary files, fsynced, and atomically replaced.
 This prevents a concurrent Firstmate write from being overwritten or a partial destination file from being exposed.
 
-The anchor is deliberately published first with a plain `Judgment capture: FAILED` warning directly under its title.
+The anchor is deliberately published first with a plain `Judgment capture: FAILED` warning as its absolute first line.
 Only a completed worker can atomically upgrade that line to `COMPLETE` or `LIMITED`.
-A missing runtime, unreadable transcript, rejected model result, worker error, timeout, concurrent destination change, or outer hook kill therefore leaves a loud statement that conversation-only durable knowledge may have been lost.
+A missing runtime, unreadable transcript, rejected model result, worker error, timeout, concurrent destination change, or outer hook kill therefore leaves a loud statement that captain preferences, corrections, and operational learnings may have been lost.
+Any publication that reached a destination before failing is labeled `FAILED - PARTIAL` and never `COMPLETE`, even when journal recovery restores the prior consistent generation.
 Judgment failure returns success from the capture hook after preserving that warning, so compaction degrades to the already-durable deterministic bridge instead of consuming the whole hook timeout or discarding fleet state.
 Deterministic capture failures retain their existing exit-2 blocking behavior.
 
@@ -128,9 +129,9 @@ printf '%s\n' '<PreCompact JSON naming the real transcript>' |
 The command completed in 7 seconds and the anchor began:
 
 ```text
-# Autocompact resume anchor
-
 Judgment capture: COMPLETE - the bounded transcript review routed durable knowledge atomically to data/captain.md.
+
+# Autocompact resume anchor
 ```
 
 Before capture, the only captain memory was `Prefer concise operational reports.`

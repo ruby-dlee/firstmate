@@ -237,8 +237,8 @@ fi
 
 render_anchor() {
   local judgment_status=$1 meta id meta_found=0
-  printf '# Autocompact resume anchor\n\n' || return 1
   printf '%s\n\n' "$judgment_status" || return 1
+  printf '# Autocompact resume anchor\n\n' || return 1
   printf "Capture ID: \`%s\`\n" "$capture_id" || return 1
   printf "Generated: \`%s\`\n" "$generated" || return 1
   printf "Trigger: \`%s\`\n" "$trigger" || return 1
@@ -267,7 +267,7 @@ render_anchor() {
 }
 
 capture_anchor() {
-  local trigger session_id transcript generated snapshot tmp capture_id judgment_status judgment_rc
+  local trigger session_id transcript generated snapshot tmp capture_id judgment_status judgment_rc judgment_partial=0
   trigger=$(json_string_field trigger "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   case "$trigger" in
@@ -322,7 +322,7 @@ capture_anchor() {
   tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") \
     || capture_failed 'could not allocate a temporary anchor'
   capture_id=${tmp##*.autocompact-resume.md.}
-  judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, conversation-only durable knowledge may have been lost.'
+  judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, captain preferences, corrections, and operational learnings may have been lost.'
   render_anchor "$judgment_status" > "$tmp" || {
     rm -f "$tmp" || capture_failed 'could not clean the incomplete temporary anchor'
     capture_failed 'could not render the resume anchor'
@@ -341,9 +341,9 @@ capture_anchor() {
   fi
 
   if [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
-    judgment_status='Judgment capture: FAILED - judgment capture was disabled; conversation-only durable knowledge may have been lost.'
+    judgment_status='Judgment capture: FAILED - judgment capture was disabled; captain preferences, corrections, and operational learnings may have been lost.'
   elif ! command -v python3 >/dev/null 2>&1; then
-    judgment_status='Judgment capture: FAILED - python3 is unavailable, so conversation-only durable knowledge may have been lost.'
+    judgment_status='Judgment capture: FAILED - python3 is unavailable, so captain preferences, corrections, and operational learnings may have been lost.'
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable.' >&2
     return 0
   else
@@ -363,25 +363,34 @@ capture_anchor() {
     if [ "$judgment_rc" -ne 0 ]; then
       case "$judgment_rc" in
         75)
-          judgment_status='Judgment capture: FAILED - a concurrent data change prevented safe publication; conversation-only durable knowledge may have been lost.'
+          judgment_status='Judgment capture: FAILED - a concurrent data change prevented safe publication; captain preferences, corrections, and operational learnings may have been lost.'
+          ;;
+        76)
+          judgment_partial=1
+          judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication stopped before all judgment updates completed; captain preferences, corrections, and operational learnings may have been lost.'
           ;;
         124)
-          judgment_status="Judgment capture: FAILED - the bounded worker exceeded its ${FM_AUTOCOMPACT_JUDGMENT_TIMEOUT_SECONDS:-120}s budget; conversation-only durable knowledge may have been lost."
+          judgment_status="Judgment capture: FAILED - the bounded worker exceeded its ${FM_AUTOCOMPACT_JUDGMENT_TIMEOUT_SECONDS:-120}s budget; captain preferences, corrections, and operational learnings may have been lost."
           ;;
         *)
-          judgment_status='Judgment capture: FAILED - the isolated transcript worker could not complete; conversation-only durable knowledge may have been lost.'
+          judgment_status='Judgment capture: FAILED - the isolated transcript worker could not complete; captain preferences, corrections, and operational learnings may have been lost.'
           ;;
       esac
     fi
   fi
 
+  if [ -e "$DATA/.firstmate-data-transaction.json" ]; then
+    judgment_partial=1
+  fi
   if command -v python3 >/dev/null 2>&1; then
     if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
-      judgment_status='Judgment capture: FAILED - the isolated transcript worker did not complete and its durable-memory transaction could not be reconciled; conversation-only durable knowledge may have been lost and the memory files may be inconsistent.'
+      judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication; recovery did not complete, so captain preferences, corrections, and operational learnings may have been lost and the memory files may be inconsistent.'
       printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: the pending durable-memory transaction could not be reconciled before anchor finalization.' >&2
+    elif [ "$judgment_partial" -eq 1 ]; then
+      judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication stopped before all judgment updates completed; captain preferences, corrections, and operational learnings may have been lost.'
     fi
   elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
-    judgment_status='Judgment capture: FAILED - python3 is unavailable and a durable-memory transaction could not be reconciled; conversation-only durable knowledge may have been lost and the memory files may be inconsistent.'
+    judgment_status='Judgment capture: FAILED - PARTIAL durable-memory publication; python3 is unavailable, so recovery did not complete, captain preferences, corrections, and operational learnings may have been lost, and the memory files may be inconsistent.'
     printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable and the pending durable-memory transaction could not be reconciled before anchor finalization.' >&2
   fi
 

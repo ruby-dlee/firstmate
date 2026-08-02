@@ -18,7 +18,9 @@ MAX_JOURNAL_BYTES = 5_000_000
 
 
 class TransactionError(Exception):
-    pass
+    def __init__(self, message: str, *, partial: bool = False) -> None:
+        super().__init__(message)
+        self.partial = partial
 
 
 def fsync_directory(data: Path) -> None:
@@ -85,6 +87,8 @@ def recover_pending_transaction(data: Path) -> bool:
     payload = load_journal(data)
     if payload is None:
         return False
+    if os.environ.get("FM_AUTOCOMPACT_TEST_FAIL_RECOVERY_WITH_JOURNAL") == "1":
+        raise TransactionError("injected pending data transaction recovery failure")
     before = payload["before"]
     assert isinstance(before, dict)
     try:
@@ -160,6 +164,9 @@ def publish_transaction(
             recover_pending_transaction(data)
         except TransactionError as recovery_exc:
             raise TransactionError(
-                f"cannot publish data transaction: {exc}; {recovery_exc}"
+                f"cannot publish data transaction: {exc}; {recovery_exc}",
+                partial=True,
             ) from recovery_exc
-        raise TransactionError(f"cannot publish data transaction: {exc}") from exc
+        raise TransactionError(
+            f"cannot publish data transaction: {exc}", partial=True
+        ) from exc

@@ -40,9 +40,15 @@ def update(args: argparse.Namespace) -> int:
     try:
         lines = args.anchor.read_text().splitlines(keepends=True)
         capture_line = f"Capture ID: `{args.capture_id}`\n"
-        if len(lines) < 5 or lines[4] != capture_line or not lines[2].startswith("Judgment capture:"):
+        if len(lines) < 5 or lines[4] != capture_line:
             return 3
-        lines[2] = f"{args.status}\n"
+        if lines[0].startswith("Judgment capture:"):
+            status_index = 0
+        elif lines[2].startswith("Judgment capture:"):
+            status_index = 2
+        else:
+            return 3
+        lines[status_index] = f"{args.status}\n"
         with tempfile.NamedTemporaryFile(
             mode="w", dir=args.anchor.parent, prefix=".autocompact-resume.md.", delete=False
         ) as output:

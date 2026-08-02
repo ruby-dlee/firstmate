@@ -513,6 +513,52 @@ nm_ci_checks_state() {
 # is a run for THIS branch active right now. Echoes the first (most recent)
 # matching row's status word (running/completed/cancelled/failed), or empty
 # when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
+# True when `axi status` renders the active step as quiet. A configured shell
+# command step (commands.test / commands.lint) ALWAYS renders quiet for its whole
+# duration, because no-mistakes flushes that step's log only when the step ends
+# (2026-08-02 incident; docs/postmortems/nm-quiet-test-step.md). So quiet here is
+# a prompt to check real liveness, never on its own evidence that anything died.
+nm_step_is_quiet() {
+  printf '%s\n' "$RUN_OUT" | grep -qE 'quiet[[:space:]]+[0-9]'
+}
+
+# Name of the step in the active_steps table, e.g. `test`. Empty when absent.
+nm_active_step_name() {
+  local row
+  row=$(printf '%s\n' "$RUN_OUT" | sed -n '/^[[:space:]]*active_steps\[/,$p' | sed -n '2p')
+  row=$(trim "$row")
+  [ -n "$row" ] || return 0
+  strip_quotes "$(trim "${row%%,*}")"
+}
+
+# One-line liveness verdict for the active step's own processes, or empty when it
+# cannot be established. Presence-only (--sample 0) so this stays a ~0.2s read on
+# the heartbeat path; presence alone separates dead from slow, which is the whole
+# distinction firstmate got wrong by hand.
+nm_step_liveness() {
+  local run_id out
+  run_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$run_id" ] || return 0
+  [ -x "$SCRIPT_DIR/fm-nm-step-liveness.sh" ] || return 0
+  case "$HAVE_TIMEOUT" in
+    timeout)  out=$(timeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    *)        out=$("$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+  esac
+  [ -n "$out" ] || return 0
+  # Compact the probe's own line to `<verdict> (<n> procs)`; this rides on every
+  # heartbeat read, so it stays token-tight. The full detail is one command away.
+  local verdict procs
+  verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
+  procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
+  [ -n "$verdict" ] || return 0
+  if [ -n "$procs" ]; then
+    printf '%s (%s procs)' "$verdict" "$procs"
+  else
+    printf '%s' "$verdict"
+  fi
+}
+
 nm_runs_status_for_branch() {  # <branch>
   local branch=$1 out row st rest br head pr field
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
@@ -688,6 +734,22 @@ if [ "$HAVE_RUN" = 1 ]; then
       verify_no_newer_active_run_or_emit "$CREW_BRANCH"
     fi
     verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
+  fi
+
+  # A quiet working step is the exact reading that made firstmate abort two
+  # healthy runs on 2026-08-02, so answer "dead or just slow?" here instead of
+  # leaving it to a hand check that gets it wrong. The verdict is APPENDED as an
+  # observation and never overrides RUN_STATE: a step momentarily between
+  # processes would otherwise be misreported as dead, which is the very failure
+  # mode this exists to end. The ci step is excluded because its monitoring runs
+  # inside the daemon with no worktree process at all, so `dead` there is
+  # meaningless rather than informative.
+  if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] && nm_step_is_quiet; then
+    ACTIVE_STEP=$(nm_active_step_name)
+    if [ -n "$ACTIVE_STEP" ] && [ "$ACTIVE_STEP" != ci ]; then
+      LIVENESS=$(nm_step_liveness)
+      [ -n "$LIVENESS" ] && RUN_DETAIL="$RUN_DETAIL${SEP}$ACTIVE_STEP $LIVENESS"
+    fi
   fi
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then

@@ -509,7 +509,7 @@ This do-not-fight rule does not license evidence commits in firstmate's own repo
 With `yolo=on`, firstmate makes those calls itself without asking - resolve ask-user findings on your judgment, and run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` / `bin/fm-merge-local.sh` once the work is green/approved - EXCEPT anything destructive, irreversible, or security-sensitive, which still escalates to the captain.
 Never merge a red PR even under yolo.
 `bin/fm-pr-merge.sh` always records `pr=` and records `pr_head=` when available before refusing a draft or asking GitHub to merge, and parses the full `https://github.com/<owner>/<repo>/pull/<n>` URL into `gh-axi pr merge <n> --repo <owner>/<repo>`.
-With no explicit merge method after `--`, it lets GitHub select the repository strategy or enqueue the PR; only a subsequently verified merged state exits successfully.
+With no explicit merge method after `--`, it ordinarily attempts `--squash` and retries without a method only when GitHub specifically rejects that strategy because the base branch's merge queue owns it; explicit caller methods remain unchanged, and only a subsequently verified merged state exits successfully.
 This holds even on a repo with no PR CI where the "checks green" signal that normally triggers `bin/fm-pr-check.sh` never fires - do not call `gh-axi pr merge` directly for a task's PR, or the recording step can be silently skipped and a later `fm-teardown.sh` has nothing to verify a squash merge against.
 After any merge you perform without asking the captain, post a one-line "merged <full PR URL or local main> after checks passed" FYI so the captain keeps a trail.
 

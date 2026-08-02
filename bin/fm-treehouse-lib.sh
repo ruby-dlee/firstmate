@@ -137,26 +137,38 @@ try:
     worktrees = state["worktrees"]
     if not isinstance(worktrees, list):
         raise TypeError("worktrees must be an array")
+    seen_paths = set()
     for entry in worktrees:
         if not isinstance(entry, dict):
             raise TypeError("worktree entry must be an object")
+        path = entry.get("path")
         leased = entry.get("leased")
         holder = entry.get("lease_holder")
+        destroying = entry.get("destroying", False)
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or "\0" in path
+            or not os.path.isabs(path)
+        ):
+            raise TypeError("worktree path must be a non-empty absolute string")
+        canonical_path = os.path.realpath(path)
+        if canonical_path in seen_paths:
+            raise TypeError("worktree paths must be unique")
+        seen_paths.add(canonical_path)
         if not isinstance(leased, bool):
             raise TypeError("leased must be a boolean")
+        if not isinstance(destroying, bool):
+            raise TypeError("destroying must be a boolean when present")
+        if destroying:
+            raise ValueError("Treehouse state contains a worktree being destroyed")
         if leased:
-            path = entry.get("path")
-            if (
-                not isinstance(path, str)
-                or not path.strip()
-                or "\0" in path
-                or not os.path.isabs(path)
-            ):
-                raise TypeError("leased worktree path must be a non-empty absolute string")
             if not isinstance(holder, str) or not holder.strip():
                 raise TypeError("leased worktree holder must be a non-empty string")
             if holder == expected_holder:
                 raise ValueError("matching Treehouse lease still exists")
+        elif holder not in (None, ""):
+            raise TypeError("returned worktree holder must be null or empty")
 except ValueError as error:
     print(
         f"error: Treehouse lease absence for {expected_holder} is unprovable: {error}",

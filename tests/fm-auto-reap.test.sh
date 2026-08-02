@@ -40,6 +40,17 @@ if [ "${FM_FAKE_TEARDOWN_ASSERT_ORPHAN:-0}" = 1 ]; then
   grep -qx 'window=' "$meta" || exit 31
   grep -qx 'direct_spawn_endpoint=not-created' "$meta" || exit 32
   grep -qx 'direct_spawn_cleanup=pending' "$meta" || exit 33
+  grep -qx 'tasktmp_phase=not-created' "$meta" || exit 34
+fi
+if [ "${FM_FAKE_TEARDOWN_ASSERT_HERDR:-0}" = 1 ]; then
+  meta="$FM_STATE_OVERRIDE/$id.meta"
+  grep -qx 'backend=herdr' "$meta" || exit 41
+  grep -qx 'window=lab-session:pane-41' "$meta" || exit 42
+  grep -qx 'herdr_session=lab-session' "$meta" || exit 43
+  grep -qx 'herdr_workspace_id=workspace-41' "$meta" || exit 44
+  grep -qx 'herdr_tab_id=tab-41' "$meta" || exit 45
+  grep -qx 'herdr_pane_id=pane-41' "$meta" || exit 46
+  ! grep -q '^direct_spawn_endpoint=' "$meta" || exit 47
 fi
 if [ "${FM_FAKE_TEARDOWN_STATUS:-0}" -ne 0 ]; then
   printf 'REFUSED: synthetic teardown refusal\n' >&2
@@ -67,8 +78,9 @@ reset_logs() {
   FM_FAKE_NM_RUNS=
   FM_FAKE_TEARDOWN_STATUS=0
   FM_FAKE_TEARDOWN_ASSERT_ORPHAN=0
+  FM_FAKE_TEARDOWN_ASSERT_HERDR=0
   export FM_FAKE_PR_STATE FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
-  export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN
+  export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
 }
 
 make_task() {  # <id> <mode>
@@ -189,8 +201,9 @@ PY
   printf '%s\t%s\n' "$project" "$worktree"
 }
 
-write_dead_acquisition() {  # <id> <project> <worktree> <mode>
-  local id=$1 project=$2 worktree=$3 mode=$4 record home_real
+write_dead_acquisition() {  # <id> <project> <worktree> <mode> [endpoint-phase] [backend] [tasktmp-phase]
+  local id=$1 project=$2 worktree=$3 mode=$4 endpoint_phase=${5:-not-created} backend=${6:-tmux} tasktmp_phase=${7:-not-created}
+  local record home_real
   record="$HOME_DIR/state/.worktree-acquire-$id.pending"
   home_real=$(cd "$HOME_DIR" && pwd -P)
   {
@@ -198,7 +211,8 @@ write_dead_acquisition() {  # <id> <project> <worktree> <mode>
     printf 'id=%s\nproject=%s\nholder=firstmate-%s\n' "$id" "$project" "$id"
     printf 'home=%s\n' "$home_real"
     printf 'kind=ship\nmode=%s\nyolo=off\ngeneration_id=orphan-test\n' "$mode"
-    printf 'tasktmp=/tmp/fm-%s-orphan-test\n' "$id"
+    printf 'tasktmp=/tmp/fm-%s-orphan-test\ntasktmp_phase=%s\n' "$id" "$tasktmp_phase"
+    printf 'backend=%s\nendpoint_phase=%s\n' "$backend" "$endpoint_phase"
     printf 'worktree=%s\n' "$worktree"
   } > "$record"
   touch -t 202001010000 "$record"
@@ -226,7 +240,8 @@ test_dead_acquisition_recovers_but_live_owner_is_untouched() {
     printf '%s\n%s\n' "$$" "$start"
     printf 'id=live-slot\nproject=%s\nholder=firstmate-live-slot\n' "$project"
     printf 'home=%s\n' "$(cd "$HOME_DIR" && pwd -P)"
-    printf 'kind=ship\nmode=direct\nyolo=off\ngeneration_id=live\ntasktmp=/tmp/fm-live-slot-live\nworktree=\n'
+    printf 'kind=ship\nmode=direct\nyolo=off\ngeneration_id=live\ntasktmp=/tmp/fm-live-slot-live\n'
+    printf 'tasktmp_phase=not-created\nbackend=tmux\nendpoint_phase=not-created\nworktree=\n'
   } > "$live_record"
   touch -t 202001010000 "$live_record"
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
@@ -294,7 +309,11 @@ import sys
 state_path, defect = sys.argv[1:]
 with open(state_path, encoding="utf-8") as stream:
     state = json.load(stream)
-state["worktrees"][0]["lease_holder" if defect == "holder" else "path"] = None
+entry = state["worktrees"][0]
+entry["leased"] = False
+entry["lease_holder"] = "unexpected-holder" if defect == "holder" else None
+if defect == "path":
+    entry["path"] = None
 with open(state_path, "w", encoding="utf-8") as stream:
     json.dump(state, stream)
 PY
@@ -308,6 +327,116 @@ PY
     rm -f "$record"
   done
   pass "malformed Treehouse holders and paths retain acquisition authority visibly"
+}
+
+test_destroying_treehouse_entry_retains_acquisition_authority() {
+  local fixture project worktree record out rc log id=destroying-entry
+  reset_logs
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  git -C "$project" worktree remove --force "$worktree"
+  python3 - "$(dirname "$(dirname "$worktree")")/treehouse-state.json" <<'PY'
+import json
+import sys
+
+state_path = sys.argv[1]
+with open(state_path, encoding="utf-8") as stream:
+    state = json.load(stream)
+entry = state["worktrees"][0]
+entry["leased"] = False
+entry["lease_holder"] = None
+entry["destroying"] = True
+with open(state_path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "destroying Treehouse entry maintenance"
+  assert_contains "$out" "lease absence could not be proven" "destroying entry diagnostic"
+  [ -f "$record" ] || fail "destroying Treehouse entry removed acquisition authority"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "destroying Treehouse entry invoked teardown"
+  log=$(cat "$HOME_DIR/state/.auto-reap.log")
+  assert_contains "$log" "retained owner-dead acquisition $id" "destroying entry retention log"
+  rm -f "$record"
+  pass "transitional Treehouse destruction never proves lease absence"
+}
+
+test_ambiguous_endpoint_phase_retains_acquisition_authority() {
+  local fixture project worktree record out rc id=ambiguous-endpoint
+  reset_logs
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct creating herdr
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 1 "$rc" "ambiguous endpoint maintenance"
+  assert_contains "$out" "endpoint creation phase is ambiguous" "ambiguous endpoint diagnostic"
+  [ -f "$record" ] || fail "ambiguous endpoint phase removed acquisition authority"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "ambiguous endpoint phase invented cleanup metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "ambiguous endpoint phase invoked teardown"
+  rm -f "$record"
+  pass "an interrupted endpoint creation remains fail-closed for exact reconciliation"
+}
+
+test_created_herdr_endpoint_identity_is_preserved_for_teardown() {
+  local fixture project worktree record tmp out rc id=created-herdr
+  reset_logs
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct created herdr
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  tmp=$(mktemp "$HOME_DIR/state/.created-herdr.XXXXXX")
+  awk '!/^(window|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id)=/' "$record" > "$tmp"
+  printf '%s\n' \
+    'window=lab-session:pane-41' \
+    'herdr_session=lab-session' \
+    'herdr_workspace_id=workspace-41' \
+    'herdr_tab_id=tab-41' \
+    'herdr_pane_id=pane-41' >> "$tmp"
+  mv "$tmp" "$record"
+  touch -t 202001010000 "$record"
+  FM_FAKE_TEARDOWN_ASSERT_HERDR=1
+  export FM_FAKE_TEARDOWN_ASSERT_HERDR
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "created Herdr endpoint recovery"
+  assert_contains "$out" "auto-reaped $id" "created Herdr endpoint was not delegated to teardown"
+  [ ! -e "$record" ] || fail "created Herdr endpoint record survived successful teardown"
+  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" "created Herdr endpoint did not invoke teardown"
+  pass "a post-launch crash retains exact Herdr endpoint identity for quiescence"
+}
+
+test_pre_tasktmp_crash_reaps_with_real_teardown() {
+  local fixture project worktree record out rc id=pre-tasktmp realbin treehouse_state treehouse_log
+  reset_logs
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct not-created tmux not-created
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  realbin="$TMP/pre-tasktmp-bin"
+  treehouse_state="$(dirname "$(dirname "$worktree")")/treehouse-state.json"
+  treehouse_log="$TMP/pre-tasktmp-treehouse.log"
+  mkdir -p "$realbin"
+  ln "$ROOT/tests/fixtures/treehouse-return-fixture.sh" "$realbin/treehouse"
+  unset FM_AUTO_REAP_TEARDOWN_BIN
+  out=$(PATH="$realbin:$PATH" \
+    FM_AUTO_REAP_E2E_WORKTREE="$worktree" \
+    FM_AUTO_REAP_E2E_PROJECT="$project" \
+    FM_AUTO_REAP_E2E_TREEHOUSE_STATE="$treehouse_state" \
+    FM_AUTO_REAP_E2E_TREEHOUSE_LOG="$treehouse_log" \
+    FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  export FM_AUTO_REAP_TEARDOWN_BIN="$FAKEBIN/fm-teardown.sh"
+  expect_code 0 "$rc" "pre-tasktmp real teardown recovery"
+  assert_contains "$out" "auto-reaped $id" "pre-tasktmp crash did not complete real teardown"
+  [ ! -e "$record" ] || fail "pre-tasktmp acquisition record became a permanent zombie"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "pre-tasktmp recovery retained synthetic metadata"
+  [ ! -e "$worktree" ] || fail "pre-tasktmp recovery retained the returned worktree"
+  assert_contains "$(cat "$treehouse_log")" "returned $worktree" "pre-tasktmp recovery did not return the exact lease"
+  pass "a pre-tasktmp crash completes ordinary teardown without synthetic owner state"
 }
 
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
@@ -408,6 +537,10 @@ test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown
 test_unregistered_treehouse_lease_retains_acquisition_authority
 test_malformed_treehouse_leases_retain_acquisition_authority
+test_destroying_treehouse_entry_retains_acquisition_authority
+test_ambiguous_endpoint_phase_retains_acquisition_authority
+test_created_herdr_endpoint_identity_is_preserved_for_teardown
+test_pre_tasktmp_crash_reaps_with_real_teardown
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap
 test_local_merge_immediately_auto_reaps
 

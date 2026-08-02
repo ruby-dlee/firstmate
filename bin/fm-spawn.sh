@@ -1075,6 +1075,8 @@ WORKTREE_RETAIN_ON_ABORT=0
 WORKTREE_EXPECTED_TIP=
 WORKTREE_ACQUIRE_RECORD=
 WORKTREE_ACQUIRE_OWNER_START=
+WORKTREE_ACQUIRE_ENDPOINT_PHASE=not-created
+WORKTREE_ACQUIRE_TASKTMP_PHASE=not-created
 META_INSTALLED=0
 META_BACKUP=
 EXISTING_ARTIFACT_BACKUP=
@@ -1284,6 +1286,7 @@ persist_failed_account_rollback() {
       echo "mode=${MODE:-no-mistakes}"
       echo "yolo=${YOLO:-off}"
       echo "tasktmp=${TASK_TMP:-}"
+      echo "tasktmp_phase=${WORKTREE_ACQUIRE_TASKTMP_PHASE:-not-created}"
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
       echo "generation_id=${SPAWN_GENERATION_ID:-account:$ACCOUNT_TASK:${ACCOUNT_ATTEMPT:-legacy}}"
@@ -1368,6 +1371,7 @@ persist_failed_direct_recovery() {
     echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
     echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
     echo "tasktmp=${TASK_TMP:-${RECORDED_TASKTMP:-}}"
+    echo "tasktmp_phase=${WORKTREE_ACQUIRE_TASKTMP_PHASE:-not-created}"
     echo "model=${RECORDED_MODEL:-${MODEL:-default}}"
     echo "effort=${RECORDED_EFFORT:-${EFFORT:-default}}"
     echo "generation_id=${RECORDED_GENERATION:-${SPAWN_GENERATION_ID:-}}"
@@ -1457,6 +1461,7 @@ persist_failed_direct_spawn() {  # <endpoint-created:0|1>
       echo "mode=$retained_mode"
       echo "yolo=$retained_yolo"
       echo "tasktmp=${TASK_TMP:-}"
+      echo "tasktmp_phase=${WORKTREE_ACQUIRE_TASKTMP_PHASE:-not-created}"
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
       echo "generation_id=${SPAWN_GENERATION_ID:-}"
@@ -1550,7 +1555,8 @@ create_worktree_acquisition_record() {
     printf 'holder=firstmate-%s\n' "$ID"
     printf 'home=%s\n' "$home_real"
     printf 'kind=%s\nmode=%s\nyolo=%s\n' "$KIND" "$MODE" "$YOLO"
-    printf 'generation_id=%s\ntasktmp=%s\nworktree=\n' "$SPAWN_GENERATION_ID" "$TASK_TMP"
+    printf 'generation_id=%s\ntasktmp=%s\ntasktmp_phase=not-created\n' "$SPAWN_GENERATION_ID" "$TASK_TMP"
+    printf 'backend=%s\nendpoint_phase=not-created\nworktree=\n' "$BACKEND"
   } > "$tmp" || {
     rm -f "$tmp"
     return 1
@@ -1580,6 +1586,61 @@ record_acquired_worktree() {
       rm -f "$tmp"
       return 1
   fi
+}
+
+persist_worktree_acquisition_phases() {
+  local tmp
+  [ -n "$WORKTREE_ACQUIRE_RECORD" ] || return 0
+  [ "$(sed -n '1p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$$" ] \
+    && [ "$(sed -n '2p' "$WORKTREE_ACQUIRE_RECORD" 2>/dev/null)" = "$WORKTREE_ACQUIRE_OWNER_START" ] || {
+    echo "error: Treehouse acquisition ownership changed for $ID" >&2
+    return 1
+  }
+  case "$WORKTREE_ACQUIRE_ENDPOINT_PHASE" in not-created|creating|created) ;; *) return 1 ;; esac
+  case "$WORKTREE_ACQUIRE_TASKTMP_PHASE" in not-created|created) ;; *) return 1 ;; esac
+  if [ "$WORKTREE_ACQUIRE_ENDPOINT_PHASE" = created ]; then
+    case "$BACKEND" in tmux|herdr|zellij|cmux) ;; *) return 1 ;; esac
+  fi
+  tmp=$(mktemp "$STATE/.worktree-acquire-$ID.phase.XXXXXX") || return 1
+  if ! awk '
+    !/^(backend|endpoint_phase|tasktmp_phase|window|tmux_window_id|tmux_session_target|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|cmux_workspace_id|cmux_surface_id)=/
+  ' "$WORKTREE_ACQUIRE_RECORD" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  {
+    printf 'backend=%s\n' "$BACKEND"
+    printf 'endpoint_phase=%s\n' "$WORKTREE_ACQUIRE_ENDPOINT_PHASE"
+    printf 'tasktmp_phase=%s\n' "$WORKTREE_ACQUIRE_TASKTMP_PHASE"
+    if [ "$WORKTREE_ACQUIRE_ENDPOINT_PHASE" = created ]; then
+      printf 'window=%s\n' "$T"
+      case "$BACKEND" in
+        tmux)
+          printf 'tmux_window_id=%s\n' "$WID"
+          printf 'tmux_session_target=%s\n' "$T"
+          ;;
+        herdr)
+          printf 'herdr_session=%s\n' "$HERDR_SES"
+          printf 'herdr_workspace_id=%s\n' "$HERDR_WORKSPACE_ID"
+          printf 'herdr_tab_id=%s\n' "$HERDR_TAB_ID"
+          printf 'herdr_pane_id=%s\n' "$HERDR_PANE_ID"
+          ;;
+        zellij)
+          printf 'zellij_session=%s\n' "$ZELLIJ_SES"
+          printf 'zellij_tab_id=%s\n' "$ZELLIJ_TAB_ID"
+          printf 'zellij_pane_id=%s\n' "$ZELLIJ_PANE_ID"
+          ;;
+        cmux)
+          printf 'cmux_workspace_id=%s\n' "$CMUX_WORKSPACE_ID"
+          printf 'cmux_surface_id=%s\n' "$CMUX_SURFACE_ID"
+          ;;
+      esac
+    fi
+  } >> "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$WORKTREE_ACQUIRE_RECORD" || { rm -f "$tmp"; return 1; }
 }
 
 clear_worktree_acquisition_record() {
@@ -3233,6 +3294,11 @@ else
   fm_tasktmp_create "$STATE" "$FM_HOME" "$ID" "$SPAWN_GENERATION_ID" "$TASK_TMP" \
     || { echo "error: cannot create exact owned task temp root for $ID" >&2; exit 1; }
 fi
+WORKTREE_ACQUIRE_TASKTMP_PHASE=created
+persist_worktree_acquisition_phases || {
+  echo "error: cannot durably record task temp creation for $ID" >&2
+  exit 1
+}
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
 # the pane shell just before the launch line, further down. CREW_PATH rides the same
 # two channels for the same reason.
@@ -3523,9 +3589,13 @@ case "$BACKEND" in
     # WT_TARGET carries that stable id for spawn-time commands below; the
     # persisted window= handle stays $T (the name form), which is safe now that
     # rename is disabled.
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=creating
+    persist_worktree_acquisition_phases || exit 1
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_CWD") || exit 1
     ENDPOINT_CREATED=1
     WT_TARGET="$WID"
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=created
+    persist_worktree_acquisition_phases || exit 1
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -3566,6 +3636,8 @@ case "$BACKEND" in
     # effort flags, "$(cat <brief>)") stay byte-identical across backends and the
     # Agent Fleet enforced-mode command is preserved verbatim. What goes away is
     # typing that command into a composer and hoping it submits.
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=creating
+    persist_worktree_acquisition_phases || exit 1
     FM_BACKEND_HERDR_AGENT_ENV=(${HERDR_AGENT_ENV[@]+"${HERDR_AGENT_ENV[@]}"})
     HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_CWD" "$HERDR_SEEDED_DEFAULT_TAB_ID" \
       /bin/bash -lc "$LAUNCH") || exit 1
@@ -3578,9 +3650,13 @@ EOF
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
     ENDPOINT_CREATED=1
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=created
+    persist_worktree_acquisition_phases || exit 1
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=creating
+    persist_worktree_acquisition_phases || exit 1
     ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_CWD") || exit 1
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
@@ -3591,9 +3667,13 @@ EOF
     fi
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
     ENDPOINT_CREATED=1
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=created
+    persist_worktree_acquisition_phases || exit 1
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=creating
+    persist_worktree_acquisition_phases || exit 1
     CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_CWD") || exit 1
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
@@ -3604,6 +3684,8 @@ EOF
     fi
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
     ENDPOINT_CREATED=1
+    WORKTREE_ACQUIRE_ENDPOINT_PHASE=created
+    persist_worktree_acquisition_phases || exit 1
     ;;
   orca)
     if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -3791,6 +3873,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "mode=$MODE"
   echo "yolo=$YOLO"
   echo "tasktmp=$TASK_TMP"
+  echo "tasktmp_phase=$WORKTREE_ACQUIRE_TASKTMP_PHASE"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"

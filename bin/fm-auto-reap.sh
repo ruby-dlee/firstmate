@@ -275,7 +275,9 @@ path_age() {
 
 recover_acquisition() {  # <record>
   local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status
-  local recorded_home home_real generation tasktmp tasktmp_owner
+  local recorded_home home_real generation tasktmp tasktmp_owner tasktmp_phase endpoint_phase backend endpoint_window
+  local tmux_window_id tmux_session_target herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id
+  local zellij_session zellij_tab_id zellij_pane_id cmux_workspace_id cmux_surface_id
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
   [ "$(path_age "$record")" -ge "$AUTO_REAP_STALE_SECS" ] || return 0
   AUTO_REAP_ID=${record##*/.worktree-acquire-}
@@ -334,6 +336,64 @@ recover_acquisition() {  # <record>
     refuse "stale acquisition task temp path does not match its exact generation"
     return 0
   }
+  tasktmp_phase=$(single_meta_value "$record" tasktmp_phase) || {
+    refuse "stale acquisition record has missing or malformed task temp phase"
+    return 0
+  }
+  case "$tasktmp_phase" in
+    not-created|created) ;;
+    *) refuse "stale acquisition record has invalid task temp phase"; return 0 ;;
+  esac
+  endpoint_phase=$(single_meta_value "$record" endpoint_phase) || {
+    refuse "stale acquisition record has missing or malformed endpoint phase"
+    return 0
+  }
+  case "$endpoint_phase" in
+    not-created|creating|created) ;;
+    *) refuse "stale acquisition record has invalid endpoint phase"; return 0 ;;
+  esac
+  backend=$(single_meta_value "$record" backend) || {
+    refuse "stale acquisition record has missing or malformed backend"
+    return 0
+  }
+  case "$backend" in tmux|herdr|zellij|cmux) ;; *) refuse "stale acquisition record has unsupported backend"; return 0 ;; esac
+  if [ "$endpoint_phase" = not-created ]; then
+    if grep -Eq '^(window|tmux_window_id|tmux_session_target|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|cmux_workspace_id|cmux_surface_id)=.+' "$record"; then
+      refuse "never-created endpoint phase contains endpoint identity"
+      return 0
+    fi
+    endpoint_window=
+  elif [ "$endpoint_phase" = created ]; then
+    endpoint_window=$(single_meta_value "$record" window) || {
+      refuse "created endpoint phase has no exact window identity"
+      return 0
+    }
+    case "$backend" in
+      tmux)
+        tmux_window_id=$(single_meta_value "$record" tmux_window_id) || { refuse "created tmux endpoint has no stable window id"; return 0; }
+        tmux_session_target=$(single_meta_value "$record" tmux_session_target) || { refuse "created tmux endpoint has no scoped session target"; return 0; }
+        [ "$endpoint_window" = "$tmux_session_target" ] || { refuse "created tmux endpoint identities disagree"; return 0; }
+        ;;
+      herdr)
+        herdr_session=$(single_meta_value "$record" herdr_session) || { refuse "created Herdr endpoint has no session identity"; return 0; }
+        herdr_workspace_id=$(single_meta_value "$record" herdr_workspace_id) || { refuse "created Herdr endpoint has no workspace identity"; return 0; }
+        herdr_tab_id=$(single_meta_value "$record" herdr_tab_id) || { refuse "created Herdr endpoint has no tab identity"; return 0; }
+        herdr_pane_id=$(single_meta_value "$record" herdr_pane_id) || { refuse "created Herdr endpoint has no pane identity"; return 0; }
+        [ "$endpoint_window" = "$herdr_session:$herdr_pane_id" ] || { refuse "created Herdr endpoint identities disagree"; return 0; }
+        ;;
+      zellij)
+        zellij_session=$(single_meta_value "$record" zellij_session) || { refuse "created Zellij endpoint has no session identity"; return 0; }
+        zellij_tab_id=$(single_meta_value "$record" zellij_tab_id) || { refuse "created Zellij endpoint has no tab identity"; return 0; }
+        zellij_pane_id=$(single_meta_value "$record" zellij_pane_id) || { refuse "created Zellij endpoint has no pane identity"; return 0; }
+        [ "$endpoint_window" = "$zellij_session:$zellij_pane_id" ] || { refuse "created Zellij endpoint identities disagree"; return 0; }
+        ;;
+      cmux)
+        cmux_workspace_id=$(single_meta_value "$record" cmux_workspace_id) || { refuse "created cmux endpoint has no workspace identity"; return 0; }
+        cmux_surface_id=$(single_meta_value "$record" cmux_surface_id) || { refuse "created cmux endpoint has no surface identity"; return 0; }
+        [ "$endpoint_window" = "$cmux_workspace_id:$cmux_surface_id" ] || { refuse "created cmux endpoint identities disagree"; return 0; }
+        ;;
+    esac
+  fi
   snapshot=$(cat "$record") || return 0
   lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$id") || {
     refuse "could not serialize stale acquisition recovery"
@@ -347,6 +407,32 @@ recover_acquisition() {  # <record>
   if [ -e "$STATE/$id.meta" ] || [ -L "$STATE/$id.meta" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     refuse "task metadata exists; retained stale acquisition for operator reconciliation"
+    return 0
+  fi
+  if [ "$endpoint_phase" = creating ]; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "endpoint creation phase is ambiguous; retained stale acquisition for exact endpoint reconciliation"
+    return 0
+  fi
+  tasktmp_owner=$(fm_tasktmp_owner_record "$STATE" "$id" "$generation") || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "stale acquisition task temp ownership record is malformed"
+    return 0
+  }
+  if [ "$tasktmp_phase" = not-created ]; then
+    if [ -e "$tasktmp_owner" ] || [ -L "$tasktmp_owner" ] || [ -e "$tasktmp" ] || [ -L "$tasktmp" ]; then
+      fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      refuse "not-created task temp phase has ownership artifacts; retained stale acquisition"
+      return 0
+    fi
+  elif ! fm_tasktmp_owner_validate "$tasktmp_owner" "$FM_HOME" "$id" "$generation" "$tasktmp"; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "created task temp phase has no exact authoritative owner record; retained stale acquisition"
+    return 0
+  elif { [ -e "$tasktmp" ] || [ -L "$tasktmp" ]; } \
+    && ! fm_tasktmp_owner_validate "$tasktmp/.fm-tasktmp-owner" "$FM_HOME" "$id" "$generation" "$tasktmp"; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "created task temp phase has no exact root proof; retained stale acquisition"
     return 0
   fi
   recorded_worktree=$(sed -n 's/^worktree=//p' "$record" | tail -1)
@@ -369,21 +455,12 @@ recover_acquisition() {  # <record>
         absence_status=$?
       fi
       if [ "$absence_status" -eq 0 ]; then
-        tasktmp_owner=$(fm_tasktmp_owner_record "$STATE" "$id" "$generation") || {
-          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-          refuse "stale acquisition task temp ownership record is malformed"
-          return 0
-        }
-        if [ -e "$tasktmp_owner" ] || [ -L "$tasktmp_owner" ]; then
+        if [ "$tasktmp_phase" = created ]; then
           fm_tasktmp_remove_owned "$STATE" "$FM_HOME" "$id" "$generation" "$tasktmp" || {
             fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
             refuse "Treehouse lease is absent but task temp ownership is forged or ambiguous; retained stale acquisition"
             return 0
           }
-        elif [ -e "$tasktmp" ] || [ -L "$tasktmp" ]; then
-          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-          refuse "Treehouse lease is absent but task temp root has no authoritative ownership record; retained stale acquisition"
-          return 0
         fi
         rm -f "$record"
         fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
@@ -412,15 +489,34 @@ recover_acquisition() {  # <record>
     return 0
   }
   {
-    printf 'window=\n'
+    printf 'window=%s\n' "$endpoint_window"
     printf 'worktree=%s\n' "$worktree"
     printf 'project=%s\n' "$project"
     printf 'harness=unknown\nkind=ship\n'
     printf 'mode=%s\n' "$(single_meta_value "$record" mode 2>/dev/null || printf no-mistakes)"
     printf 'yolo=%s\n' "$(single_meta_value "$record" yolo 2>/dev/null || printf off)"
-    printf 'tasktmp=%s\nmodel=default\neffort=default\n' "$tasktmp"
+    printf 'tasktmp=%s\ntasktmp_phase=%s\nmodel=default\neffort=default\n' "$tasktmp" "$tasktmp_phase"
     printf 'generation_id=%s\n' "$generation"
-    printf 'direct_spawn_endpoint=not-created\n'
+    printf 'backend=%s\n' "$backend"
+    if [ "$endpoint_phase" = not-created ]; then
+      printf 'direct_spawn_endpoint=not-created\n'
+    else
+      case "$backend" in
+        tmux)
+          printf 'tmux_window_id=%s\ntmux_session_target=%s\n' "$tmux_window_id" "$tmux_session_target"
+          ;;
+        herdr)
+          printf 'herdr_session=%s\nherdr_workspace_id=%s\n' "$herdr_session" "$herdr_workspace_id"
+          printf 'herdr_tab_id=%s\nherdr_pane_id=%s\n' "$herdr_tab_id" "$herdr_pane_id"
+          ;;
+        zellij)
+          printf 'zellij_session=%s\nzellij_tab_id=%s\nzellij_pane_id=%s\n' "$zellij_session" "$zellij_tab_id" "$zellij_pane_id"
+          ;;
+        cmux)
+          printf 'cmux_workspace_id=%s\ncmux_surface_id=%s\n' "$cmux_workspace_id" "$cmux_surface_id"
+          ;;
+      esac
+    fi
     printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n'
   } > "$tmp"
   mv "$tmp" "$STATE/$id.meta" || {

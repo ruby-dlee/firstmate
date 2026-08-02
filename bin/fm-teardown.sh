@@ -259,6 +259,21 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-generation temp root.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_GENERATION=$(fm_meta_get "$META" generation_id)
+TASK_TMP_PHASE=$(fm_meta_get "$META" tasktmp_phase)
+case "$TASK_TMP_PHASE" in
+  '') ;;
+  created)
+    [ -n "$TASK_TMP" ] || { echo "error: created task temp phase has no task temp path for $ID" >&2; exit 1; }
+    ;;
+  not-created)
+    [ -n "$TASK_TMP" ] \
+      && [ "$(fm_tasktmp_path "$ID" "$TASK_GENERATION" 2>/dev/null || true)" = "$TASK_TMP" ] || {
+      echo "error: not-created task temp phase is not bound to the exact task generation for $ID" >&2
+      exit 1
+    }
+    ;;
+  *) echo "error: invalid task temp phase for $ID" >&2; exit 1 ;;
+esac
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
@@ -2386,6 +2401,13 @@ safe_remove_task_tmp() {
   local target=$1 base owner_record
   [ -n "$target" ] || return 0
   owner_record=$(fm_tasktmp_owner_record "$STATE" "$ID" "$TASK_GENERATION") || return 1
+  if [ "$TASK_TMP_PHASE" = not-created ]; then
+    if [ -e "$owner_record" ] || [ -L "$owner_record" ] || [ -e "$target" ] || [ -L "$target" ]; then
+      echo "REFUSED: not-created task temp phase has ownership artifacts for $ID: $target" >&2
+      return 1
+    fi
+    return 0
+  fi
   if ! fm_tasktmp_owner_validate "$owner_record" "$FM_HOME" "$ID" "$TASK_GENERATION" "$target"; then
     echo "REFUSED: task temp ownership is missing, malformed, or ambiguous for $ID: $target" >&2
     return 1

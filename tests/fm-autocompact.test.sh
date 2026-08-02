@@ -564,7 +564,7 @@ EOF
   wait "$older_pid"
 
   anchor="$home/data/autocompact-resume.md"
-  assert_grep 'Session: `session-newer`' "$anchor" "older worker replaced the newer deterministic anchor"
+  assert_grep "Session: \`session-newer\`" "$anchor" "older worker replaced the newer deterministic anchor"
   assert_grep 'Judgment capture: FAILED' "$anchor" "older worker marked the newer failed anchor complete"
   assert_not_contains "$(cat "$anchor")" 'Judgment capture: COMPLETE' "older worker upgraded a newer failed anchor"
   pass "an older worker cannot mark a newer failed anchor complete"
@@ -600,7 +600,7 @@ time.sleep(30)
   capture "$root" "$home" manual
 
   anchor="$home/data/autocompact-resume.md"
-  assert_grep 'Session: `session-manual`' "$anchor" "capture after a killed lock holder did not publish a fresh anchor"
+  assert_grep "Session: \`session-manual\`" "$anchor" "capture after a killed lock holder did not publish a fresh anchor"
   assert_grep '# after-killed-lock' "$anchor" "capture after a killed lock holder retained stale deterministic state"
   assert_grep 'Judgment capture: FAILED - judgment capture was disabled' "$anchor" "capture after a killed lock holder claimed dishonest judgment status"
   pass "a killed coordination holder cannot block the next deterministic anchor"

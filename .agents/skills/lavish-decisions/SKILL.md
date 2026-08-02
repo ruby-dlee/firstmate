@@ -2,7 +2,7 @@
 name: lavish-decisions
 description: >-
   Agent-only workflow for creating durable captain-facing Lavish decisions.
-  Use before creating, repairing, or presenting a multi-option captain choice; route it to the durable file protocol, never a browser, form, server, or poll.
+  Use before creating, repairing, or presenting a multi-option captain choice; route it through the durable file protocol and sanctioned board surface, never a hand-authored page, built-in question tool, shared server, or poll.
   Do not use it for read-only reports or simple yes/no questions.
 user-invocable: false
 metadata:
@@ -27,6 +27,7 @@ Use the firstmate-owned `lavish-axi` file protocol documented in `tools/lavish/R
 5. Run `lavish-axi create` with a stable decision id, title, Markdown request, question JSON, and destination, and retain its emitted `Run:` line.
 6. From firstmate's environment, run `lavish show <id>` and `lavish inbox` to verify the exact durable request.
 7. Run `bin/fm-lavish-board.sh <decision-id> --home <absolute-home>` from the active firstmate checkout.
+   Only a successful exit authorizes reporting the board open because the helper checks its answering machinery before it arms pickup or opens Chrome.
    Tell the captain that the board is open in a separate Chrome window:
 
    ```text
@@ -62,6 +63,7 @@ Its `board` command writes one self-contained HTML file and exits, just as its o
 Do not use upstream `serve`, `poll`, layout-audit, or session-lifecycle commands.
 
 Firstmate may show that file through `bin/fm-lavish-board.sh`, which owns the separate named Chrome session and the task-neutral check integrated with Firstmate's existing watcher.
+Only that helper arms the pickup path; a hand-authored page is not a fallback because its answers cannot reach firstmate.
 That browser glue must never attach to the captain's main Chrome profile or expose a shared board server or session URL.
 If `lavish answer` reports `answer saved; wake not queued`, do not ask the captain to answer again.
 The next ordinary intake scan recovers the durable unreceipted answer.

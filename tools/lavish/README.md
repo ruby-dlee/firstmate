@@ -37,8 +37,10 @@ The done screen also exposes the complete formatted JSON in a read-only selectab
 None of these transports writes an answer until `lavish-axi collect` validates the payload.
 
 `bin/fm-lavish-board.sh` defaults to the shell user's `Downloads` directory and accepts `--downloads <path>` when the browser uses a different one.
+Before it opens Chrome or arms the pickup check, the helper refuses rendered HTML that lacks radio choices, per-option and per-question annotations, or a submit path that emits the schema-version-2 JSON payload.
 Its one-shot check copies a fresh matching download into the Firstmate home's durable state directory before attempting the live-page marker read.
 It never uses `localStorage`, which is not a reliable transport for `file://` boards.
+A hand-authored HTML page cannot arm this pickup path, so it cannot serve as an alternate decision route.
 
 Every command accepts `--home <path>`.
 A captain command run from a shell that does not export `FM_HOME` must include that option, while `bin/fm-lavish-board.sh` resolves its Firstmate home and supplies the option itself.

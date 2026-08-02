@@ -27,7 +27,29 @@ while [ "$#" -gt 0 ]; do
     *) exit 2 ;;
   esac
 done
-printf '<!doctype html><title>Lavish board</title>\n' > "$output"
+if [ "${FM_TEST_DEGRADED_BOARD:-0}" = 1 ]; then
+  printf '<!doctype html><title>Read-only Lavish page</title>\n' > "$output"
+  exit 0
+fi
+cat > "$output" <<'HTML'
+<!doctype html>
+<title>Lavish board</title>
+<section class="question card">
+  <input type="radio" name="choice" value="a">
+  <textarea data-option-comment></textarea>
+  <textarea data-question-note></textarea>
+</section>
+<button id="submit-button" type="button">Submit</button>
+<script>
+function buildPayload() { return { schema_version: 2 }; }
+document.querySelector('#submit-button').addEventListener('click', () => {
+  const payload = buildPayload();
+  const payloadJson = JSON.stringify(payload);
+  const blob = new Blob([payloadJson]);
+  window.__lavishPayload = payload;
+});
+</script>
+HTML
 SH
 
 cat > "$FAKEBIN/chrome-devtools-axi" <<'SH'
@@ -80,6 +102,7 @@ run_board() {
     CHROME_DEVTOOLS_AXI_PORT=9222 \
     CHROME_DEVTOOLS_AXI_USER_DATA_DIR=/captain/main/profile \
     CHROME_DEVTOOLS_AXI_WS_HEADERS=secret \
+    FM_TEST_DEGRADED_BOARD=${FM_TEST_DEGRADED_BOARD:-0} \
     FM_LAVISH_BIN="$FAKEBIN/lavish" \
     PATH="$FAKEBIN:$PATH" \
     "$BOARD" example --home "$HOME_PATH" --downloads "$DOWNLOADS_PATH"
@@ -161,6 +184,29 @@ test_check_is_silent_until_marker_then_prints_once() {
   pass "Lavish board check stays silent without the marker and emits one durable wake line with it"
 }
 
+test_unanswerable_board_refuses_before_pickup_or_open() {
+  local html check output result
+  html="$HOME_PATH/state/lavish-board-example.html"
+  check="$HOME_PATH/state/lavish-board-example.check.sh"
+  rm -f "$html" "$check"
+  : > "$LOG"
+
+  set +e
+  output=$(FM_TEST_DEGRADED_BOARD=1 run_board 2>&1)
+  result=$?
+  set -e
+  [ "$result" -eq 2 ] || fail "unanswerable board returned $result instead of refusing"
+  assert_contains "$output" 'refusing to surface an unanswerable board' \
+    "answerability failure was not loud"
+  assert_contains "$output" 'missing radio choices' \
+    "answerability failure did not identify the missing machinery"
+  assert_absent "$html" "unanswerable HTML remained available to surface"
+  assert_absent "$check" "unanswerable board armed a pickup check"
+  assert_no_grep 'chrome:' "$LOG" "unanswerable board reached Chrome"
+  pass "fm-lavish-board refuses a read-only page before pickup or browser surfacing"
+}
+
 test_launcher_isolates_chrome_and_arms_check
 test_download_survives_closed_page_and_precedes_live_read
 test_check_is_silent_until_marker_then_prints_once
+test_unanswerable_board_refuses_before_pickup_or_open

@@ -279,6 +279,19 @@ capture_anchor() {
   generated=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
     || capture_failed 'could not read the clock'
 
+  if [ -L "$DATA" ] || { [ -e "$DATA" ] && [ ! -d "$DATA" ]; }; then
+    capture_failed "unsafe data directory at $DATA"
+  fi
+  mkdir -p "$DATA" || capture_failed "could not create data directory at $DATA"
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] \
+    || capture_failed "unsafe data directory at $DATA"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only \
+      || capture_failed 'could not reconcile a pending durable-memory transaction'
+  elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
+    capture_failed 'python3 is unavailable and a durable-memory transaction needs recovery'
+  fi
+
   if command -v jq >/dev/null 2>&1; then
     snapshot=$(
       FM_ROOT_OVERRIDE="$FM_ROOT" \
@@ -301,12 +314,6 @@ capture_anchor() {
       || capture_failed 'could not report the limited capture'
   fi
 
-  if [ -L "$DATA" ] || { [ -e "$DATA" ] && [ ! -d "$DATA" ]; }; then
-    capture_failed "unsafe data directory at $DATA"
-  fi
-  mkdir -p "$DATA" || capture_failed "could not create data directory at $DATA"
-  [ -d "$DATA" ] && [ ! -L "$DATA" ] \
-    || capture_failed "unsafe data directory at $DATA"
   if [ -L "$ANCHOR" ] || { [ -e "$ANCHOR" ] && [ ! -f "$ANCHOR" ]; }; then
     capture_failed "unsafe resume anchor at $ANCHOR"
   fi
@@ -386,6 +393,15 @@ capture_anchor() {
 
 recover_context() {
   local digest digest_rc
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
+      printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY FAILED: a pending durable-memory transaction could not be reconciled, so no potentially partial memory state will be presented.'
+      return 1
+    fi
+  elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT RECOVERY FAILED: python3 is unavailable and a durable-memory transaction needs recovery, so no potentially partial memory state will be presented.'
+    return 1
+  fi
   digest=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \

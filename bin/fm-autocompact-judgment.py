@@ -3,7 +3,7 @@
 
 The worker extracts human-visible conversation from Claude's transcript, asks
 an isolated tool-free Claude process for exact inspect-then-update edits, and
-publishes validated changes with compare-before-replace semantics.
+publishes validated changes with crash-recoverable transaction semantics.
 
 It never writes project worktrees or tracked Firstmate files.
 Its only writable destinations are data/captain.md, data/learnings.md, and
@@ -24,6 +24,12 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from fm_data_transaction import (
+    TransactionError,
+    publish_transaction,
+    recover_pending_transaction,
+)
 
 
 ALLOWED_TARGETS = ("captain.md", "learnings.md", "backlog.md")
@@ -427,87 +433,12 @@ def publish_changes(
     snapshots: dict[str, tuple[bool, str]],
     changes: dict[str, str],
 ) -> None:
-    if not changes:
-        return
-    for name in changes:
-        present, content = snapshots[name]
-        if not current_bytes_match(data / name, present, content):
-            raise CaptureError(
-                f"{name} changed while judgment capture was running", EXIT_CONCURRENT
-            )
-
-    staged: dict[str, Path] = {}
-    backups: dict[str, Path | None] = {}
-    published: list[str] = []
     try:
-        for name, content in changes.items():
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".autocompact-judgment-{name}.", dir=data
-            )
-            temp_path = Path(temp_name)
-            staged[name] = temp_path
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-
-            target = data / name
-            if snapshots[name][0]:
-                backup_fd, backup_name = tempfile.mkstemp(
-                    prefix=f".autocompact-judgment-backup-{name}.", dir=data
-                )
-                os.close(backup_fd)
-                backup_path = Path(backup_name)
-                shutil.copyfile(target, backup_path, follow_symlinks=False)
-                with backup_path.open("rb") as backup_stream:
-                    os.fsync(backup_stream.fileno())
-                backups[name] = backup_path
-            else:
-                backups[name] = None
-
-        for name in changes:
-            present, content = snapshots[name]
-            if not current_bytes_match(data / name, present, content):
-                raise CaptureError(
-                    f"{name} changed before atomic publication", EXIT_CONCURRENT
-                )
-        fail_after = os.environ.get("FM_AUTOCOMPACT_TEST_FAIL_PUBLISH_AFTER")
-        for name, temp_path in staged.items():
-            if fail_after is not None and len(published) >= int(fail_after):
-                raise OSError("injected publication failure")
-            os.replace(temp_path, data / name)
-            published.append(name)
-        directory_fd = os.open(data, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except CaptureError:
-        raise
-    except OSError as exc:
-        rollback_error: OSError | None = None
-        for name in reversed(published):
-            try:
-                backup = backups[name]
-                if backup is None:
-                    (data / name).unlink()
-                else:
-                    os.replace(backup, data / name)
-            except OSError as rollback_exc:
-                rollback_error = rollback_exc
-        if rollback_error is not None:
-            raise CaptureError(
-                f"cannot publish or roll back judgment capture: {exc}; {rollback_error}",
-                EXIT_APPLY,
-            ) from rollback_error
-        raise CaptureError(f"cannot publish judgment capture: {exc}", EXIT_APPLY) from exc
-    finally:
-        for temp_path in (*staged.values(), *(path for path in backups.values() if path)):
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+        publish_transaction(data, snapshots, changes, current_bytes_match)
+    except TransactionError as exc:
+        message = str(exc)
+        exit_code = EXIT_CONCURRENT if "changed before" in message else EXIT_APPLY
+        raise CaptureError(message, exit_code) from exc
 
 
 def main() -> int:
@@ -515,6 +446,26 @@ def main() -> int:
     try:
         root = require_safe_directory(Path(args.root), "Firstmate root")
         data = require_safe_directory(Path(args.data), "Firstmate data directory")
+        lock_flags = os.O_CREAT | os.O_RDWR
+        lock_flags |= getattr(os, "O_CLOEXEC", 0)
+        lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+        writer_lock_path = data / ".firstmate-data-write.lock"
+        try:
+            recovery_lock_fd = os.open(writer_lock_path, lock_flags, 0o600)
+        except OSError as exc:
+            raise CaptureError(
+                f"cannot open the shared data-writer lock: {exc}", EXIT_CONCURRENT
+            ) from exc
+        try:
+            if not stat.S_ISREG(os.fstat(recovery_lock_fd).st_mode):
+                raise CaptureError("unsafe shared data-writer lock", EXIT_CONCURRENT)
+            fcntl.flock(recovery_lock_fd, fcntl.LOCK_EX)
+            try:
+                recover_pending_transaction(data)
+            except TransactionError as exc:
+                raise CaptureError(str(exc), EXIT_APPLY) from exc
+        finally:
+            os.close(recovery_lock_fd)
         transcript_segments, transcript_limited = extract_transcript(Path(args.transcript))
 
         snapshots: dict[str, tuple[bool, str]] = {}
@@ -564,9 +515,6 @@ def main() -> int:
         base_payload["conversation"] = segments
 
         lock_path = data / ".autocompact-judgment.lock"
-        lock_flags = os.O_CREAT | os.O_RDWR
-        lock_flags |= getattr(os, "O_CLOEXEC", 0)
-        lock_flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             lock_fd = os.open(lock_path, lock_flags, 0o600)
         except OSError as exc:
@@ -578,7 +526,6 @@ def main() -> int:
                 raise CaptureError("another judgment capture owns the data lock", EXIT_CONCURRENT) from exc
             result = run_worker(args, base_payload)
             changes = validate_and_build(result, snapshots)
-            writer_lock_path = data / ".firstmate-data-write.lock"
             writer_lock_fd = os.open(writer_lock_path, lock_flags, 0o600)
             try:
                 if not stat.S_ISREG(os.fstat(writer_lock_fd).st_mode):

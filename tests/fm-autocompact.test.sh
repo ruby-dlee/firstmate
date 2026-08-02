@@ -377,6 +377,54 @@ EOF
   pass "a partial multi-file publication failure rolls every destination back"
 }
 
+test_killed_publication_is_recovered_before_next_anchor() {
+  local rec root home transcript fake ready capture_pid worker_pid captain_before learnings_before anchor
+  rec=$(new_primary judgment-killed-publication)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  ready="$home/publish-ready"
+  write_transcript "$transcript" 'Remember my UTC preference and the writer-lock learning.'
+  printf '%s\n' '# Captain preferences' > "$home/data/captain.md"
+  printf '%s\n' '# Fleet learnings' > "$home/data/learnings.md"
+  printf '%s\n' '# Backlog' '## In flight' '## Queued' '## Done' > "$home/data/backlog.md"
+  captain_before=$(cat "$home/data/captain.md")
+  learnings_before=$(cat "$home/data/learnings.md")
+  fake=$(fake_judgment_claude "$home/fake-killed-publication" multi)
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-killed\",\"transcript_path\":\"$transcript\"}" \
+    | FM_FAKE_JUDGMENT_MODE=multi \
+      FM_AUTOCOMPACT_TEST_PAUSE_PUBLISH_AFTER=1 \
+      FM_AUTOCOMPACT_TEST_PUBLISH_READY="$ready" \
+      FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1 &
+  capture_pid=$!
+  fm_test_wait_for_file "$ready" "$capture_pid" || fail "publication did not reach the kill point"
+  worker_pid=$(cat "$ready")
+  kill -9 "$worker_pid"
+  wait "$capture_pid"
+
+  assert_grep 'Prefer UTC.' "$home/data/captain.md" "kill fixture did not expose the first destination write"
+  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "kill fixture unexpectedly published the second destination"
+  assert_present "$home/data/.firstmate-data-transaction.json" "killed publication left no recovery journal"
+  anchor="$home/data/autocompact-resume.md"
+  assert_grep 'Judgment capture: FAILED' "$anchor" "killed publication was presented as complete"
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"manual\",\"session_id\":\"session-recovery\",\"transcript_path\":\"$transcript\"}" \
+    | FM_AUTOCOMPACT_JUDGMENT=off \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1
+
+  [ "$(cat "$home/data/captain.md")" = "$captain_before" ] || fail "next capture did not recover captain.md before rendering"
+  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "next capture did not preserve learnings.md"
+  assert_absent "$home/data/.firstmate-data-transaction.json" "recovered transaction journal remained live"
+  pass "a killed multi-file publication is recovered before the next anchor"
+}
+
 test_older_worker_cannot_complete_newer_failed_anchor() {
   local rec root home transcript fake anchor ready release older_pid attempts=0
   rec=$(new_primary anchor-status-race)
@@ -539,6 +587,7 @@ test_judgment_failure_degrades_to_loud_deterministic_anchor
 test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
 test_partial_publication_failure_rolls_back_every_file
+test_killed_publication_is_recovered_before_next_anchor
 test_older_worker_cannot_complete_newer_failed_anchor
 test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles

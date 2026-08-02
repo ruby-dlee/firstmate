@@ -11,18 +11,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fm_data_transaction import TransactionError, recover_pending_transaction
 
-def parse_args() -> tuple[list[Path], list[str]]:
+
+def parse_args() -> tuple[list[Path], list[str], bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", action="append", required=True)
+    parser.add_argument("--recover-only", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
-    if not command:
+    if not command and not args.recover_only:
         parser.error("a command is required after --")
-    return [Path(value) for value in args.data], command
+    return [Path(value) for value in args.data], command, args.recover_only
 
 
 def safe_data_directory(path: Path) -> Path:
@@ -33,7 +36,7 @@ def safe_data_directory(path: Path) -> Path:
 
 
 def main() -> int:
-    data_paths, command = parse_args()
+    data_paths, command, recover_only = parse_args()
     try:
         directories = sorted({safe_data_directory(path) for path in data_paths})
     except (OSError, ValueError) as exc:
@@ -50,8 +53,12 @@ def main() -> int:
                 raise OSError(f"unsafe data-writer lock in {directory}")
             descriptors.append(descriptor)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for directory in directories:
+            recover_pending_transaction(directory)
+        if recover_only:
+            return 0
         return subprocess.run(command, check=False).returncode
-    except OSError as exc:
+    except (OSError, TransactionError) as exc:
         print(f"error: data-writer lock or command failed: {exc}", file=sys.stderr)
         return 75
     finally:

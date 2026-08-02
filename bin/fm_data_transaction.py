@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import tempfile
 from pathlib import Path
@@ -150,8 +151,7 @@ def publish_transaction(
                 ready = os.environ.get("FM_AUTOCOMPACT_TEST_PUBLISH_READY")
                 if ready:
                     atomic_write(Path(ready), f"{os.getpid()}\n", ".publish-ready.")
-                while True:
-                    os.pause()
+                os.kill(os.getpid(), signal.SIGSTOP)
         fsync_directory(data)
         journal.unlink()
         fsync_directory(data)

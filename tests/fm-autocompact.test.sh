@@ -377,7 +377,7 @@ EOF
   pass "a partial multi-file publication failure rolls every destination back"
 }
 
-test_killed_publication_is_recovered_before_next_anchor() {
+test_killed_publication_is_recovered_before_hook_return() {
   local rec root home transcript fake ready capture_pid worker_pid captain_before learnings_before anchor
   rec=$(new_primary judgment-killed-publication)
   IFS='|' read -r root home <<EOF
@@ -407,22 +407,12 @@ EOF
   kill -9 "$worker_pid"
   wait "$capture_pid"
 
-  assert_grep 'Prefer UTC.' "$home/data/captain.md" "kill fixture did not expose the first destination write"
-  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "kill fixture unexpectedly published the second destination"
-  assert_present "$home/data/.firstmate-data-transaction.json" "killed publication left no recovery journal"
+  [ "$(cat "$home/data/captain.md")" = "$captain_before" ] || fail "hook return left captain.md partially published"
+  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "hook return changed learnings.md"
+  assert_absent "$home/data/.firstmate-data-transaction.json" "hook return left a transaction journal pending"
   anchor="$home/data/autocompact-resume.md"
   assert_grep 'Judgment capture: FAILED' "$anchor" "killed publication was presented as complete"
-
-  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"manual\",\"session_id\":\"session-recovery\",\"transcript_path\":\"$transcript\"}" \
-    | FM_AUTOCOMPACT_JUDGMENT=off \
-      FM_ROOT_OVERRIDE="$root" \
-      FM_HOME="$home" \
-      "$AUTOCOMPACT" capture >/dev/null 2>&1
-
-  [ "$(cat "$home/data/captain.md")" = "$captain_before" ] || fail "next capture did not recover captain.md before rendering"
-  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "next capture did not preserve learnings.md"
-  assert_absent "$home/data/.firstmate-data-transaction.json" "recovered transaction journal remained live"
-  pass "a killed multi-file publication is recovered before the next anchor"
+  pass "a killed multi-file publication is recovered before hook return"
 }
 
 test_older_worker_cannot_complete_newer_failed_anchor() {
@@ -587,7 +577,7 @@ test_judgment_failure_degrades_to_loud_deterministic_anchor
 test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
 test_partial_publication_failure_rolls_back_every_file
-test_killed_publication_is_recovered_before_next_anchor
+test_killed_publication_is_recovered_before_hook_return
 test_older_worker_cannot_complete_newer_failed_anchor
 test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles

@@ -375,6 +375,16 @@ capture_anchor() {
     fi
   fi
 
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$SCRIPT_DIR/fm-data-write.py" --data "$DATA" --recover-only; then
+      judgment_status='Judgment capture: FAILED - the isolated transcript worker did not complete and its durable-memory transaction could not be reconciled; conversation-only durable knowledge may have been lost and the memory files may be inconsistent.'
+      printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: the pending durable-memory transaction could not be reconciled before anchor finalization.' >&2
+    fi
+  elif [ -e "$DATA/.firstmate-data-transaction.json" ]; then
+    judgment_status='Judgment capture: FAILED - python3 is unavailable and a durable-memory transaction could not be reconciled; conversation-only durable knowledge may have been lost and the memory files may be inconsistent.'
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable and the pending durable-memory transaction could not be reconciled before anchor finalization.' >&2
+  fi
+
   python3 "$SCRIPT_DIR/fm-autocompact-anchor.py" \
     --lock "$ANCHOR_LOCK" update \
     --anchor "$ANCHOR" \

@@ -26,19 +26,47 @@ fm_test_tmproot_into TMP_ROOT fm-pr-merge-tests
 # Build a fresh sandbox for one test case: a state dir with a task meta and a
 # fakebin with a gh-axi mock that records how it was invoked. Echoes the case dir.
 make_case() {
-  local name=$1 case_dir fakebin
+  local name=$1 case_dir fakebin head
   case_dir="$TMP_ROOT/$name"
   fakebin="$case_dir/fakebin"
-  mkdir -p "$case_dir/state" "$fakebin"
+  mkdir -p "$case_dir/state" "$case_dir/data" "$case_dir/accounts/codex/reviewer" "$fakebin"
+  git init -q --bare "$case_dir/origin.git"
+  git -C "$case_dir/origin.git" symbolic-ref HEAD refs/heads/main
+  git clone -q "$case_dir/origin.git" "$case_dir/_seed" 2>/dev/null
+  printf 'base\n' > "$case_dir/_seed/feature.txt"
+  git -C "$case_dir/_seed" add feature.txt
+  git -C "$case_dir/_seed" commit -qm "origin baseline"
+  git -C "$case_dir/_seed" push -q origin main
+  rm -rf "$case_dir/_seed"
+  git clone -q "$case_dir/origin.git" "$case_dir/project"
+  git -C "$case_dir/project" remote set-head origin main 2>/dev/null || true
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt" main
+  printf 'pr change\n' > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add feature.txt
+  git -C "$case_dir/wt" commit -qm "task change"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  printf '%s\n' "$head" > "$case_dir/pr-head"
+  cat > "$case_dir/reviewer.sh" <<'SH'
+#!/usr/bin/env bash
+prompt=$1
+out=$2
+grep -q 'Review exactly head SHA' "$prompt" || exit 64
+cat > "$out" <<'EOF'
+VERDICT: CLEAN
+FINDINGS:
+- none
+EOF
+SH
+  chmod +x "$case_dir/reviewer.sh"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=fm-task-x1" \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=ship" \
-    "mode=no-mistakes"
-  # No worktree/project on disk; fm-pr-check.sh tolerates a worktree it cannot
-  # stat and simply skips the pr_head lookup via `gh` in that case, so give it
-  # one that resolves for cases that want pr_head recorded.
+    "mode=no-mistakes" \
+    "harness=claude" \
+    "generation_id=spawn:task-x1:test" \
+    "account_home=$case_dir/accounts/claude/author"
   printf '%s\n' "$case_dir"
 }
 
@@ -46,9 +74,20 @@ make_case() {
 # headRefOid for fm-pr-check.sh's pr_head lookup. Args: case_dir head_sha
 add_gh_mocks() {
   local case_dir=$1 head=$2
+  if [ -f "$case_dir/pr-head" ]; then
+    head=$(cat "$case_dir/pr-head")
+  fi
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view")
+    case " $* " in
+      *" title,body "*|*"--json title,body"*) printf 'Test PR\n\nTest body\n' ; exit 0 ;;
+      *) printf '%s\n' "$FM_TEST_PR_HEAD" ; exit 0 ;;
+    esac
+    ;;
+esac
 exit 0
 SH
   cat > "$case_dir/fakebin/gh" <<SH
@@ -69,10 +108,18 @@ SH
 # real merge failure is distinguishable from the recording step.
 add_gh_mocks_merge_fails() {
   local case_dir=$1
+  local head
+  head=$(cat "$case_dir/pr-head")
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
 case "${1:-} ${2:-}" in
+  "pr view")
+    case " $* " in
+      *" title,body "*|*"--json title,body"*) printf 'Test PR\n\nTest body\n' ; exit 0 ;;
+      *) printf '%s\n' "$FM_TEST_PR_HEAD" ; exit 0 ;;
+    esac
+    ;;
   "pr merge") echo "error: pr merge failed" >&2 ; exit 1 ;;
 esac
 exit 0
@@ -88,6 +135,13 @@ run_pr_merge() {
   local case_dir=$1; shift
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_ADVERSARIAL_REVIEW_TEST_LAB=firstmate-adversarial-review-test-lab-v1 \
+  FM_ADVERSARIAL_REVIEW_HARNESS=codex \
+  FM_ADVERSARIAL_REVIEW_ACCOUNT_HOME="$case_dir/accounts/codex/reviewer" \
+  FM_ADVERSARIAL_REVIEW_MODEL=gpt-test \
+  FM_ADVERSARIAL_REVIEW_RUNNER="$case_dir/reviewer.sh" \
+  FM_TEST_PR_HEAD="$(cat "$case_dir/pr-head" 2>/dev/null || true)" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
@@ -96,7 +150,6 @@ run_pr_merge() {
 test_records_pr_and_head_before_merging() {
   local case_dir rc
   case_dir=$(make_case records-before-merge)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" deadbeefcafefeed0000000000000000deadbeef
   : > "$case_dir/gh-axi.log"
 
@@ -109,17 +162,20 @@ test_records_pr_and_head_before_merging() {
   expect_code 0 "$rc" "records-before-merge: fm-pr-merge should succeed"
   assert_grep 'pr=https://github.com/example/repo/pull/9' "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr= was not recorded"
-  assert_grep 'pr_head=deadbeefcafefeed0000000000000000deadbeef' "$case_dir/state/task-x1.meta" \
+  assert_grep "pr_head=$(cat "$case_dir/pr-head")" "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr_head= was not recorded"
+  assert_grep "adversarial_review_head=$(cat "$case_dir/pr-head")" "$case_dir/state/task-x1.meta" \
+    "records-before-merge: adversarial review head was not recorded"
+  assert_grep 'adversarial_review_verdict=CLEAN' "$case_dir/state/task-x1.meta" \
+    "records-before-merge: clean adversarial verdict was not recorded"
   grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
-  pass "fm-pr-merge records pr= and pr_head= before invoking gh-axi pr merge"
+  pass "fm-pr-merge records pr=, pr_head=, and a clean adversarial verdict before invoking gh-axi pr merge"
 }
 
 test_merge_failure_propagates_after_recording() {
   local case_dir rc
   case_dir=$(make_case merge-fails)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks_merge_fails "$case_dir"
   : > "$case_dir/gh-axi.log"
 
@@ -138,7 +194,6 @@ test_merge_failure_propagates_after_recording() {
 test_extra_merge_args_forwarded() {
   local case_dir rc
   case_dir=$(make_case extra-args)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 2222222222222222222222222222222222222222
   : > "$case_dir/gh-axi.log"
 
@@ -176,7 +231,6 @@ test_missing_meta_refuses_before_merge() {
 test_malformed_url_refuses_before_merge() {
   local case_dir rc
   case_dir=$(make_case malformed-url)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 4444444444444444444444444444444444444444
   : > "$case_dir/gh-axi.log"
 
@@ -201,7 +255,6 @@ test_malformed_url_refuses_before_merge() {
 test_rejects_unsafe_url_segments_before_recording() {
   local case_dir rc
   case_dir=$(make_case unsafe-url-segment)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 8888888888888888888888888888888888888888
   : > "$case_dir/gh-axi.log"
 
@@ -228,7 +281,6 @@ test_rejects_unsafe_url_segments_before_recording() {
 test_repo_override_args_refuse_before_recording() {
   local case_dir rc
   case_dir=$(make_case repo-override)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 9999999999999999999999999999999999999999
   : > "$case_dir/gh-axi.log"
 
@@ -253,7 +305,6 @@ test_repo_override_args_refuse_before_recording() {
 test_explicit_merge_method_not_overridden() {
   local case_dir
   case_dir=$(make_case explicit-merge-method)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 5555555555555555555555555555555555555555
   : > "$case_dir/gh-axi.log"
 
@@ -268,7 +319,6 @@ test_explicit_merge_method_not_overridden() {
 test_method_equals_merge_method_not_overridden() {
   local case_dir
   case_dir=$(make_case method-equals-merge-method)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 7777777777777777777777777777777777777777
   : > "$case_dir/gh-axi.log"
 
@@ -283,7 +333,6 @@ test_method_equals_merge_method_not_overridden() {
 test_parses_pr_url_for_gh_axi() {
   local case_dir
   case_dir=$(make_case url-parsing)
-  mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 6666666666666666666666666666666666666666
   : > "$case_dir/gh-axi.log"
 

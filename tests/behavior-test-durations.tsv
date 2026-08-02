@@ -7,6 +7,7 @@
 71100	tests/fm-account-directory.test.sh
 423936	tests/fm-account-routing-a.test.sh
 335548	tests/fm-account-routing-b.test.sh
+5000	tests/fm-adversarial-pr-review.test.sh
 33600	tests/fm-afk-inject-e2e.test.sh
 20	tests/fm-afk-inject-herdr-e2e.test.sh
 16500	tests/fm-afk-launch.test.sh

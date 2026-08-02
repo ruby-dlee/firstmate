@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Merge a task's PR, always recording pr= and any available pr_head= into
-# state/<id>.meta first via bin/fm-pr-check.sh, so bin/fm-teardown.sh's
-# landed-check has a PR reference to verify a squash merge against.
+# state/<id>.meta first via bin/fm-pr-check.sh, and refusing unless the current
+# exact PR head has a recorded CLEAN adversarial review verdict. The recorded PR
+# reference lets bin/fm-teardown.sh verify a squash merge against landed work.
 #
 # Why this exists: the normal trigger for running fm-pr-check.sh is the crewmate's
 # `done: PR <url> checks green` line, which no-mistakes only emits once its CI
@@ -86,6 +87,7 @@ reject_repo_overrides "$@" || exit 1
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || { echo "error: fm-pr-check did not record pr=$URL in $META; refusing to merge" >&2; exit 1; }
+"$SCRIPT_DIR/fm-adversarial-pr-review.sh" verify "$ID" "$URL"
 
 merge_args=()
 if ! caller_has_merge_method "$@"; then

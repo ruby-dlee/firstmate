@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Record a PR-ready task: appends pr=<url> and GitHub's pr_head=<sha> to
-# state/<id>.meta when available, then arms the watcher's merge poll by writing
-# state/<id>.check.sh, which prints one line iff the PR is merged (the watcher's
-# check contract: output = wake firstmate, silence = keep sleeping).
+# state/<id>.meta when available, runs the exact-head adversarial PR review lane,
+# then arms the watcher's merge poll by writing state/<id>.check.sh, which prints
+# one line iff the PR is merged (the watcher's check contract: output = wake
+# firstmate, silence = keep sleeping).
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 
@@ -81,6 +82,25 @@ else
   echo "error: task metadata disappeared while resolving PR state for $ID" >&2
   exit 1
 fi
+fm_account_meta_lock_release "$META_LOCK"
+trap - EXIT
+
+review_args=()
+[ -z "$PR_HEAD" ] || review_args=(--head "$PR_HEAD")
+"$SCRIPT_DIR/fm-adversarial-pr-review.sh" run "$ID" "$URL" "${review_args[@]}"
+
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+trap release_meta_lock EXIT
+[ -f "$META" ] || {
+  echo "error: task metadata disappeared after adversarial review for $ID" >&2
+  exit 1
+}
+CURRENT_WT=$(fm_account_meta_value "$META" worktree)
+CURRENT_GENERATION=$(fm_account_meta_value "$META" generation_id)
+if [ "$CURRENT_GENERATION" != "$LOOKUP_GENERATION" ] || [ "$CURRENT_WT" != "$LOOKUP_WT" ]; then
+  echo "error: task generation changed while running adversarial review for $ID" >&2
+  exit 1
+fi
 CHECK_TMP=$(mktemp "$STATE/.$ID.check.XXXXXX") || exit 1
 cat > "$CHECK_TMP" <<EOF
 state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
@@ -90,4 +110,4 @@ chmod +x "$CHECK_TMP"
 mv "$CHECK_TMP" "$STATE/$ID.check.sh"
 fm_account_meta_lock_release "$META_LOCK"
 trap - EXIT
-echo "armed: state/$ID.check.sh polls $URL"
+echo "armed: state/$ID.check.sh polls $URL after adversarial review"

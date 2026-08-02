@@ -141,7 +141,9 @@ candidate_is_usable() {
 }
 
 select_reviewer() {
-  local candidate usable chosen fallback model_diff
+  local candidate usable chosen model_diff
+  [ -n "$AUTHOR_MODEL" ] \
+    || die "refuses to run; cannot prove model separation because author model is absent"
   if test_lab_enabled && [ -n "${FM_CROSSCHECK_REVIEWER_HARNESS:-}" ]; then
     REVIEWER_HARNESS=$FM_CROSSCHECK_REVIEWER_HARNESS
     REVIEWER_ACCOUNT_HOME=${FM_CROSSCHECK_REVIEWER_ACCOUNT_HOME:-}
@@ -153,18 +155,14 @@ select_reviewer() {
       [ -n "$candidate" ] || continue
       usable=$(candidate_is_usable "$candidate" || true)
       [ -n "$usable" ] || continue
-      if [ -z "$fallback" ]; then
-        fallback=$usable
-      fi
       model_diff=${usable##*$'\t'}
-      if [ -z "$AUTHOR_MODEL" ] || [ "$model_diff" != "$AUTHOR_MODEL" ]; then
+      if [ "$model_diff" != "$AUTHOR_MODEL" ]; then
         chosen=$usable
         break
       fi
     done <<EOF
 $(choose_reviewer_harnesses)
 EOF
-    [ -n "${chosen:-}" ] || chosen=${fallback:-}
     if [ -n "${chosen:-}" ]; then
       IFS=$'\t' read -r REVIEWER_HARNESS REVIEWER_ACCOUNT_HOME REVIEWER_MODEL <<EOF
 $chosen
@@ -174,14 +172,13 @@ EOF
   [ -n "${REVIEWER_HARNESS:-}" ] || die "reviewer unavailable; no independent account could be selected"
   [ -n "${REVIEWER_ACCOUNT_HOME:-}" ] || die "reviewer unavailable; account selection returned no home"
   [ -n "${REVIEWER_MODEL:-}" ] || die "reviewer unavailable; model could not be resolved"
+  [ "$AUTHOR_MODEL" != "$REVIEWER_MODEL" ] \
+    || die "refuses to run; author and reviewer models are identical"
   [ -n "$AUTHOR_ACCOUNT_HOME" ] \
     || die "refuses to run; cannot prove reviewer is not author because author account_home is absent"
   [ "$AUTHOR_ACCOUNT_HOME" != "$REVIEWER_ACCOUNT_HOME" ] \
     || die "refuses to run; author and reviewer account_home are identical"
   MODEL_SEPARATION=different_model
-  if [ -n "$AUTHOR_MODEL" ] && [ "$AUTHOR_MODEL" = "$REVIEWER_MODEL" ]; then
-    MODEL_SEPARATION=same_model_after_no_different_model_available
-  fi
   ISOLATION_PROOF="different_account_home author=$AUTHOR_ACCOUNT_HOME reviewer=$REVIEWER_ACCOUNT_HOME author_harness=${AUTHOR_HARNESS:-unknown} author_model=${AUTHOR_MODEL:-unknown} reviewer_harness=$REVIEWER_HARNESS reviewer_model=$REVIEWER_MODEL model_separation=$MODEL_SEPARATION"
 }
 
@@ -276,7 +273,9 @@ Output contract:
         "citations": [{"path": "file", "line": 1}]
       },
       "mutation_proof": {
+        "test_name": "stable name of the regression test",
         "command": "test command that fails after reverting or breaking the fix",
+        "exit_code": 1,
         "output": "failing output",
         "mutation": "what was reverted or broken in the scratch checkout"
       }
@@ -405,7 +404,9 @@ function evidence(value) {
 }
 
 function mutationProof(value) {
-  return value && nonEmptyString(value.command) && nonEmptyString(value.output) && nonEmptyString(value.mutation);
+  return value && nonEmptyString(value.test_name) && nonEmptyString(value.command) &&
+    Number.isInteger(value.exit_code) && value.exit_code !== 0 &&
+    nonEmptyString(value.output) && nonEmptyString(value.mutation);
 }
 
 function blocker(lifecycle) {
@@ -625,7 +626,7 @@ record_meta() {
 }
 
 run_mode() {
-  local supplied_head="" run_json state
+  local supplied_head="" run_json state ledger_lock attempts
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --head)
@@ -650,6 +651,14 @@ run_mode() {
   PROMPT_FILE="$RUN_DIR/prompt.md"
   AGENT_OUT="$RUN_DIR/reviewer-output.json"
   LEDGER_TMP="$RUN_DIR/crosscheck-ledger.json"
+  ledger_lock="$TASK_DIR/.crosscheck-ledger.lock"
+  attempts=0
+  while ! mkdir "$ledger_lock" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 600 ] || die "timed out waiting for ledger lock for $ID"
+    sleep 0.1
+  done
+  trap 'rmdir "$ledger_lock" >/dev/null 2>&1 || true' EXIT
   select_reviewer
   prepare_review_checkout
   make_prompt
@@ -662,6 +671,8 @@ run_mode() {
     validate_and_update_ledger)
   fm_account_safe_file_destination "$LEDGER" || die "unsafe ledger path $LEDGER"
   mv "$LEDGER_TMP" "$LEDGER"
+  rmdir "$ledger_lock"
+  trap - EXIT
   write_report
   record_meta
   state=$(printf '%s' "$run_json" | node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(0,"utf8")); process.stdout.write(r.state);')

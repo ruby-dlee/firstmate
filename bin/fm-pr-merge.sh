@@ -87,11 +87,17 @@ reject_repo_overrides "$@" || exit 1
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || { echo "error: fm-pr-check did not record pr=$URL in $META; refusing to merge" >&2; exit 1; }
-"$SCRIPT_DIR/fm-crosscheck.sh" run "$ID" "$URL"
+REVIEWED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-)
+case "$REVIEWED_HEAD" in
+  *[!0-9a-fA-F]*|'') echo "error: fm-pr-check did not record a valid pr_head in $META; refusing to merge" >&2; exit 1 ;;
+  *) ;;
+esac
+[ "${#REVIEWED_HEAD}" -eq 40 ] || { echo "error: fm-pr-check recorded a malformed pr_head in $META; refusing to merge" >&2; exit 1; }
+"$SCRIPT_DIR/fm-crosscheck.sh" run "$ID" "$URL" --head "$REVIEWED_HEAD"
 
 merge_args=()
 if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
 fi
 
-gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@"
+gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" --match-head-commit "$REVIEWED_HEAD" ${merge_args[@]+"${merge_args[@]}"} "$@"

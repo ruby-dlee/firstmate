@@ -187,7 +187,7 @@ test_verified_fixed_with_mutation_clears() {
 JSON
   write_json "$case_dir/reviewer.json" '{
     "review": {"head_sha": "__HEAD__", "summary": "fixed", "citations": [{"path": "app.txt", "line": 1}]},
-    "finding_updates": [{"id": "cc-old", "status": "verified_fixed", "evidence": {"command": "grep -n old app.txt", "output": "no match", "citations": [{"path": "app.txt", "line": 1}]}, "mutation_proof": {"command": "tests/regression.sh", "output": "fails after reverting fix", "mutation": "reverted app.txt guard"}}],
+    "finding_updates": [{"id": "cc-old", "status": "verified_fixed", "evidence": {"command": "grep -n old app.txt", "output": "no match", "citations": [{"path": "app.txt", "line": 1}]}, "mutation_proof": {"test_name": "app regression", "command": "tests/regression.sh", "exit_code": 1, "output": "fails after reverting fix", "mutation": "reverted app.txt guard"}}],
     "new_findings": [],
     "suspicions": []
   }'

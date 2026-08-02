@@ -360,6 +360,18 @@ outcome: failed
 EOF
 }
 
+run_completed_without_outcome() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: completed
+  head: "abc1234"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+EOF
+}
+
 run_ci_monitoring() {  # <branch>
   cat <<EOF
 run:
@@ -672,6 +684,22 @@ test_completed_run_fails_closed_when_newest_run_is_unavailable() {
   assert_contains "$out" "do not merge" "unverifiable newest-run verdict is merge-safe"
   assert_not_contains "$out" "state: done" "unverifiable completed run must not read done"
   pass "a completed run fails closed when newest-run currentness is unavailable"
+}
+
+test_completed_run_without_outcome_fails_closed() {
+  reset_fakes
+  local d; d=$(new_case completed-without-outcome)
+  make_repo_on_branch "$d/wt" fm/feat-no-outcome
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-no-outcome.meta" "window=fm:fm-feat-no-outcome" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_completed_without_outcome fm/feat-no-outcome)"
+  FM_FAKE_RUNS_LIST='completed fm/feat-no-outcome abc1234 2026-08-01 23:58 https://github.com/o/r/pull/2'
+  local out; out=$(run_crew_state "$d" feat-no-outcome)
+  assert_contains "$out" "state: unknown" "outcome-less completed run -> unknown"
+  assert_contains "$out" "no terminal outcome" "unknown verdict names missing terminal evidence"
+  assert_contains "$out" "do not merge" "outcome-less completion is merge-safe"
+  assert_not_contains "$out" "state: done" "outcome-less completion must not authorize done"
+  pass "completed run without a terminal outcome fails closed"
 }
 
 test_ci_monitoring_no_checks_terminal_surfaces_done() {
@@ -1428,6 +1456,7 @@ test_checks_passed_requires_unambiguous_local_head
 test_checks_passed_rejects_same_prefix_different_full_head
 test_earlier_completed_run_is_stale_while_newer_run_active
 test_completed_run_fails_closed_when_newest_run_is_unavailable
+test_completed_run_without_outcome_fails_closed
 test_ci_monitoring_no_checks_terminal_surfaces_done
 test_ci_monitoring_green_then_rearm_stays_working
 test_ci_monitoring_no_checks_yet_stays_working

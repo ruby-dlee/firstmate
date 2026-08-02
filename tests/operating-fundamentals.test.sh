@@ -30,9 +30,8 @@ test_agent_only_folded_frontmatter_and_size() {
 }
 
 test_seven_ordered_principles() {
-  local headings expected skill_text principle_seven contract_text
+  local headings expected principle_seven contract_text
   headings=$(sed -nE 's/^## ([0-9]+\. .*)$/\1/p' "$SKILL")
-  skill_text=$(<"$SKILL")
   principle_seven=$(awk '/^## 7\./ { capture=1; next } capture && /^## / { exit } capture' "$SKILL")
   contract_text=$(git -C "$ROOT" ls-files 'AGENTS.md' '.agents/**/*.md' | sed "s#^#$ROOT/#" | xargs cat)
   expected=$(printf '%s\n' \

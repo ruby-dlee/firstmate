@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # Behavior tests for Claude Code's deterministic autocompact recovery bridge.
 set -u
 

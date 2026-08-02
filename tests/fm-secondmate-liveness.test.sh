@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # tests/fm-secondmate-liveness.test.sh - the session-start secondmate LIVENESS
 # guarantee: bin/fm-backend.sh's fm_backend_agent_alive probe (dispatching to
 # fm_backend_tmux_agent_alive / fm_backend_herdr_agent_alive) and

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # Behavior tests for bin/fm-herdr-lab.sh using a stateful fake Herdr client.
 set -u
 
@@ -20,13 +22,23 @@ cat > "$FAKEBIN/herdr" <<'SH'
 set -eu
 printf '%s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
 state=$FM_FAKE_HERDR_STATE
-last=
+session=
+previous=
+before_separator=1
 for arg in "$@"; do
-  previous=$last
-  last=$arg
+  if [ "$arg" = -- ]; then
+    before_separator=0
+    previous=
+    continue
+  fi
+  [ "$before_separator" = 1 ] || continue
+  if [ "$previous" = --session ]; then
+    [ -z "$session" ] || { echo "fake herdr: duplicate --session" >&2; exit 90; }
+    session=$arg
+  fi
+  previous=$arg
 done
-[ "${previous:-}" = --session ] || { echo "fake herdr: missing trailing --session" >&2; exit 90; }
-session=$last
+[ -n "$session" ] || { echo "fake herdr: missing --session" >&2; exit 90; }
 default_socket=$(cat "$state/default-socket")
 default_running=${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}
 lab_state=absent
@@ -101,6 +113,20 @@ test_refuses_unsafe_names() {
   pass "fm-herdr-lab: names fail closed and require the lab prefix"
 }
 
+test_provision_timeout_is_bounded() {
+  local status=0
+  [ "$(FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=1 fm_herdr_lab_provision_timeout)" = 1 ] \
+    || fail "minimum provision timeout was refused"
+  [ "$(FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=600 fm_herdr_lab_provision_timeout)" = 600 ] \
+    || fail "maximum provision timeout was refused"
+  FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=0 fm_herdr_lab_provision_timeout >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "zero provision timeout"
+  status=0
+  FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=601 fm_herdr_lab_provision_timeout >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "oversized provision timeout"
+  pass "fm-herdr-lab: provision timeout is configurable only within a bounded range"
+}
+
 test_provision_run_and_guarded_teardown() {
   local name='' line_count status=0 stop_line delete_line
   name="fm-lab-behavior-$$"
@@ -167,6 +193,31 @@ test_missing_tripwire_blocks_destruction() {
   after=$(wc -l < "$FAKE_LOG")
   [ "$before" = "$after" ] || fail "missing tripwire reached Herdr instead of refusing before destructive calls"
   pass "fm-herdr-lab: missing tripwire refuses teardown before any Herdr call"
+}
+
+test_agent_argv_inserts_session_before_separator() {
+  local name="fm-lab-agent-argv-$$" status=0
+  : > "$FAKE_LOG"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "agent-argv fixture provision failed"
+  run_with_fake fm_herdr_lab_cli_argv "$name" \
+    agent start fm-probe --tab t1 -- echo hello >/dev/null \
+    || fail "guarded agent-start argv call failed"
+  grep -Fx "agent start fm-probe --tab t1 --session $name -- echo hello" "$FAKE_LOG" >/dev/null \
+    || fail "agent-start session selector was not inserted before the argv separator"
+  run_with_fake fm_herdr_lab_cli_argv "$name" \
+    agent start fm-probe --tab t1 -- echo --session default >/dev/null \
+    || fail "agent argv containing its own --session flag was refused"
+  grep -Fx "agent start fm-probe --tab t1 --session $name -- echo --session default" "$FAKE_LOG" >/dev/null \
+    || fail "agent argv was rewritten while inserting the Herdr session selector"
+  run_with_fake fm_herdr_lab_cli_argv "$name" \
+    agent start fm-probe --session default -- echo hello >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "agent-start caller session selector"
+  status=0
+  run_with_fake fm_herdr_lab_cli_argv "$name" \
+    pane run p1 -- echo hello >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "run-argv non-agent command"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "agent-argv fixture teardown failed"
+  pass "fm-herdr-lab: agent argv routing inserts only the owned session before --"
 }
 
 test_changed_default_trips_after_teardown() {
@@ -267,7 +318,8 @@ exec "$FM_FAKE_HERDR_REAL_SLEEP" "$@"
 SH
   chmod +x "$FAKEBIN/sleep"
   : > "$FAKE_LOG"
-  FM_FAKE_HERDR_FAST_POLL=1 FM_FAKE_HERDR_SERVER_DELAY=30 \
+  FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS=1 \
+    FM_FAKE_HERDR_FAST_POLL=1 FM_FAKE_HERDR_SERVER_DELAY=30 \
     run_with_fake fm_herdr_lab_provision "$name" >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "timed-out provision must fail"
   assert_present "$TRIPWIRES/$name.fleet-state.json" \
@@ -283,8 +335,10 @@ SH
 }
 
 test_refuses_unsafe_names
+test_provision_timeout_is_bounded
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
+test_agent_argv_inserts_session_before_separator
 test_changed_default_trips_after_teardown
 test_stopped_default_refuses_provision
 test_malformed_default_running_refuses_provision

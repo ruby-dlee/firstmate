@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # Tests for bin/fm-pr-merge.sh: the one path firstmate uses to merge a task's
 # PR, which must always record pr= and any available pr_head= into the task's
 # meta before merging so fm-teardown.sh's landed-check has a PR reference to

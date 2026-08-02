@@ -5,8 +5,11 @@
 # gotmp/, exports GOTMPDIR into the crewmate pane, and records tasktmp= in the task's
 # meta. fm-teardown reads tasktmp= and removes the whole root on cleanup.
 #
-# These tests exercise the shared ownership helpers directly and verify the spawn and
-# teardown wiring structurally.
+# These tests exercise the shared ownership helpers directly.
+# The fm-spawn side is verified both structurally (the source has the contract lines)
+# and behaviorally (the mkdir + meta-write pattern it uses).
+# They also verify teardown wiring structurally.
+# Teardown cleanup is covered by tests/fm-teardown-suite.sh's full lifecycle fixture.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

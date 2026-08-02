@@ -378,6 +378,7 @@ PROFILE_PATH="$STATE_DIR/lavish-board-$DECISION_ID.chrome-profile"
 CHECK_PATH="$STATE_DIR/lavish-board-$DECISION_ID.check.sh"
 OPENED_AT=$(node -e 'process.stdout.write(String(Date.now()))')
 
+rm -f "$CHECK_PATH"
 "$LAVISH_BIN" board "$DECISION_ID" --home "$HOME_PATH" --out "$HTML_PATH"
 ANSWERABILITY_ERROR=
 if ! ANSWERABILITY_ERROR=$(assert_answerable_board "$HTML_PATH" 2>&1); then

@@ -533,8 +533,6 @@ HAVE_RUN=0
 # run-step block below skips the TOON field parsing entirely for this crewmate.
 RUN_SOURCE=full
 COARSE_STATUS=""
-COARSE_HEAD=""
-COARSE_PR=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -553,9 +551,6 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$coarse_run" ]; then
         COARSE_STATUS=${coarse_run%%|*}
-        coarse_rest=${coarse_run#*|}
-        COARSE_HEAD=${coarse_rest%%|*}
-        COARSE_PR=${coarse_rest#*|}
         HAVE_RUN=1
         RUN_SOURCE=coarse
       fi

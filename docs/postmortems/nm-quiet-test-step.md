@@ -107,13 +107,15 @@ It finds processes by **working directory**, which is the one attribute that rel
 `bin/fm-crew-state.sh` calls it automatically whenever the active step renders quiet, so the verdict appears in the ordinary heartbeat read:
 
 ```
-state: working · source: run-step · validating (running) · test alive (3 procs)
+state: working · source: run-step · validating (running) · test alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37)
 ```
 
 The verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
 The `ci` step is exempt: its monitoring runs inside the daemon and owns no worktree process, so a verdict there would always read `dead` and mean nothing.
 
-The probe also names the current unit of work and its age, because "alive" alone still leaves hours of runtime unexplained:
+The unit of work and its age ride along on that line because "alive" alone still leaves hours of runtime unexplained.
+They are carried on the heartbeat read rather than left to a second command, since the follow-up question - alive, but stuck on the same script for three hours? - is asked every time the first one is.
+Run the probe directly for the full detail:
 
 ```
 liveness: alive · run: 01KZ0Q9CZ4B4170FSBM0HX1F0M · procs: 7 · processes present in worktree · doing: bash tests/fm-teardown-a.test.sh (38:37)

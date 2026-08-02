@@ -21,6 +21,8 @@
 #   (f) worktree resolution through the no-mistakes home layout
 #   (g) unresolvable worktree                 -> unknown (never dead)
 #   (h) usage error                           -> exit 2
+#   (i) the named unit of work and its age, which separate slow from hung and
+#       which bin/fm-crew-state.sh carries onto every heartbeat read
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -34,11 +36,22 @@ WT="$TMP_ROOT/worktree"
 mkdir -p "$WT"
 
 # Track every process this suite starts so a failing assertion never leaks one.
+# Descendants are killed too, not just the tracked pid: a leaked grandchild
+# inherits this suite's stdout and holds the pipe open until it exits on its
+# own, which makes a passing suite look like a hung one to whatever is reading
+# it - including the gate's serial test loop.
 STARTED_PIDS=""
+kill_tree() {  # <pid>
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill -9 "$1" 2>/dev/null || true
+}
 kill_started() {
   local pid
   for pid in $STARTED_PIDS; do
-    kill -9 "$pid" 2>/dev/null || true
+    kill_tree "$pid"
     wait "$pid" 2>/dev/null || true
   done
   STARTED_PIDS=""
@@ -100,6 +113,32 @@ out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 1)
 [ "$(verdict_of "$out")" = alive ] || fail "a CPU-burning process must read alive, got: $out"
 assert_contains "$out" "cpu +" "the alive verdict reports the measured CPU delta"
 pass "a process consuming CPU reads alive with measured progress"
+
+kill_started
+
+# --- (i) the reported unit of work ------------------------------------------
+#
+# "alive" alone still leaves hours of runtime unexplained, which is what made a
+# healthy multi-hour step indistinguishable from a hang. The probe names the
+# step's current unit of work and its age, and bin/fm-crew-state.sh carries that
+# onto every heartbeat read, so the field is load-bearing rather than cosmetic.
+#
+# The shape mirrors the real one: a root shell the daemon owns, running one
+# child at a time - the suite's `for t in tests/*.test.sh` loop.
+( cd "$WT" && exec bash -c 'sleep 120 & wait' ) &
+PARENT=$!
+STARTED_PIDS="$STARTED_PIDS $PARENT"
+out=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+  case "$out" in *"doing: "*) break ;; esac
+  sleep 0.3
+done
+assert_contains "$out" "doing: sleep 120" "the probe names the child the step is currently running"
+# The age is what separates "slow" from "sitting on the same script for hours".
+printf '%s\n' "$out" | grep -qE 'doing: sleep 120 \([0-9]+:[0-9]{2}' \
+  || fail "the reported unit of work must carry its age, got: $out"
+pass "the probe names the current unit of work and how long it has been running"
 
 kill_started
 

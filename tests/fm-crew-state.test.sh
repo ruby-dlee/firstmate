@@ -503,19 +503,26 @@ test_quiet_step_reports_alive_liveness() {
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
   # A real process working in that worktree, named nothing like the run - the
-  # exact shape the false-negative argv search missed.
-  ( cd "$nmwt" && exec sleep 30 ) &
+  # exact shape the false-negative argv search missed. It is a parent shell with
+  # a child, matching a suite loop running one script at a time, so the reported
+  # unit of work is exercised too and not just the bare verdict.
+  ( cd "$nmwt" && exec sh -c 'sleep 30 & wait' ) &
   local sleeper=$!
   local out=""
   local _
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     out=$(run_crew_state "$d" feat-q)
-    case "$out" in *"test alive"*) break ;; esac
+    case "$out" in *"test alive"*" on "*) break ;; esac
     sleep 0.3
   done
+  pkill -9 -P "$sleeper" 2>/dev/null || true
   kill -9 "$sleeper" 2>/dev/null || true
   wait "$sleeper" 2>/dev/null || true
   assert_contains "$out" "test alive" "a quiet step with a live process reports alive"
+  # Alive alone leaves hours of runtime unexplained; naming the current unit of
+  # work and its age is what separates a slow step from a hung one without
+  # spending a run to find out, so the heartbeat read must carry it.
+  assert_contains "$out" " on sleep 30 (" "the alive verdict names the current unit of work and its age"
   pass "a quiet step with a live process reports an alive liveness verdict"
 }
 

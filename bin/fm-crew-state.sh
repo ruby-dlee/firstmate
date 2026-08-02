@@ -546,17 +546,25 @@ nm_step_liveness() {
     *)        out=$("$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
   esac
   [ -n "$out" ] || return 0
-  # Compact the probe's own line to `<verdict> (<n> procs)`; this rides on every
-  # heartbeat read, so it stays token-tight. The full detail is one command away.
-  local verdict procs
+  # Compact the probe's own line to `<verdict> (<n> procs) on <unit> (<age>)`.
+  # This rides on every heartbeat read, so it stays token-tight - but the unit of
+  # work and its age are the two fields that separate SLOW from HUNG, and this
+  # line is the read firstmate actually makes. Omitting them would leave the
+  # follow-up question ("alive, but stuck on the same script for three hours?")
+  # needing a second command on every heartbeat.
+  local verdict procs doing
   verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
   procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
   [ -n "$verdict" ] || return 0
-  if [ -n "$procs" ]; then
-    printf '%s (%s procs)' "$verdict" "$procs"
-  else
-    printf '%s' "$verdict"
-  fi
+  # `doing: <argv> (<etime>)` is the probe's last field when it could name one.
+  # The probe already truncates argv, so take it verbatim rather than re-parsing
+  # a command line whose shape varies by whatever the step happens to be running.
+  doing=${out##*doing: }
+  [ "$doing" = "$out" ] && doing=""
+  local line="$verdict"
+  [ -n "$procs" ] && line="$line ($procs procs)"
+  [ -n "$doing" ] && line="$line on $doing"
+  printf '%s' "$line"
 }
 
 nm_runs_status_for_branch() {  # <branch>

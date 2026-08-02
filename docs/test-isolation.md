@@ -24,5 +24,5 @@ It intentionally ignores volatile agent status and focus/activity fields, so nor
 
 Use `tests/run.sh --skip-herdr` for the explicit non-Herdr path.
 That option reports each skipped `herdr-lab` test and runs every hermetic test normally.
-CI names this option because its disposable image does not provide Herdr.
+CI selects the same path explicitly with `FM_TEST_SKIP_HERDR=1` on each sealed shard command because its disposable image does not provide Herdr.
 The no-mistakes test command does not skip: it requires every declared real-Herdr test to prove an owned lab or fail closed.

@@ -1,12 +1,15 @@
 # Every behavior test declares whether it can reach a real Herdr lifecycle.
 bridge-cutover-python.test.sh	hermetic
 fm-account-directory.test.sh	hermetic
-fm-account-routing.test.sh	hermetic
+fm-account-routing-a.test.sh	hermetic
+fm-account-routing-b.test.sh	hermetic
 fm-afk-inject-e2e.test.sh	hermetic
 fm-afk-inject-herdr-e2e.test.sh	herdr-lab
 fm-afk-launch.test.sh	herdr-lab
 fm-afk-reap-wake-e2e.test.sh	hermetic
 fm-arm-pretool-check.test.sh	hermetic
+fm-auto-reap-herdr-e2e.test.sh	herdr-lab
+fm-auto-reap.test.sh	hermetic
 fm-autocompact.test.sh	hermetic
 fm-backend-autodetect-smoke.test.sh	herdr-lab
 fm-backend-cmux-smoke.test.sh	hermetic
@@ -24,6 +27,7 @@ fm-backend-zellij.test.sh	hermetic
 fm-backend.test.sh	hermetic
 fm-backlog-handoff.test.sh	hermetic
 fm-bearings-snapshot.test.sh	hermetic
+fm-behavior-shards.test.sh	hermetic
 fm-bootstrap.test.sh	hermetic
 fm-brief.test.sh	hermetic
 fm-cd-pretool-check.test.sh	hermetic
@@ -50,7 +54,8 @@ fm-pi-primary-types.test.sh	hermetic
 fm-pi-watch-extension.test.sh	hermetic
 fm-pr-merge.test.sh	hermetic
 fm-prompt-exec.test.sh	hermetic
-fm-report-stack.test.sh	hermetic
+fm-report-stack-a.test.sh	hermetic
+fm-report-stack-b.test.sh	hermetic
 fm-review-diff.test.sh	hermetic
 fm-secondmate-harness.test.sh	hermetic
 fm-secondmate-lifecycle-e2e.test.sh	hermetic
@@ -70,7 +75,8 @@ fm-stow-contract.test.sh	hermetic
 fm-supervision-events.test.sh	hermetic
 fm-supervision-instructions.test.sh	hermetic
 fm-tangle-guard.test.sh	hermetic
-fm-teardown.test.sh	hermetic
+fm-teardown-a.test.sh	hermetic
+fm-teardown-b.test.sh	hermetic
 fm-transition-lib.test.sh	hermetic
 fm-turnend-guard.test.sh	hermetic
 fm-update.test.sh	hermetic
@@ -80,7 +86,9 @@ fm-watch-checkpoint.test.sh	hermetic
 fm-watch-triage.test.sh	hermetic
 fm-watcher-lock.test.sh	hermetic
 fm-x-mode.test.sh	hermetic
+lavish-repair.test.sh	hermetic
 lavish.test.sh	hermetic
+no-mistakes-required.test.sh	hermetic
 operating-fundamentals.test.sh	hermetic
 runner-entry-probe.test.sh	hermetic
 test-suite-seal.test.sh	hermetic

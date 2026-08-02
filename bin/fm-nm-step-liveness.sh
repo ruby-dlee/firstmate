@@ -151,6 +151,49 @@ EOF
   return 0
 }
 
+# --- what the step is currently doing ---------------------------------------
+#
+# "Alive" alone still leaves the operator guessing whether hours of runtime are
+# legitimate. Naming the unit of work and its age makes slow separable from hung
+# WITHOUT another abort: a suite that keeps changing what it is on is slow, one
+# that sits on the same unit past any plausible budget is worth investigating.
+#
+# The step's root process is the one in the set whose parent is NOT in the set
+# (the daemon owns it). Its direct children in the set are the current unit of
+# work - here, the `bash tests/<name>.test.sh` the suite loop is on.
+current_work() {  # <pids>
+  local pids=$1 pid ppid args elapsed roots="" out=""
+  local table
+  table=$(ps -o pid=,ppid= -p "$(printf '%s' "$pids" | tr '\n' ',' | sed 's/,$//')" 2>/dev/null) || return 0
+  while read -r pid ppid; do
+    [ -n "${pid:-}" ] || continue
+    case "
+$pids
+" in
+      *"
+$ppid
+"*) ;;
+      *) roots="$roots $pid" ;;
+    esac
+  done <<EOF
+$table
+EOF
+  for pid in $roots; do
+    while read -r cpid cppid; do
+      [ "${cppid:-}" = "$pid" ] || continue
+      args=$(ps -o args= -p "$cpid" 2>/dev/null | cut -c1-60) || continue
+      elapsed=$(ps -o etime= -p "$cpid" 2>/dev/null | tr -d ' ')
+      [ -n "$args" ] || continue
+      out="$args (${elapsed:-?})"
+      break
+    done <<EOF
+$table
+EOF
+    [ -n "$out" ] && break
+  done
+  printf '%s' "$out"
+}
+
 PIDS_T0=$(procs_in_worktree) || \
   emit unknown 0 "cannot enumerate process working directories (no /proc, no usable lsof)"
 COUNT_T0=$(printf '%s' "$PIDS_T0" | grep -c . || true)
@@ -161,7 +204,9 @@ if [ "$COUNT_T0" = 0 ]; then
 fi
 
 if [ "$SAMPLE" = 0 ]; then
-  emit alive "$COUNT_T0" "processes present in worktree (presence only, no progress sample)"
+  DOING=$(current_work "$PIDS_T0")
+  [ -n "$DOING" ] && DOING="${VERDICT_SEP}doing: $DOING"
+  emit alive "$COUNT_T0" "processes present in worktree (presence only, no progress sample)$DOING"
 fi
 
 # --- sample progress --------------------------------------------------------
@@ -227,10 +272,17 @@ $p
   esac
 done
 
+# A negative delta means processes in the set exited and were replaced between
+# samples - churn, which is progress. Report it as no measured CPU rather than a
+# nonsensical "cpu +-0.01s"; NEW_PIDS carries the real signal in that case.
+[ "$CPU_DELTA" -lt 0 ] && CPU_DELTA=0
 CPU_NOTE=$(awk -v d="$CPU_DELTA" 'BEGIN { printf "%.2fs", d / 100 }')
+DOING=$(current_work "$PIDS_T1")
+[ -n "$DOING" ] && DOING="${VERDICT_SEP}doing: $DOING"
+
 if [ "$CPU_DELTA" -gt 0 ] || [ "$NEW_PIDS" -gt 0 ]; then
-  emit alive "$COUNT_T1" "progress in ${SAMPLE}s: cpu +$CPU_NOTE, $NEW_PIDS new process(es)"
+  emit alive "$COUNT_T1" "progress in ${SAMPLE}s: cpu +$CPU_NOTE, $NEW_PIDS new process(es)$DOING"
 fi
 
 emit stalled "$COUNT_T1" \
-  "no cpu or process change in ${SAMPLE}s (may be blocked on I/O or sleeping - sample longer before acting)"
+  "no cpu or process change in ${SAMPLE}s (may be blocked on I/O or sleeping - sample longer before acting)$DOING"

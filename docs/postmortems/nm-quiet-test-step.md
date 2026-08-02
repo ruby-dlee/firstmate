@@ -63,6 +63,24 @@ Neither the run id nor the worktree path appears anywhere in any of their argv.
 `ps -ef | grep 01KZ1P01GK1HJ5JGX1B1Q73VMA` genuinely returns nothing while three of the run's processes are live.
 The only reliable link from a process to its run is its **working directory**.
 
+**And the check is worse than simply wrong: it is nondeterministic.**
+Some tests invoke a helper by absolute path, which puts the worktree into that process's argv; most do not.
+So the same check returns a different answer depending on which test happens to be executing.
+Measured across five live steps at one instant:
+
+| run | processes found by argv | processes found by working directory |
+| --- | --- | --- |
+| `01KZ0RAW7V8H4PWKMW60AWNP5F` | 0 | 42 |
+| `01KZ1MGVG2C0D9JER58PF1ZK63` | 1 | 5 |
+| `01KZ1MZG7BJYGE8EJCZ52KYH7B` | 1 | 5 |
+| `01KZ0Q9CZ4B4170FSBM0HX1F0M` | 3 | 8 |
+| `01KZ1MWG37CF9KGA9D10Z4BQ4V` | 7 | 9 |
+
+A step running 42 processes reported zero.
+Repeating the same measurement a minute later gave 2 against 46 for that row, and different numbers again for the others: the argv answer changes while nothing about the step changes.
+That intermittency is why the check survived four uses.
+It sometimes returns a plausible number, so it looks like a working check, and it reads zero exactly when a long-running test is between absolute-path invocations - which is most of the time.
+
 ## Why the timing looked damning but was not
 
 The firstmate behavior suite is genuinely slow.

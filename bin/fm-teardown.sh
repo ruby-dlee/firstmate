@@ -138,6 +138,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-treehouse-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 TEARDOWN_UPSTREAM_TIMEOUT=${FM_CHECKOUT_REFRESH_PROBE_TIMEOUT:-15}
@@ -177,7 +179,6 @@ for option in "$@"; do
       ;;
   esac
 done
-
 META="$STATE/$ID.meta"
 
 require_safe_task_metadata() {
@@ -254,13 +255,29 @@ if [ "$BACKEND" = orca ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
-# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
+# tasktmp is recorded by fm-spawn for tasks that set up a per-generation temp root;
+# absent for tasks spawned before that change, so tolerate empty legacy metadata.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && [ "$TASK_TMP" != "/tmp/fm-$ID" ]; then
+TASK_GENERATION=$(grep '^generation_id=' "$META" | cut -d= -f2- || true)
+if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP" "$TASK_GENERATION"; then
   echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
   exit 1
 fi
+TASK_TMP_PHASE=$(fm_meta_get "$META" tasktmp_phase)
+case "$TASK_TMP_PHASE" in
+  '') ;;
+  created)
+    fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" \
+      || { echo "error: created task temp phase is not bound to the exact task generation for $ID" >&2; exit 1; }
+    ;;
+  not-created)
+    fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" || {
+      echo "error: not-created task temp phase is not bound to the exact task generation for $ID" >&2
+      exit 1
+    }
+    ;;
+  *) echo "error: invalid task temp phase for $ID" >&2; exit 1 ;;
+esac
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
@@ -450,7 +467,7 @@ quiesce_secondmate_endpoint() {
 
 quiesce_child_endpoint() {
   local meta=$1 task=$2 owner_home=$3 child_home=${4:-}
-  local backend target kind endpoint_home probe_home='' endpoint_status scoped_target
+  local backend target kind endpoint_home probe_home='' endpoint_status scoped_target zellij_tab
   backend=$(fm_backend_of_meta "$meta")
   target=$(teardown_backend_target_of_meta "$meta")
   kind=$(meta_value "$meta" kind)
@@ -459,7 +476,26 @@ quiesce_child_endpoint() {
   [ "$endpoint_home" = "$FM_HOME" ] || probe_home=$endpoint_home
   scoped_target=$(meta_value "$meta" tmux_session_target)
   [ "$backend" != orca ] || scoped_target=$(meta_value "$meta" orca_worktree_id)
+  zellij_tab=$(meta_value "$meta" zellij_tab_id)
+  if [ "$backend" = zellij ] && [ -n "$zellij_tab" ]; then
+    if [ -n "$probe_home" ]; then
+      ( unset FM_ROOT_OVERRIDE; FM_HOME="$probe_home" FM_ROOT="$probe_home" \
+        fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$scoped_target" ) 2>/dev/null || {
+        echo "error: failed to stop child endpoint for $task; refusing destructive cleanup" >&2
+        return 1
+      }
+    else
+      fm_backend_kill "$backend" "$target" "$zellij_tab" "fm-$task" "$scoped_target" 2>/dev/null || {
+        echo "error: failed to stop child endpoint for $task; refusing destructive cleanup" >&2
+        return 1
+      }
+    fi
+  fi
   if [ "$backend" = orca ]; then
+    [ -n "$target" ] || {
+      echo "error: child endpoint identity for $task is missing; refusing destructive cleanup" >&2
+      return 1
+    }
     quiesce_authoritative_orca_endpoint "$target" "$scoped_target" "fm-$task" || {
       echo "error: child Orca endpoint authority or quiescence is unproven for $task" >&2
       return 1
@@ -1116,7 +1152,6 @@ require_treehouse_task_lease_or_returned() {
     *) return 1 ;;
   esac
 }
-
 require_treehouse_return_authority() {
   local worktree=$1 project=$2 worktree_root project_root worktree_common project_common
   worktree_root=$(exact_git_worktree_root "$worktree") || return 1
@@ -1131,7 +1166,7 @@ require_treehouse_return_authority() {
     echo "error: Treehouse return target $worktree_root is not registered to $project_root" >&2
     return 1
   }
-  require_treehouse_task_lease "$worktree_root" "$3"
+  fm_treehouse_require_task_lease "$worktree_root" "$3"
 }
 
 validate_teardown_target_identity() {
@@ -1142,6 +1177,14 @@ validate_teardown_target_identity() {
     echo "error: teardown project metadata is not an exact inspectable repository root: ${PROJ:-<missing>}" >&2
     return 1
   }
+  # A legacy scout can outlive its scratch worktree while its exact runtime
+  # endpoint remains. There is no worktree mutation left to authorize in that
+  # case; retain the project-root proof and let the backend's endpoint identity
+  # checks decide whether the recorded terminal can be quiesced.
+  if [ "$KIND" = scout ] && [ "$BACKEND" != orca ] \
+    && [ ! -e "$WT" ] && [ ! -L "$WT" ]; then
+    return 0
+  fi
   worktree_root=$(exact_git_worktree_root "$WT") || {
     echo "error: teardown worktree metadata is not an exact inspectable repository root: ${WT:-<missing>}" >&2
     return 1
@@ -2073,19 +2116,17 @@ import sys
 
 home, state_path = sys.argv[1:]
 try:
-    if os.path.islink(state_path):
-        raise OSError("state directory must not be a symlink")
-    metadata = os.stat(state_path)
+    home_root = os.path.realpath(home)
+    state_root = os.path.realpath(state_path)
+    if state_root == home_root or os.path.commonpath((home_root, state_root)) != home_root:
+        raise OSError("state directory resolves outside its secondmate home")
+    metadata = os.stat(state_root)
     permissions = stat.S_IMODE(metadata.st_mode)
     if not stat.S_ISDIR(metadata.st_mode):
         raise NotADirectoryError(state_path)
     if not permissions & 0o444 or not permissions & 0o111:
         raise PermissionError("state directory is unreadable")
-    home_root = os.path.realpath(home)
-    state_root = os.path.realpath(state_path)
-    if state_root != os.path.join(home_root, "state"):
-        raise OSError("state directory resolves outside its secondmate home")
-    with os.scandir(state_path) as entries:
+    with os.scandir(state_root) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
             metadata = entry.stat(follow_symlinks=False)
             if not entry.name.endswith(".meta"):
@@ -2096,7 +2137,7 @@ try:
                 raise PermissionError(f"unreadable child metadata entry: {entry.path}")
             if any(character in entry.path for character in ("\n", "\r")):
                 raise OSError("child metadata path contains unsupported control characters")
-            print(entry.path)
+            print(os.path.join(state_root, entry.name))
 except OSError as error:
     print(
         f"REFUSED: secondmate child state is unprovable at {state_path}: {error}",
@@ -2363,30 +2404,16 @@ safe_rm_rf_child_worktree() {
 }
 
 safe_remove_task_tmp() {
-  local target=$1 base
+  local target=$1
   [ -n "$target" ] || return 0
-  [ "$target" = "/tmp/fm-$ID" ] || return 1
-  base=$(python3 - <<'PY'
-import os
-import stat
-
-base = os.path.realpath("/tmp")
-if base not in ("/tmp", "/private/tmp"):
-    raise SystemExit(1)
-current = os.path.sep
-for component in base.split(os.path.sep):
-    if not component:
-        continue
-    current = os.path.join(current, component)
-    metadata = os.lstat(current)
-    if stat.S_ISLNK(metadata.st_mode):
-        raise SystemExit(1)
-if not stat.S_ISDIR(os.lstat(base).st_mode):
-    raise SystemExit(1)
-print(base)
-PY
-  ) || return 1
-  removal_tree_operation "$base/fm-$ID" "task temp root" remove
+  if [ "$TASK_TMP_PHASE" = not-created ]; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      echo "REFUSED: not-created task temp phase has a task temp root for $ID: $target" >&2
+      return 1
+    fi
+    return 0
+  fi
+  fm_account_safe_remove_task_tmp "$ID" "$target" "$TASK_GENERATION"
 }
 
 remove_worktree_compatibility_artifacts() {
@@ -2508,6 +2535,10 @@ validate_secondmate_home_landed_state() {
     $0 == "?? .claude/settings.local.json" { next }
     $0 == "?? .opencode/plugins/fm-turn-end.js" { next }
     $0 == "?? .fm-grok-turnend" { next }
+    $0 == "?? config" { next }
+    $0 == "?? data" { next }
+    $0 == "?? projects" { next }
+    $0 == "?? state" { next }
     $0 != "" { print }
   ')
   [ -z "$unsafe" ] || {
@@ -2917,9 +2948,15 @@ def inspect(objects):
         return
     visited.add(identity)
     object_device = metadata.st_dev
+    entries = []
     for name in sorted(os.listdir(directory)):
         path = os.path.join(objects, name)
         item = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        entries.append((name, path, item))
+    if objects != initial:
+        os.close(directory)
+        held[-1] = (objects, None, held[-1][2])
+    for name, path, item in entries:
         if item.st_dev != object_device:
             raise OSError(f"object storage crosses a filesystem boundary: {path}")
         if stat.S_ISLNK(item.st_mode):
@@ -2935,9 +2972,6 @@ def inspect(objects):
     if os.path.lexists(http_alternates):
         raise OSError(f"HTTP alternates are not durable proof: {http_alternates}")
     if not os.path.lexists(alternates):
-        if objects != initial:
-            os.close(directory)
-            held[held_index] = (objects, None, held[held_index][2])
         return
     alternate_fd, _ = retain(alternates, False, True)
     with os.fdopen(os.dup(alternate_fd), "r", encoding="utf-8") as stream:
@@ -2949,9 +2983,6 @@ def inspect(objects):
             raise OSError(f"quoted alternates are ambiguous: {alternates}")
         candidate = entry if os.path.isabs(entry) else os.path.join(objects, entry)
         inspect(os.path.realpath(candidate))
-    if objects != initial:
-        os.close(directory)
-        held[held_index] = (objects, None, held[held_index][2])
 
 def verify_retained():
     for path, descriptor, expected in held:
@@ -2974,6 +3005,12 @@ def verify_retained():
         if current != expected or retained != expected or stat.S_ISLNK(metadata.st_mode):
             raise OSError(f"object storage identity changed during graph proof: {path}")
 
+def release_nested_descriptors():
+    for index, (path, descriptor, expected) in enumerate(held[1:], start=1):
+        if descriptor is not None:
+            os.close(descriptor)
+            held[index] = (path, None, expected)
+
 def run(arguments, input_data=None):
     environment = os.environ.copy()
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
@@ -2991,6 +3028,7 @@ def run(arguments, input_data=None):
 
 try:
     inspect(initial)
+    release_nested_descriptors()
     marker = os.environ.get("FM_TEARDOWN_TEST_OBJECT_SCAN_MARKER", "")
     release = os.environ.get("FM_TEARDOWN_TEST_OBJECT_SCAN_RELEASE", "")
     scan_root = os.environ.get("FM_TEARDOWN_TEST_OBJECT_SCAN_ROOT", "")
@@ -3260,6 +3298,7 @@ EOF
   }
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
+    [ "$ref" != refs/stash ] || continue
     git -C "$repository" cat-file -e "$ref^{object}" 2>/dev/null || {
       echo "REFUSED: $label ref $ref depends on unavailable objects" >&2
       return 1
@@ -3910,7 +3949,7 @@ EOF
 validate_secondmate_project_clones() {
   local home=$1 registry=$2 expected_id=$3 expected_source=$4 projects_root source_projects_root
   local source_projects_candidate
-  local expected listed project clone source_clone repositories relative repository source_repository
+  local home_root expected listed project clone source_clone repositories relative repository source_repository
   if ! expected=$(fm_secondmate_registry_query "$registry" query "$expected_id" projects); then
     if [ "$registry" = "$PREPARED_REGISTRY_PATH" ] \
         && [ "$expected_id" = "$PREPARED_REGISTRY_ID" ] \
@@ -3924,7 +3963,12 @@ validate_secondmate_project_clones() {
       return 1
     fi
   fi
-  projects_root=$(fm_checkout_trusted_dir "$home/projects") || {
+  home_root=$(canonical_existing_dir "$home") || return 1
+  projects_root=$(cd "$home/projects" 2>/dev/null && pwd -P) || {
+    echo "REFUSED: secondmate projects directory is missing, redirected, or unreadable at $home/projects" >&2
+    return 1
+  }
+  path_is_ancestor_of "$home_root" "$projects_root" || {
     echo "REFUSED: secondmate projects directory is missing, redirected, or unreadable at $home/projects" >&2
     return 1
   }
@@ -4009,6 +4053,7 @@ EOF
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} expected_source=${4:-$FM_ROOT} expected_registry=${5:-} expected_project
   local abs_home_path metadata_home_root marker_id source_authority=${7:-1}
+  local project_authority=${8:-1}
   expected_project=${6:-$home}
   [ -n "$home" ] && [ -e "$home" ] || {
     echo "REFUSED: missing $label removal target ${home:-<empty>}" >&2
@@ -4048,7 +4093,7 @@ validate_firstmate_home_for_removal() {
       "secondmate top-level source repository" "$abs_home_path" || return 1
   fi
   if [ -n "$expected_id" ] && firstmate_home_has_treehouse_slot "$abs_home_path" "$expected_source"; then
-    require_treehouse_task_lease "$abs_home_path" "$expected_id" || return 1
+    fm_treehouse_require_task_lease "$abs_home_path" "$expected_id" || return 1
   fi
   # Structural proofs run BEFORE the landed-state (cleanliness) proof. Every proof
   # here is read-only and every one of them already runs before any destruction, so
@@ -4060,7 +4105,7 @@ validate_firstmate_home_for_removal() {
   # problem that has nothing to do with unlanded work. The more specific proof now
   # speaks first. Each still returns non-zero on its own failure, so a home with
   # both a structural violation and genuinely unlanded work is still refused.
-  if [ -n "$expected_id" ]; then
+  if [ -n "$expected_id" ] && [ "$project_authority" -eq 1 ]; then
     validate_secondmate_project_clones \
       "$abs_home_path" "$expected_registry" "$expected_id" "$expected_source" || return 1
   fi
@@ -4178,7 +4223,7 @@ validate_firstmate_home_children_removal() {
       child_proj=$(meta_value "$child_meta" project)
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
-      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" >/dev/null || return 1
+      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" "$home" "$home/data/secondmates.md" "$child_proj" 1 >/dev/null || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
     elif [ "$child_backend" = orca ]; then
       require_orca_task_metadata_identity "$child_meta" "$child_id" || return 1
@@ -4192,7 +4237,7 @@ validate_firstmate_home_children_removal() {
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       child_proj=$(meta_value "$child_meta" project)
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-      require_treehouse_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
+      fm_treehouse_require_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
       validate_child_worktree_landed_state "$child_meta" "$child_id" "$child_wt" "$child_proj" || return 1
     else
       echo "error: retained child metadata for $child_id because its Treehouse worktree is missing or uninspectable" >&2
@@ -4284,7 +4329,7 @@ cleanup_firstmate_home_children() {
         return 1
       fi
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-      require_treehouse_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
+      fm_treehouse_require_task_lease "$(canonical_existing_dir "$child_wt")" "firstmate-$child_id" || return 1
     fi
     if managed_account_meta "$child_meta"; then
       child_endpoint_home=$(fm_backend_endpoint_home "$child_backend" "$child_kind" "$home" "$child_home")
@@ -4530,7 +4575,7 @@ if [ "$KIND" = secondmate ]; then
     exit 1
   }
   validate_firstmate_home_for_removal \
-    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 \
+    "$HOME_PATH" "secondmate home" "$ID" "$FM_ROOT" "$SECONDMATE_REG" "$PROJ" 0 0 \
     >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
@@ -4585,6 +4630,12 @@ quiesce_task_endpoint() {
   zellij_tab=$(meta_value "$META" zellij_tab_id)
   scoped_target=$(meta_value "$META" tmux_session_target)
   [ "$BACKEND" != orca ] || scoped_target=$ORCA_WORKTREE_ID
+  if [ "$BACKEND" = zellij ] && [ -n "$zellij_tab" ]; then
+    fm_backend_kill "$BACKEND" "$T" "$zellij_tab" "fm-$ID" "$scoped_target" 2>/dev/null || {
+      echo "error: failed to stop task endpoint for $ID; retaining metadata" >&2
+      return 1
+    }
+  fi
   if [ "$BACKEND" = orca ]; then
     quiesce_authoritative_orca_endpoint "$T" "$ORCA_WORKTREE_ID" "fm-$ID" || {
       echo "error: task Orca endpoint authority or quiescence is unproven for $ID; retaining metadata" >&2
@@ -4798,7 +4849,7 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     exit 1
   }
   direct_spawn_restore_lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-  if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 \
+  if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 "$TASK_GENERATION" \
     || ! fm_account_meta_merge_extensions "$META" "$direct_spawn_backup_path" \
     || ! fm_account_safe_file_destination "$META" \
     || ! mv "$direct_spawn_backup_path" "$META"; then
@@ -4854,7 +4905,7 @@ EOF
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
+# Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"

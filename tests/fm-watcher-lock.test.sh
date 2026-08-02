@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # tests/fm-watcher-lock.test.sh - watcher singleton + lock-primitive races +
 # PID identity stability + watch-arm liveness + guard warnings. These are
 # safety-critical process invariants (a race bug may not reproduce through an

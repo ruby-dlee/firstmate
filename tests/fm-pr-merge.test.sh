@@ -14,6 +14,7 @@
 #   (f) malformed PR URL fails fast without calling gh-axi
 #   (g) explicit merge method is not overridden by the default --squash
 #   (h) repo override args fail fast because the repo comes from the URL
+#   (i) merge-queue acceptance is not reported as success unless PR state is merged
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -49,6 +50,36 @@ add_gh_mocks() {
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view") printf '%s\n' "pull_request:" "  number: ${3:-}" "  state: merged" ; exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *headRefOid*) printf '%s\n' '$head' ; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+}
+
+# gh-axi mock for the merge-queue false-success shape: the merge command itself
+# returns zero, but the subsequent independent PR view still reports open.
+add_gh_mocks_merge_accepted_not_merged() {
+  local case_dir=$1 head=$2
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view") printf '%s\n' "pull_request:" "  number: ${3:-}" "  state: open" ; exit 0 ;;
+  "pr merge") printf '%s\n' "merged:" "  number: ${3:-}" "  status: ok" "  method: squash" ; exit 0 ;;
+esac
 exit 0
 SH
   cat > "$case_dir/fakebin/gh" <<SH
@@ -113,6 +144,10 @@ test_records_pr_and_head_before_merging() {
     "records-before-merge: pr_head= was not recorded"
   grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
+  grep -qxF 'pr view 9 --repo example/repo' "$case_dir/gh-axi.log" \
+    || fail "records-before-merge: gh-axi pr view was not invoked to verify the merge"
+  assert_grep 'observed_state: merged' "$case_dir/stdout" \
+    "records-before-merge: successful merge did not report confirmed merged state"
   pass "fm-pr-merge records pr= and pr_head= before invoking gh-axi pr merge"
 }
 
@@ -133,6 +168,35 @@ test_merge_failure_propagates_after_recording() {
   assert_grep 'pr=https://github.com/example/repo/pull/13' "$case_dir/state/task-x1.meta" \
     "merge-fails: pr= should already be recorded even though the merge itself failed"
   pass "fm-pr-merge propagates a real merge failure without silently succeeding"
+}
+
+test_merge_queue_acceptance_is_not_success() {
+  local case_dir rc
+  case_dir=$(make_case queued-not-merged)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks_merge_accepted_not_merged "$case_dir" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/42 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "queued-not-merged: fm-pr-merge must not exit zero for an unconfirmed merge"
+  assert_grep 'status: enqueued' "$case_dir/stdout" \
+    "queued-not-merged: unmerged queue acceptance was not reported as enqueued"
+  assert_grep 'observed_state: open' "$case_dir/stdout" \
+    "queued-not-merged: observed open state was not reported"
+  assert_no_grep 'status: ok' "$case_dir/stdout" \
+    "queued-not-merged: helper reported success without a confirmed merged state"
+  assert_grep 'still reports example/repo#42 as open' "$case_dir/stderr" \
+    "queued-not-merged: refusal did not explain the observed open state"
+  grep -qxF 'pr merge 42 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+    || fail "queued-not-merged: gh-axi pr merge was not invoked"
+  grep -qxF 'pr view 42 --repo example/repo' "$case_dir/gh-axi.log" \
+    || fail "queued-not-merged: gh-axi pr view was not invoked to verify the merge"
+  pass "fm-pr-merge treats merge-queue acceptance as enqueued, not merged success"
 }
 
 test_extra_merge_args_forwarded() {
@@ -297,6 +361,7 @@ test_parses_pr_url_for_gh_axi() {
 
 test_records_pr_and_head_before_merging
 test_merge_failure_propagates_after_recording
+test_merge_queue_acceptance_is_not_success
 test_extra_merge_args_forwarded
 test_missing_meta_refuses_before_merge
 test_malformed_url_refuses_before_merge

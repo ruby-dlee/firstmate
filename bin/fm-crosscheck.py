@@ -4734,6 +4734,7 @@ def merge_crosschecked(
     method: str,
     title: str | None,
     body: str | None,
+    allow_queue: bool,
 ) -> int:
     require(
         os.environ.get("FM_GATE_REFUSE_BYPASS") == "1"
@@ -4748,9 +4749,16 @@ def merge_crosschecked(
     )
     adapter = load_github_adapter(root)
     try:
-        result = adapter.merge_exact(url, reviewed_head, method, title, body)
+        result = adapter.merge_exact(
+            url,
+            reviewed_head,
+            method,
+            title,
+            body,
+            allow_queue=allow_queue,
+        )
     except adapter.GitHubContractError as exc:
-        fail(f"atomic GitHub merge failed closed: {exc}")
+        fail(f"atomic GitHub merge or enqueue failed closed: {exc}")
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -4767,6 +4775,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("pr_url")
     merge.add_argument("expected_sha")
     merge.add_argument("method", choices=("merge", "squash", "rebase"))
+    merge.add_argument("--allow-queue", action="store_true")
     merge.add_argument("--title")
     merge.add_argument("--body")
     return parser
@@ -4835,6 +4844,7 @@ def main() -> int:
                 args.method,
                 args.title,
                 args.body,
+                args.allow_queue,
             )
     except CrosscheckBlockingError as exc:
         print(f"CROSSCHECK BLOCKING: {exc}", file=sys.stderr)

@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# Deterministic before/after bridge for Claude Code context compaction.
+# Deterministic and judgment-aware bridge for Claude Code context compaction.
 #
 # The tracked .claude/settings.json invokes `capture` from PreCompact and
 # `recover` from SessionStart with matcher `compact`.
-# Capture atomically replaces data/autocompact-resume.md with a fresh local-only
-# view of durable fleet state before either manual or automatic compaction.
+# Capture first atomically replaces data/autocompact-resume.md with a fresh
+# local-only view of durable fleet state before either manual or automatic
+# compaction.
+# It then gives the human-visible transcript to a separate bounded, tool-free
+# Claude process, which applies validated compare-before-replace edits only to
+# captain.md, learnings.md, and backlog.md.
+# The anchor starts with a loud incomplete judgment status and is upgraded only
+# after the bounded worker finishes, so a worker failure or outer hook timeout
+# cannot masquerade as a clean handoff.
 # Recover prints that anchor and a fresh fm-session-start.sh digest to stdout,
 # which Claude Code injects into the compacted context before the next model
 # request.
 #
-# This script intentionally does not run /stow.
-# A shell hook cannot make the model judge conversation-only knowledge, so the
-# stow skill remains the one owner of that routing and must run periodically in
-# long Claude sessions before compaction pressure becomes acute.
+# The worker reads the canonical stow, knowledge-routing, and memory-hygiene
+# contracts from tracked sources rather than duplicating them here.
+# Interactive /stow remains available for deliberate sweeps at other reset or
+# handoff boundaries.
 #
 # The hook is inert outside a primary firstmate checkout.
 # A plain main home is confirmed by equal git-dir and git-common-dir paths.
@@ -28,6 +35,14 @@
 # Usage:
 #   <PreCompact JSON | bin/fm-autocompact.sh capture
 #   <SessionStart JSON | bin/fm-autocompact.sh recover
+#
+# Judgment defaults may be overridden with:
+#   FM_AUTOCOMPACT_JUDGMENT_TIMEOUT_SECONDS=120
+#   FM_AUTOCOMPACT_JUDGMENT_MAX_INPUT_BYTES=600000
+#   FM_AUTOCOMPACT_JUDGMENT_MODEL=sonnet
+#   FM_AUTOCOMPACT_JUDGMENT_MAX_BUDGET_USD=0.50
+# `FM_AUTOCOMPACT_JUDGMENT=off` is a diagnostic/test escape hatch that always
+# leaves a loud FAILED status in the anchor.
 set -u
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
@@ -43,9 +58,11 @@ usage() {
 usage: fm-autocompact.sh capture|recover
 
 Reads a Claude Code hook payload from stdin.
-capture accepts PreCompact payloads and atomically writes the durable resume anchor.
+capture accepts PreCompact payloads, atomically writes the durable resume anchor, and runs bounded judgment capture.
 recover accepts SessionStart source=compact payloads and prints the anchor plus a fresh session-start digest.
 The script is a silent no-op outside a primary firstmate checkout.
+Judgment defaults are 120 seconds, 600000 input bytes, model sonnet, and a USD 0.50 maximum worker budget.
+FM_AUTOCOMPACT_JUDGMENT=off disables only judgment and leaves a loud FAILED anchor status.
 EOF
 }
 
@@ -218,14 +235,14 @@ else
 fi
 
 render_anchor() {
-  local meta id meta_found=0
+  local judgment_status=$1 meta id meta_found=0
   printf '# Autocompact resume anchor\n\n' || return 1
+  printf '%s\n\n' "$judgment_status" || return 1
   printf "Generated: \`%s\`\n" "$generated" || return 1
   printf "Trigger: \`%s\`\n" "$trigger" || return 1
   printf "Session: \`%s\`\n" "$session_id" || return 1
   printf "Transcript: \`%s\`\n\n" "$transcript" || return 1
-  printf 'This file is the deterministic bridge across Claude Code context compaction.\n' || return 1
-  printf "It captures durable file state only and does not replace the judgment-based \`stow\` skill.\n" || return 1
+  printf 'This file is the deterministic bridge across Claude Code context compaction plus the status of its additive judgment capture.\n' || return 1
   printf "The compact-sourced SessionStart hook prints this anchor and then runs \`bin/fm-session-start.sh\` for normal lock, wake, backlog, task, and endpoint reconciliation.\n\n" || return 1
   printf '## Fleet pickup snapshot\n\n' || return 1
   printf '    %s\n' "${snapshot//$'\n'/$'\n    '}" || return 1
@@ -248,7 +265,7 @@ render_anchor() {
 }
 
 capture_anchor() {
-  local trigger session_id transcript generated snapshot tmp
+  local trigger session_id transcript generated snapshot tmp judgment_status judgment_rc
   trigger=$(json_string_field trigger "$PAYLOAD") \
     || capture_failed 'invalid PreCompact payload'
   case "$trigger" in
@@ -295,7 +312,8 @@ capture_anchor() {
   umask 077
   tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") \
     || capture_failed 'could not allocate a temporary anchor'
-  render_anchor > "$tmp" || {
+  judgment_status='Judgment capture: FAILED - bounded transcript judgment has not completed; if this line survives, conversation-only durable knowledge may have been lost.'
+  render_anchor "$judgment_status" > "$tmp" || {
     rm -f "$tmp" || capture_failed 'could not clean the incomplete temporary anchor'
     capture_failed 'could not render the resume anchor'
   }
@@ -303,6 +321,58 @@ capture_anchor() {
     rm -f "$tmp" || capture_failed 'could not clean the unpublished temporary anchor'
     capture_failed 'could not publish the resume anchor atomically'
   }
+
+  if [ "${FM_AUTOCOMPACT_JUDGMENT:-on}" = off ]; then
+    judgment_status='Judgment capture: FAILED - judgment capture was disabled; conversation-only durable knowledge may have been lost.'
+  elif ! command -v python3 >/dev/null 2>&1; then
+    judgment_status='Judgment capture: FAILED - python3 is unavailable, so conversation-only durable knowledge may have been lost.'
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT FAILED: python3 is unavailable.' >&2
+  else
+    judgment_status=$(
+      python3 "$SCRIPT_DIR/fm-autocompact-judgment.py" \
+        --root "$SCRIPT_DIR/.." \
+        --data "$DATA" \
+        --transcript "$transcript" \
+        --session-id "$session_id" \
+        --timeout-seconds "${FM_AUTOCOMPACT_JUDGMENT_TIMEOUT_SECONDS:-120}" \
+        --max-input-bytes "${FM_AUTOCOMPACT_JUDGMENT_MAX_INPUT_BYTES:-600000}" \
+        --model "${FM_AUTOCOMPACT_JUDGMENT_MODEL:-sonnet}" \
+        --max-budget-usd "${FM_AUTOCOMPACT_JUDGMENT_MAX_BUDGET_USD:-0.50}" \
+        --claude-command "${FM_AUTOCOMPACT_JUDGMENT_CLAUDE:-claude}"
+    )
+    judgment_rc=$?
+    if [ "$judgment_rc" -ne 0 ]; then
+      case "$judgment_rc" in
+        75)
+          judgment_status='Judgment capture: FAILED - a concurrent data change prevented safe publication; conversation-only durable knowledge may have been lost.'
+          ;;
+        124)
+          judgment_status="Judgment capture: FAILED - the bounded worker exceeded its ${FM_AUTOCOMPACT_JUDGMENT_TIMEOUT_SECONDS:-120}s budget; conversation-only durable knowledge may have been lost."
+          ;;
+        *)
+          judgment_status='Judgment capture: FAILED - the isolated transcript worker could not complete; conversation-only durable knowledge may have been lost.'
+          ;;
+      esac
+    fi
+  fi
+
+  tmp=$(mktemp "$DATA/.autocompact-resume.md.XXXXXX") || {
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not allocate a status-update anchor; the existing loud incomplete status remains authoritative.' >&2
+    return 0
+  }
+  if ! awk -v status="$judgment_status" '
+      NR == 3 && /^Judgment capture:/ { $0 = status; replaced = 1 }
+      { print }
+      END { if (!replaced) exit 1 }
+    ' "$ANCHOR" > "$tmp"; then
+    rm -f "$tmp"
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not update the anchor status; the existing loud incomplete status remains authoritative.' >&2
+    return 0
+  fi
+  if ! mv -f "$tmp" "$ANCHOR"; then
+    rm -f "$tmp"
+    printf '%s\n' 'FIRSTMATE AUTOCOMPACT JUDGMENT WARNING: could not publish the anchor status; the existing loud incomplete status remains authoritative.' >&2
+  fi
 }
 
 recover_context() {

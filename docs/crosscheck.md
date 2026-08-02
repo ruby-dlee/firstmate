@@ -119,8 +119,8 @@ bin/fm-crosscheck.sh verify <task-id> <https://github.com/owner/repo/pull/number
 Verification re-reads the live PR head and complete claims document.
 It requires the latest attempt matching that head and the stable PR number/title/body claims digest to be clear, then prints only the exact reviewed SHA.
 Dynamic check counts in the full `gh-axi` document remain visible to the reviewer but are excluded from the digest so CI completing in parallel does not invalidate an otherwise exact review.
-The merge helper sends that SHA in GitHub's atomic merge request.
-A force-push before verification invalidates the ledger match, while a force-push after verification makes GitHub reject the expected-head merge request.
+The merge helper sends that SHA in GitHub's atomic expected-head merge or enqueue request.
+A force-push before verification invalidates the ledger match, while a force-push after verification makes GitHub reject the expected-head merge or enqueue request.
 
 ## Finding lifecycle
 
@@ -313,7 +313,7 @@ The real installed-tool exercise is separate and network-dependent: the dated `g
 
 Crosscheck supports immediate `merge`, `squash`, and `rebase` methods plus commit title and body fields.
 It rejects `--auto` because an asynchronous merge would escape the immediate expected-head request.
-It rejects `--delete-branch` because branch deletion is not part of the atomic merge operation.
+It rejects `--delete-branch` because branch deletion is not part of the atomic merge or enqueue operation.
 Delete a branch only in a later separately authorized action after the merge is confirmed.
 
 Reviewer-generated commands execute in a non-login shell, so evidence never depends on the operator's shell profile.

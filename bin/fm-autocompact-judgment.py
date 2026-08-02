@@ -437,6 +437,8 @@ def publish_changes(
             )
 
     staged: dict[str, Path] = {}
+    backups: dict[str, Path | None] = {}
+    published: list[str] = []
     try:
         for name, content in changes.items():
             fd, temp_name = tempfile.mkstemp(
@@ -450,14 +452,32 @@ def publish_changes(
                 stream.flush()
                 os.fsync(stream.fileno())
 
+            target = data / name
+            if snapshots[name][0]:
+                backup_fd, backup_name = tempfile.mkstemp(
+                    prefix=f".autocompact-judgment-backup-{name}.", dir=data
+                )
+                os.close(backup_fd)
+                backup_path = Path(backup_name)
+                shutil.copyfile(target, backup_path, follow_symlinks=False)
+                with backup_path.open("rb") as backup_stream:
+                    os.fsync(backup_stream.fileno())
+                backups[name] = backup_path
+            else:
+                backups[name] = None
+
         for name in changes:
             present, content = snapshots[name]
             if not current_bytes_match(data / name, present, content):
                 raise CaptureError(
                     f"{name} changed before atomic publication", EXIT_CONCURRENT
                 )
+        fail_after = os.environ.get("FM_AUTOCOMPACT_TEST_FAIL_PUBLISH_AFTER")
         for name, temp_path in staged.items():
+            if fail_after is not None and len(published) >= int(fail_after):
+                raise OSError("injected publication failure")
             os.replace(temp_path, data / name)
+            published.append(name)
         directory_fd = os.open(data, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -466,9 +486,24 @@ def publish_changes(
     except CaptureError:
         raise
     except OSError as exc:
+        rollback_error: OSError | None = None
+        for name in reversed(published):
+            try:
+                backup = backups[name]
+                if backup is None:
+                    (data / name).unlink()
+                else:
+                    os.replace(backup, data / name)
+            except OSError as rollback_exc:
+                rollback_error = rollback_exc
+        if rollback_error is not None:
+            raise CaptureError(
+                f"cannot publish or roll back judgment capture: {exc}; {rollback_error}",
+                EXIT_APPLY,
+            ) from rollback_error
         raise CaptureError(f"cannot publish judgment capture: {exc}", EXIT_APPLY) from exc
     finally:
-        for temp_path in staged.values():
+        for temp_path in (*staged.values(), *(path for path in backups.values() if path)):
             try:
                 temp_path.unlink()
             except FileNotFoundError:
@@ -543,7 +578,15 @@ def main() -> int:
                 raise CaptureError("another judgment capture owns the data lock", EXIT_CONCURRENT) from exc
             result = run_worker(args, base_payload)
             changes = validate_and_build(result, snapshots)
-            publish_changes(data, snapshots, changes)
+            writer_lock_path = data / ".firstmate-data-write.lock"
+            writer_lock_fd = os.open(writer_lock_path, lock_flags, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(writer_lock_fd).st_mode):
+                    raise CaptureError("unsafe shared data-writer lock", EXIT_CONCURRENT)
+                fcntl.flock(writer_lock_fd, fcntl.LOCK_EX)
+                publish_changes(data, snapshots, changes)
+            finally:
+                os.close(writer_lock_fd)
         finally:
             os.close(lock_fd)
 

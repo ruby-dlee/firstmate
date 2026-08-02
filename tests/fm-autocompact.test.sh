@@ -43,8 +43,12 @@ case "$FM_FAKE_JUDGMENT_MODE" in
     printf '%s\n' '{"is_error":false,"structured_output":{"result":"changes","summary":"captain preference","edits":[{"path":"captain.md","old_text":"# Captain preferences\n\n- Prefer concise reports.\n","new_text":"# Captain preferences\n\n- Prefer concise reports.\n- Use UTC timestamps in completion reports.\n","reason":"durable working-style preference"}]}}'
     ;;
   concurrent)
-    printf '%s\n' '# Captain preferences' '' '- Concurrent writer owns this value.' > "$FM_FAKE_CAPTAIN"
+    "$FM_FAKE_DATA_WRITER" --data "$FM_FAKE_DATA" -- sh -c \
+      'printf "%s\n" "# Captain preferences" "" "- Concurrent writer owns this value." > "$1"' sh "$FM_FAKE_CAPTAIN"
     printf '%s\n' '{"is_error":false,"structured_output":{"result":"changes","summary":"captain preference","edits":[{"path":"captain.md","old_text":"# Captain preferences\n\n- Prefer concise reports.\n","new_text":"# Captain preferences\n\n- Prefer concise reports.\n- Use UTC timestamps in completion reports.\n","reason":"durable working-style preference"}]}}'
+    ;;
+  multi)
+    printf '%s\n' '{"is_error":false,"structured_output":{"result":"changes","summary":"preference and learning","edits":[{"path":"captain.md","old_text":"# Captain preferences\n","new_text":"# Captain preferences\n\n- Prefer UTC.\n","reason":"preference"},{"path":"learnings.md","old_text":"# Fleet learnings\n","new_text":"# Fleet learnings\n\n- Preserve writer locks.\n","reason":"learning"}]}}'
     ;;
   timeout)
     sleep 30
@@ -330,6 +334,8 @@ EOF
   printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-concurrent\",\"transcript_path\":\"$transcript\"}" \
     | FM_FAKE_JUDGMENT_MODE=concurrent \
       FM_FAKE_CAPTAIN="$home/data/captain.md" \
+      FM_FAKE_DATA="$home/data" \
+      FM_FAKE_DATA_WRITER="$ROOT/bin/fm-data-write.py" \
       FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
       FM_ROOT_OVERRIDE="$root" \
       FM_HOME="$home" \
@@ -339,6 +345,36 @@ EOF
   anchor="$home/data/autocompact-resume.md"
   assert_grep 'concurrent data change prevented safe publication' "$anchor" "concurrent refusal was not surfaced in the anchor"
   pass "compare-before-replace refuses to corrupt a concurrent private-memory write"
+}
+
+test_partial_publication_failure_rolls_back_every_file() {
+  local rec root home transcript fake captain_before learnings_before anchor
+  rec=$(new_primary judgment-rollback)
+  IFS='|' read -r root home <<EOF
+$rec
+EOF
+  transcript="$home/transcript.jsonl"
+  write_transcript "$transcript" 'Remember my UTC preference and the writer-lock learning.'
+  printf '%s\n' '# Captain preferences' > "$home/data/captain.md"
+  printf '%s\n' '# Fleet learnings' > "$home/data/learnings.md"
+  printf '%s\n' '# Backlog' '## In flight' '## Queued' '## Done' > "$home/data/backlog.md"
+  captain_before=$(cat "$home/data/captain.md")
+  learnings_before=$(cat "$home/data/learnings.md")
+  fake=$(fake_judgment_claude "$home/fake-rollback" multi)
+
+  printf '%s\n' "{\"hook_event_name\":\"PreCompact\",\"trigger\":\"auto\",\"session_id\":\"session-rollback\",\"transcript_path\":\"$transcript\"}" \
+    | FM_FAKE_JUDGMENT_MODE=multi \
+      FM_AUTOCOMPACT_TEST_FAIL_PUBLISH_AFTER=1 \
+      FM_AUTOCOMPACT_JUDGMENT_CLAUDE="$fake" \
+      FM_ROOT_OVERRIDE="$root" \
+      FM_HOME="$home" \
+      "$AUTOCOMPACT" capture >/dev/null 2>&1
+
+  [ "$(cat "$home/data/captain.md")" = "$captain_before" ] || fail "partial failure did not roll captain.md back"
+  [ "$(cat "$home/data/learnings.md")" = "$learnings_before" ] || fail "partial failure changed learnings.md"
+  anchor="$home/data/autocompact-resume.md"
+  assert_grep 'Judgment capture: FAILED' "$anchor" "partial publication failure was not loud"
+  pass "a partial multi-file publication failure rolls every destination back"
 }
 
 test_older_worker_cannot_complete_newer_failed_anchor() {
@@ -502,6 +538,7 @@ test_judgment_capture_routes_conversation_only_preference
 test_judgment_failure_degrades_to_loud_deterministic_anchor
 test_judgment_timeout_is_bounded_inside_hook_budget
 test_concurrent_memory_change_is_never_overwritten
+test_partial_publication_failure_rolls_back_every_file
 test_older_worker_cannot_complete_newer_failed_anchor
 test_killed_lock_holder_cannot_block_future_anchor
 test_compact_sessionstart_injects_anchor_and_reconciles

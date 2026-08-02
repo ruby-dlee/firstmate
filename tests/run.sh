@@ -72,6 +72,7 @@ run_admitted() {
   token=$suite_root/admission.json
   rm -f "$token"
   write_token "$token" "$test_script" "$capability" || return 1
+  PATH="$TEST_DIR/herdr-guard-bin:$original_path" \
   FM_TEST_RUNNER_ACTIVE=firstmate-test-runner-v1 \
   FM_TEST_RUNNER_PID="$runner_pid" \
   FM_TEST_RUNNER_TOKEN="$token" \

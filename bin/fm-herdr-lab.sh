@@ -26,8 +26,9 @@
 # stop and delete, and forwarded run commands other than plain status/list
 # reads) also first re-prove that the default session is running, refusing
 # loudly on a stopped or unreadable default.
-# Provision records the running default session as a fleet-state tripwire and
-# teardown requires that record to be identical afterward.
+# Provision records the running default session, its workspace/tab/pane
+# topology, and its agent identities as a fleet-state tripwire. Teardown
+# requires that record to be identical afterward.
 # FM_HERDR_LAB_PROVISION_TIMEOUT_SECONDS is a whole number from 1 through 600.
 # It defaults to 120 so a loaded fleet gets a fair but bounded startup window.
 set -u
@@ -80,8 +81,12 @@ fm_herdr_lab_session_list() { # <session>
   fm_herdr_lab_raw "$1" session list --json
 }
 
+fm_herdr_lab_default_read() { # <herdr arguments...>
+  HERDR_SESSION=default herdr "$@" --session default
+}
+
 fm_herdr_lab_fleet_state() { # <session>
-  local name=$1 sessions snapshot
+  local name=$1 sessions workspaces tabs panes agents snapshot
   sessions=$(fm_herdr_lab_session_list "$name" 2>/dev/null) || {
     fm_herdr_lab_error "cannot read Herdr sessions for the fleet-state tripwire"
     return 1
@@ -97,7 +102,44 @@ fm_herdr_lab_fleet_state() { # <session>
     fm_herdr_lab_error "fleet-state tripwire requires exactly one named default session"
     return 1
   }
-  printf '%s\n' "$snapshot"
+  workspaces=$(fm_herdr_lab_default_read workspace list 2>/dev/null) || {
+    fm_herdr_lab_error "cannot read default workspaces for the fleet-state tripwire"
+    return 1
+  }
+  tabs=$(fm_herdr_lab_default_read tab list 2>/dev/null) || {
+    fm_herdr_lab_error "cannot read default tabs for the fleet-state tripwire"
+    return 1
+  }
+  panes=$(fm_herdr_lab_default_read pane list 2>/dev/null) || {
+    fm_herdr_lab_error "cannot read default panes for the fleet-state tripwire"
+    return 1
+  }
+  agents=$(fm_herdr_lab_default_read agent list 2>/dev/null) || {
+    fm_herdr_lab_error "cannot read default agents for the fleet-state tripwire"
+    return 1
+  }
+  jq -cn --argjson session "$snapshot" \
+    --argjson workspaces "$workspaces" --argjson tabs "$tabs" \
+    --argjson panes "$panes" --argjson agents "$agents" '
+    def stable:
+      walk(if type == "object" then
+        del(.agent_status, .status, .state, .activity, .last_activity,
+            .last_activity_at, .updated_at, .focused, .is_focused,
+            .active, .selected)
+      else . end);
+    def required_array($payload; $key):
+      if ($payload.result[$key] | type) == "array"
+      then ($payload.result[$key] | stable | sort_by(tojson))
+      else error("missing " + $key + " array")
+      end;
+    {session: $session,
+     workspaces: required_array($workspaces; "workspaces"),
+     tabs: required_array($tabs; "tabs"),
+     panes: required_array($panes; "panes"),
+     agents: required_array($agents; "agents")}' 2>/dev/null || {
+      fm_herdr_lab_error "default fleet topology or agent identity response was malformed"
+      return 1
+    }
 }
 
 fm_herdr_lab_prepare() { # <session>

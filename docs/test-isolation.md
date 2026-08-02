@@ -16,8 +16,11 @@ The only permitted lifecycle helpers inside a real-Herdr test are the wrappers i
 
 Each test runs in an owned process group.
 After the test exits, the runner reaps only processes still carrying that exact group identity.
-After a real-Herdr test exits, the runner tears down only its exact named lab through `bin/fm-herdr-lab.sh`, whose default-session tripwire must remain identical.
+After a real-Herdr test exits, the runner tears down only its exact named lab through `bin/fm-herdr-lab.sh`, whose default-session metadata, workspace/tab/pane topology, and agent identities must remain identical.
 No cleanup path enumerates and kills fleet panes, adopts an existing session, or targets the default session.
+
+The tripwire detects default server/session changes, removed or replaced fleet panes, and removed or replaced agent identities, including losses while the default server remains running.
+It intentionally ignores volatile agent status and focus/activity fields, so normal work can continue during a lab test; it cannot prove preservation of pane contents or process internals that Herdr's read APIs do not expose.
 
 Use `tests/run.sh --skip-herdr` for the explicit non-Herdr path.
 That option reports each skipped `herdr-lab` test and runs every hermetic test normally.

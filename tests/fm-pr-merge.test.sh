@@ -10,7 +10,7 @@
 #   (b) merge is refused when gh-axi pr merge itself fails (no silent success)
 #   (c) extra gh-axi pr merge args are forwarded after number and --repo
 #   (d) merge is refused before gh-axi when task meta is missing
-#   (e) PR URL is parsed to number + --repo for gh-axi without adding a method
+#   (e) PR URL is parsed to number + --repo for gh-axi with default --squash
 #   (f) malformed PR URL fails fast without calling gh-axi
 #   (g) explicit merge method is forwarded unchanged
 #   (h) repo override args fail fast because the repo comes from the URL
@@ -80,7 +80,12 @@ add_gh_mocks_merge_accepted_not_merged() {
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
 case "${1:-} ${2:-}" in
   "pr view") printf '%s\n' "pull_request:" "  number: ${3:-}" "  state: open" "  draft: no" ; exit 0 ;;
-  "pr merge") printf '%s\n' "merged:" "  number: ${3:-}" "  status: ok" "  method: default" ; exit 0 ;;
+  "pr merge")
+    case " $* " in
+      *" --squash "*) echo "error: the base branch merge queue owns the merge strategy" >&2 ; exit 1 ;;
+      *) printf '%s\n' "merged:" "  number: ${3:-}" "  status: ok" "  method: default" ; exit 0 ;;
+    esac
+    ;;
 esac
 exit 0
 SH
@@ -137,8 +142,10 @@ case "${1:-} ${2:-}" in
       || { echo "error: pr= was not recorded before enqueue" >&2; exit 91; }
     grep -qxF "pr_head=$FM_TEST_EXPECTED_HEAD" "$FM_TEST_META" \
       || { echo "error: pr_head= was not recorded before enqueue" >&2; exit 92; }
-    printf '%s\n' "merge:" "  number: ${3:-}" "  status: $FM_TEST_QUEUE_STATUS" "  method: default"
-    exit 0
+    case " $* " in
+      *" --squash "*) echo "error: the base branch merge queue owns the merge strategy" >&2 ; exit 1 ;;
+      *) printf '%s\n' "merge:" "  number: ${3:-}" "  status: $FM_TEST_QUEUE_STATUS" "  method: default" ; exit 0 ;;
+    esac
     ;;
 esac
 exit 0
@@ -216,14 +223,14 @@ test_records_pr_and_head_before_merging() {
     "records-before-merge: pr= was not recorded"
   assert_grep 'pr_head=deadbeefcafefeed0000000000000000deadbeef' "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr_head= was not recorded"
-  grep -qxF 'pr merge 9 --repo example/repo' "$case_dir/gh-axi.log" \
-    || fail "records-before-merge: gh-axi pr merge was not invoked without an explicit strategy"
+  grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+    || fail "records-before-merge: gh-axi pr merge was not invoked with default --squash"
   grep -qxF 'pr view 9 --repo example/repo' "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr view was not invoked to verify the merge"
   assert_grep 'observed_state: merged' "$case_dir/stdout" \
     "records-before-merge: successful merge did not report confirmed merged state"
-  assert_grep 'method: default' "$case_dir/stdout" \
-    "records-before-merge: no-method merge was not reported as using repository defaults"
+  assert_grep 'method: squash' "$case_dir/stdout" \
+    "records-before-merge: ordinary no-method merge was not reported as squash"
   pass "fm-pr-merge records pr= and pr_head= before invoking gh-axi pr merge"
 }
 
@@ -243,6 +250,10 @@ test_merge_failure_propagates_after_recording() {
   expect_code 1 "$rc" "merge-fails: fm-pr-merge should propagate the gh-axi merge failure"
   assert_grep 'pr=https://github.com/example/repo/pull/13' "$case_dir/state/task-x1.meta" \
     "merge-fails: pr= should already be recorded even though the merge itself failed"
+  grep -qxF 'pr merge 13 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+    || fail "merge-fails: unrelated failure did not come from the default squash attempt"
+  [ "$(grep -c '^pr merge ' "$case_dir/gh-axi.log")" -eq 1 ] \
+    || fail "merge-fails: unrelated merge error triggered a no-method retry"
   pass "fm-pr-merge propagates a real merge failure without silently succeeding"
 }
 
@@ -268,8 +279,10 @@ test_merge_queue_acceptance_is_not_success() {
     "queued-not-merged: helper reported success without a confirmed merged state"
   assert_grep 'still reports example/repo#42 as open' "$case_dir/stderr" \
     "queued-not-merged: refusal did not explain the observed open state"
+  grep -qxF 'pr merge 42 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+    || fail "queued-not-merged: default squash attempt was not invoked"
   grep -qxF 'pr merge 42 --repo example/repo' "$case_dir/gh-axi.log" \
-    || fail "queued-not-merged: gh-axi pr merge was not invoked"
+    || fail "queued-not-merged: queue-specific no-method retry was not invoked"
   grep -qxF 'pr view 42 --repo example/repo' "$case_dir/gh-axi.log" \
     || fail "queued-not-merged: gh-axi pr view was not invoked to verify the merge"
   pass "fm-pr-merge treats merge-queue acceptance as enqueued, not merged success"
@@ -291,8 +304,10 @@ test_no_method_queue_statuses_are_not_merge_success() {
     set -e
 
     expect_code 1 "$rc" "queue-status-$status: queue acceptance must not exit zero"
+    grep -qxF 'pr merge 44 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+      || fail "queue-status-$status: default squash attempt was not invoked"
     grep -qxF 'pr merge 44 --repo example/repo' "$case_dir/gh-axi.log" \
-      || fail "queue-status-$status: no-method path added or changed the merge strategy"
+      || fail "queue-status-$status: queue-specific retry retained an explicit method"
     assert_grep "status: $status" "$case_dir/stdout" \
       "queue-status-$status: queue status was not preserved"
     assert_grep 'observed_state: open' "$case_dir/stdout" \
@@ -488,8 +503,8 @@ test_parses_pr_url_for_gh_axi() {
   run_pr_merge "$case_dir" task-x1 https://github.com/my-org/my-repo/pull/126/ \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "url-parsing: fm-pr-merge failed"
 
-  grep -qxF 'pr merge 126 --repo my-org/my-repo' "$case_dir/gh-axi.log" \
-    || fail "url-parsing: gh-axi pr merge was not invoked as number + --repo without an explicit strategy"
+  grep -qxF 'pr merge 126 --repo my-org/my-repo --squash' "$case_dir/gh-axi.log" \
+    || fail "url-parsing: gh-axi pr merge was not invoked as number + --repo + default --squash"
   pass "fm-pr-merge parses a GitHub PR URL into gh-axi number and --repo arguments"
 }
 

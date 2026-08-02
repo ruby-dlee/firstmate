@@ -550,7 +550,7 @@ Tell the captain: the PR's full URL (always the complete `https://...` link, nev
 
 If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` yourself; that instruction is the explicit approval.
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
-The helper defaults to `--squash` except when the repository's merge queue owns the strategy, where the no-method path passes no explicit method and enqueues instead; explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge` remain forwarded, and `--repo` or `-R` overrides are refused because the repository is derived from the URL.
+The helper defaults to `--squash`, but if GitHub specifically reports that the base branch's merge queue owns the strategy, the no-method path retries with no explicit method so GitHub can enqueue it; explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge` remain forwarded without retry, and `--repo` or `-R` overrides are refused because the repository is derived from the URL.
 
 ### Ship teardown (only after merge is confirmed)
 

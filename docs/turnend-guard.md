@@ -62,7 +62,7 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it poin
 
 All harnesses were validated on 2026-07-08 in scratch repos or throwaway homes, not against the captain's live primary fleet state.
 
-Claude Code 2.1.204 preserved the existing behavior.
+Claude Code 2.1.204 preserved the behavior first verified on 2026-07-04 with Claude Code 2.1.201.
 Hook file used: `.claude/settings.json`.
 Command run: `claude -p "Say hi in exactly one word." --dangerously-skip-permissions --output-format json` with a scratch Stop hook that printed `SMOKETEST: you must say the word BANANA before stopping` and exited 2.
 Observed output: the first stop payload had `stop_hook_active=false`, the stop was blocked, the model continued with `BANANA`, and the second stop payload had `stop_hook_active=true` and was allowed.

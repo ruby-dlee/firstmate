@@ -150,6 +150,25 @@ Launch mechanics, including the verified command templates, live in [`bin/fm-spa
 Primary-session turn-end guard integrations for verified harnesses are tracked as repo-level hook files and documented in [`docs/turnend-guard.md`](turnend-guard.md).
 Primary-session watcher wake protocols are rendered at session start by [`bin/fm-supervision-instructions.sh`](../bin/fm-supervision-instructions.sh) from [`docs/supervision-protocols/`](supervision-protocols/).
 Claude and Grok use background-notify cycles, Codex uses bounded foreground checkpoints, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.
+
+### Historical launch-profile validation record
+
+This table preserves the version-scoped launch-axis evidence formerly embedded in the `harness-adapters` skill.
+It explains the current mappings in `bin/fm-spawn.sh`; it is not a claim that newer binaries retain the same interface.
+The original records did not retain complete command transcripts, so do not infer more evidence than the exact observations below.
+
+| Harness | Last recorded evidence |
+| --- | --- |
+| Claude | Claude Code 2.1.196 accepted `--model <model>` and `--effort <low\|medium\|high\|xhigh\|max>`. |
+| Codex | codex-cli 0.142.1 accepted `--model <model>`; its installed config schema exposed `model_reasoning_effort`, and its bundled model catalog advertised `low`, `medium`, `high`, and `xhigh`, not `max`. |
+| Grok | Grok 0.2.99 accepted `--model <model>` and `--reasoning-effort <low\|medium\|high>`; `xhigh` and `max` returned `use one of: high, medium, low`. |
+| Pi | Pi 0.80.2 accepted `--model <model>` and `--thinking <low\|medium\|high\|xhigh>`; `max` printed an invalid-thinking warning. |
+| OpenCode | OpenCode 1.17.6 accepted `--model <provider/model>` on the interactive path; `opencode run --variant` existed on a different noninteractive path, so no effort flag was verified for firstmate's interactive launch. |
+
+On 2026-08-01, `claude --version` printed `2.1.220 (Claude Code)` and `codex --version` printed `codex-cli 0.146.0-alpha.9.2`; `command -v opencode`, `command -v pi`, and `command -v grok` found no installed command.
+That check verified only presence and version output.
+No launch-axis behavior was revalidated, so reverify before widening or changing any accepted value set.
+
 `config/crew-harness` is a local, gitignored file containing one adapter name for crewmate and scout launches.
 When it is absent or contains `default`, crewmates mirror the firstmate's own harness.
 Claude crewmate and scout launches additionally require the exact installed Opus 5 model before endpoint creation.

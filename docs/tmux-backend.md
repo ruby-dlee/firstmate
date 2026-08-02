@@ -111,6 +111,15 @@ The classifier deliberately reports `unknown` for `node`/`python`/`python3` rath
 Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
 Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
 
+### Historical unresolved Grok placeholder row selection
+
+On 2026-07-10, a live Grok 0.2.93 tmux pane exposed a pristine placeholder-only state in which tmux's `#{cursor_y}` pointed at the composer box's bottom border, one row below the text row.
+After real text was typed, the cursor aligned with the text row again.
+This was a row-selection issue separate from the dark-TRUECOLOR stripping fix documented in `docs/herdr-backend.md`; Herdr's structural row scan did not share it.
+`fm_tmux_composer_state` still reads the single `#{cursor_y}` row, so the implementation has no row-window fallback if that historical UI shape recurs.
+The normal Grok spawn starts with the brief as its initial prompt, which limited the observed practical exposure, but paths that inspect or steer before the first real turn settles were never fully verified.
+Grok is not installed on the 2026-08-01 audit machine, so none of this behavior was reverified on a newer binary and its current UI state is unknown.
+
 ## Proving absence needs a session-scoped handle
 
 `fm_backend_target_state` can only answer `absent` for tmux when it can derive a session to scope `tmux list-windows` to.

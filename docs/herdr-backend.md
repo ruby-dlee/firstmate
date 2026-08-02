@@ -808,6 +808,8 @@ The captain woke to find away-mode had never injected: 20 escalations buffered, 
 Daemon triage and buffering worked perfectly; the injection leg deferred EVERY attempt with `inject deferred: supervisor pane has pending input (non-empty composer)` - 6524 lifetime occurrences in the daemon log, 2144 of them from the single overnight daemon (`pid 94088`, `backend=herdr`, `target=default:w1:p3`), dominating every other defer reason.
 
 **Root cause.** The primary firstmate runs claude, and claude-code renders a rotating prompt SUGGESTION as ghost text in an otherwise-empty composer (the primary does not set `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`; crewmates do, via `fm-spawn`, so crewmate panes never show it).
+The launch-control choice had a narrower historical validation: on Claude Code 2.1.186, the CLI's `--prompt-suggestions` flag was print/SDK-mode only and did not suppress the interactive composer ghost, while `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` did.
+That observation was not reverified on the 2.1.220 binary installed during the 2026-08-01 audit, so it remains evidence for the existing control rather than a current-version claim.
 Captured read-only from the live primary pane (no Herdr lifecycle touched):
 
 ```

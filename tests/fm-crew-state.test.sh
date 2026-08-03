@@ -20,7 +20,8 @@
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
-#   (l) a quiet active step carries a real liveness verdict (dead / alive) from
+#   (l) a quiet active step carries a real liveness verdict (dead / alive /
+#       unknown) from
 #       bin/fm-nm-step-liveness.sh, and the ci step is exempted because it owns
 #       no worktree process - the 2026-08-02 false-dead regression pair
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
@@ -188,7 +189,18 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/git" "$fb/herdr"
+  cat > "$fb/fake-liveness" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${FM_FAKE_LIVENESS_MODE:-}" in
+  empty) exit 0 ;;
+  malformed) printf 'not a liveness result\n' ;;
+  nonzero) exit 9 ;;
+  timeout) sleep 30 ;;
+  *) printf 'liveness: alive · run: 01RUN · procs: 1 · processes present\n' ;;
+esac
+SH
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/git" "$fb/herdr" "$fb/fake-liveness"
   printf '%s\n' "$fb"
 }
 
@@ -489,7 +501,8 @@ test_quiet_step_reports_dead_liveness() {
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
   local out; out=$(run_crew_state "$d" feat-q)
   assert_contains "$out" "state: working" "a quiet step is still reported working"
-  assert_contains "$out" "test dead (0 procs)" "a quiet step with no process reports dead"
+  assert_contains "$out" "liveness: dead (0 procs)" "a quiet step with no process reports dead"
+  assert_contains "$out" "step: test" "the liveness observation names its active step"
   pass "a quiet step with no live process reports a dead liveness verdict"
 }
 
@@ -512,18 +525,56 @@ test_quiet_step_reports_alive_liveness() {
   local _
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     out=$(run_crew_state "$d" feat-q)
-    case "$out" in *"test alive"*" on "*) break ;; esac
+    case "$out" in *"liveness: alive"*" on "*) break ;; esac
     sleep 0.3
   done
   pkill -9 -P "$sleeper" 2>/dev/null || true
   kill -9 "$sleeper" 2>/dev/null || true
   wait "$sleeper" 2>/dev/null || true
-  assert_contains "$out" "test alive" "a quiet step with a live process reports alive"
+  assert_contains "$out" "liveness: alive" "a quiet step with a live process reports alive"
   # Alive alone leaves hours of runtime unexplained; naming the current unit of
   # work and its age is what separates a slow step from a hung one without
   # spending a run to find out, so the heartbeat read must carry it.
   assert_contains "$out" " on sleep 30 (" "the alive verdict names the current unit of work and its age"
   pass "a quiet step with a live process reports an alive liveness verdict"
+}
+
+test_quiet_step_probe_failures_are_unknown() {
+  reset_fakes
+  local d out probe
+  d=$(new_case quiet-unknown)
+  make_repo_on_branch "$d/wt" fm/feat-qu
+  make_fakebin "$d" >/dev/null
+  probe="$d/fakebin/fake-liveness"
+  fm_write_meta "$d/state/feat-qu.meta" "window=fm:fm-feat-qu" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
+
+  FM_FAKE_AXI_STATUS=$(printf '%s\n' "$FM_FAKE_AXI_STATUS" | sed '/active_steps\[1\]/d')
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a quiet result without an identifiable step is visibly unknown"
+  assert_contains "$out" "probe unreadable: active step unavailable" "a missing active step explains its unreadable cause"
+
+  FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "an empty probe result is visibly unknown"
+  assert_contains "$out" "probe unreadable: empty result" "an empty result explains its unreadable cause"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=nonzero \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a nonzero probe result is visibly unknown"
+  assert_contains "$out" "probe unreadable: exited 9" "a nonzero result reports its exit status"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a malformed probe result is visibly unknown"
+  assert_contains "$out" "probe result unparseable" "a malformed result reports its parse failure"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_CREW_STATE_NM_TIMEOUT=1 FM_FAKE_LIVENESS_MODE=timeout \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a timed-out probe result is visibly unknown"
+  assert_contains "$out" "probe timed out after 1s" "a timed-out result reports its timeout"
+  pass "quiet-step probe failures remain visibly unknown with distinct causes"
 }
 
 # The ci step monitors GitHub from inside the daemon and owns no worktree
@@ -537,7 +588,7 @@ test_quiet_ci_step_skips_liveness() {
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q ci)"
   local out; out=$(run_crew_state "$d" feat-q)
-  assert_not_contains "$out" "dead" "the ci step never carries a dead liveness verdict"
+  assert_not_contains "$out" "liveness:" "the ci step never carries a liveness verdict"
   assert_not_contains "$out" "procs" "the ci step is not probed for worktree processes"
   pass "a quiet ci step is not given a meaningless liveness verdict"
 }
@@ -1642,6 +1693,7 @@ test_usage_error() {
 test_active_run_is_authoritative
 test_quiet_step_reports_dead_liveness
 test_quiet_step_reports_alive_liveness
+test_quiet_step_probe_failures_are_unknown
 test_quiet_ci_step_skips_liveness
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded

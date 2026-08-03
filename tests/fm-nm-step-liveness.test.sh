@@ -23,6 +23,7 @@
 #   (h) usage error                           -> exit 2
 #   (i) the named unit of work and its age, which separate slow from hung and
 #       which bin/fm-crew-state.sh carries onto every heartbeat read
+#   (j) deterministic process-gap and sampled-transition regressions
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -60,6 +61,16 @@ trap kill_started EXIT
 
 verdict_of() {  # <probe output> -> the verdict word
   printf '%s\n' "$1" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p'
+}
+
+wait_for_barrier() {  # <barrier-dir> <probe-pid>
+  local dir=$1 pid=$2 _
+  for _ in {1..200}; do
+    [ -s "$dir/ready" ] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  return 1
 }
 
 # --- (a) no process in the worktree -> dead ---------------------------------
@@ -194,24 +205,70 @@ done
   || fail "REGRESSION: a working step with no axi-status liveness signal must read alive, got: $out"
 pass "regression: a quiet step with no pid and no round still reads alive while working"
 
-# (j2) A momentary gap between units of work must NOT read dead. The suite loop
-# is empty for the instant between two test scripts; before the confirming
-# rescan, one unlucky sample there reported `dead` - the verdict that authorizes
-# discarding a run. Kill the only process and immediately start another, so the
-# first scan can land in the gap; the confirming rescan must find the successor.
+# (j2) A momentary gap between units of work must NOT read dead. The scan barrier
+# proves the first scan was empty before the successor is allowed to appear, so
+# this cannot pass merely because a load-delayed first scan found the successor.
 kill -9 "$LIVE" 2>/dev/null || true
 wait "$LIVE" 2>/dev/null || true
-( sleep 0.35; cd "$WT" && exec bash -c 'while :; do :; done' ) &
+GAP_BARRIER="$TMP_ROOT/gap-barrier"
+mkdir -p "$GAP_BARRIER"
+GAP_OUT="$TMP_ROOT/gap.out"
+FM_NM_TEST_BARRIER_DIR="$GAP_BARRIER" \
+  FM_NM_TEST_BARRIER_PHASE=after-empty-scan \
+  FM_NM_ABSENCE_CONFIRM_DELAY=0 \
+  "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0 > "$GAP_OUT" &
+GAP_PROBE=$!
+STARTED_PIDS="$STARTED_PIDS $GAP_PROBE"
+wait_for_barrier "$GAP_BARRIER" "$GAP_PROBE" \
+  || fail "the gap probe never proved its first scan was empty"
+[ "$(cat "$GAP_BARRIER/ready")" = after-empty-scan ] \
+  || fail "the gap probe reached the wrong barrier phase"
+( cd "$WT" && exec bash -c 'while :; do :; done' ) &
 SUCCESSOR=$!
 STARTED_PIDS="$STARTED_PIDS $SUCCESSOR"
-out=$(FM_NM_ABSENCE_CONFIRM_DELAY=3 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+out=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+  [ "$(verdict_of "$out")" = alive ] && break
+done
+[ "$(verdict_of "$out")" = alive ] || fail "the successor was not observable before the confirming rescan"
+printf 'after-empty-scan\n' > "$GAP_BARRIER/release"
+wait "$GAP_PROBE" || fail "the gap probe failed after its barrier was released"
+out=$(cat "$GAP_OUT")
 [ "$(verdict_of "$out")" != dead ] \
   || fail "REGRESSION: a gap between units of work must not be reported dead, got: $out"
 pass "regression: a momentary gap between units of work is not reported as death"
 
+# (j3) A process set present at the first scan but gone by the second is an
+# ambiguous step transition, not evidence that work remains alive.
+SAMPLE_BARRIER="$TMP_ROOT/sample-barrier"
+mkdir -p "$SAMPLE_BARRIER"
+SAMPLE_OUT="$TMP_ROOT/sample.out"
+FM_NM_TEST_BARRIER_DIR="$SAMPLE_BARRIER" \
+  FM_NM_TEST_BARRIER_PHASE=before-progress-sample \
+  "$PROBE" "$RUN_ID" --worktree "$WT" --sample 1 > "$SAMPLE_OUT" &
+SAMPLE_PROBE=$!
+STARTED_PIDS="$STARTED_PIDS $SAMPLE_PROBE"
+wait_for_barrier "$SAMPLE_BARRIER" "$SAMPLE_PROBE" \
+  || fail "the sample probe never observed the initial process set"
+[ "$(cat "$SAMPLE_BARRIER/ready")" = before-progress-sample ] \
+  || fail "the sample probe reached the wrong barrier phase"
+kill_tree "$SUCCESSOR"
+wait "$SUCCESSOR" 2>/dev/null || true
+printf 'before-progress-sample\n' > "$SAMPLE_BARRIER/release"
+wait "$SAMPLE_PROBE" || fail "the sample probe failed after its barrier was released"
+out=$(cat "$SAMPLE_OUT")
+[ "$(verdict_of "$out")" = unknown ] \
+  || fail "a process set that vanished during the sample must read unknown, got: $out"
+assert_contains "$out" "processes present at the first scan were gone by the second" \
+  "the transition verdict explains what changed between scans"
+assert_contains "$out" "transition could not be established" \
+  "the transition verdict states that the outcome is ambiguous"
+pass "regression: a process set that vanished during sampling reads unknown"
+
 kill_started
 
-# (j3) A genuinely absent step still reads dead after the confirming rescan, so
+# (j4) A genuinely absent step still reads dead after the confirming rescan, so
 # the fix for (j2) did not buy safety by making `dead` unreachable.
 out=$(FM_NM_ABSENCE_CONFIRM_DELAY=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
 [ "$(verdict_of "$out")" = dead ] \

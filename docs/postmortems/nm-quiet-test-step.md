@@ -107,10 +107,11 @@ It finds processes by **working directory**, which is the one attribute that rel
 `bin/fm-crew-state.sh` calls it automatically whenever the active step renders quiet, so the verdict appears in the ordinary heartbeat read:
 
 ```
-state: working · source: run-step · validating (running) · test alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37)
+state: working · source: run-step · validating (running) · liveness: alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37) · step: test
 ```
 
 The verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
+The shared supervision boundary absorbs `alive`, but surfaces both `dead` and `unknown`; an unreadable observation is not evidence of health.
 The `ci` step is exempt: its monitoring runs inside the daemon and owns no worktree process, so a verdict there would always read `dead` and mean nothing.
 
 The unit of work and its age ride along on that line because "alive" alone still leaves hours of runtime unexplained.
@@ -135,7 +136,8 @@ Two things here are the tool's to fix, and firstmate should not paper over eithe
 
 **Reporting.**
 A step running a configured command should publish the command's pid the way an agent step publishes `agent_pid`, and should flush its log incrementally rather than at step end.
-Either change alone would have prevented this incident, because either one makes `last_activity` advance.
+Publishing the pid would provide an independent liveness signal, while only incremental log flushing would make `last_activity` advance.
+Either change alone would have prevented this incident by making a healthy command distinguishable from a dead one.
 The smallest correct fix is the pid: it is a single field on a record no-mistakes already writes when it spawns the process, and it makes liveness answerable from `axi status` alone with no process inspection at all.
 
 **Recovery.**

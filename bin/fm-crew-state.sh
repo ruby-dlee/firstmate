@@ -16,6 +16,7 @@
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   ... · liveness: <alive|dead|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -68,7 +69,11 @@ ID=${1:-}
 META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
-case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
+case "$NM_TIMEOUT" in
+  ''|*[!0-9]*) NM_TIMEOUT=10 ;;
+  *) case "$NM_TIMEOUT" in *[1-9]*) ;; *) NM_TIMEOUT=10 ;; esac ;;
+esac
+NM_LIVENESS_BIN=${FM_CREW_STATE_NM_LIVENESS_BIN:-$SCRIPT_DIR/fm-nm-step-liveness.sh}
 GH_TIMEOUT=${FM_CREW_STATE_GH_TIMEOUT:-10}
 case "$GH_TIMEOUT" in
   ''|*[!0-9]*) GH_TIMEOUT=10 ;;
@@ -531,44 +536,56 @@ nm_active_step_name() {
   strip_quotes "$(trim "${row%%,*}")"
 }
 
-# One-line liveness verdict for the active step's own processes, or empty when it
-# cannot be established. Presence-only (--sample 0) so this stays a ~0.2s read on
-# the heartbeat path; presence alone separates dead from slow, which is the whole
-# distinction firstmate got wrong by hand.
+# One-line liveness verdict for the active step's own processes. Presence-only
+# (--sample 0) keeps the heartbeat path bounded and gives this consumer exactly
+# three verdicts: alive, dead, or unknown. A missing, failed, empty, or malformed
+# probe is unknown, never silence and never evidence of health or death.
 nm_step_liveness() {
-  local run_id out
+  local run_id out status=0 verdict procs doing detail line
   run_id=$(strip_quotes "$(nm_field id)")
-  [ -n "$run_id" ] || return 0
-  [ -x "$SCRIPT_DIR/fm-nm-step-liveness.sh" ] || return 0
+  [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
+  [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
   case "$HAVE_TIMEOUT" in
-    timeout)  out=$(timeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
-    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    timeout)  out=$(timeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
+    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
     # Same bounded perl fallback nm_run already uses. Without this case, a host
     # with neither timeout nor gtimeout - the ordinary macOS default, including
     # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
     # process scan could block the supervision read for as long as it took.
     perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-                  "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
-    *)        out=$("$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+                  "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
+    *)        printf 'unknown (probe unreadable: no bounded runner available)'; return ;;
   esac
-  [ -n "$out" ] || return 0
+  case "$status" in
+    0) ;;
+    124) printf 'unknown (probe timed out after %ss)' "$NM_TIMEOUT"; return ;;
+    *) printf 'unknown (probe unreadable: exited %s)' "$status"; return ;;
+  esac
+  [ -n "$out" ] || { printf 'unknown (probe unreadable: empty result)'; return; }
   # Compact the probe's own line to `<verdict> (<n> procs) on <unit> (<age>)`.
   # This rides on every heartbeat read, so it stays token-tight - but the unit of
   # work and its age are the two fields that separate SLOW from HUNG, and this
   # line is the read firstmate actually makes. Omitting them would leave the
   # follow-up question ("alive, but stuck on the same script for three hours?")
   # needing a second command on every heartbeat.
-  local verdict procs doing
   verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
   procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
-  [ -n "$verdict" ] || return 0
+  case "$verdict" in
+    alive|dead|unknown) ;;
+    *) printf 'unknown (probe result unparseable)'; return ;;
+  esac
+  case "$procs" in ''|*[!0-9]*) printf 'unknown (probe result unparseable)'; return ;; esac
   # `doing: <argv> (<etime>)` is the probe's last field when it could name one.
   # The probe already truncates argv, so take it verbatim rather than re-parsing
   # a command line whose shape varies by whatever the step happens to be running.
   doing=${out##*doing: }
   [ "$doing" = "$out" ] && doing=""
-  local line="$verdict"
-  [ -n "$procs" ] && line="$line ($procs procs)"
+  line="$verdict ($procs procs)"
+  if [ "$verdict" = unknown ]; then
+    detail=${out##*"$SEP"}
+    [ "$detail" = "$out" ] && detail="probe reported unknown"
+    line="unknown ($procs procs; $detail)"
+  fi
   [ -n "$doing" ] && line="$line on $doing"
   printf '%s' "$line"
 }
@@ -760,10 +777,14 @@ if [ "$HAVE_RUN" = 1 ]; then
   # meaningless rather than informative.
   if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] && nm_step_is_quiet; then
     ACTIVE_STEP=$(nm_active_step_name)
-    if [ -n "$ACTIVE_STEP" ] && [ "$ACTIVE_STEP" != ci ]; then
-      LIVENESS=$(nm_step_liveness)
-      [ -n "$LIVENESS" ] && RUN_DETAIL="$RUN_DETAIL${SEP}$ACTIVE_STEP $LIVENESS"
-    fi
+    case "$ACTIVE_STEP" in
+      ci) ;;
+      '') RUN_DETAIL="$RUN_DETAIL${SEP}liveness: unknown (probe unreadable: active step unavailable)${SEP}step: unknown" ;;
+      *)
+        LIVENESS=$(nm_step_liveness)
+        RUN_DETAIL="$RUN_DETAIL${SEP}liveness: $LIVENESS${SEP}step: $ACTIVE_STEP"
+        ;;
+    esac
   fi
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then

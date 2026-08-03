@@ -38,9 +38,9 @@
 # Usage:
 #   bin/fm-nm-step-liveness.sh <run-id> [--sample <seconds>] [--worktree <path>]
 #
-# --sample 0 skips the progress sample and answers presence only (alive-or-dead
-# in ~0.4s, no wait). Presence alone is decisive for the failure this exists to
-# catch, so callers on a hot path (bin/fm-crew-state.sh) use --sample 0.
+# --sample 0 skips the progress sample and answers presence only (alive, dead,
+# or unknown, with no progress wait). Presence alone is decisive for the failure
+# this exists to catch, so callers on a hot path (bin/fm-crew-state.sh) use it.
 
 set -u
 
@@ -91,6 +91,16 @@ emit() {  # <verdict> <procs> [detail]
   [ -n "${3:-}" ] && line="$line${VERDICT_SEP}$3"
   printf '%s\n' "$line"
   exit 0
+}
+
+test_scan_barrier() {  # <phase>
+  local phase=$1 dir=${FM_NM_TEST_BARRIER_DIR:-} released
+  [ "${FM_NM_TEST_BARRIER_PHASE:-}" = "$phase" ] || return 0
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  printf '%s\n' "$phase" > "$dir/ready" || return 1
+  while [ ! -f "$dir/release" ]; do sleep 0.01; done
+  IFS= read -r released < "$dir/release" || return 1
+  [ "$released" = "$phase" ]
 }
 
 # --- resolve the run's worktree ---------------------------------------------
@@ -212,6 +222,8 @@ case "$COUNT_T0" in ''|*[!0-9]*) COUNT_T0=0 ;; esac
 # common alive case - and the ~0.2s presence-only path on the heartbeat read -
 # is unaffected.
 if [ "$COUNT_T0" = 0 ]; then
+  test_scan_barrier after-empty-scan || \
+    emit unknown 0 "empty-scan test barrier could not be completed"
   sleep "$ABSENCE_CONFIRM_DELAY"
   PIDS_CONFIRM=$(procs_in_worktree) || \
     emit unknown 0 "process enumeration failed while confirming absence"
@@ -266,6 +278,8 @@ cpu_hundredths() {  # <pids...>
 
 # shellcheck disable=SC2086  # deliberate word splitting: PIDS_* are newline lists
 CPU_T0=$(cpu_hundredths $PIDS_T0)
+test_scan_barrier before-progress-sample || \
+  emit unknown "$COUNT_T0" "progress-sample test barrier could not be completed"
 sleep "$SAMPLE"
 PIDS_T1=$(procs_in_worktree) || \
   emit unknown "$COUNT_T0" "process enumeration failed mid-sample"
@@ -273,9 +287,7 @@ COUNT_T1=$(printf '%s' "$PIDS_T1" | grep -c . || true)
 case "$COUNT_T1" in ''|*[!0-9]*) COUNT_T1=0 ;; esac
 
 if [ "$COUNT_T1" = 0 ]; then
-  # The step's processes exited during the sample. That is a normal step ending,
-  # not the dead-at-start failure, so say what was observed rather than guessing.
-  emit alive "$COUNT_T0" "processes exited during the ${SAMPLE}s sample (step finishing)"
+  emit unknown 0 "processes present at the first scan were gone by the second; the step transition could not be established"
 fi
 
 # shellcheck disable=SC2086  # deliberate word splitting: PIDS_* are newline lists

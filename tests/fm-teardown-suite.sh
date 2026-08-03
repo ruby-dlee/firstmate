@@ -3681,6 +3681,70 @@ test_teardown_refuses_unsafe_tasktmp_metadata() {
   pass "teardown only removes its exact task temp root"
 }
 
+test_teardown_reaps_legacy_tasktmp_after_generation_advance() {
+  local case_dir id legacy_tasktmp legacy_parent meta teardown_error
+  case_dir=$(make_case legacy-tasktmp-advanced-generation)
+  id="legacy-tasktmp-z9-$$"
+  legacy_tasktmp="/tmp/fm-$id"
+  [ ! -e "$legacy_tasktmp" ] && [ ! -L "$legacy_tasktmp" ] \
+    || fail "legacy tasktmp fixture path already exists: $legacy_tasktmp"
+  mkdir -p "$legacy_tasktmp/gotmp"
+  printf '%s\n' leftover > "$legacy_tasktmp/gotmp/build-artifact"
+  write_meta "$case_dir" local-only ship
+  write_treehouse_lease "$case_dir/wt" "firstmate-$id"
+  meta="$case_dir/state/$id.meta"
+  sed -i.bak 's/^generation_id=.*/generation_id=spawn:advancedgeneration/' \
+    "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak" "$case_dir/fakebin/.tmux-live"
+  printf 'tasktmp=%s\ntasktmp_phase=created\n' "$legacy_tasktmp" \
+    >> "$case_dir/state/task-x1.meta"
+  mv "$case_dir/state/task-x1.meta" "$meta"
+
+  if ! run_teardown_named "$case_dir" "$id" > "$case_dir/stdout" 2> "$case_dir/stderr"; then
+    teardown_error=$(cat "$case_dir/stderr")
+    legacy_parent=$(cd "$(dirname "$legacy_tasktmp")" && pwd -P)
+    python3 "$ROOT/bin/fm-safe-task-tmp.py" \
+      "$legacy_parent/$(basename "$legacy_tasktmp")" 2>/dev/null || true
+    fail "clean task with legacy tasktmp remained deadlocked: $teardown_error"
+  fi
+  assert_absent "$meta" \
+    "legacy tasktmp teardown retained completed task metadata"
+  assert_absent "$legacy_tasktmp" \
+    "legacy tasktmp teardown retained the exact metadata temp root"
+  pass "teardown safely reaps legacy tasktmp after generation advances"
+}
+
+test_teardown_classifies_legacy_without_weakening_generation_binding() {
+  local case_dir classification mismatched_tasktmp rc
+  case_dir=$(make_case tasktmp-generation-binding-retained)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^generation_id=.*/generation_id=spawn:currentgeneration/' \
+    "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak" "$case_dir/fakebin/.tmux-live"
+
+  classification=$(STATE="$case_dir/state" bash -c '
+    . "$1"
+    fm_account_task_tmp_classify task-x1 /tmp/fm-task-x1 spawn:currentgeneration
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh") \
+    || fail "legacy tasktmp did not receive its own classification"
+  [ "$classification" = legacy ] \
+    || fail "legacy tasktmp classification was $classification instead of legacy"
+
+  mismatched_tasktmp="$case_dir/state/.task-tmp/fm-task-x1-othergeneration"
+  printf 'tasktmp=%s\ntasktmp_phase=created\n' "$mismatched_tasktmp" \
+    >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "different generation-bound tasktmp teardown exit"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "different generation-bound tasktmp refusal removed task metadata"
+  assert_grep 'unsafe task temp path' "$case_dir/stderr" \
+    "different generation-bound tasktmp refusal was unclear"
+  pass "legacy classification does not weaken generation binding"
+}
+
 test_teardown_removes_safe_tasktmp_and_accepts_absence() {
   local case_dir tasktmp
   case_dir=$(make_case safe-tasktmp)
@@ -5224,6 +5288,22 @@ if [ "${FM_TEST_FOCUSED:-}" = preserve-scratch ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-generation-deadlock ]; then
+  test_teardown_reaps_legacy_tasktmp_after_generation_advance
+  test_teardown_classifies_legacy_without_weakening_generation_binding
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-legacy-deadlock ]; then
+  test_teardown_reaps_legacy_tasktmp_after_generation_advance
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-generation-binding ]; then
+  test_teardown_classifies_legacy_without_weakening_generation_binding
+  exit 0
+fi
+
 run_partitioned_test() {
   local assigned_part test_function=$1
   assigned_part=$((FM_TEST_PART_SEQUENCE % FM_TEST_PART_TOTAL + 1))
@@ -5314,6 +5394,8 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_secondmate_registry_updates_are_locked_and_literal
   test_teardown_retains_untracked_claude_skill_draft
   test_teardown_refuses_unsafe_tasktmp_metadata
+  test_teardown_reaps_legacy_tasktmp_after_generation_advance
+  test_teardown_classifies_legacy_without_weakening_generation_binding
   test_teardown_removes_safe_tasktmp_and_accepts_absence
   test_teardown_rejects_malformed_report_requirement
   test_secondmate_state_enumeration_fails_closed

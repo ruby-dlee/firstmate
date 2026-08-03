@@ -597,6 +597,21 @@ run_direct_spawn() {
     "$ROOT/bin/fm-spawn.sh" "$@"
 }
 
+run_direct_teardown() {
+  local home=$1 worktree=$2 launch_log=$3 id=$4
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_REPORT_STACK_ROOT="$home/report-stack" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$home/checkout-refresh-state" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
+    FM_FAKE_LAUNCH_LOG="$launch_log" FM_FAKE_ENDPOINT_FILE="$home/state/.fake-endpoint" \
+    FM_FAKE_ENDPOINT_LABEL="fm-$id" FM_FAKE_KILL_RETAIN=0 \
+    FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
+    PATH="$FAKEBIN:$PATH" \
+    "$ROOT/bin/fm-teardown.sh" "$id"
+}
+
 make_spawn_case() {
   local name=$1 harness=$2 id=$3 case_dir home project worktree launch_log
   case_dir="$TMP_ROOT/spawn-$name"
@@ -895,6 +910,96 @@ test_direct_recovery_preserves_recorded_task_context() {
   fi
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "direct recovery invoked Agent Fleet"
   pass "direct recovery preserves recorded task context while refreshing account selection"
+}
+
+test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown() {
+  local record id meta generation legacy_tasktmp legacy_parent legacy_retained expected_tasktmp classification meta_tmp
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 95,90
+  set_remaining 2 30,20
+  id="direct-recovery-tasktmp-z4-$$"
+  record=$(make_spawn_case direct-recovery-tasktmp codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool --scout >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  legacy_tasktmp="/tmp/fm-$id"
+  expected_tasktmp=$(STATE="$SPAWN_HOME/state" bash -c '
+    . "$1"
+    fm_account_task_tmp_path "$2" "$3"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$id" "$generation")
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-recovery-tasktmp.XXXXXX")
+  [ ! -e "$legacy_tasktmp" ] && [ ! -L "$legacy_tasktmp" ] \
+    || fail "legacy recovery fixture path already exists: $legacy_tasktmp"
+  mkdir -p "$legacy_tasktmp/gotmp"
+  printf '%s\n' legacy-build-artifact > "$legacy_tasktmp/gotmp/artifact"
+  awk -v tasktmp="$legacy_tasktmp" '
+    /^tasktmp=/ { print "tasktmp=" tasktmp; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+
+  set_remaining 1 20,15
+  set_remaining 2 95,90
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account >/dev/null 2>&1
+  legacy_retained=0
+  if [ -e "$legacy_tasktmp" ] || [ -L "$legacy_tasktmp" ]; then
+    legacy_retained=1
+    legacy_parent=$(cd "$(dirname "$legacy_tasktmp")" && pwd -P)
+    python3 "$ROOT/bin/fm-safe-task-tmp.py" \
+      "$legacy_parent/$(basename "$legacy_tasktmp")" 2>/dev/null || true
+  fi
+  [ "$legacy_retained" -eq 0 ] \
+    || fail "direct recovery orphaned the old physical legacy tasktmp"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" \
+    "direct recovery did not move the task to the fresh account"
+  assert_grep "tasktmp=$expected_tasktmp" "$meta" \
+    "direct recovery did not migrate the legacy tasktmp to its recorded generation"
+  classification=$(STATE="$SPAWN_HOME/state" bash -c '
+    . "$1"
+    fm_account_task_tmp_classify "$2" "$3" "$4"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$id" "$expected_tasktmp" "$generation")
+  [ "$classification" = current ] \
+    || fail "recovered tasktmp is not genuinely bound to its generation: $classification"
+
+  mkdir -p "$SPAWN_HOME/data/$id"
+  cat > "$SPAWN_HOME/data/$id/report.md" <<'EOF'
+## Summary
+
+The recovered fixture completed.
+
+## What changed
+
+The legacy task temp binding was migrated.
+
+## Verification
+
+The fixture verifies recovery and teardown.
+
+## Visual evidence
+
+Visual evidence does not apply to this shell fixture.
+
+## Artifacts
+
+The task metadata and temp root are the tested artifacts.
+
+## Follow-ups
+
+No fixture follow-up is required.
+EOF
+  git -C "$SPAWN_PROJECT" worktree remove --force "$SPAWN_WORKTREE"
+  run_direct_teardown "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" "$id" \
+    > "$SPAWN_HOME/teardown.out" 2> "$SPAWN_HOME/teardown.err" \
+    || fail "recovered task did not tear down: $(cat "$SPAWN_HOME/teardown.err")"
+  assert_absent "$meta" "recovered task teardown retained metadata"
+  assert_absent "$expected_tasktmp" "recovered task teardown retained its bound tasktmp"
+  pass "direct recovery migrates legacy tasktmp binding before teardown"
 }
 
 test_direct_recovery_rejects_secondmate_metadata() {
@@ -1337,10 +1442,16 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
+  test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
   test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp ]; then
+  test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
   exit 0
 fi
 
@@ -1371,6 +1482,7 @@ test_direct_claude_recovery_resolves_legacy_default_to_anchor
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
+test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
 test_direct_recovery_rejects_secondmate_metadata
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief

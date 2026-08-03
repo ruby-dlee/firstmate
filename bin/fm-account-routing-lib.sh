@@ -304,12 +304,22 @@ fm_account_task_tmp_is_legacy() {  # <task-id> <path>
   [ "$2" = "$legacy" ]
 }
 
+fm_account_task_tmp_classify() {  # <task-id> <path> <generation-id>
+  if fm_account_task_tmp_is_current "$1" "$2" "$3"; then
+    printf 'current\n'
+  elif fm_account_task_tmp_is_previous "$1" "$2"; then
+    printf 'previous\n'
+  elif fm_account_task_tmp_is_legacy "$1" "$2"; then
+    printf 'legacy\n'
+  else
+    return 1
+  fi
+}
+
 fm_account_task_tmp_is_expected() {  # <task-id> <path> <generation-id>
   # Legacy metadata remains recognizable, but callers must use
   # fm_account_task_tmp_is_current before any filesystem mutation.
-  fm_account_task_tmp_is_current "$1" "$2" "$3" \
-    || fm_account_task_tmp_is_previous "$1" "$2" \
-    || fm_account_task_tmp_is_legacy "$1" "$2"
+  fm_account_task_tmp_classify "$1" "$2" "$3" >/dev/null
 }
 
 fm_account_safe_remove_task_tmp() {  # <task-id> <path> <generation-id> [subdirectory]

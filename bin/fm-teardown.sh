@@ -259,16 +259,21 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # absent for tasks spawned before that change, so tolerate empty legacy metadata.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_GENERATION=$(grep '^generation_id=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP" "$TASK_GENERATION"; then
-  echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
-  exit 1
+TASK_TMP_CLASS=
+if [ -n "$TASK_TMP" ]; then
+  TASK_TMP_CLASS=$(fm_account_task_tmp_classify "$ID" "$TASK_TMP" "$TASK_GENERATION") || {
+    echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
+    exit 1
+  }
 fi
 TASK_TMP_PHASE=$(fm_meta_get "$META" tasktmp_phase)
 case "$TASK_TMP_PHASE" in
   '') ;;
   created)
-    fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" \
-      || { echo "error: created task temp phase is not bound to the exact task generation for $ID" >&2; exit 1; }
+    case "$TASK_TMP_CLASS" in
+      current|legacy) ;;
+      *) echo "error: created task temp phase is not bound to the exact task generation for $ID" >&2; exit 1 ;;
+    esac
     ;;
   not-created)
     fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" || {
@@ -278,6 +283,7 @@ case "$TASK_TMP_PHASE" in
     ;;
   *) echo "error: invalid task temp phase for $ID" >&2; exit 1 ;;
 esac
+TASK_ENDPOINT_ABSENCE_PROVEN=0
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 DIRECT_SPAWN_CLEANUP=$(fm_meta_get "$META" direct_spawn_cleanup)
@@ -2404,7 +2410,7 @@ safe_rm_rf_child_worktree() {
 }
 
 safe_remove_task_tmp() {
-  local target=$1
+  local target=$1 legacy_parent legacy_target
   [ -n "$target" ] || return 0
   if [ "$TASK_TMP_PHASE" = not-created ]; then
     if [ -e "$target" ] || [ -L "$target" ]; then
@@ -2412,6 +2418,30 @@ safe_remove_task_tmp() {
       return 1
     fi
     return 0
+  fi
+  if [ "$TASK_TMP_CLASS" = legacy ]; then
+    [ "$TASK_ENDPOINT_ABSENCE_PROVEN" -eq 1 ] || {
+      echo "REFUSED: legacy task temp cleanup has no endpoint-absence proof for $ID" >&2
+      return 1
+    }
+    require_safe_task_metadata || return 1
+    if [ "$(fm_meta_get "$META" tasktmp)" != "$target" ] \
+      || ! fm_account_task_tmp_is_legacy "$ID" "$target"; then
+        echo "REFUSED: legacy task temp path changed before cleanup for $ID" >&2
+        return 1
+    fi
+    # A legacy root has no generation identity of its own. Remove only the
+    # exact metadata path after the task endpoint has been proved absent.
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      return 0
+    fi
+    legacy_parent=$(cd "$(dirname "$target")" 2>/dev/null && pwd -P) || {
+      echo "REFUSED: legacy task temp parent cannot be resolved for $ID" >&2
+      return 1
+    }
+    legacy_target="$legacy_parent/$(basename "$target")"
+    safe_rm_rf "$legacy_target" "legacy task temp root"
+    return
   fi
   fm_account_safe_remove_task_tmp "$ID" "$target" "$TASK_GENERATION"
 }
@@ -4558,6 +4588,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   validate_pending_orca_worktree_identity || exit 1
   pending_orca_endpoint_absent || exit 1
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
+  TASK_ENDPOINT_ABSENCE_PROVEN=1
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
@@ -4592,6 +4623,7 @@ if [ "$KIND" = secondmate ]; then
     require_empty_secondmate_registry "$HOME_PATH" || exit 1
   fi
   quiesce_secondmate_endpoint || exit 1
+  TASK_ENDPOINT_ABSENCE_PROVEN=1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
   else
@@ -4710,9 +4742,11 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ]; then
   if [ "$DIRECT_SPAWN_ENDPOINT" != not-created ]; then
     quiesce_retained_direct_spawn_endpoint || exit 1
   fi
+  TASK_ENDPOINT_ABSENCE_PROVEN=1
   validate_teardown_target_identity || { post_quiescence_safety_refusal; exit 1; }
 elif [ "$KIND" != secondmate ]; then
   quiesce_task_endpoint || exit 1
+  TASK_ENDPOINT_ABSENCE_PROVEN=1
   validate_teardown_target_identity || { post_quiescence_safety_refusal; exit 1; }
 fi
 

@@ -72,6 +72,13 @@ single_meta_value() {  # <file> <key>
   printf '%s\n' "$values"
 }
 
+single_meta_value_allow_empty() {  # <file> <key>
+  local file=$1 key=$2 count
+  count=$(grep -c "^${key}=" "$file" 2>/dev/null) || count=0
+  [ "$count" -eq 1 ] || return 1
+  sed -n "s/^${key}=//p" "$file"
+}
+
 status_last_verb() {  # <task>
   local last
   last=$(grep -v '^[[:space:]]*$' "$STATE/$1.status" 2>/dev/null | tail -1)
@@ -274,7 +281,7 @@ path_age() {
 }
 
 recover_acquisition() {  # <record>
-  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status
+  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status absence_class
   local recorded_home home_real generation tasktmp tasktmp_phase endpoint_phase backend endpoint_window
   local tmux_window_id tmux_session_target herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id
   local zellij_session zellij_tab_id zellij_pane_id cmux_workspace_id cmux_surface_id
@@ -284,7 +291,10 @@ recover_acquisition() {  # <record>
   AUTO_REAP_ID=${AUTO_REAP_ID%.pending}
   if fm_account_lock_owner_state "$record"; then owner_state=0; else owner_state=$?; fi
   case "$owner_state" in
-    0) return 0 ;;
+    0)
+      refuse "acquisition owner is still alive; retained its in-progress record" || true
+      return 0
+      ;;
     1) ;;
     2)
       refuse "stale acquisition owner liveness is indeterminate"
@@ -426,7 +436,11 @@ recover_acquisition() {  # <record>
     refuse "created task temp phase has an unsafe root; retained stale acquisition"
     return 0
   fi
-  recorded_worktree=$(sed -n 's/^worktree=//p' "$record" | tail -1)
+  recorded_worktree=$(single_meta_value_allow_empty "$record" worktree) || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "stale acquisition record has missing or ambiguous worktree phase"
+    return 0
+  }
   if [ -n "$recorded_worktree" ]; then
     worktree=$(fm_checkout_trusted_dir "$recorded_worktree" 2>/dev/null || true)
     [ -n "$worktree" ] && fm_treehouse_require_task_lease "$worktree" "$holder" >/dev/null 2>&1 || worktree=
@@ -440,23 +454,52 @@ recover_acquisition() {  # <record>
       find_status=$?
     fi
     if [ "$find_status" -eq 2 ]; then
-      if fm_treehouse_prove_task_lease_absent "$recorded_worktree" "$holder" >/dev/null 2>&1; then
-        absence_status=0
+      absence_class=
+      if [ -n "$recorded_worktree" ]; then
+        if fm_treehouse_prove_task_lease_absent "$recorded_worktree" "$holder" >/dev/null 2>&1; then
+          absence_status=0
+          absence_class=released
+        else
+          absence_status=$?
+        fi
+      elif [ "$endpoint_phase" = not-created ] && [ "$tasktmp_phase" = not-created ]; then
+        if fm_treehouse_prove_holder_never_acquired_in_home "$FM_HOME" "$holder" >/dev/null 2>&1; then
+          absence_status=0
+          absence_class=never-acquired
+        else
+          absence_status=$?
+        fi
       else
-        absence_status=$?
+        absence_status=1
       fi
       if [ "$absence_status" -eq 0 ]; then
-        if [ "$tasktmp_phase" = created ]; then
-          fm_account_safe_remove_task_tmp "$id" "$tasktmp" "$generation" || {
-            fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-            refuse "Treehouse lease is absent but task temp ownership is unsafe or ambiguous; retained stale acquisition"
-            return 0
-          }
+        if [ "$absence_class" = never-acquired ]; then
+          rm -f "$record"
+          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+          log_result "cleared owner-dead acquisition $id after proving it never acquired a Treehouse lease"
+          printf 'auto-reap cleared %s: owner is dead and the task never acquired a Treehouse lease\n' "$id"
+          return 0
         fi
-        rm -f "$record"
+        if [ "$absence_class" = released ]; then
+          if [ "$tasktmp_phase" = created ]; then
+            fm_account_safe_remove_task_tmp "$id" "$tasktmp" "$generation" || {
+              fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+              refuse "Treehouse lease is released but task temp ownership is unsafe or ambiguous; retained stale acquisition"
+              return 0
+            }
+          fi
+          rm -f "$record"
+          fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+          log_result "cleared owner-dead acquisition $id after proving its Treehouse lease was released"
+          printf 'auto-reap cleared %s: owner is dead and its Treehouse lease was authoritatively released\n' "$id"
+          return 0
+        fi
+      fi
+      if [ -z "$recorded_worktree" ] \
+        && [ "$endpoint_phase" = not-created ] && [ "$tasktmp_phase" = not-created ]; then
         fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-        log_result "cleared owner-dead acquisition $id after proving it owns no Treehouse lease"
-        printf 'auto-reap cleared %s: owner is dead and no Treehouse lease exists\n' "$id"
+        log_result "retained owner-dead acquisition $id because its never-acquired state is unknown"
+        refuse "never-acquired state is unknown because authoritative home pool evidence is incomplete; retained stale acquisition" || true
         return 0
       fi
       fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true

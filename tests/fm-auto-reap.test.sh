@@ -246,10 +246,90 @@ test_dead_acquisition_recovers_but_live_owner_is_untouched() {
   touch -t 202001010000 "$live_record"
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
   expect_code 0 "$rc" "live acquisition maintenance"
-  [ -z "$out" ] || fail "live acquisition produced auto-reap output: $out"
+  assert_contains "$out" "acquisition owner is still alive" \
+    "live acquisition did not produce an explicit refusal"
   [ -f "$live_record" ] || fail "live acquisition record was removed"
   [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "live acquisition invoked teardown"
   pass "crashed acquisition is recovered only after exact owner death proof"
+}
+
+test_never_acquired_record_clears_from_phases_and_empty_pool() {
+  local id=never-acquired project record out rc
+  reset_logs
+  rm -rf "$HOME_DIR/.treehouse"
+  project="$TMP/never-acquired-project"
+  fm_git_init_commit "$project"
+  write_dead_acquisition "$id" "$project" '' direct not-created tmux not-created
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  mkdir -p "$HOME_DIR/.treehouse/empty-pool"
+  printf '{"worktrees":[]}\n' \
+    > "$HOME_DIR/.treehouse/empty-pool/treehouse-state.json"
+
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "never-acquired maintenance"
+  assert_contains "$out" "never acquired a Treehouse lease" \
+    "never-acquired clearance was not classified explicitly"
+  [ ! -e "$record" ] || fail "never-acquired record survived positive absence proof"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "never-acquired clearance invented task metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "never-acquired clearance invoked teardown"
+  rm -rf "$HOME_DIR/.treehouse"
+  pass "never-acquired records clear only from empty phases and independent pool evidence"
+}
+
+test_released_acquisition_record_clears_as_released() {
+  local id=released-acquisition fixture project worktree record state out rc
+  reset_logs
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  state="$(dirname "$(dirname "$worktree")")/treehouse-state.json"
+  git -C "$project" worktree remove --force "$worktree"
+  python3 - "$state" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+entry = state["worktrees"][0]
+entry["leased"] = None
+entry["lease_holder"] = None
+entry["destroying"] = None
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "released acquisition maintenance"
+  assert_contains "$out" "Treehouse lease was authoritatively released" \
+    "released acquisition was not classified separately"
+  [ ! -e "$record" ] || fail "released acquisition authority survived positive release proof"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "released acquisition clearance invoked teardown"
+  pass "released acquisition records clear from exact authoritative lease state"
+}
+
+test_unknown_never_acquired_state_refuses() {
+  local id=unknown-acquisition project record out rc
+  reset_logs
+  rm -rf "$HOME_DIR/.treehouse"
+  project="$TMP/unknown-acquisition-project"
+  fm_git_init_commit "$project"
+  write_dead_acquisition "$id" "$project" '' direct not-created tmux not-created
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  mkdir -p "$HOME_DIR/.treehouse/incomplete-pool"
+
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "unknown acquisition maintenance"
+  assert_contains "$out" "never-acquired state is unknown" \
+    "unknown acquisition state was not refused explicitly"
+  [ -f "$record" ] || fail "unknown acquisition state lost its recovery authority"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "unknown acquisition state invented task metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "unknown acquisition state invoked teardown"
+  rm -f "$record"
+  rm -rf "$HOME_DIR/.treehouse"
+  pass "unknown acquisition state stays fail-closed"
 }
 
 test_dirty_stranded_worktree_is_retained_by_real_teardown() {
@@ -529,11 +609,41 @@ test_local_merge_immediately_auto_reaps() {
   pass "approved local merge immediately invokes automatic teardown"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-absence-states ]; then
+  test_never_acquired_record_clears_from_phases_and_empty_pool
+  test_released_acquisition_record_clears_as_released
+  test_unknown_never_acquired_state_refuses
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-live-owner ]; then
+  test_dead_acquisition_recovers_but_live_owner_is_untouched
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-never-acquired ]; then
+  test_never_acquired_record_clears_from_phases_and_empty_pool
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-released ]; then
+  test_released_acquisition_record_clears_as_released
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-unknown ]; then
+  test_unknown_never_acquired_state_refuses
+  exit 0
+fi
+
 test_merged_task_cancels_exact_run_then_tears_down
 test_open_pr_refuses_without_teardown
 test_cross_branch_active_run_refuses_without_guessing_id
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
+test_never_acquired_record_clears_from_phases_and_empty_pool
+test_released_acquisition_record_clears_as_released
+test_unknown_never_acquired_state_refuses
 test_dirty_stranded_worktree_is_retained_by_real_teardown
 test_unregistered_treehouse_lease_retains_acquisition_authority
 test_malformed_treehouse_leases_retain_acquisition_authority

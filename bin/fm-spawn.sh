@@ -1099,6 +1099,7 @@ ORIGINAL_CHECK_PRESENT=-1
 ORIGINAL_PI_EXT_PRESENT=-1
 ORIGINAL_GROK_TOKEN_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
+RECOVERY_ENDPOINT_ABSENCE_PROVEN=0
 
 spawn_test_lab_enabled() {
   fm_account_test_lab_enabled \
@@ -1557,7 +1558,7 @@ create_worktree_acquisition_record() {
   }
   record="$STATE/.worktree-acquire-$ID.pending"
   [ ! -e "$record" ] && [ ! -L "$record" ] || {
-    echo "error: stale or concurrent Treehouse acquisition record exists for $ID; let auto-reap reconcile it before retrying" >&2
+    echo "error: Treehouse acquisition record already exists for $ID; auto-reap clears it only after proving the owner dead and the lease either never acquired or authoritatively released" >&2
     return 1
   }
   tmp=$(mktemp "$STATE/.worktree-acquire-$ID.XXXXXX") || return 1
@@ -2296,7 +2297,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_MODE" ] || { echo "error: direct account recovery metadata has no mode for $ID" >&2; exit 1; }
     [ -n "$RECORDED_YOLO" ] || { echo "error: direct account recovery metadata has no yolo setting for $ID" >&2; exit 1; }
     [ -n "$RECORDED_GENERATION" ] || { echo "error: direct account recovery metadata has no generation_id for $ID" >&2; exit 1; }
-    fm_account_task_tmp_is_expected "$ID" "$RECORDED_TASKTMP" "$RECORDED_GENERATION" || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
+    RECORDED_TASKTMP_CLASS=$(fm_account_task_tmp_classify "$ID" "$RECORDED_TASKTMP" "$RECORDED_GENERATION") \
+      || { echo "error: direct account recovery metadata has an invalid tasktmp for $ID" >&2; exit 1; }
     RECORDED_META_WORKTREE_GIT_REF=$RECORDED_WORKTREE_GIT_REF
     RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
     RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
@@ -2653,7 +2655,14 @@ else
   SPAWN_GENERATION_ID="spawn:$(fm_account_attempt_id "$FM_HOME" "$ID")" || exit 1
 fi
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-  SPAWN_TASK_TMP=$RECORDED_TASKTMP
+  if [ "$RECORDED_TASKTMP_CLASS" = legacy ]; then
+    SPAWN_TASK_TMP=$(fm_account_task_tmp_path "$ID" "$SPAWN_GENERATION_ID") || {
+      echo "error: cannot migrate the legacy task temp path for $ID" >&2
+      exit 1
+    }
+  else
+    SPAWN_TASK_TMP=$RECORDED_TASKTMP
+  fi
 else
   SPAWN_TASK_TMP=$(fm_account_task_tmp_path "$ID" "$SPAWN_GENERATION_ID") || {
     echo "error: cannot establish a safe task temp path for $ID" >&2
@@ -2969,7 +2978,7 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
   RECORDED_TARGET=$(fm_backend_target_of_meta "$RESUME_META")
   RECOVERY_ENDPOINT_STATE=$(spawn_managed_endpoint_state "$BACKEND" "$RECORDED_TARGET" "fm-$ID" "$KIND" "$PROJ_ABS" "$(fm_meta_get "$RESUME_META" tmux_session_target)" 2>/dev/null)
   case "$RECOVERY_ENDPOINT_STATE" in
-    absent) ;;
+    absent) RECOVERY_ENDPOINT_ABSENCE_PROVEN=1 ;;
     present)
       echo "error: managed recovery endpoint is still alive for $ID; refusing to create a duplicate" >&2
       exit 1
@@ -4092,13 +4101,34 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
 fi
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
+  LEGACY_TASK_TMP_PARENT=
+  LEGACY_TASK_TMP_TARGET=
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
     || [ "$(fm_account_meta_value "$STATE/$ID.meta" tasktmp)" != "$TASK_TMP" ]; then
     echo "error: task generation changed before prior temp cleanup for $ID" >&2
     exit 1
   fi
-  fm_account_safe_remove_task_tmp "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || exit 1
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$RECORDED_TASKTMP_CLASS" = legacy ]; then
+    [ "$RECOVERY_ENDPOINT_ABSENCE_PROVEN" -eq 1 ] \
+      || { echo "error: prior endpoint absence is unproven before legacy task temp cleanup for $ID" >&2; exit 1; }
+    if [ "$EXISTING_TASK_TMP" != "$RECORDED_TASKTMP" ] \
+      || ! fm_account_task_tmp_is_legacy "$ID" "$EXISTING_TASK_TMP" \
+      || ! fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then
+        echo "error: legacy task temp migration identity is ambiguous for $ID" >&2
+        exit 1
+    fi
+    if [ -e "$EXISTING_TASK_TMP" ] || [ -L "$EXISTING_TASK_TMP" ]; then
+      LEGACY_TASK_TMP_PARENT=$(cd "$(dirname "$EXISTING_TASK_TMP")" 2>/dev/null && pwd -P) || {
+        echo "error: legacy task temp parent cannot be resolved for $ID" >&2
+        exit 1
+      }
+      LEGACY_TASK_TMP_TARGET="$LEGACY_TASK_TMP_PARENT/$(basename "$EXISTING_TASK_TMP")"
+      python3 "$SCRIPT_DIR/fm-safe-task-tmp.py" "$LEGACY_TASK_TMP_TARGET" || exit 1
+    fi
+  else
+    fm_account_safe_remove_task_tmp "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || exit 1
+  fi
   fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
   META_WRITE_LOCK=
 fi

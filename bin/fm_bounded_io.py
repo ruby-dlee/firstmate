@@ -334,10 +334,15 @@ def read_bounded_json(
         fail(f"bounded JSON artifact is empty: {path}")
     if before.st_size > byte_limit:
         fail(f"bounded JSON artifact exceeds {byte_limit} bytes: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"bounded JSON artifact could not be opened at {path}: {exc}")
     try:
         opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            fail(f"bounded JSON artifact descriptor is not a regular file: {path}")
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             fail(f"bounded JSON artifact identity changed while opening: {path}")
         chunks: list[bytes] = []

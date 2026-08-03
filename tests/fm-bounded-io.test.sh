@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-HELPER="$ROOT/bin/fm_bounded_io.py"
+HELPER=${FM_BOUNDED_IO_HELPER:-"$ROOT/bin/fm_bounded_io.py"}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -76,6 +76,87 @@ test_json_artifact_is_bounded_and_regular() {
     "symlinked artifact failure was not loud"
 }
 
+test_concurrent_artifact_replacements_are_rejected() {
+  artifact="$TMP/concurrent-verdict.json"
+  python3 - "$HELPER" "$artifact" <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+artifact = Path(sys.argv[2])
+
+
+def exercise_replacement(replace, expected_message):
+    original_open = module.os.open
+    replacement_started = threading.Event()
+    replacement_done = threading.Event()
+    replacement_errors = []
+
+    def replace_after_stat():
+        replacement_started.wait()
+        try:
+            replace()
+        except BaseException as error:
+            replacement_errors.append(error)
+        finally:
+            replacement_done.set()
+
+    def coordinated_open(path, flags, *args, **kwargs):
+        replacement_started.set()
+        if not replacement_done.wait(1):
+            raise AssertionError("concurrent artifact replacement did not finish")
+        if replacement_errors:
+            raise replacement_errors[0]
+        return original_open(path, flags, *args, **kwargs)
+
+    def alarm_handler(_signum, _frame):
+        raise AssertionError("concurrent FIFO replacement blocked during open")
+
+    replacer = threading.Thread(target=replace_after_stat)
+    replacer.start()
+    module.os.open = coordinated_open
+    signal.signal(signal.SIGALRM, alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, 1.5)
+    try:
+        try:
+            module.read_bounded_json(artifact, maximum_bytes=1024)
+        except module.BoundedIOError as error:
+            assert expected_message in str(error), str(error)
+        else:
+            raise AssertionError("concurrent artifact replacement was accepted")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        module.os.open = original_open
+        replacer.join()
+
+
+artifact.write_text('{"original":true}', encoding="utf-8")
+
+
+def replace_with_fifo():
+    artifact.unlink()
+    os.mkfifo(artifact)
+
+
+exercise_replacement(replace_with_fifo, "descriptor is not a regular file")
+artifact.unlink()
+artifact.write_text('{"original":true}', encoding="utf-8")
+replacement = artifact.with_name("replacement-verdict.json")
+replacement.write_text('{"replacement":true}', encoding="utf-8")
+exercise_replacement(
+    lambda: os.replace(replacement, artifact),
+    "identity changed while opening",
+)
+PY
+}
+
 test_json_decoded_strings_are_bounded() {
   artifact="$TMP/strings.json"
   python3 -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*512}))' "$artifact"
@@ -114,6 +195,7 @@ run_case() {
     final-wait) test_final_wait_keeps_original_deadline ;;
     residual-group) test_success_reaps_residual_process_group ;;
     artifact) test_json_artifact_is_bounded_and_regular ;;
+    artifact-open-race) test_concurrent_artifact_replacements_are_rejected ;;
     decoded-strings) test_json_decoded_strings_are_bounded ;;
     batch-items) test_batch_item_count_is_bounded ;;
     *) fail "unknown bounded-I/O test case: $1" ;;
@@ -123,7 +205,8 @@ run_case() {
 if [ "$#" -gt 0 ]; then
   run_case "$1"
 else
-  for case_name in output-limit final-wait residual-group artifact decoded-strings batch-items; do
+  for case_name in output-limit final-wait residual-group artifact \
+    artifact-open-race decoded-strings batch-items; do
     run_case "$case_name"
   done
 fi

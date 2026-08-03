@@ -981,9 +981,13 @@ export async function createDecision(home, {
       ...current.manifest,
       created_at: manifest.created_at,
     };
+    const requestedComparable = { ...manifest };
+    if (current.manifest.destination_format === undefined) {
+      delete requestedComparable.destination_format;
+    }
     if (
       current.request.equals(requestBytes)
-      && JSON.stringify(currentComparable) === JSON.stringify(manifest)
+      && JSON.stringify(currentComparable) === JSON.stringify(requestedComparable)
     ) {
       return { decision: current, created: false };
     }

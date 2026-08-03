@@ -157,7 +157,7 @@ check_submission() {
       if (!entry.isFile() || !pattern.test(entry.name)) continue;
       const candidate = path.join(directory, entry.name);
       const info = fs.statSync(candidate);
-      if (info.mtimeMs < openedAt - 1000) continue;
+      if (info.mtimeMs < openedAt) continue;
       try {
         const payload = JSON.parse(fs.readFileSync(candidate, "utf8"));
         if (payload?.decision_id !== decisionId) continue;

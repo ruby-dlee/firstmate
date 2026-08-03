@@ -756,6 +756,27 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
       await exists(join(fx.home, 'state', `lavish-board-${id}.check.sh`)),
       false,
     );
+    const openedAtMatch = (await readFile(checkPath, 'utf8')).match(/--opened-at ([0-9]+)/);
+    assert.ok(openedAtMatch);
+    const openedAt = Number(openedAtMatch[1]);
+    const manifest = await manifestFor(fx, id);
+    const staleDownload = join(downloads, `lavish-answer-${id}.json`);
+    await writeFile(
+      staleDownload,
+      `${JSON.stringify(browserPayload(manifest, {
+        answers: [{
+          key: 'rollout',
+          value: 'green',
+          question_note: 'Stale answer from the prior board.',
+          option_comments: {},
+        }],
+      }))}\n`,
+    );
+    const staleTime = new Date(openedAt - 500);
+    await utimes(staleDownload, staleTime, staleTime);
+    const staleInfo = await stat(staleDownload);
+    assert.ok(staleInfo.mtimeMs < openedAt);
+    assert.ok(staleInfo.mtimeMs >= openedAt - 1000);
 
     const stopped = await runExecutable(chrome, ['stop'], { env: environment });
     assert.equal(stopped.code, 0, stopped.stderr);
@@ -770,6 +791,11 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
       await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
       true,
     );
+    const stored = decode(
+      await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
+      { strict: true },
+    );
+    assert.equal(stored.answers[0].value, 'blue');
     assert.equal(
       await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
       true,
@@ -935,6 +961,44 @@ test('intake recovers a browser download payload without manual copy', async () 
   assert.equal(again.stdout, '');
 });
 
+test('intake recovers landed payloads only from the effective state root', async () => {
+  const fx = await fixture('state-override-intake');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const effectiveState = join(fx.root, 'effective-state');
+  const defaultState = join(fx.home, 'state');
+  await mkdir(effectiveState);
+  await mkdir(defaultState);
+  await writeFile(
+    join(effectiveState, `lavish-board-${id}.payload.json`),
+    `${JSON.stringify(browserPayload(manifest))}\n`,
+  );
+  await writeFile(
+    join(defaultState, `lavish-board-${id}.payload.json`),
+    `${JSON.stringify(browserPayload(manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: 'Stale default-state answer.',
+        option_comments: {},
+      }],
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { FM_STATE_OVERRIDE: effectiveState },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, /release-choice,payload-collected/);
+  assert.match(intake.stdout, /release-choice,consumed/);
+  const stored = decode(
+    await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
+    { strict: true },
+  );
+  assert.equal(stored.answers[0].value, 'blue');
+});
+
 test('protocol-1 JSON destinations recover byte-for-byte before receipt', async () => {
   const fx = await fixture('legacy-json-intake');
   const id = await createRequest(fx, {
@@ -968,6 +1032,21 @@ test('protocol-1 JSON destinations recover byte-for-byte before receipt', async 
     await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
     true,
   );
+});
+
+test('create retries preserve field-less protocol-1 manifests', async () => {
+  const fx = await fixture('legacy-create-retry');
+  const destination = 'data/lavish-answers/release-choice.json';
+  const id = await createRequest(fx, { destination });
+  const manifestPath = join(fx.home, 'data/decisions', id, 'manifest.toon');
+  const legacyManifest = await manifestFor(fx, id);
+  delete legacyManifest.destination_format;
+  const legacyText = `${encode(legacyManifest)}\n`;
+  await writeFile(manifestPath, legacyText);
+
+  const retry = await createRequest(fx, { destination, returnResult: true });
+  assert.match(retry.result.stdout, /Already exists: release-choice/);
+  assert.equal(await readFile(manifestPath, 'utf8'), legacyText);
 });
 
 test('collect fails closed with named errors for count, key, option, and request drift', async () => {

@@ -282,7 +282,7 @@ function landingCandidateId(name) {
 }
 
 async function discoverLandingCandidates(home) {
-  const stateDirectory = resolve(home, 'state');
+  const stateDirectory = resolve(process.env.FM_STATE_OVERRIDE || join(home, 'state'));
   const directories = [
     stateDirectory,
     process.env.LAVISH_DOWNLOADS_DIR,

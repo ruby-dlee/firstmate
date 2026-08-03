@@ -61,6 +61,7 @@ const reportRetentionSweepMs = reportRetentionSweepSeconds * 1000;
 const retentionPolicyName = ".retention-policy.js";
 const retentionAttemptName = ".retention-attempt.json";
 const retentionAttemptClaimName = ".retention-attempt.claim.json";
+const retentionAdmissionClockSkewMs = 60 * 1000;
 const retentionIndexAuthorityLimit = 512;
 let retentionInvalidMarkerTestGateUsed = false;
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
@@ -829,18 +830,54 @@ function retentionAdmissionIntervalMs() {
     : 5 * 60 * 1000;
 }
 
-function readRetentionAttemptRecord(name, label) {
+function invalidRetentionAttemptRecord(name, label) {
+  return new Error(`invalid ${label} at ${path.join(configuredStackRoot, name)}`);
+}
+
+function readRetentionAttemptRecord(name, label, now) {
   let record;
   try {
     record = JSON.parse(readBoundedRegularFile(name, 4096, label));
   } catch (error) {
-    if (error instanceof SyntaxError) throw new Error(`invalid ${label} at ${path.join(configuredStackRoot, name)}`);
+    if (error instanceof SyntaxError) throw invalidRetentionAttemptRecord(name, label);
     throw error;
   }
-  if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs) || record.attemptedAtMs < 0) {
-    throw new Error(`invalid ${label} at ${path.join(configuredStackRoot, name)}`);
+  const schemaValid = record?.schemaVersion === 1;
+  const timestampIntegral = Number.isSafeInteger(record?.attemptedAtMs);
+  const timestampNonnegative = record?.attemptedAtMs >= 0;
+  if (!schemaValid || !timestampIntegral || !timestampNonnegative) {
+    throw invalidRetentionAttemptRecord(name, label);
+  }
+  const timestampWithinSkew = record.attemptedAtMs <= now + retentionAdmissionClockSkewMs;
+  if (!timestampWithinSkew) {
+    const error = invalidRetentionAttemptRecord(name, label);
+    error.retentionAttemptFuture = true;
+    throw error;
   }
   return record;
+}
+
+function retentionAttemptState(name, label, now, invalidFileAgeFallback = false) {
+  const observed = lstatIfPresent(name);
+  if (!observed) return { kind: "missing" };
+  let record;
+  try {
+    record = readRetentionAttemptRecord(name, label, now);
+  } catch (error) {
+    const fileAgeMs = now - observed.mtimeMs;
+    const fileTimeWithinSkew = fileAgeMs >= -retentionAdmissionClockSkewMs;
+    const fileAgeWithinInterval = fileAgeMs < retentionAdmissionIntervalMs();
+    if ((error.retentionAttemptFuture || invalidFileAgeFallback)
+      && fileTimeWithinSkew && fileAgeWithinInterval) {
+      return { kind: "fallback-fresh", observed, error };
+    }
+    return { kind: "invalid", observed, error };
+  }
+  const ageMs = now - record.attemptedAtMs;
+  if (ageMs < retentionAdmissionIntervalMs()) {
+    return { kind: "fresh", observed, record };
+  }
+  return { kind: "stale", observed, record };
 }
 
 function quarantineObservedRetentionAttempt(name, observed, pinnedRoot, suffix) {
@@ -856,7 +893,7 @@ function quarantineObservedRetentionAttempt(name, observed, pinnedRoot, suffix) 
   try {
     runContainedHelper(
       [
-        "remove-owned-file-fd",
+        "quarantine-owned-entry-fd",
         name,
         `${observed.dev}:${observed.ino}`,
         `.${name}.${suffix}.${crypto.randomUUID()}`,
@@ -879,60 +916,46 @@ function quarantineObservedRetentionAttempt(name, observed, pinnedRoot, suffix) 
 function claimRetentionAttempt() {
   const previousDirectory = process.cwd();
   const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
-  const candidateName = `.retention-attempt.${process.pid}.${crypto.randomUUID()}.tmp`;
   const attemptedAtMs = Date.now();
+  const attemptRecord = `${JSON.stringify({ schemaVersion: 1, attemptedAtMs })}\n`;
   let transferPinnedRoot = false;
   let ownsClaim = false;
+  let candidateStat;
   try {
     process.chdir(configuredStackRoot);
     if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
       throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
     }
-    fs.writeFileSync(
-      candidateName,
-      `${JSON.stringify({ schemaVersion: 1, attemptedAtMs })}\n`,
-      { flag: "wx", mode: 0o600 },
+    let validationError;
+    let markerState = retentionAttemptState(
+      retentionAttemptName,
+      "report retention attempt marker",
+      attemptedAtMs,
     );
+    if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
+      inspectPinnedDirectory(pinnedRoot);
+      return { admitted: false };
+    }
 
     for (let attempt = 0; attempt < 16; attempt += 1) {
-      const claimStat = lstatIfPresent(retentionAttemptClaimName);
-      if (claimStat) {
-        if (claimStat.isSymbolicLink() || !claimStat.isFile()) {
-          if (attemptedAtMs - claimStat.mtimeMs < retentionAdmissionIntervalMs()) return { admitted: false };
-          throw new Error(`report retention admission claim must be a real regular file at ${path.join(configuredStackRoot, retentionAttemptClaimName)}`);
-        }
-        let claimRecord;
-        try {
-          claimRecord = readRetentionAttemptRecord(retentionAttemptClaimName, "report retention admission claim");
-        } catch {
-          if (attemptedAtMs - claimStat.mtimeMs < retentionAdmissionIntervalMs()) return { admitted: false };
-        }
-        if (claimRecord && attemptedAtMs - claimRecord.attemptedAtMs < retentionAdmissionIntervalMs()) {
-          inspectPinnedDirectory(pinnedRoot);
-          return { admitted: false };
-        }
-        if (quarantineObservedRetentionAttempt(
-          retentionAttemptClaimName,
-          claimStat,
-          pinnedRoot,
-          "expired",
-        )) continue;
-        continue;
+      const claimState = retentionAttemptState(
+        retentionAttemptClaimName,
+        "report retention admission claim",
+        attemptedAtMs,
+        true,
+      );
+      if (claimState.kind === "fresh" || claimState.kind === "fallback-fresh") {
+        inspectPinnedDirectory(pinnedRoot);
+        return { admitted: false };
       }
-
-      const markerStat = lstatIfPresent(retentionAttemptName);
-      if (markerStat && !markerStat.isSymbolicLink() && markerStat.isFile()) {
-        try {
-          const record = readRetentionAttemptRecord(retentionAttemptName, "report retention attempt marker");
-          if (attemptedAtMs - record.attemptedAtMs < retentionAdmissionIntervalMs()) {
-            inspectPinnedDirectory(pinnedRoot);
-            return { admitted: false };
-          }
-        } catch {}
+      if (claimState.kind !== "missing") {
+        if (claimState.kind === "invalid") validationError ||= claimState.error;
+        break;
       }
 
       try {
-        fs.linkSync(candidateName, retentionAttemptClaimName);
+        fs.writeFileSync(retentionAttemptClaimName, attemptRecord, { flag: "wx", mode: 0o600 });
+        candidateStat = fs.lstatSync(retentionAttemptClaimName);
         ownsClaim = true;
         break;
       } catch (error) {
@@ -940,71 +963,91 @@ function claimRetentionAttempt() {
         throw error;
       }
     }
-    if (!ownsClaim) return { admitted: false };
-
-    let validationError;
     for (let attempt = 0; attempt < 16; attempt += 1) {
-      const markerStat = lstatIfPresent(retentionAttemptName);
-      if (!markerStat) {
+      markerState = retentionAttemptState(
+        retentionAttemptName,
+        "report retention attempt marker",
+        attemptedAtMs,
+      );
+      if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
+        if (candidateStat && markerState.observed.dev === candidateStat.dev
+          && markerState.observed.ino === candidateStat.ino) break;
+        if (ownsClaim) {
+          const claimStat = lstatIfPresent(retentionAttemptClaimName);
+          if (claimStat && claimStat.dev === candidateStat.dev && claimStat.ino === candidateStat.ino) {
+            quarantineObservedRetentionAttempt(
+              retentionAttemptClaimName,
+              claimStat,
+              pinnedRoot,
+              "released",
+            );
+          }
+          ownsClaim = false;
+        }
+        inspectPinnedDirectory(pinnedRoot);
+        return { admitted: false };
+      }
+      if (markerState.kind === "missing") {
         try {
-          fs.linkSync(candidateName, retentionAttemptName);
-          break;
+          if (ownsClaim) {
+            fs.linkSync(retentionAttemptClaimName, retentionAttemptName);
+          } else {
+            fs.writeFileSync(retentionAttemptName, attemptRecord, { flag: "wx", mode: 0o600 });
+            candidateStat = fs.lstatSync(retentionAttemptName);
+          }
+          continue;
         } catch (error) {
           if (error.code === "EEXIST") continue;
           throw error;
         }
       }
-      if (markerStat.isSymbolicLink() || !markerStat.isFile()) {
-        throw new Error(`report retention attempt marker must be a real regular file at ${path.join(configuredStackRoot, retentionAttemptName)}`);
-      }
-      let record;
-      let markerError;
-      try {
-        record = readRetentionAttemptRecord(retentionAttemptName, "report retention attempt marker");
-      } catch (error) {
-        markerError = error;
-      }
-      if (!markerError && attemptedAtMs - record.attemptedAtMs < retentionAdmissionIntervalMs()) {
-        quarantineObservedRetentionAttempt(
-          retentionAttemptClaimName,
-          fs.lstatSync(retentionAttemptClaimName),
-          pinnedRoot,
-          "released",
-        );
-        ownsClaim = false;
-        inspectPinnedDirectory(pinnedRoot);
-        return { admitted: false };
-      }
-      if (markerError) validationError = markerError;
+      if (markerState.kind === "invalid") validationError ||= markerState.error;
       if (quarantineObservedRetentionAttempt(
         retentionAttemptName,
-        markerStat,
+        markerState.observed,
         pinnedRoot,
-        markerError ? "invalid" : "expired",
+        markerState.kind === "invalid" ? "invalid" : "expired",
       )) continue;
     }
 
-    const installed = lstatIfPresent(retentionAttemptName);
-    if (!installed || installed.isSymbolicLink() || !installed.isFile()) {
-      throw new Error(`report retention attempt marker was not installed at ${path.join(configuredStackRoot, retentionAttemptName)}`);
-    }
-    const installedRecord = readRetentionAttemptRecord(retentionAttemptName, "report retention attempt marker");
-    if (installed.dev !== fs.lstatSync(candidateName).dev || installed.ino !== fs.lstatSync(candidateName).ino
-      || installedRecord.attemptedAtMs !== attemptedAtMs) {
+    runTestFifoHandshake(
+      "FM_REPORT_RETENTION_INSTALLED_TEST_READY",
+      "FM_REPORT_RETENTION_INSTALLED_TEST_PROCEED",
+      "attempt-installed\n",
+      "report retention installed marker test gate",
+    );
+    const installed = fs.lstatSync(retentionAttemptName);
+    const installedRecord = readRetentionAttemptRecord(
+      retentionAttemptName,
+      "report retention attempt marker",
+      attemptedAtMs,
+    );
+    const installedInodeMatches = installed.ino === candidateStat.ino;
+    const installedTimestampMatches = installedRecord.attemptedAtMs === attemptedAtMs;
+    if (!installedInodeMatches || !installedTimestampMatches) {
       throw new Error(`report retention attempt marker changed while installing ${path.join(configuredStackRoot, retentionAttemptName)}`);
     }
-    quarantineObservedRetentionAttempt(
-      retentionAttemptClaimName,
-      fs.lstatSync(retentionAttemptClaimName),
-      pinnedRoot,
-      "released",
-    );
+    const finalClaim = lstatIfPresent(retentionAttemptClaimName);
+    if (finalClaim) {
+      const finalClaimState = retentionAttemptState(
+        retentionAttemptClaimName,
+        "report retention admission claim",
+        attemptedAtMs,
+        true,
+      );
+      if (finalClaimState.kind === "invalid") validationError ||= finalClaimState.error;
+      quarantineObservedRetentionAttempt(
+        retentionAttemptClaimName,
+        finalClaim,
+        pinnedRoot,
+        finalClaimState.kind === "invalid" ? "invalid" : "released",
+      );
+    }
     ownsClaim = false;
     inspectPinnedDirectory(pinnedRoot);
     transferPinnedRoot = true;
     return { admitted: true, pinnedRoot, validationError };
   } finally {
-    fs.rmSync(candidateName, { force: true });
     try { process.chdir(previousDirectory); } catch {}
     if (!transferPinnedRoot) fs.closeSync(pinnedRoot.descriptor);
   }

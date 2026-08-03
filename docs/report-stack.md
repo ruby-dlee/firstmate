@@ -8,7 +8,11 @@ Scheduled `prune` first checks recovery markers, cohort deadlines, publication t
 When that check proves there is no due work, `prune` exits without launching contained helpers or touching the publication lock.
 When work is due, the machine-global `.retention-attempt.json` record admits at most one retention lock attempt per configured owner interval across every Firstmate home, regardless of home count.
 The record is installed atomically before lock acquisition, so a failed admitted run remains ineligible on the next watcher or LaunchAgent loop instead of amplifying contention.
-Admission uses a short-lived shared claim so an invalid canonical attempt record is rejected before inode-owned quarantine, replaced with a fresh record, and only then reported as invalid.
+Admission state has exactly two public paths: the canonical `.retention-attempt.json` record and the short-lived `.retention-attempt.claim.json` serializer.
+Both paths classify absent entries, regular files, symlinks, directories, malformed JSON, schema mismatches, non-integral or negative timestamps, future timestamps, and stale timestamps through the same recovery state machine.
+Every observed invalid generation is quarantined by device and inode identity, the canonical record is installed and verified by inode and timestamp before claim cleanup, and any validation or cleanup failure therefore leaves the next loop cadence-blocked.
+Future record timestamps beyond one minute of clock skew are invalid; only a recent file timestamp grants one bounded admission interval before stale recovery, so a corrected forward clock step cannot suppress retention indefinitely.
+A partially written or otherwise invalid claim receives the same bounded file-age fallback, while an aged invalid claim is repaired through the canonical record before its validation error surfaces.
 Use `prune --force` only for an intentional operator-driven maintenance pass that must bypass scheduled admission.
 Scheduled retention is owned by a per-user macOS LaunchAgent only when it is installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
 The installer publishes immutable self-contained generations and atomically advances the LaunchAgent plist only after the referenced generation is complete, so a crash or reboot never depends on a later Firstmate session to restore executable code.
@@ -19,7 +23,7 @@ Merging the code does not install or activate the owner.
 
 The focused `FM_TEST_FOCUSED=retention-admission bash tests/fm-report-stack-suite.sh` benchmark constructs exactly 955 reports across 656 five-minute cohorts and runs both baseline commit `68f014697d0eea733a4e7c0294becff4e76c7bcf` and the current implementation against independent copies.
 Its result reports measured baseline and target elapsed milliseconds plus actual contained-helper child-process launch counts, requires at least one baseline helper per report, and requires zero target helpers and no target publication-lock acquisition.
-The same focused check exercises scheduled contenders from 24 distinct `FM_HOME` roots against one shared stack, generation-only, cutoff-only, and corrupt index authorities, success-only admission ordering, malformed admission state, invalid configuration, and a stack-root generation swap at their real admission or lock boundaries.
+The same focused check exercises scheduled contenders from 24 distinct `FM_HOME` roots against one shared stack, generation-only, cutoff-only, and corrupt index authorities, success-only admission ordering, every regular-file, symlink, directory, schema, timestamp, file-age, quarantine-identity, installed-inode, and installed-timestamp admission predicate, invalid configuration, and a stack-root generation swap at their real admission or lock boundaries.
 
 The authoritative visibility cutoff is the later of its prior value and the current `now - 30 days` boundary, so ordinary forward wall time tracks that boundary exactly while a backward clock adjustment never re-exposes expired reports.
 Physical cleanup still waits for each report's 30-day minimum age, its five-minute cohort deadline, and a later retention sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its minimum age.

@@ -2333,6 +2333,32 @@ if (indexMode === "corrupt") {
 NODE
 }
 
+write_report_stack_mutant() {
+  local destination_root=$1 boundary=$2 replacement=$3
+  mkdir -p "$destination_root/bin"
+  cp "$ROOT/bin/fm-contained-read.py" "$destination_root/bin/fm-contained-read.py"
+  cp "$ROOT/bin/fm-markdown-structure.cjs" "$destination_root/bin/fm-markdown-structure.cjs"
+  node - "$SCRIPT" "$destination_root/bin/fm-report-stack.mjs" "$boundary" "$replacement" <<'NODE'
+const fs = require("fs");
+const [sourceFile, destinationFile, boundary, replacement] = process.argv.slice(2);
+const source = fs.readFileSync(sourceFile, "utf8");
+if (source.split(boundary).length !== 2) throw new Error(`could not isolate admission predicate: ${boundary}`);
+fs.writeFileSync(destinationFile, source.replace(boundary, replacement));
+NODE
+  chmod +x "$destination_root/bin/fm-report-stack.mjs" "$destination_root/bin/fm-contained-read.py"
+}
+
+assert_valid_fresh_retention_attempt() {
+  node -e '
+    const fs = require("fs");
+    const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const now = Date.now();
+    if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs)
+      || record.attemptedAtMs < 0 || record.attemptedAtMs > now + 60000
+      || now - record.attemptedAtMs >= 3600000) process.exit(1);
+  ' "$1"
+}
+
 test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
   local fixture="$TMP_ROOT/retention-noop-fixture" baseline_stack="$TMP_ROOT/retention-noop-baseline-stack"
   local target_stack="$TMP_ROOT/retention-noop-target-stack" stale_stack="$TMP_ROOT/retention-noop-stale-stack"
@@ -2591,18 +2617,11 @@ test_malformed_retention_attempt_is_replaced_before_validation_error() {
 const fs = require("fs");
 const [sourceFile, destinationFile] = process.argv.slice(2);
 const source = fs.readFileSync(sourceFile, "utf8");
-const boundary = `        } catch {}
-      }
-
-      try {
-        fs.linkSync(candidateName, retentionAttemptClaimName);`;
-const mutation = `        } catch (error) {
-          throw error;
-        }
-      }
-
-      try {
-        fs.linkSync(candidateName, retentionAttemptClaimName);`;
+const boundary = `    if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
+      inspectPinnedDirectory(pinnedRoot);`;
+const mutation = `    if (markerState.kind === "invalid") throw markerState.error;
+    if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
+      inspectPinnedDirectory(pinnedRoot);`;
 if (source.split(boundary).length !== 2) throw new Error("could not isolate malformed-marker admission ordering");
 fs.writeFileSync(destinationFile, source.replace(boundary, mutation));
 NODE
@@ -2691,6 +2710,313 @@ test_retention_invalid_marker_quarantine_is_inode_owned() {
   assert_absent "$stack/.retention-attempt.claim.json" "invalid-marker inode race retained its admission claim"
   exec 7>&-; exec 8>&-
   pass "invalid admission quarantine preserves a replacement canonical inode"
+}
+
+test_retention_admission_recovers_every_marker_path_type() {
+  local case_name stack target first second status
+  for case_name in \
+    marker-nonjson marker-schema marker-negative marker-string marker-symlink marker-directory \
+    claim-nonjson claim-schema claim-negative claim-string claim-symlink claim-directory; do
+    stack="$TMP_ROOT/retention-admission-type-$case_name"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    mkdir "$stack/entries/cohort-1"
+    target="$stack/.retention-attempt.json"
+    if [[ "$case_name" = claim-* ]]; then
+      printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$target"
+      target="$stack/.retention-attempt.claim.json"
+    fi
+    case "$case_name" in
+      *-nonjson) printf 'not json\n' > "$target" ;;
+      *-schema) printf '{"schemaVersion":2,"attemptedAtMs":0}\n' > "$target" ;;
+      *-negative) printf '{"schemaVersion":1,"attemptedAtMs":-1}\n' > "$target" ;;
+      *-string) printf '{"schemaVersion":1,"attemptedAtMs":"1"}\n' > "$target" ;;
+      *-symlink) ln -s missing-admission-target "$target" ;;
+      *-directory) mkdir "$target"; printf 'payload\n' > "$target/child" ;;
+    esac
+    if [[ "$case_name" = claim-* ]]; then
+      node -e '
+        const fs = require("fs");
+        const old = new Date(Date.now() - 7200000);
+        if (fs.lstatSync(process.argv[1]).isSymbolicLink()) fs.lutimesSync(process.argv[1], old, old);
+        else fs.utimesSync(process.argv[1], old, old);
+      ' "$target"
+    fi
+
+    if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "$case_name admission corruption unexpectedly completed"
+    if [[ "$case_name" = marker-* ]]; then
+      assert_contains "$first" "report retention attempt marker" "$case_name did not fail at the canonical marker boundary"
+    else
+      assert_contains "$first" "report retention admission claim" "$case_name did not fail at the claim boundary"
+    fi
+    assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+      || fail "$case_name did not leave a valid fresh canonical admission"
+    assert_absent "$stack/.retention-attempt.claim.json" "$case_name retained its invalid claim path"
+    second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+      || fail "$case_name retried immediately after its validation failure"
+    assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+      "$case_name remained eligible on the immediate next loop"
+  done
+  pass "regular, symlink, and directory admission corruption is uniformly quarantined"
+}
+
+test_stale_claim_quarantine_failure_still_installs_admission() {
+  local stack="$TMP_ROOT/retention-claim-quarantine-failure-stack"
+  local python_wrapper="$TMP_ROOT/retention-claim-quarantine-python" first second status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+  mkdir "$stack/.retention-attempt.claim.json"
+  printf 'claim payload\n' > "$stack/.retention-attempt.claim.json/child"
+  node -e 'const fs=require("fs");const old=new Date(Date.now()-7200000);fs.utimesSync(process.argv[1],old,old)' \
+    "$stack/.retention-attempt.claim.json"
+  cat > "$python_wrapper" <<'SH'
+#!/bin/sh
+if [ "${2:-}" = quarantine-owned-entry-fd ] && [ "${3:-}" = .retention-attempt.claim.json ]; then
+  echo 'synthetic stale claim quarantine failure' >&2
+  exit 1
+fi
+exec "$FM_REAL_PYTHON" "$@"
+SH
+  chmod +x "$python_wrapper"
+
+  if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_PYTHON="$python_wrapper" \
+    FM_REAL_PYTHON="$(command -v python3)" "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "stale-claim quarantine failure unexpectedly completed"
+  assert_contains "$first" "synthetic stale claim quarantine failure" \
+    "stale-claim quarantine failure did not reach its actual cleanup boundary"
+  assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+    || fail "stale-claim quarantine failure surfaced before installing canonical admission"
+  assert_present "$stack/.retention-attempt.claim.json" \
+    "stale-claim quarantine failure unexpectedly mutated the observed claim"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "stale-claim quarantine failure retried on the immediate next loop"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "canonical admission did not suppress retry after claim cleanup failed"
+  pass "canonical admission precedes stale-claim quarantine failure"
+}
+
+test_retention_future_timestamp_uses_bounded_file_age_fallback() {
+  local stack="$TMP_ROOT/retention-future-attempt-stack" near_stack="$TMP_ROOT/retention-near-future-attempt-stack"
+  local first second third before after status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  node -e '
+    const fs = require("fs");
+    fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() + 86400000 })}\n`);
+  ' "$stack/.retention-attempt.json"
+  before=$(cat "$stack/.retention-attempt.json")
+  first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "fresh file-age fallback rejected a recently written future timestamp"
+  assert_contains "$first" '"admitted":false,"reason":"cadence"' \
+    "recent future timestamp did not use bounded file-age fallback"
+  [ "$(cat "$stack/.retention-attempt.json")" = "$before" ] \
+    || fail "file-age fallback mutated a recently written future timestamp"
+  node -e 'const fs=require("fs"); const old=new Date(Date.now()-7200000); fs.utimesSync(process.argv[1], old, old)' \
+    "$stack/.retention-attempt.json"
+  if second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "aged future timestamp suppressed retention indefinitely"
+  assert_contains "$second" "invalid report retention attempt marker" \
+    "aged future timestamp did not reach timestamp validation"
+  assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+    || fail "aged future timestamp was not replaced with fresh admission"
+  third=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "recovered future timestamp retried immediately"
+  assert_contains "$third" '"admitted":false,"reason":"cadence"' \
+    "future-timestamp validation failure remained immediately eligible"
+
+  write_retention_scale_fixture "$near_stack" 1 1 valid
+  mkdir "$near_stack/entries/cohort-1"
+  node -e '
+    const fs = require("fs");
+    fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() + 30000 })}\n`);
+  ' "$near_stack/.retention-attempt.json"
+  before=$(cat "$near_stack/.retention-attempt.json")
+  first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$near_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "bounded forward clock skew was rejected"
+  assert_contains "$first" '"admitted":false,"reason":"cadence"' \
+    "bounded forward clock skew was not admitted as fresh"
+  after=$(cat "$near_stack/.retention-attempt.json")
+  [ "$after" = "$before" ] || fail "bounded forward clock skew mutated a valid marker"
+  pass "future timestamps recover after bounded file-age fallback"
+}
+
+test_retention_admission_record_predicate_mutations() {
+  local label boundary replacement expected stack mutant_root output status
+  while IFS='|' read -r label boundary replacement expected; do
+    [ -n "$label" ] || continue
+    stack="$TMP_ROOT/retention-record-mutant-$label-stack"
+    mutant_root="$TMP_ROOT/retention-record-mutant-$label"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    mkdir "$stack/entries/cohort-1"
+    case "$label" in
+      schema) node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({schemaVersion:2,attemptedAtMs:Date.now()})+"\n")' "$stack/.retention-attempt.json" ;;
+      integer) node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({schemaVersion:1,attemptedAtMs:String(Date.now())})+"\n")' "$stack/.retention-attempt.json" ;;
+      negative) printf '{"schemaVersion":1,"attemptedAtMs":-1}\n' > "$stack/.retention-attempt.json" ;;
+      future) node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n");const old=new Date(Date.now()-7200000);fs.utimesSync(process.argv[1],old,old)' "$stack/.retention-attempt.json" ;;
+      future-mtime) node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n");const future=new Date(Date.now()+86400000);fs.utimesSync(process.argv[1],future,future)' "$stack/.retention-attempt.json" ;;
+      stale-mtime) node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n");const old=new Date(Date.now()-7200000);fs.utimesSync(process.argv[1],old,old)' "$stack/.retention-attempt.json" ;;
+      stale-record) printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json" ;;
+    esac
+    write_report_stack_mutant "$mutant_root" "$boundary" "$replacement"
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -eq 0 ] || fail "$label admission-predicate mutant was not isolated: $output"
+    assert_contains "$output" "$expected" "$label admission-predicate deletion did not bypass its boundary"
+  done <<'CASES'
+schema|schemaValid = record?.schemaVersion === 1|schemaValid = true|"reason":"cadence"
+integer|timestampIntegral = Number.isSafeInteger(record?.attemptedAtMs)|timestampIntegral = true|"reason":"cadence"
+negative|timestampNonnegative = record?.attemptedAtMs >= 0|timestampNonnegative = true|"reason":"completed"
+future|timestampWithinSkew = record.attemptedAtMs <= now + retentionAdmissionClockSkewMs|timestampWithinSkew = true|"reason":"cadence"
+future-mtime|fileTimeWithinSkew = fileAgeMs >= -retentionAdmissionClockSkewMs|fileTimeWithinSkew = true|"reason":"cadence"
+stale-mtime|fileAgeWithinInterval = fileAgeMs < retentionAdmissionIntervalMs()|fileAgeWithinInterval = true|"reason":"cadence"
+stale-record|if (ageMs < retentionAdmissionIntervalMs()) {|if (true) {|"reason":"cadence"
+CASES
+  pass "record schema, timestamp, skew, fallback, and freshness mutants are detected"
+}
+
+test_invalid_claim_file_age_fallback_mutation() {
+  local control_stack="$TMP_ROOT/retention-invalid-claim-fallback-control-stack"
+  local mutant_stack="$TMP_ROOT/retention-invalid-claim-fallback-mutant-stack"
+  local mutant_root="$TMP_ROOT/retention-invalid-claim-fallback-mutant" control mutant status
+  write_retention_scale_fixture "$control_stack" 1 1 valid
+  mkdir "$control_stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$control_stack/.retention-attempt.json"
+  printf 'partial claim write\n' > "$control_stack/.retention-attempt.claim.json"
+  cp -R "$control_stack" "$mutant_stack"
+  write_report_stack_mutant "$mutant_root" \
+    'error.retentionAttemptFuture || invalidFileAgeFallback' 'error.retentionAttemptFuture'
+
+  control=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$control_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "fresh invalid-claim file-age positive control failed"
+  assert_contains "$control" '"admitted":false,"reason":"cadence"' \
+    "fresh invalid claim did not bound a partial-write retry by file age"
+  if mutant=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "invalid-claim fallback mutant unexpectedly remained cadence-blocked"
+  assert_contains "$mutant" "invalid report retention admission claim" \
+    "deleting invalid-claim file-age fallback did not expose the partial-write retry"
+  pass "invalid-claim file-age fallback mutation is detected"
+}
+
+test_retention_installed_marker_predicate_mutations() {
+  local label boundary replacement implementation stack mutant_root executable ready proceed output state pid status saved
+  while IFS='|' read -r label boundary replacement; do
+    for implementation in control mutant; do
+      stack="$TMP_ROOT/retention-installed-$label-$implementation-stack"
+      mutant_root="$TMP_ROOT/retention-installed-$label-mutant"
+      write_retention_scale_fixture "$stack" 1 1 valid
+      mkdir "$stack/entries/cohort-1"
+      executable=$SCRIPT
+      if [ "$implementation" = mutant ]; then
+        write_report_stack_mutant "$mutant_root" "$boundary" "$replacement"
+        executable="$mutant_root/bin/fm-report-stack.mjs"
+      fi
+      ready="$TMP_ROOT/retention-installed-$label-$implementation.ready"
+      proceed="$TMP_ROOT/retention-installed-$label-$implementation.proceed"
+      output="$TMP_ROOT/retention-installed-$label-$implementation.out"
+      saved="$TMP_ROOT/retention-installed-$label-$implementation.saved"
+      mkfifo "$ready" "$proceed"
+      exec 7<>"$ready"
+      exec 8<>"$proceed"
+      FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+        FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_INSTALLED_TEST_READY="$ready" \
+        FM_REPORT_RETENTION_INSTALLED_TEST_PROCEED="$proceed" \
+        "$executable" prune --status > "$output" 2>&1 &
+      pid=$!
+      if ! IFS= read -r -t 10 state <&7; then
+        kill -TERM "$pid" 2>/dev/null || true
+        fail "$label $implementation did not reach installed-marker verification: $(cat "$output")"
+      fi
+      [ "$state" = "attempt-installed" ] || fail "$label installed-marker gate emitted an unexpected state: $state"
+      if [ "$label" = inode ]; then
+        mv "$stack/.retention-attempt.json" "$saved"
+        cp "$saved" "$stack/.retention-attempt.json"
+      else
+        printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+      fi
+      printf 'continue\n' >&8
+      if wait "$pid"; then status=0; else status=$?; fi
+      if [ "$implementation" = control ]; then
+        [ "$status" -ne 0 ] || fail "$label installed-marker positive control accepted a changed generation"
+        assert_grep "report retention attempt marker changed while installing" "$output" \
+          "$label installed-marker positive control missed its verification boundary"
+      else
+        [ "$status" -eq 0 ] || fail "$label installed-marker mutant did not bypass its deleted predicate: $(cat "$output")"
+        assert_grep '"admitted":true,"reason":"completed"' "$output" \
+          "$label installed-marker mutant was not accepted at the actual admission boundary"
+      fi
+      exec 7>&-; exec 8>&-
+    done
+  done <<'CASES'
+inode|installedInodeMatches = installed.ino === candidateStat.ino|installedInodeMatches = true
+timestamp|installedTimestampMatches = installedRecord.attemptedAtMs === attemptedAtMs|installedTimestampMatches = true
+CASES
+  pass "installed-marker inode and timestamp mutants are detected"
+}
+
+test_retention_quarantine_identity_mutation_is_detected() {
+  local stack="$TMP_ROOT/retention-quarantine-identity-mutant-stack"
+  local mutant_root="$TMP_ROOT/retention-quarantine-identity-mutant" ready proceed output state pid status saved
+  local replacement_identity after_identity
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  mkdir -p "$mutant_root/bin"
+  printf 'observed invalid admission\n' > "$stack/.retention-attempt.json"
+  cp "$SCRIPT" "$mutant_root/bin/fm-report-stack.mjs"
+  cp "$ROOT/bin/fm-markdown-structure.cjs" "$mutant_root/bin/fm-markdown-structure.cjs"
+  node - "$ROOT/bin/fm-contained-read.py" "$mutant_root/bin/fm-contained-read.py" <<'NODE'
+const fs = require("fs");
+const [sourceFile, destinationFile] = process.argv.slice(2);
+const source = fs.readFileSync(sourceFile, "utf8");
+const start = source.indexOf("def command_quarantine_owned_entry_fd(arguments):");
+const end = source.indexOf("\n\ndef ensure_child_directory", start);
+const boundary = 'f"{before.st_dev}:{before.st_ino}" != identity';
+const section = source.slice(start, end);
+if (start < 0 || end < 0 || section.split(boundary).length !== 2) {
+  throw new Error("could not isolate quarantine source-identity predicate");
+}
+fs.writeFileSync(destinationFile, source.slice(0, start) + section.replace(boundary, "False") + source.slice(end));
+NODE
+  chmod +x "$mutant_root/bin/fm-report-stack.mjs" "$mutant_root/bin/fm-contained-read.py"
+  ready="$TMP_ROOT/retention-quarantine-identity-mutant.ready"
+  proceed="$TMP_ROOT/retention-quarantine-identity-mutant.proceed"
+  output="$TMP_ROOT/retention-quarantine-identity-mutant.out"
+  saved="$TMP_ROOT/retention-quarantine-identity-mutant.saved"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_INVALID_MARKER_TEST_READY="$ready" \
+    FM_REPORT_RETENTION_INVALID_MARKER_TEST_PROCEED="$proceed" \
+    "$mutant_root/bin/fm-report-stack.mjs" prune --status > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "quarantine identity mutant did not reach the observed-inode boundary: $(cat "$output")"
+  fi
+  [ "$state" = "invalid-marker-observed" ] || fail "quarantine identity mutant emitted an unexpected state: $state"
+  mv "$stack/.retention-attempt.json" "$saved"
+  node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()})+"\n")' \
+    "$stack/.retention-attempt.json"
+  replacement_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "quarantine identity mutant unexpectedly completed without surfacing the original validation"
+  after_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  [ "$after_identity" != "$replacement_identity" ] \
+    || fail "deleting quarantine identity ownership did not expose replacement mutation"
+  exec 7>&-; exec 8>&-
+  pass "quarantine source-inode mutation is detected"
 }
 
 test_invalid_retention_configuration_is_admitted_before_validation() {
@@ -4545,8 +4871,28 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
   test_failed_retention_attempt_is_ineligible_on_the_next_loop
   test_malformed_retention_attempt_is_replaced_before_validation_error
   test_retention_invalid_marker_quarantine_is_inode_owned
+  test_retention_admission_recovers_every_marker_path_type
+  test_stale_claim_quarantine_failure_still_installs_admission
+  test_retention_future_timestamp_uses_bounded_file_age_fallback
+  test_retention_admission_record_predicate_mutations
+  test_invalid_claim_file_age_fallback_mutation
+  test_retention_installed_marker_predicate_mutations
+  test_retention_quarantine_identity_mutation_is_detected
   test_invalid_retention_configuration_is_admitted_before_validation
   test_retention_admission_and_lock_share_root_generation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-admission-integrity ]; then
+  test_malformed_retention_attempt_is_replaced_before_validation_error
+  test_retention_invalid_marker_quarantine_is_inode_owned
+  test_retention_admission_recovers_every_marker_path_type
+  test_stale_claim_quarantine_failure_still_installs_admission
+  test_retention_future_timestamp_uses_bounded_file_age_fallback
+  test_retention_admission_record_predicate_mutations
+  test_invalid_claim_file_age_fallback_mutation
+  test_retention_installed_marker_predicate_mutations
+  test_retention_quarantine_identity_mutation_is_detected
   exit 0
 fi
 
@@ -4659,6 +5005,13 @@ run_partitioned_test test_retention_admission_bounds_total_fleet_attempts_above_
 run_partitioned_test test_failed_retention_attempt_is_ineligible_on_the_next_loop
 run_partitioned_test test_malformed_retention_attempt_is_replaced_before_validation_error
 run_partitioned_test test_retention_invalid_marker_quarantine_is_inode_owned
+run_partitioned_test test_retention_admission_recovers_every_marker_path_type
+run_partitioned_test test_stale_claim_quarantine_failure_still_installs_admission
+run_partitioned_test test_retention_future_timestamp_uses_bounded_file_age_fallback
+run_partitioned_test test_retention_admission_record_predicate_mutations
+run_partitioned_test test_invalid_claim_file_age_fallback_mutation
+run_partitioned_test test_retention_installed_marker_predicate_mutations
+run_partitioned_test test_retention_quarantine_identity_mutation_is_detected
 run_partitioned_test test_invalid_retention_configuration_is_admitted_before_validation
 run_partitioned_test test_retention_admission_and_lock_share_root_generation
 run_partitioned_test test_retention_batches_make_interruption_safe_progress

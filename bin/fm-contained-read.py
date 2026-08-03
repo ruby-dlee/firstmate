@@ -1672,6 +1672,33 @@ def command_remove_owned_file_fd(arguments):
     os.unlink(quarantine, dir_fd=root)
 
 
+def command_quarantine_owned_entry_fd(arguments):
+    if len(arguments) != 3:
+        fail("usage: fm-contained-read.py quarantine-owned-entry-fd <name> <identity> <quarantine>")
+    name, identity, quarantine = arguments
+    if len(components(name)) != 1 or len(components(quarantine)) != 1:
+        fail("owned entry names must be single safe components")
+    root = checked_root(3)
+    before = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if not (stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode)) \
+            or f"{before.st_dev}:{before.st_ino}" != identity:
+        fail("owned entry generation changed before quarantine")
+    try:
+        os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+        fail("owned entry quarantine already exists")
+    except FileNotFoundError:
+        pass
+    rename_noreplace(root, root, name, quarantine)
+    moved = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
+    if moved.st_dev != before.st_dev or moved.st_ino != before.st_ino \
+            or stat.S_IFMT(moved.st_mode) != stat.S_IFMT(before.st_mode):
+        try:
+            rename_noreplace(root, root, quarantine, name)
+        except OSError:
+            pass
+        fail("owned entry generation changed during quarantine")
+
+
 def ensure_child_directory(root, name):
     try:
         os.mkdir(name, 0o700, dir_fd=root)
@@ -1895,6 +1922,8 @@ def main():
         command_finalize_retention_link_fd(sys.argv[2:])
     elif sys.argv[1] == "remove-owned-file-fd":
         command_remove_owned_file_fd(sys.argv[2:])
+    elif sys.argv[1] == "quarantine-owned-entry-fd":
+        command_quarantine_owned_entry_fd(sys.argv[2:])
     elif sys.argv[1] == "publish-report-fd":
         command_publish_report_fd(sys.argv[2:])
     elif sys.argv[1] == "rollback-report-fd":

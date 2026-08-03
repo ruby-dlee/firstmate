@@ -72,23 +72,38 @@ fm_pr_merge_section_scalar() {  # <document> <section> <key>
   '
 }
 
-fm_pr_merge_verify_custody() {  # <generation> <head>
-  local generation=$1 head=$2 current
-  [ -f "$META" ] && [ ! -L "$META" ] || return 1
-  [ "$(fm_account_meta_value "$META" generation_id)" = "$generation" ] || return 1
-  [ "$(fm_account_meta_value "$META" worktree)" = "$WORKTREE" ] || return 1
-  current=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null) || return 1
-  [ "$current" = "$head" ]
+fm_pr_merge_verify_custody() {  # <phase> <generation> <head>
+  local phase=$1 generation=$2 head=$3 current_generation current_worktree current_head
+  local expected_generation observed_generation expected_head observed_head observed_worktree
+  current_generation=
+  current_worktree=
+  if [ -f "$META" ] && [ ! -L "$META" ]; then
+    current_generation=$(fm_account_meta_value "$META" generation_id 2>/dev/null || true)
+    current_worktree=$(fm_account_meta_value "$META" worktree 2>/dev/null || true)
+  fi
+  current_head=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null || true)
+  if [ -n "$generation" ] && [ -n "$head" ] \
+    && [ "$current_generation" = "$generation" ] \
+    && [ "$current_worktree" = "$WORKTREE" ] \
+    && [ "$current_head" = "$head" ]; then
+    return 0
+  fi
+  expected_generation=${generation:-<missing>}
+  observed_generation=${current_generation:-<missing>}
+  expected_head=${head:-<missing>}
+  observed_head=${current_head:-<missing>}
+  observed_worktree=${current_worktree:-<missing>}
+  echo "error: preflight custody mismatch phase=$phase expected_generation=$expected_generation observed_generation=$observed_generation expected_head=$expected_head observed_head=$observed_head expected_worktree=$WORKTREE observed_worktree=$observed_worktree" >&2
+  return 1
 }
 
 fm_pr_merge_locked() {
   local lifecycle generation head admission admitted_head admitted_base admitted_base_ref admitted_policy
   local pr_doc current_head current_base current_base_ref residual status=0
   lifecycle=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || return 1
-  generation=$(fm_account_meta_value "$META" generation_id)
-  head=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null) || status=1
-  [ -n "$generation" ] || status=1
-  if [ "$status" -eq 0 ]; then fm_pr_merge_verify_custody "$generation" "$head" || status=1; fi
+  generation=$(fm_account_meta_value "$META" generation_id 2>/dev/null || true)
+  head=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null || true)
+  if ! fm_pr_merge_verify_custody initial "$generation" "$head"; then status=1; fi
   if [ "$status" -eq 0 ]; then
     admission=$("$SCRIPT_DIR/fm-pr-admit.sh" "$ID" "$URL") || status=1
   fi
@@ -130,7 +145,9 @@ fm_pr_merge_locked() {
       status=1
     }
   fi
-  if [ "$status" -eq 0 ]; then fm_pr_merge_verify_custody "$generation" "$admitted_head" || status=1; fi
+  if [ "$status" -eq 0 ]; then
+    fm_pr_merge_verify_custody post-admission "$generation" "$admitted_head" || status=1
+  fi
   if [ "$status" -eq 0 ]; then
     residual=$(git -C "$WORKTREE" status --porcelain=v1 --untracked-files=all) || status=1
     [ -z "$residual" ] || {

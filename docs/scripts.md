@@ -79,7 +79,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-transition-lib.sh`   | Shared backend-neutral transition record shape and single-owner status->action policy table |
-| `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
+| `fm-send.sh`             | Enforce routed Gate B/F16 text refusal; send only supported control keys through the recorded backend |
 | `fm-runtime-profile.sh`  | Verify a task's actual Codex model and effort from its harness-owned rollout record |
 | `fm-run-liveness.sh`     | Sample one exact no-mistakes run's untruncated processes across a full liveness window |
 | `fm-host-pressure.sh`    | Record contemporaneous uptime and vm_stat evidence before a host-sensitive diagnosis |

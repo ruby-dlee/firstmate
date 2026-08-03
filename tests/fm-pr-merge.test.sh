@@ -129,6 +129,19 @@ EOF
     printf '[1]:\n  - id: 101\n    user: reviewer-final\n    state: APPROVED\n    commit_id: %s\n    body: clean\n' "$FM_TEST_HEAD"
     ;;
   "api /repos/example/repo/branches/main/protection/required_status_checks")
+    if [ -n "${FM_TEST_MUTATE_CUSTODY:-}" ] && [ ! -e "$FM_TEST_CUSTODY_MUTATED" ]; then
+      case "$FM_TEST_MUTATE_CUSTODY" in
+        generation)
+          sed 's/^generation_id=.*/generation_id=test:2/' "$FM_TEST_META" > "$FM_TEST_META.next"
+          mv "$FM_TEST_META.next" "$FM_TEST_META"
+          ;;
+        head)
+          git -C "$FM_TEST_WORKTREE" commit --allow-empty -qm custody-move
+          ;;
+        *) exit 1 ;;
+      esac
+      : > "$FM_TEST_CUSTODY_MUTATED"
+    fi
     if [ "${FM_TEST_MISSING_EVIDENCE_RULE:-0}" = 1 ]; then
       printf 'strict: true\ncontexts[0]:\n'
     else
@@ -156,7 +169,8 @@ run_merge() {
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$dir/state" \
     FM_TEST_GH_LOG="$dir/gh.log" FM_TEST_PULL_COUNT="$dir/pull.count" \
     FM_TEST_POLICY_COUNT="$dir/policy.count" FM_TEST_ENDPOINT_STATE="$dir/endpoint.state" \
-    FM_TEST_WORKTREE="$dir/wt" \
+    FM_TEST_WORKTREE="$dir/wt" FM_TEST_META="$dir/state/task-x1.meta" \
+    FM_TEST_CUSTODY_MUTATED="$dir/custody-mutated" \
     FM_TEST_BASE="$base" FM_TEST_HEAD="$head" \
     PATH="$dir/fakebin:$PATH" "$MERGE" task-x1 https://github.com/example/repo/pull/9 "$@"
 }
@@ -315,6 +329,69 @@ EOF
   pass "fm-pr-merge invalidates all properties when the head moves during admission"
 }
 
+test_initial_custody_mismatch_reports_expected_and_observed_identity() {
+  local rec dir base head rc
+  rec=$(make_case initial-custody); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  sed '/^generation_id=/d' "$dir/state/task-x1.meta" > "$dir/meta.next"
+  mv "$dir/meta.next" "$dir/state/task-x1.meta"
+  run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "missing initial generation must refuse"
+  assert_grep "phase=initial expected_generation=<missing> observed_generation=<missing> expected_head=$head observed_head=$head" \
+    "$dir/err" "initial custody refusal omitted expected and observed identity"
+  [ "$(cat "$dir/endpoint.state")" = present ] || fail "initial custody refusal destroyed the endpoint"
+  printf 'generation_id=test:1\n' >> "$dir/state/task-x1.meta"
+  run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "retired initial violation must reach the declared atomic gap"
+  assert_grep 'exact-head merge is unavailable' "$dir/err" "initial custody retirement did not reach atomic refusal"
+  pass "initial custody mismatch reports and retires exact generation and HEAD evidence"
+}
+
+test_post_admission_generation_mismatch_reports_expected_and_observed_identity() {
+  local rec dir base head rc
+  rec=$(make_case generation-custody); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  FM_TEST_MUTATE_CUSTODY=generation run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "post-admission generation replacement must refuse"
+  assert_grep "phase=post-admission expected_generation=test:1 observed_generation=test:2 expected_head=$head observed_head=$head" \
+    "$dir/err" "post-admission generation refusal omitted expected and observed identity"
+  [ "$(cat "$dir/endpoint.state")" = present ] || fail "generation custody refusal destroyed the endpoint"
+  sed 's/^generation_id=.*/generation_id=test:1/' "$dir/state/task-x1.meta" > "$dir/meta.next"
+  mv "$dir/meta.next" "$dir/state/task-x1.meta"
+  rm -f "$dir/custody-mutated" "$dir/pull.count"
+  : > "$dir/gh.log"
+  FM_TEST_MUTATE_CUSTODY= run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "retired generation violation must reach the declared atomic gap"
+  assert_grep 'exact-head merge is unavailable' "$dir/err" "generation custody retirement did not reach atomic refusal"
+  pass "post-admission generation mismatch reports and retires exact identity evidence"
+}
+
+test_post_admission_head_mismatch_reports_expected_and_observed_identity() {
+  local rec dir base head moved rc
+  rec=$(make_case head-custody); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  FM_TEST_MUTATE_CUSTODY=head run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "post-admission HEAD replacement must refuse"
+  moved=$(git -C "$dir/wt" rev-parse HEAD)
+  [ "$moved" != "$head" ] || fail "HEAD mutation did not change the production representation"
+  assert_grep "phase=post-admission expected_generation=test:1 observed_generation=test:1 expected_head=$head observed_head=$moved" \
+    "$dir/err" "post-admission HEAD refusal omitted expected and observed identity"
+  [ "$(cat "$dir/endpoint.state")" = present ] || fail "HEAD custody refusal destroyed the endpoint"
+  git -C "$dir/wt" reset --hard "$head" >/dev/null
+  rm -f "$dir/custody-mutated" "$dir/pull.count"
+  : > "$dir/gh.log"
+  FM_TEST_MUTATE_CUSTODY= run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "retired HEAD violation must reach the declared atomic gap"
+  assert_grep 'exact-head merge is unavailable' "$dir/err" "HEAD custody retirement did not reach atomic refusal"
+  pass "post-admission HEAD mismatch reports and retires exact identity evidence"
+}
+
 test_armed_merge_flags_refuse() {
   local rec dir base head rc
   rec=$(make_case armed); IFS='|' read -r dir base head <<EOF
@@ -339,4 +416,7 @@ test_missing_server_evidence_rule_refuses
 test_non_strict_base_policy_rejects_then_retires
 test_review_pagination_combines_validated_pages
 test_head_movement_during_admission_refuses
+test_initial_custody_mismatch_reports_expected_and_observed_identity
+test_post_admission_generation_mismatch_reports_expected_and_observed_identity
+test_post_admission_head_mismatch_reports_expected_and_observed_identity
 test_armed_merge_flags_refuse

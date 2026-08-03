@@ -52,6 +52,13 @@ if [ "${FM_FAKE_TEARDOWN_ASSERT_HERDR:-0}" = 1 ]; then
   grep -qx 'herdr_pane_id=pane-41' "$meta" || exit 46
   ! grep -q '^direct_spawn_endpoint=' "$meta" || exit 47
 fi
+if [ "${FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT:-0}" = 1 ]; then
+  report="${FM_DATA_OVERRIDE:-$FM_HOME/data}/$id/report.md"
+  if [ ! -f "$report" ]; then
+    printf 'REFUSED: scout task %s has no report at %s.\n' "$id" "$report" >&2
+    exit 51
+  fi
+fi
 if [ "${FM_FAKE_TEARDOWN_STATUS:-0}" -ne 0 ]; then
   printf 'REFUSED: synthetic teardown refusal\n' >&2
   exit "$FM_FAKE_TEARDOWN_STATUS"
@@ -79,8 +86,10 @@ reset_logs() {
   FM_FAKE_TEARDOWN_STATUS=0
   FM_FAKE_TEARDOWN_ASSERT_ORPHAN=0
   FM_FAKE_TEARDOWN_ASSERT_HERDR=0
+  FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT=0
   export FM_FAKE_PR_STATE FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
   export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
+  export FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT
 }
 
 make_task() {  # <id> <mode>
@@ -147,7 +156,7 @@ test_cross_branch_active_run_refuses_without_guessing_id() {
   pass "active cross-branch validation is retained when its exact run ID is unavailable"
 }
 
-test_detached_scout_skips_run_attribution_but_surfaces_teardown_refusal() {
+test_detached_scout_preserves_report_gate_and_reaps_with_report() {
   local id worktree out rc
   reset_logs
   id=detached-scout
@@ -159,23 +168,53 @@ test_detached_scout_skips_run_attribution_but_surfaces_teardown_refusal() {
     "kind=scout" "mode=no-mistakes"
   printf 'done: report written\n' > "$HOME_DIR/state/$id.status"
 
-  FM_FAKE_TEARDOWN_STATUS=1
-  export FM_FAKE_TEARDOWN_STATUS
+  FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT=1
+  export FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT
   out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
-  expect_code 1 "$rc" "detached scout teardown refusal"
+  expect_code 1 "$rc" "detached scout missing-report refusal"
   assert_not_contains "$out" "no-mistakes run attribution" \
     "detached scout used an inapplicable no-mistakes branch gate"
+  assert_contains "$out" "scout task $id has no report" \
+    "detached scout did not surface the report gate refusal"
   assert_contains "$out" "ordinary teardown refused" \
-    "genuine detached scout teardown refusal was hidden"
-  [ -f "$HOME_DIR/state/$id.meta" ] || fail "refused detached scout teardown lost metadata"
-
-  reset_logs
-  out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
-  expect_code 0 "$rc" "detached scout auto-reap"
-  assert_contains "$out" "auto-reaped $id" "detached scout did not report reaping"
+    "detached scout report gate refusal was hidden"
   assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" \
-    "detached scout did not invoke ordinary teardown"
-  pass "detached scouts skip run attribution while genuine teardown refusals stay visible"
+    "detached scout did not reach the report gate in ordinary teardown"
+  [ -f "$HOME_DIR/state/$id.meta" ] || fail "missing-report scout teardown lost metadata"
+
+  mkdir -p "$HOME_DIR/data/$id"
+  printf '# Scout report\n\nDetached scout investigation is complete.\n' > "$HOME_DIR/data/$id/report.md"
+  reset_logs
+  FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT=1
+  export FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT
+  out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
+  expect_code 0 "$rc" "reported detached scout auto-reap"
+  assert_contains "$out" "auto-reaped $id" "reported detached scout did not report reaping"
+  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" \
+    "reported detached scout did not invoke ordinary teardown"
+  pass "detached scouts surface the missing-report gate and reap only after a report exists"
+}
+
+test_detached_ship_still_requires_exact_branch_attribution() {
+  local id worktree out rc
+  reset_logs
+  id=detached-ship
+  worktree="$TMP/$id"
+  fm_git_init_commit "$worktree"
+  git -C "$worktree" checkout -q --detach HEAD
+  fm_write_meta "$HOME_DIR/state/$id.meta" \
+    "window=fm:$id" "worktree=$worktree" "project=$worktree" \
+    "kind=ship" "mode=no-mistakes" "pr=https://github.com/acme/repo/pull/7"
+  printf 'done: PR checks green\n' > "$HOME_DIR/state/$id.status"
+
+  out=$("$AUTO_REAP" task "$id" pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "detached ship attribution refusal"
+  assert_contains "$out" "no-mistakes run attribution requires exact branch fm/$id" \
+    "detached ship bypassed exact no-mistakes branch attribution"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "detached ship invoked teardown"
+  [ -f "$HOME_DIR/state/$id.meta" ] || fail "detached ship refusal lost metadata"
+  rm -f "$HOME_DIR/state/$id.meta" "$HOME_DIR/state/$id.status"
+  pass "detached ship tasks still require exact branch attribution"
 }
 
 test_scout_skip_requires_detached_head_and_complete_metadata() {
@@ -628,7 +667,8 @@ test_local_merge_immediately_auto_reaps() {
 test_merged_task_cancels_exact_run_then_tears_down
 test_open_pr_refuses_without_teardown
 test_cross_branch_active_run_refuses_without_guessing_id
-test_detached_scout_skips_run_attribution_but_surfaces_teardown_refusal
+test_detached_scout_preserves_report_gate_and_reaps_with_report
+test_detached_ship_still_requires_exact_branch_attribution
 test_scout_skip_requires_detached_head_and_complete_metadata
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched

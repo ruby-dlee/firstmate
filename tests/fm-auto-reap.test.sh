@@ -156,7 +156,7 @@ test_cross_branch_active_run_refuses_without_guessing_id() {
   pass "active cross-branch validation is retained when its exact run ID is unavailable"
 }
 
-test_detached_scout_preserves_report_gate_and_reaps_with_report() {
+test_detached_scout_waits_for_review_then_preserves_report_gate() {
   local id worktree out rc
   reset_logs
   id=detached-scout
@@ -171,15 +171,24 @@ test_detached_scout_preserves_report_gate_and_reaps_with_report() {
   FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT=1
   export FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT
   out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
-  expect_code 1 "$rc" "detached scout missing-report refusal"
+  expect_code 0 "$rc" "detached scout terminal parking"
   assert_not_contains "$out" "no-mistakes run attribution" \
     "detached scout used an inapplicable no-mistakes branch gate"
+  assert_contains "$out" "auto-reap parked $id" \
+    "detached scout parking was not observable"
+  assert_contains "$out" "awaiting report review and promotion decision" \
+    "detached scout parking omitted the decision boundary"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "terminal scout signal invoked teardown"
+  [ -f "$HOME_DIR/state/$id.meta" ] || fail "parked scout lost metadata"
+
+  out=$("$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
+  expect_code 1 "$rc" "reviewed detached scout missing-report refusal"
   assert_contains "$out" "scout task $id has no report" \
-    "detached scout did not surface the report gate refusal"
+    "reviewed detached scout did not surface the report gate refusal"
   assert_contains "$out" "ordinary teardown refused" \
-    "detached scout report gate refusal was hidden"
+    "reviewed detached scout report gate refusal was hidden"
   assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" \
-    "detached scout did not reach the report gate in ordinary teardown"
+    "reviewed detached scout did not reach the report gate in ordinary teardown"
   [ -f "$HOME_DIR/state/$id.meta" ] || fail "missing-report scout teardown lost metadata"
 
   mkdir -p "$HOME_DIR/data/$id"
@@ -188,11 +197,16 @@ test_detached_scout_preserves_report_gate_and_reaps_with_report() {
   FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT=1
   export FM_FAKE_TEARDOWN_REQUIRE_SCOUT_REPORT
   out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
-  expect_code 0 "$rc" "reported detached scout auto-reap"
-  assert_contains "$out" "auto-reaped $id" "reported detached scout did not report reaping"
+  expect_code 0 "$rc" "reported detached scout terminal parking"
+  assert_contains "$out" "auto-reap parked $id" "reported detached scout was not parked"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "reported terminal scout signal invoked teardown"
+
+  out=$("$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
+  expect_code 0 "$rc" "reviewed detached scout auto-reap"
+  assert_contains "$out" "auto-reaped $id" "reviewed detached scout did not report reaping"
   assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" \
-    "reported detached scout did not invoke ordinary teardown"
-  pass "detached scouts surface the missing-report gate and reap only after a report exists"
+    "reviewed detached scout did not invoke ordinary teardown"
+  pass "detached scouts park until review and retain the ordinary report gate"
 }
 
 test_detached_ship_still_requires_exact_branch_attribution() {
@@ -217,7 +231,7 @@ test_detached_ship_still_requires_exact_branch_attribution() {
   pass "detached ship tasks still require exact branch attribution"
 }
 
-test_scout_skip_requires_detached_head_and_complete_metadata() {
+test_reviewed_scout_reap_requires_detached_head_and_complete_metadata() {
   local id worktree caller_worktree out rc
   caller_worktree="$TMP/explicit-detached-caller"
   fm_git_init_commit "$caller_worktree"
@@ -233,7 +247,7 @@ test_scout_skip_requires_detached_head_and_complete_metadata() {
     "kind=scout" "mode=no-mistakes"
   printf 'done: report written\n' > "$HOME_DIR/state/$id.status"
 
-  out=$("$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
+  out=$("$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
   expect_code 1 "$rc" "attached scout attribution refusal"
   assert_contains "$out" "no-mistakes run attribution" \
     "attached scout bypassed applicable no-mistakes branch attribution"
@@ -246,7 +260,7 @@ test_scout_skip_requires_detached_head_and_complete_metadata() {
     "window=fm:$id" "worktree=" "project=$TMP" "kind=scout" "mode=no-mistakes"
   printf 'done: report written\n' > "$HOME_DIR/state/$id.status"
 
-  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
+  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
   expect_code 1 "$rc" "empty scout worktree attribution refusal"
   assert_contains "$out" "requires a recorded worktree" \
     "empty scout worktree value reached git branch attribution"
@@ -259,7 +273,7 @@ test_scout_skip_requires_detached_head_and_complete_metadata() {
     "window=fm:$id" "project=$TMP" "kind=scout" "mode=no-mistakes"
   printf 'done: report written\n' > "$HOME_DIR/state/$id.status"
 
-  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
+  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
   expect_code 1 "$rc" "missing scout worktree attribution refusal"
   assert_contains "$out" "requires a recorded worktree" \
     "missing scout worktree key reached git branch attribution"
@@ -273,7 +287,7 @@ test_scout_skip_requires_detached_head_and_complete_metadata() {
     "window=fm:$id" "worktree=$worktree" "project=$TMP" "kind=scout" "mode=no-mistakes"
   printf 'done: report written\n' > "$HOME_DIR/state/$id.status"
 
-  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-done 2>&1); rc=$?
+  out=$(cd "$caller_worktree" && "$AUTO_REAP" task "$id" scout-reviewed 2>&1); rc=$?
   expect_code 1 "$rc" "nonexistent scout worktree attribution refusal"
   assert_contains "$out" "no-mistakes run attribution" \
     "nonexistent recorded worktree was mistaken for detached HEAD"
@@ -587,6 +601,7 @@ test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
 printf '%s\n' "$*" >> "$FM_FAKE_AUTO_REAP_CALLS"
 case "$*" in
   maintenance) ;;
+  task\ *\ scout-done) printf 'auto-reap parked by watcher: awaiting report review and promotion decision\n' ;;
   *) printf 'auto-reaped by watcher: %s\n' "$*" ;;
 esac
 SH
@@ -635,8 +650,8 @@ SH
   fi
   wait "$pid" 2>/dev/null || true
   assert_contains "$(cat "$calls")" "task scout-watch scout-done" "watcher scout route"
-  assert_contains "$(cat "$out")" "auto-reaped by watcher" "watcher scout wake result"
-  pass "watcher continuously routes merged checks and scout terminal signals to auto-reap"
+  assert_contains "$(cat "$out")" "auto-reap parked by watcher" "watcher scout parking result"
+  pass "watcher reaps merged work and parks terminal scouts for review"
 }
 
 test_local_merge_immediately_auto_reaps() {
@@ -667,9 +682,9 @@ test_local_merge_immediately_auto_reaps() {
 test_merged_task_cancels_exact_run_then_tears_down
 test_open_pr_refuses_without_teardown
 test_cross_branch_active_run_refuses_without_guessing_id
-test_detached_scout_preserves_report_gate_and_reaps_with_report
+test_detached_scout_waits_for_review_then_preserves_report_gate
 test_detached_ship_still_requires_exact_branch_attribution
-test_scout_skip_requires_detached_head_and_complete_metadata
+test_reviewed_scout_reap_requires_detached_head_and_complete_metadata
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown

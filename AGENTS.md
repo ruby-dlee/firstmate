@@ -557,7 +557,7 @@ bin/fm-teardown.sh <id>
 ```
 
 The watcher normally invokes `bin/fm-auto-reap.sh` as soon as a terminal `done` task's recorded PR is provably merged.
-The approved local-only merge helper and completed-scout signal take the same automatic path.
+The approved local-only merge helper takes the same automatic path, while a completed scout is visibly parked until its report has been reviewed and promotion has been considered.
 Auto-reaping cancels only an exactly attributed no-mistakes run, never guesses cross-branch process ownership, and then calls this ordinary teardown without `--force`.
 Persistent secondmates are excluded, and X-mode-linked tasks wait for their required final follow-up.
 An automatic refusal is an actionable wake and retains its metadata, worktree, and acquisition authority; after resolving the reported cause, retry with the ordinary command above.
@@ -585,9 +585,13 @@ It never authorizes discarding child or parent work.
 
 A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold the brief with `bin/fm-brief.sh <id> <repo> --scout`, spawn with `--scout` - then diverges after the work:
 
-- There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
+- There is no Validate or PR-ready stage.
+  When the crewmate's status says `done`, the watcher surfaces it as parked for report review and a promotion decision instead of tearing it down.
+  Read `data/<id>/report.md` while its worktree and loaded context remain available.
 - Relay the findings to the captain: plain chat for a focused answer, and a durable Lavish decision when multiple genuine choices need structured input.
-- The watcher automatically tears down on the terminal `done` signal - no merge gate.
+- If the findings warrant promotion, follow the Promotion flow below.
+  Otherwise, after explicitly deciding not to promote, run `bin/fm-auto-reap.sh task <id> scout-reviewed`.
+  That reviewed-scout path has no merge gate and delegates to ordinary teardown.
   For a post-cutover scout that ran, ordinary teardown still requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses auto-reaping because the findings are the work product.
   A failed direct spawn whose endpoint was never created may clear its bookkeeping without a report because no scout ran.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.

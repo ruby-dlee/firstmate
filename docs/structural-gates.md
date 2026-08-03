@@ -144,7 +144,7 @@ Covered route: `bin/fm-pr-merge.sh`, the canonical Firstmate PR merge entrypoint
 
 Mechanical trigger: the script rejects scheduling flags before any GitHub call, acquires the task lifecycle and shared checkout locks, runs synchronous snapshot admission, repeats local and remote identity checks, and invokes `fm_pr_require_atomic_merge_boundary` before any PR metadata write, endpoint teardown, or merge request.
 
-Deterministic snapshot predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; protected-branch required checks must be strict and nonempty; stale reviews must be dismissed; code-owner and last-push approval must be required; at least two approvals and admin enforcement must apply; and the sampled head, base, local content, checks, reviews, and residual must agree.
+Deterministic snapshot predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; protected-branch required checks must be strict and nonempty; base-branch policy must be configured to dismiss stale reviews and require code-owner and last-push approval; at least two generic non-author approvals and admin enforcement must apply; and the sampled head, base, local content, checks, reviews, and residual must agree.
 
 GitHub branch protection atomically enforces only configured required contexts, so a new failing unrequired context at the same head can appear after snapshot admission and still permit merge.
 
@@ -184,7 +184,9 @@ Deterministic predicate: one unchanged head, base, and base ref must have a none
 
 Files, check runs, and reviews are fetched as explicit bounded pages and combined only after every page is structurally validated and its reported count reconciles.
 
-Independent adversarial review is represented by a current exact-head code-owner approval under protected-branch stale-review dismissal and last-push approval, rather than by mutable spelling in a review body.
+Admission counts two generic non-author exact-head approvals and separately verifies that base-branch policy is configured to require code-owner reviews, stale-review dismissal, and last-push approval.
+
+It does not prove that this PR has a current exact-head code-owner approval or otherwise satisfies that policy at the PR level.
 
 A reviewer that stopped without submitting an exact-head `APPROVED` review contributes no verdict and the head is `UNREVIEWED`.
 
@@ -194,7 +196,7 @@ The snapshot catches absent, pending, failed, stale, truncated, moved, dirty, un
 
 Failure mode: the merge route refuses after snapshot admission because neither complete mutable server evidence nor exclusive local writer custody is available.
 
-The independent-review mutation leg is unverified and unshipped because the repository fixture cannot perform an authoritative GitHub review dismissal, and the prior fake merge-endpoint rejection was removed.
+The code-owner and independent-review mutation leg is unverified and unshipped because the repository fixture cannot prove PR-level code-owner satisfaction or perform an authoritative GitHub review dismissal.
 
 Free-form recommendations remain prose and cannot be made route-complete by this repository without the structured reporting transport described under Gate E.
 
@@ -220,6 +222,14 @@ No current route supplies both atomic units, so Gates D and F refuse rather than
 
 This ledger distinguishes firing proofs from stated gaps and does not count a snapshot, spelling assertion, wrong observing layer, unreachable symbol, or test-side semantic reimplementation as a shipped catch.
 
+The prior F20 and F21 gate acceptances are RETRACTED because their fixtures demonstrated nothing about the production guards.
+
+All A-F firing proofs were freshly re-executed against real production violations.
+
+Any leg not demonstrated is a STATED GAP.
+
+Gate B's current production-route refusal proof is separate from the retracted F21 fixture.
+
 - Gate A scope is one recorded Codex generation, the behavioral representation is a later wrong `thread_settings_applied` record, the observing layer is `bin/fm-runtime-profile.sh`, the reachable production path is `fm-codex-runtime-profile.mjs`, deterministic failure is exit 1 with the observed wrong axes, and retirement is a later exact-profile runtime record that verifies in `tests/fm-runtime-profile.test.sh`.
 - Gate B scope is the away-mode supervisor injection route, the behavioral representation is an actual text digest passed to `inject_msg`, the observing layer is `bin/fm-supervise-daemon.sh`, the reachable production symbol is the unmodified `fm_backend_send_steering`, deterministic failure is nonzero before pane input in `tests/fm-daemon.test.sh`, and retirement requires an atomic agent-session-bound backend receipt; this is a verified refusal and an unshipped delivery gap.
 - Gate B has no shipped delivery mutation proof in this lane because F16 and its released `bin/fm-send.sh` boundary are owned by `steer-enter-accepts-open-modal`; retirement requires that lane to inject an agent-to-shell transition between entry and submission and prove atomic delivery or refusal.
@@ -228,4 +238,4 @@ This ledger distinguishes firing proofs from stated gaps and does not count a sn
 - Gate D scope is one PR head and base preflight, the behavioral representation is `strict: false` on the protected-branch policy response, the observing layer is `bin/fm-pr-merge.sh`, the reachable production symbol is `fm_pr_require_server_admission_rule`, deterministic failure occurs before metadata, endpoint, or merge mutation, and restoring strict policy retires that violation only as far as the unconditional atomic-boundary refusal in `tests/fm-pr-merge.test.sh`; the merge gate remains unshipped.
 - Gate E scope is the append-only task status carrier, the behavioral representation is an invented `blocked [key=premise]:` event with no assumption test, the observing layer is the shared watcher classifier, the reachable production symbols are `status_is_captain_relevant` and `status_open_decisions`, deterministic evidence is that the carrier accepts rather than rejects it, and retirement requires an explicit `resolved` event in `tests/fm-blocker-discipline-gap.test.sh`.
 - Gate E remains unshipped until a mandatory structured blocker transport rejects missing `assumption`, `test`, and `result` fields, at which point the mutation test must flip from demonstrating acceptance to demonstrating refusal.
-- Gate F scope is one exact-head snapshot evidence set, the behavioral representations exercised through production parsing are a missing exact-head approval and a dirty tracked or untracked worktree, the observing layer is `bin/fm-pr-admit.sh`, deterministic failure is snapshot refusal, and removing those violations reaches only `fm_pr_require_atomic_merge_boundary`; authoritative review dismissal and concurrent-writer retirement evidence do not exist, so Gate F remains unshipped.
+- Gate F scope is one exact-head snapshot evidence set, the behavioral representations exercised through production parsing are a missing generic exact-head approval and a dirty tracked or untracked worktree, the observing layer is `bin/fm-pr-admit.sh`, deterministic failure is snapshot refusal, and removing those violations reaches only `fm_pr_require_atomic_merge_boundary`; PR-level code-owner proof, authoritative review dismissal, and concurrent-writer retirement evidence do not exist, so Gate F remains a STATED GAP.

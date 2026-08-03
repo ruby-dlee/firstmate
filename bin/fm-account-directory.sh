@@ -696,6 +696,7 @@ write_codex_probe_cache() { # <cache-file> <epoch> <verdict> <account-identity>
 probe_codex_account() { # <account-home> <codex-command>
   local account_home=$1 codex_bin=$2 probe_root account_name cache now cached published_at
   local timeout output error status verdict tmp_root cache_home environment_name probe_lock account_identity current_identity
+  local cache_identity current_cache_identity
   probe_root=$(probe_cache_directory) || return 1
   account_name=${account_home##*/}
   case "$account_name" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
@@ -725,7 +726,17 @@ probe_codex_account() { # <account-home> <codex-command>
   output=$tmp_root/last-message
   error=$tmp_root/stderr
   cache_home=$account_home/.agent-fleet-quota-cache
-  mkdir -p "$cache_home" 2>/dev/null || {
+  if [ -e "$cache_home" ] || [ -L "$cache_home" ]; then
+    [ -d "$cache_home" ] && [ ! -L "$cache_home" ] || cache_home=
+  else
+    mkdir -p "$cache_home" 2>/dev/null || cache_home=
+  fi
+  if [ -n "$cache_home" ]; then
+    cache_identity=$(fm_checkout_physical_path_identity "$cache_home" directory 2>/dev/null || true)
+  else
+    cache_identity=
+  fi
+  [ -n "$cache_identity" ] || {
     rm -rf "$tmp_root"
     published_at=$(probe_now 2>/dev/null || printf '%s' "$now")
     write_codex_probe_cache "$cache" "$published_at" unavailable "$account_identity" || true
@@ -762,6 +773,11 @@ probe_codex_account() { # <account-home> <codex-command>
     log "codex account $account_home unavailable: completion probe returned no exact sentinel"
   else
     log "codex account $account_home unavailable: codex exec refused or failed (exit $status)"
+  fi
+  current_cache_identity=$(fm_checkout_physical_path_identity "$cache_home" directory 2>/dev/null || true)
+  if [ "$current_cache_identity" != "$cache_identity" ]; then
+    verdict=unavailable
+    log "codex account $account_home unavailable: cache directory identity changed during completion probe"
   fi
   current_identity=$(fm_checkout_physical_path_identity "$account_home" directory 2>/dev/null || true)
   if [ "$current_identity" != "$account_identity" ]; then

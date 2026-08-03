@@ -125,6 +125,7 @@ SH
 set -u
 id=${1:-unknown}
 rc=${FM_FAKE_RUN_LIVENESS_RC:-0}
+[ -z "${FM_FAKE_RUN_LIVENESS_SLEEP:-}" ] || sleep "$FM_FAKE_RUN_LIVENESS_SLEEP"
 if [ "$rc" -eq 0 ]; then
   line='alive: run=FAKE samples=7 interval=10s counts=1,1,1,1,1,1,1 cpu=1,1,1,1,1,1,1 cpu_delta=1s repo_test_baseline=unknowns'
 else

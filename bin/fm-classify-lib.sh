@@ -31,6 +31,7 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 FM_RUN_LIVENESS_BIN="${FM_RUN_LIVENESS_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-run-liveness.sh}"
+FM_SIGNAL_LIVENESS_MAX_PARALLEL_DEFAULT=16
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -394,7 +395,9 @@ crew_is_paused() {  # <id>
 # task ids by stripping the .status / .turn-ended suffix; a no-verb wake with nothing
 # provably working must surface, so an empty/unresolvable list returns 1.
 signal_crew_provably_working() {  # <file> ...
-  local f base task seen=""
+  local f base task seen="" max_parallel pid rc=0
+  local -a tasks=()
+  local -a pids=()
   for f in "$@"; do
     base=${f##*/}
     case "$base" in
@@ -405,10 +408,20 @@ signal_crew_provably_working() {  # <file> ...
     [ -n "$task" ] || continue
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
-    crew_is_provably_working "$task" || return 1
+    tasks+=("$task")
   done
-  [ -n "$seen" ] || return 1
-  return 0
+  [ "${#tasks[@]}" -gt 0 ] || return 1
+  max_parallel=${FM_SIGNAL_LIVENESS_MAX_PARALLEL:-$FM_SIGNAL_LIVENESS_MAX_PARALLEL_DEFAULT}
+  case "$max_parallel" in ''|*[!0-9]*|0) return 1 ;; esac
+  [ "${#tasks[@]}" -le "$max_parallel" ] || return 1
+  for task in "${tasks[@]}"; do
+    crew_is_provably_working "$task" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  return "$rc"
 }
 
 # 0 (terminal/actionable) if a stale window's last status line is

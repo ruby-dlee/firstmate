@@ -366,6 +366,7 @@ test_signal_crew_provably_working_classifier() {
   local dir fakebin state
   dir=$(make_case signal-provably-working); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh"
   export FM_FAKE_CREW_STATE_a='state: working · source: run-step · running'
   export FM_FAKE_CREW_STATE_b='state: done · source: run-step · run passed'
   signal_crew_provably_working "$state/a.status" "$state/a.turn-ended" \
@@ -380,6 +381,30 @@ test_signal_crew_provably_working_classifier() {
     || fail "an empty signal file list was treated as benign"
   unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
+}
+
+test_signal_crew_provably_working_runs_one_bounded_parallel_window() {
+  local dir fakebin state started elapsed task files=""
+  dir=$(make_case signal-parallel-window); fakebin="$dir/fakebin"; state="$dir/state"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · running'
+  export FM_FAKE_RUN_LIVENESS_SLEEP=1
+  for task in a b c d e; do
+    files="$files $state/$task.turn-ended"
+  done
+  started=$SECONDS
+  # shellcheck disable=SC2086
+  signal_crew_provably_working $files \
+    || fail "parallel process window rejected five positively proved tasks"
+  elapsed=$((SECONDS - started))
+  [ "$elapsed" -lt 4 ] \
+    || fail "five coalesced process windows still ran serially for ${elapsed}s"
+  # shellcheck disable=SC2086
+  ! FM_SIGNAL_LIVENESS_MAX_PARALLEL=4 signal_crew_provably_working $files \
+    || fail "coalesced signal classification exceeded its explicit concurrency bound"
+  unset FM_FAKE_CREW_STATE FM_FAKE_RUN_LIVENESS_SLEEP
+  pass "coalesced run liveness shares one explicitly bounded parallel window"
 }
 
 # --- benign wakes are absorbed ONLY when the crewmate is provably working -----
@@ -1922,6 +1947,12 @@ if [ "${FM_TEST_FOCUSED:-}" = runtime-profiles ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = signal-parallel ]; then
+  test_signal_crew_provably_working_classifier
+  test_signal_crew_provably_working_runs_one_bounded_parallel_window
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1932,6 +1963,7 @@ test_status_is_paused_classifier
 test_failure_pause_is_failure_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
+test_signal_crew_provably_working_runs_one_bounded_parallel_window
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced

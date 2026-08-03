@@ -72,6 +72,9 @@ case "$args" in
 esac
 printf '%s\t%s\n' "$CODEX_HOME" "$args" >> "$FM_FAKE_CODEX_LOG"
 remaining=$(cat "$CODEX_HOME/test-remaining")
+if [ -n "${FM_FAKE_CODEX_CACHE_RACE_HOOK:-}" ]; then
+  "$FM_FAKE_CODEX_CACHE_RACE_HOOK"
+fi
 case "$remaining" in
   hang) sleep 30; exit 0 ;;
   none) exit 1 ;;
@@ -358,6 +361,51 @@ test_codex_completion_proof_is_bound_to_account_directory_identity() {
   calls=$(grep -c "^$ACCOUNT_ROOT/codex/1"$'\t' "$CODEX_LOG" || true)
   [ "$calls" = 2 ] || fail "replacement account directory was not re-probed under its new physical identity"
   pass "Codex completion proof cache is bound to the account directory's physical identity"
+}
+
+test_codex_completion_probe_refuses_symlinked_cache_root() {
+  local account outside out status
+  reset_accounts
+  account="$ACCOUNT_ROOT/codex/1"
+  outside="$TMP_ROOT/outside-codex-cache"
+  mkdir -p "$account" "$outside"
+  printf '100,100\n' > "$account/test-remaining"
+  ln -s "$outside" "$account/.agent-fleet-quota-cache"
+  if out=$(run_selector select codex 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Codex completion probe accepted a symlinked cache root"
+  [ ! -s "$CODEX_LOG" ] || fail "Codex ran with a symlinked XDG cache root"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "Codex completion probe wrote through the symlinked cache root"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "symlinked cache refusal did not fail closed at account selection"
+  pass "Codex completion probe refuses a symlinked account cache root"
+}
+
+test_codex_completion_probe_revalidates_cache_root_identity() {
+  local account cache hook out status
+  reset_accounts
+  set_remaining 1 100,100
+  account="$ACCOUNT_ROOT/codex/1"
+  cache="$account/.agent-fleet-quota-cache"
+  hook="$TMP_ROOT/replace-codex-cache"
+  cat > "$hook" <<SH
+#!/usr/bin/env bash
+set -u
+mv "$cache" "$cache.replaced"
+mkdir "$cache"
+SH
+  chmod +x "$hook"
+  if out=$(FM_FAKE_CODEX_CACHE_RACE_HOOK="$hook" run_selector select codex 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Codex completion probe accepted a replaced cache root"
+  assert_contains "$out" "cache directory identity changed during completion probe" \
+    "cache-root replacement was not detected after Codex returned"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "cache-root replacement retained a positive completion proof"
+  pass "Codex completion probe revalidates its account cache root identity"
 }
 
 test_codex_refuses_when_no_account_completes_probe() {
@@ -1512,6 +1560,12 @@ if [ "${FM_TEST_FOCUSED:-}" = probe-publish-time ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = codex-cache-safety ]; then
+  test_codex_completion_probe_refuses_symlinked_cache_root
+  test_codex_completion_probe_revalidates_cache_root_identity
+  exit 0
+fi
+
 test_codex_requires_exact_completion_proof
 test_profile_eligibility_requires_enabled_worker
 test_claude_approval_marker_contract
@@ -1519,6 +1573,8 @@ test_openat_binding_failure_is_a_setup_error
 test_codex_completion_proof_cache_is_bounded
 test_failed_probe_cache_starts_when_verdict_is_published
 test_codex_completion_proof_is_bound_to_account_directory_identity
+test_codex_completion_probe_refuses_symlinked_cache_root
+test_codex_completion_probe_revalidates_cache_root_identity
 test_codex_refuses_when_no_account_completes_probe
 test_codex_timeout_skips_unproved_account
 test_concurrent_codex_selection_shares_one_completion_probe

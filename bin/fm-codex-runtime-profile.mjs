@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Read Codex's own rollout record and prove the latest runtime model/effort.
-// Usage: fm-codex-runtime-profile.mjs <codex-home> <worktree> <model> <effort> <session-or-dash> <runtime-start-ns>
+// Usage: fm-codex-runtime-profile.mjs <codex-home> <worktree> <model> <effort> <session> <runtime-start-ns>
 // Exit 0 = exact match, 1 = mismatch, 2 = no authoritative runtime record.
 
 import fs from "node:fs";
@@ -9,7 +9,11 @@ import path from "node:path";
 const [codexHomeArg, worktreeArg, expectedModel, expectedEffort, expectedSessionArg, runtimeStartArg] = process.argv.slice(2);
 if (!codexHomeArg || !worktreeArg || !expectedModel || !expectedEffort
   || !expectedSessionArg || !runtimeStartArg || !/^\d+$/.test(runtimeStartArg)) {
-  console.error("error: expected <codex-home> <worktree> <model> <effort> <session-or-dash> <runtime-start-ns>");
+  console.error("error: expected <codex-home> <worktree> <model> <effort> <session> <runtime-start-ns>");
+  process.exit(2);
+}
+if (expectedSessionArg === "-") {
+  console.error("unknown: Codex runtime profile UNVERIFIED without an exact provider session identity");
   process.exit(2);
 }
 
@@ -20,7 +24,7 @@ const maxFiles = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_FILES || "128"
 const maxBytes = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_BYTES || String(16 * 1024 * 1024), 10);
 const maxTotalBytes = Number.parseInt(process.env.FM_CODEX_PROFILE_TOTAL_BYTES || String(32 * 1024 * 1024), 10);
 const maxMillis = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_MILLIS || "2000", 10);
-const expectedSession = expectedSessionArg === "-" ? null : expectedSessionArg;
+const expectedSession = expectedSessionArg;
 const runtimeStartNs = BigInt(runtimeStartArg);
 const startedAt = Date.now();
 let bytesRead = 0;
@@ -114,7 +118,7 @@ try {
         sessionIds.add(record.payload.id);
       }
     }
-    if (expectedSession && !sessionIds.has(expectedSession)) continue;
+    if (!sessionIds.has(expectedSession)) continue;
     for (const line of readTail(file).split("\n")) {
       if (!line) continue;
       let record;
@@ -155,8 +159,7 @@ try {
 }
 
 if (!latest) {
-  const binding = expectedSession ? `session ${expectedSession}` : `runtime start ${runtimeStartNs}`;
-  console.error(`unknown: no authoritative Codex runtime profile for ${binding} in worktree ${worktree}`);
+  console.error(`unknown: no authoritative Codex runtime profile for session ${expectedSession} in worktree ${worktree}`);
   process.exit(2);
 }
 

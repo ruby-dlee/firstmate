@@ -86,6 +86,23 @@ test_missing_runtime_is_unknown() {
   pass "runtime profile never turns an unreadable harness record into success"
 }
 
+test_missing_session_binding_is_unverified() {
+  local dir file meta_tmp rc
+  dir=$(make_case missing-session-binding)
+  file="$dir/codex/sessions/2026/08/02/rollout-sibling.jsonl"
+  write_session "$file" session-sibling
+  write_context "$file" 2026-08-02T20:00:00Z "$dir/wt" gpt-5.6-sol xhigh
+  meta_tmp=$(mktemp "$dir/home/state/.lane.meta.XXXXXX")
+  grep -v '^provider_session_id=' "$dir/home/state/lane.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$dir/home/state/lane.meta"
+  FM_HOME="$dir/home" "$VERIFY" lane >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 2 "$rc" "an unbound Codex generation must remain unverified"
+  assert_grep 'Codex runtime profile UNVERIFIED because provider session identity is unavailable' "$dir/err" \
+    "missing session identity fell back to a neighboring rollout"
+  assert_no_grep 'verified:' "$dir/out" "unbound generation emitted a positive runtime verdict"
+  pass "runtime profile refuses every unbound Codex generation instead of guessing a session"
+}
+
 test_mismatched_session_skips_large_tail_within_total_budget() {
   local dir file good rc out
   dir=$(make_case bounded-mismatch)
@@ -116,4 +133,5 @@ test_matching_runtime_passes
 test_later_substitution_fails
 test_previous_generation_is_not_runtime_proof
 test_missing_runtime_is_unknown
+test_missing_session_binding_is_unverified
 test_mismatched_session_skips_large_tail_within_total_budget

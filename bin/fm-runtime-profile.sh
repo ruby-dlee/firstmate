@@ -29,7 +29,10 @@ WORKTREE=$(fm_account_meta_value "$META" worktree)
 CODEX_RUNTIME_HOME=$(fm_account_meta_value "$META" runtime_home)
 RUNTIME_STARTED_AT_NS=$(fm_account_meta_value "$META" runtime_started_at_ns)
 PROVIDER_SESSION=$(fm_account_meta_value "$META" provider_session_id)
-[ -n "$PROVIDER_SESSION" ] || PROVIDER_SESSION=-
+[ -n "$PROVIDER_SESSION" ] || {
+  echo "unknown: Codex runtime profile UNVERIFIED because provider session identity is unavailable for $ID" >&2
+  exit 2
+}
 
 if [ "$MODEL" != gpt-5.6-sol ] || [ "$EFFORT" != xhigh ]; then
   echo "mismatch: recorded Codex profile model=${MODEL:-default} effort=${EFFORT:-default}; expected model=gpt-5.6-sol effort=xhigh" >&2

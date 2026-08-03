@@ -286,7 +286,7 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
     FM_FAKE_TMUX_CAPTURE_FAIL=1 FM_SEND_SETTLE=0 \
     "$SEND" managed-unknown "Preserve this unknown delivery verbatim." >/dev/null 2>"$err"; rc=$?
-  expect_code 1 "$rc" "unknown managed delivery must be a hard failure"
+  expect_code 0 "$rc" "unknown managed delivery should retain the lenient send result"
   assert_present "$unconfirmed" "unknown managed delivery was not durably audited"
   assert_grep 'delivery unconfirmed' "$unconfirmed" "unknown steering audit omitted its delivery verdict"
   assert_grep '> Preserve this unknown delivery verbatim.' "$unconfirmed" \
@@ -297,7 +297,7 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
     "unknown delivery was recorded as delivered pending steering"
   assert_contains "$(cat "$err")" "durably recorded as unconfirmed" \
     "unknown delivery warning omitted its explicit verdict"
-  pass "fm-send strict: unknown managed delivery is audited and exits nonzero"
+  pass "fm-send strict: unknown managed delivery remains explicitly unconfirmed"
 }
 
 test_managed_steering_intent_precedes_external_submission() {

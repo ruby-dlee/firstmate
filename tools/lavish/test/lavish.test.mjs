@@ -34,6 +34,34 @@ const ONE_PIXEL_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
 );
+const COMPLETE_CAPTAIN_ITEM = `# Release choice
+
+## System and purpose
+
+The release process moves approved product improvements to customers so they receive useful changes without avoidable service disruption.
+
+## Business impact
+
+If the rollout choice is wrong, customers may lose service and the business may delay improvements that merchants already expect.
+
+## Fix cost
+
+Choosing the safer staged release requires additional monitoring time and delays full availability by one day.
+
+## Leave cost
+
+Choosing the faster release accepts a higher chance of customer disruption and urgent recovery work.
+
+## Decision requested
+
+Which rollout should we approve: the safer staged release or the faster immediate release?
+`;
+
+function captainRequest(...items) {
+  return `${items.map((item) => (
+    `<!-- fm-captain-item: decision -->\n${item.trimEnd()}\n<!-- /fm-captain-item -->`
+  )).join('\n\n')}\n`;
+}
 
 async function exists(path) {
   try {
@@ -52,7 +80,7 @@ async function fixture(name) {
   await mkdir(home, { recursive: true });
   await writeFile(
     request,
-    '# Release choice\n\nRecommendation: choose blue.\n\nBlue is safer; green is faster.\n',
+    captainRequest(COMPLETE_CAPTAIN_ITEM),
   );
   await writeFile(
     questions,
@@ -360,6 +388,55 @@ async function createRequest(fx, {
   assert.equal(result.code, 0, result.stderr);
   return returnResult ? { id, result } : id;
 }
+
+test('create refuses request text that never cleared the captain item check', async () => {
+  const fx = await fixture('unchecked-request');
+  await writeFile(
+    fx.request,
+    '# Release choice\n\nRecommendation: choose blue.\n\nBlue is safer; green is faster.\n',
+  );
+  const result = await runCli([
+    'create',
+    '--id',
+    'unchecked-request',
+    '--title',
+    'Unchecked request',
+    '--request',
+    fx.request,
+    '--questions',
+    fx.questions,
+    '--destination',
+    'data/replies/unchecked-request.toon',
+  ], { home: fx.home });
+
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /captain request refused by the required draft check/);
+  assert.match(result.stderr, /invalid: request-assembly - unchecked prose outside item markers/);
+  assert.equal(await exists(join(fx.home, 'data/decisions/unchecked-request')), false);
+});
+
+test('create stores the exact checked multi-item request and preserves verbatim detail', async () => {
+  const fx = await fixture('checked-request');
+  const technicalFinding = 'worker.py:97 kept the ClickHouse pointer guard green on main.';
+  const itemWithFinding = `${COMPLETE_CAPTAIN_ITEM}
+
+## Verbatim technical finding
+
+<!-- fm-verbatim:start -->
+${technicalFinding}
+<!-- fm-verbatim:end -->
+`;
+  const request = captainRequest(COMPLETE_CAPTAIN_ITEM, itemWithFinding);
+  await writeFile(fx.request, request);
+
+  const id = await createRequest(fx, { id: 'checked-request' });
+  const stored = await readFile(
+    join(fx.home, 'data/decisions', id, 'request.md'),
+    'utf8',
+  );
+  assert.equal(stored, request);
+  assert.ok(stored.includes(technicalFinding));
+});
 
 async function manifestFor(fx, id) {
   return decode(

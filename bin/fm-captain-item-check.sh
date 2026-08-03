@@ -8,7 +8,8 @@
 # item until it names the system's purpose, the business impact, both sides of
 # the cost tradeoff, and the exact decision being requested in plain language.
 #
-# Each file contains exactly one item with these level-two sections, in order:
+# A risk or decision file contains exactly one plain-language wrapper with
+# these level-two sections, in order:
 #
 #   ## System and purpose
 #   ## Business impact
@@ -16,8 +17,31 @@
 #   ## Leave cost
 #   ## Decision requested
 #
+# It may then carry an exact technical finding without forcing that finding to
+# become the captain-facing explanation:
+#
+#   ## Verbatim technical finding
+#   <!-- fm-verbatim:start -->
+#   <unaltered finding>
+#   <!-- fm-verbatim:end -->
+#
+# The wrapper is checked and the delimited finding is deliberately excluded
+# from prose checks.
+# A Lavish request is the exact assembly accepted by request mode: one or more
+# individually valid items, no other prose, each enclosed in these markers:
+#
+#   <!-- fm-captain-item: risk -->
+#   <one complete item>
+#   <!-- /fm-captain-item -->
+#
+# Use `decision` instead of `risk` in the opening marker when applicable.
+# Request mode checks the assembly and every enclosed item.
+# `lavish-axi create` snapshots the request bytes once, runs request mode on
+# that snapshot, and stores those same bytes so checked and surfaced content
+# cannot diverge.
+#
 # Usage:
-#   fm-captain-item-check.sh <risk|decision> <file-with-one-item>
+#   fm-captain-item-check.sh <risk|decision|request> <file>
 #
 # Exit 0 = clear to surface.
 # Exit 1 = hard draft failure; fix every reported element first.
@@ -26,11 +50,12 @@ set -uo pipefail
 
 MODE=${1:-}
 FILE=${2:-}
+SELF=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/${0##*/}
 
 case "$MODE" in
-  risk|decision) ;;
+  risk|decision|request) ;;
   *)
-    printf 'usage: %s <risk|decision> <file>\n' "${0##*/}" >&2
+    printf 'usage: %s <risk|decision|request> <file>\n' "${0##*/}" >&2
     exit 2
     ;;
 esac
@@ -40,6 +65,89 @@ esac
   exit 2
 }
 
+check_request() {
+  local temporary manifest parse_error parse_rc request_failed mode item item_number output
+  temporary=$(mktemp -d "${TMPDIR:-/tmp}/fm-captain-item-check.XXXXXX") || exit 2
+  manifest="$temporary/manifest.tsv"
+  parse_error="$temporary/parse-error"
+  : > "$manifest"
+  : > "$parse_error"
+
+  awk -v output="$temporary" -v manifest="$manifest" -v error_file="$parse_error" '
+    function refuse(message) {
+      if (!failed) print message > error_file
+      failed = 1
+      exit 1
+    }
+    /^<!-- fm-captain-item: (risk|decision) -->$/ {
+      if (inside) refuse("nested item marker")
+      inside = 1
+      count += 1
+      mode = $0
+      sub(/^<!-- fm-captain-item: /, "", mode)
+      sub(/ -->$/, "", mode)
+      item = sprintf("%s/item-%06d.md", output, count)
+      print mode "\t" item >> manifest
+      next
+    }
+    /^<!-- \/fm-captain-item -->$/ {
+      if (!inside) refuse("closing marker without an open item")
+      inside = 0
+      close(item)
+      next
+    }
+    /fm-captain-item/ {
+      refuse("malformed item marker")
+    }
+    inside {
+      print > item
+      next
+    }
+    $0 !~ /^[[:space:]]*$/ {
+      refuse("unchecked prose outside item markers")
+    }
+    END {
+      if (failed) exit 1
+      if (inside) refuse("item marker is not closed")
+      if (count == 0) refuse("request contains no checked items")
+    }
+  ' "$FILE"
+  parse_rc=$?
+  if [ "$parse_rc" -ne 0 ]; then
+    printf 'captain-item-check: FAIL (mode=request, file=%s)\n' "$FILE"
+    printf '  invalid: request-assembly - %s\n' "$(cat "$parse_error")"
+    rm -rf "$temporary"
+    return 1
+  fi
+
+  request_failed=0
+  item_number=0
+  while IFS=$'\t' read -r mode item; do
+    item_number=$((item_number + 1))
+    output="$temporary/item-$item_number.output"
+    if ! "$SELF" "$mode" "$item" > "$output"; then
+      request_failed=1
+      printf 'captain-item-check: item %s (%s) failed\n' "$item_number" "$mode"
+      sed 's/^/  /' "$output"
+    fi
+  done < "$manifest"
+
+  if [ "$request_failed" -ne 0 ]; then
+    printf 'captain-item-check: FAIL (mode=request, file=%s)\n' "$FILE"
+    rm -rf "$temporary"
+    return 1
+  fi
+
+  printf 'captain-item-check: CLEAR (mode=request, file=%s, items=%s)\n' \
+    "$FILE" "$item_number"
+  rm -rf "$temporary"
+}
+
+if [ "$MODE" = request ]; then
+  check_request
+  exit $?
+fi
+
 failures=''
 
 add_failure() {
@@ -48,16 +156,17 @@ add_failure() {
 
 heading_count() {
   local heading=$1
-  awk -v heading="$heading" '$0 == heading { count += 1 } END { print count + 0 }' "$FILE"
+  printf '%s\n' "$CHECK_TEXT" \
+    | awk -v heading="$heading" '$0 == heading { count += 1 } END { print count + 0 }'
 }
 
 section_body() {
   local heading=$1
-  awk -v heading="$heading" '
+  printf '%s\n' "$CHECK_TEXT" | awk -v heading="$heading" '
     $0 == heading { inside = 1; next }
     inside && /^## / { exit }
     inside { print }
-  ' "$FILE"
+  '
 }
 
 word_count() {
@@ -82,6 +191,41 @@ check_section() {
   fi
 }
 
+if grep -Fxq '## Verbatim technical finding' "$FILE"; then
+  CHECK_TEXT=$(awk '$0 == "## Verbatim technical finding" { exit } { print }' "$FILE")
+  if ! awk '
+    $0 == "<!-- fm-verbatim:start -->" {
+      if (state != 0) exit 1
+      state = 1
+      next
+    }
+    $0 == "<!-- fm-verbatim:end -->" {
+      if (state != 1) exit 1
+      state = 2
+      next
+    }
+    state == 1 {
+      if ($0 !~ /^[[:space:]]*$/) content = 1
+      next
+    }
+    $0 == "## Verbatim technical finding" {
+      heading = 1
+      next
+    }
+    heading && $0 !~ /^[[:space:]]*$/ { exit 1 }
+    END {
+      if (!heading || state != 2 || !content) exit 1
+    }
+  ' "$FILE"; then
+    add_failure 'invalid: verbatim-block - place one nonempty finding between the exact documented markers with no prose outside them'
+  fi
+else
+  CHECK_TEXT=$(cat "$FILE")
+  if grep -q 'fm-verbatim:' "$FILE"; then
+    add_failure 'invalid: verbatim-block - marker requires the documented Verbatim technical finding heading'
+  fi
+fi
+
 check_section '## System and purpose' \
   'system-purpose' 'what the system does and why it exists' 12
 check_section '## Business impact' \
@@ -93,7 +237,7 @@ check_section '## Leave cost' \
 check_section '## Decision requested' \
   'decision' 'the specific call the captain is making' 8
 
-headings=$(awk '/^## / { print }' "$FILE")
+headings=$(printf '%s\n' "$CHECK_TEXT" | awk '/^## / { print }')
 expected_headings=$(cat <<'EOF'
 ## System and purpose
 ## Business impact
@@ -139,15 +283,18 @@ for term in \
   'test suite' Redis ClickHouse DML TTL mutex lease feed ingest API HTTP JSON \
   SQL schema module class function method
 do
-  if grep -qiE "(^|[^[:alnum:]_])${term}([^[:alnum:]_]|$)" "$FILE"; then
+  if printf '%s\n' "$CHECK_TEXT" \
+    | grep -qiE "(^|[^[:alnum:]_])${term}([^[:alnum:]_]|$)"; then
     add_failure "opaque: internal term '$term' - replace it with the user-visible behavior"
   fi
 done
 
-if grep -qE '`|[[:alnum:]]_[[:alnum:]]|[[:lower:]][[:upper:]][[:alnum:]]*' "$FILE"; then
+if printf '%s\n' "$CHECK_TEXT" \
+  | grep -qE '`|[[:alnum:]]_[[:alnum:]]|[[:lower:]][[:upper:]][[:alnum:]]*'; then
   add_failure 'opaque: code-shaped name - remove internal identifiers from the captain-facing item'
 fi
-if grep -qiE '(^|[^[:alnum:]])(PR[[:space:]]*#[0-9]+|[[:xdigit:]]{7,40}|[^[:space:]]+\.(py|sh|ts|tsx|js|json|md)(:[0-9]+)?)([^[:alnum:]]|$)' "$FILE"; then
+if printf '%s\n' "$CHECK_TEXT" \
+  | grep -qiE '(^|[^[:alnum:]])(PR[[:space:]]*#[0-9]+|[[:xdigit:]]{7,40}|[^[:space:]]+\.(py|sh|ts|tsx|js|json|md)(:[0-9]+)?)([^[:alnum:]]|$)'; then
   add_failure 'opaque: engineering reference - explain the business behavior instead of citing implementation evidence'
 fi
 

@@ -2273,6 +2273,8 @@ def mountinfo_paths():
     paths = set()
     path = "/proc/self/mountinfo"
     if not os.path.exists(path):
+        if sys.platform.startswith("linux"):
+            raise OSError("Linux mount authority is unavailable")
         return paths
     with open(path, "r", encoding="utf-8") as stream:
         for line in stream:
@@ -2396,6 +2398,12 @@ except OSError as error:
     raise SystemExit(1)
 PY
 }
+
+if [ "${FM_TEARDOWN_TEST_REMOVAL_AUTHORITY:-}" = firstmate-test-removal-authority-v1 ]; then
+  fm_account_test_lab_enabled || exit 2
+  removal_tree_operation "${FM_TEARDOWN_TEST_REMOVAL_TARGET:?}" "test removal root" remove
+  exit
+fi
 
 safe_rm_rf() {
   local target=$1 label=$2 canonical

@@ -314,6 +314,96 @@ PY
   pass "released acquisition records clear from exact authoritative lease state"
 }
 
+test_duplicate_empty_required_acquisition_field_refuses() {
+  local id=duplicate-empty-required project record out rc
+  reset_logs
+  rm -rf "$HOME_DIR/.treehouse"
+  project="$TMP/duplicate-empty-required-project"
+  fm_git_init_commit "$project"
+  write_dead_acquisition "$id" "$project" '' direct not-created tmux not-created
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  printf 'holder=\n' >> "$record"
+  touch -t 202001010000 "$record"
+  mkdir -p "$HOME_DIR/.treehouse/empty-pool"
+  printf '{"worktrees":[]}\n' \
+    > "$HOME_DIR/.treehouse/empty-pool/treehouse-state.json"
+
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  assert_contains "$out" "invalid lease holder" \
+    "duplicate empty required acquisition field was not classified as malformed"
+  expect_code 1 "$rc" "duplicate empty acquisition field maintenance"
+  [ -f "$record" ] || fail "duplicate empty required acquisition field lost recovery authority"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] \
+    || fail "duplicate empty required acquisition field invented task metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "duplicate empty required acquisition field invoked teardown"
+  rm -f "$record"
+  rm -rf "$HOME_DIR/.treehouse"
+  pass "duplicate empty required acquisition fields remain malformed"
+}
+
+test_released_redirected_recorded_path_refuses() {
+  local id=released-redirected-path fixture project worktree record state redirect_target alias_path out rc
+  reset_logs
+  id=released-redirected-path
+  fixture=$(make_treehouse_fixture "$id")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+  write_dead_acquisition "$id" "$project" "$worktree" direct
+  record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+  state="$(dirname "$(dirname "$worktree")")/treehouse-state.json"
+  redirect_target="$TMP/$id-redirect-target"
+  git -C "$project" worktree remove --force "$worktree"
+  mkdir -p "$redirect_target"
+  ln -s "$redirect_target" "$worktree"
+  python3 - "$state" "$redirect_target" <<'PY'
+import json
+import sys
+
+path, redirected = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+entry = state["worktrees"][0]
+entry["path"] = redirected
+entry["leased"] = None
+entry["lease_holder"] = None
+entry["destroying"] = None
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "redirected released path maintenance"
+  assert_contains "$out" "lease absence could not be proven" \
+    "redirected recorded worktree path was accepted as its returned entry"
+  [ -f "$record" ] || fail "redirected recorded worktree path lost acquisition authority"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "redirected recorded worktree path invoked teardown"
+  rm -f "$worktree"
+
+  alias_path="$(dirname "$worktree")/../1/$(basename "$worktree")"
+  python3 - "$state" "$alias_path" <<'PY'
+import json
+import sys
+
+path, alias_path = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+state["worktrees"][0]["path"] = alias_path
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
+  out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "aliased released path maintenance"
+  assert_contains "$out" "CORRUPT authoritative Treehouse lease state" \
+    "aliased returned worktree entry was normalized into recorded authority"
+  [ -f "$record" ] || fail "aliased returned worktree entry lost acquisition authority"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "aliased returned worktree entry invoked teardown"
+  rm -f "$record"
+  pass "released proof compares exact paths without following redirects or aliases"
+}
+
 test_unknown_never_acquired_state_refuses() {
   local id=unknown-acquisition project record out rc
   reset_logs
@@ -634,6 +724,8 @@ test_local_merge_immediately_auto_reaps() {
 if [ "${FM_TEST_FOCUSED:-}" = acquisition-absence-states ]; then
   test_never_acquired_record_clears_from_phases_and_empty_pool
   test_released_acquisition_record_clears_as_released
+  test_duplicate_empty_required_acquisition_field_refuses
+  test_released_redirected_recorded_path_refuses
   test_released_created_endpoint_refuses_without_absence_proof
   test_unknown_never_acquired_state_refuses
   exit 0
@@ -651,7 +743,18 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = acquisition-released ]; then
   test_released_acquisition_record_clears_as_released
+  test_released_redirected_recorded_path_refuses
   test_released_created_endpoint_refuses_without_absence_proof
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-malformed-required ]; then
+  test_duplicate_empty_required_acquisition_field_refuses
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = acquisition-released-path ]; then
+  test_released_redirected_recorded_path_refuses
   exit 0
 fi
 
@@ -667,6 +770,8 @@ test_x_link_and_teardown_refusal_remain_visible
 test_acquired_and_live_owner_records_are_retained
 test_never_acquired_record_clears_from_phases_and_empty_pool
 test_released_acquisition_record_clears_as_released
+test_duplicate_empty_required_acquisition_field_refuses
+test_released_redirected_recorded_path_refuses
 test_unknown_never_acquired_state_refuses
 test_dirty_acquired_worktree_is_retained_without_synthetic_metadata
 test_unregistered_treehouse_lease_retains_acquisition_authority

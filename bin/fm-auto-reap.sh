@@ -65,11 +65,12 @@ meta_value() {  # <meta> <key>
 }
 
 single_meta_value() {  # <file> <key>
-  local file=$1 key=$2 values count
-  values=$(sed -n "s/^${key}=//p" "$file")
-  count=$(printf '%s\n' "$values" | awk 'NF { n++ } END { print n + 0 }')
+  local file=$1 key=$2 value count
+  count=$(grep -c "^${key}=" "$file" 2>/dev/null) || count=0
   [ "$count" -eq 1 ] || return 1
-  printf '%s\n' "$values"
+  value=$(sed -n "s/^${key}=//p" "$file")
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
 }
 
 single_meta_value_allow_empty() {  # <file> <key>

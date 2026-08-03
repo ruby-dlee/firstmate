@@ -3714,6 +3714,93 @@ test_teardown_reaps_legacy_tasktmp_after_generation_advance() {
   pass "teardown safely reaps legacy tasktmp after generation advances"
 }
 
+test_tasktmp_removers_refuse_without_linux_mount_authority() {
+  local case_dir safe_target teardown_target runner_script out status guard_count
+  guard_count=$(grep -hF 'raise OSError("Linux mount authority is unavailable")' \
+    "$ROOT/bin/fm-safe-task-tmp.py" "$ROOT/bin/fm-teardown.sh" | wc -l | tr -d '[:space:]')
+  [ "$guard_count" -eq 2 ] \
+    || fail "both tasktmp removers must fail closed without Linux mount authority"
+  if [ "$(uname -s)" != Linux ] || ! command -v unshare >/dev/null 2>&1 \
+    || ! command -v mount >/dev/null 2>&1 \
+    || ! command -v umount >/dev/null 2>&1; then
+    pass "SKIP isolated procfs-less mount authority is unavailable"
+    return
+  fi
+
+  case_dir=$(make_case tasktmp-missing-linux-mount-authority)
+  safe_target="$case_dir/safe-tasktmp"
+  teardown_target="$case_dir/teardown-removal-root"
+  runner_script="$case_dir/run-without-procfs.sh"
+  write_meta "$case_dir" local-only ship
+  mkdir -p "$safe_target" "$teardown_target"
+  printf '%s\n' preserve > "$safe_target/sentinel"
+  printf '%s\n' preserve > "$teardown_target/sentinel"
+  cat > "$runner_script" <<'SH'
+#!/usr/bin/env bash
+set -u
+case_dir=$1
+root=$2
+safe_target=$3
+teardown_target=$4
+mount --make-rprivate / >/dev/null 2>&1 || exit 90
+umount /proc >/dev/null 2>&1 || exit 90
+[ ! -e /proc/self/mountinfo ] || exit 91
+
+safe_out=$(python3 "$root/bin/fm-safe-task-tmp.py" "$safe_target" 2>&1)
+safe_status=$?
+[ "$safe_status" -ne 0 ] || exit 92
+case "$safe_out" in
+  *"Linux mount authority is unavailable"*) ;;
+  *) exit 93 ;;
+esac
+[ -f "$safe_target/sentinel" ] || exit 94
+
+teardown_out=$(FM_ROOT_OVERRIDE="$root" \
+  FM_HOME="$case_dir" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_PROJECTS_OVERRIDE="$case_dir/source-projects" \
+  FM_CHECKOUT_REFRESH_LOCK_ROOT="$case_dir/checkout-locks" \
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+  FM_TEARDOWN_TEST_REMOVAL_AUTHORITY=firstmate-test-removal-authority-v1 \
+  FM_TEARDOWN_TEST_REMOVAL_TARGET="$teardown_target" \
+  PATH="$case_dir/fakebin:$PATH" \
+  "$root/bin/fm-teardown.sh" task-x1 2>&1)
+teardown_status=$?
+[ "$teardown_status" -ne 0 ] || exit 95
+case "$teardown_out" in
+  *"Linux mount authority is unavailable"*) ;;
+  *) exit 96 ;;
+esac
+[ -f "$teardown_target/sentinel" ] || exit 97
+[ -f "$case_dir/state/task-x1.meta" ] || exit 98
+SH
+  chmod +x "$runner_script"
+
+  if unshare --user --map-root-user --mount true >/dev/null 2>&1; then
+    out=$(unshare --user --map-root-user --mount "$runner_script" \
+      "$case_dir" "$ROOT" "$safe_target" "$teardown_target" 2>&1)
+    status=$?
+  elif command -v sudo >/dev/null 2>&1 \
+    && sudo -n unshare --mount true >/dev/null 2>&1; then
+    out=$(sudo -n unshare --mount "$runner_script" \
+      "$case_dir" "$ROOT" "$safe_target" "$teardown_target" 2>&1)
+    status=$?
+  else
+    pass "SKIP isolated procfs-less mount authority is unavailable"
+    return
+  fi
+
+  if [ "$status" -eq 90 ]; then
+    pass "SKIP procfs cannot be unmounted in the isolated namespace"
+    return
+  fi
+  [ "$status" -eq 0 ] \
+    || fail "procfs-less mount-authority refusal failed with $status: $out"
+  pass "tasktmp removers fail closed without Linux mount authority"
+}
+
 test_teardown_classifies_legacy_without_weakening_generation_binding() {
   local case_dir classification mismatched_tasktmp rc
   case_dir=$(make_case tasktmp-generation-binding-retained)
@@ -5294,6 +5381,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tasktmp-generation-deadlock ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-procfs-authority ]; then
+  test_tasktmp_removers_refuse_without_linux_mount_authority
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = tasktmp-legacy-deadlock ]; then
   test_teardown_reaps_legacy_tasktmp_after_generation_advance
   exit 0
@@ -5395,6 +5487,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_teardown_retains_untracked_claude_skill_draft
   test_teardown_refuses_unsafe_tasktmp_metadata
   test_teardown_reaps_legacy_tasktmp_after_generation_advance
+  test_tasktmp_removers_refuse_without_linux_mount_authority
   test_teardown_classifies_legacy_without_weakening_generation_binding
   test_teardown_removes_safe_tasktmp_and_accepts_absence
   test_teardown_rejects_malformed_report_requirement

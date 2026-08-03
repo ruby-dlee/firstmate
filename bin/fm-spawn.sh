@@ -4074,6 +4074,11 @@ cleanup_legacy_task_tmp_before_recovery_commit() {
     LEGACY_TASK_TMP_TARGET="$LEGACY_TASK_TMP_PARENT/$(basename "$EXISTING_TASK_TMP")"
     python3 "$SCRIPT_DIR/fm-safe-task-tmp.py" "$LEGACY_TASK_TMP_TARGET" || exit 1
   fi
+  ACCOUNT_SPAWN_COMMITTED=1
+  if fm_account_test_lab_enabled \
+    && [ "${FM_TEST_SIGNAL_AFTER_LEGACY_TASKTMP_REMOVE:-}" = firstmate-signal-after-legacy-tasktmp-remove-v1 ]; then
+    kill -TERM "$$"
+  fi
   fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
   META_WRITE_LOCK=
   EXISTING_TASK_TMP=

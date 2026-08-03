@@ -580,11 +580,13 @@ run_direct_spawn() {
     FM_FAKE_SEND_KEYS_FAIL="${FM_FAKE_SEND_KEYS_FAIL:-0}" \
     FM_TEST_FAIL_AFTER_ENDPOINT="${FM_TEST_FAIL_AFTER_ENDPOINT:-0}" \
     FM_TEST_TASKTMP_CREATE_FAIL="${FM_TEST_TASKTMP_CREATE_FAIL:-0}" \
+    FM_TEST_SIGNAL_AFTER_LEGACY_TASKTMP_REMOVE="${FM_TEST_SIGNAL_AFTER_LEGACY_TASKTMP_REMOVE:-}" \
     FM_FAKE_HERDR_DRIFT_WORKTREE="${FM_FAKE_HERDR_DRIFT_WORKTREE:-}" \
     T="${T:-}" \
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" \
     PATH="$FAKEBIN:$PATH" \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
     FM_ACCOUNT_DIRECTORY_ROOT="$ACCOUNT_ROOT" \
     FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
@@ -1055,6 +1057,60 @@ test_direct_recovery_rolls_back_when_legacy_cleanup_refuses() {
   assert_absent "$SPAWN_HOME/state/.fake-endpoint" \
     "legacy cleanup refusal retained the replacement endpoint"
   pass "legacy cleanup remains inside direct recovery rollback authority"
+}
+
+test_direct_recovery_signal_after_legacy_removal_keeps_migrated_binding() {
+  local record id meta generation legacy_tasktmp expected_tasktmp meta_tmp out status
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 95,90
+  set_remaining 2 30,20
+  id="direct-recovery-tasktmp-signal-z4-$$"
+  record=$(make_spawn_case direct-recovery-tasktmp-signal codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool --scout >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  legacy_tasktmp="/tmp/fm-$id"
+  expected_tasktmp=$(STATE="$SPAWN_HOME/state" bash -c '
+    . "$1"
+    fm_account_task_tmp_path "$2" "$3"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$id" "$generation")
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-recovery-tasktmp-signal.XXXXXX")
+  [ ! -e "$legacy_tasktmp" ] && [ ! -L "$legacy_tasktmp" ] \
+    || fail "legacy recovery signal fixture path already exists: $legacy_tasktmp"
+  mkdir -p "$legacy_tasktmp/gotmp"
+  printf '%s\n' legacy-build-artifact > "$legacy_tasktmp/gotmp/artifact"
+  awk -v tasktmp="$legacy_tasktmp" '
+    /^tasktmp=/ { print "tasktmp=" tasktmp; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+
+  set_remaining 1 20,15
+  set_remaining 2 95,90
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  if out=$(FM_TEST_SIGNAL_AFTER_LEGACY_TASKTMP_REMOVE=firstmate-signal-after-legacy-tasktmp-remove-v1 \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+
+  [ "$status" -ne 0 ] \
+    || fail "post-removal signal fixture unexpectedly completed recovery: $out"
+  assert_absent "$legacy_tasktmp" "post-removal signal retained the old physical legacy tasktmp"
+  assert_grep "tasktmp=$expected_tasktmp" "$meta" \
+    "post-removal signal restored metadata pointing at the deleted legacy tasktmp"
+  assert_grep "account_home=$ACCOUNT_ROOT/codex/2" "$meta" \
+    "post-removal signal restored the superseded account binding"
+  assert_present "$SPAWN_HOME/state/.fake-endpoint" \
+    "post-removal signal rolled back the committed replacement endpoint"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  pass "post-removal signals retain the durable migrated tasktmp binding"
 }
 
 test_safe_tasktmp_refuses_same_device_bind_mount() {
@@ -1564,6 +1620,7 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_recovery_preserves_recorded_task_context
   test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
   test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  test_direct_recovery_signal_after_legacy_removal_keeps_migrated_binding
   test_safe_tasktmp_refuses_same_device_bind_mount
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
@@ -1575,12 +1632,18 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp ]; then
   test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
   test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  test_direct_recovery_signal_after_legacy_removal_keeps_migrated_binding
   test_safe_tasktmp_refuses_same_device_bind_mount
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp-rollback ]; then
   test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp-post-remove-signal ]; then
+  test_direct_recovery_signal_after_legacy_removal_keeps_migrated_binding
   exit 0
 fi
 
@@ -1618,6 +1681,7 @@ test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
 test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
 test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+test_direct_recovery_signal_after_legacy_removal_keeps_migrated_binding
 test_safe_tasktmp_refuses_same_device_bind_mount
 test_direct_recovery_rejects_secondmate_metadata
 test_direct_recovery_rejects_worktree_from_another_project

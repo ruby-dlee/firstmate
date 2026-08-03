@@ -12,6 +12,8 @@ def mountinfo_paths():
     paths = set()
     mountinfo = "/proc/self/mountinfo"
     if not os.path.exists(mountinfo):
+        if sys.platform.startswith("linux"):
+            raise OSError("Linux mount authority is unavailable")
         return paths
     with open(mountinfo, encoding="utf-8") as stream:
         for line in stream:

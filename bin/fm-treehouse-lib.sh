@@ -137,6 +137,13 @@ try:
     worktrees = state["worktrees"]
     if not isinstance(worktrees, list):
         raise TypeError("worktrees must be an array")
+    if (
+        not expected_path
+        or "\0" in expected_path
+        or not os.path.isabs(expected_path)
+        or os.path.normpath(expected_path) != expected_path
+    ):
+        raise TypeError("recorded worktree path must be canonical and absolute")
     seen_paths = set()
     recorded_entries = []
     for entry in worktrees:
@@ -155,10 +162,12 @@ try:
             or not os.path.isabs(path)
         ):
             raise TypeError("worktree path must be a non-empty absolute string")
-        canonical_path = os.path.realpath(path)
-        if canonical_path in seen_paths:
+        normalized_path = os.path.normpath(path)
+        if normalized_path != path:
+            raise TypeError("worktree paths must be canonical")
+        if normalized_path in seen_paths:
             raise TypeError("worktree paths must be unique")
-        seen_paths.add(canonical_path)
+        seen_paths.add(normalized_path)
         if leased is not None and not isinstance(leased, bool):
             raise TypeError("leased must be true, false, or null")
         if destroying is not None and not isinstance(destroying, bool):
@@ -172,7 +181,7 @@ try:
                 raise ValueError("matching Treehouse lease still exists")
         elif holder not in (None, ""):
             raise TypeError("returned worktree holder must be null or empty")
-        if canonical_path == os.path.realpath(expected_path):
+        if normalized_path == expected_path:
             recorded_entries.append(entry)
     if len(recorded_entries) != 1:
         raise ValueError("recorded worktree has no unique authoritative release entry")

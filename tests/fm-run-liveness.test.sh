@@ -139,6 +139,16 @@ test_sampler_processes_are_not_run_evidence() {
   pass "run liveness excludes its own process family from affirmative evidence"
 }
 
+test_sampler_processes_are_not_run_evidence() {
+  local dir rc
+  dir=$(make_case sampler-self)
+  FM_TEST_COUNTS=0,0 FM_TEST_INCLUDE_SAMPLER=1 FM_RUN_LIVENESS_SAMPLES=2 \
+    run_live "$dir" env >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "sampler family must not prove run liveness"
+  assert_grep 'counts=0,0' "$dir/err" "sampler processes contaminated exact-run counts"
+  pass "run liveness excludes its own process family from affirmative evidence"
+}
+
 test_record_change_is_inconclusive() {
   local dir rc
   dir=$(make_case changed-record)

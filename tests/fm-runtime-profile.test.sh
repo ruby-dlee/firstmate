@@ -77,6 +77,21 @@ test_previous_generation_is_not_runtime_proof() {
   pass "runtime profile rejects matching records from another generation"
 }
 
+test_previous_generation_is_not_runtime_proof() {
+  local dir old_file new_file rc
+  dir=$(make_case prior-generation)
+  old_file="$dir/codex/sessions/2026/08/02/rollout-old.jsonl"
+  new_file="$dir/codex/sessions/2026/08/02/rollout-new.jsonl"
+  write_session "$old_file" session-old
+  write_context "$old_file" 2026-08-02T20:00:00Z "$dir/wt" gpt-5.6-sol xhigh
+  write_session "$new_file" session-new
+  write_context "$new_file" 2026-08-02T19:00:00Z "$dir/wt" gpt-5.6-sol xhigh
+  FM_HOME="$dir/home" "$VERIFY" lane >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 2 "$rc" "an older generation must not verify the current runtime"
+  assert_grep 'session session-new' "$dir/err" "stale-generation refusal omitted the session binding"
+  pass "runtime profile rejects matching records from another generation"
+}
+
 test_missing_runtime_is_unknown() {
   local dir rc
   dir=$(make_case missing)

@@ -49,7 +49,7 @@ NM_HOME="${FM_NM_HOME:-${NO_MISTAKES_HOME:-$HOME/.no-mistakes}}"
 SAMPLE_DEFAULT=3
 # How long to wait before re-scanning when the first scan finds nothing, so a
 # momentary gap between the step's units of work cannot be reported as death.
-ABSENCE_CONFIRM_DELAY=${FM_NM_ABSENCE_CONFIRM_DELAY:-1}
+ABSENCE_CONFIRM_DELAY=${FM_NM_ABSENCE_CONFIRM_DELAY-1}
 
 RUN_ID=""
 SAMPLE=$SAMPLE_DEFAULT
@@ -92,6 +92,22 @@ emit() {  # <verdict> <procs> [detail]
   printf '%s\n' "$line"
   exit 0
 }
+
+absence_confirm_delay_is_positive() {
+  awk -v value="$ABSENCE_CONFIRM_DELAY" 'BEGIN {
+    exit !(value ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && value + 0 > 0)
+  }'
+}
+
+if [ "$ABSENCE_CONFIRM_DELAY" = 0 ]; then
+  if [ "${FM_NM_TEST_BARRIER_PHASE:-}" != after-empty-scan ] \
+    || [ -z "${FM_NM_TEST_BARRIER_DIR:-}" ] \
+    || [ ! -d "$FM_NM_TEST_BARRIER_DIR" ]; then
+    emit unknown 0 "invalid absence-confirmation delay: zero requires the explicit empty-scan test barrier"
+  fi
+elif ! absence_confirm_delay_is_positive; then
+  emit unknown 0 "invalid absence-confirmation delay: expected a positive number"
+fi
 
 test_scan_barrier() {  # <phase>
   local phase=$1 dir=${FM_NM_TEST_BARRIER_DIR:-} released
@@ -225,6 +241,9 @@ if [ "$COUNT_T0" = 0 ]; then
   test_scan_barrier after-empty-scan || \
     emit unknown 0 "empty-scan test barrier could not be completed"
   sleep "$ABSENCE_CONFIRM_DELAY"
+  WAIT_STATUS=$?
+  [ "$WAIT_STATUS" -eq 0 ] || \
+    emit unknown 0 "absence-confirmation wait failed: sleep exited $WAIT_STATUS"
   PIDS_CONFIRM=$(procs_in_worktree) || \
     emit unknown 0 "process enumeration failed while confirming absence"
   COUNT_CONFIRM=$(printf '%s' "$PIDS_CONFIRM" | grep -c . || true)

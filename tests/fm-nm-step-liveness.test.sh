@@ -235,8 +235,8 @@ done
 printf 'after-empty-scan\n' > "$GAP_BARRIER/release"
 wait "$GAP_PROBE" || fail "the gap probe failed after its barrier was released"
 out=$(cat "$GAP_OUT")
-[ "$(verdict_of "$out")" != dead ] \
-  || fail "REGRESSION: a gap between units of work must not be reported dead, got: $out"
+[ "$(verdict_of "$out")" = alive ] \
+  || fail "REGRESSION: a gap with a confirmed successor must be reported alive, got: $out"
 pass "regression: a momentary gap between units of work is not reported as death"
 
 # (j3) A process set present at the first scan but gone by the second is an
@@ -267,6 +267,34 @@ assert_contains "$out" "transition could not be established" \
 pass "regression: a process set that vanished during sampling reads unknown"
 
 kill_started
+
+for delay in '' -1 invalid 1s; do
+  out=$(FM_NM_ABSENCE_CONFIRM_DELAY="$delay" "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+  [ "$(verdict_of "$out")" = unknown ] \
+    || fail "an invalid absence-confirmation delay must read unknown, got: $out"
+  assert_contains "$out" "invalid absence-confirmation delay" \
+    "an invalid absence-confirmation delay explains why it was rejected"
+done
+
+out=$(FM_NM_ABSENCE_CONFIRM_DELAY=0 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" = unknown ] \
+  || fail "zero delay without the empty-scan test barrier must read unknown, got: $out"
+assert_contains "$out" "zero requires the explicit empty-scan test barrier" \
+  "zero delay names its test-only requirement"
+
+WAIT_FAIL_BIN="$TMP_ROOT/wait-fail-bin"
+mkdir -p "$WAIT_FAIL_BIN"
+cat > "$WAIT_FAIL_BIN/sleep" <<'SH'
+#!/usr/bin/env bash
+exit 7
+SH
+chmod +x "$WAIT_FAIL_BIN/sleep"
+out=$(PATH="$WAIT_FAIL_BIN:$PATH" FM_NM_ABSENCE_CONFIRM_DELAY=1 \
+  "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" = unknown ] \
+  || fail "a failed absence-confirmation wait must read unknown, got: $out"
+assert_contains "$out" "absence-confirmation wait failed: sleep exited 7" \
+  "a failed wait explains why absence was not confirmed"
 
 # (j4) A genuinely absent step still reads dead after the confirming rescan, so
 # the fix for (j2) did not buy safety by making `dead` unreachable.

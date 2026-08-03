@@ -350,23 +350,30 @@ crew_state_line() {  # <id>
 # it becomes unknown; a line with no liveness field remains empty for backward
 # compatibility and keeps its previous classification.
 crew_state_liveness_verdict() {  # <current-state-line>
-  local rest=$1 field value sep=' · '
+  local rest=$1 field value label sep=' · '
   while :; do
     case "$rest" in
       *"$sep"*) field=${rest%%"$sep"*}; rest=${rest#*"$sep"} ;;
       *) field=$rest; rest= ;;
     esac
-    case "$field" in
-      liveness:\ *)
-        value=${field#liveness: }
-        value=${value%% *}
-        case "$value" in
-          alive|dead|unknown) printf '%s' "$value" ;;
-          *) printf 'unknown' ;;
-        esac
-        return 0
-        ;;
-    esac
+    label=${field%%:*}
+    label=${label#"${label%%[![:space:]]*}"}
+    label=${label%"${label##*[![:space:]]}"}
+    label=$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')
+    if [ "$label" = liveness ]; then
+      case "$field" in
+        liveness:\ *)
+          value=${field#liveness: }
+          value=${value%% *}
+          case "$value" in
+            alive|dead|unknown) printf '%s' "$value" ;;
+            *) printf 'unknown' ;;
+          esac
+          ;;
+        *) printf 'unknown' ;;
+      esac
+      return 0
+    fi
     [ -n "$rest" ] || return 0
   done
 }

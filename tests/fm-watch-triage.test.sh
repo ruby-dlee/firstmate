@@ -330,7 +330,7 @@ test_failure_pause_is_failure_classifier() {
 # (surface it) - so the watcher's stale path gets both for one bounded call.
 # crew_is_paused delegates to it exactly as crew_is_provably_working does.
 test_crew_absorb_class_classifier() {
-  local dir fakebin
+  local dir fakebin malformed
   dir=$(make_case absorb-class); fakebin="$dir/fakebin"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE
@@ -344,6 +344,23 @@ test_crew_absorb_class_classifier() {
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: unknown (probe unreadable) · step: test'
   [ "$(crew_absorb_class a)" = none ] || fail "unknown command-step liveness was absorbed as working"
   ! crew_is_paused a || fail "unknown command-step liveness was absorbed as paused"
+  for malformed in \
+    'state: working · source: run-step · validating (running) · liveness:' \
+    'state: working · source: run-step · validating (running) · liveness:alive (2 procs)' \
+    'state: working · source: run-step · validating (running) · liveness: healthy (2 procs)' \
+    'state: working · source: run-step · validating (running) · LIVENESS: alive (2 procs)' \
+    'state: working · source: run-step · validating (running) · liveness : alive (2 procs)'; do
+    [ "$(crew_state_liveness_verdict "$malformed")" = unknown ] \
+      || fail "malformed liveness field was treated as absent: $malformed"
+    FM_FAKE_CREW_STATE=$malformed
+    [ "$(crew_absorb_class a)" = none ] \
+      || fail "malformed liveness field was absorbed as working: $malformed"
+  done
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  [ -z "$(crew_state_liveness_verdict "$FM_FAKE_CREW_STATE")" ] \
+    || fail "a state line without a liveness field gained an observation"
+  [ "$(crew_absorb_class a)" = working ] \
+    || fail "a state line without a liveness field changed classification"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   [ "$(crew_absorb_class a)" = working ] || fail "busy pane not classed working"
   FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting upstream'

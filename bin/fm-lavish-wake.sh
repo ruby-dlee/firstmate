@@ -64,6 +64,11 @@ esac
 [ -d "$HOME_ARG" ] && [ ! -L "$HOME_ARG" ] \
   || { echo "fm-lavish-wake: unsafe FM_HOME" >&2; exit 2; }
 FM_HOME=$(cd "$HOME_ARG" && pwd -P)
+STATE_ARG=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+mkdir -p "$STATE_ARG"
+[ -d "$STATE_ARG" ] && [ ! -L "$STATE_ARG" ] \
+  || { echo "fm-lavish-wake: unsafe state directory" >&2; exit 2; }
+FM_STATE_OVERRIDE=$(cd "$STATE_ARG" && pwd -P)
 EXPECTED="$FM_HOME/data/decisions/$DECISION/answer.toon"
 [ -d "$(dirname "$ANSWER")" ] \
   || { echo "fm-lavish-wake: answer directory is missing" >&2; exit 2; }
@@ -83,7 +88,7 @@ fi
 [ "$actual" = "$DIGEST" ] \
   || { echo "fm-lavish-wake: answer digest does not match file" >&2; exit 2; }
 
-export FM_HOME
+export FM_HOME FM_STATE_OVERRIDE
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 

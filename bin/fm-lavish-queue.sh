@@ -49,7 +49,12 @@ esac
 [ -d "$HOME_ARG" ] && [ ! -L "$HOME_ARG" ] \
   || { echo "fm-lavish-queue: unsafe FM_HOME" >&2; exit 2; }
 FM_HOME=$(cd "$HOME_ARG" && pwd -P)
-STATE="$FM_HOME/state"
+STATE_ARG=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+[ -d "$STATE_ARG" ] && [ ! -L "$STATE_ARG" ] \
+  || { echo "fm-lavish-queue: unsafe state directory" >&2; exit 2; }
+STATE=$(cd "$STATE_ARG" && pwd -P)
+FM_STATE_OVERRIDE=$STATE
+export FM_STATE_OVERRIDE
 [ -d "$STATE" ] && [ ! -L "$STATE" ] \
   || { echo "fm-lavish-queue: unsafe state directory" >&2; exit 2; }
 

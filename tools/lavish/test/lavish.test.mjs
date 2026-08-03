@@ -160,6 +160,7 @@ async function fakeTmux(fx) {
 case "$1" in
   display-message)
     case "$*" in
+      *pane_pid*) printf '%s\\n' "\${LAVISH_FAKE_TMUX_PANE_PID:?}" ;;
       *pane_current_command*) printf 'claude\\n' ;;
       *cursor_y*) printf '0\\n' ;;
       *) printf '@1\\n' ;;
@@ -175,7 +176,7 @@ esac
   return { bin, log };
 }
 
-async function writeSupervisorLock(fx, target) {
+async function writeSupervisorLock(fx, target, stateDirectory = join(fx.home, 'state')) {
   const holderPath = join(fx.root, 'fake-bin/codex-lock-holder');
   await symlink('/bin/sleep', holderPath);
   const holder = spawn(holderPath, ['30'], { stdio: 'ignore' });
@@ -189,9 +190,9 @@ async function writeSupervisorLock(fx, target) {
     cwd: fx.home,
     encoding: 'utf8',
   }).trim();
-  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await mkdir(stateDirectory, { recursive: true });
   await writeFile(
-    join(fx.home, 'state/.lock'),
+    join(stateDirectory, '.lock'),
     `${holder.pid}\n${started}\nhome=${canonicalHome}\nbackend=tmux\ntarget=${target}\n`,
   );
   return holder;
@@ -721,6 +722,7 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
   const downloads = join(fx.root, 'Downloads');
   const fakeBin = join(fx.root, 'browser-bin');
   const fakeState = join(fx.root, 'fake-browser-state.json');
+  const effectiveState = join(fx.root, 'effective-state');
   await mkdir(downloads);
   await mkdir(fakeBin);
   const chrome = join(fakeBin, 'chrome-devtools-axi');
@@ -729,37 +731,61 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
     `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
   );
   await chmod(chrome, 0o700);
+  const fake = await fakeTmux(fx);
+  const holder = await writeSupervisorLock(fx, 'home:0', effectiveState);
   const environment = {
-    PATH: `${fakeBin}:${process.env.PATH}`,
+    PATH: `${fake.bin}:${fakeBin}:${process.env.PATH}`,
     FM_LAVISH_BIN: CLI,
+    FM_LAVISH_QUEUE_DISABLE: '0',
+    FM_STATE_OVERRIDE: effectiveState,
     LAVISH_FAKE_CHROME_STATE: fakeState,
+    LAVISH_FAKE_TMUX_PANE_PID: String(holder.pid),
     LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
   };
 
-  const opened = await runExecutable(
-    BOARD_ADAPTER,
-    [id, '--home', fx.home, '--downloads', downloads],
-    { env: environment },
-  );
-  assert.equal(opened.code, 0, opened.stderr);
-  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
-  assert.equal(await exists(checkPath), true);
+  try {
+    const opened = await runExecutable(
+      BOARD_ADAPTER,
+      [id, '--home', fx.home, '--downloads', downloads],
+      { env: environment },
+    );
+    assert.equal(opened.code, 0, opened.stderr);
+    const checkPath = join(effectiveState, `lavish-board-${id}.check.sh`);
+    assert.equal(await exists(checkPath), true);
+    assert.equal(
+      await exists(join(fx.home, 'state', `lavish-board-${id}.check.sh`)),
+      false,
+    );
 
-  const stopped = await runExecutable(chrome, ['stop'], { env: environment });
-  assert.equal(stopped.code, 0, stopped.stderr);
-  const checked = await runExecutable(checkPath, [], { env: environment });
-  assert.equal(checked.code, 0, checked.stderr);
-  assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
-  assert.equal(
-    await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
-    true,
-  );
-  assert.equal(
-    await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
-    true,
-  );
-  assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
-  assert.equal(await exists(checkPath), false);
+    const stopped = await runExecutable(chrome, ['stop'], { env: environment });
+    assert.equal(stopped.code, 0, stopped.stderr);
+    const checked = await runExecutable(checkPath, [], {
+      env: environment,
+      unsetEnv: ['FM_STATE_OVERRIDE'],
+    });
+    assert.equal(checked.code, 0, checked.stderr);
+    assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
+    assert.match(checked.stdout, /lavish-delivery: prompt queued/);
+    assert.equal(
+      await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
+      true,
+    );
+    assert.equal(
+      await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
+      true,
+    );
+    assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
+    assert.match(await readFile(fake.log, 'utf8'), /-t home:0 /);
+    assert.equal(
+      await exists(join(effectiveState, 'lavish-deliveries', `${id}.digest`)),
+      true,
+    );
+    assert.equal(await exists(checkPath), false);
+  } finally {
+    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
+    holder.kill();
+    await closed;
+  }
 });
 
 test('B5 watcher check leaves a live unsubmitted board open and pending', async () => {
@@ -890,6 +916,7 @@ test('intake recovers a browser download payload without manual copy', async () 
 
   const destinationPath = join(fx.home, 'data/lavish-answers/release-choice.json');
   assert.deepEqual(JSON.parse(await readFile(destinationPath, 'utf8')), payload);
+  assert.equal(manifest.destination_format, 'payload-json-v2');
   assert.equal(
     await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
     true,
@@ -906,6 +933,41 @@ test('intake recovers a browser download payload without manual copy', async () 
   });
   assert.equal(again.code, 0, again.stderr);
   assert.equal(again.stdout, '');
+});
+
+test('protocol-1 JSON destinations recover byte-for-byte before receipt', async () => {
+  const fx = await fixture('legacy-json-intake');
+  const id = await createRequest(fx, {
+    destination: 'data/lavish-answers/release-choice.json',
+  });
+  const manifestPath = join(fx.home, 'data/decisions', id, 'manifest.toon');
+  const manifest = await manifestFor(fx, id);
+  delete manifest.destination_format;
+  await writeFile(manifestPath, `${encode(manifest)}\n`);
+
+  const payloadPath = join(fx.root, 'payload.json');
+  await writeFile(
+    payloadPath,
+    `${JSON.stringify(browserPayload(manifest))}\n`,
+  );
+  const collected = await runCli(['collect', id, '--payload', payloadPath], { home: fx.home });
+  assert.equal(collected.code, 0, collected.stderr);
+
+  const answerPath = join(fx.home, 'data/decisions', id, 'answer.toon');
+  const answerBytes = await readFile(answerPath);
+  const destinationDirectory = join(fx.home, 'data/lavish-answers');
+  const destinationPath = join(destinationDirectory, 'release-choice.json');
+  await mkdir(destinationDirectory, { recursive: true });
+  await writeFile(destinationPath, answerBytes);
+
+  const intake = await runCli(['intake'], { home: fx.home });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, /release-choice,consumed/);
+  assert.deepEqual(await readFile(destinationPath), answerBytes);
+  assert.equal(
+    await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
+    true,
+  );
 });
 
 test('collect fails closed with named errors for count, key, option, and request drift', async () => {
@@ -1010,6 +1072,37 @@ test('B2 visible queue refuses an ambient target not bound to the answer home', 
   assert.equal(await exists(fake.log), false, 'queue wrote into the ambient pane');
 });
 
+test('B2 visible queue revalidates the target against the lock holder', async () => {
+  const fx = await fixture('queue-unbound-lock');
+  const fake = await fakeTmux(fx);
+  const holder = await writeSupervisorLock(fx, 'ambient:0');
+  try {
+    const result = await runExecutable(
+      QUEUE_ADAPTER,
+      [
+        '--home', fx.home,
+        '--decision', 'release-choice',
+        '--answer', join(fx.home, 'data/decisions/release-choice/answer.toon'),
+        '--digest', `sha256:${'0'.repeat(64)}`,
+        '--destination', 'data/replies/release-choice.toon',
+      ],
+      {
+        env: {
+          PATH: `${fake.bin}:${process.env.PATH}`,
+          LAVISH_FAKE_TMUX_PANE_PID: '999999999',
+        },
+      },
+    );
+    assert.equal(result.code, 4, result.stderr);
+    assert.match(result.stderr, /home-bound supervisor/i);
+    assert.equal(await exists(fake.log), false, 'queue wrote into an unowned pane');
+  } finally {
+    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
+    holder.kill();
+    await closed;
+  }
+});
+
 test('B3 visible queue uses the manifest destination and home-bound target', async () => {
   const fx = await fixture('queue-destination');
   const id = await createRequest(fx);
@@ -1035,6 +1128,7 @@ test('B3 visible queue uses the manifest destination and home-bound target', asy
           FM_LAVISH_QUEUE_DISABLE: '0',
           FM_SUPERVISOR_BACKEND: 'tmux',
           FM_SUPERVISOR_TARGET: 'ambient:0',
+          LAVISH_FAKE_TMUX_PANE_PID: String(holder.pid),
         },
       },
     );

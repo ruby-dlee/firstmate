@@ -241,6 +241,16 @@ export function validateManifest(raw, expectedId = undefined) {
   const title = requireString(manifest.title, 'manifest.title');
   const createdAt = requireTimestamp(manifest.created_at, 'manifest.created_at');
   const destination = validateDestination(manifest.destination);
+  let destinationFormat;
+  if (manifest.destination_format !== undefined) {
+    destinationFormat = requireString(
+      manifest.destination_format,
+      'manifest.destination_format',
+    );
+    if (!['answer-toon', 'payload-json-v2'].includes(destinationFormat)) {
+      throw new LavishError('unsupported manifest.destination_format', 2);
+    }
+  }
   const requestSha256 = requireDigest(
     manifest.request_sha256,
     'manifest.request_sha256',
@@ -320,6 +330,7 @@ export function validateManifest(raw, expectedId = undefined) {
     title,
     created_at: createdAt,
     destination,
+    ...(destinationFormat === undefined ? {} : { destination_format: destinationFormat }),
     expected_count: manifest.expected_count,
     request_sha256: requestSha256,
     questions,
@@ -580,7 +591,7 @@ export function encodeJsonPayload(payload) {
 }
 
 function destinationTextForAnswer(decision, answer, answerText) {
-  if (extname(decision.manifest.destination).toLowerCase() === '.json') {
+  if (decision.manifest.destination_format === 'payload-json-v2') {
     return encodeJsonPayload(payloadFromAnswer(answer));
   }
   return answerText;
@@ -931,6 +942,9 @@ export async function createDecision(home, {
   requireString(title, 'title');
   requireTimestamp(createdAt, 'created_at');
   const normalizedDestination = validateDestination(destination);
+  const destinationFormat = extname(normalizedDestination).toLowerCase() === '.json'
+    ? 'payload-json-v2'
+    : 'answer-toon';
   const normalizedQuestions = validateQuestions(questions);
   const requestBytes = Buffer.isBuffer(request) ? request : Buffer.from(request, 'utf8');
   if (requestBytes.length === 0) {
@@ -946,6 +960,7 @@ export async function createDecision(home, {
     title,
     created_at: createdAt,
     destination: normalizedDestination,
+    destination_format: destinationFormat,
     expected_count: normalizedQuestions.length,
     request_sha256: requestDigest,
     questions: normalizedQuestions,

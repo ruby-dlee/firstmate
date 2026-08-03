@@ -27,7 +27,7 @@ It then queues a redundant wake pointer and exits without waiting for firstmate.
 If wake enqueueing fails, the durable answer remains authoritative.
 The command prints `answer saved; wake not queued`, exits nonzero, and the next ordinary intake scan recovers it.
 
-`bin/fm-lavish-board.sh` renders the same immutable request into self-contained HTML and opens it with a decision-specific Chrome profile below `$FM_HOME/state`.
+`bin/fm-lavish-board.sh` renders the same immutable request into self-contained HTML and opens it with a decision-specific Chrome profile below the effective state root (`FM_STATE_OVERRIDE` or `$FM_HOME/state`).
 Submit first writes and reads back a browser-profile record, then shows a confirmation describing that durable record; the optional browser download is not treated as confirmed delivery.
 The armed check recovers the record from the same profile even after the visible browser closes, validates it through `lavish-axi collect`, and runs intake.
 
@@ -71,6 +71,8 @@ lavish-axi intake
 Intake validates every unreceipted answer, writes the declared destination first, then writes `receipt.toon`.
 An existing matching destination or receipt is an idempotent success.
 A conflicting destination fails closed.
+New manifests declare `destination_format`; `.json` destinations receive the schema-version-2 browser payload, while other destinations receive the authoritative TOON answer.
+Protocol-1 manifests without `destination_format` retain the original byte-for-byte TOON copy behavior regardless of filename.
 
 All commands require either `FM_HOME` or an explicit `--home <path>` and never guess a fleet home.
 Firstmate's internal commands use `FM_HOME`; captain-facing commands carry the resolved absolute `--home` path.
@@ -87,6 +89,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - `kind: lavish-decision-manifest`
 - `schema_version`, stable `decision_id`, `title`, and `created_at`
 - an `$FM_HOME`-relative durable `destination`
+- optional `destination_format` (`answer-toon` or `payload-json-v2`); absence retains protocol-1 TOON copy semantics
 - `expected_count` and the ordered `questions` array
 - each question's nonempty unique key and ordered nonempty options
 - `request_sha256`, formatted as `sha256:<hex>`

@@ -8,7 +8,7 @@
 #
 # Internal watcher entry point:
 #   fm-lavish-board.sh --check <decision-id> --home <path> --session <name>
-#     --downloads <path> --opened-at <milliseconds>
+#     --downloads <path> --state <path> --opened-at <milliseconds>
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -129,10 +129,10 @@ collect_submission() {
 check_submission() {
   local decision_id=$1
   local home=$2
-  local session=$3
-  local downloads=$4
-  local opened_at=$5
-  local state_dir="$home/state"
+  local state_dir=$3
+  local session=$4
+  local downloads=$5
+  local opened_at=$6
   local payload_path="$state_dir/lavish-board-$decision_id.payload.json"
   local check_path="$state_dir/lavish-board-$decision_id.check.sh"
   local profile_path="$state_dir/lavish-board-$decision_id.chrome-profile"
@@ -243,6 +243,7 @@ validate_id "$DECISION_ID"
 HOME_ARG=${FM_HOME:-$REPO_ROOT}
 SESSION=
 DOWNLOADS_ARG=${LAVISH_DOWNLOADS_DIR:-${HOME:+$HOME/Downloads}}
+STATE_ARG=${FM_STATE_OVERRIDE:-}
 OPENED_AT=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -260,6 +261,12 @@ while [ "$#" -gt 0 ]; do
       [ "$MODE" = check ] || fail '--session is internal to the watcher check'
       [ "$#" -gt 1 ] || fail '--session requires a name'
       SESSION=$2
+      shift 2
+      ;;
+    --state)
+      [ "$MODE" = check ] || fail '--state is internal to the watcher check'
+      [ "$#" -gt 1 ] || fail '--state requires a path'
+      STATE_ARG=$2
       shift 2
       ;;
     --opened-at)
@@ -282,12 +289,19 @@ done
 HOME_PATH=$(resolve_home "$HOME_ARG")
 [ -n "$DOWNLOADS_ARG" ] || fail 'could not resolve a Downloads directory; pass --downloads'
 DOWNLOADS_PATH=$(resolve_downloads "$DOWNLOADS_ARG")
-STATE_DIR="$HOME_PATH/state"
+STATE_ARG=${STATE_ARG:-$HOME_PATH/state}
+mkdir -p "$STATE_ARG"
+[ -d "$STATE_ARG" ] && [ ! -L "$STATE_ARG" ] \
+  || fail "unsafe state directory: $STATE_ARG"
+STATE_DIR=$(cd "$STATE_ARG" && pwd -P)
+FM_STATE_OVERRIDE=$STATE_DIR
+export FM_STATE_OVERRIDE
 
 if [ "$MODE" = check ]; then
   [ -n "$SESSION" ] || fail '--session is required in check mode'
   [ -n "$OPENED_AT" ] || fail '--opened-at is required in check mode'
-  check_submission "$DECISION_ID" "$HOME_PATH" "$SESSION" "$DOWNLOADS_PATH" "$OPENED_AT"
+  check_submission \
+    "$DECISION_ID" "$HOME_PATH" "$STATE_DIR" "$SESSION" "$DOWNLOADS_PATH" "$OPENED_AT"
   exit 0
 fi
 
@@ -296,8 +310,6 @@ command -v chrome-devtools-axi >/dev/null 2>&1 \
   || fail 'chrome-devtools-axi is not installed'
 command -v node >/dev/null 2>&1 || fail 'node is not installed'
 
-mkdir -p "$STATE_DIR"
-[ ! -L "$STATE_DIR" ] || fail "unsafe state directory: $STATE_DIR"
 umask 077
 
 HOME_DIGEST=$(printf '%s' "$HOME_PATH" | shasum -a 256 | awk '{print substr($1,1,12)}')
@@ -316,9 +328,9 @@ mkdir -p "$PROFILE_PATH"
   || fail "unsafe Chrome profile directory: $PROFILE_PATH"
 {
   printf '#!/usr/bin/env bash\n'
-  printf 'exec %q --check %q --home %q --session %q --downloads %q --opened-at %q\n' \
-    "$SCRIPT_DIR/fm-lavish-board.sh" "$DECISION_ID" "$HOME_PATH" "$SESSION" \
-    "$DOWNLOADS_PATH" "$OPENED_AT"
+  printf 'exec env FM_STATE_OVERRIDE=%q %q --check %q --home %q --state %q --session %q --downloads %q --opened-at %q\n' \
+    "$STATE_DIR" "$SCRIPT_DIR/fm-lavish-board.sh" "$DECISION_ID" "$HOME_PATH" \
+    "$STATE_DIR" "$SESSION" "$DOWNLOADS_PATH" "$OPENED_AT"
 } > "$CHECK_TMP"
 chmod 700 "$CHECK_TMP"
 mv "$CHECK_TMP" "$CHECK_PATH"

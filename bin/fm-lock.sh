@@ -26,10 +26,9 @@ write_lock() {
   local pid=$1 start tmp canonical_home backend='' target=''
   start=$(fm_session_lock_process_start_time "$pid") || return 1
   canonical_home=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 1
-  if target=$(discover_supervisor_target) \
-    && backend=$(discover_supervisor_backend); then
-    case "$backend" in tmux|herdr|zellij|orca|cmux) ;; *) backend=; target= ;; esac
-  else
+  if ! target=$(discover_supervisor_target) \
+    || ! backend=$(discover_supervisor_backend) \
+    || ! fm_session_lock_supervisor_target_owns_pid "$backend" "$target" "$pid"; then
     backend=
     target=
   fi

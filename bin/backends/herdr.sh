@@ -2707,16 +2707,25 @@ fm_backend_herdr_send_text_line() {  # <target> <text>
 # Verified: `pane send-text` does NOT auto-submit (contrary to the addendum's
 # original guess); it behaves exactly like tmux's `-l` literal send.
 #
-# Native-first: `agent send` addresses the registered AGENT, so it cannot deliver
-# steering text into a pane whose agent has died and left a bare shell - where the
-# very next Enter would run that text as a shell command. `pane send-text` is the
-# fallback, kept because firstmate must still be able to drive a husk or an
-# agent-less pane during recovery and stuck-crewmate handling.
+# Herdr's native `agent send` reapplies the account's stored thread settings to a
+# Codex session before it delivers the message.
+# That silently replaced an explicitly launched gpt-5.6-sol/xhigh session with
+# the account default gpt-5.6-luna/medium during an ordinary steer.
+# Codex therefore uses literal pane input after a native agent identity read.
+# Other registered agents retain native delivery.
+# An agent-less pane is never a steering target because the following Enter
+# could execute the instruction in a bare shell.
 fm_backend_herdr_send_literal() {  # <target> <text> [expected-label]
+  local agent_json agent
   fm_backend_herdr_target_ready "$1" "${3:-}" || return 1
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent send "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1 \
-    && return 0
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
+  agent_json=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent get "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || return 1
+  agent=$(printf '%s' "$agent_json" | fm_backend_herdr_control_jq -r '.result.agent.agent // empty' 2>/dev/null) || return 1
+  [ -n "$agent" ] || return 1
+  if [ "$agent" = codex ]; then
+    fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
+  else
+    fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent send "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
+  fi
 }
 
 # fm_backend_herdr_agent_session_id: the harness's OWN session id for the agent

@@ -1647,7 +1647,7 @@ test_pr_check_backfills_legacy_generation_and_records_state() {
   expect_code 1 "$count" "successful legacy PR generation backfill count"
   assert_grep "pr=$url" "$meta" "successful legacy PR check did not record the PR URL"
   assert_grep "pr_head=$head" "$meta" "successful legacy PR check did not record the PR head"
-  assert_present "$state/task-x1.check.sh" "successful legacy PR check did not arm the merge poll"
+  assert_absent "$state/task-x1.check.sh" "successful legacy PR check armed a merge poll"
   pass "fm-pr-check upgrades legacy task metadata without breaking PR handling"
 }
 
@@ -6608,6 +6608,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = nested-repository ]; then
   test_secondmate_retirement_recurses_into_ignored_nested_repositories
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = directory-symlink ]; then
+  test_secondmate_retirement_accounts_for_directory_symlinks
   exit 0
 fi
 

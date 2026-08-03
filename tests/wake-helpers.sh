@@ -178,6 +178,28 @@ printf '%s\n' "${val:-state: unknown · source: none · fake default}"
 exit 0
 SH
   chmod +x "$fakebin/fm-crew-state.sh"
+  cat > "$fakebin/fm-run-liveness.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+id=${1:-unknown}
+rc=${FM_FAKE_RUN_LIVENESS_RC:-0}
+if [ "$rc" -eq 0 ]; then
+  line='alive: run=FAKE samples=7 interval=10s counts=1,1,1,1,1,1,1 cpu=1,1,1,1,1,1,1 cpu_delta=1s repo_test_baseline=unknowns'
+else
+  line='unknown: run=FAKE samples=7 interval=10s counts=0,0,0,0,0,0,0 cpu=0,0,0,0,0,0,0 cpu_delta=0s repo_test_baseline=unknowns (entire window had zero run-owned processes, which does not prove death)'
+fi
+if [ -n "${FM_STATE_OVERRIDE:-}" ]; then printf '%s\n' "$line" > "$FM_STATE_OVERRIDE/.run-liveness-$id"; fi
+printf '%s\n' "$line"
+exit "$rc"
+SH
+  chmod +x "$fakebin/fm-run-liveness.sh"
+  cat > "$fakebin/fm-runtime-profile.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "${FM_FAKE_RUNTIME_PROFILE_OUTPUT:-verified: Codex runtime model=gpt-5.6-sol effort=xhigh}"
+exit "${FM_FAKE_RUNTIME_PROFILE_RC:-0}"
+SH
+  chmod +x "$fakebin/fm-runtime-profile.sh"
   printf '%s\n' "$fakebin/fm-crew-state.sh"
 }
 

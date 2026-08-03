@@ -82,14 +82,18 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-transition-lib.sh`   | Shared backend-neutral transition record shape and single-owner status->action policy table |
-| `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
+| `fm-send.sh`             | Enforce routed Gate B/F16 text refusal; send only supported control keys through the recorded backend |
+| `fm-runtime-profile.sh`  | Verify a task's actual Codex model and effort from its harness-owned rollout record |
+| `fm-run-liveness.sh`     | Sample one exact no-mistakes run's untruncated processes across a full liveness window |
+| `fm-host-pressure.sh`    | Record contemporaneous uptime and vm_stat evidence before a host-sensitive diagnosis |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
 | `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads through a fail-closed read-only CLI               |
 | `fm-crosscheck.sh`       | Run, verify, or atomically merge through the durable exact-head PR finding ledger     |
 | `fm-crosscheck.py`       | Validate and execute crosscheck reviewer evidence and finding lifecycle transitions  |
-| `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
-| `fm-pr-merge.sh`         | Require exact-head crosscheck, record PR metadata, and atomically merge the reviewed SHA |
+| `fm-pr-check.sh`         | Record exact PR metadata without arming merge execution or replacing task checks      |
+| `fm-pr-admit.sh`         | Require four settled native properties on one unchanged exact PR head                 |
+| `fm-pr-merge.sh`         | Combine exact-head admission and independent crosscheck, then refuse before merge arming |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |

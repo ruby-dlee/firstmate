@@ -457,11 +457,10 @@ if [ $((RESUME_ACCOUNT + CONTINUE_ACCOUNT + DIRECT_ACCOUNT_RECOVERY)) -gt 1 ]; t
   exit 1
 fi
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-  if [ "$KIND_SET" = 1 ] || [ "$HARNESS_SET" = 1 ] || [ "$MODEL_SET" = 1 ] \
-    || [ "$EFFORT_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
+  if [ "$KIND_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
     || [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ] \
     || [ "$NO_ACCOUNT_ROUTING" = 1 ] || [ "$BACKLOG_ROW_EXEMPTION_SET" = 1 ]; then
-    echo "error: --recover-direct-account accepts only a task id; task context comes from metadata" >&2
+    echo "error: --recover-direct-account accepts a task id plus current-policy --harness/--model/--effort only; task and backend context come from metadata" >&2
     exit 1
   fi
 fi
@@ -2358,12 +2357,19 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
     RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
     RECORDED_META_WORKTREE_GIT_SETUP_HEAD=$RECORDED_WORKTREE_GIT_SETUP_HEAD
-    HARNESS_ARG=$RECORDED_HARNESS
+    if [ -f "$CONFIG/crew-dispatch.json" ]; then
+      [ "$HARNESS_SET" = 1 ] || {
+        echo "error: direct recovery must pass the harness freshly selected from current config/crew-dispatch.json; recorded harness '$RECORDED_HARNESS' will not be replayed" >&2
+        exit 1
+      }
+    elif [ "$HARNESS_SET" = 0 ]; then
+      HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" crew) || exit 1
+    fi
+    case "$HARNESS_ARG" in
+      claude|codex) ;;
+      *) echo "error: current direct recovery policy selected unsupported harness '$HARNESS_ARG'" >&2; exit 1 ;;
+    esac
     HARNESS_SET=1
-    MODEL=$RECORDED_MODEL
-    EFFORT=$RECORDED_EFFORT
-    [ "$MODEL" = default ] && MODEL=
-    [ "$EFFORT" = default ] && EFFORT=
     ARG3=$HARNESS_ARG
     DIRECT_ACCOUNT_RESPAWN=1
     PROJ=$RECORDED_PROJECT
@@ -2377,12 +2383,23 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
     [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
     [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
+    if [ "$KIND" = secondmate ]; then
+      [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" secondmate) || exit 1
+    elif [ -f "$CONFIG/crew-dispatch.json" ]; then
+      [ "$HARNESS_SET" = 1 ] || {
+        echo "error: account recovery must pass the harness freshly selected from current config/crew-dispatch.json; recorded harness '$RECORDED_HARNESS' will not be replayed" >&2
+        exit 1
+      }
+    elif [ "$HARNESS_SET" = 0 ]; then
+      HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" crew) || exit 1
+    fi
+    case "$HARNESS_ARG" in claude|codex) ;; *) echo "error: current account recovery policy selected unsupported harness '$HARNESS_ARG'" >&2; exit 1 ;; esac
     if [ "$RESUME_ACCOUNT" = 1 ]; then
       FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
       RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
       [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
-      if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
-        echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+      if [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
+        echo "error: --resume-account cannot retain provider session identity because current harness policy '$HARNESS_ARG' differs from recorded harness '$RECORDED_HARNESS'; use continuation with an explicitly resolved profile" >&2
         exit 1
       fi
       if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
@@ -2401,7 +2418,6 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       ACCOUNT_TASK=$RECORDED_ACCOUNT_TASK
       ACCOUNT_ATTEMPT=$RECORDED_ATTEMPT
     else
-      [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
       if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
         if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
           ACCOUNT_POOL=$RECORDED_POOL
@@ -2622,6 +2638,38 @@ if [ "$KIND" != secondmate ] && [ "$HARNESS" = claude ]; then
     echo "error: Claude crew/scout model '$MODEL' does not match the installed Opus 5 anchor '$CLAUDE_CREW_MODEL'" >&2
     exit 1
   }
+fi
+
+# Codex has one fail-closed fleet profile.
+# Unknown or future model names are not ordered optimistically; they must be
+# admitted here deliberately before they can count as at least the required
+# gpt-5.6-sol/xhigh profile.
+# Recovery re-resolves these axes from this current policy instead of replaying
+# model= and effort= from task metadata.
+if [ "$HARNESS" = codex ]; then
+  [ "$RAW_LAUNCH" != 1 ] || {
+    echo "error: Codex launch does not accept raw commands because the required runtime profile cannot be proved" >&2
+    exit 1
+  }
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    if [ "$MODEL_SET" = 1 ] && [ "$MODEL" != gpt-5.6-sol ]; then
+      echo "error: current Codex recovery policy requires model=gpt-5.6-sol (got explicit model=${MODEL:-default})" >&2
+      exit 1
+    fi
+    if [ "$EFFORT_SET" = 1 ] && [ "$EFFORT" != xhigh ]; then
+      echo "error: current Codex recovery policy requires effort=xhigh (got explicit effort=${EFFORT:-default})" >&2
+      exit 1
+    fi
+    MODEL=gpt-5.6-sol
+    EFFORT=xhigh
+  else
+    [ -n "$MODEL" ] || MODEL=gpt-5.6-sol
+    [ -n "$EFFORT" ] || EFFORT=xhigh
+  fi
+  if [ "$MODEL" != gpt-5.6-sol ] || [ "$EFFORT" != xhigh ]; then
+    echo "error: Codex launch requires the admitted runtime profile model=gpt-5.6-sol effort=xhigh (got model=${MODEL:-default} effort=${EFFORT:-default})" >&2
+    exit 1
+  fi
 fi
 
 ACCOUNT_EXPLICIT=0

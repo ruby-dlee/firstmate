@@ -14,8 +14,8 @@
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crewmate
 #                          is not provably working, unless afk is active
-#   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
-#                          timer) regardless of what the status log says - an active
+#   stale: <window>        a process-window-proved run is absorbed regardless of
+#                          what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
 #                          line, since the crewmate's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
@@ -23,14 +23,9 @@
 #                          re-surface cadence, never as a wedge. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
-#                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
-#                          consecutive escalations on the SAME pane, the reason
-#                          also carries a "demand-deep-inspection" marker so the
-#                          wake payload itself, not just repetition, forces a
-#                          closer look instead of another routine supervision
-#                          resume. A recognized harness permission prompt surfaces
+#                          both surfaced at once. A repository-derived recheck
+#                          repeats the full run-owned process window; only a failed
+#                          window surfaces as UNKNOWN. A recognized harness permission prompt surfaces
 #                          immediately with an explicit permission-blocked reason.
 #                          A pane that remains busy without meaningful output,
 #                          status, or turn-end progress surfaces after
@@ -120,6 +115,11 @@ POLL=${FM_POLL:-15}                   # seconds between cycles
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
+RUNTIME_PROFILE_INTERVAL=${FM_RUNTIME_PROFILE_INTERVAL:-300}
+RUNTIME_PROFILE_STARTUP_GRACE=${FM_RUNTIME_PROFILE_STARTUP_GRACE:-60}
+FM_RUNTIME_PROFILE_BIN=${FM_RUNTIME_PROFILE_BIN:-$SCRIPT_DIR/fm-runtime-profile.sh}
+case "$RUNTIME_PROFILE_INTERVAL" in ''|*[!0-9]*|0) RUNTIME_PROFILE_INTERVAL=300 ;; esac
+case "$RUNTIME_PROFILE_STARTUP_GRACE" in ''|*[!0-9]*) RUNTIME_PROFILE_STARTUP_GRACE=60 ;; esac
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 ACCOUNT_SESSION_SYNC_INTERVAL=${FM_ACCOUNT_SESSION_SYNC_INTERVAL:-60}
 ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
@@ -151,13 +151,14 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # busy pane is SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
 # signal, a no-verb signal whose crewmate is not provably working, any check, a stale
-# pane whose crewmate is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
+# pane whose crewmate is not provably working, a stale whose repeated process
+# window has no positive sample, or anything unknown) is written to the durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
-STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # minimum idle secs before repeating the run-owned process window
+FM_PERMISSION_DEMAND_INSPECT_COUNT=${FM_PERMISSION_DEMAND_INSPECT_COUNT:-3}
 # A macOS TCC/system dialog can block a foreground tool while the harness keeps
 # rendering its busy footer, so ordinary stale detection never starts. Track a
 # semantic pane fingerprint that excludes verified busy-footer churn and surface
@@ -324,28 +325,16 @@ wake() {  # <reason> [durable-resurface-marker]
   exit 0
 }
 
-# Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
-# (default 3): a pane that keeps re-wedging on the SAME stale hash - each
-# escalation gets absorbed again as "still validating" one poll later, since the
-# hash never changes - can otherwise repeat forever with no signal that this is
-# no longer a one-off. At the threshold, wedge_timer_check appends a
-# "demand-deep-inspection" marker to the wake payload so the wake reason itself
-# (not just repetition the supervisor has to notice on its own) forces a closer
-# look instead of another routine supervision resume. Reset wherever a window's
-# pane/hash state resets to genuinely active (see the two rm-on-reset call sites
-# below).
-FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
-
-# Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
-# absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
-# watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crewmate
-# state (the costly check already ran once, at classification time). Shared by
-# both places a hash can be absorbed this way: the plain non-terminal path,
-# and the stale_is_terminal-overridden path (a captain-relevant status-log
-# line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+# Repeat-poll wedge bookkeeping for an already-classified stale hash.
+# The initial classification already crossed a complete run-owned process
+# window through crew_absorb_class.
+# A later due check repeats that process window instead of concluding from the
+# still-static pane or the recorded run status.
+# The cadence comes from this repository's recent completed test durations.
+# Unknown baselines use the conservative four-minute initial floor, but a
+# fleet-wide duration is never used to call a run anomalous or wedged.
+liveness_recheck_if_due() {  # <window> <since-file> <triage-label> <legacy-escalation-file>
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age reason task cache baseline threshold class evidence now
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -353,20 +342,111 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       triage_log "absorbed $label timer reset: $win"
       ;;
     *)
-      age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
-        echo "$n" > "$escalation_file"
-        reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
-        if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
-          reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+      now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+      age=$(( now - since ))
+      task=$(window_to_task "$win" "$STATE")
+      cache="$STATE/.run-liveness-$task"
+      baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
+      threshold=$STALE_ESCALATE_SECS
+      case "$baseline" in
+        ''|*[!0-9]*) ;;
+        *)
+          threshold=$((baseline / 4))
+          [ "$threshold" -ge "$STALE_ESCALATE_SECS" ] || threshold=$STALE_ESCALATE_SECS
+          ;;
+      esac
+      if [ "$age" -ge "$threshold" ]; then
+        class=$(watch_absorb_class "$task")
+        evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
+        if [ "$class" = working ]; then
+          date +%s > "$since_file"
+          rm -f "$escalation_file"
+          triage_log "absorbed $label after repeated process window: $win ($evidence; next repository-derived cadence ${threshold}s)"
+          return
         fi
+        reason="stale: $win (process-window liveness UNKNOWN after idle ${age}s; no death proof: $evidence)"
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
         wake "$reason"
       fi
       ;;
   esac
+}
+
+liveness_recheck_is_due() {  # <window> <since-file>
+  local win=$1 since_file=$2 since age task cache baseline threshold now
+  since=$(cat "$since_file" 2>/dev/null || true)
+  case "$since" in ''|*[!0-9]*) return 1 ;; esac
+  now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+  age=$(( now - since ))
+  task=$(window_to_task "$win" "$STATE")
+  cache="$STATE/.run-liveness-$task"
+  baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
+  threshold=$STALE_ESCALATE_SECS
+  case "$baseline" in
+    ''|*[!0-9]*) ;;
+    *)
+      threshold=$((baseline / 4))
+      [ "$threshold" -ge "$STALE_ESCALATE_SECS" ] || threshold=$STALE_ESCALATE_SECS
+      ;;
+  esac
+  [ "$age" -ge "$threshold" ]
+}
+
+watch_absorb_class() {  # <task> [declared-pause-status-line]
+  local task=$1 observation
+  observation=$(crew_absorb_observation_from_batch "${WATCH_ABSORB_OBSERVATIONS:-}" "$task") || observation=unknown
+  crew_absorb_class_from_observation "$observation" "${2:-}"
+}
+
+watch_age_of() {  # <file>
+  local f=$1 mtime now age
+  mtime=$(stat_mtime "$f")
+  case "$mtime" in ''|*[!0-9]*) printf '999999'; return ;; esac
+  now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] || age=0
+  printf '%s' "$age"
+}
+
+pause_state_needs_observation() {  # <window> <status-line>
+  local win=$1 last=$2 key recheck_file
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  if ! status_is_paused "$last"; then
+    return 0
+  fi
+  recheck_file="$STATE/.paused-rechecked-$key"
+  [ -e "$STATE/.paused-$key" ] && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] && return 1
+  return 0
+}
+
+watch_window_needs_observation() {  # <window> <kind> <task> <status-line> <hash> <busy>
+  local win=$1 kind=$2 task=$3 last=$4 h=$5 busy=$6 key prev n sf ssf pf
+  [ "$busy" != 1 ] && ! afk_present || return 1
+  [ "$kind" != secondmate ] || status_is_paused "$last" || return 1
+  if status_is_paused "$last" && pause_state_needs_observation "$win" "$last"; then
+    return 0
+  fi
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  prev=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
+  [ "$h" = "$prev" ] || return 1
+  n=$(( $(cat "$STATE/.count-$key" 2>/dev/null || echo 0) + 1 ))
+  [ "$n" -ge 2 ] || return 1
+  [ "$kind" != secondmate ] || { pause_state_needs_observation "$win" "$last"; return; }
+  sf="$STATE/.stale-$key"
+  ssf="$STATE/.stale-since-$key"
+  pf="$STATE/.paused-$key"
+  if stale_is_terminal "$win" "$STATE"; then
+    [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ] || return 0
+    [ -e "$ssf" ] && liveness_recheck_is_due "$win" "$ssf"
+    return
+  fi
+  [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ] || return 0
+  if [ -e "$pf" ] || status_is_paused "$last"; then
+    pause_state_needs_observation "$win" "$last"
+    return
+  fi
+  liveness_recheck_is_due "$win" "$ssf"
 }
 
 # Absorb a stale pane whose crewmate is in a DECLARED external-wait pause (paused:),
@@ -426,26 +506,18 @@ pause_state_class() {  # <window> <task>
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused "$last"; then
     rm -f "$recheck_file"
-    crew_absorb_class "$task"
+    watch_absorb_class "$task"
     return
   fi
-  # Cached verdict: skip the costly authoritative re-read (an fm-crew-state.sh call
-  # plus the keyed open/resolved fold) while a recent recheck still stands AND the
-  # status stream it was taken from is byte-identical. Both halves of the pause proof
-  # are pure functions of that stream, so an unchanged signature means the earlier
-  # verdict is still exactly as true - while any append, including one that OPENS a
-  # decision after the pause flag was written, invalidates the cache and forces a
-  # fresh proof rather than riding out the age window behind a stale `paused`.
-  # The recheck marker carries the signature as its content; callers read only its
-  # mtime for the age bound, and a marker left by an older watcher simply mismatches
-  # and re-proves.
+  # Reuse a pause proof only while its durable status stream is byte-identical.
+  # Any append, including a newly opened decision, invalidates the cache.
   sig=$(stat_sig "$statusf")
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
      && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
     printf 'paused'
     return
   fi
-  class=$(crew_absorb_class "$task" "$last")
+  class=$(watch_absorb_class "$task" "$last")
   case "$class" in
     paused)
       sig=$(stat_sig "$statusf")
@@ -465,10 +537,11 @@ pause_state_class() {  # <window> <task>
 # Surface a stopped stale pane immediately. Pause cadence markers belong to the
 # durable status, not to this one surface event: retain them while that status still
 # declares a pause, and clear them only after the task has genuinely resumed.
-surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last
+surface_nonterminal_stale() {  # <window> <hash> [reason]
+  local win=$1 h=$2 reason=${3:-} key task last
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  fm_wake_append stale "$win" "stale: $win" || exit 1
+  [ -n "$reason" ] || reason="stale: $win"
+  fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
   task=$(window_to_task "$win" "$STATE")
@@ -476,7 +549,13 @@ surface_nonterminal_stale() {  # <window> <hash>
   if ! status_is_paused "$last"; then
     clear_pause_state "$win"
   fi
-  wake "stale: $win"
+  wake "$reason"
+}
+
+surface_process_window_unknown() {  # <window> <task> <hash>
+  local win=$1 task=$2 h=$3 evidence
+  evidence=$(cat "$STATE/.run-liveness-$task" 2>/dev/null || echo "missing process-window evidence")
+  surface_nonterminal_stale "$win" "$h" "stale: $win (process-window liveness UNKNOWN; no death proof: $evidence)"
 }
 
 # Recognize the stable confirmation chrome rendered by verified harnesses when a
@@ -576,7 +655,7 @@ handle_permission_prompt() {  # <window> <task> <hash> <kind>
   fi
   printf '%s' "$n" > "$escalation_file"
   reason="stale: $win (permission-prompt detected: waiting for a $kind grant; inspect the requested action and escalate it to the captain - do not approve it automatically; escalation $n)"
-  if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+  if [ "$n" -ge "$FM_PERMISSION_DEMAND_INSPECT_COUNT" ]; then
     reason="stale: $win (permission-prompt detected: waiting for a $kind grant; inspect the requested action and escalate it to the captain - do not approve it automatically; escalation $n; demand-deep-inspection)"
   fi
   fm_wake_append stale "$win" "$reason" || exit 1
@@ -633,7 +712,7 @@ busy_stall_check() {  # <window> <task> <tail40>
   n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$n" > "$escalation_file"
   reason="stale: $win (permission/system-dialog suspected: no meaningful progress for ${age}s while the harness remained busy; inspect the visible macOS dialog or Privacy & Security in System Settings and escalate any grant to the captain; timeout heuristic, not direct OS detection; escalation $n)"
-  if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+  if [ "$n" -ge "$FM_PERMISSION_DEMAND_INSPECT_COUNT" ]; then
     reason="stale: $win (permission/system-dialog suspected: no meaningful progress for ${age}s while the harness remained busy; inspect the visible macOS dialog or Privacy & Security in System Settings and escalate any grant to the captain; timeout heuristic, not direct OS detection; escalation $n; demand-deep-inspection)"
   fi
   fm_wake_append stale "$win" "$reason" || exit 1
@@ -836,26 +915,17 @@ mark_all_captain_relevant_surfaced() {
 }
 
 # Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
-# events retain their surfaced-marker dedup. Command-step liveness is handled as
-# three explicit states: alive is healthy, while dead and unknown both surface
-# because neither may be absorbed as positive evidence. A line with no liveness
-# observation keeps its prior behavior.
+# events retain their surfaced-marker dedup. Run liveness is deliberately absent
+# here: only the repeated exact-run process window on the stale path can prove
+# BUSY, and a one-shot current-state field cannot prove death or a wedge.
 heartbeat_scan_finds_actionable() {
-  local f task last surfaced verdict
+  local f task last surfaced
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
     surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
     [ "$surfaced" = "$last" ] && continue
     return 0
   done < <(scan_captain_relevant_statuses "$STATE")
-  while IFS=$(printf '\t') read -r task verdict _; do
-    [ -n "$task" ] || continue
-    case "$verdict" in
-      alive) ;;
-      dead|unknown) return 0 ;;
-      *) return 0 ;;
-    esac
-  done < <(scan_crew_liveness_observations "$STATE")
   return 1
 }
 
@@ -970,6 +1040,60 @@ handle_push_transition() {  # <backend> <session> <record>
   wake "$reason"
 }
 
+# Re-read every Codex task's harness-owned rollout record after each new
+# generation starts and again on a fixed cadence.
+# Metadata is only the expected policy; it is never accepted as runtime proof.
+# A mismatch and an unreadable record both surface because silence would turn a
+# substituted or unproved runtime into an assumed-good one.
+verify_runtime_profiles_if_due() {
+  local marker="$STATE/.last-runtime-profile-check" meta task harness generation task_marker
+  local out rc reason due_all=0 meta_age tmp runtime_start provider_session verification_key wake_reason=
+  if [ ! -e "$marker" ]; then
+    safe_touch_marker_or_log "$marker" "runtime profile check" || true
+  elif marker_due "$marker" "$RUNTIME_PROFILE_INTERVAL" "runtime profile check"; then
+    due_all=1
+  fi
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    harness=$(fm_meta_get "$meta" harness)
+    [ "$harness" = codex ] || continue
+    task=${meta##*/}
+    task=${task%.meta}
+    generation=$(fm_meta_get "$meta" generation_id)
+    [ -n "$generation" ] || generation="legacy:$task"
+    runtime_start=$(fm_meta_get "$meta" runtime_started_at_ns)
+    provider_session=$(fm_meta_get "$meta" provider_session_id)
+    verification_key=$generation
+    if [ -n "$runtime_start" ] || [ -n "$provider_session" ]; then
+      verification_key="$generation:$runtime_start:$provider_session"
+    fi
+    task_marker="$STATE/.runtime-profile-verified-$task"
+    if [ "$due_all" -eq 0 ] && [ "$(cat "$task_marker" 2>/dev/null || true)" = "$verification_key" ]; then
+      continue
+    fi
+    if out=$("$FM_RUNTIME_PROFILE_BIN" "$task" 2>&1); then
+      triage_log "runtime profile $task: $out"
+      tmp=$(mktemp "$STATE/.runtime-profile-verified-$task.XXXXXX") || exit 1
+      printf '%s' "$verification_key" > "$tmp" || { rm -f "$tmp"; exit 1; }
+      safe_marker_path "$task_marker" || { rm -f "$tmp"; exit 1; }
+      mv "$tmp" "$task_marker" || { rm -f "$tmp"; exit 1; }
+      continue
+    else
+      rc=$?
+    fi
+    meta_age=$(age_of "$meta")
+    if [ "$meta_age" -lt "$RUNTIME_PROFILE_STARTUP_GRACE" ]; then
+      triage_log "runtime profile $task pending after start (${meta_age}s, exit $rc: $out)"
+      continue
+    fi
+    reason="runtime-profile: $task (verification exit $rc: $out)"
+    fm_wake_append stale "$task" "$reason" || exit 1
+    [ -n "$wake_reason" ] || wake_reason=$reason
+  done
+  [ "$due_all" -eq 0 ] || safe_touch_marker_or_log "$marker" "runtime profile check" || true
+  [ -z "$wake_reason" ] || wake "$wake_reason"
+}
+
 # --- Main entry: the runtime below runs only when this file is executed as a
 # script. When sourced (unit tests loading the functions above), return here
 # before acquiring the singleton lock or entering the blocking loop.
@@ -1025,6 +1149,8 @@ while :; do
   safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
 
   prune_reports_if_due
+
+  verify_runtime_profiles_if_due
 
   # A managed provider's SessionStart hook may race the initial spawn return.
   # Reconcile only metas still missing provider_session_id; failures stay
@@ -1146,6 +1272,16 @@ EOF
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
   # remembers the hash already classified).
+  stale_windows=()
+  stale_kinds=()
+  stale_tasks=()
+  stale_lasts=()
+  stale_tails=()
+  stale_hashes=()
+  stale_busies=()
+  absorb_tasks=()
+  absorb_seen=
+  WATCH_CLASSIFY_EPOCH=$(date +%s)
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
@@ -1161,10 +1297,47 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
     window_busy=0
     if window_is_busy "$w" "$tail40"; then
       window_busy=1
+    fi
+    stale_windows+=("$w")
+    stale_kinds+=("$kind")
+    stale_tasks+=("$task")
+    stale_lasts+=("$last")
+    stale_tails+=("$tail40")
+    stale_hashes+=("$h")
+    stale_busies+=("$window_busy")
+    skip_observation=0
+    if [ "$window_busy" != 1 ] && ! status_is_paused "$last"; then
+      allow_directory_trust=0
+      brief_processing_started "$task" && allow_directory_trust=1
+      [ -z "$(permission_prompt_kind "$(window_harness "$w")" "$tail40" "$allow_directory_trust" || true)" ] \
+        || skip_observation=1
+    fi
+    if [ "$skip_observation" = 0 ] \
+      && watch_window_needs_observation "$w" "$kind" "$task" "$last" "$h" "$window_busy"; then
+      case " $absorb_seen " in
+        *" $task "*) ;;
+        *) absorb_seen="$absorb_seen $task"; absorb_tasks+=("$task") ;;
+      esac
+    fi
+  done < <(recorded_windows)
+  WATCH_ABSORB_OBSERVATIONS=
+  if [ "${#absorb_tasks[@]}" -gt 0 ]; then
+    WATCH_ABSORB_OBSERVATIONS=$(crew_absorb_observations_bounded "$STATE" "${absorb_tasks[@]}") \
+      || WATCH_ABSORB_OBSERVATIONS=
+  fi
+  for ((stale_i = 0; stale_i < ${#stale_windows[@]}; stale_i++)); do
+    w=${stale_windows[$stale_i]}
+    kind=${stale_kinds[$stale_i]}
+    task=${stale_tasks[$stale_i]}
+    last=${stale_lasts[$stale_i]}
+    tail40=${stale_tails[$stale_i]}
+    h=${stale_hashes[$stale_i]}
+    window_busy=${stale_busies[$stale_i]}
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    if [ "$window_busy" = 1 ]; then
       mark_brief_processing_started "$task" || true
     fi
     # A declared external wait is its own idle state and must be classified
@@ -1250,7 +1423,7 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            if [ "$(watch_absorb_class "$(window_to_task "$w" "$STATE")")" = working ]; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
@@ -1266,7 +1439,7 @@ EOF
             # wedge timer is running for it) - keep treating it that way
             # without re-reading the crewmate state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
-            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+            liveness_recheck_if_due "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
           fi
           # else: already surfaced as genuinely terminal on a prior poll of
           # this same hash - nothing left to do (matches the original,
@@ -1288,7 +1461,7 @@ EOF
           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(crew_absorb_class "$task")" in
+            case "$(watch_absorb_class "$task")" in
               working)
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
@@ -1297,6 +1470,9 @@ EOF
                 ;;
               paused)
                 handle_paused_stale "$w" "$task" "$h"
+                ;;
+              unknown)
+                surface_process_window_unknown "$w" "$task" "$h"
                 ;;
               none)
                 surface_nonterminal_stale "$w" "$h"
@@ -1312,13 +1488,14 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
+                         liveness_recheck_if_due "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
+                unknown) surface_process_window_unknown "$w" "$task" "$h" ;;
                 none)    surface_nonterminal_stale "$w" "$h" ;;
                 *)       surface_nonterminal_stale "$w" "$h" ;;
               esac
             else
-              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+              liveness_recheck_if_due "$w" "$ssf" "non-terminal stale" "$ewf"
             fi
           fi
         fi
@@ -1344,7 +1521,7 @@ EOF
         [ -e "$pf" ] && clear_pause_tracking "$w"
       fi
     fi
-  done < <(recorded_windows)
+  done
 
   # Heartbeat: the watcher runs a bounded fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive

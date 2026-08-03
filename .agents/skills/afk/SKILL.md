@@ -82,7 +82,7 @@ While `state/.afk` exists, the watcher reverts to one-shot enqueue-and-exit beha
 - A declared `paused:` external wait self-handles and re-surfaces after `FM_PAUSE_RESURFACE_SECS`, which defaults to 3600 seconds.
 - A `check` always escalates because check scripts print only when firstmate should wake.
 - A terminal `stale` escalates immediately.
-- A non-terminal `stale` rechecks after `FM_STALE_ESCALATE_SECS`, which defaults to 240 seconds, and escalates only if it remains a possible wedge.
+- A non-terminal `stale` running step crosses the shared exact-run process window before absorption and repeats that window on its repository-derived cadence; a window with no positive sample surfaces as `UNKNOWN`, never as proof of death or a wedge.
 - A `heartbeat` self-handles while the daemon's cheap fleet scan backs up missed captain-relevant statuses.
 - An unknown or uncertain reason escalates fail-safe.
 

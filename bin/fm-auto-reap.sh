@@ -2,9 +2,9 @@
 # Automatically reap terminal crewmate resources through fm-teardown.sh.
 #
 # `task <id> <pr-merged|scout-done|local-merged>` validates the terminal event,
-# reaps an exactly-attributed no-mistakes run when necessary, and delegates all
-# endpoint, cleanliness, landing, report, and Treehouse-return proofs to ordinary
-# teardown without --force.
+# refuses while any exactly-attributed no-mistakes run is active, and delegates
+# all endpoint, cleanliness, landing, report, and Treehouse-return proofs to
+# ordinary teardown without --force. It never cancels a run.
 #
 # `maintenance` recovers pre-metadata Treehouse acquisitions left by a crashed
 # spawn. A record is eligible only after an age threshold and exact PID/start-time
@@ -154,7 +154,7 @@ pr_is_merged() {  # <meta>
 }
 
 reap_no_mistakes_run() {  # <meta>
-  local meta=$1 worktree branch branch_status nm captured run_branch run_id run_status outcome runs_output row status rest row_branch
+  local meta=$1 worktree branch branch_status nm captured run_branch run_id run_status
   [ "$(meta_value "$meta" mode)" = no-mistakes ] || return 0
   worktree=$(meta_value "$meta" worktree)
   [ -n "$worktree" ] || {
@@ -190,47 +190,23 @@ reap_no_mistakes_run() {  # <meta>
     run_status=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*status:[[:space:]]*//p' | head -1)
     run_status=${run_status#\"}
     run_status=${run_status%\"}
-    outcome=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*outcome:[[:space:]]*//p' | head -1)
-    outcome=${outcome#\"}
-    outcome=${outcome%\"}
     [ -n "$run_id" ] || {
       refuse "matching no-mistakes run has no exact run ID"
       return 1
     }
-    if [ -z "$outcome" ] && [ "$run_status" != completed ] \
-      && [ "$run_status" != cancelled ] && [ "$run_status" != failed ]; then
-      if run_capture captured "$nm" axi abort --run "$run_id"; then :; else return 1; fi
-      [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
-        refuse "failed to cancel exact no-mistakes run $run_id"
-        return 1
-      }
-      log_result "cancelled no-mistakes run $run_id for $AUTO_REAP_ID"
-    fi
-    return 0
-  fi
-  if run_capture runs_output env -C "$worktree" "$nm" runs --limit 200; then :; else return 1; fi
-  [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
-    refuse "cross-branch no-mistakes attribution could not be inspected"
-    return 1
-  }
-  while IFS= read -r row; do
-    row=$(printf '%s' "$row" | sed 's/^[[:space:]]*//')
-    [ -n "$row" ] || continue
-    status=${row%%[[:space:]]*}
-    rest=${row#"$status"}
-    rest=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//')
-    row_branch=${rest%%[[:space:]]*}
-    [ "$row_branch" = "$branch" ] || continue
-    case "$status" in
-      running)
-        refuse "branch still has an active no-mistakes run but its exact run ID is unavailable"
+    case "$run_status" in
+      completed|cancelled|failed) return 0 ;;
+      *)
+        refuse "exact no-mistakes run $run_id for $run_branch is still active; automatic cancellation is forbidden because process absence and run status cannot prove safe pushed-head custody"
         return 1
         ;;
     esac
-    return 0
-  done <<EOF
-$runs_output
-EOF
+  fi
+  # `axi status` is branch-blind when this worktree has no run and may return a
+  # neighbouring lane. The coarse runs list has no exact run ID, so it cannot
+  # retire that ambiguity. Refuse rather than acting on branch/status alone.
+  refuse "no exact run ID plus task-branch record is available for $branch (status returned ${run_branch:-no branch}); retaining the lane"
+  return 1
 }
 
 run_teardown() {  # <task>

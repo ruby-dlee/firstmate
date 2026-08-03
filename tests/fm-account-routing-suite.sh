@@ -3201,17 +3201,19 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 }
 
 test_cross_profile_continuation_for_harness() {
-  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
+  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model source_effort
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
   if [ "$harness" = claude ]; then
     source_model=claude-opus-5
+    source_effort=high
   else
-    source_model="$harness-source-model"
+    source_model=gpt-5.6-sol
+    source_effort=xhigh
   fi
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort "$source_effort")
   status=$?
   [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -3301,7 +3303,7 @@ PY
   assert_not_contains "$launch" 'replacement launch generation' \
     "$harness launch consumed replacement bytes from its generation pathname"
   assert_contains "$launch" "$source_model" "$harness same-provider continuation lost its inherited model"
-  assert_regex '^effort=high$' "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
+  assert_regex "^effort=$source_effort$" "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "$harness continuation did not release its predecessor after binding"
   assert_grep "session remove --task $old_task" "$AF_LOG" "$harness continuation did not remove its predecessor mapping"
   assert_grep "agent_fleet_task=$new_task" "$HOME_DIR/data/$id/account-attempts.md" "$harness continuation lineage lost the new attempt"
@@ -3309,22 +3311,26 @@ PY
 }
 
 test_cross_provider_continuation_uses_target_default_pool() {
-  local source=$1 target=$2 id rec old_task out status source_model target_model launch
+  local source=$1 target=$2 id rec old_task out status source_model source_effort target_model target_effort launch
   id="account-continue-$source-to-$target-z21a"
   rec=$(make_case "continue-$source-to-$target" "$source" "$id")
   read_case "$rec"
   if [ "$source" = claude ]; then
     source_model=claude-opus-5
+    source_effort=high
   else
-    source_model="$source-source-model"
+    source_model=gpt-5.6-sol
+    source_effort=xhigh
   fi
   if [ "$target" = claude ]; then
     target_model=claude-opus-5
+    target_effort=default
   else
-    target_model=default
+    target_model=gpt-5.6-sol
+    target_effort=xhigh
   fi
   out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort high)
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort "$source_effort")
   status=$?
   [ "$status" -eq 0 ] || fail "$source initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -3342,7 +3348,7 @@ test_cross_provider_continuation_uses_target_default_pool() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "$source_model" "$source-to-$target continuation inherited the source provider's model"
   assert_regex "^model=$target_model$" "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not resolve the target model"
-  assert_regex '^effort=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target effort default"
+  assert_regex "^effort=$target_effort$" "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not resolve target effort policy"
   assert_grep "predecessor=$old_task" "$HOME_DIR/data/$id/account-attempts.md" \
     "$source-to-$target continuation lost predecessor lineage"
   pass "$source-to-$target continuation resolves the target provider pool"
@@ -3661,12 +3667,12 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
 
   out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "unconfirmed steering delivery returned an unsafe retry signal: $out"
-  assert_contains "$out" "could not be confirmed" "audit failure warning overstated delivery truth"
+  [ "$status" -ne 0 ] || fail "unconfirmed steering delivery returned success without a verification receipt: $out"
+  assert_contains "$out" "could not be confirmed" "audit failure overstated delivery truth"
   assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not submitted before confirmation failed"
   assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-unconfirmed.md" \
     "unconfirmed steering was not durably recorded for reconciliation"
-  pass "unconfirmed steering is durably spooled without returning a retry signal"
+  pass "unconfirmed steering is durably spooled and returns the required hard-stop signal"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -5557,9 +5563,11 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   printf 'outside\n' > "$CASE_DIR/outside-steering"
   ln -s "$CASE_DIR/outside-steering" "$original/steering.md"
   touch "$CASE_DIR/endpoint-live"
+  set +e
   out=$(run_send "$id" "Delivered without following the steering symlink." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "symlinked steering file changed delivery truth: $out"
+  set -e
+  [ "$status" -ne 0 ] || fail "unconfirmed steering incorrectly exited zero: $out"
   [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
   assert_grep 'Delivered without following the steering symlink' "$original/steering-unconfirmed.md" \
     "safe unconfirmed steering was not recorded without following the canonical trail symlink"
@@ -6798,6 +6806,11 @@ if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
   run_isolated_test test_task_tmp_removal_pins_ancestors_during_swap
   run_isolated_test test_task_tmp_partial_removal_fails_closed
   run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = gate-b-send ]; then
+  run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
   exit 0
 fi
 

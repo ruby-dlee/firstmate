@@ -17,9 +17,9 @@
 # working/paused wrappers). It is NOT a pure status-file read: it reuses
 # bin/fm-crew-state.sh, which may make bounded no-mistakes and GitHub PR-state
 # calls, to decide whether a crewmate that just stopped its turn or went stale is
-# working, deliberately paused, or neither. Signal and stale callers keep those
-# reads bounded to the paths that need them; heartbeat readers inspect the fleet
-# only on their backoff cadence.
+# working, deliberately paused, or neither. Callers run it ONLY on no-verb signal
+# handling and first sighting of a stale hash, never on every wake, so the
+# per-wake triage stays cheap.
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
@@ -30,6 +30,8 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
+FM_RUN_LIVENESS_BIN="${FM_RUN_LIVENESS_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-run-liveness.sh}"
+FM_LIVENESS_MAX_PARALLEL_DEFAULT=16
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -213,6 +215,28 @@ status_line_note() {  # <status-line> -> text after the first colon, trimmed
     *) printf '%s' "$1" ;;
   esac
 }
+
+# A blocker can enter the durable open-decision set only when its premise and
+# falsification evidence ride on the same event.
+# Canonical note grammar:
+#   assumption=<premise>; test=<mechanical probe>; result=<observed outcome>
+# This validates carrier structure, not the truth of prose; the supervisor must
+# still inspect the named test before relaying the conclusion.
+status_blocker_has_proof() {  # <status-line>
+  local note
+  [ "$(status_line_verb "$1")" = blocked ] || return 1
+  note=$(status_line_note "$1")
+  printf '%s\n' "$note" | awk '
+    BEGIN { FS = ";[[:space:]]*" }
+    NF != 3 { exit 1 }
+    $1 !~ /^assumption=[^[:space:]].*/ { exit 1 }
+    $2 !~ /^test=[^[:space:]].*/ { exit 1 }
+    $3 !~ /^result=[^[:space:]].*/ { exit 1 }
+    tolower($2) ~ /^test=(untested|none|unknown|not run)([[:space:]]|$)/ { exit 1 }
+    tolower($3) ~ /^result=(untested|none|unknown|not run)([[:space:]]|$)/ { exit 1 }
+  '
+}
+
 _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
   local prefix=${1%%:*} k
   case "$prefix" in
@@ -248,12 +272,6 @@ EOF
 # the file, no globals beyond the optional FM_CLASSIFY_RESOLVE_VERB override. This
 # is the durable open-set the fleet snapshot and any point-in-time consumer must use
 # instead of trusting the last status line.
-status_open_decisions() {  # <status-file>
-  local f=$1
-  [ -f "$f" ] || return 0
-  _fm_status_open_decisions_stream < "$f"
-}
-
 _fm_status_open_decisions_stream() {
   local line verb key note resolve open='' stripped
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
@@ -264,6 +282,9 @@ _fm_status_open_decisions_stream() {
     key=$(_fm_decision_key "$line") || continue
     case "$verb" in
       needs-decision|blocked)
+        if [ "$verb" = blocked ] && ! status_blocker_has_proof "$line"; then
+          continue
+        fi
         note=$(status_line_note "$line")
         open=$(_fm_decision_drop "$open" "$key")
         [ -n "$open" ] && open="${open}"$'\n'
@@ -276,6 +297,12 @@ _fm_status_open_decisions_stream() {
     esac
   done
   printf '%s' "$open"
+}
+
+status_open_decisions() {  # <status-file>
+  local f=$1
+  [ -f "$f" ] || return 0
+  _fm_status_open_decisions_stream < "$f"
 }
 
 # Resolve a task id from each metadata file's last window=, terminal=, or managed
@@ -317,10 +344,7 @@ signal_reason_is_actionable() {  # <file> ...
   return 1
 }
 
-# Resolve the status file backing <id>, from the consumer's state dir, using the same
-# STATE/FM_STATE_OVERRIDE resolution window_to_task already relies on. Prints nothing
-# when no state dir is known or the file is absent - which the pause gate below treats
-# as "this pause cannot be proven", never as "no decisions are open".
+# Resolve and atomically inspect the durable status stream behind one task.
 _fm_status_file_for() {  # <id>
   local id=$1 state=${STATE:-${FM_STATE_OVERRIDE:-}}
   [ -n "$id" ] && [ -n "$state" ] || return 0
@@ -328,23 +352,16 @@ _fm_status_file_for() {  # <id>
   printf '%s/%s.status' "$state" "$id"
 }
 
-# 0 if <id> carries a DECLARED external wait that is safe to absorb on the pause
-# cadence. Two independent proofs are required, and BOTH come from the crewmate's own
-# durable status stream rather than from anything about its terminal:
-#
-#   1. the stream's current line declares a pause (status_is_paused), which already
-#      rejects a FAILURE reported under the pause verb (status_pause_is_failure), and
-#   2. the keyed open/resolved fold (status_open_decisions) is empty, so no question
-#      is still unanswered underneath that pause.
-#
-# (2) is the safety boundary and is not redundant with (1): the status stream is an
-# append-only EVENT log, so a later `paused:` line MASKS an earlier still-open
-# needs-decision from any last-line read. A lane with an unanswered question must
-# never go quiet, so the fold - not the last line - decides.
-#
-# Fails closed in both directions. An id with no locatable status file cannot be
-# proven either way, so it is refused rather than absorbed: absence of a signal is
-# never evidence of a pause.
+_fm_status_file_sig() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%z:%Fm' "$1" 2>/dev/null
+  else
+    stat -c '%s:%Y' "$1" 2>/dev/null
+  fi
+}
+
+# A pause is absorbable only when the current durable event is a non-failure
+# pause and the keyed open/resolved fold contains no unanswered decision.
 crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
   local id=$1 declared=${2:-} f snapshot current before after
   f=$(_fm_status_file_for "$id")
@@ -360,55 +377,6 @@ crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
   [ -n "$after" ] && [ "$before" = "$after" ]
 }
 
-_fm_status_file_sig() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f '%z:%Fm' "$1" 2>/dev/null
-  else
-    stat -c '%s:%Y' "$1" 2>/dev/null
-  fi
-}
-
-# Classify WHY an idle/stale crewmate MIGHT be safely absorbed instead of surfaced.
-# Prints exactly one token:
-#   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
-#             pane; the crewmate is legitimately mid-work on a static-looking pane
-#             (e.g. waiting on CI);
-#   paused  - the crewmate declared an external wait and nothing is outstanding
-#             (crew_declared_pause_absorbable), so its pane is EXPECTED to idle;
-#   none    - neither, so the wake must surface.
-#
-# PRECEDENCE, and why it is this way round. bin/fm-crew-state.sh's authoritative
-# verdict ("state: <s> · source: <src> · <detail>") answers "what is the PIPELINE
-# doing"; a declared pause answers "what is the WORK doing". Only one of those can
-# overrule the other, and active work is the one that does: a crewmate that appended
-# `paused:` and then STARTED a run has superseded its own declaration, so a `working`
-# run-step or busy pane still wins. Every OTHER verdict yields to a proven pause.
-#
-# That last sentence is the 2026-08-03 fix. This used to admit a pause only against a
-# `done` run-step (the narrower #53 carve-out), which made the pipeline verdict the
-# discriminator for a signal that is not about the pipeline at all:
-#   - `parked` vetoed it, so a lane whose recycled worktree had been re-checked-out
-#     onto another lane's branch inherited that foreign run's parked gate and
-#     wedge-escalated eight times in a row against an explicit, resolved pause;
-#   - `failed` vetoed it, though fm-crew-state.sh maps a routinely CANCELLED run here
-#     too, so ordinary teardown-cancelled runs silenced legitimate pauses; and
-#   - `unknown` vetoed it, so a pause whose pane was GONE - the case with the least
-#     reason to suspect a wedge - surfaced as one.
-# Absorption never consulted pane liveness in any branch; the pipeline verdict was
-# always the discriminator. Safety does not rest on those vetoes: it rests on the two
-# proofs in crew_declared_pause_absorbable (a non-failure pause verb, and an empty
-# open-decision fold) and on the caller's bounded FM_PAUSE_RESURFACE_SECS recheck,
-# which re-surfaces an absorbed pause once per window so one cannot rot invisibly.
-#
-# One fm-crew-state.sh read serves both absorb reasons at once. The optional second
-# argument lets stale-pane triage pass the status line it already read; omitted, the
-# pause is read from the durable stream, so no call site can accidentally decide a
-# pause case without the pause.
-# NOT a pure local read: fm-crew-state.sh may make bounded no-mistakes and GitHub
-# PR-state calls, so signal and stale callers run it only on no-verb signal and
-# first-sighting stale paths. Heartbeat callers use it only on their backoff
-# cadence.
-# FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_state_line() {  # <id>
   local line
   [ -n "$1" ] || return 0
@@ -416,11 +384,8 @@ crew_state_line() {  # <id>
   printf '%s\n' "$line" | head -1
 }
 
-# Parse the optional presence-only liveness observation from a current-state
-# line. This boundary has exactly three verdicts: alive, dead, and unknown.
-# An unrecognized value in an explicit liveness field is malformed evidence, so
-# it becomes unknown; a line with no liveness field remains empty for backward
-# compatibility and keeps its previous classification.
+# Parse process-derived liveness detail for diagnostics only. A historical
+# `dead` field is downgraded to UNKNOWN because absence can never prove death.
 crew_state_liveness_verdict() {  # <current-state-line>
   local rest=$1 field value label sep=' · '
   while :; do
@@ -435,12 +400,8 @@ crew_state_liveness_verdict() {  # <current-state-line>
     if [ "$label" = liveness ]; then
       case "$field" in
         liveness:\ *)
-          value=${field#liveness: }
-          value=${value%% *}
-          case "$value" in
-            alive|dead|unknown) printf '%s' "$value" ;;
-            *) printf 'unknown' ;;
-          esac
+          value=${field#liveness: }; value=${value%% *}
+          case "$value" in alive) printf 'alive' ;; dead|unknown|*) printf 'unknown' ;; esac
           ;;
         *) printf 'unknown' ;;
       esac
@@ -450,9 +411,6 @@ crew_state_liveness_verdict() {  # <current-state-line>
   done
 }
 
-# Print task, verdict, and current-state line for each ship carrying a liveness
-# observation. Callers explicitly decide alive/dead/unknown actionability; a
-# line with no observation is omitted so its existing behavior is unchanged.
 scan_crew_liveness_observations() {  # <state-dir>
   local state=$1 meta task kind line verdict
   for meta in "$state"/*.meta; do
@@ -468,8 +426,12 @@ scan_crew_liveness_observations() {  # <state-dir>
   done
 }
 
-crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src liveness
+# A run's `working` field selects the exact process window but never proves life.
+# BUSY requires any affirmative run-owned process sample; every absence or read
+# failure is UNKNOWN. A busy pane is already affirmative evidence. A proven
+# durable pause applies only after no active run/pane evidence was established.
+crew_absorb_observation() {  # <id> [declared-pause-status-line]
+  local id=$1 declared_pause=${2:-} line state src run_rc
   [ -n "$id" ] || { printf 'none'; return; }
   line=$(crew_state_line "$id")
   case "$line" in
@@ -477,15 +439,20 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
       state=${line#state: }; state=${state%% *}
       src=${line#*source: }; src=${src%% *}
       if [ "$state" = working ]; then
-        liveness=$(crew_state_liveness_verdict "$line")
-        case "$src:$liveness" in
-          run-step:alive|run-step:|pane:alive|pane:) printf 'working'; return ;;
+        case "$src" in
+          run-step)
+            "$FM_RUN_LIVENESS_BIN" "$id" >/dev/null 2>&1
+            run_rc=$?
+            case "$run_rc" in
+              0) printf 'working'; return ;;
+              *) printf 'unknown'; return ;;
+            esac
+            ;;
+          pane) printf 'working'; return ;;
         esac
       fi
       ;;
   esac
-  # An unreadable verdict falls through here too: it is not evidence against a pause
-  # the crewmate durably declared, and it is exactly what a torn-down pane produces.
   if crew_declared_pause_absorbable "$id" "$declared_pause"; then
     printf 'paused'
     return
@@ -493,35 +460,72 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
   printf 'none'
 }
 
+crew_absorb_class_from_observation() {  # <observation> [declared-pause-status-line]
+  case "$1" in working|unknown|paused|none) printf '%s' "$1" ;; *) printf 'unknown' ;; esac
+}
+
+crew_absorb_class() {  # <id> [declared-pause-status-line]
+  crew_absorb_observation "$1" "${2:-}"
+}
+
+crew_absorb_observations_bounded() {  # <state-dir> <id> ...
+  local state=$1 max_parallel batch_dir id pid rc=0 i=0 observation
+  local -a ids=()
+  local -a pids=()
+  shift
+  max_parallel=${FM_LIVENESS_MAX_PARALLEL:-${FM_SIGNAL_LIVENESS_MAX_PARALLEL:-$FM_LIVENESS_MAX_PARALLEL_DEFAULT}}
+  case "$max_parallel" in ''|*[!0-9]*|0) return 1 ;; esac
+  [ "$#" -gt 0 ] && [ "$#" -le "$max_parallel" ] || return 1
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  batch_dir=$(mktemp -d "$state/.classify-batch.XXXXXX") || return 1
+  for id in "$@"; do
+    ids+=("$id")
+    crew_absorb_observation "$id" > "$batch_dir/$i" &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  i=0
+  for id in "${ids[@]}"; do
+    observation=$(cat "$batch_dir/$i" 2>/dev/null || true)
+    case "$observation" in working|unknown|paused|none) ;; *) observation=unknown; rc=1 ;; esac
+    printf '%s\t%s\n' "$id" "$observation"
+    i=$((i + 1))
+  done
+  rm -f "$batch_dir"/*
+  rmdir "$batch_dir"
+  return "$rc"
+}
+
+crew_absorb_observation_from_batch() {  # <batch-output> <id>
+  local batch=$1 wanted=$2 id observation
+  while IFS="$(printf '\t')" read -r id observation; do
+    [ "$id" = "$wanted" ] || continue
+    printf '%s' "$observation"
+    return 0
+  done <<EOF
+$batch
+EOF
+  printf 'unknown'
+  return 1
+}
+
 # 0 if crewmate <id> shows POSITIVE evidence it is still working (crew_absorb_class
 # reports `working`). This is the "provably working" predicate at the heart of
 # absorb-only-when-provably-working: a no-verb turn-end or stale wake is absorbed
 # ONLY when this returns 0, and SURFACED otherwise (the crewmate may be done, waiting
-# on a decision, or wedged). For stale panes it is checked before trusting the
+# on a decision, or has unknown liveness). For stale panes it is checked before trusting the
 # status log so a pre-validation captain-relevant line does not override an active
-# run. See crew_absorb_class for the exact working/paused/none decision.
+# run. See crew_absorb_class for the exact working/unknown/paused/none decision.
 crew_is_provably_working() {  # <id>
-  # This predicate needs only prove-or-surface; `none` deliberately groups dead
-  # and unknown on the surface side because neither is positive working evidence.
-  case "$(crew_absorb_class "$1")" in
-    working) return 0 ;;
-    paused|none) return 1 ;;
-    *) return 1 ;;
-  esac
+  [ "$(crew_absorb_class "$1")" = working ]
 }
 
-# 0 if crewmate <id> is in a declared external-wait pause with nothing outstanding.
+# 0 if crewmate <id>'s authoritative current state is a declared external-wait pause.
 # The stale path absorbs such a crewmate (on a long re-surface cadence) instead of
-# escalating a possible wedge. See crew_absorb_class for the precedence and
-# crew_declared_pause_absorbable for the two proofs a pause must satisfy.
+# escalating a possible wedge.
 crew_is_paused() {  # <id>
-  # This predicate needs only pause-or-not; dead and unknown arrive as `none`
-  # and stay distinct from the one absorbable paused outcome.
-  case "$(crew_absorb_class "$1")" in
-    paused) return 0 ;;
-    working|none) return 1 ;;
-    *) return 1 ;;
-  esac
+  [ "$(crew_absorb_class "$1")" = paused ]
 }
 
 # 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
@@ -530,7 +534,8 @@ crew_is_paused() {  # <id>
 # task ids by stripping the .status / .turn-ended suffix; a no-verb wake with nothing
 # provably working must surface, so an empty/unresolvable list returns 1.
 signal_crew_provably_working() {  # <file> ...
-  local f base task seen="" class
+  local f base task seen="" state file_state batch observation rc=0
+  local -a tasks=()
   for f in "$@"; do
     base=${f##*/}
     case "$base" in
@@ -541,17 +546,20 @@ signal_crew_provably_working() {  # <file> ...
     [ -n "$task" ] || continue
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
-    class=$(crew_absorb_class "$task")
-    # A signal needs only absorb-or-surface; `none` includes dead and unknown,
-    # both of which must surface rather than be treated as assume-fine.
-    case "$class" in
-      working) ;;
-      paused|none) return 1 ;;
-      *) return 1 ;;
-    esac
+    tasks+=("$task")
+    case "$f" in */*) file_state=${f%/*} ;; *) file_state=. ;; esac
+    if [ -n "${state:-}" ] && [ "$state" != "$file_state" ]; then
+      return 1
+    fi
+    state=$file_state
   done
-  [ -n "$seen" ] || return 1
-  return 0
+  [ "${#tasks[@]}" -gt 0 ] || return 1
+  batch=$(crew_absorb_observations_bounded "$state" "${tasks[@]}") || return 1
+  for task in "${tasks[@]}"; do
+    observation=$(crew_absorb_observation_from_batch "$batch" "$task") || rc=1
+    [ "$(crew_absorb_class_from_observation "$observation")" = working ] || rc=1
+  done
+  return "$rc"
 }
 
 # 0 (terminal/actionable) if a stale window's last status line is

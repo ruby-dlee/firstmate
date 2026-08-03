@@ -94,7 +94,7 @@ make_task() {  # <id> <mode>
   printf 'done: PR checks green\n' > "$HOME_DIR/state/$id.status"
 }
 
-test_merged_task_cancels_exact_run_then_tears_down() {
+test_merged_task_retains_active_exact_run_then_reaps_terminal_run() {
   local out rc
   reset_logs
   make_task merged-run no-mistakes
@@ -105,11 +105,27 @@ test_merged_task_cancels_exact_run_then_tears_down() {
     '  status: running')
   export FM_FAKE_NM_STATUS
   out=$("$AUTO_REAP" task merged-run pr-merged 2>&1); rc=$?
-  expect_code 0 "$rc" "merged task auto-reap"
-  assert_contains "$out" "auto-reaped merged-run" "merged task reports reaping"
-  assert_contains "$(cat "$FM_FAKE_NM_LOG")" "axi abort --run 01EXACT" "exact no-mistakes run canceled"
-  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "merged-run" "ordinary teardown invoked"
-  pass "ordinary attached ship branch cancels its exact no-mistakes run before teardown"
+  expect_code 1 "$rc" "active exact run auto-reap refusal"
+  assert_contains "$out" "automatic cancellation is forbidden" "active run refusal names the custody boundary"
+  [ ! -s "$FM_FAKE_NM_LOG" ] || fail "active exact run was cancelled"
+  assert_no_grep 'axi abort' "$AUTO_REAP" \
+    "production auto-reap still contains a cancellation route without pushed-head custody"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "active exact run reached teardown"
+  [ -f "$HOME_DIR/state/merged-run.meta" ] || fail "active exact run lost task metadata"
+
+  FM_FAKE_NM_STATUS=$(printf '%s\n' \
+    'run:' \
+    '  id: "01EXACT"' \
+    '  branch: fm/merged-run' \
+    '  status: completed' \
+    'outcome: passed')
+  export FM_FAKE_NM_STATUS
+  out=$("$AUTO_REAP" task merged-run pr-merged 2>&1); rc=$?
+  expect_code 0 "$rc" "terminal exact run auto-reap"
+  assert_contains "$out" "auto-reaped merged-run" "terminal run reports reaping"
+  [ ! -s "$FM_FAKE_NM_LOG" ] || fail "terminal exact run invoked abort"
+  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "merged-run" "ordinary teardown was not invoked"
+  pass "auto-reap never cancels active runs and reaps only an exact terminal run"
 }
 
 test_open_pr_refuses_without_teardown() {
@@ -140,7 +156,7 @@ test_cross_branch_active_run_refuses_without_guessing_id() {
   export FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
   out=$("$AUTO_REAP" task cross-run pr-merged 2>&1); rc=$?
   expect_code 1 "$rc" "cross-branch active run refusal"
-  assert_contains "$out" "exact run ID is unavailable" "cross-branch refusal reason"
+  assert_contains "$out" "no exact run ID plus task-branch record" "cross-branch refusal reason"
   [ ! -s "$FM_FAKE_NM_LOG" ] || fail "cross-branch run was aborted by guess"
   [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "cross-branch task invoked teardown"
   rm -f "$HOME_DIR/state/cross-run.meta" "$HOME_DIR/state/cross-run.status"
@@ -625,7 +641,7 @@ test_local_merge_immediately_auto_reaps() {
   pass "approved local merge immediately invokes automatic teardown"
 }
 
-test_merged_task_cancels_exact_run_then_tears_down
+test_merged_task_retains_active_exact_run_then_reaps_terminal_run
 test_open_pr_refuses_without_teardown
 test_cross_branch_active_run_refuses_without_guessing_id
 test_detached_scout_skips_run_attribution_but_surfaces_teardown_refusal

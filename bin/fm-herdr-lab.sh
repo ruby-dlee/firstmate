@@ -125,7 +125,7 @@ fm_herdr_lab_fleet_state() { # <session>
       walk(if type == "object" then
         del(.agent_status, .status, .state, .activity, .last_activity,
             .last_activity_at, .updated_at, .focused, .is_focused,
-            .active, .selected)
+            .active, .selected, .revision, .scroll)
       else . end);
     def required_array($payload; $key):
       if ($payload.result[$key] | type) == "array"
@@ -310,6 +310,24 @@ fm_herdr_lab_provision_timeout() {
   printf '%s\n' "$timeout"
 }
 
+fm_herdr_lab_launch_server() { # <session>
+  HERDR_SESSION="$1" python3 - "$1" <<'PY'
+import os
+import subprocess
+import sys
+
+process = subprocess.Popen(
+    ["herdr", "server", "--session", sys.argv[1]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env=os.environ.copy(),
+    start_new_session=True,
+)
+print(process.pid)
+PY
+}
+
 fm_herdr_lab_cancel_provision() { # <pid>
   local pid=$1 attempt=0 descendants targets target any_live
   descendants=$(fm_herdr_lab_descendants "$pid") || descendants=
@@ -362,8 +380,8 @@ fm_herdr_lab_provision() { # <session>
   fm_herdr_lab_require_default_running "$name" provision || return 1
   timeout=$(fm_herdr_lab_provision_timeout) || return 1
   max_attempts=$((timeout * 5))
-  fm_herdr_lab_raw "$name" server >/dev/null 2>&1 &
-  server_pid=$!
+  server_pid=$(fm_herdr_lab_launch_server "$name") || return 1
+  [[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || return 1
   attempt=0
   while [ "$attempt" -lt "$max_attempts" ]; do
     running=$(fm_herdr_lab_cli "$name" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null) || running=false
@@ -497,6 +515,10 @@ fm_herdr_lab_name() { # <label>
   local label=${1:-lab}
   label=$(printf '%s' "$label" | tr -cd 'a-zA-Z0-9_-' | sed 's/^[^a-zA-Z0-9]*//; s/-*$//')
   [ -n "$label" ] || label=lab
+  # Herdr nests the name below sessions/<name>/herdr.sock. Keep the readable
+  # component bounded so macOS's 104-byte Unix-socket path limit is not spent
+  # by a long test filename; PID plus RANDOM retain per-run uniqueness.
+  label=${label:0:24}
   printf 'fm-lab-%s-%s-%s\n' "$label" "$$" "$RANDOM"
 }
 

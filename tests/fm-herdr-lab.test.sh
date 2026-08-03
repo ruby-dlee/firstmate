@@ -42,6 +42,7 @@ done
 [ -n "$session" ] || { echo "fake herdr: missing --session" >&2; exit 90; }
 default_socket=$(cat "$state/default-socket")
 default_running=${FM_FAKE_HERDR_DEFAULT_RUNNING:-true}
+default_activity=$(cat "$state/default-activity" 2>/dev/null || printf '0\n')
 lab_state=absent
 [ ! -f "$state/$session" ] || lab_state=$(cat "$state/$session")
 
@@ -65,7 +66,8 @@ case "$1 ${2:-}" in
     printf '%s\n' '{"result":{"tabs":[{"workspace_id":"w1","tab_id":"t1","label":"fleet"}]}}'
     ;;
   "pane list")
-    jq -Rsc '{result:{panes:(split("\n")[:-1] | map({workspace_id:"w1",tab_id:"t1",pane_id:.}))}}' \
+    jq -Rsc --argjson activity "$default_activity" \
+      '{result:{panes:(split("\n")[:-1] | map({workspace_id:"w1",tab_id:"t1",pane_id:.,revision:$activity,scroll:{max_offset_from_bottom:$activity}}))}}' \
       "$state/default-agents"
     ;;
   "agent list")
@@ -118,13 +120,19 @@ run_with_fake() {
 }
 
 test_refuses_unsafe_names() {
-  local status=0
+  local status=0 generated
   fm_herdr_lab_validate_name default >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "literal default must be refused"
   status=0
   fm_herdr_lab_validate_name arbitrary-session >/dev/null 2>&1 || status=$?
   expect_code 1 "$status" "non-lab prefix must be refused"
   fm_herdr_lab_validate_name fm-lab-safe-123 || fail "valid lab session name was refused"
+  generated=$(fm_herdr_lab_name suite-fm-backend-herdr-respawn-idem-e2e)
+  [ "${#generated}" -le 43 ] || fail "generated lab name can exceed its Unix-socket-safe bound: $generated"
+  case "$generated" in
+    fm-lab-suite-fm-backend-herdr-r-*) ;;
+    *) fail "generated lab name lost its bounded readable prefix: $generated" ;;
+  esac
   pass "fm-herdr-lab: names fail closed and require the lab prefix"
 }
 
@@ -263,6 +271,17 @@ test_changed_default_fleet_members_trip_after_teardown() {
   pass "fm-herdr-lab: default pane and agent deaths trip the fleet-state guard"
 }
 
+test_default_runtime_activity_does_not_trip() {
+  local name="fm-lab-tripwire-activity-$$"
+  : > "$FAKE_LOG"
+  printf '0\n' > "$FAKE_STATE/default-activity"
+  run_with_fake fm_herdr_lab_provision "$name" || fail "runtime-activity tripwire fixture provision failed"
+  printf '1\n' > "$FAKE_STATE/default-activity"
+  run_with_fake fm_herdr_lab_teardown "$name" || fail "transient default runtime activity tripped teardown"
+  rm -f "$FAKE_STATE/default-activity"
+  pass "fm-herdr-lab: transient default runtime activity does not change fleet identity"
+}
+
 test_stopped_default_refuses_provision() {
   local name="fm-lab-stopped-default-$$" status=0
   : > "$FAKE_LOG"
@@ -371,6 +390,7 @@ test_missing_tripwire_blocks_destruction
 test_agent_argv_inserts_session_before_separator
 test_changed_default_trips_after_teardown
 test_changed_default_fleet_members_trip_after_teardown
+test_default_runtime_activity_does_not_trip
 test_stopped_default_refuses_provision
 test_malformed_default_running_refuses_provision
 test_stopped_default_blocks_destructive_boundaries

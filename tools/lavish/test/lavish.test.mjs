@@ -25,6 +25,7 @@ const REPO_ROOT = resolve(PACKAGE_ROOT, '../..');
 const CLI = join(PACKAGE_ROOT, 'src/cli.mjs');
 const WAKE_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-wake.sh');
 const WAKE_DRAIN = join(REPO_ROOT, 'bin/fm-wake-drain.sh');
+const PROCESS_GROUP_MAX_BUFFER = 16 * 1024 * 1024;
 
 async function exists(path) {
   try {
@@ -59,16 +60,52 @@ async function fixture(name) {
   return { root, home, request, questions };
 }
 
-function processGroupMembers(pgid) {
-  const output = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], {
-    encoding: 'utf8',
-  });
+function processGroupMembers(pgid, { execFile = execFileSync } = {}) {
+  let output;
+  try {
+    output = execFile('ps', ['-g', String(pgid), '-o', 'pid=,command='], {
+      encoding: 'utf8',
+      maxBuffer: PROCESS_GROUP_MAX_BUFFER,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    const stdout = error.stdout?.toString() ?? '';
+    const stderr = error.stderr?.toString() ?? '';
+    if (error.status === 1 && stdout.trim() === '' && stderr.trim() === '') {
+      return [];
+    }
+    const detail = error.code === 'ENOBUFS'
+      ? `ps output exceeded the ${PROCESS_GROUP_MAX_BUFFER}-byte inspection buffer`
+      : stderr.trim() || error.message;
+    throw new Error(`could not inspect process group ${pgid}: ${detail}`, {
+      cause: error,
+    });
+  }
   return output
     .trim()
     .split('\n')
-    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
-    .filter((match) => match !== null && Number(match[2]) === pgid)
-    .map((match) => ({ pid: Number(match[1]), command: match[3] }));
+    .map((line) => line.trim().match(/^(\d+)\s+(.*)$/))
+    .filter((match) => match !== null)
+    .map((match) => ({ pid: Number(match[1]), command: match[2] }));
+}
+
+function assertNoProcessGroupMembers(pgid, processGroupOptions) {
+  const members = processGroupMembers(pgid, processGroupOptions);
+  assert.deepEqual(
+    members,
+    [],
+    `command left processes in group ${pgid}: ${JSON.stringify(members)}`,
+  );
+}
+
+function finishDetachedRun(resolveRun, rejectRun, result, processGroupOptions) {
+  try {
+    assertNoProcessGroupMembers(result.pid, processGroupOptions);
+  } catch (error) {
+    rejectRun(error);
+    return;
+  }
+  resolveRun(result);
 }
 
 async function listeningSockets(pid) {
@@ -134,13 +171,11 @@ function runCli(args, {
     });
     child.on('error', rejectRun);
     child.on('close', (code, signal) => {
-      const members = processGroupMembers(child.pid);
-      assert.deepEqual(
-        members,
-        [],
-        `command left processes in group ${child.pid}: ${JSON.stringify(members)}`,
+      finishDetachedRun(
+        resolveRun,
+        rejectRun,
+        { code, signal, stdout, stderr, pid: child.pid },
       );
-      resolveRun({ code, signal, stdout, stderr, pid: child.pid });
     });
     child.stdin.end(input);
   });
@@ -169,13 +204,11 @@ function runExecutable(executable, args, {
     });
     child.on('error', rejectRun);
     child.on('close', (code, signal) => {
-      const members = processGroupMembers(child.pid);
-      assert.deepEqual(
-        members,
-        [],
-        `command left processes in group ${child.pid}: ${JSON.stringify(members)}`,
+      finishDetachedRun(
+        resolveRun,
+        rejectRun,
+        { code, signal, stdout, stderr, pid: child.pid },
       );
-      resolveRun({ code, signal, stdout, stderr, pid: child.pid });
     });
     child.stdin.end(input);
   });
@@ -217,6 +250,77 @@ async function answer(fx, id, {
     env,
   });
 }
+
+test('process group inspection reports small scoped ps output', () => {
+  const members = processGroupMembers(4242, {
+    execFile: () => '101 first-worker\nmalformed row\n202 second worker\n',
+  });
+  assert.deepEqual(members, [
+    { pid: 101, command: 'first-worker' },
+    { pid: 202, command: 'second worker' },
+  ]);
+});
+
+test('process group inspection reports synthetic output above the old default limit', () => {
+  const oldDefaultMaxBuffer = 1024 * 1024;
+  const rows = Array.from(
+    { length: 20_000 },
+    (_, index) => `${100_000 + index} worker-${index}-${'x'.repeat(48)}`,
+  );
+  const output = `${rows.join('\n')}\n`;
+  assert.ok(Buffer.byteLength(output) > oldDefaultMaxBuffer);
+
+  let invocation;
+  const members = processGroupMembers(4242, {
+    execFile: (file, args, options) => {
+      invocation = { file, args, options };
+      return output;
+    },
+  });
+
+  assert.deepEqual(invocation.args, ['-g', '4242', '-o', 'pid=,command=']);
+  assert.equal(invocation.file, 'ps');
+  assert.equal(invocation.options.maxBuffer, PROCESS_GROUP_MAX_BUFFER);
+  assert.ok(invocation.options.maxBuffer > Buffer.byteLength(output));
+  assert.equal(members.length, rows.length);
+  assert.deepEqual(members[0], {
+    pid: 100_000,
+    command: `worker-0-${'x'.repeat(48)}`,
+  });
+  assert.deepEqual(members.at(-1), {
+    pid: 119_999,
+    command: `worker-19999-${'x'.repeat(48)}`,
+  });
+});
+
+test('process group inspection errors reject the scoped run with attribution', async () => {
+  const enobufs = Object.assign(new Error('spawnSync ps ENOBUFS'), {
+    code: 'ENOBUFS',
+  });
+  await assert.rejects(
+    new Promise((resolveRun, rejectRun) => {
+      finishDetachedRun(
+        resolveRun,
+        rejectRun,
+        { code: 0, signal: null, stdout: '', stderr: '', pid: 4242 },
+        { execFile: () => { throw enobufs; } },
+      );
+    }),
+    /could not inspect process group 4242: ps output exceeded the 16777216-byte inspection buffer/,
+  );
+});
+
+test('process group cleanup still fails for a leaked Lavish process', () => {
+  assert.throws(
+    () => assertNoProcessGroupMembers(4242, {
+      execFile: () => '303 leaked-lavish-worker\n',
+    }),
+    {
+      name: 'AssertionError',
+      message: /command left processes in group 4242.*leaked-lavish-worker/,
+    },
+  );
+});
 
 test('a seven-day-old request remains answerable with no firstmate process', async () => {
   const fx = await fixture('seven-day');

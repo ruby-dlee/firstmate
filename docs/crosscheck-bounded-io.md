@@ -4,7 +4,9 @@ Crosscheck treats every external byte stream, artifact, item collection, and pro
 The shared implementation is `bin/fm_bounded_io.py`.
 
 One absolute deadline covers command execution, output draining, final wait, and cleanup.
-Stdout and stderr share one aggregate byte ceiling, and the command's whole process group is terminated after either failure or a successful leader exit.
+Stdout and stderr share one aggregate byte ceiling, and a retained supervisor anchor owns cleanup after either failure or a successful command exit.
+Linux uses a child subreaper, while macOS combines identity-pinned descendant census with an inherited ownership marker, so changing sessions or process groups does not escape cleanup.
+The anchor is not reaped until ownership cleanup is verified, and an unsupported or unprovable cleanup fails closed.
 Structured artifacts must be stable regular files within a byte ceiling before decoding, and decoded depth, item count, and string bytes are bounded separately.
 Artifact opens are nonblocking and no-follow, and the opened descriptor must remain a regular file with the device and inode observed before opening.
 Review and evidence batches share a deadline and item counter rather than multiplying a per-item timeout by repository-controlled array length.

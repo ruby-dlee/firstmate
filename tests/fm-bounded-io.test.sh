@@ -58,6 +58,118 @@ test_success_reaps_residual_process_group() {
   fi
 }
 
+test_detached_descendant_cannot_escape() {
+  pid_file="$TMP/detached-pid"
+  python3 "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
+    python3 -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True); print(child.pid)' \
+    >"$pid_file"
+  child_pid=$(cat "$pid_file")
+  case "$child_pid" in ''|*[!0-9]*) fail "detached child PID was malformed" ;; esac
+  if kill -0 "$child_pid" 2>/dev/null; then
+    kill "$child_pid" 2>/dev/null || true
+    fail "detached descendant escaped ownership cleanup as $child_pid"
+  fi
+}
+
+test_batch_deadline_remains_absolute() {
+  python3 - "$HELPER" <<'PY'
+import importlib.util
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+budget = module.DeadlineBudget(0.05, 1)
+deadline = budget.bounded_deadline(1, "review command")
+time.sleep(0.06)
+started = time.monotonic()
+try:
+    module.run_bounded(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        timeout_seconds=1,
+        absolute_deadline=deadline,
+        maximum_output_bytes=1024,
+    )
+except module.BoundedTimeout as error:
+    assert "expired before start" in str(error), str(error)
+else:
+    raise AssertionError("expired batch deadline was restarted by the command")
+assert time.monotonic() - started < 0.25
+PY
+}
+
+test_selector_failure_precedes_spawn() {
+  python3 - "$HELPER" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+spawned = []
+
+
+def selector_failure():
+    raise RuntimeError("selector unavailable")
+
+
+def unexpected_spawn(*_args, **_kwargs):
+    spawned.append(True)
+    raise AssertionError("child spawned before selector setup completed")
+
+
+module.selectors.DefaultSelector = selector_failure
+module.subprocess.Popen = unexpected_spawn
+try:
+    module.run_bounded(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        timeout_seconds=1,
+        maximum_output_bytes=1024,
+    )
+except RuntimeError as error:
+    assert str(error) == "selector unavailable", str(error)
+else:
+    raise AssertionError("selector failure was accepted")
+assert not spawned
+PY
+}
+
+test_partial_input_writes_do_not_copy_remainder() {
+  python3 - "$HELPER" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original_write = module.os.write
+observed = []
+
+
+def partial_write(descriptor, value):
+    observed.append(isinstance(value, memoryview))
+    if isinstance(value, memoryview):
+        value = value[: min(3, len(value))]
+    return original_write(descriptor, value)
+
+
+module.os.write = partial_write
+result = module.run_bounded(
+    [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"],
+    timeout_seconds=2,
+    maximum_output_bytes=1024,
+    input_bytes=b"x" * 64,
+)
+assert result.returncode == 0, result.returncode
+assert result.stdout == b"64\n", result.stdout
+assert observed and all(observed), observed
+PY
+}
+
 test_json_artifact_is_bounded_and_regular() {
   artifact="$TMP/verdict.json"
   python3 -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*4096}))' "$artifact"
@@ -169,6 +281,46 @@ test_json_decoded_strings_are_bounded() {
     "decoded-string failure was not loud"
 }
 
+test_hostile_json_failures_are_normalized() {
+  python3 - "$HELPER" "$TMP" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+root = Path(sys.argv[2])
+artifacts = {
+    "deep.json": ("[" * 1500 + "0" + "]" * 1500).encode(),
+    "integer.json": b"1" * 5000,
+    "surrogate.json": b'"\\ud800"',
+}
+for name, value in artifacts.items():
+    path = root / name
+    path.write_bytes(value)
+    try:
+        module.read_bounded_json(path, maximum_bytes=8192)
+    except module.BoundedIOError as error:
+        assert "JSON" in str(error), str(error)
+    else:
+        raise AssertionError(f"hostile JSON escaped normalization: {name}")
+recursive = root / "recursive.json"
+recursive.write_bytes(b"[]")
+original_loads = module.json.loads
+module.json.loads = lambda _value: (_ for _ in ()).throw(RecursionError("nested"))
+try:
+    module.read_bounded_json(recursive, maximum_bytes=8192)
+except module.BoundedIOError as error:
+    assert "malformed" in str(error), str(error)
+else:
+    raise AssertionError("JSON recursion failure escaped normalization")
+finally:
+    module.json.loads = original_loads
+PY
+}
+
 test_batch_item_count_is_bounded() {
   python3 - "$HELPER" <<'PY'
 import importlib.util
@@ -194,9 +346,14 @@ run_case() {
     output-limit) test_output_limit_terminates_noisy_process ;;
     final-wait) test_final_wait_keeps_original_deadline ;;
     residual-group) test_success_reaps_residual_process_group ;;
+    detached-tree) test_detached_descendant_cannot_escape ;;
+    batch-deadline) test_batch_deadline_remains_absolute ;;
+    selector-order) test_selector_failure_precedes_spawn ;;
+    partial-input) test_partial_input_writes_do_not_copy_remainder ;;
     artifact) test_json_artifact_is_bounded_and_regular ;;
     artifact-open-race) test_concurrent_artifact_replacements_are_rejected ;;
     decoded-strings) test_json_decoded_strings_are_bounded ;;
+    hostile-json) test_hostile_json_failures_are_normalized ;;
     batch-items) test_batch_item_count_is_bounded ;;
     *) fail "unknown bounded-I/O test case: $1" ;;
   esac
@@ -205,8 +362,9 @@ run_case() {
 if [ "$#" -gt 0 ]; then
   run_case "$1"
 else
-  for case_name in output-limit final-wait residual-group artifact \
-    artifact-open-race decoded-strings batch-items; do
+  for case_name in output-limit final-wait residual-group detached-tree \
+    batch-deadline selector-order partial-input artifact artifact-open-race \
+    decoded-strings hostile-json batch-items; do
     run_case "$case_name"
   done
 fi

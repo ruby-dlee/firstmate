@@ -32,6 +32,7 @@
 2000	tests/fm-behavior-shards.test.sh
 5222	tests/fm-backlog-handoff.test.sh
 17908	tests/fm-bearings-snapshot.test.sh
+2000	tests/fm-bounded-io.test.sh
 9402	tests/fm-bootstrap.test.sh
 1875	tests/fm-brief.test.sh
 13892	tests/fm-cd-pretool-check.test.sh

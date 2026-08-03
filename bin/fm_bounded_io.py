@@ -3,17 +3,20 @@
 
 The module is importable by Python helpers and also exposes a small CLI for
 empirical checks. One absolute deadline covers process execution, output
-draining, final wait, and process-group cleanup.
+draining, final wait, and anchored ownership cleanup.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import errno
 import json
 import math
 import os
 from pathlib import Path
+import secrets
 import selectors
 import signal
 import stat
@@ -26,6 +29,9 @@ from typing import Any, NoReturn, Sequence
 DEFAULT_CLEANUP_GRACE_SECONDS = 0.25
 DEFAULT_JSON_MAX_DEPTH = 64
 DEFAULT_JSON_MAX_ITEMS = 4096
+INTERNAL_SUPERVISOR_MODE = "--bounded-io-supervisor"
+OWNERSHIP_ENVIRONMENT_KEY = "FM_BOUNDED_IO_OWNERSHIP"
+SUPERVISOR_STATUS_LIMIT = 4096
 
 
 class BoundedIOError(RuntimeError):
@@ -45,7 +51,10 @@ def fail(message: str) -> NoReturn:
 
 
 def positive_number(value: float | int, label: str) -> float:
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        fail(f"{label} must be a positive finite number")
     if not math.isfinite(numeric) or numeric <= 0:
         fail(f"{label} must be a positive finite number")
     return numeric
@@ -90,67 +99,482 @@ class DeadlineBudget:
         if time.monotonic() >= self.deadline:
             fail(f"{label} exceeded the {self.maximum_seconds:g}-second deadline")
 
-    def timeout(self, requested_seconds: float, label: str) -> float:
+    def bounded_deadline(self, requested_seconds: float, label: str) -> float:
         requested = positive_number(requested_seconds, f"{label} timeout")
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
+        now = time.monotonic()
+        if now >= self.deadline:
             fail(f"{label} exceeded the {self.maximum_seconds:g}-second deadline")
-        return min(requested, remaining)
+        return min(self.deadline, now + requested)
 
 
-def _process_group_exists(process_group: int) -> bool:
+def _write_supervisor_status(descriptor: int, code: str, detail: str = "") -> None:
+    safe_detail = detail.replace("\n", " ")[:1024]
+    payload = f"{code}:{safe_detail}\n".encode("utf-8", "backslashreplace")
+    offset = 0
+    while offset < len(payload):
+        try:
+            offset += os.write(descriptor, payload[offset:])
+        except InterruptedError:
+            continue
+        except OSError:
+            return
+
+
+def _linux_enable_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _linux_process_identity(process_id: int) -> tuple[int, int] | None:
     try:
-        os.killpg(process_group, 0)
+        raw = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    closing = raw.rfind(")")
+    if closing < 0:
+        return None
+    fields = raw[closing + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return process_id, int(fields[19])
+    except ValueError:
+        return None
+
+
+def _linux_children(process_id: int) -> list[int]:
+    try:
+        raw = Path(f"/proc/{process_id}/task/{process_id}/children").read_text(
+            encoding="ascii"
+        )
+    except (OSError, UnicodeError):
+        return []
+    try:
+        return [int(value) for value in raw.split()]
+    except ValueError:
+        return []
+
+
+def _linux_owned_processes() -> dict[int, tuple[int, int]]:
+    owned: dict[int, tuple[int, int]] = {}
+    pending = _linux_children(os.getpid())
+    while pending:
+        process_id = pending.pop()
+        if process_id in owned:
+            continue
+        identity = _linux_process_identity(process_id)
+        if identity is None:
+            continue
+        owned[process_id] = identity
+        pending.extend(_linux_children(process_id))
+    return owned
+
+
+class _DarwinBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("xstatus", ctypes.c_uint32),
+        ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32),
+        ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("command", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("nfiles", ctypes.c_uint32),
+        ("pgid", ctypes.c_uint32),
+        ("job_control", ctypes.c_uint32),
+        ("terminal_device", ctypes.c_uint32),
+        ("terminal_pgid", ctypes.c_uint32),
+        ("nice", ctypes.c_int32),
+        ("started_seconds", ctypes.c_uint64),
+        ("started_microseconds", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_table() -> dict[int, tuple[int, int, int, tuple[int, int]]]:
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    list_all = libproc.proc_listallpids
+    list_all.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    list_all.restype = ctypes.c_int
+    pid_info = libproc.proc_pidinfo
+    pid_info.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    pid_info.restype = ctypes.c_int
+    capacity = list_all(None, 0)
+    if capacity < 0 or capacity > 131_072:
+        raise OSError(ctypes.get_errno(), "bounded process inventory is unavailable")
+    processes = (ctypes.c_int * (capacity + 256))()
+    count = list_all(processes, ctypes.sizeof(processes))
+    if count < 0 or count > len(processes):
+        raise OSError(ctypes.get_errno(), "bounded process inventory changed")
+    table: dict[int, tuple[int, int, int, tuple[int, int]]] = {}
+    for process_id in processes[:count]:
+        if process_id <= 0:
+            continue
+        info = _DarwinBsdInfo()
+        copied = pid_info(process_id, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if copied != ctypes.sizeof(info) or info.pid != process_id:
+            continue
+        table[process_id] = (
+            int(info.ppid),
+            int(info.pgid),
+            int(info.uid),
+            (int(info.started_seconds), int(info.started_microseconds)),
+        )
+    return table
+
+
+def _darwin_process_identity(process_id: int) -> tuple[int, int] | None:
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    pid_info = libproc.proc_pidinfo
+    pid_info.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    pid_info.restype = ctypes.c_int
+    info = _DarwinBsdInfo()
+    copied = pid_info(process_id, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if copied != ctypes.sizeof(info) or info.pid != process_id:
+        return None
+    return int(info.started_seconds), int(info.started_microseconds)
+
+
+def _darwin_process_arguments(process_id: int) -> bytes | None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    sysctl = libc.sysctl
+    sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    sysctl.restype = ctypes.c_int
+    query = (ctypes.c_int * 3)(1, 49, process_id)
+    size = ctypes.c_size_t()
+    if sysctl(query, 3, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value <= 0 or size.value > 1_048_576:
+        raise OSError(errno.EOVERFLOW, "bounded process arguments are oversized")
+    buffer = ctypes.create_string_buffer(size.value)
+    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    return buffer.raw[: size.value]
+
+
+def _darwin_owned_processes(
+    command_id: int,
+    token: str,
+    known: dict[int, tuple[int, int]],
+) -> dict[int, tuple[int, int]]:
+    table = _darwin_process_table()
+    owned: dict[int, tuple[int, int]] = {}
+    pending: set[int] = set()
+    for process_id, identity in known.items():
+        current = table.get(process_id)
+        if current is not None and current[3] == identity:
+            pending.add(process_id)
+            owned[process_id] = identity
+    changed = True
+    while changed:
+        changed = False
+        for process_id, (parent_id, _group_id, _uid, identity) in table.items():
+            if process_id in pending or parent_id in pending:
+                if process_id not in pending:
+                    pending.add(process_id)
+                    changed = True
+                owned[process_id] = identity
+    marker = f"{OWNERSHIP_ENVIRONMENT_KEY}={token}\0".encode("ascii")
+    earliest_owned_start = min(known.values(), default=(0, 0))
+    for process_id, (_parent_id, group_id, uid, identity) in table.items():
+        if process_id == os.getpid() or process_id in owned:
+            continue
+        if group_id == os.getpgrp():
+            owned[process_id] = identity
+            continue
+        if uid != os.getuid() or identity < earliest_owned_start:
+            continue
+        arguments = _darwin_process_arguments(process_id)
+        if arguments is not None and marker in arguments:
+            owned[process_id] = identity
+    return owned
+
+
+def _darwin_record_descendants(
+    command_id: int,
+    known: dict[int, tuple[int, int]],
+) -> dict[int, tuple[int, int]]:
+    table = _darwin_process_table()
+    owned: dict[int, tuple[int, int]] = {}
+    pending: set[int] = set()
+    command = table.get(command_id)
+    if command is not None:
+        pending.add(command_id)
+        owned[command_id] = command[3]
+    for process_id, identity in known.items():
+        current = table.get(process_id)
+        if current is not None and current[3] == identity:
+            pending.add(process_id)
+            owned[process_id] = identity
+    changed = True
+    while changed:
+        changed = False
+        for process_id, (parent_id, _group_id, _uid, identity) in table.items():
+            if parent_id in pending and process_id not in pending:
+                pending.add(process_id)
+                owned[process_id] = identity
+                changed = True
+    return owned
+
+
+def _identity_still_matches(process_id: int, identity: tuple[int, int]) -> bool:
+    if sys.platform.startswith("linux"):
+        return _linux_process_identity(process_id) == identity
+    return _darwin_process_identity(process_id) == identity
+
+
+def _signal_owned_processes(
+    owned: dict[int, tuple[int, int]], signal_number: int
+) -> None:
+    for process_id, identity in owned.items():
+        if not _identity_still_matches(process_id, identity):
+            continue
+        try:
+            os.kill(process_id, signal_number)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            raise BoundedIOError(
+                f"owned process {process_id} could not be signaled"
+            ) from exc
+
+
+def _reap_supervisor_children(
+    command_id: int, command_status: int | None
+) -> int | None:
+    while True:
+        try:
+            waited, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return command_status
+        except InterruptedError:
+            continue
+        if waited == 0:
+            return command_status
+        if waited == command_id:
+            command_status = os.waitstatus_to_exitcode(status)
+
+
+def _supervisor_owned_processes(
+    command_id: int,
+    token: str,
+    known: dict[int, tuple[int, int]],
+) -> dict[int, tuple[int, int]]:
+    if sys.platform.startswith("linux"):
+        return _linux_owned_processes()
+    return _darwin_owned_processes(command_id, token, known)
+
+
+def _supervisor_cleanup(
+    command_id: int,
+    token: str,
+    deadline: float,
+    grace: float,
+    command_status: int | None,
+    initial_known: dict[int, tuple[int, int]],
+) -> tuple[int | None, bool, str]:
+    known = dict(initial_known)
+    term_deadline = min(deadline, time.monotonic() + grace)
+    signal_number = signal.SIGTERM
+    while True:
+        command_status = _reap_supervisor_children(command_id, command_status)
+        try:
+            owned = _supervisor_owned_processes(command_id, token, known)
+        except OSError as exc:
+            return command_status, False, f"owned-process inventory failed: {exc}"
+        known.update(owned)
+        if not owned and command_status is not None:
+            return command_status, True, ""
+        now = time.monotonic()
+        if now >= deadline:
+            remaining = ",".join(str(value) for value in sorted(owned)) or "unknown"
+            return command_status, False, f"owned processes remain: {remaining}"
+        if now >= term_deadline:
+            signal_number = signal.SIGKILL
+        try:
+            _signal_owned_processes(owned, signal_number)
+        except BoundedIOError as exc:
+            return command_status, False, str(exc)
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
+
+def _run_supervisor(arguments: Sequence[str]) -> int:
+    if len(arguments) < 5 or arguments[3] != "--":
+        return 126
+    try:
+        status_descriptor = int(arguments[0])
+        deadline = float(arguments[1])
+        grace = float(arguments[2])
+    except ValueError:
+        return 126
+    command_arguments = list(arguments[4:])
+    abort_requested = False
+
+    def request_abort(_signal_number: int, _frame: Any) -> None:
+        nonlocal abort_requested
+        abort_requested = True
+
+    for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signal_number, request_abort)
+    if sys.platform.startswith("linux"):
+        try:
+            _linux_enable_subreaper()
+        except OSError as exc:
+            _write_supervisor_status(status_descriptor, "E", f"subreaper setup: {exc}")
+            _write_supervisor_status(status_descriptor, "C")
+            return 126
+    elif sys.platform != "darwin":
+        _write_supervisor_status(
+            status_descriptor, "E", "process ownership is unsupported on this platform"
+        )
+        _write_supervisor_status(status_descriptor, "C")
+        return 126
+    token = secrets.token_hex(24)
+    command_environment = dict(os.environ)
+    command_environment[OWNERSHIP_ENVIRONMENT_KEY] = token
+    try:
+        command = subprocess.Popen(command_arguments, env=command_environment)
+    except FileNotFoundError:
+        _write_supervisor_status(
+            status_descriptor, "E", f"bounded command is unavailable: {command_arguments[0]}"
+        )
+        _write_supervisor_status(status_descriptor, "C")
+        return 126
+    except OSError as exc:
+        _write_supervisor_status(
+            status_descriptor, "E", f"bounded command could not start: {exc}"
+        )
+        _write_supervisor_status(status_descriptor, "C")
+        return 126
+    if sys.platform.startswith("linux"):
+        command_identity = _linux_process_identity(command.pid)
+    else:
+        command_identity = _darwin_process_identity(command.pid)
+    initial_known = (
+        {command.pid: command_identity} if command_identity is not None else {}
+    )
+    command_status: int | None = None
+    next_inventory = time.monotonic()
+    while not abort_requested and command_status is None:
+        if sys.platform == "darwin" and time.monotonic() >= next_inventory:
+            try:
+                initial_known.update(
+                    _darwin_record_descendants(command.pid, initial_known)
+                )
+            except OSError as exc:
+                _write_supervisor_status(
+                    status_descriptor, "U", f"owned-process inventory failed: {exc}"
+                )
+                abort_requested = True
+                break
+            next_inventory = time.monotonic() + 0.02
+        command_status = _reap_supervisor_children(command.pid, command_status)
+        if command_status is None:
+            time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
+            abort_requested = True
+    command_status, verified, detail = _supervisor_cleanup(
+        command.pid,
+        token,
+        deadline,
+        grace,
+        command_status,
+        initial_known,
+    )
+    if command_status is not None:
+        _write_supervisor_status(status_descriptor, "X", str(command_status))
+    if verified:
+        _write_supervisor_status(status_descriptor, "C")
+        return 0
+    _write_supervisor_status(status_descriptor, "U", detail)
+    return 126
+
+
+def _consume_supervisor_status(
+    buffer: bytearray,
+    state: dict[str, Any],
+) -> None:
+    while b"\n" in buffer:
+        raw, remainder = buffer.split(b"\n", 1)
+        buffer[:] = remainder
+        code, separator, detail = raw.partition(b":")
+        decoded = detail.decode("utf-8", "replace") if separator else ""
+        if code == b"X":
+            try:
+                state["returncode"] = int(decoded)
+            except ValueError:
+                state["error"] = "supervisor returned a malformed command status"
+        elif code == b"C":
+            state["cleanup_verified"] = True
+        elif code == b"E":
+            state["error"] = decoded or "bounded command supervisor failed"
+        elif code == b"U":
+            state["cleanup_error"] = decoded or "owned-process cleanup was unverified"
+        else:
+            state["error"] = "bounded command supervisor returned an unknown status"
+
+
+def _anchor_group_is_owned(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        return os.getpgid(process.pid) == process.pid
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
-    return True
 
 
-def _wait_for_group_exit(process_group: int, deadline: float) -> bool:
-    while time.monotonic() < deadline:
-        if not _process_group_exists(process_group):
-            return True
-        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-    return not _process_group_exists(process_group)
+def _request_anchor_abort(process: subprocess.Popen[bytes]) -> None:
+    if not _anchor_group_is_owned(process):
+        return
+    try:
+        os.kill(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
 
 
-def _wait_for_process(process: subprocess.Popen[bytes], deadline: float) -> bool:
+def _reap_anchor(process: subprocess.Popen[bytes], deadline: float) -> bool:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return process.poll() is not None
+        return False
     try:
         process.wait(timeout=remaining)
         return True
     except subprocess.TimeoutExpired:
         return False
-
-
-def _terminate_group(
-    process: subprocess.Popen[bytes],
-    deadline: float,
-    cleanup_grace_seconds: float,
-) -> None:
-    process_group = process.pid
-    grace = positive_number(cleanup_grace_seconds, "cleanup grace seconds")
-    if _process_group_exists(process_group):
-        try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        term_deadline = min(deadline, time.monotonic() + grace)
-        _wait_for_group_exit(process_group, term_deadline)
-    if _process_group_exists(process_group):
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    _wait_for_process(process, deadline)
-    if _process_group_exists(process_group):
-        _wait_for_group_exit(process_group, deadline)
-    if process.poll() is None or _process_group_exists(process_group):
-        fail(f"process-group cleanup could not be verified for group {process_group}")
 
 
 def run_bounded(
@@ -162,6 +586,7 @@ def run_bounded(
     env: dict[str, str] | None = None,
     input_bytes: bytes | None = None,
     cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
+    absolute_deadline: float | None = None,
 ) -> CommandResult:
     """Run one command with aggregate output, time, and process-tree bounds."""
 
@@ -169,38 +594,79 @@ def run_bounded(
         fail("bounded command arguments must be nonempty strings")
     timeout = positive_number(timeout_seconds, "timeout seconds")
     output_limit = positive_integer(maximum_output_bytes, "maximum output bytes")
+    started = time.monotonic()
+    deadline = started + timeout
+    if absolute_deadline is not None:
+        deadline = min(
+            deadline,
+            positive_number(absolute_deadline, "absolute deadline"),
+        )
+    available = deadline - started
+    if available <= 0:
+        raise BoundedTimeout("bounded command deadline expired before start")
     cleanup_grace = min(
         positive_number(cleanup_grace_seconds, "cleanup grace seconds"),
-        timeout / 10,
+        available / 2,
     )
-    deadline = time.monotonic() + timeout
     command_deadline = deadline - cleanup_grace
+    selector = selectors.DefaultSelector()
+    status_read, status_write = os.pipe()
+    os.set_blocking(status_read, False)
+    supervisor_arguments = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        INTERNAL_SUPERVISOR_MODE,
+        str(status_write),
+        repr(deadline),
+        repr(cleanup_grace),
+        "--",
+        *arguments,
+    ]
     try:
         process = subprocess.Popen(
-            list(arguments),
+            supervisor_arguments,
             cwd=cwd,
             env=env,
             stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=(status_write,),
         )
-    except FileNotFoundError as exc:
-        fail(f"bounded command is unavailable: {arguments[0]}")
+    except FileNotFoundError:
+        selector.close()
+        os.close(status_read)
+        os.close(status_write)
+        fail(f"bounded supervisor is unavailable: {sys.executable}")
     except OSError as exc:
-        fail(f"bounded command could not start: {exc}")
+        selector.close()
+        os.close(status_read)
+        os.close(status_write)
+        fail(f"bounded supervisor could not start: {exc}")
 
-    selector = selectors.DefaultSelector()
-    streams = {"stdout": process.stdout, "stderr": process.stderr}
     output = {"stdout": bytearray(), "stderr": bytearray()}
+    status_buffer = bytearray()
+    state: dict[str, Any] = {
+        "returncode": None,
+        "cleanup_verified": False,
+        "cleanup_error": None,
+        "error": None,
+    }
     captured = 0
     input_offset = 0
+    input_view = memoryview(input_bytes) if input_bytes else None
+    primary_error: BaseException | None = None
+    result: CommandResult | None = None
     try:
+        os.close(status_write)
+        status_write = -1
+        streams = {"stdout": process.stdout, "stderr": process.stderr}
         for label, stream in streams.items():
             if stream is None:
                 fail(f"bounded command {label} pipe is unavailable")
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, label)
+        selector.register(status_read, selectors.EVENT_READ, "status")
         if process.stdin is not None:
             if input_bytes:
                 os.set_blocking(process.stdin.fileno(), False)
@@ -208,20 +674,27 @@ def run_bounded(
             else:
                 process.stdin.close()
 
-        while selector.get_map() or process.poll() is None:
-            remaining = command_deadline - time.monotonic()
+        while selector.get_map():
+            active_deadline = (
+                deadline
+                if state["returncode"] is not None
+                or state["cleanup_verified"]
+                or state["cleanup_error"]
+                or state["error"]
+                else command_deadline
+            )
+            remaining = active_deadline - time.monotonic()
             if remaining <= 0:
+                if state["returncode"] is not None:
+                    fail("owned-process cleanup exceeded the absolute deadline")
                 raise BoundedTimeout(
                     f"bounded command timed out after {timeout:g} seconds"
                 )
-            if not selector.get_map():
-                time.sleep(min(0.01, remaining))
-                continue
             for key, _ in selector.select(timeout=min(0.1, remaining)):
                 stream = key.fileobj
                 if key.data == "stdin":
                     try:
-                        written = os.write(stream.fileno(), input_bytes[input_offset:])
+                        written = os.write(stream.fileno(), input_view[input_offset:])
                     except BlockingIOError:
                         continue
                     except BrokenPipeError:
@@ -230,6 +703,21 @@ def run_bounded(
                     if written == 0 or input_offset == len(input_bytes):
                         selector.unregister(stream)
                         stream.close()
+                    continue
+                if key.data == "status":
+                    try:
+                        chunk = os.read(status_read, SUPERVISOR_STATUS_LIMIT + 1)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(status_read)
+                        os.close(status_read)
+                        status_read = -1
+                    else:
+                        status_buffer.extend(chunk)
+                        if len(status_buffer) > SUPERVISOR_STATUS_LIMIT:
+                            fail("bounded command supervisor status is oversized")
+                        _consume_supervisor_status(status_buffer, state)
                     continue
                 try:
                     chunk = os.read(stream.fileno(), min(65_536, output_limit + 1))
@@ -246,26 +734,73 @@ def run_bounded(
                         f"{output_limit}-byte aggregate output limit"
                     )
                 output[key.data].extend(chunk)
-
-        if not _wait_for_process(process, command_deadline):
-            raise BoundedTimeout(
-                f"bounded command timed out after {timeout:g} seconds"
-            )
-        _terminate_group(process, deadline, cleanup_grace)
-        return CommandResult(
+            if state["cleanup_error"]:
+                fail(f"owned-process cleanup could not be verified: {state['cleanup_error']}")
+            if state["error"]:
+                fail(str(state["error"]))
+            if (
+                state["cleanup_verified"]
+                and state["returncode"] is not None
+                and all(label not in ("stdout", "stderr") for label in (
+                    key.data for key in selector.get_map().values()
+                ))
+            ):
+                break
+        if state["returncode"] is None:
+            fail("bounded command supervisor exited without a command status")
+        if not state["cleanup_verified"]:
+            fail("owned-process cleanup could not be verified")
+        result = CommandResult(
             tuple(arguments),
-            int(process.returncode),
+            int(state["returncode"]),
             bytes(output["stdout"]),
             bytes(output["stderr"]),
         )
-    except BaseException:
-        _terminate_group(process, deadline, cleanup_grace)
-        raise
+    except BaseException as exc:
+        primary_error = exc
     finally:
+        if not state["cleanup_verified"]:
+            _request_anchor_abort(process)
+            while time.monotonic() < deadline and not state["cleanup_verified"]:
+                if status_read < 0:
+                    break
+                try:
+                    chunk = os.read(status_read, SUPERVISOR_STATUS_LIMIT + 1)
+                except BlockingIOError:
+                    time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+                    continue
+                if not chunk:
+                    break
+                status_buffer.extend(chunk)
+                if len(status_buffer) > SUPERVISOR_STATUS_LIMIT:
+                    break
+                _consume_supervisor_status(status_buffer, state)
+        anchor_reaped = _reap_anchor(process, deadline)
         selector.close()
+        if status_read >= 0:
+            os.close(status_read)
+        if status_write >= 0:
+            os.close(status_write)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
+        if input_view is not None:
+            input_view.release()
+        cleanup_failure = state["cleanup_error"]
+        if not anchor_reaped or not state["cleanup_verified"]:
+            cleanup_failure = cleanup_failure or (
+                f"cleanup could not be verified for anchored process {process.pid}"
+            )
+        if cleanup_failure:
+            cleanup_error = BoundedIOError(str(cleanup_failure))
+            if primary_error is not None:
+                raise cleanup_error from primary_error
+            raise cleanup_error
+    if primary_error is not None:
+        raise primary_error
+    if result is None:
+        fail("bounded command did not produce a result")
+    return result
 
 
 def _json_budget(
@@ -367,14 +902,22 @@ def read_bounded_json(
         fail(f"bounded JSON artifact changed while reading: {path}")
     try:
         value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _json_budget(
+            value,
+            maximum_depth=maximum_depth,
+            maximum_items=maximum_items,
+            maximum_string_bytes=string_limit,
+        )
+    except BoundedIOError:
+        raise
+    except (
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         fail(f"bounded JSON artifact is malformed at {path}: {exc}")
-    _json_budget(
-        value,
-        maximum_depth=maximum_depth,
-        maximum_items=maximum_items,
-        maximum_string_bytes=string_limit,
-    )
     return value
 
 
@@ -395,6 +938,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == INTERNAL_SUPERVISOR_MODE:
+        return _run_supervisor(sys.argv[2:])
     args = build_parser().parse_args()
     try:
         if args.command == "run":

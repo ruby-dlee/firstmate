@@ -23,12 +23,6 @@ if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
   . "$DAEMON"
 fi
 
-fm_backend_send_steering() {
-  local verdict
-  verdict=$(fm_backend_send_text_submit "$1" "$2" "$3" 3 0 0)
-  [ "$verdict" = empty ]
-}
-
 fm_test_tmproot_into TMP_ROOT fm-daemon-tests
 
 test_afk_start_refuses_when_flag_cannot_be_written() {
@@ -522,44 +516,36 @@ test_housekeeping_orca_persistent_stale_resolves_terminal() {
 }
 
 test_escalate_batches_into_one_digest() {
-  local dir state fakebin sent capture n
+  local dir state output
   dir=$(make_supercase batch)
   state="$dir/state"
-  fakebin="$dir/fakebin"
-  sent="$dir/sent.log"; : > "$sent"
-  capture="$dir/pane.txt"; : > "$capture"
+  output="$dir/reap.out"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+  ( FM_AFK_DELIVERY=reap-wake FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" ) > "$output" \
     || fail "escalate_flush failed"
-  grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
-  grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
+  grep -F "event A" "$output" >/dev/null || fail "batch digest missing event A"
+  grep -F "event B" "$output" >/dev/null || fail "batch digest missing event B"
+  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$output" >/dev/null \
     || fail "batch digest did not join events with literal ' | '"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after flush"
   [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
-  n=$(grep -c '\[ENTER\]' "$sent")
-  [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
-  pass "multiple escalations flush as a single batched digest"
+  pass "multiple escalations flush as one native reap-wake digest"
 }
 
 test_escalate_batch_age_uses_first_append() {
-  local dir state fakebin sent capture
+  local dir state output
   dir=$(make_supercase batch-age)
   state="$dir/state"
-  fakebin="$dir/fakebin"
-  sent="$dir/sent.log"; : > "$sent"
-  capture="$dir/pane.txt"; : > "$capture"
+  output="$dir/reap.out"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   echo $(( $(date +%s) - 100 )) > "$state/.subsuper-escalations.since"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 \
-    housekeeping "$state"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
+  ( FM_AFK_DELIVERY=reap-wake FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 \
+    housekeeping "$state" ) > "$output"
+  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$output" >/dev/null \
     || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
   [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
@@ -1007,29 +993,27 @@ test_submit_ack_reports_pending_on_persistent_swallow() {
   pass "submit-ACK reports pending on a persistently swallowed Enter (type-once)"
 }
 
-test_max_defer_empty_swallow_types_once_and_alarms() {
+test_max_defer_atomic_refusal_alarms_without_typing() {
   local dir state fakebin sent
   dir=$(make_bordered_case maxdefer-stuck)
   state="$dir/state"; fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
   printf '│ > │\n' > "$dir/composer"
-  touch "$dir/.swallow"
   escalate_add "$state" "needs-decision: pick A"
   echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
   afk_enter "$state"
   PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
-    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 \
     FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 housekeeping "$state"
-  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
-    || fail "max-defer typed the digest more than once"
+  [ ! -s "$sent" ] || fail "atomic steering refusal wrote pane input"
   [ -s "$state/.subsuper-inject-wedged" ] \
     || fail "stuck max-defer inject did not raise a wedge alarm marker"
   [ -s "$state/.subsuper-escalations" ] \
     || fail "buffer lost after a failed max-defer inject (must be preserved)"
-  pass "max-defer on an empty stuck pane types once, alarms, and preserves the buffer"
+  pass "max-defer preserves and alarms after production steering refusal"
 }
 
-test_max_defer_flushes_empty_idle_pane() {
+test_max_defer_refusal_preserves_empty_idle_buffer() {
   local dir state fakebin sent
   dir=$(make_bordered_case maxdefer-recover)
   state="$dir/state"; fakebin="$dir/fakebin"
@@ -1041,9 +1025,10 @@ test_max_defer_flushes_empty_idle_pane() {
   PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
     FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
     housekeeping "$state"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a recovered max-defer flush"
-  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge alarm left behind after a successful max-defer flush"
-  pass "max-defer flushes and clears the buffer on an empty bordered pane"
+  [ ! -s "$sent" ] || fail "atomic steering refusal wrote to an empty pane"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer was lost after atomic steering refusal"
+  [ -e "$state/.subsuper-inject-wedged" ] || fail "atomic steering refusal did not raise a wedge alarm"
+  pass "max-defer preserves an empty-pane digest when steering is unavailable"
 }
 
 test_max_defer_pending_composer_alarms_without_typing() {
@@ -1065,7 +1050,7 @@ test_max_defer_pending_composer_alarms_without_typing() {
   pass "max-defer on a pending composer alarms without typing"
 }
 
-test_normal_flush_clears_stale_wedge_marker() {
+test_normal_flush_refusal_preserves_stale_wedge_marker() {
   local dir state fakebin sent
   dir=$(make_bordered_case normal-clears-wedge)
   state="$dir/state"; fakebin="$dir/fakebin"
@@ -1073,12 +1058,14 @@ test_normal_flush_clears_stale_wedge_marker() {
   printf 'old wedge\n' > "$state/.subsuper-inject-wedged"
   escalate_add "$state" "done: PR https://x/y/pull/2"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
-    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
-    || fail "normal escalate_flush failed"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after normal flush"
-  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge marker survived successful normal flush"
-  pass "normal flush clears a stale wedge marker"
+  if PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state"; then
+    fail "normal escalate_flush succeeded without an atomic steering route"
+  fi
+  [ ! -s "$sent" ] || fail "normal refusal wrote pane input"
+  [ -s "$state/.subsuper-escalations" ] || fail "normal refusal dropped the escalation buffer"
+  [ -e "$state/.subsuper-inject-wedged" ] || fail "normal refusal removed the existing wedge marker"
+  pass "normal flush preserves buffered evidence when steering is unavailable"
 }
 
 test_below_max_defer_does_nothing() {
@@ -1627,25 +1614,25 @@ test_inject_msg_herdr_pane_gone_defers() {
   pass "inject_msg: herdr pane-gone check defers before any busy/composer/submit call"
 }
 
-test_inject_msg_herdr_submits_through_backend_dispatch() {
-  local dir state
+test_inject_msg_herdr_refuses_unbound_text_delivery() {
+  local dir state err
   dir=$(make_supercase inject-herdr-submit)
   state="$dir/state"
+  err="$dir/inject.err"
   afk_enter "$state"
   (
     fm_backend_target_exists() { return 0; }
     fm_backend_busy_state() { printf 'idle'; }
     fm_backend_capture() { printf 'idle prompt\n'; }
     fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() {
-      [ "$1" = herdr ] && [ "$2" = "default:w1:p2" ] || fail "unexpected send_text_submit args: $1 $2"
-      case "$3" in *"hello"*) : ;; *) fail "digest text missing from send_text_submit: $3" ;; esac
-      printf 'empty'
-    }
-    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
-      || fail "inject_msg should succeed when send_text_submit confirms empty"
-  ) || fail "herdr successful-submit inject_msg subshell failed"
-  pass "inject_msg: dispatches busy-guard/composer-guard/submit through the herdr backend and succeeds on a confirmed empty composer"
+    fm_backend_send_text_submit() { fail "split text submission must not run from inject_msg"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" 2> "$err"; then
+      fail "inject_msg should refuse when herdr has no atomic steering route"
+    fi
+  ) || fail "herdr atomic-refusal inject_msg subshell failed"
+  grep -F "no atomic agent-session-bound text steering operation" "$err" >/dev/null \
+    || fail "inject_msg did not reach the production steering refusal"
+  pass "inject_msg reaches production steering refusal before pane input"
 }
 
 # Safety-critical (task fm-composer-shellglyph-safety): the away-mode injector
@@ -1727,10 +1714,10 @@ test_pane_input_pending_bordered_idle_not_pending
 test_pane_input_pending_bordered_with_text_is_pending
 test_submit_ack_confirms_on_bordered_empty_composer
 test_submit_ack_reports_pending_on_persistent_swallow
-test_max_defer_empty_swallow_types_once_and_alarms
-test_max_defer_flushes_empty_idle_pane
+test_max_defer_atomic_refusal_alarms_without_typing
+test_max_defer_refusal_preserves_empty_idle_buffer
 test_max_defer_pending_composer_alarms_without_typing
-test_normal_flush_clears_stale_wedge_marker
+test_normal_flush_refusal_preserves_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard
@@ -1764,5 +1751,5 @@ test_pane_input_pending_herdr_dispatch
 test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
-test_inject_msg_herdr_submits_through_backend_dispatch
+test_inject_msg_herdr_refuses_unbound_text_delivery
 test_inject_msg_defers_on_dead_shell_unknown

@@ -510,9 +510,9 @@ Firstmate's own repo is the exception: its `.no-mistakes/` stays gitignored, unt
 This do-not-fight rule does not license evidence commits in firstmate's own repo.
 
 **yolo (orthogonal).** With `yolo=off` (default) every approval is the captain's: ask-user findings, PR merges, the local-only merge.
-With `yolo=on`, firstmate makes those calls itself without asking - resolve ask-user findings on your judgment, and run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` / `bin/fm-merge-local.sh` once the work is green/approved - EXCEPT anything destructive, irreversible, or security-sensitive, which still escalates to the captain.
+With `yolo=on`, firstmate makes those calls itself without asking - resolve ask-user findings on your judgment, and run the applicable merge preflight once the work is green/approved - EXCEPT anything destructive, irreversible, or security-sensitive, which still escalates to the captain.
 Never merge a red PR even under yolo.
-`bin/fm-pr-merge.sh` records `pr=` and the exact `pr_head=`, refuses every scheduled or armed merge mode, synchronously requires the five exact-head properties in `bin/fm-pr-admit.sh`, and sends the admitted head SHA to GitHub's one-shot merge endpoint so a force-push fails atomically.
+`bin/fm-pr-merge.sh` refuses every scheduled or armed merge mode, synchronously samples the five exact-head properties in `bin/fm-pr-admit.sh`, and then fails closed without changing task metadata or the endpoint because arbitrary later check contexts and detached worktree writers are not yet bound to the merge request.
 It defaults to squash and accepts only an explicit merge method after `--`.
 Do not call a raw GitHub merge command for a task PR because that bypasses exact-head admission and landed-work recording.
 After any merge you perform without asking the captain, post a one-line "merged <full PR URL or local main> after checks passed" FYI so the captain keeps a trail.
@@ -552,7 +552,7 @@ Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's exact `pr
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
 (The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
 
-If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` yourself; that instruction is the explicit approval.
+If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` as the required preflight and report its current atomic-boundary refusal without bypassing it.
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
 The helper defaults to `--squash`, accepts explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge`, and refuses scheduling, delete-after, admin, `--repo`, and `-R` flags.
 

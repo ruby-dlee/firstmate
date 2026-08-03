@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Synchronously admit and merge one task PR without arming future execution.
+# Synchronously preflight one task PR and refuse until atomic merge custody exists.
 # Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <method>]
 # Supported methods: --squash (default), --merge, --rebase, --method=<value>.
 # Scheduling flags are refused.
-# The final GitHub merge request carries the admitted head SHA, so a force-push
-# between admission and execution fails atomically instead of landing new code.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,8 +15,6 @@ fm_refuse_if_gate_agent
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-checkout-lock-lib.sh
 . "$SCRIPT_DIR/fm-checkout-lock-lib.sh"
-# shellcheck source=bin/fm-backend.sh
-. "$SCRIPT_DIR/fm-backend.sh"
 
 ID=${1:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <method>]}
 URL=${2:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <method>]}
@@ -85,45 +81,14 @@ fm_pr_merge_verify_custody() {  # <generation> <head>
   [ "$current" = "$head" ]
 }
 
-fm_pr_merge_quiesce() {
-  local backend target scoped tab state i=0
-  backend=$(fm_backend_of_meta "$META")
-  target=$(fm_backend_target_of_meta "$META")
-  scoped=$(fm_account_meta_value "$META" tmux_session_target)
-  tab=$(fm_account_meta_value "$META" zellij_tab_id)
-  [ -n "$target" ] || { echo "error: task endpoint identity is unavailable for merge quiescence" >&2; return 1; }
-  state=$(fm_backend_target_state "$backend" "$target" "fm-$ID" "$scoped" 2>/dev/null)
-  case "$state" in
-    absent) return 0 ;;
-    present) ;;
-    *) echo "error: task endpoint state is unknown; merge custody cannot be proved" >&2; return 1 ;;
-  esac
-  fm_backend_kill "$backend" "$target" "$tab" "fm-$ID" "$scoped" >/dev/null 2>&1 || {
-    echo "error: task endpoint could not be quiesced before merge" >&2
-    return 1
-  }
-  while [ "$i" -lt 20 ]; do
-    state=$(fm_backend_target_state "$backend" "$target" "fm-$ID" "$scoped" 2>/dev/null)
-    [ "$state" != absent ] || return 0
-    [ "$state" != unknown ] || break
-    sleep 0.1
-    i=$((i + 1))
-  done
-  echo "error: task endpoint did not become provably absent before merge" >&2
-  return 1
-}
-
 fm_pr_merge_locked() {
   local lifecycle generation head admission admitted_head admitted_base admitted_base_ref admitted_policy
-  local pr_doc current_head current_base current_base_ref residual merge_doc merged message status=0
+  local pr_doc current_head current_base current_base_ref residual status=0
   lifecycle=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || return 1
   generation=$(fm_account_meta_value "$META" generation_id)
   head=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null) || status=1
   [ -n "$generation" ] || status=1
   if [ "$status" -eq 0 ]; then fm_pr_merge_verify_custody "$generation" "$head" || status=1; fi
-  if [ "$status" -eq 0 ]; then fm_pr_merge_quiesce || status=1; fi
-  if [ "$status" -eq 0 ]; then fm_pr_merge_verify_custody "$generation" "$head" || status=1; fi
-  if [ "$status" -eq 0 ]; then "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL" >/dev/null || status=1; fi
   if [ "$status" -eq 0 ]; then
     admission=$("$SCRIPT_DIR/fm-pr-admit.sh" "$ID" "$URL") || status=1
   fi
@@ -141,14 +106,14 @@ fm_pr_merge_locked() {
       ????????????????????????????????????????:????????????????????????????????????????) ;;
       *) echo "error: admission receipt carried an invalid head or base" >&2; status=1 ;;
     esac
-    [ "$admitted_policy" = native-strict ] && [ -n "$admitted_base_ref" ] || {
-      echo "error: admission receipt carried no server-native policy identity" >&2
+    [ "$admitted_policy" = snapshot-native-strict ] && [ -n "$admitted_base_ref" ] || {
+      echo "error: admission receipt carried no server-policy snapshot identity" >&2
       status=1
     }
   fi
   if [ "$status" -eq 0 ]; then
     fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$admitted_base_ref" || {
-      echo "error: strict required checks and protected review evidence are not enforced at the server merge boundary" >&2
+      echo "error: strict required checks or protected review policy changed during preflight" >&2
       status=1
     }
   fi
@@ -173,27 +138,12 @@ fm_pr_merge_locked() {
       status=1
     }
   fi
-  if [ "$status" -eq 0 ]; then
-    merge_doc=$(gh-axi api PUT "/repos/$OWNER/$REPO/pulls/$NUMBER/merge" \
-      --field "sha=$admitted_head" --field "merge_method=$METHOD") || status=1
-  fi
-  if [ "$status" -eq 0 ]; then
-    merged=$(printf '%s\n' "$merge_doc" | sed -n 's/^merged: *//p' | head -1)
-    if [ "$merged" != true ]; then
-      message=$(printf '%s\n' "$merge_doc" | sed -n 's/^message: *//p' | head -1)
-      echo "error: GitHub did not merge admitted head $admitted_head (${message:-no merge verdict})" >&2
-      status=1
-    fi
-  fi
+  if [ "$status" -eq 0 ]; then fm_pr_require_atomic_merge_boundary "$METHOD" || status=1; fi
   if ! fm_account_lifecycle_lock_release "$lifecycle" >/dev/null 2>&1; then
-    if [ "$status" -eq 0 ]; then
-      echo "warning: exact-head merge succeeded but task lifecycle lock cleanup needs recovery" >&2
-    else
-      status=1
-    fi
+    echo "error: exact-head preflight lock cleanup needs recovery" >&2
+    status=1
   fi
-  [ "$status" -eq 0 ] || return "$status"
-  printf 'merged: %s exact_head=%s method=%s\n' "$URL" "$admitted_head" "$METHOD"
+  return "$status"
 }
 
 LOCK_ROOT=$(fm_checkout_lock_root "$STATE")

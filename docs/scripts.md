@@ -86,8 +86,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
 | `fm-pr-check.sh`         | Record `pr=` and exact `pr_head=` without arming merge execution or replacing task checks |
-| `fm-pr-admit.sh`         | Require five settled properties on one unchanged PR head before merge execution     |
-| `fm-pr-merge.sh`         | Admit and atomically merge one exact PR head without scheduling future execution     |
+| `fm-pr-admit.sh`         | Snapshot five settled properties on one unchanged PR head without merge authority   |
+| `fm-pr-merge.sh`         | Preflight one exact PR head and refuse until atomic server and worktree custody exists |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |

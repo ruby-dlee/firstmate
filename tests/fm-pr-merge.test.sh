@@ -129,12 +129,6 @@ EOF
     printf '[1]:\n  - id: 101\n    user: reviewer-final\n    state: APPROVED\n    commit_id: %s\n    body: clean\n' "$FM_TEST_HEAD"
     ;;
   "api /repos/example/repo/branches/main/protection/required_status_checks")
-    policy_count=$(cat "$FM_TEST_POLICY_COUNT" 2>/dev/null || echo 0)
-    policy_count=$((policy_count + 1))
-    printf '%s\n' "$policy_count" > "$FM_TEST_POLICY_COUNT"
-    if [ "${FM_TEST_DIRTY_AFTER_ADMISSION:-0}" = 1 ] && [ "$policy_count" -ge 2 ]; then
-      printf 'late residual\n' > "$FM_TEST_WORKTREE/late-residual.txt"
-    fi
     if [ "${FM_TEST_MISSING_EVIDENCE_RULE:-0}" = 1 ]; then
       printf 'strict: true\ncontexts[0]:\n'
     else
@@ -148,15 +142,8 @@ EOF
     printf 'enabled: true\n'
     ;;
   "api PUT /repos/example/repo/pulls/9/merge --field sha=$FM_TEST_HEAD --field merge_method="*)
-    if [ "${FM_TEST_REVOKED_REVIEW:-0}" = 1 ]; then
-      echo 'error: required code-owner review was dismissed' >&2
-      exit 1
-    fi
-    if [ "${FM_TEST_MERGE_FAIL:-0}" = 1 ]; then
-      echo 'error: head moved' >&2
-      exit 1
-    fi
-    printf 'merged: true\nmessage: merged\n'
+    echo 'unexpected merge request from fail-closed preflight' >&2
+    exit 1
     ;;
   *) echo "unexpected gh-axi call: $*" >&2; exit 1 ;;
 esac
@@ -174,19 +161,22 @@ run_merge() {
     PATH="$dir/fakebin:$PATH" "$MERGE" task-x1 https://github.com/example/repo/pull/9 "$@"
 }
 
-test_exact_head_admitted_and_merged_once() {
-  local rec dir base head out
+test_exact_head_preflight_refuses_and_preserves_custody() {
+  local rec dir base head rc
   rec=$(make_case success); IFS='|' read -r dir base head <<EOF
 $rec
 EOF
   add_gh_axi "$dir"; : > "$dir/gh.log"
-  out=$(run_merge "$dir" "$base" "$head") || fail "exact-head merge fixture refused: $out"
-  assert_contains "$out" "exact_head=$head" "merge receipt omitted exact head"
-  assert_grep "pr_head=$head" "$dir/state/task-x1.meta" "PR head was not recorded"
+  cp "$dir/state/task-x1.meta" "$dir/meta.before"
+  run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "merge must refuse without complete atomic evidence and custody"
+  assert_grep 'cannot require arbitrary later check contexts' "$dir/err" "atomic check gap was not named"
+  assert_grep 'cannot prove detached worktree-writer custody' "$dir/err" "detached-writer custody gap was not named"
+  cmp -s "$dir/meta.before" "$dir/state/task-x1.meta" || fail "failed preflight changed task metadata"
+  [ "$(cat "$dir/endpoint.state")" = present ] || fail "failed preflight destroyed the task endpoint"
   [ "$("$dir/state/task-x1.check.sh")" = custom ] || fail "fm-pr-check overwrote the task-owned custom check"
-  grep -qxF "api PUT /repos/example/repo/pulls/9/merge --field sha=$head --field merge_method=squash" "$dir/gh.log" \
-    || fail "merge did not carry the admitted head atomically"
-  pass "fm-pr-merge admits five exact-head properties and executes one guarded merge"
+  assert_no_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "unprovable custody reached merge"
+  pass "fm-pr-merge preserves endpoint and metadata when atomic custody is unavailable"
 }
 
 test_unsettled_checks_refuse() {
@@ -282,7 +272,7 @@ EOF
 }
 
 test_non_strict_base_policy_rejects_then_retires() {
-  local rec dir base head out rc
+  local rec dir base head rc
   rec=$(make_case non-strict); IFS='|' read -r dir base head <<EOF
 $rec
 EOF
@@ -292,54 +282,24 @@ EOF
   assert_grep 'does not enforce strict required checks' "$dir/err" "non-strict refusal was unclear"
   assert_no_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "non-strict base policy reached merge"
   : > "$dir/gh.log"; rm -f "$dir/policy.count" "$dir/pull.count"
-  out=$(run_merge "$dir" "$base" "$head") || fail "strict policy did not retire the base-drift violation"
-  assert_contains "$out" "exact_head=$head" "strict-policy repair did not merge exact head"
-  pass "fm-pr-merge rejects and retires non-strict base admission policy"
-}
-
-test_revoked_same_head_review_is_server_rejected_then_retired() {
-  local rec dir base head out rc
-  rec=$(make_case revoked-review); IFS='|' read -r dir base head <<EOF
-$rec
-EOF
-  add_gh_axi "$dir"; : > "$dir/gh.log"
-  FM_TEST_REVOKED_REVIEW=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
-  expect_code 1 "$rc" "dismissed same-head review must fail at the server merge boundary"
-  assert_grep 'required code-owner review was dismissed' "$dir/err" "server review mutation refusal was hidden"
-  assert_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "review mutation never reached the native server guard"
-  : > "$dir/gh.log"; rm -f "$dir/policy.count" "$dir/pull.count"
-  out=$(run_merge "$dir" "$base" "$head") || fail "restored review state did not retire the violation"
-  assert_contains "$out" "exact_head=$head" "restored review state did not merge exact head"
-  pass "server-native review protection rejects and retires same-head mutation"
-}
-
-test_late_worktree_residual_rejects_then_retires() {
-  local rec dir base head out rc
-  rec=$(make_case late-residual); IFS='|' read -r dir base head <<EOF
-$rec
-EOF
-  add_gh_axi "$dir"; : > "$dir/gh.log"
-  FM_TEST_DIRTY_AFTER_ADMISSION=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
-  expect_code 1 "$rc" "late untracked residual must refuse at final merge custody"
-  assert_grep 'residual appeared at the final merge boundary' "$dir/err" "late residual refusal was unclear"
-  assert_no_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "late worktree residual reached merge"
-  rm -f "$dir/wt/late-residual.txt" "$dir/policy.count" "$dir/pull.count"
-  : > "$dir/gh.log"
-  out=$(run_merge "$dir" "$base" "$head") || fail "clean worktree did not retire late residual"
-  assert_contains "$out" "exact_head=$head" "clean worktree repair did not merge exact head"
-  pass "merge custody catches and retires a real late worktree residual"
+  run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "strict policy repair must still stop at the declared atomic boundary gap"
+  assert_grep 'exact-head merge is unavailable' "$dir/err" "strict-policy retirement did not reach the atomic boundary gap"
+  assert_no_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "strict-policy retirement bypassed the atomic gap"
+  pass "strict policy retires its violation without claiming merge custody"
 }
 
 test_review_pagination_combines_validated_pages() {
-  local rec dir base head out
+  local rec dir base head rc
   rec=$(make_case paginated-reviews); IFS='|' read -r dir base head <<EOF
 $rec
 EOF
   add_gh_axi "$dir"; : > "$dir/gh.log"
-  out=$(FM_TEST_MULTIPAGE_REVIEWS=1 run_merge "$dir" "$base" "$head") \
-    || fail "multi-page review admission refused: $out"
+  FM_TEST_MULTIPAGE_REVIEWS=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "review snapshot should reach the declared atomic boundary gap"
   assert_grep 'reviews?per_page=100&page=2' "$dir/gh.log" "review pagination never fetched page two"
-  pass "fm-pr-merge validates and combines explicit review pages"
+  assert_grep 'exact-head merge is unavailable' "$dir/err" "paginated review snapshot did not reach atomic refusal"
+  pass "fm-pr-merge validates review pages without claiming atomic review evidence"
 }
 
 test_head_movement_during_admission_refuses() {
@@ -350,7 +310,7 @@ EOF
   add_gh_axi "$dir"; : > "$dir/gh.log"
   FM_TEST_MOVE_DURING_ADMISSION=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
   expect_code 1 "$rc" "head movement during admission must invalidate every property"
-  assert_grep 'head/base/state changed during admission' "$dir/err" "admission movement refusal was unclear"
+  assert_grep 'PR changed after server policy verification' "$dir/err" "admission movement refusal was unclear"
   assert_no_grep 'api PUT /repos/example/repo/pulls/9/merge' "$dir/gh.log" "moved head reached merge"
   pass "fm-pr-merge invalidates all properties when the head moves during admission"
 }
@@ -368,19 +328,7 @@ EOF
   pass "fm-pr-merge cannot leave a merge armed"
 }
 
-test_atomic_head_movement_failure_propagates() {
-  local rec dir base head rc
-  rec=$(make_case moved); IFS='|' read -r dir base head <<EOF
-$rec
-EOF
-  add_gh_axi "$dir"; : > "$dir/gh.log"
-  FM_TEST_MERGE_FAIL=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
-  expect_code 1 "$rc" "atomic head mismatch must propagate"
-  assert_grep 'head moved' "$dir/err" "atomic merge failure was hidden"
-  pass "fm-pr-merge propagates GitHub's atomic exact-head refusal"
-}
-
-test_exact_head_admitted_and_merged_once
+test_exact_head_preflight_refuses_and_preserves_custody
 test_unsettled_checks_refuse
 test_stopped_reviewer_is_unreviewed
 test_stale_review_is_unreviewed
@@ -389,9 +337,6 @@ test_content_file_set_mismatch_refuses
 test_dirty_worktree_refuses_admission
 test_missing_server_evidence_rule_refuses
 test_non_strict_base_policy_rejects_then_retires
-test_revoked_same_head_review_is_server_rejected_then_retired
-test_late_worktree_residual_rejects_then_retires
 test_review_pagination_combines_validated_pages
 test_head_movement_during_admission_refuses
 test_armed_merge_flags_refuse
-test_atomic_head_movement_failure_propagates

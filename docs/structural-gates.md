@@ -48,15 +48,23 @@ Account config pins and explicit launch flags preserve the `refuse loudly rather
 
 ## Gate B: Steering delivery
 
+Status: unshipped stated gap, with a production hard-stop protecting the away-mode supervisor route.
+
+Gate B is not shipped by this lane after the ownership split.
+
 Covered route: every text instruction sent through `bin/fm-send.sh` or the away-mode supervisor injection path.
 
-Mechanical trigger: both callers dispatch through `fm_backend_send_steering` before any pane input operation.
+Mechanical trigger: the away-mode supervisor dispatches through `fm_backend_send_steering` before any pane input operation, while `bin/fm-send.sh` remains a separately owned route-completeness gap.
 
 Deterministic predicate: text can be delivered only by one backend operation that atomically binds the expected live agent session and instruction submission.
 
-Failure mode: every current backend exits nonzero before sending literal text or Enter because none implements that primitive, while special-key control remains a separate operation.
+Failure mode: every current `fm_backend_send_steering` adapter exits nonzero before sending literal text or Enter because none implements that primitive, while special-key control and the separately owned `bin/fm-send.sh` path remain outside that hard-stop.
 
 A supervisor claim made after a nonzero exit is free-form prose and cannot be intercepted mechanically, and no current backend can produce a supported text-delivery receipt.
+
+Finding F16 remains open: sibling pane adapters can change from an agent session to a bare shell between text entry and Enter, so the checked session and the acted-on session are not atomic.
+
+The production refusal is verified through `inject_msg` and `fm_backend_send_steering` without replacing either symbol, but refusal is not a delivery receipt and does not make this gate shipped.
 
 ## Gate C: Positive-only run liveness and destructive-run custody
 
@@ -100,13 +108,17 @@ Lifecycle `status` and `updated_at` values remain records rather than heartbeats
 
 If an independently verified load-independent signal becomes available, it should precede process sampling as affirmative evidence without changing the UNKNOWN result for absence.
 
-Deterministic cancellation predicate: one task lifecycle lock is held from the initial generation and head snapshot through teardown; immediately before `axi abort`, the task must be a ship lane on its exact `fm/<id>` branch; the authoritative run ID and run branch must match that task; the run head and recorded last-pushed head must both equal current `HEAD`; and the task agent must be affirmatively classified `dead` by the backend adapter.
+The positive-only liveness half is shipped, but safe destructive-run custody remains an unshipped stated gap.
 
-The exact worktree `HEAD.lock` and branch-ref lock are then held across the final run proof, `axi abort`, and terminal cancellation proof, so Git itself rejects any replacement head transition during destructive custody.
+Failure mode for liveness: an all-zero window, changed or cross-branch run record, unreadable status, or failed process sample is surfaced as UNKNOWN and routes only to the non-destructive alternative.
 
-The exact run ID and branch are verified again after cancellation, and cancellation must be reported terminal before teardown proceeds.
+The automatic reaper resolves the task branch and exact run ID when the current status supplies one, but an independent no-mistakes executor can still advance the same run before run-ID-only cancellation.
 
-Failure mode: an all-zero window, changed or cross-branch run record, unreadable status, failed process sample, missing pushed-head proof, current/pushed divergence, or non-dead agent is surfaced as UNKNOWN or refusal and routes only to the non-destructive alternative.
+That concurrent run-head writer is not serialized with repository-owned task teardown, so the current route cannot make proof, expected generation and head, cancellation, and teardown one atomic transition.
+
+The required deterministic cancellation predicate would hold one authority shared by every run-head writer from the initial generation, run, and head snapshot through expected-identity cancellation and terminal teardown.
+
+Failure mode for destructive custody: an absent exact run ID or branch mismatch causes refusal, while missing pre-abort pushed-head, dead-agent, and shared run-head authority leave automatic cancellation unshipped.
 
 Nothing reachable from absence authorizes cancellation, restart, replacement, or teardown.
 
@@ -126,13 +138,21 @@ Another repository's durations never enter the query.
 
 ## Gate D: One-shot merge
 
+Status: unshipped stated gap, with a nondestructive production preflight and unconditional fail-closed boundary.
+
 Covered route: `bin/fm-pr-merge.sh`, the canonical Firstmate PR merge entrypoint.
 
-Mechanical trigger: the script rejects scheduling flags before any GitHub call, acquires the task lifecycle and shared checkout locks, proves the exact endpoint absent, runs synchronous admission, repeats local and remote identity checks, and calls GitHub's merge REST endpoint with the admitted `sha` value.
+Mechanical trigger: the script rejects scheduling flags before any GitHub call, acquires the task lifecycle and shared checkout locks, runs synchronous snapshot admission, repeats local and remote identity checks, and invokes `fm_pr_require_atomic_merge_boundary` before any PR metadata write, endpoint teardown, or merge request.
 
-Deterministic predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; protected-branch required checks must be strict and nonempty; stale reviews must be dismissed; code-owner and last-push approval must be required; at least two approvals and admin enforcement must apply; and the REST merge succeeds only if the current PR head still equals the admitted head and GitHub still accepts every native policy predicate.
+Deterministic snapshot predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; protected-branch required checks must be strict and nonempty; stale reviews must be dismissed; code-owner and last-push approval must be required; at least two approvals and admin enforcement must apply; and the sampled head, base, local content, checks, reviews, and residual must agree.
 
-Failure mode: any endpoint uncertainty, task generation movement, head or base movement, worktree residual, mutable check or review violation, policy weakening, or merge refusal exits nonzero and no merge remains armed.
+GitHub branch protection atomically enforces only configured required contexts, so a new failing unrequired context at the same head can appear after snapshot admission and still permit merge.
+
+Firstmate's checkout and lifecycle locks cover cooperating repository callers, but they cannot prevent a task process, detached child, human shell, or external tool from writing the worktree by path.
+
+Failure mode: after the complete nondestructive preflight, the atomic boundary exits nonzero, leaves task metadata and the endpoint intact, and never calls the merge endpoint.
+
+Retirement requires a server-native required aggregate that is authoritatively invalidated by every exact-head check mutation and a worktree execution authority that excludes every writer for the entire residual-sample-and-merge interval.
 
 `bin/fm-pr-check.sh` now records only PR metadata and never creates or overwrites `state/<id>.check.sh`.
 
@@ -154,9 +174,11 @@ That transport is a separate owner-level architecture change.
 
 ## Gate F: Exact-head merge evidence
 
+Status: unshipped stated gap, while exact-head snapshot admission remains available for diagnosis.
+
 Covered route: every merge execution through `bin/fm-pr-merge.sh`.
 
-Mechanical trigger: synchronous `bin/fm-pr-admit.sh` runs immediately before the atomic exact-head merge call.
+Mechanical trigger: synchronous `bin/fm-pr-admit.sh` runs from the merge preflight and emits a receipt explicitly labelled `snapshot-native-strict`.
 
 Deterministic predicate: one unchanged head, base, and base ref must have a nonempty green and settled check set; two distinct non-author exact-head `APPROVED` review verdicts with no exact-head change request; exact local and PR head equality; an identical GitHub-file and local base-to-head file set; and a mechanically clean index and worktree including untracked paths.
 
@@ -168,26 +190,42 @@ A reviewer that stopped without submitting an exact-head `APPROVED` review contr
 
 Admission does not publish a sticky client-side success status because same-head review and check state can change afterward.
 
-GitHub's strict required-check and protected-review rules remain the authoritative mutable predicate at the atomic server merge boundary.
+The snapshot catches absent, pending, failed, stale, truncated, moved, dirty, unprotected, or contradictory evidence, but it does not claim an authoritative same-SHA review dismissal or post-snapshot worktree mutation catch.
 
-The task endpoint is quiesced and task lifecycle plus checkout custody stays held from before admission through the merge request, with a second tracked, staged, and untracked residual check immediately before that request.
+Failure mode: the merge route refuses after snapshot admission because neither complete mutable server evidence nor exclusive local writer custody is available.
 
-Failure mode: any absent, pending, failed, stale, truncated, moved, dirty, unprotected, or contradictory property exits nonzero before the merge endpoint is called.
+The independent-review mutation leg is unverified and unshipped because the repository fixture cannot perform an authoritative GitHub review dismissal, and the prior fake merge-endpoint rejection was removed.
 
 Free-form recommendations remain prose and cannot be made route-complete by this repository without the structured reporting transport described under Gate E.
 
 The merge executor itself never treats CI colour as sufficient.
 
+## Shared TOCTOU coverage
+
+The server-side atomic unit must bind the admitted head and base, every exact-head check and review mutation, and the merge request against concurrent GitHub App, reviewer, and base-branch writers.
+
+The local atomic unit must bind task generation and endpoint ownership, complete worktree-writer exclusion, the final tracked, staged, and untracked residual sample, and the merge request against task, child-process, shell, recovery, and external-tool writers.
+
+- Direct writers include the active harness and any command it launches in the task worktree; checkout and lifecycle locks do not cover them after spawn.
+- Reconciliation writers include `fm-teardown.sh` cleanup and Treehouse return paths; their cooperating mutations use checkout or lifecycle locks, but an already-running task child does not.
+- Retry writers include teardown retry and stale-lock recovery plus checkout-refresh and fleet-sync retries; repository-owned checkout operations are covered where they call `fm_checkout_lock_run`, while raw process writes remain uncovered.
+- Watcher writers include `fm-watch.sh` routes into automatic reap and recovery; task lifecycle serialization covers cooperating metadata transitions, but the independent no-mistakes run-head writer remains uncovered.
+- Recovery writers include `fm-bootstrap.sh` secondmate liveness recovery and direct or managed recovery through `fm-spawn.sh`; generation checks cover installation of a replacement, but the resumed process can write after the lock is released.
+- Resume writers include `fm-spawn.sh --resume-account`, `--continue-account`, and direct-account recovery; their setup is serialized, but their launched harnesses and descendants are deliberately long-lived and therefore outside merge custody.
+- Uncovered routes are an arbitrary task process, detached or background descendant, human shell, raw Git or filesystem command, provider-owned worktree process, and any external no-mistakes executor that does not share Firstmate's locks.
+
+No current route supplies both atomic units, so Gates D and F refuse rather than converting cooperative-lock coverage into a claim of exclusive custody.
+
 ## Mutation evidence ledger
 
-Each shipped gate below mutates the production representation, invokes the production observing path, proves deterministic refusal, removes the violation, and observes the repaired outcome.
-
-Gate E is listed as an evidenced gap because its real carrier accepts the violation instead of rejecting it.
+This ledger distinguishes firing proofs from stated gaps and does not count a snapshot, spelling assertion, wrong observing layer, unreachable symbol, or test-side semantic reimplementation as a shipped catch.
 
 - Gate A scope is one recorded Codex generation, the behavioral representation is a later wrong `thread_settings_applied` record, the observing layer is `bin/fm-runtime-profile.sh`, the reachable production path is `fm-codex-runtime-profile.mjs`, deterministic failure is exit 1 with the observed wrong axes, and retirement is a later exact-profile runtime record that verifies in `tests/fm-runtime-profile.test.sh`.
-- Gate B scope is every terminal-backed text steer, the behavioral representation is an actual text request to a live-shaped tmux task, the observing layer is `bin/fm-send.sh`, the reachable production symbol is `fm_backend_send_steering`, deterministic failure is nonzero before any `send-keys`, and retirement removes the text representation and exercises only a control key in `tests/fm-send-strict.test.sh`.
-- Gate C scope is exact-run diagnosis plus one owned destructive cancellation, the behavioral representations are an all-zero real sampler window and a real Git commit attempted during abort, the observing layers are `bin/fm-run-liveness.sh` and `bin/fm-auto-reap.sh`, the reachable production paths are the run-owned sampler and Git transition locks, deterministic failures are UNKNOWN and a rejected ref update, and retirement supplies an affirmative owned process then permits the commit only after custody releases in `tests/fm-run-liveness.test.sh` and `tests/fm-auto-reap.test.sh`.
-- Gate D scope is one PR head and base combination, the behavioral representation is `strict: false` on the real protected-branch policy response, the observing layer is `bin/fm-pr-merge.sh`, the reachable production symbol is `fm_pr_require_server_admission_rule`, deterministic failure occurs before the merge endpoint, and retirement restores strict policy and permits the exact-head request in `tests/fm-pr-merge.test.sh`.
+- Gate B scope is the away-mode supervisor injection route, the behavioral representation is an actual text digest passed to `inject_msg`, the observing layer is `bin/fm-supervise-daemon.sh`, the reachable production symbol is the unmodified `fm_backend_send_steering`, deterministic failure is nonzero before pane input in `tests/fm-daemon.test.sh`, and retirement requires an atomic agent-session-bound backend receipt; this is a verified refusal and an unshipped delivery gap.
+- Gate B has no shipped delivery mutation proof in this lane because F16 and its released `bin/fm-send.sh` boundary are owned by `steer-enter-accepts-open-modal`; retirement requires that lane to inject an agent-to-shell transition between entry and submission and prove atomic delivery or refusal.
+- Gate C liveness scope is one exact run, the behavioral representation is an all-zero real sampler window, the observing layer and reachable production path are `bin/fm-run-liveness.sh`, deterministic failure is UNKNOWN, and retirement supplies an affirmative owned process in `tests/fm-run-liveness.test.sh`.
+- Gate C destructive custody has no shipped mutation proof in this lane because F12 and its released `bin/fm-auto-reap.sh` boundary are owned by `autoreap-cancels-before-containment`; retirement requires that lane to race a real run-head transition against abort and prove the transition or abort is rejected atomically under one authority shared by every run-head writer.
+- Gate D scope is one PR head and base preflight, the behavioral representation is `strict: false` on the protected-branch policy response, the observing layer is `bin/fm-pr-merge.sh`, the reachable production symbol is `fm_pr_require_server_admission_rule`, deterministic failure occurs before metadata, endpoint, or merge mutation, and restoring strict policy retires that violation only as far as the unconditional atomic-boundary refusal in `tests/fm-pr-merge.test.sh`; the merge gate remains unshipped.
 - Gate E scope is the append-only task status carrier, the behavioral representation is an invented `blocked [key=premise]:` event with no assumption test, the observing layer is the shared watcher classifier, the reachable production symbols are `status_is_captain_relevant` and `status_open_decisions`, deterministic evidence is that the carrier accepts rather than rejects it, and retirement requires an explicit `resolved` event in `tests/fm-blocker-discipline-gap.test.sh`.
 - Gate E remains unshipped until a mandatory structured blocker transport rejects missing `assumption`, `test`, and `result` fields, at which point the mutation test must flip from demonstrating acceptance to demonstrating refusal.
-- Gate F scope is one exact-head independent-review and worktree evidence set, the behavioral representations are a dismissed same-head code-owner approval and a late real untracked file, the observing layers are GitHub's protected merge endpoint and the final local custody check, the reachable production paths are `fm-pr-admit.sh` and `fm-pr-merge.sh`, deterministic failures are server rejection or refusal before PUT, and retirement restores the review and removes the residual before the successful exact-head request in `tests/fm-pr-merge.test.sh`.
+- Gate F scope is one exact-head snapshot evidence set, the behavioral representations exercised through production parsing are a missing exact-head approval and a dirty tracked or untracked worktree, the observing layer is `bin/fm-pr-admit.sh`, deterministic failure is snapshot refusal, and removing those violations reaches only `fm_pr_require_atomic_merge_boundary`; authoritative review dismissal and concurrent-writer retirement evidence do not exist, so Gate F remains unshipped.

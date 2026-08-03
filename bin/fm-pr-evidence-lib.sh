@@ -30,3 +30,8 @@ fm_pr_require_server_admission_rule() {  # <owner> <repo> <base-ref>
   admins_enabled=$(fm_pr_evidence_scalar "$admins" enabled)
   [ "$admins_enabled" = true ]
 }
+
+fm_pr_require_atomic_merge_boundary() {
+  echo "error: exact-head merge is unavailable: GitHub cannot require arbitrary later check contexts and Firstmate cannot prove detached worktree-writer custody; endpoint and metadata preserved" >&2
+  return 1
+}

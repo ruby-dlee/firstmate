@@ -231,6 +231,6 @@ read_pr || { echo "error: PR moved after server policy verification" >&2; exit 1
     exit 1
   }
 
-printf 'admitted: head=%s base=%s base_ref=%s policy=native-strict total=%s passed=%s failed=%s skipped=%s pending=%s reviewers=%s residual_bytes=0\n' \
+printf 'admitted: head=%s base=%s base_ref=%s policy=snapshot-native-strict total=%s passed=%s failed=%s skipped=%s pending=%s reviewers=%s residual_bytes=0\n' \
   "$PR_HEAD" "$PR_BASE" "$PR_BASE_REF" \
   "$total" "$passed" "$failed" "$skipped" "$pending" "$reviewers"

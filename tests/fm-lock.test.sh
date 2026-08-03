@@ -114,7 +114,7 @@ test_live_same_identity_blocks_another_session() {
 }
 
 test_same_session_reacquire_succeeds() {
-  local home fakebin holder out status
+  local home home_physical fakebin holder out status
   home="$TMP_ROOT/reacquire-home"
   fakebin="$TMP_ROOT/reacquire-fakebin"
   mkdir -p "$home/state"
@@ -131,11 +131,17 @@ test_same_session_reacquire_succeeds() {
     FM_FAKE_OTHER_COMM=/bin/bash \
     FM_FAKE_OTHER_ARGS=bash \
     FM_FAKE_OTHER_PPID="$holder" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=bound:0 \
     PATH="$fakebin:$PATH" \
     "$LOCK" 2>&1) || status=$?
 
   expect_code 0 "$status" "same-session re-acquire should succeed"
   assert_contains "$out" "lock acquired: harness pid $holder" "same-session re-acquire did not retain the holder pid"
+  home_physical=$(cd "$home" && pwd -P)
+  assert_grep "home=$home_physical" "$home/state/.lock" "lock did not bind its canonical FM_HOME"
+  assert_grep 'backend=tmux' "$home/state/.lock" "lock did not bind the supervisor backend"
+  assert_grep 'target=bound:0' "$home/state/.lock" "lock did not bind the supervisor target"
   pass "fm-lock still allows a genuine same-session re-acquire"
 }
 

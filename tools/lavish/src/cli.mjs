@@ -247,6 +247,8 @@ async function enqueueWake(home, decision, answerDigest) {
         decision.answerPath,
         '--digest',
         answerDigest,
+        '--destination',
+        decision.manifest.destination,
       ],
       {
         env: process.env,

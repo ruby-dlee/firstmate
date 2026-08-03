@@ -18,14 +18,18 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import vm from 'node:vm';
 import { decode, encode } from '@toon-format/toon';
 import { parseHTML } from 'linkedom';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = resolve(PACKAGE_ROOT, '../..');
 const CLI = join(PACKAGE_ROOT, 'src/cli.mjs');
+const BOARD_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-board.sh');
 const WAKE_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-wake.sh');
+const QUEUE_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-queue.sh');
 const WAKE_DRAIN = join(REPO_ROOT, 'bin/fm-wake-drain.sh');
+const FAKE_BROWSER = join(PACKAGE_ROOT, 'test-support/fake-browser.mjs');
 const ONE_PIXEL_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
@@ -67,6 +71,7 @@ async function fixture(name) {
 function processGroupMembers(pgid) {
   const output = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], {
     encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
   });
   return output
     .trim()
@@ -74,6 +79,122 @@ function processGroupMembers(pgid) {
     .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
     .filter((match) => match !== null && Number(match[2]) === pgid)
     .map((match) => ({ pid: Number(match[1]), command: match[3] }));
+}
+
+function processDescendants(rootPid) {
+  const output = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const processes = output
+    .trim()
+    .split('\n')
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+    .filter((match) => match !== null)
+    .map((match) => ({
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      command: match[3],
+    }));
+  const descendants = new Set([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const processInfo of processes) {
+      if (
+        !descendants.has(processInfo.pid)
+        && descendants.has(processInfo.ppid)
+      ) {
+        descendants.add(processInfo.pid);
+        changed = true;
+      }
+    }
+  }
+  descendants.delete(rootPid);
+  return processes.filter((processInfo) => descendants.has(processInfo.pid));
+}
+
+function executeBoardSubmission(html, { storageFailure = false } = {}) {
+  const { window, document } = parseHTML(html);
+  const storage = new Map();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem(key) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key, value) {
+        if (storageFailure) throw new Error('durable browser storage unavailable');
+        storage.set(key, String(value));
+      },
+    },
+  });
+  window.Blob = globalThis.Blob;
+  window.URL = {
+    createObjectURL: () => 'blob:lavish-test',
+    revokeObjectURL: () => {},
+  };
+  window.scrollTo = () => {};
+  window.setTimeout = (callback) => {
+    callback();
+    return 1;
+  };
+  const script = document.querySelector('script').textContent;
+  vm.runInContext(script, vm.createContext(window));
+  const selected = document.querySelector('input[type="radio"]');
+  selected.checked = true;
+  selected.setAttribute('checked', '');
+  document.querySelector('#review-button').click();
+  document.querySelector('#submit-button').click();
+  return { document, storage };
+}
+
+async function fakeTmux(fx) {
+  const bin = join(fx.root, 'fake-bin');
+  const log = join(fx.root, 'tmux.log');
+  await mkdir(bin);
+  const tmux = join(bin, 'tmux');
+  await writeFile(
+    tmux,
+    `#!/bin/sh
+case "$1" in
+  display-message)
+    case "$*" in
+      *pane_current_command*) printf 'claude\\n' ;;
+      *cursor_y*) printf '0\\n' ;;
+      *) printf '@1\\n' ;;
+    esac
+    ;;
+  capture-pane) printf '│ > │\\n' ;;
+  send-keys) printf '%s\\n' "$*" >> '${log}' ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  await chmod(tmux, 0o700);
+  return { bin, log };
+}
+
+async function writeSupervisorLock(fx, target) {
+  const holderPath = join(fx.root, 'fake-bin/codex-lock-holder');
+  await symlink('/bin/sleep', holderPath);
+  const holder = spawn(holderPath, ['30'], { stdio: 'ignore' });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  const started = execFileSync(
+    'ps',
+    ['-o', 'lstart=', '-p', String(holder.pid)],
+    { encoding: 'utf8' },
+  ).trim();
+  const canonicalHome = execFileSync('/bin/pwd', ['-P'], {
+    cwd: fx.home,
+    encoding: 'utf8',
+  }).trim();
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(fx.home, 'state/.lock'),
+    `${holder.pid}\n${started}\nhome=${canonicalHome}\nbackend=tmux\ntarget=${target}\n`,
+  );
+  return holder;
 }
 
 async function listeningSockets(pid) {
@@ -254,6 +375,51 @@ async function answer(fx, id, {
     env,
   });
 }
+
+test('answer has no child process or listening socket while waiting and leaves none', async () => {
+  const fx = await fixture('resources');
+  const id = await createRequest(fx);
+  const child = spawn(CLI, ['answer', id, '--home', fx.home], {
+    detached: true,
+    env: {
+      ...process.env,
+      LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  const completion = new Promise((resolveCompletion, rejectCompletion) => {
+    child.on('error', rejectCompletion);
+    child.on('close', (code, signal) => {
+      resolveCompletion({ code, signal, stderr });
+    });
+  });
+  const deadline = Date.now() + 5_000;
+  while (
+    !stdout.includes('Choose 1-2 for rollout: ')
+    && child.exitCode === null
+    && Date.now() < deadline
+  ) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.match(stdout, /Choose 1-2 for rollout:/, stderr);
+  assert.equal(child.exitCode, null, stderr);
+  assert.deepEqual(processDescendants(child.pid), []);
+  assert.deepEqual(await listeningSockets(child.pid), []);
+
+  child.stdin.end('1\nresource proof\ny\n');
+  const result = await completion;
+  assert.equal(result.signal, null);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(processDescendants(child.pid), []);
+});
 
 test('a seven-day-old request remains answerable with no firstmate process', async () => {
   const fx = await fixture('seven-day');
@@ -446,7 +612,9 @@ test('configured wake adapter works from an installed-style CLI location', async
     { input: '1\nconfigured path\ny\n' },
   );
   assert.equal(answered.code, 0, answered.stderr);
-  assert.match(await readFile(adapterLog, 'utf8'), /--decision release-choice/);
+  const adapterArgs = await readFile(adapterLog, 'utf8');
+  assert.match(adapterArgs, /--decision release-choice/);
+  assert.match(adapterArgs, /--destination data\/replies\/release-choice\.toon/);
 });
 
 test('board renders the manifest, annotations, Markdown context, visuals, and submit contract', async () => {
@@ -517,6 +685,122 @@ test('board renders the manifest, annotations, Markdown context, visuals, and su
   assert.match(script, /submittedPayload\.value = payloadJson/);
   assert.match(script, /document\.title = SUBMIT_MARKER/);
   assert.match(script, /LAVISH-SUBMIT v2/);
+});
+
+test('B1 board submit persists the payload before showing durable confirmation', async () => {
+  const fx = await fixture('board-durable-submit');
+  const id = await createRequest(fx);
+  const output = join(fx.root, 'board.html');
+  const result = await runCli(['board', id, '--out', output], { home: fx.home });
+  assert.equal(result.code, 0, result.stderr);
+
+  const submitted = executeBoardSubmission(await readFile(output, 'utf8'));
+  assert.equal(submitted.storage.size, 1, 'submit did not persist a browser record');
+  const durableRecord = JSON.parse([...submitted.storage.values()][0]);
+  assert.equal(durableRecord.marker, 'LAVISH-SUBMIT v2');
+  assert.equal(durableRecord.payload.decision_id, id);
+  const confirmation = submitted.document.querySelector('#confirmation');
+  assert.equal(confirmation.hidden, false);
+  assert.match(confirmation.textContent, /durably saved/i);
+
+  const rejected = executeBoardSubmission(await readFile(output, 'utf8'), {
+    storageFailure: true,
+  });
+  assert.equal(
+    rejected.document.querySelector('#confirmation').hidden,
+    true,
+    'a failed durable write still showed success',
+  );
+  assert.equal(rejected.document.querySelector('#submit-button').disabled, false);
+  assert.equal(rejected.storage.size, 0);
+});
+
+test('B5 fm-lavish-board executes submit and recovers after immediate browser close', async () => {
+  const fx = await fixture('board-shell-e2e');
+  const id = await createRequest(fx);
+  const downloads = join(fx.root, 'Downloads');
+  const fakeBin = join(fx.root, 'browser-bin');
+  const fakeState = join(fx.root, 'fake-browser-state.json');
+  await mkdir(downloads);
+  await mkdir(fakeBin);
+  const chrome = join(fakeBin, 'chrome-devtools-axi');
+  await writeFile(
+    chrome,
+    `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
+  );
+  await chmod(chrome, 0o700);
+  const environment = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    FM_LAVISH_BIN: CLI,
+    LAVISH_FAKE_CHROME_STATE: fakeState,
+    LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
+  };
+
+  const opened = await runExecutable(
+    BOARD_ADAPTER,
+    [id, '--home', fx.home, '--downloads', downloads],
+    { env: environment },
+  );
+  assert.equal(opened.code, 0, opened.stderr);
+  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
+  assert.equal(await exists(checkPath), true);
+
+  const stopped = await runExecutable(chrome, ['stop'], { env: environment });
+  assert.equal(stopped.code, 0, stopped.stderr);
+  const checked = await runExecutable(checkPath, [], { env: environment });
+  assert.equal(checked.code, 0, checked.stderr);
+  assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
+  assert.equal(
+    await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
+    true,
+  );
+  assert.equal(
+    await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
+    true,
+  );
+  assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
+  assert.equal(await exists(checkPath), false);
+});
+
+test('B5 watcher check leaves a live unsubmitted board open and pending', async () => {
+  const fx = await fixture('board-live-pending');
+  const id = await createRequest(fx);
+  const downloads = join(fx.root, 'Downloads');
+  const fakeBin = join(fx.root, 'browser-bin');
+  const fakeState = join(fx.root, 'fake-browser-state.json');
+  await mkdir(downloads);
+  await mkdir(fakeBin);
+  const chrome = join(fakeBin, 'chrome-devtools-axi');
+  await writeFile(
+    chrome,
+    `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
+  );
+  await chmod(chrome, 0o700);
+  const environment = {
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    FM_LAVISH_BIN: CLI,
+    LAVISH_FAKE_CHROME_STATE: fakeState,
+    LAVISH_FAKE_CHROME_AUTO_SUBMIT: '0',
+    LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
+  };
+
+  const opened = await runExecutable(
+    BOARD_ADAPTER,
+    [id, '--home', fx.home, '--downloads', downloads],
+    { env: environment },
+  );
+  assert.equal(opened.code, 0, opened.stderr);
+  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
+  const checked = await runExecutable(checkPath, [], { env: environment });
+  assert.equal(checked.code, 0, checked.stderr);
+  const browserState = JSON.parse(await readFile(fakeState, 'utf8'));
+  assert.equal(browserState.open, true);
+  assert.equal(Object.keys(browserState.storage).length, 0);
+  assert.equal(
+    await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
+    false,
+  );
+  assert.equal(await exists(checkPath), true);
 });
 
 test('board renders a conventional visuals directory on an existing manifest', async () => {
@@ -660,6 +944,109 @@ test('collect fails closed with named errors for count, key, option, and request
       await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
       false,
     );
+  }
+});
+
+test('B4 collect rejects explicit null annotations without committing an answer', async () => {
+  const cases = [
+    {
+      name: 'question-note',
+      mutate(payload) {
+        payload.answers[0].question_note = null;
+      },
+    },
+    {
+      name: 'option-comments',
+      mutate(payload) {
+        payload.answers[0].option_comments = null;
+      },
+    },
+    {
+      name: 'overall-note',
+      mutate(payload) {
+        payload.note = null;
+      },
+    },
+  ];
+  for (const failure of cases) {
+    const fx = await fixture(`null-${failure.name}`);
+    const id = await createRequest(fx);
+    const payload = browserPayload(await manifestFor(fx, id));
+    failure.mutate(payload);
+    const payloadPath = join(fx.root, 'payload.json');
+    await writeFile(payloadPath, `${JSON.stringify(payload)}\n`);
+    const result = await runCli(['collect', id, '--payload', payloadPath], { home: fx.home });
+    assert.equal(result.code, 2, `${failure.name}: ${result.stderr}`);
+    assert.match(result.stderr, /payload_invalid_annotation/);
+    assert.equal(
+      await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
+      false,
+    );
+  }
+});
+
+test('B2 visible queue refuses an ambient target not bound to the answer home', async () => {
+  const fx = await fixture('queue-wrong-home');
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  const fake = await fakeTmux(fx);
+  const result = await runExecutable(
+    QUEUE_ADAPTER,
+    [
+      '--home', fx.home,
+      '--decision', 'release-choice',
+      '--answer', join(fx.home, 'data/decisions/release-choice/answer.toon'),
+      '--digest', `sha256:${'0'.repeat(64)}`,
+    ],
+    {
+      env: {
+        PATH: `${fake.bin}:${process.env.PATH}`,
+        FM_SUPERVISOR_BACKEND: 'tmux',
+        FM_SUPERVISOR_TARGET: 'ambient:0',
+      },
+    },
+  );
+  assert.equal(result.code, 4, result.stderr);
+  assert.match(result.stderr, /home-bound supervisor/i);
+  assert.equal(await exists(fake.log), false, 'queue wrote into the ambient pane');
+});
+
+test('B3 visible queue uses the manifest destination and home-bound target', async () => {
+  const fx = await fixture('queue-destination');
+  const id = await createRequest(fx);
+  const payloadPath = join(fx.root, 'payload.json');
+  await writeFile(
+    payloadPath,
+    `${JSON.stringify(browserPayload(await manifestFor(fx, id)))}\n`,
+  );
+  const fake = await fakeTmux(fx);
+  const holder = await writeSupervisorLock(fx, 'home:0');
+  try {
+    const result = await runExecutable(
+      CLI,
+      [
+        'collect', id,
+        '--payload', payloadPath,
+        '--home', fx.home,
+      ],
+      {
+        env: {
+          PATH: `${fake.bin}:${process.env.PATH}`,
+          LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
+          FM_LAVISH_QUEUE_DISABLE: '0',
+          FM_SUPERVISOR_BACKEND: 'tmux',
+          FM_SUPERVISOR_TARGET: 'ambient:0',
+        },
+      },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const log = await readFile(fake.log, 'utf8');
+    assert.match(log, /-t home:0 /);
+    assert.match(log, /ingested at data\/replies\/release-choice\.toon/);
+    assert.doesNotMatch(log, /data\/lavish-answers\/release-choice\.json/);
+  } finally {
+    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
+    holder.kill();
+    await closed;
   }
 });
 
@@ -864,46 +1251,4 @@ test('an explicit reconciled map migrates only the named unanswered session', as
     await exists(join(fx.home, 'data/decisions/irrelevant/manifest.toon')),
     false,
   );
-});
-
-test('answer has no child process or listening socket while waiting and leaves none', async () => {
-  const fx = await fixture('resources');
-  const id = await createRequest(fx);
-  const child = spawn(CLI, ['answer', id, '--home', fx.home], {
-    detached: true,
-    env: {
-      ...process.env,
-      LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  child.stdout.on('data', (chunk) => {
-    stdout += chunk;
-  });
-  const deadline = Date.now() + 5_000;
-  while (!stdout.includes('Choose 1-2 for rollout: ') && Date.now() < deadline) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
-  }
-  assert.match(stdout, /Choose 1-2 for rollout:/);
-  assert.deepEqual(processGroupMembers(child.pid), [
-    { pid: child.pid, command: processGroupMembers(child.pid)[0]?.command },
-  ]);
-  assert.deepEqual(await listeningSockets(child.pid), []);
-
-  const completion = new Promise((resolveCompletion, rejectCompletion) => {
-    let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
-    child.on('error', rejectCompletion);
-    child.on('close', (code, signal) => {
-      resolveCompletion({ code, signal, stderr });
-    });
-  });
-  child.stdin.end('1\nresource proof\ny\n');
-  const result = await completion;
-  assert.equal(result.signal, null);
-  assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(processGroupMembers(child.pid), []);
 });

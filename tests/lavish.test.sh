@@ -51,7 +51,8 @@ test_wake_can_disable_visible_queue() {
         --home "$home" \
         --decision demo \
         --answer "$home/data/decisions/demo/answer.toon" \
-        --digest "$digest"
+        --digest "$digest" \
+        --destination data/replies/demo.toon
   )
   case "$out" in
     *'lavish-delivery: prompt queue disabled for demo'*) ;;

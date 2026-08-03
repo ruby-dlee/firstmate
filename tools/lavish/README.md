@@ -3,7 +3,8 @@
 Lavish is firstmate's durable decision inbox.
 It stores complete requests and answers under `$FM_HOME/data/decisions/` and uses short-lived terminal commands only.
 
-There is no server, browser, URL, listener, poll, watcher, idle timeout, or resident process.
+The core file protocol has no server, URL, listener, long poll, idle timeout, or resident process.
+The optional Firstmate board wrapper opens a bounded dedicated Chrome profile and arms one ordinary watcher check; the durable request and answer files remain authoritative.
 An unanswered request remains answerable until the files are deliberately removed.
 
 ## Human commands
@@ -16,6 +17,7 @@ For direct human use, pass the same explicit home to every command, replacing th
 lavish inbox --home '/Users/example/firstmate-home'
 lavish show <decision-id> --home '/Users/example/firstmate-home'
 lavish answer <decision-id> --home '/Users/example/firstmate-home'
+bin/fm-lavish-board.sh <decision-id> --home '/Users/example/firstmate-home'
 ```
 
 `lavish answer` renders the complete request, collects one numbered choice for every ordered question, accepts an optional note, shows the whole batch, and requires one explicit confirmation.
@@ -24,6 +26,10 @@ It then queues a redundant wake pointer and exits without waiting for firstmate.
 
 If wake enqueueing fails, the durable answer remains authoritative.
 The command prints `answer saved; wake not queued`, exits nonzero, and the next ordinary intake scan recovers it.
+
+`bin/fm-lavish-board.sh` renders the same immutable request into self-contained HTML and opens it with a decision-specific Chrome profile below `$FM_HOME/state`.
+Submit first writes and reads back a browser-profile record, then shows a confirmation describing that durable record; the optional browser download is not treated as confirmed delivery.
+The armed check recovers the record from the same profile even after the visible browser closes, validates it through `lavish-axi collect`, and runs intake.
 
 ## Agent commands
 
@@ -73,7 +79,7 @@ The firstmate bootstrap install command also records the checkout's narrow wake 
 
 ## Protocol
 
-The protocol has schema version `1`.
+Manifest and receipt schema version `1` remain current; answers may be schema version `1` or annotation-capable schema version `2`.
 TOON's strict decoder validates every encoded array count before Lavish applies the schema rules below.
 
 `manifest.toon` contains:
@@ -92,7 +98,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - `schema_version`, `decision_id`, `request_sha256`, and `submitted_at`
 - exactly one ordered answer for every expected question key
 - each selected option value and label
-- an optional note
+- schema version `2` also carries string question notes, per-option string comments, and an overall string note
 
 `receipt.toon` contains:
 
@@ -101,7 +107,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - the declared destination and its content digest
 
 The initial `answer.toon` is write-once.
-Later revisions require a future numbered-revision protocol and are not part of schema version `1`.
+Later answer revisions require a future numbered-revision protocol and are not part of either accepted answer schema.
 
 ## Legacy migration
 

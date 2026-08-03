@@ -243,8 +243,11 @@ function boardScript(decision) {
   const overallNote = document.querySelector('#overall-note');
   const payloadBackup = document.querySelector('#payload-backup');
   const submittedPayload = document.querySelector('#submitted-payload');
+  const submitError = document.querySelector('#submit-error');
   const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '.json';
+  const storageKey = 'lavish-submit:' + MANIFEST.decision_id + ':' + MANIFEST.request_sha256;
   window.__lavishPayload = null;
+  window.__lavishStorageKey = storageKey;
 
   function buildPayload() {
     return {
@@ -323,6 +326,14 @@ function boardScript(decision) {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
+  function persistPayload(payload) {
+    const durableRecord = JSON.stringify({ marker: SUBMIT_MARKER, payload });
+    localStorage.setItem(storageKey, durableRecord);
+    if (localStorage.getItem(storageKey) !== durableRecord) {
+      throw new Error('durable browser storage verification failed');
+    }
+  }
+
   document.querySelector('#review-button').addEventListener('click', () => {
     const missing = MANIFEST.questions.find((question) => !form.querySelector(
       'input[data-question-key="' + question.key + '"]:checked',
@@ -352,12 +363,26 @@ function boardScript(decision) {
   document.querySelector('#submit-button').addEventListener('click', (event) => {
     const payload = buildPayload();
     const payloadJson = JSON.stringify(payload, null, 2) + '\\n';
-    downloadPayload(payloadJson);
+    submitError.hidden = true;
+    try {
+      persistPayload(payload);
+    } catch {
+      submittedPayload.value = payloadJson;
+      payloadBackup.hidden = false;
+      submitError.textContent = 'Could not durably save this answer. Keep this board open and try again.';
+      submitError.hidden = false;
+      return;
+    }
     window.__lavishPayload = payload;
     submittedPayload.value = payloadJson;
     payloadBackup.hidden = false;
     document.title = SUBMIT_MARKER;
     event.currentTarget.disabled = true;
+    try {
+      downloadPayload(payloadJson);
+    } catch {
+      // The verified browser-profile record remains authoritative.
+    }
     document.querySelector('#confirmation').hidden = false;
   });
 })();`;
@@ -407,7 +432,8 @@ export async function renderBoard(decision) {
       <p class="eyebrow">Final review</p>
       <h2 id="review-title">Submit this complete answer batch?</h2>
       <div id="review-list" class="review-list"></div>
-      <p id="confirmation" class="confirmation" role="status" hidden>Answer downloaded. Firstmate will validate and confirm receipt.</p>
+      <p id="confirmation" class="confirmation" role="status" hidden>Answer durably saved in this board's local profile. Firstmate will validate and confirm receipt.</p>
+      <p id="submit-error" class="form-error" role="alert" hidden></p>
       <section id="payload-backup" class="payload-backup" aria-labelledby="payload-backup-title" hidden>
         <h3 id="payload-backup-title">Manual payload backup</h3>
         <p>If the browser blocked the download, copy and save this complete JSON payload.</p>

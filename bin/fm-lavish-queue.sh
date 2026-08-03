@@ -14,12 +14,14 @@ HOME_ARG=
 DECISION=
 ANSWER=
 DIGEST=
+DESTINATION=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --home) HOME_ARG=${2:-}; shift 2 ;;
     --decision) DECISION=${2:-}; shift 2 ;;
     --answer) ANSWER=${2:-}; shift 2 ;;
     --digest) DIGEST=${2:-}; shift 2 ;;
+    --destination) DESTINATION=${2:-}; shift 2 ;;
     *) printf 'fm-lavish-queue: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -47,7 +49,7 @@ esac
 [ -d "$HOME_ARG" ] && [ ! -L "$HOME_ARG" ] \
   || { echo "fm-lavish-queue: unsafe FM_HOME" >&2; exit 2; }
 FM_HOME=$(cd "$HOME_ARG" && pwd -P)
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+STATE="$FM_HOME/state"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] \
   || { echo "fm-lavish-queue: unsafe state directory" >&2; exit 2; }
 
@@ -70,13 +72,20 @@ fi
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-supervisor-target-lib.sh
-. "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
+# shellcheck source=bin/fm-session-lock-lib.sh
+. "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
-target=$(discover_supervisor_target || true)
-backend=$(discover_supervisor_backend || true)
-[ -n "$target" ] || { echo "fm-lavish-queue: supervisor target is not discoverable" >&2; exit 4; }
-[ -n "$backend" ] || { echo "fm-lavish-queue: supervisor backend is not discoverable" >&2; exit 4; }
+route=$(fm_session_lock_supervisor_route "$STATE/.lock" "$FM_HOME" 2>/dev/null || true)
+[ -n "$route" ] || {
+  echo "fm-lavish-queue: home-bound supervisor target is missing or stale for $FM_HOME" >&2
+  exit 4
+}
+backend=${route%%$'\t'*}
+target=${route#*$'\t'}
+[ "$route" != "$backend" ] && [ -n "$target" ] || {
+  echo "fm-lavish-queue: home-bound supervisor target is invalid for $FM_HOME" >&2
+  exit 4
+}
 fm_backend_validate "$backend" || exit 4
 fm_backend_target_exists "$backend" "$target" \
   || { echo "fm-lavish-queue: supervisor target is not live: $backend $target" >&2; exit 4; }
@@ -110,8 +119,21 @@ case "$composer" in
     ;;
 esac
 
+[ -n "$DESTINATION" ] \
+  || { echo "fm-lavish-queue: --destination is required" >&2; exit 2; }
+case "$DESTINATION" in
+  data/?*) ;;
+  *) echo "fm-lavish-queue: invalid destination" >&2; exit 2 ;;
+esac
+case "$DESTINATION" in
+  /*|*\\*|*/|*//*|*/./*|*/../*|*$'\n'*|*$'\r'*)
+    echo "fm-lavish-queue: invalid destination" >&2
+    exit 2
+    ;;
+esac
+
 relative_answer=${ANSWER#"$FM_HOME/"}
-message="Captain submitted Lavish decision $DECISION. The durable answer is saved at $relative_answer and should now be ingested at data/lavish-answers/$DECISION.json. Run bin/fm-lavish-intake.sh if needed, read the answer, and do not ask the captain to resubmit."
+message="Captain submitted Lavish decision $DECISION. The durable answer is saved at $relative_answer and should now be ingested at $DESTINATION. Run bin/fm-lavish-intake.sh if needed, read the answer, and do not ask the captain to resubmit."
 verdict=$(fm_backend_send_text_submit "$backend" "$target" "$message" 3 0.4 0.2)
 case "$verdict" in
   empty)

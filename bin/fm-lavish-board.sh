@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Render one durable Lavish decision, open it in an isolated headed Chrome
-# session, and arm a one-shot watcher check for its durable download with a
-# browser submit-marker fallback.
+# Render one durable Lavish decision, open it in a dedicated headed Chrome
+# profile, and arm a one-shot watcher check for its durable download with a
+# durable browser-profile fallback.
 #
 # Usage:
 #   fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
@@ -20,9 +20,9 @@ usage() {
   cat <<'USAGE'
 Usage: fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
 
-Render a self-contained Lavish board, open it in a headed isolated Chrome
-session, and arm a watcher check that captures the downloaded payload first,
-with LAVISH-SUBMIT v2 live-page capture as a fallback.
+Render a self-contained Lavish board, open it in a headed dedicated Chrome
+profile, and arm a watcher check that captures the downloaded payload first,
+with the verified LAVISH-SUBMIT v2 browser-profile record as a fallback.
 USAGE
 }
 
@@ -53,18 +53,56 @@ resolve_downloads() {
 
 isolated_chrome() {
   local session=$1
-  shift
+  local profile=$2
+  local headed=$3
+  shift 3
   (
     unset CHROME_DEVTOOLS_AXI_AUTO_CONNECT
     unset CHROME_DEVTOOLS_AXI_BROWSER_URL
     unset CHROME_DEVTOOLS_AXI_CHROME_ARGS
     unset CHROME_DEVTOOLS_AXI_PORT
-    unset CHROME_DEVTOOLS_AXI_USER_DATA_DIR
     unset CHROME_DEVTOOLS_AXI_WS_HEADERS
     export CHROME_DEVTOOLS_AXI_SESSION="$session"
-    export CHROME_DEVTOOLS_AXI_HEADED=1
+    export CHROME_DEVTOOLS_AXI_USER_DATA_DIR="$profile"
+    if [ "$headed" = 1 ]; then
+      export CHROME_DEVTOOLS_AXI_HEADED=1
+    else
+      unset CHROME_DEVTOOLS_AXI_HEADED
+    fi
     chrome-devtools-axi "$@"
   )
+}
+
+write_evaluation_payload() {  # <evaluation-output> <target> <decision-id>
+  local evaluation=$1 target=$2 decision_id=$3 result_line
+  result_line=$(printf '%s\n' "$evaluation" | sed -n 's/^result: //p' | sed -n '1p')
+  [ -n "$result_line" ] || return 1
+  printf '%s\n' "$result_line" | node -e '
+    const fs = require("node:fs");
+    const raw = fs.readFileSync(0, "utf8").trim();
+    const target = process.argv[1];
+    const marker = process.argv[2];
+    const decisionId = process.argv[3];
+    let snapshot = raw;
+    try {
+      for (let depth = 0; depth < 4 && typeof snapshot === "string"; depth += 1) {
+        snapshot = JSON.parse(snapshot);
+      }
+      let payload = snapshot?.payload ?? null;
+      let markerMatches = snapshot?.title === marker;
+      if (snapshot?.durable_record != null) {
+        let durable = snapshot.durable_record;
+        if (typeof durable === "string") durable = JSON.parse(durable);
+        if (durable?.marker !== marker || durable?.payload == null) process.exit(3);
+        payload = durable.payload;
+        markerMatches = true;
+      }
+      if (!markerMatches || payload?.decision_id !== decisionId) process.exit(3);
+      fs.writeFileSync(target, JSON.stringify(payload) + "\n", { mode: 0o600 });
+    } catch {
+      process.exit(4);
+    }
+  ' "$target" "$SUBMIT_MARKER" "$decision_id"
 }
 
 collect_submission() {
@@ -97,9 +135,13 @@ check_submission() {
   local state_dir="$home/state"
   local payload_path="$state_dir/lavish-board-$decision_id.payload.json"
   local check_path="$state_dir/lavish-board-$decision_id.check.sh"
-  local downloaded_path evaluation result_line temporary
+  local profile_path="$state_dir/lavish-board-$decision_id.chrome-profile"
+  local html_path="$state_dir/lavish-board-$decision_id.html"
+  local downloaded_path evaluation temporary board_url
 
   [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || exit 0
+  [ -d "$profile_path" ] && [ ! -L "$profile_path" ] || exit 0
+  [ -f "$html_path" ] && [ ! -L "$html_path" ] || exit 0
 
   downloaded_path=$(node -e '
     const fs = require("node:fs");
@@ -140,45 +182,50 @@ check_submission() {
       mv "$temporary" "$payload_path"
       collect_submission "$decision_id" "$home" "$payload_path" || return
       rm -f "$check_path"
-      isolated_chrome "$session" stop >/dev/null 2>&1 || true
+      isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
       printf 'lavish-submit: %s %s\n' "$decision_id" "$payload_path"
       return
     fi
     rm -f "$temporary"
   fi
 
-  evaluation=$(isolated_chrome "$session" eval \
-    'JSON.stringify({title: document.title, payload: window.__lavishPayload ?? null})' \
-    2>/dev/null) || exit 0
-  result_line=$(printf '%s\n' "$evaluation" | sed -n 's/^result: //p' | sed -n '1p')
-  [ -n "$result_line" ] || exit 0
-
   temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
-  if printf '%s\n' "$result_line" | node -e '
-    const fs = require("node:fs");
-    const raw = fs.readFileSync(0, "utf8").trim();
-    const target = process.argv[1];
-    const marker = process.argv[2];
-    let snapshot = raw;
-    try {
-      for (let depth = 0; depth < 4 && typeof snapshot === "string"; depth += 1) {
-        snapshot = JSON.parse(snapshot);
-      }
-    } catch {
-      process.exit(4);
-    }
-    if (snapshot?.title !== marker || snapshot?.payload == null) process.exit(3);
-    fs.writeFileSync(target, JSON.stringify(snapshot.payload) + "\n", { mode: 0o600 });
-  ' "$temporary" "$SUBMIT_MARKER"; then
-    mv "$temporary" "$payload_path"
+  evaluation=$(isolated_chrome "$session" "$profile_path" 0 eval \
+    'JSON.stringify({title: document.title, payload: window.__lavishPayload ?? null, durable_record: typeof window.__lavishStorageKey === "string" ? localStorage.getItem(window.__lavishStorageKey) : null})' \
+    2>/dev/null) || evaluation=
+  if [ -n "$evaluation" ]; then
+    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id"; then
+      mv "$temporary" "$payload_path"
+    else
+      rm -f "$temporary"
+      exit 0
+    fi
   else
     rm -f "$temporary"
-    exit 0
+    board_url=$(node -e \
+      'const { pathToFileURL } = require("node:url"); console.log(pathToFileURL(process.argv[1]).href);' \
+      "$html_path")
+    isolated_chrome "$session" "$profile_path" 0 open "$board_url" >/dev/null 2>&1 \
+      || exit 0
+    evaluation=$(isolated_chrome "$session" "$profile_path" 0 eval \
+      'JSON.stringify({title: document.title, payload: window.__lavishPayload ?? null, durable_record: typeof window.__lavishStorageKey === "string" ? localStorage.getItem(window.__lavishStorageKey) : null})' \
+      2>/dev/null) || {
+        isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
+        exit 0
+      }
+    temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
+    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id"; then
+      mv "$temporary" "$payload_path"
+    else
+      rm -f "$temporary"
+      isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
+      exit 0
+    fi
   fi
 
   collect_submission "$decision_id" "$home" "$payload_path" || return
   rm -f "$check_path"
-  isolated_chrome "$session" stop >/dev/null 2>&1 || true
+  isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
   printf 'lavish-submit: %s %s\n' "$decision_id" "$payload_path"
 }
 
@@ -257,12 +304,16 @@ HOME_DIGEST=$(printf '%s' "$HOME_PATH" | shasum -a 256 | awk '{print substr($1,1
 SESSION="lavish-${DECISION_ID:0:36}-$HOME_DIGEST"
 HTML_PATH="$STATE_DIR/lavish-board-$DECISION_ID.html"
 PAYLOAD_PATH="$STATE_DIR/lavish-board-$DECISION_ID.payload.json"
+PROFILE_PATH="$STATE_DIR/lavish-board-$DECISION_ID.chrome-profile"
 CHECK_PATH="$STATE_DIR/lavish-board-$DECISION_ID.check.sh"
 CHECK_TMP=$(mktemp "$STATE_DIR/.lavish-board-$DECISION_ID.check.XXXXXX")
 OPENED_AT=$(node -e 'process.stdout.write(String(Date.now()))')
 
 "$LAVISH_BIN" board "$DECISION_ID" --home "$HOME_PATH" --out "$HTML_PATH"
 rm -f "$PAYLOAD_PATH"
+mkdir -p "$PROFILE_PATH"
+[ -d "$PROFILE_PATH" ] && [ ! -L "$PROFILE_PATH" ] \
+  || fail "unsafe Chrome profile directory: $PROFILE_PATH"
 {
   printf '#!/usr/bin/env bash\n'
   printf 'exec %q --check %q --home %q --session %q --downloads %q --opened-at %q\n' \
@@ -275,7 +326,7 @@ mv "$CHECK_TMP" "$CHECK_PATH"
 BOARD_URL=$(node -e \
   'const { pathToFileURL } = require("node:url"); console.log(pathToFileURL(process.argv[1]).href);' \
   "$HTML_PATH")
-if ! isolated_chrome "$SESSION" open "$BOARD_URL"; then
+if ! isolated_chrome "$SESSION" "$PROFILE_PATH" 1 open "$BOARD_URL"; then
   rm -f "$CHECK_PATH"
   fail 'could not open the isolated Chrome session'
 fi

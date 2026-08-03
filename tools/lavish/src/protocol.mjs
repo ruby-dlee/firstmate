@@ -493,14 +493,18 @@ export function validateCollectPayload(raw, manifest) {
         `unknown option ${String(rawSelection.value)} for ${question.key}`,
       );
     }
-    const questionNote = rawSelection.question_note ?? '';
+    const questionNote = rawSelection.question_note === undefined
+      ? ''
+      : rawSelection.question_note;
     if (typeof questionNote !== 'string') {
       payloadError(
         'payload_invalid_annotation',
         `question note for ${question.key} must be a string`,
       );
     }
-    const rawComments = rawSelection.option_comments ?? {};
+    const rawComments = rawSelection.option_comments === undefined
+      ? {}
+      : rawSelection.option_comments;
     if (
       rawComments === null
       || typeof rawComments !== 'object'
@@ -546,7 +550,7 @@ export function validateCollectPayload(raw, manifest) {
       payloadError('payload_unknown_key', `missing question key ${question.key}`);
     }
   }
-  const note = raw.note ?? '';
+  const note = raw.note === undefined ? '' : raw.note;
   if (typeof note !== 'string') {
     payloadError('payload_invalid_annotation', 'overall note must be a string');
   }

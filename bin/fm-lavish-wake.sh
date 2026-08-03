@@ -8,7 +8,8 @@
 #
 # Usage:
 #   fm-lavish-wake.sh --home <FM_HOME> --decision <id> \
-#     --answer <absolute-answer.toon> --digest <sha256:hex>
+#     --answer <absolute-answer.toon> --digest <sha256:hex> \
+#     --destination <FM_HOME-relative-path>
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,12 +18,14 @@ HOME_ARG=
 DECISION=
 ANSWER=
 DIGEST=
+DESTINATION=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --home) HOME_ARG=${2:-}; shift 2 ;;
     --decision) DECISION=${2:-}; shift 2 ;;
     --answer) ANSWER=${2:-}; shift 2 ;;
     --digest) DIGEST=${2:-}; shift 2 ;;
+    --destination) DESTINATION=${2:-}; shift 2 ;;
     *) printf 'fm-lavish-wake: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -31,6 +34,7 @@ done
 [ -n "$DECISION" ] || { echo "fm-lavish-wake: --decision is required" >&2; exit 2; }
 [ -n "$ANSWER" ] || { echo "fm-lavish-wake: --answer is required" >&2; exit 2; }
 [ -n "$DIGEST" ] || { echo "fm-lavish-wake: --digest is required" >&2; exit 2; }
+[ -n "$DESTINATION" ] || { echo "fm-lavish-wake: --destination is required" >&2; exit 2; }
 
 case "$DECISION" in
   [a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9]) ;;
@@ -46,6 +50,16 @@ case "$hex" in
   ''|*[!0-9a-f]*) echo "fm-lavish-wake: invalid answer digest" >&2; exit 2 ;;
 esac
 [ "${#hex}" -eq 64 ] || { echo "fm-lavish-wake: invalid answer digest" >&2; exit 2; }
+case "$DESTINATION" in
+  data/?*) ;;
+  *) echo "fm-lavish-wake: invalid destination" >&2; exit 2 ;;
+esac
+case "$DESTINATION" in
+  /*|*\\*|*/|*//*|*/./*|*/../*|*$'\n'*|*$'\r'*)
+    echo "fm-lavish-wake: invalid destination" >&2
+    exit 2
+    ;;
+esac
 
 [ -d "$HOME_ARG" ] && [ ! -L "$HOME_ARG" ] \
   || { echo "fm-lavish-wake: unsafe FM_HOME" >&2; exit 2; }
@@ -88,7 +102,8 @@ queue_out=$("$SCRIPT_DIR/fm-lavish-queue.sh" \
   --home "$FM_HOME" \
   --decision "$DECISION" \
   --answer "$ANSWER_CANONICAL" \
-  --digest "$DIGEST" 2>&1) || queue_status=$?
+  --digest "$DIGEST" \
+  --destination "$DESTINATION" 2>&1) || queue_status=$?
 if [ "${queue_status:-0}" -eq 0 ]; then
   printf '%s\n' "$queue_out"
 else

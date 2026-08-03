@@ -17,16 +17,16 @@
 # working/paused wrappers). It is NOT a pure status-file read: it reuses
 # bin/fm-crew-state.sh, which may make bounded no-mistakes and GitHub PR-state
 # calls, to decide whether a crewmate that just stopped its turn or went stale is
-# working, deliberately paused, or neither. Callers run it ONLY on no-verb signal
-# handling and first sighting of a stale hash, never on every wake, so the
-# per-wake triage stays cheap.
+# working, deliberately paused, or neither. Callers run it on no-verb signal
+# handling, first sighting of a stale hash, and away-mode pause-custody
+# reconciliation; ordinary per-wake triage stays cheap.
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
 # bin/ script (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CLASSIFY_LIB_DIR="."
 
-# The crewmate current-state reader used for the "provably working" decision.
+# The crewmate current-state reader used for the attendance decision.
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
@@ -315,25 +315,23 @@ signal_reason_is_actionable() {  # <file> ...
 # Classify WHY an idle/stale crewmate MIGHT be safely absorbed instead of surfaced,
 # from bin/fm-crew-state.sh's one authoritative current-state line
 # ("state: <s> · source: <src> · <detail>"). Prints exactly one token:
-#   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
-#             pane; the crewmate is legitimately mid-work on a static-looking pane
-#             (e.g. waiting on CI);
+#   working - a busy pane proves the crewmate is presently attending its work;
 #   paused  - the crewmate's authoritative current state is a declared external-wait
 #             pause (paused:), or stale-pane triage supplied that durable pause
 #             alongside a finished run-step, so the pane is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
-#             torn-down/unknown crewmate, or an unreadable verdict).
+#   none    - neither, so the wake must surface (including an active or parked run
+#             without independent attendance evidence).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
-# authoritatively (not the status log) keeps run-step precedence: a crewmate that
-# appended paused: but then STARTED a run reports working, never paused. The optional
-# second argument is reserved for stale-pane absorb triage. A declared pause there
+# authoritatively (not the status log) preserves current-state precedence without
+# treating an in-flight run as proof that its owner is attending it. The optional
+# second argument supplies the task's durable status event. A declared pause there
 # may override only a DONE run-step (including passed and checks-passed outcomes,
 # which fm-crew-state.sh maps to done), because the run has finished and the durable
-# event explains why its pane is now expected to idle. Failed, parked, unknown, and
-# actively-working run-steps never yield to that event.
+# event explains why its pane is now expected to idle. Active, parked, failed, and
+# unknown run-steps never yield to that event.
 # NOT a pure local read: fm-crew-state.sh may make bounded no-mistakes and GitHub
-# PR-state calls, so callers run it only on no-verb signal and first-sighting
-# stale paths, never every wake.
+# PR-state calls, so callers limit it to no-verb signals, first-sighting stale
+# paths, and explicit pause-custody reconciliation.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id> [declared-pause-status-line]
   local id=$1 declared_pause=${2:-} line state src
@@ -341,27 +339,33 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
-  if [ "$state" = paused ]; then printf 'paused'; return; fi
   src=${line#*source: }; src=${src%% *}
-  if [ "$state" = working ]; then
-    case "$src" in run-step|pane) printf 'working'; return ;; esac
+  if status_is_paused "$declared_pause"; then
+    if [ "$state" = paused ]; then printf 'paused'; return; fi
+    if [ "$state" = "done" ] && [ "$src" = run-step ]; then
+      printf 'paused'
+      return
+    fi
+    if [ "$src" = run-step ]; then
+      printf 'none'
+      return
+    fi
   fi
-  if [ "$state" = "done" ] && [ "$src" = run-step ] && status_is_paused "$declared_pause"; then
-    printf 'paused'
-    return
+  if [ "$state" = paused ]; then printf 'paused'; return; fi
+  if [ "$state" = working ]; then
+    case "$src" in pane) printf 'working'; return ;; esac
   fi
   printf 'none'
 }
 
-# 0 if crewmate <id> shows POSITIVE evidence it is still working (crew_absorb_class
+# 0 if crewmate <id> shows POSITIVE evidence it is still attending (crew_absorb_class
 # reports `working`). This is the "provably working" predicate at the heart of
 # absorb-only-when-provably-working: a no-verb turn-end or stale wake is absorbed
 # ONLY when this returns 0, and SURFACED otherwise (the crewmate may be done, waiting
-# on a decision, or wedged). For stale panes it is checked before trusting the
-# status log so a pre-validation captain-relevant line does not override an active
-# run. See crew_absorb_class for the exact working/paused/none decision.
-crew_is_provably_working() {  # <id>
-  [ "$(crew_absorb_class "$1")" = working ]
+# on a decision, unattended, or wedged). See crew_absorb_class for the exact
+# working/paused/none decision.
+crew_is_provably_working() {  # <id> [status-line]
+  [ "$(crew_absorb_class "$1" "${2:-}")" = working ]
 }
 
 # 0 if crewmate <id>'s authoritative current state is a declared external-wait pause.
@@ -371,13 +375,12 @@ crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
 
-# 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
-# working; 1 (actionable/surface) if any is not, or no task can be resolved. Pass the
-# same space-separated file list as signal_reason_is_actionable. Files are mapped to
-# task ids by stripping the .status / .turn-ended suffix; a no-verb wake with nothing
-# provably working must surface, so an empty/unresolvable list returns 1.
-signal_crew_provably_working() {  # <file> ...
-  local f base task seen=""
+# Classify all tasks referenced by a no-verb signal in one token. A turn-ended
+# marker makes a working task actionable because the owner has ended its turn;
+# a real external pause remains safely paused only when no active or parked run
+# contradicts it. Prints working, paused, or none.
+signal_crew_absorb_class() {  # <file> ...
+  local f other base other_base task seen="" state_dir last class saw_paused=0 turn_ended
   for f in "$@"; do
     base=${f##*/}
     case "$base" in
@@ -388,10 +391,41 @@ signal_crew_provably_working() {  # <file> ...
     [ -n "$task" ] || continue
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
-    crew_is_provably_working "$task" || return 1
+    state_dir=${f%/*}
+    [ "$state_dir" != "$f" ] || state_dir=${STATE:-${FM_STATE_OVERRIDE:-}}
+    last=$(last_status_line "$state_dir/$task.status")
+    class=$(crew_absorb_class "$task" "$last")
+    turn_ended=0
+    for other in "$@"; do
+      other_base=${other##*/}
+      [ "$other_base" = "$task.turn-ended" ] && { turn_ended=1; break; }
+    done
+    if [ "$turn_ended" = 1 ] && [ "$class" = working ]; then
+      printf 'none'
+      return
+    fi
+    case "$class" in
+      working) ;;
+      paused) saw_paused=1 ;;
+      *) printf 'none'; return ;;
+    esac
   done
-  [ -n "$seen" ] || return 1
-  return 0
+  [ -n "$seen" ] || { printf 'none'; return; }
+  if [ "$saw_paused" = 1 ]; then printf 'paused'; else printf 'working'; fi
+}
+
+# 0 only when every referenced task has positive attendance evidence.
+signal_crew_provably_working() {  # <file> ...
+  [ "$(signal_crew_absorb_class "$@")" = working ]
+}
+
+# 0 when every referenced task is either positively attended or in a genuine
+# external wait with no validation run left unattended.
+signal_crew_safely_absorbable() {  # <file> ...
+  case "$(signal_crew_absorb_class "$@")" in
+    working|paused) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # 0 (terminal/actionable) if a stale window's last status line is

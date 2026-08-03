@@ -1496,11 +1496,8 @@ test_missing_meta() {
 
 # (k) crew_is_provably_working end-to-end over the REAL fm-crew-state.sh (not a
 # canned fake verdict, unlike tests/fm-watch-triage.test.sh's classifier
-# coverage). This is the direct regression pair for the 2026-07-02 herdr
-# incident: a validating crewmate whose bare `axi status` answer belongs to
-# another branch must still be absorbed by the watcher via the runs-list
-# fallback (working), while a crewmate with genuinely no run anywhere and an idle
-# pane must still surface (the safety property the fix must never widen away).
+# coverage). A matching active run remains authoritative current work state, but
+# without independent pane attendance it must not authorize wake absorption.
 test_provably_working_via_runs_list_fallback() {
   reset_fakes
   local d; d=$(new_case provably-working-crossbranch)
@@ -1514,8 +1511,8 @@ test_provably_working_via_runs_list_fallback() {
 EOF
 )"
   PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-provable \
-    || fail "cross-branch attribution via the runs list was not treated as provably working"
-  pass "crew_is_provably_working absorbs a validating crew found only via the runs-list fallback"
+    && fail "cross-branch active run attribution alone was treated as attendance proof"
+  pass "crew_is_provably_working does not absorb from runs-list activity alone"
 }
 
 test_not_provably_working_when_stopped() {

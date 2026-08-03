@@ -3,9 +3,10 @@
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
 # and keeps blocking; it queues and exits only for actionable wakes.
 # The no-verb signal and stale path is absorb-only-when-provably-working: a wake
-# is absorbed only when the crewmate shows POSITIVE evidence it is still working (an
-# actively-running no-mistakes step, or a backend busy signal), and surfaced
-# otherwise, so a crewmate that finishes (or stops and waits) without a current
+# is absorbed only when the crewmate shows POSITIVE attendance evidence from a
+# backend busy signal; an active run alone is surfaced because it does not prove
+# that its owner is still attending it, so a crewmate that finishes (or stops and
+# waits) without a current
 # working signal is never silently swallowed. A declared external-wait pause is
 # the separate idle absorb case and re-surfaces only on its long bounded cadence,
 # although its initial no-verb status signal still surfaces in normal mode.
@@ -140,10 +141,10 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # and ABSORBS the benign majority - it advances the suppression marker, logs to a
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
-# while the crewmate shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crewmate that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
+# while the crewmate shows positive evidence it is still attending through a busy
+# pane, via crew_is_provably_working over
+# fm-crew-state.sh); a crewmate that stopped its turn with no busy pane is
+# SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
 # signal, a no-verb signal whose crewmate is not provably working, any check, a stale
 # pane whose crewmate is not provably working, a provably-working stale past the
@@ -421,10 +422,6 @@ pause_state_class() {  # <window> <task>
   if ! status_is_paused "$last"; then
     rm -f "$recheck_file"
     crew_absorb_class "$task"
-    return
-  fi
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
-    printf 'paused'
     return
   fi
   class=$(crew_absorb_class "$task" "$last")
@@ -885,16 +882,14 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task key h reason last
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    # The durable status is the trusted gate on this native edge. Commit the
-    # handled transition, then enter the shared pause path so it owns the marker
-    # and bounded re-surface cadence even when no auxiliary crew-state read exists.
+  last=$(last_status_line "$STATE/$task.status")
+  if status_is_paused "$last" && [ "$(crew_absorb_class "$task" "$last")" = paused ]; then
     key=$(printf '%s' "$window" | tr ':/.' '___')
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
@@ -1122,6 +1117,7 @@ EOF
           ;;
         *)
           clear_pause_tracking "$w"
+          surface_nonterminal_stale "$w" "$h"
           ;;
       esac
     fi

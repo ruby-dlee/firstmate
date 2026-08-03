@@ -14,12 +14,13 @@ They also include recognized mid-run Claude or Codex permission prompts and busy
 The permission-prompt matcher and the explicitly heuristic macOS system-dialog fallback are detailed in [permission-stall-detection.md](permission-stall-detection.md).
 Repeated unchanged wedge or permission-stall escalations add an escalation count to the wake reason and, at `FM_WEDGE_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
-No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crewmate is still working: an actively running no-mistakes step for that crewmate's branch or a backend busy signature.
-A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
+No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive attendance evidence from a backend busy signature.
+An active no-mistakes run records work state but does not prove that its owner is attending it, and a turn-ended owner with only that evidence surfaces immediately.
+A crewmate that declares `paused:` for a known external wait is separately absorbed while idle only when no active or parked validation contradicts the pause, and is re-surfaced on the longer pause cadence rather than being treated as a possible wedge.
 For stale-pane triage only, that durable declaration also explains the expected idle pane after a matching no-mistakes run has reached current-state `done`; active and failed runs retain normal run-step precedence, and stopped crewmates without a declared pause surface immediately.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
-Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
+Fresh stale panes use the same current-state read before trusting the status log, so positive pane attendance outranks an old captain-relevant status-log line left behind before validation while an unattended or unverified active run surfaces.
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.

@@ -182,8 +182,8 @@ test_managed_tmux_window_id_reverse_mapping() {
 }
 
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
-# benign (absorb) ONLY when fm-crew-state.sh reports the crewmate as working from an
-# actively-running pipeline step (source run-step) or a busy pane (source pane);
+# benign (absorb) ONLY when fm-crew-state.sh reports positive attendance from a
+# busy pane (source pane); an active run-step alone is work state, not attendance.
 # everything else - a stale working: status-log line, a finished/parked/failed run,
 # an unknown/torn-down crewmate, or an empty id - is NOT provable, so it surfaces. The
 # fake fm-crew-state.sh (FM_CREW_STATE_BIN) returns a canned verdict per case.
@@ -196,7 +196,7 @@ test_crew_is_provably_working_classifier() {
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
-  crew_is_provably_working a || fail "active run-step not treated as provably working"
+  ! crew_is_provably_working a || fail "active run-step alone was treated as attendance proof"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   crew_is_provably_working a || fail "busy pane not treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
@@ -212,7 +212,7 @@ test_crew_is_provably_working_classifier() {
   FM_FAKE_CREW_STATE='state: working · source: run-step · x'
   ! crew_is_provably_working "" || fail "empty id treated as provably working"
   unset FM_FAKE_CREW_STATE
-  pass "crew_is_provably_working: only working+run-step/pane is provable; idle/finished/parked/failed/unknown surface"
+  pass "crew_is_provably_working: only positive pane attendance absorbs; run-only and uncertain states surface"
 }
 
 # status_is_paused: the shared pause verb test both consumers read (so neither
@@ -320,7 +320,7 @@ test_failure_pause_is_failure_classifier() {
 }
 
 # crew_absorb_class: the single fm-crew-state.sh read that returns BOTH absorb
-# reasons - working (active run/busy pane), paused (declared external wait), or none
+# reasons - working (busy pane), paused (declared external wait), or none
 # (surface it) - so the watcher's stale path gets both for one bounded call.
 # crew_is_paused delegates to it exactly as crew_is_provably_working does.
 test_crew_absorb_class_classifier() {
@@ -329,7 +329,9 @@ test_crew_absorb_class_classifier() {
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
-  [ "$(crew_absorb_class a)" = working ] || fail "active run-step not classed working"
+  [ "$(crew_absorb_class a)" = none ] || fail "active run-step alone was classed absorbable"
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
+    || fail "active run-step was absorbed behind a declared pause"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   [ "$(crew_absorb_class a)" = working ] || fail "busy pane not classed working"
   FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting upstream'
@@ -343,6 +345,9 @@ test_crew_absorb_class_classifier() {
   FM_FAKE_CREW_STATE='state: failed · source: run-step · validation failed'
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
     || fail "failed run-step was absorbed behind a declared pause"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review'
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
+    || fail "parked run-step was absorbed behind a declared pause"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   [ "$(crew_absorb_class a)" = none ] || fail "stale working: status-log classed absorbable"
   FM_FAKE_CREW_STATE='state: unknown · source: none · worktree gone'
@@ -360,10 +365,16 @@ test_signal_crew_provably_working_classifier() {
   local dir fakebin state
   dir=$(make_case signal-provably-working); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
-  export FM_FAKE_CREW_STATE_a='state: working · source: run-step · running'
+  printf 'working: compiling\n' > "$state/a.status"
+  : > "$state/a.turn-ended"
+  printf 'paused: awaiting upstream\n' > "$state/c.status"
+  export FM_FAKE_CREW_STATE_a='state: working · source: pane · harness busy'
   export FM_FAKE_CREW_STATE_b='state: done · source: run-step · run passed'
-  signal_crew_provably_working "$state/a.status" "$state/a.turn-ended" \
-    || fail "a single provably-working crew (status+turn-end) was not benign"
+  export FM_FAKE_CREW_STATE_c='state: paused · source: status-log · awaiting upstream'
+  signal_crew_provably_working "$state/a.status" \
+    || fail "a positively attended working signal was not benign"
+  ! signal_crew_provably_working "$state/a.status" "$state/a.turn-ended" \
+    || fail "a turn-ended crew was treated as attended from its stale busy verdict"
   ! signal_crew_provably_working "$state/a.status" "$state/b.turn-ended" \
     || fail "a coalesced batch including a stopped crew was treated as benign"
   ! signal_crew_provably_working "$state/b.turn-ended" \
@@ -372,8 +383,10 @@ test_signal_crew_provably_working_classifier() {
     || fail "a non-signal file resolved to a benign verdict"
   ! signal_crew_provably_working \
     || fail "an empty signal file list was treated as benign"
-  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b
-  pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
+  signal_crew_safely_absorbable "$state/c.status" \
+    || fail "a genuine external pause was not safely absorbable by away mode"
+  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b FM_FAKE_CREW_STATE_c
+  pass "signal classification requires attendance, surfaces turn-end, and preserves genuine external pauses"
 }
 
 # --- benign wakes are absorbed ONLY when the crewmate is provably working -----
@@ -383,10 +396,8 @@ test_provably_working_signal_absorbed() {
   dir=$(make_case provably-working-signal); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
-  # The crewmate's pipeline is in an actively-running step: positive evidence it is
-  # still working, so a no-verb working: signal is absorbed (the original low-churn
-  # case during a long validation).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  # The busy pane is positive attendance evidence, so the working signal is benign.
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -400,22 +411,22 @@ test_provably_working_signal_absorbed() {
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
 }
 
-test_turn_ended_provably_working_absorbed() {
-  local dir state fakebin out pid
-  dir=$(make_case turn-ended-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+test_paused_active_run_turn_end_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case paused-active-run-turn-ended); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  printf 'paused: awaiting upstream\n' > "$state/task.status"
   : > "$state/task.turn-ended"
-  # A busy pane is the second form of positive evidence (covers a queued
-  # continuation right after the turn-end).
-  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a turn-end whose crew is provably working (should absorb): $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || fail "provably-working turn-end printed a wake reason: $(cat "$out")"
-  [ ! -s "$state/.wake-queue" ] || fail "provably-working turn-end enqueued a durable wake record"
-  reap "$pid"
-  pass "a bare turn-end whose crew is provably working (busy pane) is absorbed"
+  wait_for_exit "$pid" 40 || fail "watcher absorbed a paused active run after its owner ended the turn"
+  grep -F "signal:" "$out" | grep -F "$state/task.turn-ended" >/dev/null \
+    || fail "paused active-run turn-end did not surface as a signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after paused active-run turn-end failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/task.turn-ended" >/dev/null \
+    || fail "paused active-run turn-end was not queued"
+  pass "start run, append paused, end turn surfaces as unattended validation"
 }
 
 # --- a no-verb signal whose crewmate is NOT provably working SURFACES ---------
@@ -810,7 +821,7 @@ test_stale_terminal_status_overridden_by_active_run() {
   pane_hash=$(hash_text "no-mistakes axi run: validating...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
 
   # Phase A: a high escalation threshold means the first sighting is absorbed,
   # not surfaced, despite the captain-relevant "done:" status-log line.
@@ -864,7 +875,7 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
   # The crewmate's pipeline is actively running: a static pane is normal (waiting on CI).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
 
   # Phase A: a high escalation threshold means the first sighting is absorbed.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -1285,7 +1296,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
 
   printf 'working: upstream landed, resuming\n' > "$state/transition.status"
   sig=$(seen_sig "$state/transition.status"); printf '%s' "$sig" > "$state/.seen-transition_status"
-  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -1302,9 +1313,9 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
 }
 
 test_nonterminal_paused_rechecks_authoritative_state() {
-  local dir state fakebin out capture_file window key pane_hash sig pid
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
   dir=$(make_case nonterminal-paused-recheck); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-pause-recheck"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"; window="test:fm-pause-recheck"
   printf 'idle awaiting external\n' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/pause-recheck.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/pause-recheck.status"
@@ -1321,14 +1332,15 @@ test_nonterminal_paused_rechecks_authoritative_state() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "an active run behind a declared pause surfaced instead of resuming wedge tracking: $(cat "$out")"
-  fi
+  wait_for_exit "$pid" 40 || fail "an active run behind a declared pause was absorbed"
+  grep -F "stale: $window" "$out" >/dev/null || fail "paused active-run stale did not surface"
   [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "authoritative active run retained paused mode"; }
-  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "authoritative active run did not resume wedge tracking"; }
-  reap "$pid"
+  [ ! -e "$state/.stale-since-$key" ] || fail "unattended active run started a wedge timer instead of surfacing"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after paused active-run stale failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null \
+    || fail "paused active-run stale was not queued"
   unset FM_FAKE_CREW_STATE
-  pass "a declared pause is periodically rechecked against authoritative active-run state"
+  pass "a declared pause cannot absorb an active validation run"
 }
 
 test_paused_authoritative_working_preserves_wedge_timer() {
@@ -1345,7 +1357,7 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '1\n' > "$state/.count-$key"
   : > "$state/.paused-$key"
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -1396,7 +1408,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
   # The crewmate's pipeline is actively running: a static pane is normal (waiting on CI).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
 
   # Priming round: first sighting of this stale hash classifies and absorbs it
   # (establishing .stale-$key and starting the wedge timer) without going
@@ -1450,7 +1462,7 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   printf '1\n' > "$state/.count-$key"
   # Pre-seed one escalation as if a prior wedge round already fired.
   printf '1\n' > "$state/.wedge-escalations-$key"
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
 
   # The pane content changes (the crewmate is active again): the hash no longer
   # matches, so the watcher resets escalation bookkeeping instead of escalating.
@@ -1533,7 +1545,7 @@ SH
   printf 'working: compiling step 2\n' > "$status_file"
   # Provably working so the no-verb signal is absorbed (which is what writes the
   # triage log line under test).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_WATCH_TRIAGE_LOG_MAX_BYTES=1 "$WATCH" > "$out" &
   pid=$!
@@ -1603,7 +1615,7 @@ test_beacon_stays_fresh_while_absorbing() {
   printf 'working: a\n' > "$status_file"
   # Provably working so the working: notes are absorbed (the path that must keep the
   # beacon fresh).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_live "$pid" 15 || { reap "$pid"; fail "watcher exited while absorbing the first benign signal"; }
@@ -1636,7 +1648,7 @@ test_afk_present_reverts_watcher_to_one_shot() {
   # Set a PROVABLY-WORKING verdict: if afk failed to bypass the provably-working
   # check, this no-verb signal would be absorbed (not surfaced). The test asserting
   # a surface therefore also proves afk reverts to one-shot and skips the costly read.
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_for_exit "$pid" 40 || fail "with .afk present the watcher did not exit one-shot for a benign signal"
@@ -1856,7 +1868,7 @@ test_failure_pause_is_failure_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
 test_provably_working_signal_absorbed
-test_turn_ended_provably_working_absorbed
+test_paused_active_run_turn_end_surfaces
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced

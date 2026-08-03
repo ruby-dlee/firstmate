@@ -365,9 +365,11 @@ land_on_origin_main() {
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<SH
 #!/usr/bin/env bash
-case "${1:-} ${2:-}" in
+case "\${1:-} \${2:-}" in
+  "api /repos/example/repo/pulls/7")
+    printf '%s\n' 'head:' '  sha: $head' 'base:' '  sha: 0000000000000000000000000000000000000000' ; exit 0 ;;
   "pr list")
     printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
   "pr view")
@@ -1070,13 +1072,13 @@ test_pr_check_serializes_with_account_session_updates() {
   url=https://github.com/example/repo/pull/7
   head=deadbeefcafefeed0000000000000000deadbeef
   write_meta "$case_dir" no-mistakes ship
-  cat > "$case_dir/fakebin/gh" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 touch "$FM_TEST_LOOKUP_READY"
 while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
-printf '%s\n' "$FM_TEST_PR_HEAD"
+printf '%s\n' 'head:' "  sha: $FM_TEST_PR_HEAD" 'base:' '  sha: 0000000000000000000000000000000000000000'
 SH
-  chmod +x "$case_dir/fakebin/gh"
+  chmod +x "$case_dir/fakebin/gh-axi"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
   FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
@@ -1111,13 +1113,13 @@ test_pr_check_rejects_reused_task_generation() {
   head=deadbeefcafefeed0000000000000000deadbeef
   staged="$state/.task-x1.meta.reused"
   write_meta "$case_dir" no-mistakes ship
-  cat > "$case_dir/fakebin/gh" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 touch "$FM_TEST_LOOKUP_READY"
 while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
-printf '%s\n' "$FM_TEST_PR_HEAD"
+printf '%s\n' 'head:' "  sha: $FM_TEST_PR_HEAD" 'base:' '  sha: 0000000000000000000000000000000000000000'
 SH
-  chmod +x "$case_dir/fakebin/gh"
+  chmod +x "$case_dir/fakebin/gh-axi"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
   FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
@@ -1156,11 +1158,11 @@ test_pr_check_backfills_legacy_generation_and_records_state() {
   write_meta "$case_dir" no-mistakes ship
   grep -v '^generation_id=' "$meta" > "$staged"
   mv "$staged" "$meta"
-  cat > "$case_dir/fakebin/gh" <<SH
+  cat > "$case_dir/fakebin/gh-axi" <<SH
 #!/usr/bin/env bash
-printf '%s\n' '$head'
+printf '%s\n' 'head:' '  sha: $head' 'base:' '  sha: 0000000000000000000000000000000000000000'
 SH
-  chmod +x "$case_dir/fakebin/gh"
+  chmod +x "$case_dir/fakebin/gh-axi"
 
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" >/dev/null \
@@ -1171,7 +1173,7 @@ SH
   expect_code 1 "$count" "successful legacy PR generation backfill count"
   assert_grep "pr=$url" "$meta" "successful legacy PR check did not record the PR URL"
   assert_grep "pr_head=$head" "$meta" "successful legacy PR check did not record the PR head"
-  assert_present "$state/task-x1.check.sh" "successful legacy PR check did not arm the merge poll"
+  assert_absent "$state/task-x1.check.sh" "successful legacy PR check armed a merge poll"
   pass "fm-pr-check upgrades legacy task metadata without breaking PR handling"
 }
 
@@ -1186,13 +1188,13 @@ test_pr_check_backfills_legacy_generation_before_race_check() {
   write_meta "$case_dir" no-mistakes ship
   grep -v '^generation_id=' "$meta" > "$staged"
   mv "$staged" "$meta"
-  cat > "$case_dir/fakebin/gh" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 touch "$FM_TEST_LOOKUP_READY"
 while [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do sleep 0.05; done
-printf '%s\n' "$FM_TEST_PR_HEAD"
+printf '%s\n' 'head:' "  sha: $FM_TEST_PR_HEAD" 'base:' '  sha: 0000000000000000000000000000000000000000'
 SH
-  chmod +x "$case_dir/fakebin/gh"
+  chmod +x "$case_dir/fakebin/gh-axi"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" \
   FM_TEST_LOOKUP_READY="$lookup_ready" FM_TEST_LOOKUP_RELEASE="$lookup_release" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \

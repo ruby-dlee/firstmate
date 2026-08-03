@@ -188,12 +188,16 @@ The optional declared `claude-crew-last-resort` pool is checked only after no us
 Because Claude account identity is not machine-readable per directory, pool membership is the only ownership policy: the selector never infers an account from `.claude.json`, a hidden quota identity, or the nondiscriminating Keychain account label.
 A profile assigned only to `claude-manual` remains a hard exclusion; declaring last-resort behavior requires adding the separate last-resort pool deliberately.
 They invoke Herdr's own integration installer against the selected profile directory and verify its per-profile hook file before launching.
-Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates, logs in, or invokes a model.
+Account credentials remain captain-owned and read-only to Firstmate; selection never authenticates or logs in.
 
-Codex health and usage are genuinely readable per account.
-Every selection performs a fresh per-account quota read instead of trusting a prior cache, and a Codex directory with no fresh general usage window is skipped.
-This means an account re-authenticated immediately before spawn is eligible on that spawn.
-Fresh quota is an opportunistic ranking layer: the highest minimum remaining percentage wins, exact best-score ties rotate, and if every eligible account's signal is unavailable the selector explicitly rotates across the whole eligible set.
+Codex quota telemetry is not an account-capacity predicate: measured fixtures reported positive capacity for exhausted accounts and zero or exclusion for other unusable accounts.
+That wrong-in-both-directions evidence makes the signal permanently contested rather than merely stale, so it is never used to route or refuse and every expired proof falls back to codex's own completion probe.
+Direct Codex selection therefore ignores that telemetry and requires codex itself to complete a tiny ephemeral `gpt-5.6-sol`/`xhigh` sentinel prompt under each exact account home.
+A positive completion proof is cached for 30 minutes, so a healthy account consumes at most two tiny probes per hour regardless of spawn frequency; failed or unavailable probes are cached for one minute.
+These are bounded freshness windows, not a claim that capacity cannot change inside them: a newly exhausted account can still refuse a launch, but the explicit account config and launch flags make that refusal loud instead of silently degrading the model.
+A missing CLI, timeout, nonzero refusal, authentication failure, or malformed completion excludes that account, and no positively proved account makes selection fail closed rather than rotate through unproved capacity.
+Pane activity and no-mistakes run progress never contribute to capacity because a pipeline can remain active after its agent account is exhausted.
+Accounts carrying current positive proofs rotate under the same serialized cursor.
 Claude's config-directory-specific macOS Keychain credential is not currently distinguishable through non-interactive quota reads.
 For candidates with prior Keychain approval, Claude treats missing quota as unreadable rather than unhealthy, rotates across eligible accounts in stable bytewise order, and prints a loud `CLAUDE USAGE UNREADABLE` note explaining that keychain/quota-read gap.
 The rotation cursor is persisted under the passwd user's `.local/state/firstmate/account-directory/` and guarded by an advisory lock, so concurrent selectors spread across the same deterministic candidate sequence instead of racing to its first element.
@@ -222,7 +226,7 @@ That compatibility path is recovery-only for ordinary crewmates and is not used 
 Secondmate launches continue to create and recover legacy Agent Fleet managed generations until their dedicated direct-account integration is designed.
 Bootstrap requires Agent Fleet for direct worker-pool eligibility, for enforced secondmate routing, and when legacy `account_profile=` or pending rollback metadata exists.
 New direct ship/scout routing also requires `jq`, `quota-axi`, and Herdr's integration installer.
-Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, uses `lease recover` rather than new-task quota selection, resumes the recorded provider session without replaying the brief as a new prompt, and requires a higher monotonic `session_event_seq` from a SessionStart accepted after its local launch gate before committing the recovered lease.
+Same-profile recovery is sticky and fail-closed: `bin/fm-spawn.sh <id> --resume-account` validates existing task metadata and Agent Fleet's session mapping, re-resolves current harness policy and refuses if it no longer equals the recorded provider, uses `lease recover` rather than new-task quota selection, resumes the provider session without replaying the brief as a new prompt, and requires a higher monotonic `session_event_seq` from a SessionStart accepted after its local launch gate before committing the recovered lease.
 Wall-clock `updated_at` remains diagnostic only and never decides launch freshness.
 Schema-1 mappings remain readable as virtual sequence zero; the next same-binding SessionStart atomically migrates them to schema 2 / sequence 1, while a changed binding is rejected without modifying the legacy record.
 The per-task lifecycle lock serializes concurrent managed recovery attempts, and a waiter re-reads the committed metadata generation after acquiring ownership before it acts.
@@ -273,7 +277,10 @@ Account pool and profile fields are valid only for `claude` and `codex`, and sel
 `select` is optional and currently supports `quota-balanced`.
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback.
 `default` is optional.
-An omitted model or effort means the selected harness uses its own default for that axis.
+An omitted model or effort means the selected harness uses its own default for that axis, except Codex, whose spawn backstop resolves omissions to and admits only `gpt-5.6-sol` with `xhigh` effort.
+Bootstrap rejects every configured Codex profile that does not name both exact axes.
+Recovery re-resolves the current harness plus the Codex axes rather than replaying task metadata; when natural-language dispatch rules are active, it refuses unless the freshly selected concrete harness is passed explicitly.
+Changing an account config does not retroactively repair an already substituted session; the harness-owned runtime record is checked after a new task generation starts and periodically, and a mismatched live session must be relaunched.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 `quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
 Any quota-balanced candidate carrying `account_profile` remains invalid for compatibility, and pool-aware candidates must all carry `account_pool`.
@@ -577,10 +584,11 @@ FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watche
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # status regex that makes watcher and daemon signal/stale/scan output captain-relevant
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
-FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stale panes whose crewmate is not provably working surface immediately unless they declare the pause verb
+FM_STALE_ESCALATE_SECS=240         # minimum seconds before the repository-derived run-process recheck cadence; never a wedge verdict by itself
+FM_RUNTIME_PROFILE_INTERVAL=300    # seconds between harness-owned Codex runtime profile checks
 FM_PERMISSION_STALL_ESCALATE_SECS=900 # busy seconds without meaningful pane/status/turn-end progress before a possible macOS permission/system-dialog block surfaces; timeout heuristic, not direct OS detection
 FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a recheck in the watcher or away-mode daemon
-FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive unchanged wedge or permission-stall escalations before demand-deep-inspection is added
+FM_PERMISSION_DEMAND_INSPECT_COUNT=3 # consecutive permission-stall escalations before demand-deep-inspection is added
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone

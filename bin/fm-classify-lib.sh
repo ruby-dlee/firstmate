@@ -30,6 +30,7 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
+FM_RUN_LIVENESS_BIN="${FM_RUN_LIVENESS_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-run-liveness.sh}"
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -318,6 +319,8 @@ signal_reason_is_actionable() {  # <file> ...
 #   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
 #             pane; the crewmate is legitimately mid-work on a static-looking pane
 #             (e.g. waiting on CI);
+#   unknown - the run remained recorded running but a complete process window
+#             contained no positive sample; absence does not prove death;
 #   paused  - the crewmate's authoritative current state is a declared external-wait
 #             pause (paused:), or stale-pane triage supplied that durable pause
 #             alongside a finished run-step, so the pane is EXPECTED to idle;
@@ -336,7 +339,7 @@ signal_reason_is_actionable() {  # <file> ...
 # stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src
+  local id=$1 declared_pause=${2:-} line state src run_rc
   [ -n "$id" ] || { printf 'none'; return; }
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
@@ -344,7 +347,21 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
   if [ "$state" = paused ]; then printf 'paused'; return; fi
   src=${line#*source: }; src=${src%% *}
   if [ "$state" = working ]; then
-    case "$src" in run-step|pane) printf 'working'; return ;; esac
+    case "$src" in
+      run-step)
+        # A run status is a record, not liveness evidence.
+        # The asymmetric process window owns this transition: any run-owned
+        # process sample is alive, while an all-zero complete window is UNKNOWN,
+        # never proof that the run is dead or wedged.
+        "$FM_RUN_LIVENESS_BIN" "$id" >/dev/null 2>&1
+        run_rc=$?
+        case "$run_rc" in
+          0) printf 'working'; return ;;
+          1) printf 'unknown'; return ;;
+        esac
+        ;;
+      pane) printf 'working'; return ;;
+    esac
   fi
   if [ "$state" = "done" ] && [ "$src" = run-step ] && status_is_paused "$declared_pause"; then
     printf 'paused'
@@ -357,9 +374,9 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
 # reports `working`). This is the "provably working" predicate at the heart of
 # absorb-only-when-provably-working: a no-verb turn-end or stale wake is absorbed
 # ONLY when this returns 0, and SURFACED otherwise (the crewmate may be done, waiting
-# on a decision, or wedged). For stale panes it is checked before trusting the
+# on a decision, or has unknown liveness). For stale panes it is checked before trusting the
 # status log so a pre-validation captain-relevant line does not override an active
-# run. See crew_absorb_class for the exact working/paused/none decision.
+# run. See crew_absorb_class for the exact working/unknown/paused/none decision.
 crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }

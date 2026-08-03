@@ -40,10 +40,11 @@
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
-#   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
-#     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
+#   - Evidence-gated wedge latency: a stale pane without a declared external
+#     wait is rechecked after the larger of STALE_ESCALATE_SECS and one quarter
+#     of this repository's recent median test duration. A recorded running step
+#     remains absorbable only after a positive run-owned process sample; an
+#     all-zero complete window surfaces UNKNOWN rather than death. A declared pause instead
 #     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
@@ -87,8 +88,9 @@
 #                                   disables. Use sparingly: it overrides the
 #                                   captain-relevant escalation for matching
 #                                   kinds.
-#          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
-#                                   as a possible wedge (default 240)
+#          FM_STALE_ESCALATE_SECS   minimum idle seconds before a stale pane is
+#                                   process-window rechecked (default 240; a
+#                                   repository test-duration baseline can raise it)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
@@ -931,8 +933,10 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
-#  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
-#     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
+#  2) stale recheck: for each pending stale marker past its repository-derived
+#     cadence, re-peek the pane and repeat the run-owned process window. Any
+#     positive sample resets the timer; an all-zero complete window (or no
+#     positive working evidence for a stopped task) surfaces UNKNOWN.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
 #     re-peek; busy/gone -> clear; still idle + still paused -> escalate a recheck
 #     digest and reset the window (repeating bounded re-surface, never a wedge).
@@ -940,6 +944,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local cache baseline threshold class evidence
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -994,13 +999,39 @@ housekeeping() {  # <state>
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
-    [ "$age" -ge "${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}" ] || continue
+    cache="$state/.run-liveness-$task"
+    baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
+    threshold=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}
+    case "$baseline" in
+      ''|*[!0-9]*) ;;
+      *)
+        due=$((baseline / 4))
+        [ "$due" -gt "$threshold" ] && threshold=$due
+        ;;
+    esac
+    [ "$age" -ge "$threshold" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
       0) rm -f "$marker" ;;
       2) rm -f "$marker" ;;
-      *) escalate_add "$state" "stale persisted ${age}s (possible wedge): $win"
-         stale_marker_remove "$win" "$state" ;;
+      *)
+        class=$(crew_absorb_class "$task")
+        evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
+        case "$class" in
+          working)
+            _now > "$marker"
+            log "self-handle: stale process window remained alive for $win ($evidence; next repository-derived cadence ${threshold}s)"
+            ;;
+          paused)
+            stale_marker_remove "$win" "$state"
+            pause_marker_record "$win" "$state"
+            ;;
+          *)
+            escalate_add "$state" "stale process-window liveness UNKNOWN after ${age}s; no death proof: $win ($evidence)"
+            stale_marker_remove "$win" "$state"
+            ;;
+        esac
+        ;;
     esac
   done
 

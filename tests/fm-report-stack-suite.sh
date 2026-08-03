@@ -2322,7 +2322,9 @@ fs.writeFileSync(
 if (indexMode === "corrupt") {
   fs.writeFileSync(path.join(stack, "index.html"), "corrupt index authority\n");
 } else {
-  const authority = { ...policy, generation: indexMode === "stale" ? "stale-fixture" : policy.generation };
+  const authority = { ...policy };
+  if (indexMode === "stale") authority.generation = "stale-fixture";
+  if (indexMode === "cutoff") authority.cutoffMs += 1;
   fs.writeFileSync(
     path.join(stack, "index.html"),
     `<!-- firstmate-retention ${JSON.stringify(authority)} -->\nexisting index\n`,
@@ -2334,16 +2336,20 @@ NODE
 test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
   local fixture="$TMP_ROOT/retention-noop-fixture" baseline_stack="$TMP_ROOT/retention-noop-baseline-stack"
   local target_stack="$TMP_ROOT/retention-noop-target-stack" stale_stack="$TMP_ROOT/retention-noop-stale-stack"
-  local corrupt_stack="$TMP_ROOT/retention-noop-corrupt-stack" baseline_root="$TMP_ROOT/retention-noop-baseline"
+  local cutoff_stack="$TMP_ROOT/retention-noop-cutoff-stack" corrupt_stack="$TMP_ROOT/retention-noop-corrupt-stack"
+  local cutoff_mutant_stack="$TMP_ROOT/retention-noop-cutoff-mutant-stack"
+  local baseline_root="$TMP_ROOT/retention-noop-baseline" cutoff_mutant_root="$TMP_ROOT/retention-noop-cutoff-mutant"
   local helper="$TMP_ROOT/retention-helper-counter" baseline_log="$TMP_ROOT/retention-baseline-helper.log"
   local target_log="$TMP_ROOT/retention-target-helper.log" base=68f014697d0eea733a4e7c0294becff4e76c7bcf
   local baseline_start baseline_end baseline_ms target_start target_end target_ms baseline_helpers target_helpers
-  local output observed_reports observed_cohorts stack status
+  local mutant_output output observed_reports observed_cohorts stack status
 
   write_retention_scale_fixture "$fixture" 955 656 valid
   cp -R "$fixture" "$baseline_stack"
   cp -R "$fixture" "$target_stack"
   write_retention_scale_fixture "$stale_stack" 1 1 stale
+  write_retention_scale_fixture "$cutoff_stack" 1 1 cutoff
+  cp -R "$cutoff_stack" "$cutoff_mutant_stack"
   write_retention_scale_fixture "$corrupt_stack" 1 1 corrupt
   mkdir -p "$baseline_root/bin"
   git -C "$ROOT" show "$base:bin/fm-report-stack.mjs" > "$baseline_root/bin/fm-report-stack.mjs" \
@@ -2353,6 +2359,18 @@ test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
   git -C "$ROOT" show "$base:bin/fm-markdown-structure.cjs" > "$baseline_root/bin/fm-markdown-structure.cjs" \
     || fail "could not materialize the baseline markdown parser"
   chmod +x "$baseline_root/bin/fm-report-stack.mjs" "$baseline_root/bin/fm-contained-read.py"
+  mkdir -p "$cutoff_mutant_root/bin"
+  cp "$ROOT/bin/fm-contained-read.py" "$cutoff_mutant_root/bin/fm-contained-read.py"
+  cp "$ROOT/bin/fm-markdown-structure.cjs" "$cutoff_mutant_root/bin/fm-markdown-structure.cjs"
+  node - "$SCRIPT" "$cutoff_mutant_root/bin/fm-report-stack.mjs" <<'NODE'
+const fs = require("fs");
+const [sourceFile, destinationFile] = process.argv.slice(2);
+const source = fs.readFileSync(sourceFile, "utf8");
+const comparison = "indexAuthority.generation !== policy.generation || indexAuthority.cutoffMs !== policy.cutoffMs";
+if (source.split(comparison).length !== 2) throw new Error("could not isolate the cutoff-authority comparison");
+fs.writeFileSync(destinationFile, source.replace(comparison, "indexAuthority.generation !== policy.generation"));
+NODE
+  chmod +x "$cutoff_mutant_root/bin/fm-report-stack.mjs" "$cutoff_mutant_root/bin/fm-contained-read.py"
   cat > "$helper" <<'SH'
 #!/bin/sh
 printf 'helper\n' >> "$FM_REPORT_HELPER_LOG"
@@ -2383,6 +2401,7 @@ SH
   baseline_helpers=$(wc -l < "$baseline_log" | tr -d ' ')
   target_helpers=$(wc -l < "$target_log" | tr -d ' ')
   assert_contains "$output" '"reason":"no-work"' "scaled no-op retention was not classified as no work"
+  assert_contains "$output" '"admitted":false' "valid matching index authority did not take the no-work path"
   [ "$target_helpers" -eq 0 ] || fail "scaled no-op retention launched $target_helpers contained helper processes"
   [ "$baseline_helpers" -ge 955 ] \
     || fail "baseline helper-process evidence observed only $baseline_helpers launches for 955 reports"
@@ -2391,7 +2410,7 @@ SH
   [ "$observed_reports" -eq 955 ] || fail "scaled no-op fixture contained $observed_reports reports instead of 955"
   [ "$observed_cohorts" -eq 656 ] || fail "scaled no-op fixture contained $observed_cohorts cohorts instead of 656"
 
-  for stack in "$stale_stack" "$corrupt_stack"; do
+  for stack in "$stale_stack" "$cutoff_stack" "$corrupt_stack"; do
     if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
       FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
     [ "$status" -ne 0 ] || fail "invalid index authority was accepted as a no-op at $stack"
@@ -2400,17 +2419,24 @@ SH
     assert_present "$stack/.retention-attempt.json" "invalid index authority was not admitted before repair"
   done
 
+  mutant_output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$cutoff_mutant_stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$cutoff_mutant_root/bin/fm-report-stack.mjs" prune --status) \
+    || fail "cutoff-comparison mutant unexpectedly reached the publication lock"
+  assert_contains "$mutant_output" '"reason":"no-work"' \
+    "deleting the cutoff comparison did not disable the cutoff-only authority guard"
+
   pass "retention benchmark: base ${baseline_ms}ms/${baseline_helpers} helpers; target ${target_ms}ms/${target_helpers} helpers"
 }
 
 test_retention_admission_bounds_total_fleet_attempts_above_current_population() {
   local stack="$TMP_ROOT/retention-admission-stack" outdir="$TMP_ROOT/retention-admission-output"
+  local homes="$TMP_ROOT/retention-admission-homes"
   local owner_ready="$TMP_ROOT/retention-admission-owner.ready" owner_proceed="$TMP_ROOT/retention-admission-owner.proceed"
   local waiter_ready="$TMP_ROOT/retention-admission-waiter.ready" waiter_proceed="$TMP_ROOT/retention-admission-waiter.proceed"
   local owner_out="$TMP_ROOT/retention-admission-owner.out" owner_pid state extra admitted skipped index status
   local contenders=24
   local -a pids
-  mkdir -p "$stack/entries/cohort-1" "$outdir"
+  mkdir -p "$stack/entries/cohort-1" "$outdir" "$homes"
   mkfifo "$owner_ready" "$owner_proceed" "$waiter_ready" "$waiter_proceed"
   exec 7<>"$owner_ready"
   exec 8<>"$owner_proceed"
@@ -2428,7 +2454,8 @@ test_retention_admission_bounds_total_fleet_attempts_above_current_population() 
   [ "$state" = "lock-acquired" ] || fail "retention admission owner emitted an unexpected state: $state"
 
   for index in $(seq 1 "$contenders"); do
-    FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
+    mkdir -p "$homes/$index/state" "$homes/$index/data"
+    FM_HOME="$homes/$index" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
       FM_REPORT_LOCK_WAITER_TEST_READY="$waiter_ready" FM_REPORT_LOCK_WAITER_TEST_PROCEED="$waiter_proceed" \
       "$SCRIPT" prune --status > "$outdir/$index.out" 2>&1 &
     pids[index]=$!
@@ -2467,6 +2494,8 @@ test_retention_admission_bounds_total_fleet_attempts_above_current_population() 
   skipped=$(grep -l '"admitted":false,"reason":"cadence"' "$outdir"/*.out | wc -l | tr -d ' ')
   [ "$admitted" -eq 1 ] || fail "global admission allowed $admitted of $contenders contenders"
   [ "$skipped" -eq $((contenders - 1)) ] || fail "global admission skipped $skipped of $contenders contenders"
+  [ "$(find "$homes" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" -eq "$contenders" ] \
+    || fail "retention admission fixture did not create $contenders distinct Firstmate homes"
   assert_present "$stack/.retention-attempt.json" "global retention admission did not persist its attempt record"
   exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-
   pass "machine-global admission allows one lock attempt across 24 concurrent homes"
@@ -2544,6 +2573,124 @@ NODE
   assert_contains "$second" '"admitted":false,"reason":"cadence"' \
     "failed retention became eligible again on the next watcher-equivalent loop"
   pass "preflight failures claim admission before lock-scoped validation and cadence"
+}
+
+test_malformed_retention_attempt_is_replaced_before_validation_error() {
+  local stack="$TMP_ROOT/retention-malformed-attempt-stack" mutant_stack="$TMP_ROOT/retention-malformed-attempt-mutant-stack"
+  local mutant_root="$TMP_ROOT/retention-malformed-attempt-mutant" first second mutant_first mutant_second
+  local before_identity after_identity status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'malformed admission\n' > "$stack/.retention-attempt.json"
+  cp -R "$stack" "$mutant_stack"
+  before_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  mkdir -p "$mutant_root/bin"
+  cp "$ROOT/bin/fm-contained-read.py" "$mutant_root/bin/fm-contained-read.py"
+  cp "$ROOT/bin/fm-markdown-structure.cjs" "$mutant_root/bin/fm-markdown-structure.cjs"
+  node - "$SCRIPT" "$mutant_root/bin/fm-report-stack.mjs" <<'NODE'
+const fs = require("fs");
+const [sourceFile, destinationFile] = process.argv.slice(2);
+const source = fs.readFileSync(sourceFile, "utf8");
+const boundary = `        } catch {}
+      }
+
+      try {
+        fs.linkSync(candidateName, retentionAttemptClaimName);`;
+const mutation = `        } catch (error) {
+          throw error;
+        }
+      }
+
+      try {
+        fs.linkSync(candidateName, retentionAttemptClaimName);`;
+if (source.split(boundary).length !== 2) throw new Error("could not isolate malformed-marker admission ordering");
+fs.writeFileSync(destinationFile, source.replace(boundary, mutation));
+NODE
+  chmod +x "$mutant_root/bin/fm-report-stack.mjs" "$mutant_root/bin/fm-contained-read.py"
+
+  if mutant_first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "pre-claim malformed-marker mutation unexpectedly succeeded"
+  assert_contains "$mutant_first" "invalid report retention attempt marker" \
+    "pre-claim malformed-marker mutation did not fail at admission parsing"
+  assert_absent "$mutant_stack/.retention-attempt.claim.json" \
+    "pre-claim malformed-marker mutation unexpectedly installed a durable claim"
+  if mutant_second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "pre-claim malformed-marker mutation was unexpectedly cadence-blocked"
+  assert_contains "$mutant_second" "invalid report retention attempt marker" \
+    "immediate-next-loop guard did not expose the pre-claim malformed-marker mutation"
+
+  if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "malformed retention attempt unexpectedly completed"
+  assert_contains "$first" "invalid report retention attempt marker" \
+    "malformed retention attempt did not surface validation after fresh admission"
+  assert_absent "$stack/.retention-attempt.claim.json" "malformed-marker recovery retained its admission claim"
+  after_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  [ "$after_identity" != "$before_identity" ] \
+    || fail "malformed retention attempt was not quarantined by observed inode identity"
+  node -e '
+    const fs = require("fs");
+    const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs)) process.exit(1);
+  ' "$stack/.retention-attempt.json" \
+    || fail "malformed retention attempt was not replaced by a valid fresh admission"
+
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "fresh admission did not suppress the immediate malformed-marker retry"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "malformed-marker validation failure remained eligible on the immediate next loop"
+  pass "malformed admission markers are inode-quarantined before validation surfaces"
+}
+
+test_retention_invalid_marker_quarantine_is_inode_owned() {
+  local stack="$TMP_ROOT/retention-invalid-marker-race-stack" saved="$TMP_ROOT/retention-invalid-marker-race-saved"
+  local ready="$TMP_ROOT/retention-invalid-marker-race.ready" proceed="$TMP_ROOT/retention-invalid-marker-race.proceed"
+  local output="$TMP_ROOT/retention-invalid-marker-race.out" replacement_identity after_identity state pid status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'observed invalid admission\n' > "$stack/.retention-attempt.json"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_INVALID_MARKER_TEST_READY="$ready" \
+    FM_REPORT_RETENTION_INVALID_MARKER_TEST_PROCEED="$proceed" \
+    "$SCRIPT" prune --status > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "invalid-marker race did not reach inode-owned quarantine: $(cat "$output")"
+  fi
+  [ "$state" = "invalid-marker-observed" ] || fail "invalid-marker race emitted an unexpected state: $state"
+  mv "$stack/.retention-attempt.json" "$saved"
+  node -e '
+    const fs = require("fs");
+    fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() })}\n`);
+  ' "$stack/.retention-attempt.json"
+  replacement_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "invalid-marker inode race did not accept the fresh replacement: $(cat "$output")"
+  assert_grep '"admitted":false,"reason":"cadence"' "$output" \
+    "invalid-marker inode race did not reject the fresh replacement before further mutation"
+  assert_grep "observed invalid admission" "$saved" "invalid-marker quarantine mutated the observed inode after replacement"
+  after_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$stack/.retention-attempt.json"; else stat -c '%d:%i' "$stack/.retention-attempt.json"; fi)
+  [ "$after_identity" = "$replacement_identity" ] \
+    || fail "invalid-marker quarantine removed or replaced the unobserved canonical inode"
+  assert_absent "$stack/.retention-attempt.claim.json" "invalid-marker inode race retained its admission claim"
+  exec 7>&-; exec 8>&-
+  pass "invalid admission quarantine preserves a replacement canonical inode"
 }
 
 test_invalid_retention_configuration_is_admitted_before_validation() {
@@ -4396,6 +4543,8 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
   test_noop_retention_skips_helpers_and_publication_lock_at_scale
   test_retention_admission_bounds_total_fleet_attempts_above_current_population
   test_failed_retention_attempt_is_ineligible_on_the_next_loop
+  test_malformed_retention_attempt_is_replaced_before_validation_error
+  test_retention_invalid_marker_quarantine_is_inode_owned
   test_invalid_retention_configuration_is_admitted_before_validation
   test_retention_admission_and_lock_share_root_generation
   exit 0
@@ -4508,6 +4657,8 @@ run_partitioned_test test_watcher_periodically_owns_idle_report_retention
 run_partitioned_test test_noop_retention_skips_helpers_and_publication_lock_at_scale
 run_partitioned_test test_retention_admission_bounds_total_fleet_attempts_above_current_population
 run_partitioned_test test_failed_retention_attempt_is_ineligible_on_the_next_loop
+run_partitioned_test test_malformed_retention_attempt_is_replaced_before_validation_error
+run_partitioned_test test_retention_invalid_marker_quarantine_is_inode_owned
 run_partitioned_test test_invalid_retention_configuration_is_admitted_before_validation
 run_partitioned_test test_retention_admission_and_lock_share_root_generation
 run_partitioned_test test_retention_batches_make_interruption_safe_progress

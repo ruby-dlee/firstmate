@@ -85,8 +85,11 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
+| `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads and exact-SHA atomic merge responses             |
+| `fm-crosscheck.sh`       | Run or verify the durable independent exact-head PR finding ledger                   |
+| `fm-crosscheck.py`       | Validate and execute crosscheck reviewer evidence and finding lifecycle transitions  |
 | `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
-| `fm-pr-merge.sh`         | Record PR metadata, then merge a task's PR from its full GitHub URL                  |
+| `fm-pr-merge.sh`         | Require exact-head crosscheck, record PR metadata, and atomically merge the reviewed SHA |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |

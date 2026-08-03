@@ -1,0 +1,16 @@
+number: 72
+state: open
+title: "feat: observed contract fixture"
+merged: false
+head:
+  label: "ruby-dlee:fm/example"
+  ref: fm/example
+  sha: c9cbe79154013efcec9aa478f1476d0eff6c63df
+  repo:
+    full_name: ruby-dlee/firstmate
+base:
+  label: "ruby-dlee:main"
+  ref: main
+  sha: 68f014697d0eea733a4e7c0294becff4e76c7bcf
+  repo:
+    full_name: ruby-dlee/firstmate

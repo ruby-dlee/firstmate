@@ -53,10 +53,8 @@ if [ -z "$LOOKUP_GENERATION" ]; then
 fi
 fm_account_meta_lock_release "$META_LOCK"
 if [ -n "$LOOKUP_WT" ] && [ -d "$LOOKUP_WT" ]; then
-  if command -v gh >/dev/null 2>&1; then
-    if REMOTE_HEAD=$(cd "$LOOKUP_WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-      PR_HEAD=$REMOTE_HEAD
-    fi
+  if PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>/dev/null); then
+    PR_HEAD=$PR_HEAD_LOOKUP
   fi
 fi
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
@@ -82,8 +80,10 @@ else
   exit 1
 fi
 CHECK_TMP=$(mktemp "$STATE/.$ID.check.XXXXXX") || exit 1
+printf -v PR_ADAPTER_Q '%q' "$FM_ROOT/bin/fm-github-pr.py"
+printf -v URL_Q '%q' "$URL"
 cat > "$CHECK_TMP" <<EOF
-state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
+state=\$($PR_ADAPTER_Q state $URL_Q 2>/dev/null)
 [ "\$state" = "MERGED" ] && echo "merged"
 EOF
 chmod +x "$CHECK_TMP"

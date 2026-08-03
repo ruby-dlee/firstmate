@@ -32,14 +32,19 @@
 #   fm-lint.sh --required-version print the pinned ShellCheck version and exit
 #                                  (CI reads this to install the exact same one)
 #
-# Exit status is ShellCheck's own on a lint run, so a caller (CI or the gate)
-# fails exactly when ShellCheck reports a finding; a version mismatch or a
-# missing ShellCheck fails before linting with a distinct message.
+# ShellCheck retains analysis state across every root file in one invocation and
+# its memory growth is superlinear, so lint inputs are deliberately capped at
+# one root per process. External-source following preserves the source context
+# supplied by the full canonical list without making every file a root in every
+# process. Every batch runs even when an earlier batch reports a finding, and
+# the first non-zero ShellCheck status is returned after all inputs have been
+# checked. A version mismatch or missing ShellCheck fails before lint.
 set -eu
 
 # The single source of the pinned ShellCheck version. Bump here and CI follows
 # automatically via `--required-version`; the test suite reads it the same way.
 REQUIRED_SHELLCHECK=0.11.0
+SHELLCHECK_BATCH_SIZE=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -67,10 +72,40 @@ if [ "$resolved" != "$REQUIRED_SHELLCHECK" ]; then
   exit 1
 fi
 
+run_shellcheck_batches() {
+  local -a batch=()
+  local path batch_status overall_status=0
+
+  for path in "$@"; do
+    batch+=("$path")
+    if [ "${#batch[@]}" -lt "$SHELLCHECK_BATCH_SIZE" ]; then
+      continue
+    fi
+
+    batch_status=0
+    shellcheck --norc -x "${batch[@]}" || batch_status=$?
+    if [ "$overall_status" -eq 0 ] && [ "$batch_status" -ne 0 ]; then
+      overall_status=$batch_status
+    fi
+    batch=()
+  done
+
+  if [ "${#batch[@]}" -gt 0 ]; then
+    batch_status=0
+    shellcheck --norc -x "${batch[@]}" || batch_status=$?
+    if [ "$overall_status" -eq 0 ] && [ "$batch_status" -ne 0 ]; then
+      overall_status=$batch_status
+    fi
+  fi
+
+  return "$overall_status"
+}
+
 if [ "$#" -gt 0 ]; then
-  exec shellcheck --norc "$@"
+  run_shellcheck_batches "$@"
+  exit $?
 fi
 
 # Canonical file set: the ONE authoritative definition. Callers reference this
 # script; they never re-spell these globs.
-exec shellcheck --norc bin/*.sh bin/backends/*.sh tests/*.sh
+run_shellcheck_batches bin/*.sh bin/backends/*.sh tests/*.sh

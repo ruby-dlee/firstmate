@@ -772,11 +772,10 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
         }],
       }))}\n`,
     );
-    const staleTime = new Date(openedAt - 500);
+    const staleTime = new Date(openedAt + 500);
     await utimes(staleDownload, staleTime, staleTime);
     const staleInfo = await stat(staleDownload);
-    assert.ok(staleInfo.mtimeMs < openedAt);
-    assert.ok(staleInfo.mtimeMs >= openedAt - 1000);
+    assert.ok(staleInfo.mtimeMs > openedAt);
 
     const stopped = await runExecutable(chrome, ['stop'], { env: environment });
     assert.equal(stopped.code, 0, stopped.stderr);

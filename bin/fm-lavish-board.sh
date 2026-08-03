@@ -170,25 +170,6 @@ check_submission() {
     if (candidates[0]) process.stdout.write(candidates[0].candidate);
   ' "$downloads" "$decision_id" "$opened_at" 2>/dev/null) || downloaded_path=
 
-  if [ -n "$downloaded_path" ]; then
-    temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
-    if cp "$downloaded_path" "$temporary" \
-      && chmod 600 "$temporary" \
-      && node -e '
-        const fs = require("node:fs");
-        const payload = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        if (payload?.decision_id !== process.argv[2]) process.exit(3);
-      ' "$temporary" "$decision_id"; then
-      mv "$temporary" "$payload_path"
-      collect_submission "$decision_id" "$home" "$payload_path" || return
-      rm -f "$check_path"
-      isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
-      printf 'lavish-submit: %s %s\n' "$decision_id" "$payload_path"
-      return
-    fi
-    rm -f "$temporary"
-  fi
-
   temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
   evaluation=$(isolated_chrome "$session" "$profile_path" 0 eval \
     'JSON.stringify({title: document.title, payload: window.__lavishPayload ?? null, durable_record: typeof window.__lavishStorageKey === "string" ? localStorage.getItem(window.__lavishStorageKey) : null})' \
@@ -220,6 +201,23 @@ check_submission() {
       rm -f "$temporary"
       isolated_chrome "$session" "$profile_path" 0 stop >/dev/null 2>&1 || true
       exit 0
+    fi
+  fi
+
+  if [ -n "$downloaded_path" ]; then
+    temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
+    if cp "$downloaded_path" "$temporary" \
+      && chmod 600 "$temporary" \
+      && node -e '
+        const fs = require("node:fs");
+        const { isDeepStrictEqual } = require("node:util");
+        const downloaded = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        const durable = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+        if (!isDeepStrictEqual(downloaded, durable)) process.exit(3);
+      ' "$temporary" "$payload_path"; then
+      mv "$temporary" "$payload_path"
+    else
+      rm -f "$temporary"
     fi
   fi
 

@@ -24,9 +24,10 @@ Use the firstmate-owned `lavish-axi` file protocol documented in `tools/lavish/R
    Use nonempty unique lowercase-slug keys.
 4. Choose a durable `$FM_HOME`-relative destination below `data/`.
    This is where intake commits the validated answer before writing its receipt.
-5. Run `lavish-axi create` with a stable decision id, title, Markdown request, question JSON, and destination, and retain its emitted `Run:` line.
-6. From firstmate's environment, run `lavish show <id>` and `lavish inbox` to verify the exact durable request.
-7. Choose exactly one captain surface.
+5. Before creation, put each captain-facing risk or decision item in its own file and run `bin/fm-captain-item-check.sh` as documented for every item; any failure blocks creation.
+6. Run `lavish-axi create` with a stable decision id, title, Markdown request, question JSON, and destination, and retain its emitted `Run:` line.
+7. From firstmate's environment, run `lavish show <id>` and `lavish inbox` to verify the exact durable request.
+8. Choose exactly one captain surface.
    For a terminal answer, surface only the title and the exact `Run:` line emitted by `lavish-axi create`:
 
    ```text

@@ -375,12 +375,40 @@ crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
 
-# Classify all tasks referenced by a no-verb signal in one token. A turn-ended
-# marker makes a working task actionable because the owner has ended its turn;
-# a real external pause remains safely paused only when no active or parked run
-# contradicts it. Prints working, paused, or none.
+# Classify one task referenced by a signal. A turn-ended marker makes a working
+# task actionable because the owner has ended its turn; a real external pause
+# remains safely paused only when no active or parked run contradicts it.
+signal_task_absorb_class() {  # <task> <file> ...
+  local task=$1 f base candidate state_dir="" last class turn_ended=0 matched=0
+  shift
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     candidate=${base%.status} ;;
+      *.turn-ended) candidate=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ "$candidate" = "$task" ] || continue
+    matched=1
+    [ -n "$state_dir" ] || {
+      state_dir=${f%/*}
+      [ "$state_dir" != "$f" ] || state_dir=${STATE:-${FM_STATE_OVERRIDE:-}}
+    }
+    [ "$base" != "$task.turn-ended" ] || turn_ended=1
+  done
+  [ "$matched" = 1 ] || { printf 'none'; return; }
+  last=$(last_status_line "$state_dir/$task.status")
+  class=$(crew_absorb_class "$task" "$last")
+  if [ "$turn_ended" = 1 ] && [ "$class" = working ]; then
+    printf 'none'
+  else
+    printf '%s' "$class"
+  fi
+}
+
+# Classify all tasks referenced by a signal in one token.
 signal_crew_absorb_class() {  # <file> ...
-  local f other base other_base task seen="" state_dir last class saw_paused=0 turn_ended
+  local f base task seen="" class saw_paused=0
   for f in "$@"; do
     base=${f##*/}
     case "$base" in
@@ -391,19 +419,7 @@ signal_crew_absorb_class() {  # <file> ...
     [ -n "$task" ] || continue
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
-    state_dir=${f%/*}
-    [ "$state_dir" != "$f" ] || state_dir=${STATE:-${FM_STATE_OVERRIDE:-}}
-    last=$(last_status_line "$state_dir/$task.status")
-    class=$(crew_absorb_class "$task" "$last")
-    turn_ended=0
-    for other in "$@"; do
-      other_base=${other##*/}
-      [ "$other_base" = "$task.turn-ended" ] && { turn_ended=1; break; }
-    done
-    if [ "$turn_ended" = 1 ] && [ "$class" = working ]; then
-      printf 'none'
-      return
-    fi
+    class=$(signal_task_absorb_class "$task" "$@")
     case "$class" in
       working) ;;
       paused) saw_paused=1 ;;

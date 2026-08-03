@@ -125,6 +125,26 @@ test_classify_terminal_signal_escalates() {
   pass "captain-relevant status verbs escalate"
 }
 
+test_classify_coalesced_signal_checks_each_task() {
+  local dir state key out
+  dir=$(make_supercase classify-coalesced-attendance)
+  state="$dir/state"
+  printf 'done: PR https://x/y/pull/1\n' > "$state/done-a.status"
+  printf 'working: validating\n' > "$state/run-b.status"
+  : > "$state/run-b.turn-ended"
+  key=$(printf '%s' "done-a" | tr ':/.' '___')
+  printf 'done: PR https://x/y/pull/1' > "$state/.subsuper-seen-status-$key"
+  out=$(FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+    'state: working · source: run-step · validating (running)' \
+    classify_signal "$state/done-a.status $state/run-b.status $state/run-b.turn-ended" "$state")
+  case "$out" in escalate\|*) ;; *) fail "seen captain status hid another task's unattended turn-end: $out" ;; esac
+  out=$(FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+    'state: working · source: pane · harness busy' \
+    classify_signal "$state/done-a.status $state/run-b.status" "$state")
+  case "$out" in self\|*) ;; *) fail "seen captain status prevented a separately attended task from self-handling: $out" ;; esac
+  pass "coalesced signal dedup checks every task's attendance independently"
+}
+
 test_classify_check_and_unknown_escalate() {
   local out
   out=$(classify_check "check: /s/c.check.sh: merged: https://x")
@@ -412,6 +432,44 @@ test_housekeeping_surfaces_unattended_paused_run() {
     || fail "housekeeping did not surface an unattended parked validation"
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "unattended validation retained its long-cadence pause marker"
   pass "housekeeping replaces stale pause custody with an immediate unattended-validation escalation"
+}
+
+test_pause_custody_snapshot_probes_in_parallel() {
+  local dir state reader started task key
+  dir=$(make_supercase parallel-pause-probes)
+  state="$dir/state"
+  reader="$dir/fakebin/fm-crew-state-parallel.sh"
+  started="$dir/probes-started"
+  : > "$started"
+  for task in pause-a pause-b pause-c; do
+    printf 'window=sess:fm-%s\nkind=ship\n' "$task" > "$state/$task.meta"
+    printf 'paused: awaiting upstream\n' > "$state/$task.status"
+  done
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$1" >> "$FM_FAKE_PROBES_STARTED"
+i=0
+while [ "$(wc -l < "$FM_FAKE_PROBES_STARTED")" -lt "$FM_FAKE_PROBES_EXPECTED" ]; do
+  i=$((i + 1))
+  [ "$i" -lt 40 ] || { printf 'state: unknown · source: none · serial probe timeout\n'; exit 0; }
+  sleep 0.05
+done
+printf 'state: paused · source: status-log · awaiting upstream\n'
+SH
+  chmod +x "$reader"
+  (
+    export FM_CREW_STATE_BIN="$reader"
+    export FM_FAKE_PROBES_STARTED="$started"
+    export FM_FAKE_PROBES_EXPECTED=3
+    migrate_watcher_pause_markers "$state"
+  )
+  for task in pause-a pause-b pause-c; do
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    [ -e "$state/.subsuper-paused-$key" ] || fail "parallel pause snapshot failed open for $task"
+  done
+  [ ! -s "$state/.subsuper-escalations" ] || fail "parallel pause snapshot treated serialized probe timeouts as unattended"
+  pass "pause custody snapshot probes the fleet concurrently"
 }
 
 test_housekeeping_pause_marker_transitions_to_clear() {
@@ -982,22 +1040,25 @@ test_classify_signal_dedup_against_scan() {
   pass "classify_signal dedupes against the catch-all scan seen marker"
 }
 
-test_classify_stale_dedup_against_signal() {
-  # If the signal path already escalated a status (seen marker matches),
-  # classify_stale must self-handle to avoid a duplicate in the digest.
-  local dir state key out
+test_classify_stale_seen_status_requires_attendance() {
+  local dir state key out marker
   dir=$(make_supercase stale-dedup)
   state="$dir/state"
   printf 'done: PR https://x/y/pull/10\n' > "$state/dup-s10.status"
   key=$(printf '%s' "dup-s10" | tr ':/.' '___')
   printf 'done: PR https://x/y/pull/10' > "$state/.subsuper-seen-status-$key"
-  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-dup-s10" "$state")
-  case "$out" in self\|*) ;; *) fail "stale not deduped against signal: $out" ;; esac
-  # Without the seen marker, it should escalate.
-  rm -f "$state/.subsuper-seen-status-$key"
-  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-dup-s10" "$state")
-  case "$out" in escalate\|*) ;; *) fail "stale should escalate when not seen: $out" ;; esac
-  pass "classify_stale dedupes against the signal path seen marker"
+  marker="$state/.subsuper-stale-$key"
+  date +%s > "$marker"
+  FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+    'state: working · source: run-step · validating (running)' \
+    handle_wake "stale: sess:fm-dup-s10" "$state"
+  [ -s "$state/.subsuper-escalations" ] || fail "seen status hid an unattended active validation"
+  [ ! -e "$marker" ] || fail "unattended active validation retained a stale suppressor"
+  out=$(FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+    'state: working · source: pane · harness busy' \
+    classify_stale "sess:fm-dup-s10" "$state")
+  case "$out" in self\|*) ;; *) fail "positive pane attendance did not supersede a seen stale status: $out" ;; esac
+  pass "stale status dedup never substitutes for current attendance"
 }
 
 test_pane_input_pending_bordered_idle_not_pending() {
@@ -1746,6 +1807,7 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
+test_classify_coalesced_signal_checks_each_task
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
 test_stale_terminal_escalates
@@ -1764,6 +1826,7 @@ test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
 test_housekeeping_surfaces_unattended_paused_run
+test_pause_custody_snapshot_probes_in_parallel
 test_housekeeping_pause_marker_transitions_to_clear
 test_housekeeping_herdr_persistent_stale_resolves_meta
 test_housekeeping_herdr_idle_busy_footer_clears_stale
@@ -1793,7 +1856,7 @@ test_tmux_composer_state_bordered_and_agent_rows_are_empty
 test_tmux_composer_state_requires_matching_box_borders
 test_pane_input_pending_honors_idle_override_after_border_strip
 test_classify_signal_dedup_against_scan
-test_classify_stale_dedup_against_signal
+test_classify_stale_seen_status_requires_attendance
 test_pane_input_pending_bordered_idle_not_pending
 test_pane_input_pending_bordered_with_text_is_pending
 test_submit_ack_confirms_on_bordered_empty_composer

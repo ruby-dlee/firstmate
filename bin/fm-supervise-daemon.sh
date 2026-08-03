@@ -329,7 +329,8 @@ _collapse_newlines() {  # <text>
 # summary firstmate would otherwise have to re-read.
 
 classify_signal() {  # <reason-after-colon> <state>
-  local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
+  local reason=$1 state=$2 f base task last distilled="" rel="" all_seen=1 seen
+  local tasks="" task_seen relevant turn_ended class unattended=""
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
@@ -345,15 +346,38 @@ classify_signal() {  # <reason-after-colon> <state>
     seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
+  for f in $reason; do
+    base=${f##*/}
+    case "$base" in
+      *.status) task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *) continue ;;
+    esac
+    case " $tasks " in *" $task "*) continue ;; esac
+    tasks="$tasks $task"
+    last=$(last_status_line "$state/$task.status")
+    relevant=0
+    status_is_captain_relevant "$last" && relevant=1
+    turn_ended=0
+    for task_seen in $reason; do
+      [ "${task_seen##*/}" = "$task.turn-ended" ] && { turn_ended=1; break; }
+    done
+    if [ "$relevant" = 0 ] || [ "$turn_ended" = 1 ]; then
+      # shellcheck disable=SC2086 # $reason is the watcher's space-separated signal-path list.
+      class=$(signal_task_absorb_class "$task" $reason)
+      case "$class" in
+        working|paused) ;;
+        *) unattended="$unattended $task" ;;
+      esac
+    fi
+  done
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
-  if [ -z "$rel" ]; then
-    # shellcheck disable=SC2086 # $reason is the watcher's space-separated signal-path list.
-    if signal_crew_safely_absorbable $reason; then
-      printf 'self|routine signal: %s' "$distilled"
-    else
-      printf 'escalate|unattended or unverified signal: %s' "${distilled:-$reason}"
-    fi
+  unattended=${unattended# }
+  if [ -n "$unattended" ]; then
+    printf 'escalate|unattended or unverified signal (%s): %s' "$unattended" "${distilled:-$reason}"
+  elif [ -z "$rel" ]; then
+    printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
     # self-handle to avoid a duplicate entry in the digest.
@@ -367,40 +391,32 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen class
+  local win=$1 state=$2 task last class
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
-  if [ -n "$last" ] && status_is_paused "$last"; then
+  if { status_is_paused "$last" || status_is_captain_relevant "$last"; } 2>/dev/null; then
     class=$(crew_absorb_class "$task" "$last")
+    if [ "$class" = working ]; then
+      printf 'self|stale status superseded by positive pane attendance: %s' "$last"
+      return
+    fi
+  else
+    class=none
+  fi
+  if [ -n "$last" ] && status_is_paused "$last"; then
     case "$class" in
       paused)
         printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
         return
         ;;
-      working)
-        printf 'self|paused status superseded by positive pane attendance: %s' "$last"
-        return
-        ;;
       *)
-        seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
-        if [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ]; then
-          printf 'self|unattended validation already escalated: %s' "$last"
-        else
-          printf 'escalate|paused status with active, parked, or unverified validation attendance: %s' "$last"
-        fi
+        printf 'escalate|paused status with active, parked, or unverified validation attendance: %s' "$last"
         return
         ;;
     esac
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
-    # Dedupe against the signal path: if this status was already escalated
-    # (seen marker matches), self-handle to avoid a duplicate in the digest.
-    seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
-    if [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ]; then
-      printf 'self|stale + terminal (already escalated by signal): %s' "$last"
-      return
-    fi
-    printf 'escalate|stale + terminal status: %s' "$last"
+    printf 'escalate|stale + terminal status without positive attendance: %s' "$last"
     return
   fi
   # Non-terminal (or no status): defer to the persistence recheck. The caller
@@ -482,13 +498,16 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line> [absorb-clas
   if status_is_paused "$last" && [ "$class" = paused ]; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
-  elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
+  elif [ "$class" = none ] || [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
   fi
 }
 
 migrate_watcher_pause_markers() {  # <state>
-  local state=$1 meta win task key last watcher_key class seen
+  local state=$1 meta win task key last watcher_key class seen current result probe_root i pid
+  local count=0
+  local -a probe_wins probe_tasks probe_lasts probe_results probe_pids
+  probe_root=
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
@@ -498,17 +517,56 @@ migrate_watcher_pause_markers() {  # <state>
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
-      class=$(crew_absorb_class "$task" "$last")
-      reconcile_pause_tracking "$win" "$state" "$last" "$class"
-      if status_is_paused "$last" && [ "$class" = none ]; then
-        seen="$state/.subsuper-seen-status-$key"
-        if [ "$(cat "$seen" 2>/dev/null || true)" != "$last" ]; then
-          escalate_add "$state" "paused status with active, parked, or unverified validation attendance: $win"
-          mark_status_seen "$state" "$task" "$last"
-        fi
+      if [ "$count" -eq 0 ]; then
+        probe_root=$(mktemp -d "$state/.subsuper-pause-probes.XXXXXX" 2>/dev/null || true)
       fi
+      probe_wins[$count]=$win
+      probe_tasks[$count]=$task
+      probe_lasts[$count]=$last
+      if [ -n "$probe_root" ]; then
+        result="$probe_root/$count"
+        probe_results[$count]=$result
+        crew_absorb_class "$task" "$last" > "$result" &
+        probe_pids[$count]=$!
+      else
+        probe_results[$count]=
+        probe_pids[$count]=
+      fi
+      count=$((count + 1))
     fi
   done
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    win=${probe_wins[$i]}
+    task=${probe_tasks[$i]}
+    last=${probe_lasts[$i]}
+    result=${probe_results[$i]:-}
+    pid=${probe_pids[$i]:-}
+    class=none
+    if [ -n "$pid" ] && wait "$pid"; then
+      class=$(cat "$result" 2>/dev/null || true)
+    fi
+    [ -z "$result" ] || rm -f "$result"
+    case "$class" in working|paused|none) ;; *) class=none ;; esac
+    current=$(last_status_line "$state/$task.status")
+    if [ "$current" != "$last" ]; then
+      last=$current
+      class=none
+    fi
+    reconcile_pause_tracking "$win" "$state" "$last" "$class"
+    key=$(_stale_key "$task")
+    seen="$state/.subsuper-seen-status-$key"
+    if status_is_paused "$last" && [ "$class" = none ]; then
+      if [ "$(cat "$seen" 2>/dev/null || true)" != "$last" ]; then
+        escalate_add "$state" "paused status with active, parked, or unverified validation attendance: $win"
+        mark_status_seen "$state" "$task" "$last"
+      fi
+    elif status_is_paused "$last" && [ "$class" = paused ]; then
+      rm -f "$seen"
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$probe_root" ] || rmdir "$probe_root" 2>/dev/null || true
 }
 
 sync_pause_markers_from_signal() {  # <state> <signal files>
@@ -536,18 +594,24 @@ mark_status_seen() {  # <state> <task> <last-line>
   printf '%s' "$line" > "$state/.subsuper-seen-status-$(_stale_key "$task")"
 }
 
-# Mark every status line a per-wake classification escalated as seen, so a stale
-# wake does not duplicate an unattended-validation signal and the catch-all scan
-# does not re-escalate a captain-relevant line.
+# Mark every status line a per-wake classification escalated as seen so the
+# catch-all scan does not re-escalate a captain-relevant line.
 mark_escalated_seen() {  # <kind> <arg> <state>
-  local kind=$1 arg=$2 state=$3 f last task
+  local kind=$1 arg=$2 state=$3 f base last task tasks=""
   case "$kind" in
     signal)
       for f in $arg; do
         [ -e "$f" ] || continue
-        last=$(last_status_line "$f")
+        base=${f##*/}
+        case "$base" in
+          *.status) task=${base%.status} ;;
+          *.turn-ended) task=${base%.turn-ended} ;;
+          *) continue ;;
+        esac
+        case " $tasks " in *" $task "*) continue ;; esac
+        tasks="$tasks $task"
+        last=$(last_status_line "$state/$task.status")
         [ -n "$last" ] || continue
-        task=$(basename "$f"); task="${task%.status}"
         mark_status_seen "$state" "$task" "$last"
       done ;;
     stale)

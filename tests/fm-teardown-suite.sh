@@ -1634,6 +1634,51 @@ test_preserve_scratch_captures_then_reclaims_dirty_worktree() {
   pass "preserve-then-reclaim captures non-ignored work and summarizes ignored output"
 }
 
+test_preserve_scratch_captures_then_removes_nested_git_directory() {
+  local case_dir rc scratch_capture nested_clone extracted_payload
+  case_dir=$(make_case preserve-nested-git-scratch)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt landed "landed task work"
+  add_fork_with_pushed_branch "$case_dir"
+  nested_clone="$case_dir/wt/nested-clone"
+  git clone -q "$case_dir/origin.git" "$nested_clone"
+  printf '%s\n' "committed nested clone payload" > "$nested_clone/preserved.txt"
+  git -C "$nested_clone" add -- preserved.txt
+  git -C "$nested_clone" commit -qm "nested clone payload"
+  printf '%s\n' "uncommitted nested clone payload" > "$nested_clone/operator-note.txt"
+  assert_grep "uncommitted nested clone payload" "$nested_clone/operator-note.txt" \
+    "preserve-nested-git: fixture did not expose the payload before teardown"
+
+  set +e
+  run_teardown "$case_dir" --preserve-scratch \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" \
+    "preserve-nested-git: preserved nested repository must not block reclaim"
+  assert_absent "$nested_clone" \
+    "preserve-nested-git: cleanup left the nested repository in the worktree"
+  scratch_capture=$(find "$case_dir/data/task-x1/scratch" -mindepth 1 -maxdepth 1 \
+    -type d -print -quit)
+  [ -n "$scratch_capture" ] || fail \
+    "preserve-nested-git: no durable scratch capture was written"
+  assert_present "$scratch_capture/capture-complete" \
+    "preserve-nested-git: verified capture was not marked complete"
+  extracted_payload="$case_dir/extracted-nested-payload.txt"
+  tar -xOf "$scratch_capture/untracked.tar" \
+    "nested-clone/operator-note.txt" > "$extracted_payload" \
+    || fail "preserve-nested-git: nested payload was hollow in the archive"
+  assert_grep "uncommitted nested clone payload" "$extracted_payload" \
+    "preserve-nested-git: archive did not preserve the nested payload bytes"
+  tar -tf "$scratch_capture/untracked.tar" \
+    | grep -Fx "nested-clone/.git/HEAD" >/dev/null \
+    || fail "preserve-nested-git: nested repository metadata was not archived"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "preserve-nested-git: teardown left task metadata behind"
+  pass "preserve-then-reclaim archives and removes an untracked nested repository"
+}
+
 test_preserve_scratch_never_cleans_unlanded_commits() {
   local case_dir rc
   case_dir=$(make_case preserve-unlanded)
@@ -5189,6 +5234,7 @@ if [ "${FM_TEST_FOCUSED:-}" = reclaim-regressions ]; then
   test_watchman_cookies_do_not_block_teardown
   test_ignored_worktree_content_is_summarized_without_blocking
   test_preserve_scratch_captures_then_reclaims_dirty_worktree
+  test_preserve_scratch_captures_then_removes_nested_git_directory
   test_preserve_scratch_never_cleans_unlanded_commits
   test_preserve_scratch_refuses_tracked_drift_before_cleanup
   test_preserve_scratch_refuses_index_drift_during_tracked_verification
@@ -5221,6 +5267,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = preserve-scratch ]; then
   test_preserve_scratch_captures_then_reclaims_dirty_worktree
+  test_preserve_scratch_captures_then_removes_nested_git_directory
   exit 0
 fi
 
@@ -5346,6 +5393,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_watchman_cookies_do_not_block_teardown
   test_ignored_worktree_content_is_summarized_without_blocking
   test_preserve_scratch_captures_then_reclaims_dirty_worktree
+  test_preserve_scratch_captures_then_removes_nested_git_directory
   test_preserve_scratch_never_cleans_unlanded_commits
   test_preserve_scratch_refuses_tracked_drift_before_cleanup
   test_preserve_scratch_refuses_index_drift_during_tracked_verification

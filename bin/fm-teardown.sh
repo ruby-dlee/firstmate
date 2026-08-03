@@ -42,6 +42,8 @@
 # --preserve-scratch first proves committed work landed, captures tracked diffs
 # and non-ignored untracked payloads under data/<task-id>/scratch/, then cleans
 # and repeats the ordinary safety proof before reclaim proceeds.
+# Untracked directories containing nested repositories are archived recursively,
+# verified against a complete manifest, and removed only with Git's double-force guard.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge on the captain's approval) as a fallback
 # for the common case where there is no remote at all.
@@ -1608,6 +1610,207 @@ filter_preservable_untracked_paths() {
   done < "$source" > "$destination"
 }
 
+preserved_untracked_snapshot() {
+  local action=$1 capture_dir=$2
+  python3 - "$action" "$WT" "$capture_dir" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+import tarfile
+
+action, root, capture = sys.argv[1:]
+paths_path = os.path.join(capture, "untracked.paths")
+archive_path = os.path.join(capture, "untracked.tar")
+manifest_path = os.path.join(capture, "untracked-manifest.json")
+
+
+def read_roots():
+    with open(paths_path, "rb") as stream:
+        encoded = [item for item in stream.read().split(b"\0") if item]
+    roots = []
+    for item in encoded:
+        relative = item.decode("utf-8", "surrogateescape")
+        normalized = os.path.normpath(relative)
+        if (
+            not relative
+            or os.path.isabs(relative)
+            or normalized in (os.curdir, os.pardir)
+            or normalized.startswith(os.pardir + os.sep)
+        ):
+            raise OSError(f"unsafe untracked path: {relative!r}")
+        for existing in roots:
+            if (
+                normalized == existing
+                or normalized.startswith(existing + os.sep)
+                or existing.startswith(normalized + os.sep)
+            ):
+                raise OSError(
+                    f"overlapping untracked paths: {existing!r}, {normalized!r}"
+                )
+        roots.append(normalized)
+    return roots
+
+
+def snapshot(relative):
+    path = os.path.join(root, relative)
+    metadata = os.lstat(path)
+    record = {
+        "path": relative,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "size": metadata.st_size,
+    }
+    if stat.S_ISREG(metadata.st_mode):
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise OSError(f"untracked file identity changed: {relative}")
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        record["sha256"] = digest.hexdigest()
+    elif stat.S_ISLNK(metadata.st_mode):
+        record["target"] = os.readlink(path)
+    return record
+
+
+def scan_entry(relative, records):
+    record = snapshot(relative)
+    records.append(record)
+    if not stat.S_ISDIR(record["mode"]):
+        return
+    path = os.path.join(root, relative)
+    with os.scandir(path) as stream:
+        names = sorted((entry.name for entry in stream), key=os.fsencode)
+    for name in names:
+        scan_entry(os.path.join(relative, name), records)
+
+
+def scan_roots(roots):
+    records = []
+    for relative in roots:
+        scan_entry(relative, records)
+    return records
+
+
+def verify_archive(entries):
+    expected_paths = [entry["path"] for entry in entries]
+    with tarfile.open(archive_path, "r") as archive:
+        members = archive.getmembers()
+        actual_paths = [os.path.normpath(member.name) for member in members]
+        if actual_paths != expected_paths:
+            raise OSError("untracked archive does not match its complete manifest")
+        for expected, member in zip(entries, members):
+            expected_mode = expected["mode"]
+            if stat.S_IMODE(expected_mode) != member.mode:
+                raise OSError(
+                    f"untracked archive mode mismatch: {expected['path']}"
+                )
+            if stat.S_ISDIR(expected_mode):
+                valid_type = member.isdir()
+            elif stat.S_ISLNK(expected_mode):
+                valid_type = member.issym()
+            elif stat.S_ISREG(expected_mode):
+                valid_type = member.isreg() or member.islnk()
+            elif stat.S_ISCHR(expected_mode):
+                valid_type = member.ischr()
+            elif stat.S_ISBLK(expected_mode):
+                valid_type = member.isblk()
+            elif stat.S_ISFIFO(expected_mode):
+                valid_type = member.isfifo()
+            else:
+                valid_type = False
+            if not valid_type:
+                raise OSError(
+                    f"untracked archive type mismatch: {expected['path']}"
+                )
+            if stat.S_ISREG(expected_mode):
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise OSError(
+                        f"untracked archive payload missing: {expected['path']}"
+                    )
+                digest = hashlib.sha256()
+                size = 0
+                with stream:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        digest.update(chunk)
+                if size != expected["size"] or digest.hexdigest() != expected["sha256"]:
+                    raise OSError(
+                        f"untracked archive payload mismatch: {expected['path']}"
+                    )
+            elif stat.S_ISLNK(expected_mode) and member.linkname != expected["target"]:
+                raise OSError(
+                    f"untracked archive link mismatch: {expected['path']}"
+                )
+
+
+roots = read_roots()
+if action == "capture":
+    before = scan_roots(roots)
+    with tarfile.open(archive_path, "w", dereference=False) as archive:
+        for entry in before:
+            archive.add(
+                os.path.join(root, entry["path"]),
+                arcname=entry["path"],
+                recursive=False,
+            )
+    after = scan_roots(roots)
+    if before != after:
+        raise OSError("untracked work changed during scratch capture")
+    verify_archive(before)
+    document = {"version": 1, "roots": roots, "entries": before}
+    with open(manifest_path, "w", encoding="utf-8") as stream:
+        json.dump(document, stream, indent=2, ensure_ascii=True)
+        stream.write("\n")
+    with open(
+        os.path.join(capture, "untracked.txt"),
+        "w",
+        encoding="utf-8",
+    ) as stream:
+        for relative in roots:
+            stream.write(json.dumps(relative, ensure_ascii=True) + "\n")
+elif action == "verify":
+    with open(manifest_path, encoding="utf-8") as stream:
+        document = json.load(stream)
+    if document.get("version") != 1 or document.get("roots") != roots:
+        raise OSError("untracked capture manifest does not match its path inventory")
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        raise OSError("untracked capture manifest has no complete entry inventory")
+    if scan_roots(roots) != entries:
+        raise OSError("untracked work changed after scratch capture")
+    verify_archive(entries)
+elif action == "removed":
+    with open(manifest_path, encoding="utf-8") as stream:
+        document = json.load(stream)
+    if document.get("version") != 1 or document.get("roots") != roots:
+        raise OSError("untracked capture manifest does not match its path inventory")
+    remaining = [
+        relative
+        for relative in roots
+        if os.path.lexists(os.path.join(root, relative))
+    ]
+    if remaining:
+        raise OSError(f"captured untracked paths remain after cleanup: {remaining!r}")
+else:
+    raise OSError(f"unknown preserved-untracked action: {action}")
+PY
+}
+
 capture_worktree_scratch() {
   local task_dir scratch_root capture_dir all_untracked
   [ -d "$DATA" ] || mkdir -p "$DATA" || return 1
@@ -1650,69 +1853,7 @@ capture_worktree_scratch() {
     "$all_untracked" "$capture_dir/untracked.paths" || return 1
   rm -f "$all_untracked"
 
-  python3 - "$WT" "$capture_dir" <<'PY'
-import hashlib
-import json
-import os
-import stat
-import sys
-import tarfile
-
-root, capture = sys.argv[1:]
-with open(os.path.join(capture, "untracked.paths"), "rb") as stream:
-    paths = [item.decode("utf-8", "surrogateescape") for item in stream.read().split(b"\0") if item]
-
-def snapshot(path):
-    metadata = os.lstat(path)
-    record = {
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "mode": metadata.st_mode,
-        "size": metadata.st_size,
-    }
-    if stat.S_ISREG(metadata.st_mode):
-        digest = hashlib.sha256()
-        with open(path, "rb", buffering=0) as stream:
-            opened = os.fstat(stream.fileno())
-            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                raise OSError(f"untracked file identity changed: {path}")
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        record["sha256"] = digest.hexdigest()
-    elif stat.S_ISLNK(metadata.st_mode):
-        record["target"] = os.readlink(path)
-    return record
-
-manifest = []
-archive_path = os.path.join(capture, "untracked.tar")
-with tarfile.open(archive_path, "w", dereference=False) as archive:
-    for relative in paths:
-        normalized = os.path.normpath(relative)
-        if (
-            not relative
-            or os.path.isabs(relative)
-            or normalized == os.pardir
-            or normalized.startswith(os.pardir + os.sep)
-        ):
-            raise OSError(f"unsafe untracked path: {relative!r}")
-        source = os.path.join(root, relative)
-        before = snapshot(source)
-        archive.add(source, arcname=relative, recursive=False)
-        after = snapshot(source)
-        if before != after:
-            raise OSError(f"untracked file changed during capture: {relative}")
-        manifest.append({"path": relative, **before})
-
-with open(os.path.join(capture, "untracked.txt"), "w", encoding="utf-8") as stream:
-    for relative in paths:
-        stream.write(json.dumps(relative, ensure_ascii=False) + "\n")
-with open(os.path.join(capture, "untracked-manifest.json"), "w", encoding="utf-8") as stream:
-    json.dump(manifest, stream, indent=2, ensure_ascii=False)
-    stream.write("\n")
-PY
+  preserved_untracked_snapshot capture "$capture_dir" || return 1
   capture_preserved_tracked_snapshot "$capture_dir" || return 1
   verify_preserved_tracked_capture "$capture_dir" || return 1
   : > "$capture_dir/capture-complete"
@@ -1877,40 +2018,12 @@ verify_preserved_tracked_capture() {
 
 verify_preserved_untracked_snapshot() {
   local capture_dir=$1
-  python3 - "$WT" "$capture_dir/untracked-manifest.json" <<'PY'
-import hashlib
-import json
-import os
-import stat
-import sys
+  preserved_untracked_snapshot verify "$capture_dir"
+}
 
-root, manifest_path = sys.argv[1:]
-with open(manifest_path, encoding="utf-8") as stream:
-    manifest = json.load(stream)
-for expected in manifest:
-    path = os.path.join(root, expected["path"])
-    metadata = os.lstat(path)
-    actual = {
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "mode": metadata.st_mode,
-        "size": metadata.st_size,
-    }
-    if stat.S_ISREG(metadata.st_mode):
-        digest = hashlib.sha256()
-        with open(path, "rb", buffering=0) as stream:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        actual["sha256"] = digest.hexdigest()
-    elif stat.S_ISLNK(metadata.st_mode):
-        actual["target"] = os.readlink(path)
-    comparison = {key: expected[key] for key in actual}
-    if actual != comparison:
-        raise OSError(f"untracked file changed after capture: {expected['path']}")
-PY
+verify_preserved_untracked_removed() {
+  local capture_dir=$1
+  preserved_untracked_snapshot removed "$capture_dir"
 }
 
 clean_preserved_worktree_scratch() {
@@ -1920,8 +2033,9 @@ clean_preserved_worktree_scratch() {
   verify_preserved_tracked_snapshot "$capture_dir" || return 1
   git -C "$WT" reset --hard HEAD >/dev/null || return 1
   while IFS= read -r -d '' path; do
-    git -C "$WT" clean -fd -- "$path" >/dev/null || return 1
+    git -C "$WT" clean -ffd -- "$path" >/dev/null || return 1
   done < "$capture_dir/untracked.paths"
+  verify_preserved_untracked_removed "$capture_dir"
 }
 
 prepare_preserved_worktree_scratch_locked() {

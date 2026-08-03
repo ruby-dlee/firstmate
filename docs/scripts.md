@@ -67,6 +67,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
 | `fm-checkout-lock-lib.sh` | Shared common-Git-directory lock identity and ownership for checkout mutation       |
 | `fm-process-tree-lib.sh` | Shared bounded command runner that terminates and reaps complete process trees         |
+| `fm_bounded_io.py`      | Shared Python bounds for process trees, aggregate output, JSON artifacts, and item batches |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-lavish-intake.sh`    | Invoke compatible store-and-forward Lavish intake at an existing turn boundary       |

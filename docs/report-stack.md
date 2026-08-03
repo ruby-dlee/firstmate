@@ -15,6 +15,11 @@ Each sweep uses a crash-recoverable namespace cutover to isolate expired cohorts
 The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, and records a successful-prune heartbeat that session bootstrap validates.
 LaunchAgent failure retries and home-local fallback calls share the machine-global admission record, so neither increases the aggregate retention lock-attempt rate as homes are added.
 Merging the code does not install or activate the owner.
+
+The focused `FM_TEST_FOCUSED=retention-admission tests/fm-report-stack-suite.sh` benchmark constructs exactly 955 reports across 656 five-minute cohorts and runs both baseline commit `68f014697d0eea733a4e7c0294becff4e76c7bcf` and the current implementation against independent copies.
+Its result reports measured baseline and target elapsed milliseconds plus actual contained-helper child-process launch counts, requires at least one baseline helper per report, and requires zero target helpers and no target publication-lock acquisition.
+The same focused check exercises 24 simultaneous homes, stale and corrupt index authorities, success-only admission ordering, invalid configuration, and a stack-root generation swap at their real admission or lock boundaries.
+
 The authoritative visibility cutoff is the later of its prior value and the current `now - 30 days` boundary, so ordinary forward wall time tracks that boundary exactly while a backward clock adjustment never re-exposes expired reports.
 Physical cleanup still waits for each report's 30-day minimum age, its five-minute cohort deadline, and a later retention sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its minimum age.
 The cohort width plus owner sweep interval may total at most 15 days, bounding scheduled visibility removal and tombstoning to 45 days after completion while physical tombstone deletion remains best-effort and bounded per sweep.

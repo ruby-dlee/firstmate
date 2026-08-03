@@ -2277,77 +2277,130 @@ test_watcher_periodically_owns_idle_report_retention() {
   pass "watcher supervision periodically owns idle report retention"
 }
 
-test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
-  local stack="$TMP_ROOT/retention-noop-scale-stack" control="$TMP_ROOT/retention-noop-control-stack"
-  local helper="$TMP_ROOT/retention-helper-counter" log="$TMP_ROOT/retention-helper.log"
-  local count=1000 deadline cohort output observed
-  deadline=$(( ($(date +%s) * 1000 + 17 * 24 * 60 * 60 * 1000 + 299999) / 300000 * 300000 ))
-  cohort="cohort-$deadline"
-  node - "$stack" "$control" "$count" "$deadline" <<'NODE'
+write_retention_scale_fixture() {
+  local stack=$1 reports=$2 cohorts=$3 index_mode=${4:-valid}
+  node - "$stack" "$reports" "$cohorts" "$index_mode" <<'NODE'
 const fs = require("fs");
 const path = require("path");
-const [stack, control, countText, deadlineText] = process.argv.slice(2);
-const count = Number(countText);
-const deadline = Number(deadlineText);
+const [stack, reportsText, cohortsText, indexMode] = process.argv.slice(2);
+const reports = Number(reportsText);
+const cohorts = Number(cohortsText);
 const retentionMs = 30 * 24 * 60 * 60 * 1000;
-const completedAt = new Date(deadline - retentionMs - 60_000).toISOString();
-const cohort = `cohort-${deadline}`;
-function populate(root, total) {
-  const cohortRoot = path.join(root, "entries", cohort);
-  fs.mkdirSync(cohortRoot, { recursive: true });
-  for (let index = 0; index < total; index += 1) {
-    const reportId = `noop-report-${index}`;
-    const reportRoot = path.join(cohortRoot, reportId);
-    fs.mkdirSync(reportRoot);
-    fs.writeFileSync(path.join(reportRoot, "manifest.json"), `${JSON.stringify({
-      schemaVersion: 1,
-      reportId,
-      taskId: reportId,
-      title: reportId,
-      summary: reportId,
-      completedAt,
-      retentionCohort: cohort,
-      kind: "ship",
-      project: "example",
-      harness: "codex",
-    })}\n`);
-  }
-  fs.writeFileSync(path.join(root, "index.html"), "existing index\n");
+const firstDeadline = Math.ceil((Date.now() + 17 * 24 * 60 * 60 * 1000) / 300_000) * 300_000;
+const cohortNames = [];
+fs.mkdirSync(path.join(stack, "entries"), { recursive: true });
+for (let index = 0; index < cohorts; index += 1) {
+  const cohort = `cohort-${firstDeadline + index * 300_000}`;
+  cohortNames.push(cohort);
+  fs.mkdirSync(path.join(stack, "entries", cohort));
+}
+for (let index = 0; index < reports; index += 1) {
+  const cohort = cohortNames[index % cohorts];
+  const deadline = Number(cohort.slice("cohort-".length));
+  const completedAt = new Date(deadline - retentionMs - 60_000).toISOString();
+  const reportId = `noop-report-${index}`;
+  const reportRoot = path.join(stack, "entries", cohort, reportId);
+  fs.mkdirSync(reportRoot);
+  fs.writeFileSync(path.join(reportRoot, "manifest.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    reportId,
+    taskId: reportId,
+    title: reportId,
+    summary: reportId,
+    completedAt,
+    retentionCohort: cohort,
+    kind: "ship",
+    project: "example",
+    harness: "codex",
+  })}\n`);
+}
+const policy = { schemaVersion: 1, generation: "fixture", cutoffMs: Date.now() - retentionMs };
+fs.writeFileSync(
+  path.join(stack, ".retention-policy.js"),
+  `window.firstmateRetentionPolicy=${JSON.stringify(policy)};\n`,
+);
+if (indexMode === "corrupt") {
+  fs.writeFileSync(path.join(stack, "index.html"), "corrupt index authority\n");
+} else {
+  const authority = { ...policy, generation: indexMode === "stale" ? "stale-fixture" : policy.generation };
   fs.writeFileSync(
-    path.join(root, ".retention-policy.js"),
-    `window.firstmateRetentionPolicy=${JSON.stringify({
-      schemaVersion: 1,
-      generation: "fixture",
-      cutoffMs: Date.now() - retentionMs,
-    })};\n`,
+    path.join(stack, "index.html"),
+    `<!-- firstmate-retention ${JSON.stringify(authority)} -->\nexisting index\n`,
   );
 }
-populate(stack, count);
-populate(control, 1);
 NODE
+}
+
+test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
+  local fixture="$TMP_ROOT/retention-noop-fixture" baseline_stack="$TMP_ROOT/retention-noop-baseline-stack"
+  local target_stack="$TMP_ROOT/retention-noop-target-stack" stale_stack="$TMP_ROOT/retention-noop-stale-stack"
+  local corrupt_stack="$TMP_ROOT/retention-noop-corrupt-stack" baseline_root="$TMP_ROOT/retention-noop-baseline"
+  local helper="$TMP_ROOT/retention-helper-counter" baseline_log="$TMP_ROOT/retention-baseline-helper.log"
+  local target_log="$TMP_ROOT/retention-target-helper.log" base=68f014697d0eea733a4e7c0294becff4e76c7bcf
+  local baseline_start baseline_end baseline_ms target_start target_end target_ms baseline_helpers target_helpers
+  local output observed_reports observed_cohorts stack status
+
+  write_retention_scale_fixture "$fixture" 955 656 valid
+  cp -R "$fixture" "$baseline_stack"
+  cp -R "$fixture" "$target_stack"
+  write_retention_scale_fixture "$stale_stack" 1 1 stale
+  write_retention_scale_fixture "$corrupt_stack" 1 1 corrupt
+  mkdir -p "$baseline_root/bin"
+  git -C "$ROOT" show "$base:bin/fm-report-stack.mjs" > "$baseline_root/bin/fm-report-stack.mjs" \
+    || fail "could not materialize the retention benchmark baseline"
+  git -C "$ROOT" show "$base:bin/fm-contained-read.py" > "$baseline_root/bin/fm-contained-read.py" \
+    || fail "could not materialize the baseline contained helper"
+  git -C "$ROOT" show "$base:bin/fm-markdown-structure.cjs" > "$baseline_root/bin/fm-markdown-structure.cjs" \
+    || fail "could not materialize the baseline markdown parser"
+  chmod +x "$baseline_root/bin/fm-report-stack.mjs" "$baseline_root/bin/fm-contained-read.py"
   cat > "$helper" <<'SH'
 #!/bin/sh
 printf 'helper\n' >> "$FM_REPORT_HELPER_LOG"
 exec "$FM_REPORT_REAL_PYTHON" "$@"
 SH
   chmod +x "$helper"
+  : > "$baseline_log"
+  : > "$target_log"
 
-  output=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_PYTHON="$helper" \
-    FM_REPORT_HELPER_LOG="$log" FM_REPORT_REAL_PYTHON="$(command -v python3)" \
+  baseline_start=$(node -e 'process.stdout.write(process.hrtime.bigint().toString())')
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$baseline_stack" \
+    FM_REPORT_PYTHON="$helper" FM_REPORT_HELPER_LOG="$baseline_log" \
+    FM_REPORT_REAL_PYTHON="$(command -v python3)" \
+    "$baseline_root/bin/fm-report-stack.mjs" prune >/dev/null \
+    || fail "955-report/656-cohort baseline retention pass failed"
+  baseline_end=$(node -e 'process.stdout.write(process.hrtime.bigint().toString())')
+
+  target_start=$(node -e 'process.stdout.write(process.hrtime.bigint().toString())')
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$target_stack" \
+    FM_REPORT_PYTHON="$helper" FM_REPORT_HELPER_LOG="$target_log" \
+    FM_REPORT_REAL_PYTHON="$(command -v python3)" \
     FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status) \
-    || fail "1,000-report no-op retention did not complete outside the publication lock"
-  assert_contains "$output" '"reason":"no-work"' "scaled no-op retention was not classified as no work"
-  [ ! -s "$log" ] || fail "scaled no-op retention launched a contained helper"
-  observed=$(find "$stack/entries/$cohort" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-  [ "$observed" -eq "$count" ] || fail "scaled no-op fixture did not contain exactly $count reports"
+    || fail "955-report/656-cohort no-op retention did not complete outside the publication lock"
+  target_end=$(node -e 'process.stdout.write(process.hrtime.bigint().toString())')
 
-  : > "$log"
-  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$control" FM_REPORT_PYTHON="$helper" \
-    FM_REPORT_HELPER_LOG="$log" FM_REPORT_REAL_PYTHON="$(command -v python3)" \
-    "$SCRIPT" prune --force >/dev/null \
-    || fail "contained-helper counter positive control could not run forced retention"
-  [ -s "$log" ] || fail "contained-helper counter could not observe the forced-retention positive control"
-  pass "1,000-report no-op retention uses no helpers and never acquires the publication lock"
+  baseline_ms=$(( (baseline_end - baseline_start + 999999) / 1000000 ))
+  target_ms=$(( (target_end - target_start + 999999) / 1000000 ))
+  baseline_helpers=$(wc -l < "$baseline_log" | tr -d ' ')
+  target_helpers=$(wc -l < "$target_log" | tr -d ' ')
+  assert_contains "$output" '"reason":"no-work"' "scaled no-op retention was not classified as no work"
+  [ "$target_helpers" -eq 0 ] || fail "scaled no-op retention launched $target_helpers contained helper processes"
+  [ "$baseline_helpers" -ge 955 ] \
+    || fail "baseline helper-process evidence observed only $baseline_helpers launches for 955 reports"
+  observed_reports=$(find "$target_stack/entries" -mindepth 2 -maxdepth 2 -type d | wc -l | tr -d ' ')
+  observed_cohorts=$(find "$target_stack/entries" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  [ "$observed_reports" -eq 955 ] || fail "scaled no-op fixture contained $observed_reports reports instead of 955"
+  [ "$observed_cohorts" -eq 656 ] || fail "scaled no-op fixture contained $observed_cohorts cohorts instead of 656"
+
+  for stack in "$stale_stack" "$corrupt_stack"; do
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "invalid index authority was accepted as a no-op at $stack"
+    assert_contains "$output" "synthetic report publication lock setup failure" \
+      "invalid index authority did not reach the admitted publication-lock boundary"
+    assert_present "$stack/.retention-attempt.json" "invalid index authority was not admitted before repair"
+  done
+
+  pass "retention benchmark: base ${baseline_ms}ms/${baseline_helpers} helpers; target ${target_ms}ms/${target_helpers} helpers"
 }
 
 test_retention_admission_bounds_total_fleet_attempts_above_current_population() {
@@ -2420,22 +2473,138 @@ test_retention_admission_bounds_total_fleet_attempts_above_current_population() 
 }
 
 test_failed_retention_attempt_is_ineligible_on_the_next_loop() {
-  local stack="$TMP_ROOT/retention-failure-cadence-stack" first second status
-  mkdir -p "$stack/entries/cohort-1"
-  if first=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
-    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
-  [ "$status" -ne 0 ] || fail "synthetic admitted retention failure unexpectedly succeeded"
-  assert_contains "$first" "synthetic report publication lock setup failure" \
-    "retention failure fixture did not reach the real publication-lock boundary"
+  local stack="$TMP_ROOT/retention-failure-cadence-stack" mutant_stack="$TMP_ROOT/retention-failure-mutant-stack"
+  local mutant_root="$TMP_ROOT/retention-failure-mutant" first second mutant_first mutant_second status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  printf 'malformed policy\n' > "$stack/.retention-policy.js"
+  cp -R "$stack" "$mutant_stack"
+  mkdir -p "$mutant_root/bin"
+  cp "$ROOT/bin/fm-contained-read.py" "$mutant_root/bin/fm-contained-read.py"
+  cp "$ROOT/bin/fm-markdown-structure.cjs" "$mutant_root/bin/fm-markdown-structure.cjs"
+  node - "$SCRIPT" "$mutant_root/bin/fm-report-stack.mjs" <<'NODE'
+const fs = require("fs");
+const [sourceFile, destinationFile] = process.argv.slice(2);
+const source = fs.readFileSync(sourceFile, "utf8");
+const start = source.indexOf("function prune(force) {");
+const endMarker = "\n}\n\nfunction snapshotTaskArtifacts";
+const end = source.indexOf(endMarker, start);
+if (start < 0 || end < 0) throw new Error("could not locate scheduled prune admission boundary");
+const replacement = `function prune(force) {
+  if (!force && !retentionWorkDueWithoutLock()) {
+    lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "no-work" };
+    return;
+  }
+  validateRetentionConfiguration();
+  withLock(() => {});
+  if (!force) {
+    const admission = claimRetentionAttempt();
+    if (!admission.admitted) {
+      lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "cadence" };
+      return;
+    }
+    fs.closeSync(admission.pinnedRoot.descriptor);
+  }
+  lastPruneStatus = { ...lastPruneStatus, admitted: true, reason: force ? "forced" : "completed" };
+}`;
+fs.writeFileSync(destinationFile, source.slice(0, start) + replacement + source.slice(end + 2));
+NODE
+  chmod +x "$mutant_root/bin/fm-report-stack.mjs" "$mutant_root/bin/fm-contained-read.py"
+
+  if mutant_first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "success-only admission mutation unexpectedly completed"
+  assert_contains "$mutant_first" "invalid report retention authority" \
+    "success-only admission mutation did not fail at the pre-existing policy validation boundary"
+  assert_absent "$mutant_stack/.retention-attempt.json" \
+    "success-only admission mutation unexpectedly recorded its failed attempt"
+  if mutant_second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "success-only admission mutation was unexpectedly cadence-blocked"
+  assert_contains "$mutant_second" "invalid report retention authority" \
+    "immediate-next-loop guard did not expose the success-only admission mutation"
+
+  if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "admitted malformed-policy retention attempt unexpectedly succeeded"
+  assert_contains "$first" "invalid report retention authority" \
+    "retention failure fixture did not reach policy validation under the real publication lock"
   assert_present "$stack/.retention-attempt.json" "failed retention did not persist its pre-lock attempt record"
 
-  second=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
-    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status) \
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
     || fail "next-loop retention invocation retried the failed lock attempt"
   assert_contains "$second" '"admitted":false,"reason":"cadence"' \
     "failed retention became eligible again on the next watcher-equivalent loop"
-  assert_present "$stack/entries/cohort-1" "failed-retention fixture lost its still-due work"
-  pass "a failed retention lock attempt is globally ineligible on the next loop"
+  pass "preflight failures claim admission before lock-scoped validation and cadence"
+}
+
+test_invalid_retention_configuration_is_admitted_before_validation() {
+  local stack="$TMP_ROOT/retention-invalid-configuration-stack" first second status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_COHORT_MS=invalid FM_REPORT_RETENTION_INTERVAL=3600 \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "invalid retention configuration unexpectedly succeeded"
+  assert_contains "$first" "FM_REPORT_RETENTION_COHORT_MS must be a positive integer" \
+    "invalid retention configuration did not fail at its validation boundary"
+  assert_present "$stack/.retention-attempt.json" \
+    "invalid retention configuration failed before recording scheduled admission"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_COHORT_MS=invalid FM_REPORT_RETENTION_INTERVAL=3600 \
+    "$SCRIPT" prune --status) \
+    || fail "invalid retention configuration retried before its admission interval"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "invalid retention configuration was eligible again on the immediate next loop"
+  pass "configuration validation cannot bypass scheduled retention admission"
+}
+
+test_retention_admission_and_lock_share_root_generation() {
+  local stack="$TMP_ROOT/retention-root-generation-stack" old_stack="$TMP_ROOT/retention-root-generation-old"
+  local ready="$TMP_ROOT/retention-root-generation.ready" proceed="$TMP_ROOT/retention-root-generation.proceed"
+  local output="$TMP_ROOT/retention-root-generation.out" state contender pid status
+  mkdir -p "$stack/entries/cohort-1"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_ADMITTED_TEST_READY="$ready" \
+    FM_REPORT_RETENTION_ADMITTED_TEST_PROCEED="$proceed" \
+    "$SCRIPT" prune --status > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "root-generation fixture did not reach the post-admission boundary: $(cat "$output")"
+  fi
+  [ "$state" = "attempt-admitted" ] || fail "root-generation fixture emitted an unexpected state: $state"
+  mv "$stack" "$old_stack"
+  mkdir -p "$stack/entries/cohort-1"
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "retention accepted a replacement stack root after admission"
+  assert_grep "report stack root generation changed between retention admission and publication lock acquisition" \
+    "$output" "retention did not refuse the root generation disagreement"
+  assert_present "$old_stack/.retention-attempt.json" "admission record was not bound to the original stack generation"
+  assert_absent "$old_stack/.publish.lock" "original stack generation received a lock after its path was replaced"
+  assert_absent "$stack/.publish.lock" "replacement stack generation received an unadmitted lock"
+
+  if contender=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "replacement generation lock-boundary positive control unexpectedly succeeded"
+  assert_contains "$contender" "synthetic report publication lock setup failure" \
+    "replacement generation could not claim and reach its own lock boundary"
+  assert_present "$stack/.retention-attempt.json" "replacement generation did not own its lock admission"
+  assert_absent "$old_stack/.publish.lock" "root swap split the admitted attempt across lock namespaces"
+  exec 7>&-; exec 8>&-
+  pass "retention admission and publication lock remain on one root generation"
 }
 
 test_retention_restores_expired_entries_when_index_swap_fails() {
@@ -4227,6 +4396,8 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
   test_noop_retention_skips_helpers_and_publication_lock_at_scale
   test_retention_admission_bounds_total_fleet_attempts_above_current_population
   test_failed_retention_attempt_is_ineligible_on_the_next_loop
+  test_invalid_retention_configuration_is_admitted_before_validation
+  test_retention_admission_and_lock_share_root_generation
   exit 0
 fi
 
@@ -4337,6 +4508,8 @@ run_partitioned_test test_watcher_periodically_owns_idle_report_retention
 run_partitioned_test test_noop_retention_skips_helpers_and_publication_lock_at_scale
 run_partitioned_test test_retention_admission_bounds_total_fleet_attempts_above_current_population
 run_partitioned_test test_failed_retention_attempt_is_ineligible_on_the_next_loop
+run_partitioned_test test_invalid_retention_configuration_is_admitted_before_validation
+run_partitioned_test test_retention_admission_and_lock_share_root_generation
 run_partitioned_test test_retention_batches_make_interruption_safe_progress
 run_partitioned_group \
   test_persistent_retention_owner_prunes_without_tasks_or_watcher \

@@ -60,6 +60,7 @@ const reportRetentionSweepSeconds = Number(process.env.FM_REPORT_RETENTION_INTER
 const reportRetentionSweepMs = reportRetentionSweepSeconds * 1000;
 const retentionPolicyName = ".retention-policy.js";
 const retentionAttemptName = ".retention-attempt.json";
+const retentionIndexAuthorityLimit = 512;
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
 const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
 
@@ -380,6 +381,31 @@ function readBoundedRegularFile(file, maxBytes, label) {
   }
 }
 
+function readRegularFileFirstLine(file, maxBytes, label) {
+  const initial = fs.lstatSync(file);
+  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  const descriptor = fs.openSync(file, flags);
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino) {
+      throw new Error(`${label} must be a stable real regular file at ${file}`);
+    }
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytesRead).indexOf(10);
+    if (newline < 0 || newline > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte header limit at ${file}`);
+    const current = fs.lstatSync(file);
+    if (current.isSymbolicLink() || !current.isFile()
+      || current.dev !== opened.dev || current.ino !== opened.ino) {
+      throw new Error(`${label} changed while reading ${file}`);
+    }
+    return buffer.subarray(0, newline).toString("utf8").replace(/\r$/, "");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 function readLockControl(file, label) {
   return readBoundedRegularFile(file, lockControlLimit, label);
 }
@@ -644,6 +670,17 @@ function indexPage(rows, policy) {
 </main></body></html>`;
 }
 
+function parseRetentionIndexAuthority(source) {
+  const match = source.match(/^<!-- firstmate-retention (\{.*\}) -->$/);
+  if (!match) throw new Error("invalid report retention authority in index.html");
+  const authority = JSON.parse(match[1]);
+  if (authority.schemaVersion !== 1 || typeof authority.generation !== "string"
+    || !Number.isFinite(authority.cutoffMs)) {
+    throw new Error("invalid report retention authority in index.html");
+  }
+  return authority;
+}
+
 function validateRetentionConfiguration() {
   if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
     throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
@@ -669,7 +706,7 @@ function lstatIfPresent(file) {
   }
 }
 
-function retentionWorkDueWithoutLock() {
+function checkedRetentionWorkDueWithoutLock() {
   validateRetentionConfiguration();
   const rootStat = lstatIfPresent(configuredStackRoot);
   if (!rootStat) return false;
@@ -752,13 +789,19 @@ function retentionWorkDueWithoutLock() {
       const policyStat = lstatIfPresent(retentionPolicyName);
       if (!indexStat || indexStat.isSymbolicLink() || !indexStat.isFile()
         || !policyStat || policyStat.isSymbolicLink() || !policyStat.isFile()) return true;
-      parseRetentionPolicySource(
+      const policy = parseRetentionPolicySource(
         readBoundedRegularFile(
           retentionPolicyName,
           4096,
           "report retention authority",
         ).toString("utf8").trim(),
       );
+      const indexAuthority = parseRetentionIndexAuthority(readRegularFileFirstLine(
+        "index.html",
+        retentionIndexAuthorityLimit,
+        "report stack index authority",
+      ));
+      if (indexAuthority.generation !== policy.generation || indexAuthority.cutoffMs !== policy.cutoffMs) return true;
     }
     inspectPinnedDirectory(pinnedRoot);
     return false;
@@ -770,11 +813,26 @@ function retentionWorkDueWithoutLock() {
   }
 }
 
+function retentionWorkDueWithoutLock() {
+  try {
+    return checkedRetentionWorkDueWithoutLock();
+  } catch {
+    return true;
+  }
+}
+
+function retentionAdmissionIntervalMs() {
+  return Number.isSafeInteger(reportRetentionSweepMs) && reportRetentionSweepMs > 0
+    ? reportRetentionSweepMs
+    : 5 * 60 * 1000;
+}
+
 function claimRetentionAttempt() {
   const previousDirectory = process.cwd();
   const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
   const candidateName = `.retention-attempt.${process.pid}.${crypto.randomUUID()}.tmp`;
   const attemptedAtMs = Date.now();
+  let transferPinnedRoot = false;
   try {
     process.chdir(configuredStackRoot);
     if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
@@ -790,7 +848,9 @@ function claimRetentionAttempt() {
       if (!markerStat) {
         try {
           fs.linkSync(candidateName, retentionAttemptName);
-          return true;
+          inspectPinnedDirectory(pinnedRoot);
+          transferPinnedRoot = true;
+          return { admitted: true, pinnedRoot };
         } catch (error) {
           if (error.code === "EEXIST") continue;
           throw error;
@@ -807,7 +867,10 @@ function claimRetentionAttempt() {
       if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs) || record.attemptedAtMs < 0) {
         throw new Error(`invalid report retention attempt marker at ${path.join(configuredStackRoot, retentionAttemptName)}`);
       }
-      if (attemptedAtMs - record.attemptedAtMs < reportRetentionSweepMs) return false;
+      if (attemptedAtMs - record.attemptedAtMs < retentionAdmissionIntervalMs()) {
+        inspectPinnedDirectory(pinnedRoot);
+        return { admitted: false };
+      }
       try {
         runContainedHelper(
           [
@@ -825,21 +888,32 @@ function claimRetentionAttempt() {
         throw error;
       }
     }
-    return false;
+    return { admitted: false };
   } finally {
     fs.rmSync(candidateName, { force: true });
     try { process.chdir(previousDirectory); } catch {}
-    fs.closeSync(pinnedRoot.descriptor);
+    if (!transferPinnedRoot) fs.closeSync(pinnedRoot.descriptor);
   }
 }
 
-function acquireLock() {
-  fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
-  const pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
-  process.chdir(configuredStackRoot);
-  if (!sameDirectoryIdentity(pinnedStackRoot.descriptor)) {
-    fs.closeSync(pinnedStackRoot.descriptor);
-    throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
+function acquireLock(admittedStackRoot) {
+  let pinnedStackRoot;
+  try {
+    if (!admittedStackRoot) fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
+    pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
+    if (admittedStackRoot && (pinnedStackRoot.dev !== admittedStackRoot.dev
+      || pinnedStackRoot.ino !== admittedStackRoot.ino || pinnedStackRoot.real !== admittedStackRoot.real)) {
+      throw new Error("report stack root generation changed between retention admission and publication lock acquisition");
+    }
+    process.chdir(configuredStackRoot);
+    if (!sameDirectoryIdentity(pinnedStackRoot.descriptor)) {
+      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
+    }
+  } catch (error) {
+    try { fs.closeSync(pinnedStackRoot?.descriptor); } catch {}
+    throw error;
+  } finally {
+    try { fs.closeSync(admittedStackRoot?.descriptor); } catch {}
   }
   stackRootDescriptor = pinnedStackRoot.descriptor;
   stackRoot = ".";
@@ -848,6 +922,7 @@ function acquireLock() {
   let lockDeadline = Date.now() + reportLockWaitMs;
   let reclaimGuardWaiterSignaled = false;
   while (true) {
+    inspectPinnedDirectory(pinnedStackRoot);
     const deadlineExpired = Date.now() >= lockDeadline;
     try {
       fs.lstatSync(reclaimGuard);
@@ -922,6 +997,7 @@ function acquireLock() {
             existsError.code = "EEXIST";
             throw existsError;
           }
+          inspectPinnedDirectory(pinnedStackRoot);
           fs.renameSync(candidate, lock);
           installedLock = true;
           runTestFifoHandshake(
@@ -1158,8 +1234,19 @@ function acquireLock() {
 
 let lastPruneStatus = { pruned: 0, pending: false };
 
-function withLock(callback) {
-  const release = acquireLock();
+function withLock(callback, admittedStackRoot) {
+  let release;
+  try {
+    release = acquireLock(admittedStackRoot);
+  } catch (error) {
+    try { fs.closeSync(entriesDescriptor); } catch {}
+    try { fs.closeSync(retentionTombstoneDescriptor); } catch {}
+    try { fs.closeSync(stackRootDescriptor); } catch {}
+    entriesDescriptor = undefined;
+    retentionTombstoneDescriptor = undefined;
+    stackRootDescriptor = undefined;
+    throw error;
+  }
   let operationError;
   try {
     recoverRetentionCutover();
@@ -1196,18 +1283,33 @@ function withLock(callback) {
 }
 
 function prune(force) {
-  validateRetentionConfiguration();
+  let admittedStackRoot;
   if (!force) {
     if (!retentionWorkDueWithoutLock()) {
       lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "no-work" };
       return;
     }
-    if (!claimRetentionAttempt()) {
+    const admission = claimRetentionAttempt();
+    if (!admission.admitted) {
       lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "cadence" };
       return;
     }
+    admittedStackRoot = admission.pinnedRoot;
   }
-  withLock(() => {});
+  try {
+    runTestFifoHandshake(
+      "FM_REPORT_RETENTION_ADMITTED_TEST_READY",
+      "FM_REPORT_RETENTION_ADMITTED_TEST_PROCEED",
+      "attempt-admitted\n",
+      "report retention admission test gate",
+    );
+    validateRetentionConfiguration();
+    const lockStackRoot = admittedStackRoot;
+    admittedStackRoot = undefined;
+    withLock(() => {}, lockStackRoot);
+  } finally {
+    try { fs.closeSync(admittedStackRoot?.descriptor); } catch {}
+  }
   lastPruneStatus = { ...lastPruneStatus, admitted: true, reason: force ? "forced" : "completed" };
 }
 

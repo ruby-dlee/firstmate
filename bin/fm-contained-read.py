@@ -1680,8 +1680,8 @@ def command_quarantine_owned_entry_fd(arguments):
         fail("owned entry names must be single safe components")
     root = checked_root(3)
     before = os.stat(name, dir_fd=root, follow_symlinks=False)
-    if not (stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode)) \
-            or f"{before.st_dev}:{before.st_ino}" != identity:
+    source_identity_guard = f"{before.st_dev}:{before.st_ino}" == identity
+    if not source_identity_guard:
         fail("owned entry generation changed before quarantine")
     try:
         os.stat(quarantine, dir_fd=root, follow_symlinks=False)
@@ -1689,9 +1689,31 @@ def command_quarantine_owned_entry_fd(arguments):
     except FileNotFoundError:
         pass
     rename_noreplace(root, root, name, quarantine)
+    ready = os.environ.get("FM_CONTAINED_QUARANTINE_TEST_READY")
+    proceed = os.environ.get("FM_CONTAINED_QUARANTINE_TEST_PROCEED")
+    if ready and proceed:
+        with open(ready, "x", encoding="utf-8") as marker:
+            marker.write(f"{quarantine}\n")
+        deadline = time.monotonic() + 5
+        while not os.path.exists(proceed):
+            if time.monotonic() >= deadline:
+                fail("owned entry quarantine test gate timed out")
+            time.sleep(0.01)
     moved = os.stat(quarantine, dir_fd=root, follow_symlinks=False)
-    if moved.st_dev != before.st_dev or moved.st_ino != before.st_ino \
-            or stat.S_IFMT(moved.st_mode) != stat.S_IFMT(before.st_mode):
+    moved_device_guard = moved.st_dev == before.st_dev
+    moved_inode_guard = moved.st_ino == before.st_ino
+    moved_type_guard = stat.S_IFMT(moved.st_mode) == stat.S_IFMT(before.st_mode)
+    device_mismatch_test = os.environ.get("FM_CONTAINED_QUARANTINE_DEVICE_MISMATCH_TEST")
+    if device_mismatch_test and not os.path.exists(device_mismatch_test):
+        with open(device_mismatch_test, "x", encoding="utf-8") as marker:
+            marker.write("used\n")
+        moved_device_guard = False
+    type_mismatch_test = os.environ.get("FM_CONTAINED_QUARANTINE_TYPE_MISMATCH_TEST")
+    if type_mismatch_test and not os.path.exists(type_mismatch_test):
+        with open(type_mismatch_test, "x", encoding="utf-8") as marker:
+            marker.write("used\n")
+        moved_type_guard = False
+    if not moved_device_guard or not moved_inode_guard or not moved_type_guard:
         try:
             rename_noreplace(root, root, quarantine, name)
         except OSError:

@@ -842,14 +842,14 @@ function readRetentionAttemptRecord(name, label, now) {
     if (error instanceof SyntaxError) throw invalidRetentionAttemptRecord(name, label);
     throw error;
   }
-  const schemaValid = record?.schemaVersion === 1;
-  const timestampIntegral = Number.isSafeInteger(record?.attemptedAtMs);
-  const timestampNonnegative = record?.attemptedAtMs >= 0;
-  if (!schemaValid || !timestampIntegral || !timestampNonnegative) {
+  const schemaGuard = record?.schemaVersion === 1;
+  const timestampIntegralGuard = Number.isSafeInteger(record?.attemptedAtMs);
+  const timestampNonnegativeGuard = record?.attemptedAtMs >= 0;
+  if (!schemaGuard || !timestampIntegralGuard || !timestampNonnegativeGuard) {
     throw invalidRetentionAttemptRecord(name, label);
   }
-  const timestampWithinSkew = record.attemptedAtMs <= now + retentionAdmissionClockSkewMs;
-  if (!timestampWithinSkew) {
+  const timestampWithinSkewGuard = record.attemptedAtMs <= now + retentionAdmissionClockSkewMs;
+  if (!timestampWithinSkewGuard) {
     const error = invalidRetentionAttemptRecord(name, label);
     error.retentionAttemptFuture = true;
     throw error;
@@ -865,23 +865,33 @@ function retentionAttemptState(name, label, now, invalidFileAgeFallback = false)
     record = readRetentionAttemptRecord(name, label, now);
   } catch (error) {
     const fileAgeMs = now - observed.mtimeMs;
-    const fileTimeWithinSkew = fileAgeMs >= -retentionAdmissionClockSkewMs;
-    const fileAgeWithinInterval = fileAgeMs < retentionAdmissionIntervalMs();
-    if ((error.retentionAttemptFuture || invalidFileAgeFallback)
-      && fileTimeWithinSkew && fileAgeWithinInterval) {
+    const fileTimeWithinSkewGuard = fileAgeMs >= -retentionAdmissionClockSkewMs;
+    const fileAgeWithinIntervalGuard = fileAgeMs < retentionAdmissionIntervalMs();
+    const fallbackEligibleGuard = error.retentionAttemptFuture || invalidFileAgeFallback;
+    if (fallbackEligibleGuard && fileTimeWithinSkewGuard && fileAgeWithinIntervalGuard) {
       return { kind: "fallback-fresh", observed, error };
     }
     return { kind: "invalid", observed, error };
   }
   const ageMs = now - record.attemptedAtMs;
-  if (ageMs < retentionAdmissionIntervalMs()) {
+  const ageFreshGuard = ageMs < retentionAdmissionIntervalMs();
+  if (ageFreshGuard) {
     return { kind: "fresh", observed, record };
   }
   return { kind: "stale", observed, record };
 }
 
-function quarantineObservedRetentionAttempt(name, observed, pinnedRoot, suffix) {
-  if (suffix === "invalid" && !retentionInvalidMarkerTestGateUsed) {
+function retentionAttemptPathStateAfterMutation(name, observed) {
+  const current = lstatIfPresent(name);
+  const pathAbsentGuard = !current;
+  if (pathAbsentGuard) return "absent";
+  const pathIdentityChangedGuard = `${current.dev}:${current.ino}` !== `${observed.dev}:${observed.ino}`;
+  if (pathIdentityChangedGuard) return "replaced";
+  return "same";
+}
+
+function retireObservedRetentionAttempt(name, observed, pinnedRoot, disposition) {
+  if (disposition === "invalid" && !retentionInvalidMarkerTestGateUsed) {
     retentionInvalidMarkerTestGateUsed = true;
     runTestFifoHandshake(
       "FM_REPORT_RETENTION_INVALID_MARKER_TEST_READY",
@@ -890,27 +900,97 @@ function quarantineObservedRetentionAttempt(name, observed, pinnedRoot, suffix) 
       "report retention invalid marker test gate",
     );
   }
+  const persistentQuarantine = disposition === "invalid";
   try {
     runContainedHelper(
-      [
-        "quarantine-owned-entry-fd",
-        name,
-        `${observed.dev}:${observed.ino}`,
-        `.${name}.${suffix}.${crypto.randomUUID()}`,
-      ],
+      persistentQuarantine
+        ? [
+          "quarantine-owned-entry-fd",
+          name,
+          `${observed.dev}:${observed.ino}`,
+          `.${name}.${disposition}.${crypto.randomUUID()}`,
+        ]
+        : [
+          "remove-owned-file-fd",
+          name,
+          `${observed.dev}:${observed.ino}`,
+          `.${name}.${disposition}.${crypto.randomUUID()}`,
+        ],
       [pinnedRoot.descriptor],
       1024 * 1024,
     );
+    if (persistentQuarantine) {
+      runTestFifoHandshake(
+        "FM_REPORT_RETENTION_QUARANTINED_TEST_READY",
+        "FM_REPORT_RETENTION_QUARANTINED_TEST_PROCEED",
+        "admission-quarantined\n",
+        "report retention quarantined entry test gate",
+      );
+    }
   } catch (error) {
-    const current = lstatIfPresent(name);
-    if (!current) return true;
-    if (current.dev !== observed.dev || current.ino !== observed.ino) return false;
+    const state = retentionAttemptPathStateAfterMutation(name, observed);
+    if (state === "absent") return true;
+    if (state === "replaced") return false;
     throw error;
   }
-  const current = lstatIfPresent(name);
-  if (!current) return true;
-  if (current.dev !== observed.dev || current.ino !== observed.ino) return false;
+  const state = retentionAttemptPathStateAfterMutation(name, observed);
+  if (state === "absent") return true;
+  if (state === "replaced") return false;
   throw new Error(`report retention admission generation remained after quarantine at ${path.join(configuredStackRoot, name)}`);
+}
+
+function installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord) {
+  let installedCandidate;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const markerState = retentionAttemptState(
+      retentionAttemptName,
+      "report retention attempt marker",
+      attemptedAtMs,
+    );
+    if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
+      const candidateIdentityGuard = Boolean(installedCandidate && markerState.observed.dev === installedCandidate.dev && markerState.observed.ino === installedCandidate.ino);
+      const candidateTimestampGuard = markerState.record?.attemptedAtMs === attemptedAtMs;
+      if (candidateIdentityGuard && candidateTimestampGuard) {
+        return { owned: true, observed: markerState.observed };
+      }
+      return { owned: false, observed: markerState.observed };
+    }
+    if (markerState.kind !== "missing") {
+      if (!retireObservedRetentionAttempt(
+        retentionAttemptName,
+        markerState.observed,
+        pinnedRoot,
+        markerState.kind === "invalid" ? "invalid" : "expired",
+      )) continue;
+    }
+    const candidateName = `.${retentionAttemptName}.candidate.${crypto.randomUUID()}`;
+    let candidateObserved;
+    try {
+      fs.writeFileSync(candidateName, attemptRecord, { flag: "wx", mode: 0o600 });
+      candidateObserved = fs.lstatSync(candidateName);
+      fs.linkSync(candidateName, retentionAttemptName);
+      installedCandidate = candidateObserved;
+      runTestFifoHandshake(
+        "FM_REPORT_RETENTION_CANDIDATE_TEST_READY",
+        "FM_REPORT_RETENTION_CANDIDATE_TEST_PROCEED",
+        "candidate-installed\n",
+        "report retention candidate marker test gate",
+      );
+    } catch (error) {
+      if (error.code === "EEXIST") continue;
+      throw error;
+    } finally {
+      if (candidateObserved) {
+        retireObservedRetentionAttempt(
+          candidateName,
+          candidateObserved,
+          pinnedRoot,
+          "candidate",
+        );
+      }
+    }
+  }
+  throw new Error(`report retention attempt marker could not be installed at ${path.join(configuredStackRoot, retentionAttemptName)}`);
 }
 
 function claimRetentionAttempt() {
@@ -920,7 +1000,6 @@ function claimRetentionAttempt() {
   const attemptRecord = `${JSON.stringify({ schemaVersion: 1, attemptedAtMs })}\n`;
   let transferPinnedRoot = false;
   let ownsClaim = false;
-  let candidateStat;
   try {
     process.chdir(configuredStackRoot);
     if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
@@ -932,6 +1011,7 @@ function claimRetentionAttempt() {
       "report retention attempt marker",
       attemptedAtMs,
     );
+    if (markerState.kind === "invalid") validationError ||= markerState.error;
     if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
       inspectPinnedDirectory(pinnedRoot);
       return { admitted: false };
@@ -950,97 +1030,92 @@ function claimRetentionAttempt() {
       }
       if (claimState.kind !== "missing") {
         if (claimState.kind === "invalid") validationError ||= claimState.error;
-        break;
+        try {
+          if (!retireObservedRetentionAttempt(
+            retentionAttemptClaimName,
+            claimState.observed,
+            pinnedRoot,
+            claimState.kind === "invalid" ? "invalid" : "expired",
+          )) continue;
+        } catch (error) {
+          installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
+          throw error;
+        }
       }
 
       try {
         fs.writeFileSync(retentionAttemptClaimName, attemptRecord, { flag: "wx", mode: 0o600 });
-        candidateStat = fs.lstatSync(retentionAttemptClaimName);
         ownsClaim = true;
         break;
       } catch (error) {
         if (error.code === "EEXIST") continue;
+        installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
         throw error;
       }
     }
-    for (let attempt = 0; attempt < 16; attempt += 1) {
-      markerState = retentionAttemptState(
+    if (!ownsClaim) {
+      installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
+      throw new Error(`report retention admission claim could not be installed at ${path.join(configuredStackRoot, retentionAttemptClaimName)}`);
+    }
+    let installation;
+    try {
+      installation = installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
+      if (!installation.owned) {
+        const claimState = retentionAttemptState(
+          retentionAttemptClaimName,
+          "report retention admission claim",
+          attemptedAtMs,
+          true,
+        );
+        if (claimState.kind !== "missing") {
+          retireObservedRetentionAttempt(
+            retentionAttemptClaimName,
+            claimState.observed,
+            pinnedRoot,
+            claimState.error ? "invalid" : "released",
+          );
+        }
+        ownsClaim = false;
+        inspectPinnedDirectory(pinnedRoot);
+        return { admitted: false };
+      }
+      runTestFifoHandshake(
+        "FM_REPORT_RETENTION_INSTALLED_TEST_READY",
+        "FM_REPORT_RETENTION_INSTALLED_TEST_PROCEED",
+        "attempt-installed\n",
+        "report retention installed marker test gate",
+      );
+      if (process.env.FM_REPORT_RETENTION_PARTIAL_INSTALL_TEST === "1") {
+        fs.writeFileSync(retentionAttemptName, "partial admission\n");
+      }
+      const installed = fs.lstatSync(retentionAttemptName);
+      const installedRecord = readRetentionAttemptRecord(
         retentionAttemptName,
         "report retention attempt marker",
         attemptedAtMs,
       );
-      if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
-        if (candidateStat && markerState.observed.dev === candidateStat.dev
-          && markerState.observed.ino === candidateStat.ino) break;
-        if (ownsClaim) {
-          const claimStat = lstatIfPresent(retentionAttemptClaimName);
-          if (claimStat && claimStat.dev === candidateStat.dev && claimStat.ino === candidateStat.ino) {
-            quarantineObservedRetentionAttempt(
-              retentionAttemptClaimName,
-              claimStat,
-              pinnedRoot,
-              "released",
-            );
-          }
-          ownsClaim = false;
-        }
-        inspectPinnedDirectory(pinnedRoot);
-        return { admitted: false };
+      const installedIdentityGuard = `${installed.dev}:${installed.ino}` === `${installation.observed.dev}:${installation.observed.ino}`;
+      const installedTimestampGuard = installedRecord.attemptedAtMs === attemptedAtMs;
+      if (!installedIdentityGuard || !installedTimestampGuard) {
+        throw new Error(`report retention attempt marker changed while installing ${path.join(configuredStackRoot, retentionAttemptName)}`);
       }
-      if (markerState.kind === "missing") {
-        try {
-          if (ownsClaim) {
-            fs.linkSync(retentionAttemptClaimName, retentionAttemptName);
-          } else {
-            fs.writeFileSync(retentionAttemptName, attemptRecord, { flag: "wx", mode: 0o600 });
-            candidateStat = fs.lstatSync(retentionAttemptName);
-          }
-          continue;
-        } catch (error) {
-          if (error.code === "EEXIST") continue;
-          throw error;
-        }
-      }
-      if (markerState.kind === "invalid") validationError ||= markerState.error;
-      if (quarantineObservedRetentionAttempt(
-        retentionAttemptName,
-        markerState.observed,
-        pinnedRoot,
-        markerState.kind === "invalid" ? "invalid" : "expired",
-      )) continue;
+    } catch (error) {
+      installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
+      throw error;
     }
-
-    runTestFifoHandshake(
-      "FM_REPORT_RETENTION_INSTALLED_TEST_READY",
-      "FM_REPORT_RETENTION_INSTALLED_TEST_PROCEED",
-      "attempt-installed\n",
-      "report retention installed marker test gate",
-    );
-    const installed = fs.lstatSync(retentionAttemptName);
-    const installedRecord = readRetentionAttemptRecord(
-      retentionAttemptName,
-      "report retention attempt marker",
+    const finalClaimState = retentionAttemptState(
+      retentionAttemptClaimName,
+      "report retention admission claim",
       attemptedAtMs,
+      true,
     );
-    const installedInodeMatches = installed.ino === candidateStat.ino;
-    const installedTimestampMatches = installedRecord.attemptedAtMs === attemptedAtMs;
-    if (!installedInodeMatches || !installedTimestampMatches) {
-      throw new Error(`report retention attempt marker changed while installing ${path.join(configuredStackRoot, retentionAttemptName)}`);
-    }
-    const finalClaim = lstatIfPresent(retentionAttemptClaimName);
-    if (finalClaim) {
-      const finalClaimState = retentionAttemptState(
+    if (finalClaimState.kind !== "missing") {
+      if (finalClaimState.error) validationError ||= finalClaimState.error;
+      retireObservedRetentionAttempt(
         retentionAttemptClaimName,
-        "report retention admission claim",
-        attemptedAtMs,
-        true,
-      );
-      if (finalClaimState.kind === "invalid") validationError ||= finalClaimState.error;
-      quarantineObservedRetentionAttempt(
-        retentionAttemptClaimName,
-        finalClaim,
+        finalClaimState.observed,
         pinnedRoot,
-        finalClaimState.kind === "invalid" ? "invalid" : "released",
+        finalClaimState.error ? "invalid" : "released",
       );
     }
     ownsClaim = false;

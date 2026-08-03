@@ -18,8 +18,11 @@
 #   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
 # Logic, in order:
-#   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crewmate's branch, active or terminal
+#   1. Resolve worktree + backend target + kind from state/<id>.meta. For a ship
+#      in no-mistakes mode, bind its task branch to the metadata's exact
+#      worktree_git_ref=refs/heads/fm/<id>; never derive it from worktree HEAD.
+#   2. Matching no-mistakes run for this crewmate's metadata-bound task branch,
+#      active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
@@ -38,7 +41,8 @@
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
 #      `resolved` never become current state or detail.
-#   5. Missing meta or torn-down worktree: report unknown · none. If no run is
+#   5. Missing/ambiguous task-branch identity, missing meta, or a torn-down
+#      worktree: report unknown · none. If no run is
 #      attributed to this crewmate, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
 #
@@ -97,6 +101,8 @@ meta_value() {  # <key>
 WT=$(meta_value worktree)
 KIND=$(meta_value kind)
 [ -n "$KIND" ] || KIND=ship
+MODE=$(meta_value mode)
+[ -n "$MODE" ] || MODE=no-mistakes
 
 # A torn-down (or never-created) worktree has no current state to read.
 if [ -z "$WT" ] || [ ! -d "$WT" ]; then
@@ -434,9 +440,35 @@ nm_runs_status_for_branch() {  # <branch>
   return 0
 }
 
-# CREW_BRANCH is empty at detached HEAD (a just-spawned crewmate, or a scout's
-# scratch worktree); with no branch there is no run to attribute to this crewmate.
-CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+# A no-mistakes ship's branch is task identity, not worktree state. Pooled
+# worktrees may legitimately be checked out on a predecessor or neighbour task's
+# branch, so consulting HEAD here can attribute that neighbour's run - including
+# a terminal run - to this task. Direct spawn metadata records the authoritative
+# final ref. Require exactly one self-binding ref and require its task namespace
+# before any run state can be trusted. The reader's public contract always exits
+# zero for a successful read, so refusal is rendered as unknown/none with the
+# disagreement in detail.
+TASK_BRANCH=""
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+  EXPECTED_TASK_REF="refs/heads/fm/$ID"
+  TASK_REF_COUNT=0
+  TASK_REF=""
+  while IFS= read -r TASK_META_LINE; do
+    case "$TASK_META_LINE" in
+      worktree_git_ref=*)
+        TASK_REF_COUNT=$((TASK_REF_COUNT + 1))
+        TASK_REF=${TASK_META_LINE#worktree_git_ref=}
+        ;;
+    esac
+  done < "$META"
+  if [ "$TASK_REF_COUNT" != 1 ]; then
+    emit unknown none "task branch identity unavailable: expected exactly one worktree_git_ref=$EXPECTED_TASK_REF, found $TASK_REF_COUNT"
+  fi
+  if [ "$TASK_REF" != "$EXPECTED_TASK_REF" ]; then
+    emit unknown none "task branch identity disagreement: metadata has ${TASK_REF:-<empty>}, expected $EXPECTED_TASK_REF"
+  fi
+  TASK_BRANCH=${TASK_REF#refs/heads/}
+fi
 
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
@@ -447,11 +479,11 @@ RUN_SOURCE=full
 COARSE_STATUS=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
-if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ] && [ -n "$TASK_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$TASK_BRANCH" ]; then
       HAVE_RUN=1
     else
       # The active-or-most-recent run is for another branch (the CLI is alive
@@ -460,7 +492,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+      COARSE_STATUS=$(nm_runs_status_for_branch "$TASK_BRANCH")
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse

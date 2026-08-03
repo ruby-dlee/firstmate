@@ -18,8 +18,28 @@ const worktree = fs.realpathSync(worktreeArg);
 const sessions = path.join(codexHome, "sessions");
 const maxFiles = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_FILES || "128", 10);
 const maxBytes = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_BYTES || String(16 * 1024 * 1024), 10);
+const maxTotalBytes = Number.parseInt(process.env.FM_CODEX_PROFILE_TOTAL_BYTES || String(32 * 1024 * 1024), 10);
+const maxMillis = Number.parseInt(process.env.FM_CODEX_PROFILE_MAX_MILLIS || "2000", 10);
 const expectedSession = expectedSessionArg === "-" ? null : expectedSessionArg;
 const runtimeStartNs = BigInt(runtimeStartArg);
+const startedAt = Date.now();
+let bytesRead = 0;
+
+if (![maxFiles, maxBytes, maxTotalBytes, maxMillis].every(Number.isSafeInteger)
+  || maxFiles < 1 || maxBytes < 1 || maxTotalBytes < 1 || maxMillis < 1) {
+  console.error("error: Codex runtime scan bounds must be positive safe integers");
+  process.exit(2);
+}
+
+function requireBudget(length = 0) {
+  if (Date.now() - startedAt > maxMillis) {
+    throw new Error(`scan time budget exceeded (${maxMillis}ms)`);
+  }
+  if (length > maxTotalBytes - bytesRead) {
+    throw new Error(`scan byte budget exceeded (${maxTotalBytes} bytes)`);
+  }
+  bytesRead += length;
+}
 
 function timestampNs(value) {
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(value || "");
@@ -36,9 +56,11 @@ function collectRollouts(root) {
   const pending = [{ dir: root, depth: 0 }];
   const files = [];
   while (pending.length > 0) {
+    requireBudget();
     const { dir, depth } = pending.pop();
     if (depth > 5) continue;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      requireBudget();
       const item = path.join(dir, entry.name);
       if (entry.isDirectory()) pending.push({ dir: item, depth: depth + 1 });
       else if (entry.isFile() && /^rollout-.*\.jsonl$/.test(entry.name)) {
@@ -52,6 +74,7 @@ function collectRollouts(root) {
 
 function readTail(file) {
   const length = Math.min(file.size, maxBytes);
+  requireBudget(length);
   const offset = file.size - length;
   const fd = fs.openSync(file.item, "r");
   try {
@@ -67,6 +90,7 @@ function readTail(file) {
 
 function readHead(file) {
   const length = Math.min(file.size, 64 * 1024);
+  requireBudget(length);
   const fd = fs.openSync(file.item, "r");
   try {
     const buffer = Buffer.alloc(length);
@@ -90,6 +114,7 @@ try {
         sessionIds.add(record.payload.id);
       }
     }
+    if (expectedSession && !sessionIds.has(expectedSession)) continue;
     for (const line of readTail(file).split("\n")) {
       if (!line) continue;
       let record;
@@ -99,8 +124,8 @@ try {
         sessionIds.add(record.payload.id);
       }
     }
-    if (expectedSession && !sessionIds.has(expectedSession)) continue;
     for (const record of records) {
+      requireBudget();
       let settings = null;
       if (record.type === "turn_context" && record.payload?.cwd === worktree) {
         settings = {

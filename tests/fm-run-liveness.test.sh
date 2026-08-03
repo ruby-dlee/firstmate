@@ -116,13 +116,17 @@ test_detached_scout_never_queries_run_state() {
 }
 
 test_entire_zero_window_is_unknown() {
-  local dir rc
+  local dir out rc
   dir=$(make_case all-zero)
   FM_TEST_COUNTS=0,0,0 FM_RUN_LIVENESS_SAMPLES=3 run_live "$dir" env >"$dir/out" 2>"$dir/err"; rc=$?
   expect_code 1 "$rc" "all-zero stable running window should be unknown"
   assert_grep 'never proves idle, death, or a wedge' "$dir/err" "all-zero uncertainty was not explicit"
   assert_no_grep 'wedged' "$dir/err" "process absence was mislabeled as a wedge"
-  pass "run liveness reports an entire zero-process window as UNKNOWN, never death"
+  rm -f "$dir/nm.count" "$dir/ps.count"
+  out=$(FM_TEST_COUNTS=0,2,0 FM_RUN_LIVENESS_SAMPLES=3 run_live "$dir" env) \
+    || fail "affirmative run process did not retire the unknown liveness window"
+  assert_contains "$out" 'busy:' "affirmative run-owned process was not observed"
+  pass "run liveness rejects absence and retires it only with affirmative evidence"
 }
 
 test_sampler_processes_are_not_run_evidence() {

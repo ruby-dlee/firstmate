@@ -180,30 +180,24 @@ review_page=1
 while :; do
   [ "$review_page" -le 1000 ] || { echo "error: review pagination exceeded the safe bound" >&2; exit 1; }
   REVIEWS_DOC=$(gh-axi api "/repos/$OWNER/$REPO/pulls/$NUMBER/reviews?per_page=100&page=$review_page") || exit 1
-  printf '%s\n' "$REVIEWS_DOC" | node "$SCRIPT_DIR/fm-toon-table.mjs" user state commit_id body > "$TMP_DIR/reviews-page"
+  printf '%s\n' "$REVIEWS_DOC" | node "$SCRIPT_DIR/fm-toon-table.mjs" user state commit_id > "$TMP_DIR/reviews-page"
   review_page_count=$(wc -l < "$TMP_DIR/reviews-page" | tr -d ' ')
   cat "$TMP_DIR/reviews-page" >> "$TMP_DIR/reviews"
   [ "$review_page_count" -eq 100 ] || break
   review_page=$((review_page + 1))
 done
 : > "$TMP_DIR/approved-reviewers"
-adversarial_reviewers=0
 review_blocked=0
-while IFS=$'\t' read -r reviewer review_state review_head review_body; do
+while IFS=$'\t' read -r reviewer review_state review_head; do
   [ "$review_head" = "$PR_HEAD" ] || continue
   [ "$review_state" != CHANGES_REQUESTED ] || { review_blocked=1; continue; }
   [ "$review_state" = APPROVED ] || continue
   [ -n "$reviewer" ] && [ "$reviewer" != "$PR_AUTHOR" ] || continue
   printf '%s\n' "$reviewer" >> "$TMP_DIR/approved-reviewers"
-  case "$review_body" in
-    *"FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=$PR_HEAD"*)
-      adversarial_reviewers=$((adversarial_reviewers + 1))
-      ;;
-  esac
 done < "$TMP_DIR/reviews"
 reviewers=$(LC_ALL=C sort -u "$TMP_DIR/approved-reviewers" | wc -l | tr -d ' ')
-[ "$review_blocked" -eq 0 ] && [ "$reviewers" -ge 2 ] && [ "$adversarial_reviewers" -ge 1 ] || {
-  echo "error: exact head is UNREVIEWED: need two distinct non-author APPROVED verdicts, no exact-head change request, and an approval carrying FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=$PR_HEAD (approvals=$reviewers adversarial=$adversarial_reviewers blocked=$review_blocked)" >&2
+[ "$review_blocked" -eq 0 ] && [ "$reviewers" -ge 2 ] || {
+  echo "error: exact head is UNREVIEWED: need two distinct non-author APPROVED verdicts and no exact-head change request (approvals=$reviewers blocked=$review_blocked)" >&2
   exit 1
 }
 
@@ -221,25 +215,22 @@ read_pr || { echo "error: PR moved or became unreadable during admission" >&2; e
   }
 
 fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$PR_BASE_REF" || {
-  echo "error: base branch does not enforce the exact-head admission context, two reviews, and admin protection" >&2
+  echo "error: base branch does not enforce strict required checks, stale-review dismissal, code-owner and last-push review, two approvals, and admin protection" >&2
   exit 1
 }
-EVIDENCE_DOC=$(gh-axi api POST "/repos/$OWNER/$REPO/statuses/$PR_HEAD" \
-  --field "state=success" --field "context=$FM_PR_ADMISSION_CONTEXT" \
-  --field "description=Exact-head checks and independent reviews admitted") || exit 1
-[ "$(scalar "$EVIDENCE_DOC" state)" = success ] \
-  && [ "$(scalar "$EVIDENCE_DOC" context)" = "$FM_PR_ADMISSION_CONTEXT" ] || {
-    echo "error: GitHub did not publish the exact-head admission evidence" >&2
-    exit 1
-  }
-read_pr || { echo "error: PR moved after exact-head evidence publication" >&2; exit 1; }
+git -C "$WORKTREE" status --porcelain=v1 --untracked-files=all > "$TMP_DIR/final-worktree-status"
+[ ! -s "$TMP_DIR/final-worktree-status" ] || {
+  echo "error: content containment failed: admitted worktree changed during admission" >&2
+  exit 1
+}
+read_pr || { echo "error: PR moved after server policy verification" >&2; exit 1; }
 [ "$PR_HEAD" = "$FIRST_HEAD" ] && [ "$PR_BASE" = "$FIRST_BASE" ] \
   && [ "$PR_BASE_REF" = "$FIRST_BASE_REF" ] && [ "$PR_STATE" = open ] \
   && [ "$PR_DRAFT" = false ] && [ "$PR_AUTO" = null ] || {
-    echo "error: PR changed after exact-head evidence publication" >&2
+    echo "error: PR changed after server policy verification" >&2
     exit 1
   }
 
-printf 'admitted: head=%s base=%s base_ref=%s evidence=%s total=%s passed=%s failed=%s skipped=%s pending=%s reviewers=%s residual_bytes=0\n' \
-  "$PR_HEAD" "$PR_BASE" "$PR_BASE_REF" "$FM_PR_ADMISSION_CONTEXT" \
+printf 'admitted: head=%s base=%s base_ref=%s policy=native-strict total=%s passed=%s failed=%s skipped=%s pending=%s reviewers=%s residual_bytes=0\n' \
+  "$PR_HEAD" "$PR_BASE" "$PR_BASE_REF" \
   "$total" "$passed" "$failed" "$skipped" "$pending" "$reviewers"

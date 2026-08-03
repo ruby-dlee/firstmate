@@ -15,6 +15,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,9 @@ MAX_CAPTURE = 200_000
 MAX_LEDGER_PROMPT_BYTES = 64_000
 MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
+MAX_REVIEW_ITEMS = 32
+MAX_EVIDENCE_ITEMS = 32
+PROCESS_TERMINATION_GRACE_SECONDS = 0.25
 TEST_RUNNERS = {
     "bash",
     "bun",
@@ -111,27 +115,56 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             pass
 
 
-def terminate_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+def process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    return True
+
+
+def terminate_residual_process_group(process_group: int) -> None:
+    if not process_group_exists(process_group):
         return
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline and process_group_exists(process_group):
+        time.sleep(0.02)
+    if process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    except (ProcessLookupError, PermissionError):
+        pass
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
-        process.wait()
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    terminate_residual_process_group(process.pid)
 
 
 def bounded_communicate(
     process: subprocess.Popen[bytes],
     input_bytes: bytes | None,
-    timeout: int,
+    timeout: float,
     command_name: str,
 ) -> tuple[str, str]:
     selector = selectors.DefaultSelector()
@@ -153,14 +186,14 @@ def bounded_communicate(
         else:
             process.stdin.close()
 
-    started = time.monotonic()
+    deadline = time.monotonic() + timeout
     captured = 0
     try:
         while selector.get_map():
-            remaining = timeout - (time.monotonic() - started)
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 terminate_process(process)
-                fail(f"{command_name} timed out after {timeout}s")
+                fail(f"{command_name} timed out after {timeout:g}s")
             for key, _ in selector.select(min(remaining, 0.25)):
                 stream = key.fileobj
                 if key.data == "stdin":
@@ -196,7 +229,16 @@ def bounded_communicate(
             if stream is not None and not stream.closed:
                 stream.close()
 
-    process.wait()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        terminate_process(process)
+        fail(f"{command_name} timed out after {timeout:g}s")
+    try:
+        process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        terminate_process(process)
+        fail(f"{command_name} timed out after {timeout:g}s")
+    terminate_residual_process_group(process.pid)
     return (
         outputs["stdout"].decode("utf-8", errors="replace"),
         outputs["stderr"].decode("utf-8", errors="replace"),
@@ -208,7 +250,7 @@ def run_command(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
-    timeout: int = 60,
+    timeout: float = 60,
     input_text: str | None = None,
     description: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -255,7 +297,6 @@ def write_sandbox_profile(
             "(allow file-ioctl)",
             "(allow file-write*",
             f"  (subpath {json.dumps(str(writable_root.resolve()))})",
-            '  (subpath "/private/tmp")',
             '  (literal "/dev/null"))',
             "",
         ]
@@ -271,16 +312,26 @@ def run_sandboxed(
     profile_path: Path,
     allow_network: bool,
     env: dict[str, str] | None = None,
-    timeout: int = 60,
+    timeout: float = 60,
     input_text: str | None = None,
     description: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     write_sandbox_profile(profile_path, cwd, allow_network=allow_network)
     environment = (env or os.environ).copy()
     private_tmp = cwd / ".crosscheck" / "tmp"
+    private_cache = cwd / ".crosscheck" / "cache"
+    python_cache = cwd / ".crosscheck" / "pycache"
     private_tmp.mkdir(parents=True, exist_ok=True)
+    private_cache.mkdir(parents=True, exist_ok=True)
+    python_cache.mkdir(parents=True, exist_ok=True)
     environment.update(
-        {"TMPDIR": str(private_tmp), "TMP": str(private_tmp), "TEMP": str(private_tmp)}
+        {
+            "TMPDIR": str(private_tmp),
+            "TMP": str(private_tmp),
+            "TEMP": str(private_tmp),
+            "XDG_CACHE_HOME": str(private_cache),
+            "PYTHONPYCACHEPREFIX": str(python_cache),
+        }
     )
     sandbox = os.environ.get("FM_CROSSCHECK_SANDBOX_BIN", "sandbox-exec")
     return run_command(
@@ -293,7 +344,7 @@ def run_sandboxed(
     )
 
 
-def git(cwd: Path, *arguments: str, timeout: int = 60) -> str:
+def git(cwd: Path, *arguments: str, timeout: float = 60) -> str:
     result = run_command(["git", "-C", str(cwd), *arguments], timeout=timeout)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -370,7 +421,12 @@ def github_snapshot(root: Path, url: str) -> dict[str, Any]:
     return value
 
 
-def validate_citation(citation: Any, review_dir: Path, label: str) -> dict[str, Any]:
+def validate_citation(
+    citation: Any,
+    review_dir: Path,
+    label: str,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     require(isinstance(citation, dict), f"{label} must be an object")
     require_exact_keys(citation, {"path", "line"}, label)
     relative = require_string(citation.get("path"), f"{label}.path")
@@ -379,7 +435,12 @@ def validate_citation(citation: Any, review_dir: Path, label: str) -> dict[str, 
     candidate = (review_dir / relative).resolve()
     require(candidate.is_relative_to(review_dir.resolve()), f"{label}.path escapes the review checkout")
     tracked = run_command(
-        ["git", "-C", str(review_dir), "ls-files", "--error-unmatch", "--", relative]
+        ["git", "-C", str(review_dir), "ls-files", "--error-unmatch", "--", relative],
+        timeout=(
+            evidence_command_timeout(deadline, 60, label)
+            if deadline is not None
+            else 60
+        ),
     )
     require(tracked.returncode == 0, f"{label}.path is not tracked at the reviewed head")
     try:
@@ -390,10 +451,16 @@ def validate_citation(citation: Any, review_dir: Path, label: str) -> dict[str, 
     return {"path": relative, "line": line}
 
 
-def validate_citations(value: Any, review_dir: Path, label: str) -> list[dict[str, Any]]:
+def validate_citations(
+    value: Any,
+    review_dir: Path,
+    label: str,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
     require(isinstance(value, list) and value, f"{label} must be a nonempty array")
+    require(len(value) <= MAX_REVIEW_ITEMS, f"{label} has too many entries")
     return [
-        validate_citation(citation, review_dir, f"{label}[{index}]")
+        validate_citation(citation, review_dir, f"{label}[{index}]", deadline)
         for index, citation in enumerate(value)
     ]
 
@@ -430,7 +497,30 @@ def evidence_timeout() -> int:
     return value
 
 
-def execute_reproduction(value: Any, review_dir: Path, label: str) -> dict[str, Any]:
+def evidence_run_timeout() -> int:
+    raw = os.environ.get("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS", "900")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        fail("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be an integer")
+    require(
+        1 <= value <= 3600,
+        "FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be between 1 and 3600",
+    )
+    return value
+
+
+def evidence_command_timeout(
+    deadline: float, requested: float, label: str
+) -> float:
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, f"evidence batch timed out before {label}")
+    return min(requested, remaining)
+
+
+def execute_reproduction(
+    value: Any, review_dir: Path, label: str, deadline: float
+) -> dict[str, Any]:
     require(isinstance(value, dict), f"{label} must be an object")
     require_exact_keys(value, {"test_path", "command", "expected_exit", "output_contains"}, label)
     test_path = require_string(value.get("test_path"), f"{label}.test_path")
@@ -454,7 +544,7 @@ def execute_reproduction(value: Any, review_dir: Path, label: str) -> dict[str, 
             / f"evidence-{hashlib.sha256(label.encode()).hexdigest()[:10]}.sb"
         ),
         allow_network=False,
-        timeout=evidence_timeout(),
+        timeout=evidence_command_timeout(deadline, evidence_timeout(), label),
         description=label,
     )
     combined = result.stdout + result.stderr
@@ -504,15 +594,62 @@ def test_arguments(
     return [invocation["runner"], *invocation["arguments"], test_path]
 
 
-def create_proof_checkout(source: Path, destination: Path, head_sha: str, label: str) -> None:
+def validate_named_test(
+    review_dir: Path, test_path: str, label: str, deadline: float
+) -> None:
+    relative = Path(test_path)
+    require(not relative.is_absolute(), f"{label}.test_path must be relative")
+    require(
+        relative.as_posix() == test_path
+        and all(part not in {"", ".", ".."} for part in relative.parts),
+        f"{label}.test_path must be a canonical repository path",
+    )
+    candidate = review_dir / relative
+    try:
+        mode = candidate.lstat().st_mode
+    except OSError as exc:
+        fail(f"{label}.test_path is unavailable: {exc}")
+    require(stat.S_ISREG(mode), f"{label}.test_path must be a regular file")
+    lexical = Path(os.path.abspath(candidate))
+    require(
+        candidate.resolve() == lexical,
+        f"{label}.test_path must not traverse a symlink",
+    )
+    tracked = run_command(
+        ["git", "-C", str(review_dir), "ls-files", "--error-unmatch", "--", test_path],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} named test lookup"),
+    )
+    require(tracked.returncode == 0, f"{label}.test_path is not a tracked named test")
+
+
+def create_proof_checkout(
+    source: Path,
+    destination: Path,
+    head_sha: str,
+    label: str,
+    deadline: float,
+) -> None:
     clone = run_command(
         ["git", "clone", "--quiet", "--no-hardlinks", str(source), str(destination)],
-        timeout=180,
+        timeout=evidence_command_timeout(deadline, 180, f"{label} proof clone"),
     )
     require(clone.returncode == 0, f"{label} could not create its proof checkout")
-    git(destination, "checkout", "--quiet", "--detach", head_sha)
+    git(
+        destination,
+        "checkout",
+        "--quiet",
+        "--detach",
+        head_sha,
+        timeout=evidence_command_timeout(deadline, 60, f"{label} proof checkout"),
+    )
     require(
-        git(destination, "status", "--porcelain") == "",
+        git(
+            destination,
+            "status",
+            "--porcelain",
+            timeout=evidence_command_timeout(deadline, 60, f"{label} proof status"),
+        )
+        == "",
         f"{label} proof checkout is not clean",
     )
 
@@ -523,16 +660,14 @@ def execute_mutation_proof(
     head_sha: str,
     proof_root: Path,
     label: str,
+    deadline: float,
 ) -> dict[str, Any]:
     require(isinstance(value, dict), f"{label} must be an object")
     require_exact_keys(
         value, {"test_path", "test_invocation", "mutation_patch_path"}, label
     )
     test_path = require_string(value.get("test_path"), f"{label}.test_path")
-    tracked = run_command(
-        ["git", "-C", str(review_dir), "ls-files", "--error-unmatch", "--", test_path]
-    )
-    require(tracked.returncode == 0, f"{label}.test_path is not a tracked named test")
+    validate_named_test(review_dir, test_path, label, deadline)
     invocation = validate_test_invocation(
         value.get("test_invocation"), f"{label}.test_invocation"
     )
@@ -550,8 +685,8 @@ def execute_mutation_proof(
     proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
     baseline_dir = proof_root / f"proof-{proof_id}-baseline"
     mutated_dir = proof_root / f"proof-{proof_id}-mutated"
-    create_proof_checkout(review_dir, baseline_dir, head_sha, label)
-    create_proof_checkout(review_dir, mutated_dir, head_sha, label)
+    create_proof_checkout(review_dir, baseline_dir, head_sha, label, deadline)
+    create_proof_checkout(review_dir, mutated_dir, head_sha, label, deadline)
 
     baseline_profile = baseline_dir / ".crosscheck" / "mutation-proof.sb"
     baseline = run_sandboxed(
@@ -559,7 +694,9 @@ def execute_mutation_proof(
         cwd=baseline_dir,
         profile_path=baseline_profile,
         allow_network=False,
-        timeout=evidence_timeout(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} baseline test"
+        ),
         description=f"{label} baseline test",
     )
     require(baseline.returncode == 0, f"{label} named test does not pass before mutation")
@@ -571,10 +708,16 @@ def execute_mutation_proof(
             "apply",
             "--whitespace=nowarn",
             str(patch_path),
-        ]
+        ],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutation apply"),
     )
     require(applied.returncode == 0, f"{label} mutation patch does not apply")
-    changed = git(mutated_dir, "diff", "--name-only").splitlines()
+    changed = git(
+        mutated_dir,
+        "diff",
+        "--name-only",
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutation diff"),
+    ).splitlines()
     require(bool(changed), f"{label} mutation patch changes no tracked implementation")
     require(test_path not in changed, f"{label} mutation changed its named test")
 
@@ -584,7 +727,9 @@ def execute_mutation_proof(
         cwd=mutated_dir,
         profile_path=mutated_profile,
         allow_network=False,
-        timeout=evidence_timeout(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} mutated test"
+        ),
         description=f"{label} mutated test",
     )
     require(mutated.returncode != 0, f"{label} named test still passes after mutation")
@@ -937,9 +1082,15 @@ def review_output_schema() -> dict[str, Any]:
             "schema": {"type": "string", "const": REVIEW_SCHEMA},
             "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
             "summary": {"type": "string", "minLength": 1},
-            "citations": {"type": "array", "minItems": 1, "items": citation},
+            "citations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_REVIEW_ITEMS,
+                "items": citation,
+            },
             "finding_updates": {
                 "type": "array",
+                "maxItems": MAX_REVIEW_ITEMS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -956,6 +1107,7 @@ def review_output_schema() -> dict[str, Any]:
             },
             "new_findings": {
                 "type": "array",
+                "maxItems": MAX_REVIEW_ITEMS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -964,20 +1116,31 @@ def review_output_schema() -> dict[str, Any]:
                         "title": {"type": "string", "minLength": 1},
                         "severity": {"enum": sorted(SEVERITIES)},
                         "description": {"type": "string", "minLength": 1},
-                        "citations": {"type": "array", "minItems": 1, "items": citation},
+                        "citations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_REVIEW_ITEMS,
+                            "items": citation,
+                        },
                         "reproduction": reproduction,
                     },
                 },
             },
             "suspicions": {
                 "type": "array",
+                "maxItems": MAX_REVIEW_ITEMS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["description", "citations"],
                     "properties": {
                         "description": {"type": "string", "minLength": 1},
-                        "citations": {"type": "array", "minItems": 1, "items": citation},
+                        "citations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_REVIEW_ITEMS,
+                            "items": citation,
+                        },
                     },
                 },
             },
@@ -1194,6 +1357,19 @@ def validate_review_shape(value: Any, head_sha: str, review_dir: Path) -> dict[s
     value["citations"] = validate_citations(value.get("citations"), review_dir, "reviewer verdict citations")
     for key in ("finding_updates", "new_findings", "suspicions"):
         require(isinstance(value.get(key), list), f"reviewer verdict {key} must be an array")
+        require(
+            len(value[key]) <= MAX_REVIEW_ITEMS,
+            f"reviewer verdict {key} has too many entries",
+        )
+    evidence_items = len(value["new_findings"])
+    for update in value["finding_updates"]:
+        if isinstance(update, dict):
+            evidence_items += int(update.get("reproduction") is not None)
+            evidence_items += int(update.get("mutation_proof") is not None)
+    require(
+        evidence_items <= MAX_EVIDENCE_ITEMS,
+        "reviewer verdict requests too many evidence executions",
+    )
     return value
 
 
@@ -1219,9 +1395,11 @@ def apply_review(
     config: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     now = utc_now()
-    by_id = {finding["id"]: finding for finding in ledger["findings"]}
+    working_ledger = copy.deepcopy(ledger)
+    by_id = {finding["id"]: finding for finding in working_ledger["findings"]}
     updated_ids: list[str] = []
     seen_updates: set[str] = set()
+    evidence_deadline = time.monotonic() + evidence_run_timeout()
 
     for index, update in enumerate(review["finding_updates"]):
         label = f"finding_updates[{index}]"
@@ -1239,11 +1417,21 @@ def apply_review(
         equivalent_to = update.get("equivalent_to")
         proof: dict[str, Any] | None = None
         if reproduction is not None:
-            proof = execute_reproduction(reproduction, review_dir, f"{label}.reproduction")
+            proof = execute_reproduction(
+                reproduction,
+                review_dir,
+                f"{label}.reproduction",
+                evidence_deadline,
+            )
         if status == "verified-fixed":
             require(mutation is not None, f"{label} needs executed mutation proof")
             proof = execute_mutation_proof(
-                mutation, review_dir, snapshot_value["head_sha"], proof_root, f"{label}.mutation_proof"
+                mutation,
+                review_dir,
+                snapshot_value["head_sha"],
+                proof_root,
+                f"{label}.mutation_proof",
+                evidence_deadline,
             )
             require(equivalent_to is None, f"{label}.equivalent_to must be null")
         elif status == "closed-equivalent":
@@ -1283,9 +1471,19 @@ def apply_review(
         severity = new.get("severity")
         require(severity in SEVERITIES, f"{label}.severity is invalid")
         description = require_string(new.get("description"), f"{label}.description")
-        citations = validate_citations(new.get("citations"), review_dir, f"{label}.citations")
+        citations = validate_citations(
+            new.get("citations"),
+            review_dir,
+            f"{label}.citations",
+            evidence_deadline,
+        )
         new["citations"] = citations
-        reproduction = execute_reproduction(new.get("reproduction"), review_dir, f"{label}.reproduction")
+        reproduction = execute_reproduction(
+            new.get("reproduction"),
+            review_dir,
+            f"{label}.reproduction",
+            evidence_deadline,
+        )
         identifier = finding_id(new)
         require(identifier not in by_id, f"{label} duplicates existing finding {identifier}; update it instead")
         finding = {
@@ -1305,7 +1503,7 @@ def apply_review(
                 }
             ],
         }
-        ledger["findings"].append(finding)
+        working_ledger["findings"].append(finding)
         by_id[identifier] = finding
         new_ids.append(identifier)
 
@@ -1317,11 +1515,16 @@ def apply_review(
         suspicions.append(
             {
                 "description": require_string(suspicion.get("description"), f"{label}.description"),
-                "citations": validate_citations(suspicion.get("citations"), review_dir, f"{label}.citations"),
+                "citations": validate_citations(
+                    suspicion.get("citations"),
+                    review_dir,
+                    f"{label}.citations",
+                    evidence_deadline,
+                ),
             }
         )
 
-    active = active_findings_for_head(ledger, snapshot_value["head_sha"])
+    active = active_findings_for_head(working_ledger, snapshot_value["head_sha"])
     state = "unreviewed" if suspicions else ("blocking" if active else "clear")
     run = {
         "at": now,
@@ -1337,8 +1540,8 @@ def apply_review(
         "active_blockers": active,
         "suspicions": suspicions,
     }
-    ledger["runs"].append(run)
-    return ledger, run
+    working_ledger["runs"].append(run)
+    return working_ledger, run
 
 
 def append_unreviewed_run(

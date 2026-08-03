@@ -11,7 +11,7 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-ADAPTER="$ROOT/bin/fm-github-pr.py"
+ADAPTER="${FM_TEST_GITHUB_ADAPTER:-$ROOT/bin/fm-github-pr.py}"
 fm_test_tmproot_into TMP_ROOT fm-github-pr-tests
 FAKEBIN="$TMP_ROOT/fakebin"
 mkdir -p "$FAKEBIN"
@@ -20,17 +20,37 @@ cat > "$FAKEBIN/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
 case "$*" in
+  "api /repos/ruby-dlee/firstmate/pulls/1")
+    case "${FM_TEST_API_MODE:-ok}" in
+      ok) sed 's/^number: 72$/number: 1/' "$FM_TEST_API_FIXTURE" ;;
+      boolean-number) sed 's/^number: 72$/number: true/' "$FM_TEST_API_FIXTURE" ;;
+      *) exit 98 ;;
+    esac
+    ;;
+  "pr view 1 --repo ruby-dlee/firstmate --full")
+    case "${FM_TEST_CLAIMS_MODE:-ok}" in
+      ok) sed 's/^  number: 72$/  number: 1/' "$FM_TEST_CLAIMS_FIXTURE" ;;
+      boolean-number) sed 's/^  number: 72$/  number: true/' "$FM_TEST_CLAIMS_FIXTURE" ;;
+      *) exit 98 ;;
+    esac
+    ;;
   "api /repos/ruby-dlee/firstmate/pulls/72")
-    [ "${FM_TEST_API_MODE:-ok}" = ok ] || {
-      [ "$FM_TEST_API_MODE" = error ] && exit 42
-      sed '/^  sha:/d' "$FM_TEST_API_FIXTURE"
-      exit 0
-    }
-    cat "$FM_TEST_API_FIXTURE"
+    case "${FM_TEST_API_MODE:-ok}" in
+      ok) cat "$FM_TEST_API_FIXTURE" ;;
+      error) exit 42 ;;
+      malformed) sed '/^  sha:/d' "$FM_TEST_API_FIXTURE" ;;
+      malformed-array) sed 's/labels\[1\]/labels[2]/' "$FM_TEST_API_FIXTURE" ;;
+      boolean-number) sed 's/^number: 72$/number: true/' "$FM_TEST_API_FIXTURE" ;;
+      *) exit 98 ;;
+    esac
     ;;
   "pr view 72 --repo ruby-dlee/firstmate --full")
-    [ "${FM_TEST_CLAIMS_MODE:-ok}" = ok ] || exit 43
-    cat "$FM_TEST_CLAIMS_FIXTURE"
+    case "${FM_TEST_CLAIMS_MODE:-ok}" in
+      ok) cat "$FM_TEST_CLAIMS_FIXTURE" ;;
+      error) exit 43 ;;
+      boolean-number) sed 's/^  number: 72$/  number: true/' "$FM_TEST_CLAIMS_FIXTURE" ;;
+      *) exit 98 ;;
+    esac
     ;;
   "api PUT /repos/ruby-dlee/firstmate/pulls/72/merge --field sha=c9cbe79154013efcec9aa478f1476d0eff6c63df --field merge_method=squash")
     cat "$FM_TEST_MERGE_FIXTURE"
@@ -49,6 +69,7 @@ export FM_TEST_API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
 export FM_TEST_CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
 export FM_TEST_MERGE_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-merge-success.toon"
 PR_URL=https://github.com/ruby-dlee/firstmate/pull/72
+BOOLEAN_PR_URL=https://github.com/ruby-dlee/firstmate/pull/1
 
 test_snapshot_uses_observed_contract() {
   local output
@@ -118,6 +139,58 @@ test_merge_uses_exact_sha_field() {
   pass "GitHub merge sends the expected SHA atomically and requires merged true"
 }
 
+test_malformed_array_subtrees_fail_closed() {
+  local rc
+  set +e
+  FM_TEST_API_MODE=malformed-array "$ADAPTER" snapshot "$PR_URL" \
+    > "$TMP_ROOT/malformed-array.out" 2> "$TMP_ROOT/malformed-array.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "malformed TOON array count"
+  assert_grep 'declares 2 rows, found 1' "$TMP_ROOT/malformed-array.err" \
+    "ignored TOON array rows were not strictly validated"
+  pass "unrelated TOON arrays are count- and row-validated before isolation"
+}
+
+test_boolean_pr_numbers_fail_closed() {
+  local mode rc
+  for mode in api claims; do
+    set +e
+    if [ "$mode" = api ]; then
+      FM_TEST_API_MODE=boolean-number "$ADAPTER" snapshot "$BOOLEAN_PR_URL" \
+        > "$TMP_ROOT/boolean-$mode.out" 2> "$TMP_ROOT/boolean-$mode.err"
+    else
+      FM_TEST_CLAIMS_MODE=boolean-number "$ADAPTER" snapshot "$BOOLEAN_PR_URL" \
+        > "$TMP_ROOT/boolean-$mode.out" 2> "$TMP_ROOT/boolean-$mode.err"
+    fi
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "boolean PR number in $mode document"
+    assert_grep 'returned PR True, expected 1' "$TMP_ROOT/boolean-$mode.err" \
+      "boolean PR number was treated as integer 1 in $mode document"
+  done
+  pass "boolean PR numbers fail closed in API and claims documents"
+}
+
+if [ -n "${FM_TEST_CASE:-}" ]; then
+  case "$FM_TEST_CASE" in
+    test_malformed_array_subtrees_fail_closed|test_boolean_pr_numbers_fail_closed)
+      "$FM_TEST_CASE"
+      exit 0
+      ;;
+    *) fail "unknown focused GitHub adapter test: $FM_TEST_CASE" ;;
+  esac
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
+  test_snapshot_uses_observed_contract
+  test_malformed_array_subtrees_fail_closed
+  test_boolean_pr_numbers_fail_closed
+  exit 0
+fi
+
 test_snapshot_uses_observed_contract
 test_lookup_errors_fail_closed
 test_merge_uses_exact_sha_field
+test_malformed_array_subtrees_fail_closed
+test_boolean_pr_numbers_fail_closed

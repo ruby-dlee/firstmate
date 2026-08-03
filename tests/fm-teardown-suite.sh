@@ -68,7 +68,7 @@ fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TREEHOUSE_REAPER="$ROOT/bin/fm-treehouse-reap.sh"
-PR_CHECK="$ROOT/bin/fm-pr-check.sh"
+PR_CHECK="${FM_TEST_PR_CHECK:-$ROOT/bin/fm-pr-check.sh}"
 # shellcheck source=bin/fm-checkout-lock-lib.sh disable=SC1091
 . "$ROOT/bin/fm-checkout-lock-lib.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
@@ -1227,6 +1227,70 @@ SH
   wake_size=$(printf '%s' "$wake" | wc -c)
   [ "$wake_size" -le 550 ] || fail "lookup-error watcher wake was unbounded: $wake_size bytes"
   pass "PR lookup errors block setup and wake later polls loudly within a bound"
+}
+
+test_pr_check_without_worktree_still_performs_lookup() {
+  local case_dir rc staged url
+  case_dir=$(make_case pr-check-missing-worktree)
+  write_meta "$case_dir" no-mistakes ship
+  staged="$case_dir/state/.task-x1.meta.missing-worktree"
+  url=https://github.com/example/repo/pull/7
+  grep -v '^worktree=' "$case_dir/state/task-x1.meta" > "$staged"
+  mv "$staged" "$case_dir/state/task-x1.meta"
+  add_gh_axi_error "$case_dir"
+  set +e
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+  PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "PR lookup without worktree metadata"
+  assert_grep 'UNREVIEWED: PR head lookup failed' "$case_dir/err" \
+    "missing worktree metadata bypassed the remote PR lookup"
+  assert_no_grep '^pr=' "$case_dir/state/task-x1.meta" \
+    "missing worktree metadata still recorded an unreviewed PR"
+  assert_absent "$case_dir/state/task-x1.check.sh" \
+    "missing worktree metadata armed a watcher without a reviewed head"
+  pass "PR setup performs its remote lookup even without worktree metadata"
+}
+
+test_closed_pr_wakes_loudly_as_unreviewed() {
+  local case_dir head url wake wake_size
+  case_dir=$(make_case pr-check-closed-pr)
+  write_meta "$case_dir" no-mistakes ship
+  head=deadbeefcafefeed0000000000000000deadbeef
+  url=https://github.com/example/repo/pull/7
+  install_pr_check_lookup_fake "$case_dir"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
+    "$PR_CHECK" task-x1 "$url" >/dev/null \
+    || fail "PR watcher setup failed before closed-state exercise"
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+[ "$*" = "api /repos/example/repo/pulls/7" ] || exit 97
+printf '%s\n' \
+  'number: 7' \
+  'state: closed' \
+  'merged: false' \
+  'head:' \
+  '  ref: fm/task-x1' \
+  '  sha: deadbeefcafefeed0000000000000000deadbeef' \
+  '  repo:' \
+  '    full_name: example/repo' \
+  'base:' \
+  '  ref: main' \
+  '  sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '  repo:' \
+  '    full_name: example/repo'
+SH
+  chmod +x "$case_dir/fakebin/gh-axi"
+  wake=$(PATH="$case_dir/fakebin:$PATH" bash "$case_dir/state/task-x1.check.sh") \
+    || fail "closed-state watcher wake exited nonzero"
+  assert_contains "$wake" 'UNREVIEWED: PR state is CLOSED' \
+    "closed PR remained silent in the watcher"
+  wake_size=$(printf '%s' "$wake" | wc -c)
+  [ "$wake_size" -le 550 ] || fail "closed-state watcher wake was unbounded: $wake_size bytes"
+  pass "closed PRs wake the watcher loudly as unreviewed"
 }
 
 test_pr_check_serializes_with_account_session_updates() {
@@ -5994,10 +6058,29 @@ if [ "${FM_TEST_FOCUSED:-}" = crosscheck-pr-lookup ]; then
   test_pr_check_does_not_refresh_stale_pr_head
   test_pr_check_records_remote_head_when_local_lags
   test_pr_check_lookup_errors_are_loud_and_bounded
+  test_pr_check_without_worktree_still_performs_lookup
+  test_closed_pr_wakes_loudly_as_unreviewed
   test_pr_check_serializes_with_account_session_updates
   test_pr_check_rejects_reused_task_generation
   test_pr_check_backfills_legacy_generation_and_records_state
   test_pr_check_backfills_legacy_generation_before_race_check
+  exit 0
+fi
+
+if [ -n "${FM_TEST_CASE:-}" ]; then
+  case "$FM_TEST_CASE" in
+    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
+      "$FM_TEST_CASE"
+      exit 0
+      ;;
+    *) fail "unknown focused teardown test: $FM_TEST_CASE" ;;
+  esac
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-3-pr-check ]; then
+  test_pr_check_lookup_errors_are_loud_and_bounded
+  test_pr_check_without_worktree_still_performs_lookup
+  test_closed_pr_wakes_loudly_as_unreviewed
   exit 0
 fi
 

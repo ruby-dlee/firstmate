@@ -52,14 +52,12 @@ if [ -z "$LOOKUP_GENERATION" ]; then
   fi
 fi
 fm_account_meta_lock_release "$META_LOCK"
-if [ -n "$LOOKUP_WT" ] && [ -d "$LOOKUP_WT" ]; then
-  if ! PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>&1); then
-    PR_HEAD_DIAGNOSTIC=$(printf '%s' "$PR_HEAD_LOOKUP" | tr '\r\n' '  ')
-    printf 'UNREVIEWED: PR head lookup failed: %.500s\n' "$PR_HEAD_DIAGNOSTIC" >&2
-    exit 1
-  fi
-  PR_HEAD=$PR_HEAD_LOOKUP
+if ! PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>&1); then
+  PR_HEAD_DIAGNOSTIC=$(printf '%s' "$PR_HEAD_LOOKUP" | tr '\r\n' '  ')
+  printf 'UNREVIEWED: PR head lookup failed: %.500s\n' "$PR_HEAD_DIAGNOSTIC" >&2
+  exit 1
 fi
+PR_HEAD=$PR_HEAD_LOOKUP
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 release_meta_lock() {
   fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
@@ -75,7 +73,7 @@ if [ -f "$META" ]; then
   if ! grep -qxF "pr=$URL" "$META"; then
     echo "pr=$URL" >> "$META"
   fi
-  if [ -n "$PR_HEAD" ] && [ "$CURRENT_WT" = "$LOOKUP_WT" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
+  if [ "$CURRENT_WT" = "$LOOKUP_WT" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
     echo "pr_head=$PR_HEAD" >> "$META"
   fi
 else
@@ -91,7 +89,11 @@ if ! state=\$($PR_ADAPTER_Q state $URL_Q 2>&1); then
   printf 'UNREVIEWED: PR state lookup failed: %.500s\n' "\$diagnostic"
   exit 0
 fi
-[ "\$state" = "MERGED" ] && echo "merged"
+case "\$state" in
+  OPEN) ;;
+  MERGED) echo "merged" ;;
+  *) printf 'UNREVIEWED: PR state is %.500s\n' "\$state" ;;
+esac
 EOF
 chmod +x "$CHECK_TMP"
 mv "$CHECK_TMP" "$STATE/$ID.check.sh"

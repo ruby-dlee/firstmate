@@ -77,35 +77,215 @@ def _parse_scalar(raw: str, line_number: int) -> Any:
     return raw
 
 
+def _split_table_row(raw: str, line_number: int) -> list[str]:
+    cells: list[str] = []
+    start = 0
+    quoted = False
+    escaped = False
+    nesting = 0
+    for index, character in enumerate(raw):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character in "[{":
+            nesting += 1
+        elif character in "]}":
+            nesting -= 1
+            if nesting < 0:
+                raise GitHubContractError(
+                    f"malformed gh-axi TOON table row at line {line_number}"
+                )
+        elif character == "," and nesting == 0:
+            cells.append(raw[start:index].strip())
+            start = index + 1
+    if quoted or escaped or nesting != 0:
+        raise GitHubContractError(
+            f"malformed gh-axi TOON table row at line {line_number}"
+        )
+    cells.append(raw[start:].strip())
+    return cells
+
+
+def _mapping_entry(content: str, line_number: int) -> tuple[str, str]:
+    if ":" not in content:
+        raise GitHubContractError(
+            f"malformed gh-axi TOON mapping at line {line_number}"
+        )
+    key, raw_value = content.split(":", 1)
+    if KEY_RE.fullmatch(key) is None:
+        raise GitHubContractError(
+            f"malformed gh-axi TOON key at line {line_number}"
+        )
+    return key, raw_value.lstrip(" ")
+
+
+def _validate_mapping_block(
+    lines: list[tuple[int, int, str]],
+    index: int,
+    parent_depth: int,
+    initial_keys: set[str] | None = None,
+) -> int:
+    keys = set(initial_keys or ())
+    while index < len(lines) and lines[index][1] > parent_depth:
+        line_number, depth, content = lines[index]
+        if depth != parent_depth + 1:
+            raise GitHubContractError(
+                f"malformed gh-axi TOON nesting at line {line_number}"
+            )
+        array_header = ARRAY_HEADER_RE.fullmatch(content)
+        if array_header is not None:
+            key = array_header.group("key")
+            if key in keys:
+                raise GitHubContractError(f"duplicate gh-axi TOON field {key}")
+            keys.add(key)
+            index = _validate_array_subtree(lines, index, array_header)
+            continue
+        key, raw_value = _mapping_entry(content, line_number)
+        if key in keys:
+            raise GitHubContractError(f"duplicate gh-axi TOON field {key}")
+        keys.add(key)
+        index += 1
+        if raw_value == "":
+            if index >= len(lines) or lines[index][1] <= depth:
+                raise GitHubContractError(
+                    f"malformed empty gh-axi TOON section at line {line_number}"
+                )
+            index = _validate_mapping_block(lines, index, depth)
+        else:
+            _parse_scalar(raw_value, line_number)
+    return index
+
+
+def _validate_array_subtree(
+    lines: list[tuple[int, int, str]],
+    index: int,
+    header: re.Match[str],
+) -> int:
+    line_number, depth, _ = lines[index]
+    count = int(header.group("count"))
+    fields_text = header.group("fields")
+    fields = fields_text.split(",") if fields_text is not None else None
+    if fields is not None and len(set(fields)) != len(fields):
+        raise GitHubContractError(
+            f"duplicate gh-axi TOON table field at line {line_number}"
+        )
+    index += 1
+    child_start = index
+
+    if fields is not None:
+        rows = 0
+        while index < len(lines) and lines[index][1] > depth:
+            row_line, row_depth, content = lines[index]
+            if row_depth != depth + 1:
+                raise GitHubContractError(
+                    f"malformed gh-axi TOON table nesting at line {row_line}"
+                )
+            cells = _split_table_row(content, row_line)
+            if len(cells) != len(fields):
+                raise GitHubContractError(
+                    f"gh-axi TOON table row at line {row_line} has {len(cells)} "
+                    f"cells, expected {len(fields)}"
+                )
+            for cell in cells:
+                _parse_scalar(cell, row_line)
+            rows += 1
+            index += 1
+        if rows != count:
+            raise GitHubContractError(
+                f"gh-axi TOON array at line {line_number} declares {count} rows, "
+                f"found {rows}"
+            )
+        return index
+
+    if count == 0:
+        if index < len(lines) and lines[index][1] > depth:
+            raise GitHubContractError(
+                f"gh-axi TOON array at line {line_number} declares 0 items but is nonempty"
+            )
+        return index
+    if child_start >= len(lines) or lines[child_start][1] <= depth:
+        raise GitHubContractError(
+            f"gh-axi TOON array at line {line_number} declares {count} items, found 0"
+        )
+
+    first_content = lines[child_start][2]
+    object_items = first_content.startswith("- ") and ":" in first_content[2:]
+    items = 0
+    if object_items:
+        while index < len(lines) and lines[index][1] > depth:
+            item_line, item_depth, content = lines[index]
+            if item_depth != depth + 1 or not content.startswith("- "):
+                raise GitHubContractError(
+                    f"malformed gh-axi TOON object array at line {item_line}"
+                )
+            key, raw_value = _mapping_entry(content[2:], item_line)
+            items += 1
+            index += 1
+            if raw_value == "":
+                if index >= len(lines) or lines[index][1] <= item_depth:
+                    raise GitHubContractError(
+                        f"malformed empty gh-axi TOON section at line {item_line}"
+                    )
+                index = _validate_mapping_block(lines, index, item_depth)
+            else:
+                _parse_scalar(raw_value, item_line)
+                index = _validate_mapping_block(
+                    lines, index, item_depth, initial_keys={key}
+                )
+    else:
+        while index < len(lines) and lines[index][1] > depth:
+            item_line, item_depth, content = lines[index]
+            if item_depth != depth + 1:
+                raise GitHubContractError(
+                    f"malformed gh-axi TOON array nesting at line {item_line}"
+                )
+            scalar = content[2:] if content.startswith("- ") else content
+            _parse_scalar(scalar, item_line)
+            items += 1
+            index += 1
+    if items != count:
+        raise GitHubContractError(
+            f"gh-axi TOON array at line {line_number} declares {count} items, "
+            f"found {items}"
+        )
+    return index
+
+
 def parse_toon_mapping(document: str) -> dict[tuple[str, ...], Any]:
-    """Parse required mappings while isolating unrelated TOON array subtrees."""
+    """Parse required mappings after validating unrelated TOON array subtrees."""
 
     values: dict[tuple[str, ...], Any] = {}
     sections: set[tuple[str, ...]] = set()
     stack: list[str] = []
-    saw_content = False
-    ignored_array_depth: int | None = None
-
+    lines: list[tuple[int, int, str]] = []
     for line_number, raw_line in enumerate(document.splitlines(), start=1):
         if not raw_line.strip():
             continue
-        saw_content = True
         indent = len(raw_line) - len(raw_line.lstrip(" "))
         if indent % 2:
             raise GitHubContractError(
                 f"malformed gh-axi TOON indentation at line {line_number}"
             )
-        depth = indent // 2
-        if ignored_array_depth is not None:
-            if depth > ignored_array_depth:
-                continue
-            ignored_array_depth = None
+        lines.append((line_number, indent // 2, raw_line[indent:]))
+
+    if not lines:
+        raise GitHubContractError("gh-axi returned an empty document")
+
+    index = 0
+    while index < len(lines):
+        line_number, depth, content = lines[index]
         if depth > len(stack):
             raise GitHubContractError(
                 f"malformed gh-axi TOON nesting at line {line_number}"
             )
         stack = stack[:depth]
-        content = raw_line[indent:]
         array_header = ARRAY_HEADER_RE.fullmatch(content)
         if array_header is not None:
             key = array_header.group("key")
@@ -115,31 +295,21 @@ def parse_toon_mapping(document: str) -> dict[tuple[str, ...], Any]:
                     f"duplicate gh-axi TOON field {'.'.join(path)}"
                 )
             sections.add(path)
-            ignored_array_depth = depth
+            index = _validate_array_subtree(lines, index, array_header)
             continue
-        if ":" not in content:
-            raise GitHubContractError(
-                f"malformed gh-axi TOON mapping at line {line_number}"
-            )
-        key, raw_value = content.split(":", 1)
-        if KEY_RE.fullmatch(key) is None:
-            raise GitHubContractError(
-                f"malformed gh-axi TOON key at line {line_number}"
-            )
+        key, raw_value = _mapping_entry(content, line_number)
         path = tuple(stack + [key])
         if path in values or path in sections:
             raise GitHubContractError(
                 f"duplicate gh-axi TOON field {'.'.join(path)}"
             )
-        raw_value = raw_value.lstrip(" ")
         if raw_value == "":
             sections.add(path)
             stack.append(key)
         else:
             values[path] = _parse_scalar(raw_value, line_number)
+        index += 1
 
-    if not saw_content:
-        raise GitHubContractError("gh-axi returned an empty document")
     return values
 
 
@@ -205,7 +375,11 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
     base_ref = _required(values, "base", "ref")
     base_repo = _required(values, "base", "repo", "full_name")
 
-    if actual_number != number:
+    if (
+        not isinstance(actual_number, int)
+        or isinstance(actual_number, bool)
+        or actual_number != number
+    ):
         raise GitHubContractError(
             f"gh-axi returned PR {actual_number!r}, expected {number}"
         )
@@ -248,7 +422,11 @@ def fetch_claims(url: str) -> tuple[str, dict[str, Any]]:
     )
     values = parse_toon_mapping(raw)
     actual_number = _required(values, "pull_request", "number")
-    if actual_number != number:
+    if (
+        not isinstance(actual_number, int)
+        or isinstance(actual_number, bool)
+        or actual_number != number
+    ):
         raise GitHubContractError(
             f"gh-axi claims document returned PR {actual_number!r}, expected {number}"
         )

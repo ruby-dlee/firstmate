@@ -82,6 +82,8 @@ Crosscheck executes the command itself and stores its actual exit and bounded ou
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
 Crosscheck creates separate clean checkouts at the exact reviewed head, confirms the named test passes in the baseline checkout, applies the patch only in the mutated checkout, and requires the same test to fail there.
+Each proof checkout has its own writable temporary and cache state, while shared host temporary directories remain outside the sandbox write policy.
+The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
 The patch cannot modify the named test.
 
@@ -93,11 +95,13 @@ Later reviewers receive only a bounded projection of finding IDs, lifecycle stat
 Finding prose, reproduction output, test output, and lifecycle notes remain durable in the ledger but are never reinjected into a later reviewer prompt.
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, and the exact review checkout.
 The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, and structured JSON output.
-Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, `/private/tmp`, and `/dev/null`.
+Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout and `/dev/null`.
 An unavailable sandbox blocks the reviewer rather than launching it with ambient write authority.
 A nonzero exit, timeout, missing artifact, empty artifact, malformed artifact, wrong-head artifact, or unresolved suspicion records an `unreviewed` attempt and exits nonzero.
 This includes provider refusals that surface only as a stopped or silent agent.
 Reviewer and evidence stdout plus stderr share a 200,000-byte capture ceiling; crossing it terminates the process group and records a loud `unreviewed` attempt.
+The final process wait remains inside the same deadline, and residual processes in the command group are terminated after the leader exits.
+Reviewer result arrays are capped at 32 entries, at most 32 evidence executions are accepted, and all reproduction and mutation work shares a 900-second aggregate deadline by default.
 
 ## Installed external contracts
 
@@ -122,12 +126,13 @@ The merge form with optional `commit_title` and `commit_message` fields was sepa
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Write,Edit,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
-The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded and a sibling write failed with `Operation not permitted`.
+The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
 
 ## Validation evidence boundaries
 
 `tests/fm-github-pr.test.sh` is hermetic coverage using checked-in TOON shapes observed from installed `gh-axi 0.1.25`.
-`tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Claude, and sandbox fakes.
+Most of `tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Claude, and sandbox fakes.
+Its `test_installed_sandbox_denies_shared_private_tmp` case is the exception: it invokes the real installed `/usr/bin/sandbox-exec` and verifies the generated proof profile denies shared host temporary state.
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
 The focused PR-check cases in `tests/fm-teardown-suite.sh` and the merge cases in `tests/fm-pr-merge.test.sh` also use observed-shape GitHub fakes.
 Those deterministic suites validate parsing, lifecycle, failure handling, and atomic request construction; they do not claim to exercise live provider availability.

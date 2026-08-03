@@ -10,7 +10,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
-CROSSCHECK="$ROOT/bin/fm-crosscheck.sh"
+CROSSCHECK_PY="${FM_TEST_CROSSCHECK_PY:-$ROOT/bin/fm-crosscheck.py}"
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-tests
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
 CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
@@ -28,8 +28,11 @@ make_case() {
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/regression.test.sh"
   printf '#!/usr/bin/env bash\n[ ! -e .stateful-proof-marker ] || exit 19\ntouch .stateful-proof-marker\ngrep -qx fixed app.txt\n' \
     > "$repo/tests/stateful.test.sh"
+  printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/shared-test.sh"
+  ln -s ../shared-test.sh "$repo/tests/symlink.test.sh"
   chmod +x "$repo/tests/regression.test.sh" "$repo/tests/stateful.test.sh"
-  git -C "$repo" add app.txt other.txt tests/regression.test.sh tests/stateful.test.sh
+  git -C "$repo" add app.txt other.txt shared-test.sh tests/regression.test.sh \
+    tests/stateful.test.sh tests/symlink.test.sh
   git -C "$repo" commit -qm base
   base=$(git -C "$repo" rev-parse HEAD)
   git -C "$repo" checkout -qb feature
@@ -253,7 +256,7 @@ elif scenario == "new-finding":
             "output_contains": "REPRODUCED-BUG",
         },
     }]
-elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful-forgery"}:
+elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful-forgery", "symlink-forgery"}:
     patch = protocol / "mutations" / "revert.patch"
     if scenario in {"verified-fixed", "forged-command"}:
         patch.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +276,20 @@ elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful
 -base
 +irrelevant
 """)
-    test_path = "tests/stateful.test.sh" if scenario == "stateful-forgery" else "tests/regression.test.sh"
+    elif scenario == "symlink-forgery":
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        patch.write_text("""diff --git a/shared-test.sh b/shared-test.sh
+--- a/shared-test.sh
++++ b/shared-test.sh
+@@ -1,2 +1,2 @@
+ #!/usr/bin/env bash
+-grep -qx fixed app.txt
++exit 41
+""")
+    test_path = {
+        "stateful-forgery": "tests/stateful.test.sh",
+        "symlink-forgery": "tests/symlink.test.sh",
+    }.get(scenario, "tests/regression.test.sh")
     mutation_proof = {
         "test_path": test_path,
         "test_invocation": {"runner": "bash", "arguments": []},
@@ -323,6 +339,28 @@ elif scenario == "noisy-reproduction":
             "output_contains": "E",
         },
     }]
+elif scenario == "slow-reproduction":
+    reproduction = protocol / "reproductions" / "slow.sh"
+    reproduction.parent.mkdir(parents=True, exist_ok=True)
+    reproduction.write_text("#!/usr/bin/env bash\nsleep 3\necho SLOW-REPRODUCTION\nexit 7\n")
+    os.chmod(reproduction, 0o755)
+    base["new_findings"] = [{
+        "title": "Slow evidence",
+        "severity": "blocking",
+        "description": "The reproduction consumes the aggregate evidence budget.",
+        "citations": [{"path": "app.txt", "line": 1}],
+        "reproduction": {
+            "test_path": ".crosscheck/reproductions/slow.sh",
+            "command": "bash .crosscheck/reproductions/slow.sh",
+            "expected_exit": 7,
+            "output_contains": "SLOW-REPRODUCTION",
+        },
+    }]
+elif scenario == "too-many-items":
+    base["suspicions"] = [{
+        "description": f"Bounded suspicion {index}",
+        "citations": [{"path": "app.txt", "line": 1}],
+    } for index in range(33)]
 elif scenario == "suspicion":
     base["suspicions"] = [{
         "description": "The reviewer could not finish a reproduction.",
@@ -355,7 +393,7 @@ run_case() {
   FM_TEST_REVIEWER_HOME="$case_dir/reviewer-home" \
   FM_TEST_BASE="$base" \
   FM_TEST_HEAD="$head" \
-    "$CROSSCHECK" "$command" task-x1 "$PR_URL" "$@"
+    python3 "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@"
 }
 
 seed_open_ledger() {
@@ -532,6 +570,142 @@ test_stateful_test_cannot_fabricate_mutation_causality() {
   pass "baseline and mutation tests run in independent clean checkouts"
 }
 
+test_final_wait_and_residual_processes_are_bounded() {
+  python3 - "$CROSSCHECK_PY" "$TMP_ROOT/residual-child-marker" <<'PY' \
+    || fail "process lifetime escaped its deadline or process group"
+import importlib.util
+from pathlib import Path
+import shlex
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+started = time.monotonic()
+try:
+    module.run_command(
+        ["/bin/bash", "-c", "exec 1>&- 2>&-; sleep 2"],
+        timeout=0.3,
+        description="closed-pipe command",
+    )
+except module.CrosscheckError as exc:
+    assert "timed out" in str(exc)
+else:
+    raise AssertionError("closed-pipe command escaped its deadline")
+assert time.monotonic() - started < 1.6
+
+marker = Path(sys.argv[2])
+module.run_command(
+    [
+        "/bin/bash",
+        "-c",
+        f"(exec 1>&- 2>&-; sleep 1; printf leaked > {shlex.quote(str(marker))}) &",
+    ],
+    timeout=2,
+    description="residual-child command",
+)
+time.sleep(1.2)
+assert not marker.exists()
+PY
+  pass "pipe EOF cannot escape deadlines or leave residual child processes"
+}
+
+test_installed_sandbox_denies_shared_private_tmp() {
+  local marker profile
+  marker="/private/tmp/fm-crosscheck-shared-state-$$"
+  profile="$TMP_ROOT/isolated-proof.sb"
+  python3 - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
+    || fail "generated proof sandbox permits shared host state"
+import importlib.util
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+profile = Path(sys.argv[2])
+marker = Path(sys.argv[3])
+module.write_sandbox_profile(profile, profile.parent, allow_network=False)
+try:
+    result = subprocess.run(
+        [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            str(profile),
+            "/bin/sh",
+            "-c",
+            f": > {shlex.quote(str(marker))}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+finally:
+    marker.unlink(missing_ok=True)
+PY
+  pass "installed sandbox denies proof access to shared private tmp"
+}
+
+test_symlinked_named_test_cannot_hide_test_mutation() {
+  local record case_dir base head rc
+  record=$(make_case symlink-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" symlink-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "symlinked named test"
+  assert_grep 'test_path must be a regular file' "$case_dir/err" \
+    "symlinked test alias hid a mutation to its executed target"
+  pass "symlinked named tests cannot hide mutations to executed test code"
+}
+
+test_evidence_batch_item_limit_precedes_execution() {
+  local record case_dir base head rc
+  record=$(make_case too-many-items)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  set +e
+  run_case "$case_dir" "$base" "$head" too-many-items run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "oversized reviewer batch"
+  assert_grep 'reviewer verdict suspicions has too many entries' "$case_dir/err" \
+    "oversized reviewer arrays reached application"
+  pass "reviewer item limits are validated before evidence application"
+}
+
+test_evidence_batch_has_aggregate_deadline() {
+  local record case_dir base head rc started elapsed
+  record=$(make_case aggregate-evidence-deadline)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  started=$(date +%s)
+  set +e
+  FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS=10 \
+  FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS=1 \
+    run_case "$case_dir" "$base" "$head" slow-reproduction run \
+      > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  elapsed=$(($(date +%s) - started))
+  expect_code 1 "$rc" "aggregate evidence deadline"
+  [ "$elapsed" -lt 10 ] || fail "aggregate evidence deadline took ${elapsed}s"
+  assert_grep 'timed out' "$case_dir/err" \
+    "aggregate evidence deadline did not block loudly"
+  pass "all reviewer evidence shares one bounded execution deadline"
+}
+
 test_artifacts_cannot_escape_designated_subtrees() {
   local record case_dir base head rc
   record=$(make_case escaped-reproduction)
@@ -654,7 +828,7 @@ assert value["runs"][-1]["active_blockers"] == ["cc-aaaaaaaaaaaa"]
 }
 
 test_equivalent_finding_reopens_when_direct_proof_regresses() {
-  python3 - "$ROOT/bin/fm-crosscheck.py" <<'PY' || fail "equivalent finding did not fail closed after target regression"
+  python3 - "$CROSSCHECK_PY" <<'PY' || fail "equivalent finding did not fail closed after target regression"
 import importlib.util
 import sys
 
@@ -813,6 +987,30 @@ test_verify_rechecks_live_head_and_claims() {
   pass "merge verification rechecks the exact live head, base, and stable claims digest"
 }
 
+if [ -n "${FM_TEST_CASE:-}" ]; then
+  case "$FM_TEST_CASE" in
+    test_final_wait_and_residual_processes_are_bounded|\
+    test_installed_sandbox_denies_shared_private_tmp|\
+    test_symlinked_named_test_cannot_hide_test_mutation|\
+    test_evidence_batch_item_limit_precedes_execution|\
+    test_evidence_batch_has_aggregate_deadline)
+      "$FM_TEST_CASE"
+      exit 0
+      ;;
+    *) fail "unknown focused Crosscheck test: $FM_TEST_CASE" ;;
+  esac
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
+  test_verified_fix_executes_mutation_proof
+  test_final_wait_and_residual_processes_are_bounded
+  test_installed_sandbox_denies_shared_private_tmp
+  test_symlinked_named_test_cannot_hide_test_mutation
+  test_evidence_batch_item_limit_precedes_execution
+  test_evidence_batch_has_aggregate_deadline
+  exit 0
+fi
+
 test_clear_review_uses_policy_contract
 test_claude_reviewer_provides_model_separation_for_codex_author
 test_new_finding_requires_executed_reproduction
@@ -820,6 +1018,11 @@ test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_forged_git_diff_mutation_command_is_rejected
 test_stateful_test_cannot_fabricate_mutation_causality
+test_final_wait_and_residual_processes_are_bounded
+test_installed_sandbox_denies_shared_private_tmp
+test_symlinked_named_test_cannot_hide_test_mutation
+test_evidence_batch_item_limit_precedes_execution
+test_evidence_batch_has_aggregate_deadline
 test_artifacts_cannot_escape_designated_subtrees
 test_reviewer_and_evidence_output_limits_fail_closed
 test_prompt_uses_only_bounded_ledger_projection

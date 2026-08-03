@@ -294,7 +294,16 @@ probe_failure_ttl_seconds() {
 }
 
 probe_now() {
-  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_NOW:-}" ]; then
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_NOW_SEQUENCE_FILE:-}" ]; then
+    local sequence=$FM_ACCOUNT_DIRECTORY_PROBE_NOW_SEQUENCE_FILE value tmp
+    [ -f "$sequence" ] && [ ! -L "$sequence" ] || return 1
+    value=$(sed -n '1p' "$sequence")
+    tmp=$(mktemp "${sequence}.XXXXXX") || return 1
+    sed '1d' "$sequence" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$sequence" || { rm -f "$tmp"; return 1; }
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$value"
+  elif test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_NOW:-}" ]; then
     case "$FM_ACCOUNT_DIRECTORY_PROBE_NOW" in
       ''|*[!0-9]*) echo "error: Codex probe test clock must be an integer" >&2; return 1 ;;
     esac
@@ -685,7 +694,7 @@ write_codex_probe_cache() { # <cache-file> <epoch> <verdict> <account-identity>
 }
 
 probe_codex_account() { # <account-home> <codex-command>
-  local account_home=$1 codex_bin=$2 probe_root account_name cache now cached
+  local account_home=$1 codex_bin=$2 probe_root account_name cache now cached published_at
   local timeout output error status verdict tmp_root cache_home environment_name probe_lock account_identity current_identity
   probe_root=$(probe_cache_directory) || return 1
   account_name=${account_home##*/}
@@ -718,7 +727,8 @@ probe_codex_account() { # <account-home> <codex-command>
   cache_home=$account_home/.agent-fleet-quota-cache
   mkdir -p "$cache_home" 2>/dev/null || {
     rm -rf "$tmp_root"
-    write_codex_probe_cache "$cache" "$now" unavailable "$account_identity" || true
+    published_at=$(probe_now 2>/dev/null || printf '%s' "$now")
+    write_codex_probe_cache "$cache" "$published_at" unavailable "$account_identity" || true
     fm_account_meta_lock_release "$probe_lock" || true
     printf 'unavailable\n'
     return 0
@@ -763,7 +773,8 @@ probe_codex_account() { # <account-home> <codex-command>
     log "codex account $account_home completed the exact gpt-5.6-sol/xhigh ground-truth probe"
   fi
   rm -rf "$tmp_root"
-  write_codex_probe_cache "$cache" "$now" "$verdict" "$account_identity" \
+  published_at=$(probe_now) || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  write_codex_probe_cache "$cache" "$published_at" "$verdict" "$account_identity" \
     || { fm_account_meta_lock_release "$probe_lock"; return 1; }
   fm_account_meta_lock_release "$probe_lock" || return 1
   printf '%s\n' "$verdict"

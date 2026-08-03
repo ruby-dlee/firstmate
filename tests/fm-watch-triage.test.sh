@@ -1783,6 +1783,29 @@ test_runtime_profile_verifies_each_new_generation_before_periodic_cadence() {
   pass "watcher verifies every new Codex generation immediately and periodically thereafter"
 }
 
+test_runtime_profile_mismatches_do_not_starve_later_tasks() {
+  local dir state fakebin out
+  dir=$(make_case runtime-profile-fairness); state="$dir/state"; fakebin="$dir/fakebin"
+  fm_write_meta "$state/lane-a.meta" \
+    'window=test:fm-lane-a' 'harness=codex' 'generation_id=spawn:a'
+  fm_write_meta "$state/lane-b.meta" \
+    'window=test:fm-lane-b' 'harness=codex' 'generation_id=spawn:b'
+  out=$(
+    export FM_STATE_OVERRIDE="$state"
+    export FM_RUNTIME_PROFILE_BIN="$fakebin/fm-runtime-profile.sh"
+    export FM_RUNTIME_PROFILE_INTERVAL=999999
+    export FM_RUNTIME_PROFILE_STARTUP_GRACE=0
+    export FM_FAKE_RUNTIME_PROFILE_RC=1
+    export FM_FAKE_RUNTIME_PROFILE_OUTPUT='mismatch: synthetic profile'
+    . "$WATCH"
+    verify_runtime_profiles_if_due
+  )
+  assert_contains "$out" 'runtime-profile: lane-a' "first mismatch was not surfaced"
+  assert_grep 'runtime-profile: lane-a' "$state/.wake-queue" "first mismatch was not durably queued"
+  assert_grep 'runtime-profile: lane-b' "$state/.wake-queue" "later mismatch was starved by the first wake"
+  pass "runtime profile verification collects every due verdict before waking"
+}
+
 test_watcher_markers_refuse_symlinks() {
   local dir state fake_root sync_bin outside before after
   dir=$(make_case watcher-marker-symlink); state="$dir/state"
@@ -1893,6 +1916,12 @@ if [ "${FM_TEST_FOCUSED:-}" = failure-pause ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = runtime-profiles ]; then
+  test_runtime_profile_verifies_each_new_generation_before_periodic_cadence
+  test_runtime_profile_mismatches_do_not_starve_later_tasks
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1937,5 +1966,6 @@ test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
 test_account_session_sync_is_bounded_and_cadenced
 test_runtime_profile_verifies_each_new_generation_before_periodic_cadence
+test_runtime_profile_mismatches_do_not_starve_later_tasks
 test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback

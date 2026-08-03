@@ -206,7 +206,7 @@ Review diffs go through `bin/fm-review-diff.sh`, which refreshes the authoritati
 For target project repos shipped through their own no-mistakes pipeline, commits under `.no-mistakes/evidence/` are the pipeline's PR-viewable validation evidence and are expected to stay in the crewmate branch until the evidence-hosting design changes.
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.
 PR-based task merges go through `bin/fm-pr-merge.sh`, which records the exact PR head without arming a poll, synchronously runs `bin/fm-pr-admit.sh`, and invokes GitHub's one-shot merge endpoint with that admitted SHA.
-Admission binds green settled checks, two distinct non-author exact-head approvals, a machine-readable independent adversarial attestation, local and remote content containment, and the independent verdict to one unchanged head and base.
+Admission binds green settled checks, two distinct non-author exact-head approvals, a machine-readable independent adversarial attestation, a clean local worktree, local and remote content containment, and a server-required exact-head status receipt to one unchanged head, base, and base ref.
 The helper defaults to squash, preserves explicit merge-method flags, and rejects scheduling, malformed URLs, side-effect flags, or repository overrides before merge admission.
 Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be landed before the worktree is returned.
 Terminal auto-reaping invokes that exact teardown path without `--force`; it does not introduce a second or weaker landed-work definition.

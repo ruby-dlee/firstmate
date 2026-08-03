@@ -326,6 +326,23 @@ test_codex_completion_proof_cache_is_bounded() {
   pass "Codex completion proofs expire on a bounded clock and are refreshed from codex itself"
 }
 
+test_failed_probe_cache_starts_when_verdict_is_published() {
+  local clock cache out status
+  reset_accounts
+  set_remaining 1 none
+  clock="$TMP_ROOT/probe-publish-clock"
+  printf '100\n100\n160\n' > "$clock"
+  if out=$(FM_ACCOUNT_DIRECTORY_PROBE_NOW_SEQUENCE_FILE="$clock" run_selector select codex 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "unavailable account unexpectedly selected"
+  cache="$ROTATION_STATE/codex-probes/1.status"
+  [ "$(cut -f2 "$cache")" = 160 ] || fail "failed probe cache was timestamped before the verdict"
+  pass "failed completion-proof TTL starts when its verdict is published"
+}
+
 test_codex_completion_proof_is_bound_to_account_directory_identity() {
   local out status calls
   reset_accounts
@@ -1490,11 +1507,17 @@ if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = probe-publish-time ]; then
+  test_failed_probe_cache_starts_when_verdict_is_published
+  exit 0
+fi
+
 test_codex_requires_exact_completion_proof
 test_profile_eligibility_requires_enabled_worker
 test_claude_approval_marker_contract
 test_openat_binding_failure_is_a_setup_error
 test_codex_completion_proof_cache_is_bounded
+test_failed_probe_cache_starts_when_verdict_is_published
 test_codex_completion_proof_is_bound_to_account_directory_identity
 test_codex_refuses_when_no_account_completes_probe
 test_codex_timeout_skips_unproved_account

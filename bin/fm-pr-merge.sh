@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
+# shellcheck source=bin/fm-pr-evidence-lib.sh
+. "$SCRIPT_DIR/fm-pr-evidence-lib.sh"
 
 ID=${1:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <method>]}
 URL=${2:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <method>]}
@@ -68,9 +70,19 @@ case "$ADMITTED_HEAD" in
   ????????????????????????????????????????) ;;
   *) echo "error: admission receipt carried an invalid head" >&2; exit 1 ;;
 esac
+ADMITTED_BASE_REF=${ADMISSION#* base_ref=}
+ADMITTED_BASE_REF=${ADMITTED_BASE_REF%% *}
+ADMITTED_EVIDENCE=${ADMISSION#* evidence=}
+ADMITTED_EVIDENCE=${ADMITTED_EVIDENCE%% *}
+[ -n "$ADMITTED_BASE_REF" ] && [ "$ADMITTED_EVIDENCE" = "$FM_PR_ADMISSION_CONTEXT" ] || {
+  echo "error: admission receipt carried no server-enforced evidence identity" >&2
+  exit 1
+}
+fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$ADMITTED_BASE_REF" || {
+  echo "error: exact-head admission evidence is not required at the server merge boundary" >&2
+  exit 1
+}
 
-# The REST merge endpoint's sha field is an atomic compare-and-merge guard.
-# It refuses if the PR head moved after the synchronous admission above.
 MERGE_DOC=$(gh-axi api PUT "/repos/$OWNER/$REPO/pulls/$NUMBER/merge" \
   --field "sha=$ADMITTED_HEAD" --field "merge_method=$METHOD") || exit 1
 MERGED=$(printf '%s\n' "$MERGE_DOC" | sed -n 's/^merged: *//p' | head -1)

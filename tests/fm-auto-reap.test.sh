@@ -70,6 +70,11 @@ if [ "${FM_FAKE_TEARDOWN_ASSERT_HERDR:-0}" = 1 ]; then
   grep -qx 'herdr_pane_id=pane-41' "$meta" || exit 46
   ! grep -q '^direct_spawn_endpoint=' "$meta" || exit 47
 fi
+if [ "${FM_FAKE_TEARDOWN_ASSERT_LOCK:-0}" = 1 ]; then
+  [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$FM_STATE_OVERRIDE/.account-lifecycle-$id.lock" ] || exit 51
+  [ -f "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" ] && [ ! -L "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" ] || exit 52
+  [ "$(sed -n '1p' "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD")" = "$PPID" ] || exit 53
+fi
 if [ "${FM_FAKE_TEARDOWN_STATUS:-0}" -ne 0 ]; then
   printf 'REFUSED: synthetic teardown refusal\n' >&2
   exit "$FM_FAKE_TEARDOWN_STATUS"
@@ -105,8 +110,10 @@ reset_logs() {
   FM_FAKE_TEARDOWN_STATUS=0
   FM_FAKE_TEARDOWN_ASSERT_ORPHAN=0
   FM_FAKE_TEARDOWN_ASSERT_HERDR=0
+  FM_FAKE_TEARDOWN_ASSERT_LOCK=0
   export FM_FAKE_PR_STATE FM_FAKE_AGENT_VERDICT FM_FAKE_EXACT_BRANCH FM_FAKE_EXACT_ID
   export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
+  export FM_FAKE_TEARDOWN_ASSERT_LOCK
 }
 
 make_task() {  # <id> <mode>
@@ -117,7 +124,8 @@ make_task() {  # <id> <mode>
   git -C "$worktree" remote add no-mistakes "$TMP/no-mistakes-repos/repo-$id.git"
   fm_write_meta "$HOME_DIR/state/$id.meta" \
     "window=fm:$id" "worktree=$worktree" "project=$worktree" \
-    "kind=ship" "mode=$mode" "pr=https://github.com/acme/repo/pull/7"
+    "kind=ship" "mode=$mode" "generation_id=test:$id" \
+    "pr=https://github.com/acme/repo/pull/7"
   printf 'done: PR checks green\n' > "$HOME_DIR/state/$id.status"
   if [ ! -f "$FM_AUTO_REAP_NO_MISTAKES_DB" ]; then
     sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" <<'SQL'
@@ -153,12 +161,14 @@ test_merged_task_cancels_exact_run_then_tears_down() {
   reset_logs
   make_task merged-run no-mistakes
   insert_run merged-run 01EXACT fm/merged-run running "$(git -C "$TMP/merged-run" rev-parse HEAD)"
+  FM_FAKE_TEARDOWN_ASSERT_LOCK=1
+  export FM_FAKE_TEARDOWN_ASSERT_LOCK
   out=$("$AUTO_REAP" task merged-run pr-merged 2>&1); rc=$?
   expect_code 0 "$rc" "merged task auto-reap"
   assert_contains "$out" "auto-reaped merged-run" "merged task reports reaping"
   assert_contains "$(cat "$FM_FAKE_NM_LOG")" "axi abort --run 01EXACT" "exact no-mistakes run canceled"
   assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "merged-run" "ordinary teardown invoked"
-  pass "merged terminal task cancels its exact no-mistakes run before teardown"
+  pass "merged terminal task keeps lifecycle custody through cancellation and teardown"
 }
 
 test_open_pr_refuses_without_teardown() {
@@ -613,7 +623,7 @@ test_local_merge_immediately_auto_reaps() {
   git -C "$worktree" commit -qm change
   fm_write_meta "$HOME_DIR/state/$id.meta" \
     "window=fm:$id" "worktree=$worktree" "project=$project" \
-    "kind=ship" "mode=local-only"
+    "kind=ship" "mode=local-only" "generation_id=test:$id"
   printf 'done: ready in branch\n' > "$HOME_DIR/state/$id.status"
   out=$("$MERGE_LOCAL" "$id" 2>&1); rc=$?
   expect_code 0 "$rc" "local merge plus auto-reap"

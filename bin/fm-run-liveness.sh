@@ -15,6 +15,7 @@ META="$STATE/$ID.meta"
 CACHE="$STATE/.run-liveness-$ID"
 NM_BIN=${FM_RUN_LIVENESS_NM_BIN:-no-mistakes}
 PS_BIN=${FM_RUN_LIVENESS_PS_BIN:-ps}
+CWD_BIN=${FM_RUN_LIVENESS_CWD_BIN:-lsof}
 HOST_PRESSURE_BIN=${FM_RUN_LIVENESS_HOST_PRESSURE_BIN:-$SCRIPT_DIR/fm-host-pressure.sh}
 SAMPLES=${FM_RUN_LIVENESS_SAMPLES:-7}
 INTERVAL=${FM_RUN_LIVENESS_INTERVAL:-10}
@@ -105,20 +106,62 @@ cpu_delta=0
 any_process=0
 i=1
 while [ "$i" -le "$SAMPLES" ]; do
-  snapshot=$(
-    "$PS_BIN" axww -o pid=,ppid=,%cpu=,time=,command= 2>/dev/null \
-      | awk -v run="/$START_RUN/" '
-          index($0, "/.no-mistakes/worktrees/") && index($0, run) {
-            count += 1
-            cpu += $3
-            split($4, a, /[:-]/)
-            n = length(a)
-            if (n == 2) secs += a[1] * 60 + a[2]
-            else if (n == 3) secs += a[1] * 3600 + a[2] * 60 + a[3]
-            else if (n == 4) secs += a[1] * 86400 + a[2] * 3600 + a[3] * 60 + a[4]
+  sample_ps=$(mktemp "$STATE/.run-liveness-ps-$ID.XXXXXX") \
+    || emit_result 2 "inconclusive: cannot stage process sample for run $START_RUN"
+  sample_cwd=$(mktemp "$STATE/.run-liveness-cwd-$ID.XXXXXX") \
+    || { rm -f "$sample_ps"; emit_result 2 "inconclusive: cannot stage cwd sample for run $START_RUN"; }
+  if ! FM_RUN_LIVENESS_SAMPLER_PID=$$ "$PS_BIN" axww -o pid=,ppid=,%cpu=,time=,command= > "$sample_ps" 2>/dev/null \
+    || ! FM_RUN_LIVENESS_SAMPLER_PID=$$ "$CWD_BIN" -d cwd -F pn > "$sample_cwd" 2>/dev/null; then
+    rm -f "$sample_ps" "$sample_cwd"
+    emit_result 2 "inconclusive: process ownership could not be sampled for run $START_RUN"
+  fi
+  snapshot=$(awk -v self="$$" -v run="/$START_RUN/" '
+          FILENAME == ARGV[1] {
+            if ($0 ~ /^p[0-9]+$/) cwd_pid = substr($0, 2)
+            else if ($0 ~ /^n\// && cwd_pid != "") cwd[cwd_pid] = substr($0, 2)
+            next
           }
-          END { printf "%d\t%.1f\t%.0f", count + 0, cpu + 0, secs + 0 }'
-  ) || emit_result 2 "inconclusive: process table could not be sampled for run $START_RUN"
+          {
+            pid = $1
+            rows += 1
+            parent[pid] = $2
+            process_cpu[pid] = $3
+            process_time[pid] = $4
+            if (index(cwd[pid], "/.no-mistakes/worktrees/") && index(cwd[pid], run)) {
+              seed[pid] = 1
+            }
+          }
+          END {
+            sampler[self] = 1
+            for (pass = 1; pass <= rows; pass += 1) {
+              for (pid in parent) {
+                if (sampler[parent[pid]]) sampler[pid] = 1
+              }
+            }
+            for (pid in seed) {
+              if (!sampler[pid]) owned[pid] = 1
+            }
+            for (pass = 1; pass <= rows; pass += 1) {
+              for (pid in parent) {
+                if (!sampler[pid] && owned[parent[pid]]) owned[pid] = 1
+              }
+            }
+            for (pid in owned) {
+              if (!owned[pid]) continue
+              count += 1
+              cpu += process_cpu[pid]
+              split(process_time[pid], a, /[:-]/)
+              n = length(a)
+              if (n == 2) secs += a[1] * 60 + a[2]
+              else if (n == 3) secs += a[1] * 3600 + a[2] * 60 + a[3]
+              else if (n == 4) secs += a[1] * 86400 + a[2] * 3600 + a[3] * 60 + a[4]
+            }
+            printf "%d\t%.1f\t%.0f", count + 0, cpu + 0, secs + 0
+          }' "$sample_cwd" "$sample_ps") || {
+    rm -f "$sample_ps" "$sample_cwd"
+    emit_result 2 "inconclusive: process table could not be sampled for run $START_RUN"
+  }
+  rm -f "$sample_ps" "$sample_cwd"
   count=${snapshot%%$'\t'*}
   rest=${snapshot#*$'\t'}
   cpu=${rest%%$'\t'*}

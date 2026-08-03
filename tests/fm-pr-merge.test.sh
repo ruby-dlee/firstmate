@@ -55,16 +55,17 @@ head:
   sha: $response_head
 base:
   sha: $FM_TEST_BASE
+  ref: main
 EOF
     ;;
-  "api /repos/example/repo/pulls/9/files --paginate")
+  "api /repos/example/repo/pulls/9/files?per_page=100&page=1")
     if [ "${FM_TEST_FILE_MISMATCH:-0}" = 1 ]; then
       printf '[1]:\n  - sha: abc\n    filename: other.txt\n    status: modified\n'
     else
       printf '[1]:\n  - sha: abc\n    filename: gate.txt\n    status: modified\n'
     fi
     ;;
-  "api /repos/example/repo/commits/$FM_TEST_HEAD/check-runs --paginate")
+  "api /repos/example/repo/commits/$FM_TEST_HEAD/check-runs?per_page=100&page=1")
     if [ "${FM_TEST_TRUNCATED_CHECKS:-0}" = 1 ]; then
       printf 'total_count: 2\ncheck_runs[1]:\n  - id: 41\n    name: behavior\n'
     else
@@ -81,14 +82,43 @@ EOF
   "api /repos/example/repo/commits/$FM_TEST_HEAD/status")
     printf 'state: pending\ntotal_count: 0\n'
     ;;
-  "api /repos/example/repo/pulls/9/reviews --paginate")
-    if [ "${FM_TEST_ONE_REVIEW:-0}" = 1 ]; then
+  "api /repos/example/repo/pulls/9/reviews?per_page=100&page=1")
+    if [ "${FM_TEST_MULTIPAGE_REVIEWS:-0}" = 1 ]; then
+      printf '[100]:\n'
+      i=1
+      while [ "$i" -le 100 ]; do
+        printf '  - id: %s\n    user: reviewer-%s\n    state: APPROVED\n    commit_id: %s\n    body: clean\n' \
+          "$i" "$i" "$FM_TEST_HEAD"
+        i=$((i + 1))
+      done
+    elif [ "${FM_TEST_ONE_REVIEW:-0}" = 1 ]; then
       printf '[1]:\n  - id: 1\n    user: reviewer-one\n    state: APPROVED\n    commit_id: %s\n    body: clean\n' "$FM_TEST_HEAD"
     elif [ "${FM_TEST_STALE_ADVERSARIAL:-0}" = 1 ]; then
       printf '[2]:\n  - id: 1\n    user: reviewer-one\n    state: APPROVED\n    commit_id: %s\n    body: clean\n  - id: 2\n    user: reviewer-two\n    state: APPROVED\n    commit_id: 0000000000000000000000000000000000000000\n    body: "FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=0000000000000000000000000000000000000000"\n' "$FM_TEST_HEAD"
     else
       printf '[2]:\n  - id: 1\n    user: reviewer-one\n    state: APPROVED\n    commit_id: %s\n    body: clean\n  - id: 2\n    user: reviewer-two\n    state: APPROVED\n    commit_id: %s\n    body: "FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=%s"\n' "$FM_TEST_HEAD" "$FM_TEST_HEAD" "$FM_TEST_HEAD"
     fi
+    ;;
+  "api /repos/example/repo/pulls/9/reviews?per_page=100&page=2")
+    [ "${FM_TEST_MULTIPAGE_REVIEWS:-0}" = 1 ] || exit 1
+    printf '[1]:\n  - id: 101\n    user: reviewer-final\n    state: APPROVED\n    commit_id: %s\n    body: "FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=%s"\n' \
+      "$FM_TEST_HEAD" "$FM_TEST_HEAD"
+    ;;
+  "api /repos/example/repo/branches/main/protection/required_status_checks/contexts")
+    if [ "${FM_TEST_MISSING_EVIDENCE_RULE:-0}" = 1 ]; then
+      printf '[1]:\n  - ci/required\n'
+    else
+      printf '[2]:\n  - ci/required\n  - firstmate/exact-head-admission\n'
+    fi
+    ;;
+  "api /repos/example/repo/branches/main/protection/required_pull_request_reviews")
+    printf 'required_approving_review_count: 2\n'
+    ;;
+  "api /repos/example/repo/branches/main/protection/enforce_admins")
+    printf 'enabled: true\n'
+    ;;
+  "api POST /repos/example/repo/statuses/$FM_TEST_HEAD --field state=success --field context=firstmate/exact-head-admission --field description=Exact-head checks and independent reviews admitted")
+    printf 'state: success\ncontext: firstmate/exact-head-admission\n'
     ;;
   "api PUT /repos/example/repo/pulls/9/merge --field sha=$FM_TEST_HEAD --field merge_method="*)
     if [ "${FM_TEST_MERGE_FAIL:-0}" = 1 ]; then
@@ -191,6 +221,45 @@ EOF
   pass "fm-pr-merge requires exact local and GitHub PR file containment"
 }
 
+test_dirty_worktree_refuses_admission() {
+  local rec dir base head rc
+  rec=$(make_case dirty-worktree); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  printf 'untracked\n' > "$dir/wt/untracked.txt"
+  run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "untracked worktree residual must refuse"
+  assert_grep 'tracked, staged, or untracked residual' "$dir/err" "dirty worktree refusal was unclear"
+  assert_no_grep 'api PUT .*merge' "$dir/gh.log" "dirty worktree reached merge"
+  pass "fm-pr-merge requires a mechanically clean admitted worktree"
+}
+
+test_missing_server_evidence_rule_refuses() {
+  local rec dir base head rc
+  rec=$(make_case missing-rule); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  FM_TEST_MISSING_EVIDENCE_RULE=1 run_merge "$dir" "$base" "$head" >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "merge must refuse without a required admission context"
+  assert_grep 'does not enforce the exact-head admission context' "$dir/err" "missing server rule refusal was unclear"
+  assert_no_grep 'api PUT .*merge' "$dir/gh.log" "unprotected evidence reached merge"
+  pass "fm-pr-merge requires exact-head evidence in server branch protection"
+}
+
+test_review_pagination_combines_validated_pages() {
+  local rec dir base head out
+  rec=$(make_case paginated-reviews); IFS='|' read -r dir base head <<EOF
+$rec
+EOF
+  add_gh_axi "$dir"; : > "$dir/gh.log"
+  out=$(FM_TEST_MULTIPAGE_REVIEWS=1 run_merge "$dir" "$base" "$head") \
+    || fail "multi-page review admission refused: $out"
+  assert_grep 'reviews?per_page=100&page=2' "$dir/gh.log" "review pagination never fetched page two"
+  pass "fm-pr-merge validates and combines explicit review pages"
+}
+
 test_head_movement_during_admission_refuses() {
   local rec dir base head rc
   rec=$(make_case admission-move); IFS='|' read -r dir base head <<EOF
@@ -235,6 +304,9 @@ test_stopped_reviewer_is_unreviewed
 test_stale_adversarial_verdict_is_unreviewed
 test_truncated_check_enumeration_refuses
 test_content_file_set_mismatch_refuses
+test_dirty_worktree_refuses_admission
+test_missing_server_evidence_rule_refuses
+test_review_pagination_combines_validated_pages
 test_head_movement_during_admission_refuses
 test_armed_merge_flags_refuse
 test_atomic_head_movement_failure_propagates

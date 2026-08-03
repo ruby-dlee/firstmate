@@ -33,15 +33,36 @@ value=$(printf '%s' "$FM_TEST_COUNTS" | cut -d, -f"$n")
 case "$value" in ''|*[!0-9]*) value=0 ;; esac
 i=1
 while [ "$i" -le "$value" ]; do
-  printf '%d 1 1.5 00:0%d worker /.no-mistakes/worktrees/repo/RUN123/job-%d\n' "$((100 + i))" "$n" "$i"
+  if [ "$i" -eq 1 ]; then
+    printf '101 1 1.5 00:0%d worker /.no-mistakes/worktrees/repo/RUN123/job-1\n' "$n"
+  else
+    printf '%d 101 1.5 00:0%d compiler-child-%d\n' "$((100 + i))" "$n" "$i"
+  fi
   i=$((i + 1))
 done
+if [ "${FM_TEST_INCLUDE_SAMPLER:-0}" = 1 ]; then
+  printf '%s 1 9.0 00:09 sampler /.no-mistakes/worktrees/repo/RUN123/self\n' "$FM_RUN_LIVENESS_SAMPLER_PID"
+  printf '%s %s 9.0 00:09 awk /.no-mistakes/worktrees/repo/RUN123/self-child\n' \
+    "$((FM_RUN_LIVENESS_SAMPLER_PID + 1))" "$FM_RUN_LIVENESS_SAMPLER_PID"
+fi
+SH
+  cat > "$dir/fakebin/lsof" <<'SH'
+#!/usr/bin/env bash
+n=$(cat "$FM_TEST_PS_COUNT" 2>/dev/null || echo 0)
+value=$(printf '%s' "$FM_TEST_COUNTS" | cut -d, -f"$n")
+case "$value" in ''|*[!0-9]*) value=0 ;; esac
+if [ "$value" -gt 0 ]; then
+  printf 'p101\nn/.no-mistakes/worktrees/repo/RUN123/work\n'
+fi
+if [ "${FM_TEST_INCLUDE_SAMPLER:-0}" = 1 ]; then
+  printf 'p%s\nn/.no-mistakes/worktrees/repo/RUN123/sampler\n' "$FM_RUN_LIVENESS_SAMPLER_PID"
+fi
 SH
   cat > "$dir/fakebin/host-pressure" <<'SH'
 #!/usr/bin/env bash
 printf 'host-pressure observed_at=fixture\nuptime: load averages: 29.0 25.0 20.0\nvm_stat:\nPages swapped out: 42.\n'
 SH
-  chmod +x "$dir/fakebin/no-mistakes" "$dir/fakebin/ps" "$dir/fakebin/host-pressure"
+  chmod +x "$dir/fakebin/no-mistakes" "$dir/fakebin/ps" "$dir/fakebin/lsof" "$dir/fakebin/host-pressure"
   printf '%s\n' "$dir"
 }
 
@@ -50,6 +71,7 @@ run_live() {
   FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
     FM_RUN_LIVENESS_NM_BIN="$dir/fakebin/no-mistakes" \
     FM_RUN_LIVENESS_PS_BIN="$dir/fakebin/ps" \
+    FM_RUN_LIVENESS_CWD_BIN="$dir/fakebin/lsof" \
     FM_RUN_LIVENESS_HOST_PRESSURE_BIN="$dir/fakebin/host-pressure" \
     FM_RUN_LIVENESS_DB="$dir/state.sqlite" \
     FM_RUN_LIVENESS_TEST_LAB=firstmate-run-liveness-test-lab-v1 \
@@ -103,6 +125,16 @@ test_entire_zero_window_is_unknown() {
   pass "run liveness reports an entire zero-process window as UNKNOWN, never death"
 }
 
+test_sampler_processes_are_not_run_evidence() {
+  local dir rc
+  dir=$(make_case sampler-self)
+  FM_TEST_COUNTS=0,0 FM_TEST_INCLUDE_SAMPLER=1 FM_RUN_LIVENESS_SAMPLES=2 \
+    run_live "$dir" env >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 1 "$rc" "sampler family must not prove run liveness"
+  assert_grep 'counts=0,0' "$dir/err" "sampler processes contaminated exact-run counts"
+  pass "run liveness excludes its own process family from affirmative evidence"
+}
+
 test_record_change_is_inconclusive() {
   local dir rc
   dir=$(make_case changed-record)
@@ -129,6 +161,7 @@ SQL
 
 test_any_process_sample_is_alive
 test_entire_zero_window_is_unknown
+test_sampler_processes_are_not_run_evidence
 test_record_change_is_inconclusive
 test_baseline_is_repository_scoped
 test_neighbor_run_is_inconclusive_before_sampling

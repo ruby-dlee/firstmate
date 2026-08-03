@@ -80,23 +80,28 @@ New findings must supply a helper under `.crosscheck/reproductions/`, a command 
 Crosscheck executes the command itself and stores its actual exit and bounded output in the ledger.
 
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
-Crosscheck clones the exact reviewed head, confirms the named test passes, applies the patch, and requires the same test to fail.
+It supplies an approved test runner plus a structured argument array, never a free-form shell command.
+Crosscheck creates separate clean checkouts at the exact reviewed head, confirms the named test passes in the baseline checkout, applies the patch only in the mutated checkout, and requires the same test to fail there.
+The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
 The patch cannot modify the named test.
 
 ## Refusal and liveness
 
 The reviewer is a synchronous Codex or Claude invocation with a bounded timeout and a JSON output schema.
 PR claims are delimited as untrusted data, and the reviewer is directed to ignore embedded instructions and use focused evidence rather than duplicate no-mistakes' broad suite.
+Later reviewers receive only a bounded projection of finding IDs, lifecycle state, severity, exact-head clearance, and proof digests.
+Finding prose, reproduction output, test output, and lifecycle notes remain durable in the ledger but are never reinjected into a later reviewer prompt.
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, and the exact review checkout.
 The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, and structured JSON output.
 Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, `/private/tmp`, and `/dev/null`.
 An unavailable sandbox blocks the reviewer rather than launching it with ambient write authority.
 A nonzero exit, timeout, missing artifact, empty artifact, malformed artifact, wrong-head artifact, or unresolved suspicion records an `unreviewed` attempt and exits nonzero.
 This includes provider refusals that surface only as a stopped or silent agent.
+Reviewer and evidence stdout plus stderr share a 200,000-byte capture ceiling; crossing it terminates the process group and records a loud `unreviewed` attempt.
 
 ## Installed external contracts
 
-The external surface was observed on 2026-08-02 before implementation.
+The external surface was observed on 2026-08-02 before implementation and rechecked on 2026-08-03 for nonempty TOON arrays.
 The installed versions were `gh-axi 0.1.25`, `codex-cli 0.146.0-alpha.9.2`, and Claude Code 2.1.220.
 
 `gh-axi pr view` supports `--full` but does not support raw-gh `--json` or `-q` flags.
@@ -112,11 +117,21 @@ gh-axi api PUT /repos/<owner>/<repo>/pulls/<number>/merge \
 
 The checked-in TOON fixtures under `tests/fixtures/gh-axi-v0.1.25-*.toon` are reduced from those observed documents.
 Every GitHub fake rejects command forms outside this surface.
+The `labels[1]{id,name,color,default,description}:` table in the PR API fixture was observed from installed `gh-axi 0.1.25` with `gh-axi api /repos/lance-format/lance/pulls/8166` on 2026-08-03.
 The merge form with optional `commit_title` and `commit_message` fields was separately exercised against an already-merged PR and returned the observed successful no-op response.
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Write,Edit,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded and a sibling write failed with `Operation not permitted`.
+
+## Validation evidence boundaries
+
+`tests/fm-github-pr.test.sh` is hermetic coverage using checked-in TOON shapes observed from installed `gh-axi 0.1.25`.
+`tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Claude, and sandbox fakes.
+Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
+The focused PR-check cases in `tests/fm-teardown-suite.sh` and the merge cases in `tests/fm-pr-merge.test.sh` also use observed-shape GitHub fakes.
+Those deterministic suites validate parsing, lifecycle, failure handling, and atomic request construction; they do not claim to exercise live provider availability.
+The real installed-tool exercise is separate and network-dependent: the dated `gh-axi` observations above cover successful documents, while an adapter lookup for an absent PR through installed `gh-axi` must exit nonzero with `GitHub state is unreviewed`.
 
 ## Deliberate limitations
 

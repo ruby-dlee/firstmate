@@ -24,9 +24,12 @@ make_case() {
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/fakebin"
   git -C "$repo" init -q -b main
   printf 'base\n' > "$repo/app.txt"
+  printf 'base\n' > "$repo/other.txt"
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/regression.test.sh"
-  chmod +x "$repo/tests/regression.test.sh"
-  git -C "$repo" add app.txt tests/regression.test.sh
+  printf '#!/usr/bin/env bash\n[ ! -e .stateful-proof-marker ] || exit 19\ntouch .stateful-proof-marker\ngrep -qx fixed app.txt\n' \
+    > "$repo/tests/stateful.test.sh"
+  chmod +x "$repo/tests/regression.test.sh" "$repo/tests/stateful.test.sh"
+  git -C "$repo" add app.txt other.txt tests/regression.test.sh tests/stateful.test.sh
   git -C "$repo" commit -qm base
   base=$(git -C "$repo" rev-parse HEAD)
   git -C "$repo" checkout -qb feature
@@ -124,6 +127,10 @@ done
 [ -f "$schema" ] || exit 98
 [ -n "$workdir" ] && [ -n "$output" ] || exit 99
 cat > "$FM_TEST_PROMPT_LOG"
+if [ "$FM_TEST_REVIEW_SCENARIO" = noisy-reviewer ]; then
+  python3 -c 'import sys; sys.stdout.write("R" * 210000)'
+  exit 0
+fi
 python3 "$FM_TEST_REVIEW_DRIVER" "$workdir" "$output" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD"
 SH
   chmod +x "$case_dir/fakebin/codex"
@@ -246,9 +253,9 @@ elif scenario == "new-finding":
             "output_contains": "REPRODUCED-BUG",
         },
     }]
-elif scenario in {"verified-fixed", "missing-proof"}:
+elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful-forgery"}:
     patch = protocol / "mutations" / "revert.patch"
-    if scenario == "verified-fixed":
+    if scenario in {"verified-fixed", "forged-command"}:
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text("""diff --git a/app.txt b/app.txt
 --- a/app.txt
@@ -257,17 +264,64 @@ elif scenario in {"verified-fixed", "missing-proof"}:
 -fixed
 +broken
 """)
+    elif scenario == "stateful-forgery":
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        patch.write_text("""diff --git a/other.txt b/other.txt
+--- a/other.txt
++++ b/other.txt
+@@ -1 +1 @@
+-base
++irrelevant
+""")
+    test_path = "tests/stateful.test.sh" if scenario == "stateful-forgery" else "tests/regression.test.sh"
+    mutation_proof = {
+        "test_path": test_path,
+        "test_invocation": {"runner": "bash", "arguments": []},
+        "mutation_patch_path": ".crosscheck/mutations/revert.patch",
+    }
+    if scenario == "forged-command":
+        mutation_proof = {
+            "test_path": test_path,
+            "test_command": "git diff --quiet # tests/regression.test.sh",
+            "mutation_patch_path": ".crosscheck/mutations/revert.patch",
+        }
     base["finding_updates"] = [{
         "id": "cc-aaaaaaaaaaaa",
         "status": "verified-fixed",
         "note": "The named regression test detects a reverted fix.",
         "reproduction": None,
-        "mutation_proof": {
-            "test_path": "tests/regression.test.sh",
-            "test_command": "bash tests/regression.test.sh",
-            "mutation_patch_path": ".crosscheck/mutations/revert.patch",
-        },
+        "mutation_proof": mutation_proof,
         "equivalent_to": None,
+    }]
+elif scenario == "escaped-reproduction":
+    base["new_findings"] = [{
+        "title": "Escaped evidence",
+        "severity": "blocking",
+        "description": "The helper resolves outside its designated subtree.",
+        "citations": [{"path": "app.txt", "line": 1}],
+        "reproduction": {
+            "test_path": ".crosscheck/reproductions/../../tests/regression.test.sh",
+            "command": "bash .crosscheck/reproductions/../../tests/regression.test.sh",
+            "expected_exit": 0,
+            "output_contains": "UNREACHABLE-MARKER",
+        },
+    }]
+elif scenario == "noisy-reproduction":
+    reproduction = protocol / "reproductions" / "noisy.sh"
+    reproduction.parent.mkdir(parents=True, exist_ok=True)
+    reproduction.write_text("#!/usr/bin/env bash\npython3 -c 'import sys; sys.stdout.write(\"E\" * 210000)'\n")
+    os.chmod(reproduction, 0o755)
+    base["new_findings"] = [{
+        "title": "Noisy evidence",
+        "severity": "blocking",
+        "description": "The helper exceeds the evidence output budget.",
+        "citations": [{"path": "app.txt", "line": 1}],
+        "reproduction": {
+            "test_path": ".crosscheck/reproductions/noisy.sh",
+            "command": "bash .crosscheck/reproductions/noisy.sh",
+            "expected_exit": 0,
+            "output_contains": "E",
+        },
     }]
 elif scenario == "suspicion":
     base["suspicions"] = [{
@@ -437,6 +491,117 @@ assert proof["mutated_files"] == ["app.txt"]
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "mutation proof execution was not durably recorded"
   pass "verified-fixed requires a passing named test that fails after implementation mutation"
+}
+
+test_forged_git_diff_mutation_command_is_rejected() {
+  local record case_dir base head rc
+  record=$(make_case forged-command)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" forged-command run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "forged git-diff mutation command"
+  assert_grep 'test_command' "$case_dir/err" \
+    "free-form git-diff mutation command was not rejected"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+assert value["runs"][-1]["state"] == "unreviewed"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "forged git-diff command cleared the durable finding"
+  pass "forged git-diff command cannot impersonate a named test"
+}
+
+test_stateful_test_cannot_fabricate_mutation_causality() {
+  local record case_dir base head rc
+  record=$(make_case stateful-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" stateful-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "stateful mutation fabrication"
+  assert_grep 'named test still passes after mutation' "$case_dir/err" \
+    "baseline state leaked into the mutated checkout"
+  pass "baseline and mutation tests run in independent clean checkouts"
+}
+
+test_artifacts_cannot_escape_designated_subtrees() {
+  local record case_dir base head rc
+  record=$(make_case escaped-reproduction)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  set +e
+  run_case "$case_dir" "$base" "$head" escaped-reproduction run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "escaped reproduction artifact"
+  assert_grep 'artifact path escapes .crosscheck/reproductions/' "$case_dir/err" \
+    "resolved artifact containment was not enforced: $(tr '\n' ' ' < "$case_dir/err")"
+  pass "resolved evidence paths remain inside designated subtrees"
+}
+
+test_reviewer_and_evidence_output_limits_fail_closed() {
+  local scenario record case_dir base head rc
+  for scenario in noisy-reviewer noisy-reproduction; do
+    record=$(make_case "$scenario")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    set +e
+    run_case "$case_dir" "$base" "$head" "$scenario" run \
+      > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "$scenario output limit"
+    assert_grep 'exceeded the 200000-byte output limit' "$case_dir/err" \
+      "$scenario did not terminate loudly at the output limit"
+  done
+  pass "reviewer and evidence output are capped while processes are drained"
+}
+
+test_prompt_uses_only_bounded_ledger_projection() {
+  local record case_dir base head rc size
+  record=$(make_case bounded-ledger-prompt)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  python3 - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path))
+finding = value["findings"][0]
+finding["title"] = "PERSISTED-TITLE-INSTRUCTION"
+finding["description"] = "PERSISTED-DESCRIPTION-INSTRUCTION"
+finding["history"][0]["note"] = "PERSISTED-NOTE-INSTRUCTION"
+finding["history"][0]["proof"] = {"output": "PERSISTED-OUTPUT-INSTRUCTION" * 10000}
+with open(path, "w") as stream:
+    json.dump(value, stream)
+PY
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "durable open finding"
+  assert_no_grep 'PERSISTED-TITLE-INSTRUCTION' "$case_dir/prompt.log" \
+    "repository-controlled ledger title reached the reviewer prompt"
+  assert_no_grep 'PERSISTED-DESCRIPTION-INSTRUCTION' "$case_dir/prompt.log" \
+    "repository-controlled ledger description reached the reviewer prompt"
+  assert_no_grep 'PERSISTED-NOTE-INSTRUCTION' "$case_dir/prompt.log" \
+    "repository-controlled ledger note reached the reviewer prompt"
+  assert_no_grep 'PERSISTED-OUTPUT-INSTRUCTION' "$case_dir/prompt.log" \
+    "repository-controlled evidence output reached the reviewer prompt"
+  assert_grep 'proof_sha256' "$case_dir/prompt.log" \
+    "reviewer prompt omitted the durable proof digest"
+  size=$(wc -c < "$case_dir/prompt.log")
+  [ "$size" -lt 100000 ] || fail "reviewer prompt was not bounded: $size bytes"
+  pass "later reviewers receive bounded lifecycle metadata and proof digests only"
 }
 
 test_nonexistent_mutation_proof_is_unreviewed() {
@@ -653,6 +818,11 @@ test_claude_reviewer_provides_model_separation_for_codex_author
 test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
+test_forged_git_diff_mutation_command_is_rejected
+test_stateful_test_cannot_fabricate_mutation_causality
+test_artifacts_cannot_escape_designated_subtrees
+test_reviewer_and_evidence_output_limits_fail_closed
+test_prompt_uses_only_bounded_ledger_projection
 test_nonexistent_mutation_proof_is_unreviewed
 test_mutation_proof_does_not_float_to_a_new_head
 test_equivalent_finding_reopens_when_direct_proof_regresses

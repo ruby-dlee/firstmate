@@ -12,11 +12,13 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, NoReturn
 
 
@@ -29,6 +31,26 @@ ACTIVE_LIFECYCLES = {"open", "claimed-fixed"}
 ALL_LIFECYCLES = ACTIVE_LIFECYCLES | {"verified-fixed", "closed-equivalent"}
 SEVERITIES = {"blocking", "high", "medium", "low"}
 MAX_CAPTURE = 200_000
+MAX_LEDGER_PROMPT_BYTES = 64_000
+MAX_PROJECTED_FINDINGS = 512
+MAX_PROJECTED_EVENTS = 8
+TEST_RUNNERS = {
+    "bash",
+    "bun",
+    "direct",
+    "jest",
+    "node",
+    "php",
+    "pytest",
+    "python",
+    "python3",
+    "rspec",
+    "ruby",
+    "sh",
+    "vitest",
+    "zsh",
+}
+FILE_TEST_RUNNERS = TEST_RUNNERS - {"direct", "jest", "pytest", "rspec", "vitest"}
 
 
 class CrosscheckError(RuntimeError):
@@ -89,6 +111,98 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             pass
 
 
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def bounded_communicate(
+    process: subprocess.Popen[bytes],
+    input_bytes: bytes | None,
+    timeout: int,
+    command_name: str,
+) -> tuple[str, str]:
+    selector = selectors.DefaultSelector()
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = {
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    for name, stream in streams.items():
+        require(stream is not None, f"{command_name} output pipe is unavailable")
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, name)
+
+    input_offset = 0
+    if process.stdin is not None:
+        if input_bytes:
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+
+    started = time.monotonic()
+    captured = 0
+    try:
+        while selector.get_map():
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                terminate_process(process)
+                fail(f"{command_name} timed out after {timeout}s")
+            for key, _ in selector.select(min(remaining, 0.25)):
+                stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        written = os.write(stream.fileno(), input_bytes[input_offset:])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        written = 0
+                    input_offset += written
+                    if written == 0 or input_offset == len(input_bytes):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), 65_536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                captured += len(chunk)
+                if captured > MAX_CAPTURE:
+                    terminate_process(process)
+                    fail(
+                        f"{command_name} exceeded the {MAX_CAPTURE}-byte output limit"
+                    )
+                outputs[key.data].extend(chunk)
+    finally:
+        selector.close()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+    process.wait()
+    return (
+        outputs["stdout"].decode("utf-8", errors="replace"),
+        outputs["stderr"].decode("utf-8", errors="replace"),
+    )
+
+
 def run_command(
     arguments: list[str],
     *,
@@ -107,23 +221,18 @@ def run_command(
             stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             start_new_session=True,
         )
     except FileNotFoundError as exc:
         fail(f"required executable is unavailable: {command_name}")
     except OSError as exc:
         fail(f"could not start required executable {command_name}: {exc}")
-    try:
-        stdout, stderr = process.communicate(input_text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-        fail(f"{command_name} timed out after {timeout}s")
+    stdout, stderr = bounded_communicate(
+        process,
+        input_text.encode("utf-8") if input_text is not None else None,
+        timeout,
+        command_name,
+    )
     return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
@@ -292,9 +401,22 @@ def validate_citations(value: Any, review_dir: Path, label: str) -> list[dict[st
 def safe_artifact(review_dir: Path, relative: str, prefix: str) -> Path:
     require_string(relative, "artifact path")
     require(relative.startswith(prefix), f"artifact path must start with {prefix}")
-    candidate = (review_dir / relative).resolve()
-    require(candidate.is_relative_to(review_dir.resolve()), "artifact path escapes the review checkout")
-    require(candidate.is_file() and not candidate.is_symlink(), f"artifact is absent: {relative}")
+    review_root = review_dir.resolve()
+    designated_root = (review_dir / prefix.rstrip("/")).resolve()
+    source_path = review_dir / relative
+    candidate = source_path.resolve()
+    require(
+        designated_root.is_relative_to(review_root),
+        f"artifact directory escapes the review checkout: {prefix}",
+    )
+    require(
+        candidate.is_relative_to(designated_root),
+        f"artifact path escapes {prefix}",
+    )
+    require(
+        source_path.is_file() and not source_path.is_symlink(),
+        f"artifact is absent: {relative}",
+    )
     return candidate
 
 
@@ -348,6 +470,53 @@ def execute_reproduction(value: Any, review_dir: Path, label: str) -> dict[str, 
     }
 
 
+def validate_test_invocation(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label} must be an object")
+    require_exact_keys(value, {"runner", "arguments"}, label)
+    runner = require_string(value.get("runner"), f"{label}.runner")
+    require(runner in TEST_RUNNERS, f"{label}.runner is not an approved test runner")
+    arguments = value.get("arguments")
+    require(isinstance(arguments, list), f"{label}.arguments must be an array")
+    require(len(arguments) <= 64, f"{label}.arguments has too many entries")
+    validated_arguments = [
+        require_string(argument, f"{label}.arguments[{index}]", allow_empty=True)
+        for index, argument in enumerate(arguments)
+    ]
+    require(
+        all("\x00" not in argument for argument in validated_arguments),
+        f"{label}.arguments must not contain NUL bytes",
+    )
+    return {"runner": runner, "arguments": validated_arguments}
+
+
+def test_arguments(
+    invocation: dict[str, Any], test_path: str, checkout: Path
+) -> list[str]:
+    if invocation["runner"] == "direct":
+        executable = checkout / test_path
+        require(
+            os.access(executable, os.X_OK),
+            f"tracked named test is not executable: {test_path}",
+        )
+        return [str(executable), *invocation["arguments"]]
+    if invocation["runner"] in FILE_TEST_RUNNERS:
+        return [invocation["runner"], test_path, *invocation["arguments"]]
+    return [invocation["runner"], *invocation["arguments"], test_path]
+
+
+def create_proof_checkout(source: Path, destination: Path, head_sha: str, label: str) -> None:
+    clone = run_command(
+        ["git", "clone", "--quiet", "--no-hardlinks", str(source), str(destination)],
+        timeout=180,
+    )
+    require(clone.returncode == 0, f"{label} could not create its proof checkout")
+    git(destination, "checkout", "--quiet", "--detach", head_sha)
+    require(
+        git(destination, "status", "--porcelain") == "",
+        f"{label} proof checkout is not clean",
+    )
+
+
 def execute_mutation_proof(
     value: Any,
     review_dir: Path,
@@ -356,14 +525,17 @@ def execute_mutation_proof(
     label: str,
 ) -> dict[str, Any]:
     require(isinstance(value, dict), f"{label} must be an object")
-    require_exact_keys(value, {"test_path", "test_command", "mutation_patch_path"}, label)
+    require_exact_keys(
+        value, {"test_path", "test_invocation", "mutation_patch_path"}, label
+    )
     test_path = require_string(value.get("test_path"), f"{label}.test_path")
     tracked = run_command(
         ["git", "-C", str(review_dir), "ls-files", "--error-unmatch", "--", test_path]
     )
     require(tracked.returncode == 0, f"{label}.test_path is not a tracked named test")
-    test_command = require_string(value.get("test_command"), f"{label}.test_command")
-    require(test_path in test_command, f"{label}.test_command must name {test_path}")
+    invocation = validate_test_invocation(
+        value.get("test_invocation"), f"{label}.test_invocation"
+    )
     patch_relative = require_string(
         value.get("mutation_patch_path"), f"{label}.mutation_patch_path"
     )
@@ -375,36 +547,42 @@ def execute_mutation_proof(
         f"{label} must mutate implementation, not its named test",
     )
 
-    proof_dir = proof_root / f"proof-{hashlib.sha256(label.encode()).hexdigest()[:10]}"
-    clone = run_command(
-        ["git", "clone", "--quiet", "--no-hardlinks", str(review_dir), str(proof_dir)],
-        timeout=180,
-    )
-    require(clone.returncode == 0, f"{label} could not create its proof checkout")
-    git(proof_dir, "checkout", "--quiet", "--detach", head_sha)
+    proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
+    baseline_dir = proof_root / f"proof-{proof_id}-baseline"
+    mutated_dir = proof_root / f"proof-{proof_id}-mutated"
+    create_proof_checkout(review_dir, baseline_dir, head_sha, label)
+    create_proof_checkout(review_dir, mutated_dir, head_sha, label)
 
-    sandbox_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
+    baseline_profile = baseline_dir / ".crosscheck" / "mutation-proof.sb"
     baseline = run_sandboxed(
-        ["/bin/bash", "-lc", test_command],
-        cwd=proof_dir,
-        profile_path=sandbox_profile,
+        test_arguments(invocation, test_path, baseline_dir),
+        cwd=baseline_dir,
+        profile_path=baseline_profile,
         allow_network=False,
         timeout=evidence_timeout(),
         description=f"{label} baseline test",
     )
     require(baseline.returncode == 0, f"{label} named test does not pass before mutation")
     applied = run_command(
-        ["git", "-C", str(proof_dir), "apply", "--whitespace=nowarn", str(patch_path)]
+        [
+            "git",
+            "-C",
+            str(mutated_dir),
+            "apply",
+            "--whitespace=nowarn",
+            str(patch_path),
+        ]
     )
     require(applied.returncode == 0, f"{label} mutation patch does not apply")
-    changed = git(proof_dir, "diff", "--name-only").splitlines()
+    changed = git(mutated_dir, "diff", "--name-only").splitlines()
     require(bool(changed), f"{label} mutation patch changes no tracked implementation")
     require(test_path not in changed, f"{label} mutation changed its named test")
 
+    mutated_profile = mutated_dir / ".crosscheck" / "mutation-proof.sb"
     mutated = run_sandboxed(
-        ["/bin/bash", "-lc", test_command],
-        cwd=proof_dir,
-        profile_path=sandbox_profile,
+        test_arguments(invocation, test_path, mutated_dir),
+        cwd=mutated_dir,
+        profile_path=mutated_profile,
         allow_network=False,
         timeout=evidence_timeout(),
         description=f"{label} mutated test",
@@ -412,7 +590,7 @@ def execute_mutation_proof(
     require(mutated.returncode != 0, f"{label} named test still passes after mutation")
     return {
         "test_path": test_path,
-        "test_command": test_command,
+        "test_invocation": invocation,
         "mutation_patch_sha256": hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
         "mutated_files": changed,
         "baseline_exit": baseline.returncode,
@@ -482,7 +660,7 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 require(isinstance(proof, dict), f"{event_label}.proof must be an object")
                 required_proof = {
                     "test_path",
-                    "test_command",
+                    "test_invocation",
                     "mutation_patch_sha256",
                     "mutated_files",
                     "baseline_exit",
@@ -491,6 +669,11 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                     "mutated_output",
                 }
                 require_exact_keys(proof, required_proof, f"{event_label}.proof")
+                require_string(proof.get("test_path"), f"{event_label}.proof.test_path")
+                validate_test_invocation(
+                    proof.get("test_invocation"),
+                    f"{event_label}.proof.test_invocation",
+                )
                 require(proof.get("baseline_exit") == 0, f"{event_label}.proof baseline did not pass")
                 require(
                     isinstance(proof.get("mutated_exit"), int)
@@ -502,6 +685,26 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                     and re.fullmatch(r"[0-9a-f]{64}", proof["mutation_patch_sha256"])
                     is not None,
                     f"{event_label}.proof mutation digest is invalid",
+                )
+                mutated_files = proof.get("mutated_files")
+                require(
+                    isinstance(mutated_files, list) and bool(mutated_files),
+                    f"{event_label}.proof.mutated_files must be nonempty",
+                )
+                for file_index, mutated_file in enumerate(mutated_files):
+                    require_string(
+                        mutated_file,
+                        f"{event_label}.proof.mutated_files[{file_index}]",
+                    )
+                require_string(
+                    proof.get("baseline_output"),
+                    f"{event_label}.proof.baseline_output",
+                    allow_empty=True,
+                )
+                require_string(
+                    proof.get("mutated_output"),
+                    f"{event_label}.proof.mutated_output",
+                    allow_empty=True,
                 )
             elif event_status == "closed-equivalent":
                 require(
@@ -703,10 +906,22 @@ def review_output_schema() -> dict[str, Any]:
     mutation = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["test_path", "test_command", "mutation_patch_path"],
+        "required": ["test_path", "test_invocation", "mutation_patch_path"],
         "properties": {
             "test_path": {"type": "string"},
-            "test_command": {"type": "string"},
+            "test_invocation": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["runner", "arguments"],
+                "properties": {
+                    "runner": {"enum": sorted(TEST_RUNNERS)},
+                    "arguments": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {"type": "string"},
+                    },
+                },
+            },
             "mutation_patch_path": {"type": "string"},
         },
     }
@@ -770,7 +985,57 @@ def review_output_schema() -> dict[str, Any]:
     }
 
 
+def proof_sha256(proof: Any) -> str | None:
+    if proof is None:
+        return None
+    material = json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def ledger_prompt_projection(
+    ledger: dict[str, Any], head_sha: str
+) -> list[dict[str, Any]]:
+    require(
+        len(ledger["findings"]) <= MAX_PROJECTED_FINDINGS,
+        "durable findings exceed the bounded reviewer projection",
+    )
+    by_id = {finding["id"]: finding for finding in ledger["findings"]}
+    projection: list[dict[str, Any]] = []
+    for finding in ledger["findings"]:
+        history = finding["history"]
+        relevant = [event for event in history if event["head_sha"] == head_sha]
+        if history[-1] not in relevant:
+            relevant.append(history[-1])
+        projected_events = []
+        for event in relevant[-MAX_PROJECTED_EVENTS:]:
+            projected_events.append(
+                {
+                    "head_sha": event["head_sha"],
+                    "status": event["status"],
+                    "proof_sha256": proof_sha256(event["proof"]),
+                }
+            )
+        projection.append(
+            {
+                "id": finding["id"],
+                "lifecycle": finding["lifecycle"],
+                "severity": finding["severity"],
+                "clear_for_reviewed_head": finding_is_clear_for_head(
+                    finding, head_sha, by_id
+                ),
+                "events": projected_events,
+            }
+        )
+    encoded = json.dumps(projection, indent=2, sort_keys=True)
+    require(
+        len(encoded.encode("utf-8")) <= MAX_LEDGER_PROMPT_BYTES,
+        "durable findings exceed the bounded reviewer prompt",
+    )
+    return projection
+
+
 def make_prompt(snapshot_value: dict[str, Any], ledger: dict[str, Any]) -> str:
+    projection = ledger_prompt_projection(ledger, snapshot_value["head_sha"])
     return f"""You are the independent merge-gate reviewer for a pull request.
 Review exact head {snapshot_value['head_sha']} against exact base {snapshot_value['base_sha']}.
 Perform a rigorous release-readiness review of the full diff and the PR's own claims.
@@ -781,7 +1046,8 @@ Write mutation patches only under .crosscheck/mutations/.
 
 A new finding is admissible only when you provide a reproduction helper and command that you actually ran.
 The command must name its helper, and its exit code plus a distinctive output marker must reproduce the defect.
-A prior finding is verified-fixed only when you name a tracked test that passes now and provide a patch under .crosscheck/mutations/ that breaks or reverts the implementation without changing that test.
+A prior finding is verified-fixed only when you name a tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts the implementation without changing that test.
+The gate appends the named test path to the approved runner invocation and runs clean baseline and mutated checkouts independently.
 The gate will independently run every reproduction and every mutation proof.
 If you cannot reproduce a concern, return it as a suspicion; suspicions block the merge.
 Silence never closes an existing finding.
@@ -800,8 +1066,8 @@ No-mistakes owns the broad regression suite.
 Do not spend this bounded independent-review run repeating the full suite.
 Inspect the full diff, then execute focused reproductions and positive controls for concrete concerns.
 
-Current durable findings, including fixes whose proof must cover this exact head:
-{json.dumps(ledger['findings'], indent=2, sort_keys=True)}
+Bounded durable-finding lifecycle metadata and proof digests:
+{json.dumps(projection, indent=2, sort_keys=True)}
 """
 
 

@@ -33,6 +33,12 @@ PR_URL_RE = re.compile(
 )
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ARRAY_HEADER_RE = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)"
+    r"\[(?P<count>0|[1-9][0-9]*)\]"
+    r"(?:\{(?P<fields>[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:,[A-Za-z_][A-Za-z0-9_]*)*)\})?:$"
+)
 
 
 class GitHubContractError(RuntimeError):
@@ -72,12 +78,13 @@ def _parse_scalar(raw: str, line_number: int) -> Any:
 
 
 def parse_toon_mapping(document: str) -> dict[tuple[str, ...], Any]:
-    """Parse the mapping-only subset emitted by the observed gh-axi calls."""
+    """Parse required mappings while isolating unrelated TOON array subtrees."""
 
     values: dict[tuple[str, ...], Any] = {}
     sections: set[tuple[str, ...]] = set()
     stack: list[str] = []
     saw_content = False
+    ignored_array_depth: int | None = None
 
     for line_number, raw_line in enumerate(document.splitlines(), start=1):
         if not raw_line.strip():
@@ -89,12 +96,27 @@ def parse_toon_mapping(document: str) -> dict[tuple[str, ...], Any]:
                 f"malformed gh-axi TOON indentation at line {line_number}"
             )
         depth = indent // 2
+        if ignored_array_depth is not None:
+            if depth > ignored_array_depth:
+                continue
+            ignored_array_depth = None
         if depth > len(stack):
             raise GitHubContractError(
                 f"malformed gh-axi TOON nesting at line {line_number}"
             )
         stack = stack[:depth]
         content = raw_line[indent:]
+        array_header = ARRAY_HEADER_RE.fullmatch(content)
+        if array_header is not None:
+            key = array_header.group("key")
+            path = tuple(stack + [key])
+            if path in values or path in sections:
+                raise GitHubContractError(
+                    f"duplicate gh-axi TOON field {'.'.join(path)}"
+                )
+            sections.add(path)
+            ignored_array_depth = depth
+            continue
         if ":" not in content:
             raise GitHubContractError(
                 f"malformed gh-axi TOON mapping at line {line_number}"

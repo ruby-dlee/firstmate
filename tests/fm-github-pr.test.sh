@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Contract tests for bin/fm-github-pr.py.
 #
-# The three TOON fixtures were reduced from real gh-axi 0.1.25 output observed
-# on 2026-08-02 for PR reads and an already-merged PR merge response.
+# The TOON fixtures were reduced from real gh-axi 0.1.25 output observed on
+# 2026-08-02 and 2026-08-03, including a nonempty labels table from PR 8166.
 # The fake accepts only the exact installed command forms used in production,
 # so raw-gh flags such as --json or -q cannot make the suite falsely green.
+# Every invocation below is hermetic coverage of those observed shapes.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -73,7 +74,7 @@ assert value["claims_identity"] == {
     "snapshot regressed to unsupported raw-gh --json"
   assert_no_grep '-q' "$FM_TEST_GH_AXI_LOG" \
     "snapshot regressed to unsupported raw-gh -q"
-  pass "GitHub snapshot uses only observed gh-axi 0.1.25 command and output shapes"
+  pass "GitHub snapshot accepts observed gh-axi arrays without trusting them"
 }
 
 test_lookup_errors_fail_closed() {

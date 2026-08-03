@@ -69,16 +69,33 @@ async function fixture(name) {
 }
 
 function processGroupMembers(pgid) {
-  const output = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], {
+  const output = execFileSync('ps', ['-axo', 'pid=,pgid='], {
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
   });
-  return output
+  const pids = output
     .trim()
     .split('\n')
-    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)$/))
     .filter((match) => match !== null && Number(match[2]) === pgid)
-    .map((match) => ({ pid: Number(match[1]), command: match[3] }));
+    .map((match) => Number(match[1]));
+
+  return pids.flatMap((pid) => {
+    let details;
+    try {
+      details = execFileSync(
+        'ps',
+        ['-p', String(pid), '-o', 'pid=,pgid=,command='],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+    } catch (error) {
+      if (error.status === 1) return [];
+      throw error;
+    }
+    const match = details.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (match === null || Number(match[2]) !== pgid) return [];
+    return [{ pid: Number(match[1]), command: match[3] }];
+  });
 }
 
 function processDescendants(rootPid) {

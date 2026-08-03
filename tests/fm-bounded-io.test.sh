@@ -269,6 +269,93 @@ else:
 PY
 }
 
+test_linux_child_inventory_streams_with_bounds() {
+  python3 - "$HELPER" <<'PY'
+import errno
+import importlib.util
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+closed = []
+reads = []
+
+
+def install_chunks(values):
+    chunks = iter(values)
+    module.os.open = lambda *_args: 55
+    module.os.close = lambda descriptor: closed.append(descriptor)
+
+    def read_chunk(descriptor, maximum):
+        reads.append((descriptor, maximum))
+        return next(chunks)
+
+    module.os.read = read_chunk
+
+
+install_chunks((b"12 3", b"4\n", b""))
+budget = module._ProcessCensusBudget(time.monotonic() + 1, maximum_items=3)
+assert module._linux_children(999, budget) == [12, 34]
+assert closed == [55], closed
+closed.clear()
+reads.clear()
+install_chunks((b"1 2 ", b"3 ", b"4 ", b"5 ", b""))
+budget = module._ProcessCensusBudget(time.monotonic() + 1, maximum_items=3)
+try:
+    module._linux_children(999, budget)
+except OSError as error:
+    assert error.errno == errno.EOVERFLOW, error
+else:
+    raise AssertionError("streamed child inventory crossed its item limit")
+assert len(reads) == 3, reads
+assert closed == [55], closed
+PY
+}
+
+test_darwin_descendant_refresh_prunes_stale_entries() {
+  python3 - "$HELPER" <<'PY'
+import errno
+import importlib.util
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+command_identity = (10, 1)
+live_identity = (11, 1)
+stale_identity = (12, 1)
+known = {
+    10: command_identity,
+    11: live_identity,
+    12: stale_identity,
+}
+table = {
+    10: (1, 10, 501, command_identity),
+    11: (1, 11, 501, live_identity),
+}
+module._darwin_process_table = lambda budget: table
+budget = module._ProcessCensusBudget(time.monotonic() + 1, maximum_items=4)
+module._darwin_refresh_descendants(10, known, budget)
+assert known == {10: command_identity, 11: live_identity}, known
+visited = []
+module._darwin_process_table = lambda budget: visited.append(True) or table
+oversized = {10: command_identity, 11: live_identity, 12: stale_identity}
+budget = module._ProcessCensusBudget(time.monotonic() + 1, maximum_items=2)
+try:
+    module._darwin_refresh_descendants(10, oversized, budget)
+except OSError as error:
+    assert error.errno == errno.EOVERFLOW, error
+else:
+    raise AssertionError("oversized retained descendant inventory was traversed")
+assert not visited, visited
+PY
+}
+
 test_partial_input_writes_do_not_copy_remainder() {
   python3 - "$HELPER" <<'PY'
 import importlib.util
@@ -484,6 +571,8 @@ run_case() {
     spawn-guard) test_input_validation_precedes_spawn ;;
     identity-signal) test_identity_bound_signaling_avoids_reused_pids ;;
     census-bounds) test_process_census_enforces_item_and_time_bounds ;;
+    linux-census-stream) test_linux_child_inventory_streams_with_bounds ;;
+    darwin-census-prune) test_darwin_descendant_refresh_prunes_stale_entries ;;
     partial-input) test_partial_input_writes_do_not_copy_remainder ;;
     artifact) test_json_artifact_is_bounded_and_regular ;;
     artifact-open-race) test_concurrent_artifact_replacements_are_rejected ;;
@@ -499,8 +588,8 @@ if [ "$#" -gt 0 ]; then
 else
   for case_name in output-limit final-wait residual-group detached-tree \
     batch-deadline selector-order spawn-guard identity-signal census-bounds \
-    partial-input artifact artifact-open-race decoded-strings hostile-json \
-    batch-items; do
+    linux-census-stream darwin-census-prune partial-input artifact \
+    artifact-open-race decoded-strings hostile-json batch-items; do
     run_case "$case_name"
   done
 fi

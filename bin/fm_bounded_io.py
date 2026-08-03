@@ -201,17 +201,46 @@ def _linux_process_identity(
 def _linux_children(process_id: int, budget: _ProcessCensusBudget) -> list[int]:
     budget.checkpoint()
     try:
-        raw = Path(f"/proc/{process_id}/task/{process_id}/children").read_text(
-            encoding="ascii"
+        descriptor = os.open(
+            f"/proc/{process_id}/task/{process_id}/children",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
         )
-    except (OSError, UnicodeError):
+    except OSError:
         return []
-    budget.checkpoint()
+    children: list[int] = []
+    value = 0
+    has_value = False
     try:
-        children = [int(value) for value in raw.split()]
-    except ValueError:
-        return []
-    budget.ensure_item_count(len(children))
+        while True:
+            budget.checkpoint()
+            try:
+                chunk = os.read(descriptor, 4096)
+            except InterruptedError:
+                continue
+            except OSError:
+                return []
+            budget.checkpoint()
+            if not chunk:
+                break
+            for character in chunk:
+                if 48 <= character <= 57:
+                    value = value * 10 + character - 48
+                    if value > 2_147_483_647:
+                        return []
+                    has_value = True
+                    continue
+                if character not in b" \t\n\r\v\f":
+                    return []
+                if has_value:
+                    budget.ensure_item_count(len(children) + 1)
+                    children.append(value)
+                    value = 0
+                    has_value = False
+        if has_value:
+            budget.ensure_item_count(len(children) + 1)
+            children.append(value)
+    finally:
+        os.close(descriptor)
     return children
 
 
@@ -407,6 +436,7 @@ def _darwin_descendants(
     roots: dict[int, tuple[int, int]],
     budget: _ProcessCensusBudget,
 ) -> dict[int, tuple[int, int]]:
+    budget.ensure_item_count(len(roots))
     children: dict[int, list[tuple[int, tuple[int, int]]]] = {}
     for process_id, (parent_id, _group_id, _uid, identity) in table.items():
         budget.checkpoint()
@@ -431,6 +461,7 @@ def _darwin_owned_processes(
     known: dict[int, tuple[int, int]],
     budget: _ProcessCensusBudget,
 ) -> dict[int, tuple[int, int]]:
+    budget.ensure_item_count(len(known))
     table = _darwin_process_table(budget)
     roots: dict[int, tuple[int, int]] = {}
     for process_id, identity in known.items():
@@ -461,6 +492,7 @@ def _darwin_record_descendants(
     known: dict[int, tuple[int, int]],
     budget: _ProcessCensusBudget,
 ) -> dict[int, tuple[int, int]]:
+    budget.ensure_item_count(len(known))
     table = _darwin_process_table(budget)
     roots: dict[int, tuple[int, int]] = {}
     command = table.get(command_id)
@@ -472,6 +504,17 @@ def _darwin_record_descendants(
         if current is not None and current[3] == identity:
             roots[process_id] = identity
     return _darwin_descendants(table, roots, budget)
+
+
+def _darwin_refresh_descendants(
+    command_id: int,
+    known: dict[int, tuple[int, int]],
+    budget: _ProcessCensusBudget,
+) -> None:
+    refreshed = _darwin_record_descendants(command_id, known, budget)
+    budget.ensure_item_count(len(refreshed))
+    known.clear()
+    known.update(refreshed)
 
 
 def _linux_signal_owned_process(
@@ -581,6 +624,11 @@ def _supervisor_cleanup(
     command_status: int | None,
     initial_known: dict[int, tuple[int, int]],
 ) -> tuple[int | None, bool, str]:
+    initial_budget = _ProcessCensusBudget(deadline)
+    try:
+        initial_budget.ensure_item_count(len(initial_known))
+    except OSError as exc:
+        return command_status, False, f"owned-process inventory failed: {exc}"
     known = dict(initial_known)
     term_deadline = min(deadline, time.monotonic() + grace)
     signal_number = signal.SIGTERM
@@ -590,7 +638,7 @@ def _supervisor_cleanup(
             owned = _supervisor_owned_processes(command_id, token, known, deadline)
         except OSError as exc:
             return command_status, False, f"owned-process inventory failed: {exc}"
-        known.update(owned)
+        known = dict(owned)
         if not owned and command_status is not None:
             return command_status, True, ""
         now = time.monotonic()
@@ -666,12 +714,10 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
     while not abort_requested and command_status is None:
         if sys.platform == "darwin" and time.monotonic() >= next_inventory:
             try:
-                initial_known.update(
-                    _darwin_record_descendants(
-                        command.pid,
-                        initial_known,
-                        _ProcessCensusBudget(deadline),
-                    )
+                _darwin_refresh_descendants(
+                    command.pid,
+                    initial_known,
+                    _ProcessCensusBudget(deadline),
                 )
             except OSError as exc:
                 _write_supervisor_status(

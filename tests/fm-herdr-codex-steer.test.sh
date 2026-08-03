@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Herdr steering must not invoke native agent send for Codex.
+# Herdr steering must refuse Codex when no session-bound preserving route exists.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -23,12 +23,13 @@ fm_backend_herdr_cli() {
   esac
 }
 
-test_codex_uses_literal_pane_delivery() {
+test_codex_refuses_unbound_pane_delivery() {
   : > "$LOG"
-  FM_TEST_AGENT=codex fm_backend_herdr_send_literal default:w1:p2 'keep profile'
-  assert_grep 'pane send-text w1:p2 keep profile' "$LOG" "Codex steer did not use literal pane input"
-  assert_no_grep 'agent send' "$LOG" "Codex steer invoked the thread-settings-resetting native route"
-  pass "Herdr Codex steering bypasses native agent send"
+  if FM_TEST_AGENT=codex fm_backend_herdr_send_literal default:w1:p2 'keep profile'; then
+    fail "Codex steer accepted a non-atomic pane route"
+  fi
+  assert_no_grep 'pane send-text\|agent send' "$LOG" "refused Codex steer delivered instruction text"
+  pass "Herdr refuses Codex steering without a session-bound preserving route"
 }
 
 test_other_agents_retain_native_delivery() {
@@ -48,6 +49,6 @@ test_agentless_pane_refuses() {
   pass "Herdr refuses to steer an agent-less shell pane"
 }
 
-test_codex_uses_literal_pane_delivery
+test_codex_refuses_unbound_pane_delivery
 test_other_agents_retain_native_delivery
 test_agentless_pane_refuses

@@ -313,9 +313,10 @@ for arg in "$@"; do
 done
 case "$*" in
   '--format json profile list')
-    root=${FM_ACCOUNT_DIRECTORY_ROOT:?}
-    printf '{"profiles":[{"provider":"%s","home":"%s/%s/account-1","pools":["%s-crew"],"enabled":true,"safety_policy":"worker"}]}\n' \
-      "$provider" "$root" "$provider" "$provider"
+    root=${FM_ACCOUNT_DIRECTORY_ROOT:-__FM_FAKE_FIXTURE_DIR__/accounts}
+    mkdir -p "$root/$provider/account-1"
+    printf '{"profiles":[{"id":"%s","provider":"%s","home":"%s/%s/account-1","pools":["%s-crew"],"enabled":true,"safety_policy":"worker"}]}\n' \
+      "$profile" "$provider" "$root" "$provider" "$provider"
     ;;
   '--format json contract')
     [ -z "${FM_FAKE_AF_CONTRACT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_CONTRACT_SLEEP"
@@ -3513,6 +3514,37 @@ test_live_secondmate_recovery_precedes_home_convergence() {
   pass "managed secondmate recovery validates liveness before home convergence"
 }
 
+test_secondmate_provider_change_reloads_complete_profile() {
+  local id rec sm out status launch
+  id=account-secondmate-profile-recovery-z21f
+  rec=$(make_case secondmate-profile-recovery codex)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  out=$(FM_FAKE_AF_PROVIDER=codex FM_FAKE_AF_PROFILE=codex-2 FM_FAKE_AF_POOL=codex-crew \
+    run_spawn "$id" "$sm" --secondmate --account-pool codex-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "secondmate profile recovery precondition failed: $out"
+  assert_grep "runtime_home=$FAKEBIN_DIR/accounts/codex/account-1" "$HOME_DIR/state/$id.meta" \
+    "managed Codex secondmate did not persist its Agent Fleet runtime home"
+  rm -f "$CASE_DIR/endpoint-live"
+  printf 'claude claude-opus-5 high\n' > "$HOME_DIR/config/secondmate-harness"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_PROVIDER=claude FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -eq 0 ] || fail "secondmate provider-change recovery failed: $out"
+  assert_grep 'harness=claude' "$HOME_DIR/state/$id.meta" "secondmate recovery retained the old provider"
+  assert_grep 'model=claude-opus-5' "$HOME_DIR/state/$id.meta" "secondmate recovery lost the current model pin"
+  assert_grep 'effort=high' "$HOME_DIR/state/$id.meta" "secondmate recovery lost the current effort pin"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" 'claude-opus-5' "secondmate recovery launched target-provider defaults"
+  assert_contains "$launch" '--effort' "secondmate recovery omitted the current effort pin"
+  pass "secondmate recovery reloads the current provider, model, and effort profile"
+}
+
 test_continuation_fails_closed_without_original_brief() {
   local id rec out status
   id=account-continue-nobrief-z22
@@ -6416,6 +6448,11 @@ if [ "${FM_TEST_FOCUSED:-}" = concurrent-continuation ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-profile-recovery ]; then
+  run_isolated_test test_secondmate_provider_change_reloads_complete_profile
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = session-sync-teardown-race ]; then
   run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
   exit 0
@@ -6825,6 +6862,7 @@ run_isolated_test test_predecessor_cleanup_failure_preserves_replacement_for_ret
 run_isolated_test test_failed_continuation_cleanup_restores_predecessor_for_retry
 run_isolated_test test_concurrent_continuations_serialize_before_mutation
 run_isolated_test test_live_secondmate_recovery_precedes_home_convergence
+run_isolated_test test_secondmate_provider_change_reloads_complete_profile
 run_isolated_test test_continuation_fails_closed_without_original_brief
 run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
 run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery

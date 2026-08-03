@@ -236,8 +236,30 @@ if [ "$PRELOCK_KIND" = secondmate ]; then
   }
   TEARDOWN_ACCOUNT_LOCKS+=("$SECONDMATE_HOME_LIFECYCLE_LOCK")
 fi
-ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
-TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
+  expected_delete_lock="$STATE/.account-lifecycle-$ID.lock"
+  inherited_delete_identity=
+  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_delete_lock" ]; then
+    inherited_delete_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_delete_identity=
+  fi
+  case "$inherited_delete_identity" in
+    *$'\n'*)
+      inherited_delete_pid=${inherited_delete_identity%%$'\n'*}
+      inherited_delete_start=${inherited_delete_identity#*$'\n'}
+      ;;
+    *) echo "error: invalid inherited account lifecycle lock for teardown $ID" >&2; exit 1 ;;
+  esac
+  current_parent_start=$(fm_account_process_start_time "$PPID" 2>/dev/null || true)
+  if [ "$inherited_delete_pid" != "$PPID" ] || [ -z "$current_parent_start" ] \
+    || [ "$inherited_delete_start" != "$current_parent_start" ]; then
+    echo "error: inherited account lifecycle lock is not owned by teardown parent for $ID" >&2
+    exit 1
+  fi
+  ACCOUNT_DELETE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+else
+  ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+fi
 require_safe_task_metadata || { echo "error: task metadata changed while teardown waited for $ID" >&2; exit 1; }
 if managed_account_meta "$META"; then
   MANAGED_ACCOUNT=1

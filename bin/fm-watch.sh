@@ -926,7 +926,7 @@ handle_push_transition() {  # <backend> <session> <record>
 # substituted or unproved runtime into an assumed-good one.
 verify_runtime_profiles_if_due() {
   local marker="$STATE/.last-runtime-profile-check" meta task harness generation task_marker
-  local out rc reason due_all=0 meta_age tmp
+  local out rc reason due_all=0 meta_age tmp runtime_start provider_session verification_key wake_reason=
   if [ ! -e "$marker" ]; then
     safe_touch_marker_or_log "$marker" "runtime profile check" || true
   elif marker_due "$marker" "$RUNTIME_PROFILE_INTERVAL" "runtime profile check"; then
@@ -940,14 +940,20 @@ verify_runtime_profiles_if_due() {
     task=${task%.meta}
     generation=$(fm_meta_get "$meta" generation_id)
     [ -n "$generation" ] || generation="legacy:$task"
+    runtime_start=$(fm_meta_get "$meta" runtime_started_at_ns)
+    provider_session=$(fm_meta_get "$meta" provider_session_id)
+    verification_key=$generation
+    if [ -n "$runtime_start" ] || [ -n "$provider_session" ]; then
+      verification_key="$generation:$runtime_start:$provider_session"
+    fi
     task_marker="$STATE/.runtime-profile-verified-$task"
-    if [ "$due_all" -eq 0 ] && [ "$(cat "$task_marker" 2>/dev/null || true)" = "$generation" ]; then
+    if [ "$due_all" -eq 0 ] && [ "$(cat "$task_marker" 2>/dev/null || true)" = "$verification_key" ]; then
       continue
     fi
     if out=$("$FM_RUNTIME_PROFILE_BIN" "$task" 2>&1); then
       triage_log "runtime profile $task: $out"
       tmp=$(mktemp "$STATE/.runtime-profile-verified-$task.XXXXXX") || exit 1
-      printf '%s' "$generation" > "$tmp" || { rm -f "$tmp"; exit 1; }
+      printf '%s' "$verification_key" > "$tmp" || { rm -f "$tmp"; exit 1; }
       safe_marker_path "$task_marker" || { rm -f "$tmp"; exit 1; }
       mv "$tmp" "$task_marker" || { rm -f "$tmp"; exit 1; }
       continue
@@ -961,10 +967,10 @@ verify_runtime_profiles_if_due() {
     fi
     reason="runtime-profile: $task (verification exit $rc: $out)"
     fm_wake_append stale "$task" "$reason" || exit 1
-    safe_touch_marker_or_log "$marker" "runtime profile check" || true
-    wake "$reason"
+    [ -n "$wake_reason" ] || wake_reason=$reason
   done
   [ "$due_all" -eq 0 ] || safe_touch_marker_or_log "$marker" "runtime profile check" || true
+  [ -z "$wake_reason" ] || wake "$wake_reason"
 }
 
 # --- Main entry: the runtime below runs only when this file is executed as a

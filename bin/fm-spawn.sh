@@ -342,6 +342,9 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+SECONDMATE_CONFIG_PROFILE=0
+CODEX_RUNTIME_HOME=
+RUNTIME_STARTED_AT_NS=
 BACKEND_ARG=
 ACCOUNT_POOL=
 ACCOUNT_PROFILE=
@@ -2327,7 +2330,10 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
     [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
     if [ "$KIND" = secondmate ]; then
-      [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" secondmate) || exit 1
+      if [ "$HARNESS_SET" != 1 ]; then
+        HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" secondmate) || exit 1
+        SECONDMATE_CONFIG_PROFILE=1
+      fi
     elif [ -f "$CONFIG/crew-dispatch.json" ]; then
       [ "$HARNESS_SET" = 1 ] || {
         echo "error: account recovery must pass the harness freshly selected from current config/crew-dispatch.json; recorded harness '$RECORDED_HARNESS' will not be replayed" >&2
@@ -2381,7 +2387,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     fi
     HARNESS_SET=1
     ARG3=$HARNESS_ARG
-    if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+    if { [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; } \
+      && [ "$SECONDMATE_CONFIG_PROFILE" != 1 ]; then
       [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
       [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
     fi
@@ -2504,6 +2511,7 @@ case "$ARG3" in
     # The launch_template lookup below is the unverified-adapter guard for both
     # kinds: a harness with no template aborts the spawn.
     if [ "$KIND" = secondmate ]; then
+      SECONDMATE_CONFIG_PROFILE=1
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" secondmate)
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
     else
@@ -2528,7 +2536,7 @@ esac
 # the harness itself came from the secondmate config fallback chain. Resolving
 # here on every spawn makes the pin durable across respawns. Precedence: explicit
 # --model/--effort flags still win over the file's tokens.
-if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
+if [ "$KIND" = secondmate ] && [ "$SECONDMATE_CONFIG_PROFILE" = 1 ]; then
   if [ "$MODEL_SET" -eq 0 ]; then
     SM_MODEL=$("$SCRIPT_DIR/fm-harness.sh" secondmate-model)
     [ -z "$SM_MODEL" ] || MODEL=$SM_MODEL
@@ -3546,6 +3554,26 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
     }
   fi
 fi
+if [ "$HARNESS" = codex ]; then
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    CODEX_RUNTIME_HOME=$(fm_account_profile_home codex "$ACCOUNT_PROFILE") || {
+      echo "error: selected Codex profile '$ACCOUNT_PROFILE' has no unique authoritative runtime home" >&2
+      exit 1
+    }
+  elif [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+    CODEX_RUNTIME_HOME=$DIRECT_ACCOUNT_HOME
+  else
+    CODEX_RUNTIME_HOME=${CODEX_HOME:-$HOME/.codex}
+  fi
+  case "$CODEX_RUNTIME_HOME" in
+    /*) ;;
+    *) echo "error: Codex runtime home is not absolute: $CODEX_RUNTIME_HOME" >&2; exit 1 ;;
+  esac
+  [ ! -L "$CODEX_RUNTIME_HOME" ] || {
+    echo "error: Codex runtime home is redirected: $CODEX_RUNTIME_HOME" >&2
+    exit 1
+  }
+fi
 }
 
 # build_launch_command: resolve LAUNCH (the full harness launch command) and its
@@ -3662,6 +3690,9 @@ W="fm-$ID"
 if [ "$BACKEND" = herdr ]; then
   prepare_launch_environment
   build_launch_command
+  if [ "$HARNESS" = codex ]; then
+    RUNTIME_STARTED_AT_NS=$(python3 -c 'import time; print(time.time_ns())') || exit 1
+  fi
 fi
 SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -3911,6 +3942,9 @@ fi
 
 if [ "$BACKEND" != herdr ]; then
   prepare_launch_environment
+  if [ "$HARNESS" = codex ]; then
+    RUNTIME_STARTED_AT_NS=$(python3 -c 'import time; print(time.time_ns())') || exit 1
+  fi
 fi
 
 META_WINDOW=$T
@@ -3969,6 +4003,8 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  [ "$HARNESS" != codex ] || echo "runtime_home=$CODEX_RUNTIME_HOME"
+  [ "$HARNESS" != codex ] || echo "runtime_started_at_ns=$RUNTIME_STARTED_AT_NS"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"
   [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"

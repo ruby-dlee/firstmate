@@ -21,6 +21,9 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 AUTO_REAP_STALE_SECS=${FM_AUTO_REAP_STALE_SECS:-300}
 AUTO_REAP_COMMAND_TIMEOUT=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
 AUTO_REAP_NO_MISTAKES_DB=${FM_AUTO_REAP_NO_MISTAKES_DB:-$HOME/.no-mistakes/state.sqlite}
+AUTO_REAP_TASK_LOCK=
+AUTO_REAP_EXPECTED_GENERATION=
+AUTO_REAP_EXPECTED_HEAD=
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
@@ -99,6 +102,23 @@ log_result() {
     tail -n 2000 "$log" > "$tmp" 2>/dev/null && mv "$tmp" "$log" 2>/dev/null || true
     rm -f "$tmp" 2>/dev/null || true
   fi
+}
+
+release_auto_reap_task_lock() {
+  [ -z "$AUTO_REAP_TASK_LOCK" ] \
+    || fm_account_lifecycle_lock_release "$AUTO_REAP_TASK_LOCK" >/dev/null 2>&1 || true
+  AUTO_REAP_TASK_LOCK=
+}
+trap release_auto_reap_task_lock EXIT
+
+verify_task_custody() {  # <meta>
+  local meta=$1 worktree current
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  [ "$(meta_value "$meta" generation_id)" = "$AUTO_REAP_EXPECTED_GENERATION" ] || return 1
+  worktree=$(meta_value "$meta" worktree)
+  [ -z "$AUTO_REAP_EXPECTED_HEAD" ] && return 0
+  current=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) || return 1
+  [ "$current" = "$AUTO_REAP_EXPECTED_HEAD" ]
 }
 
 run_capture() {  # <output-variable> <command> [args...]
@@ -203,6 +223,7 @@ agent_liveness_verdict() {  # <meta>
 
 verify_active_run_for_abort() {  # <meta> <no-mistakes-bin> <expected-run-id>
   local meta=$1 nm=$2 expected_id=$3 captured cli_id cli_branch cli_status current verdict
+  verify_task_custody "$meta" || { refuse "task generation or head changed during cancellation custody"; return 1; }
   load_active_run_proof "$meta" || return 1
   [ "$ACTIVE_RUN_COUNT" -eq 1 ] || {
     refuse "active no-mistakes run disappeared during cancellation proof"
@@ -243,6 +264,10 @@ verify_active_run_for_abort() {  # <meta> <no-mistakes-bin> <expected-run-id>
   verdict=$(agent_liveness_verdict "$meta") || verdict=unknown
   [ "$verdict" = dead ] || {
     refuse "task agent is $verdict, not provably dead; cancellation is not authorized"
+    return 1
+  }
+  verify_task_custody "$meta" || {
+    refuse "task generation or head changed after dead-agent proof"
     return 1
   }
 }
@@ -316,6 +341,7 @@ reap_no_mistakes_run() {  # <meta>
   # conjunctive: exact run ID and branch, exact current/run head, an equal
   # recorded pushed head, and a confidently dead task agent.
   verify_active_run_for_abort "$meta" "$nm" "$run_id" || return 1
+  verify_task_custody "$meta" || { refuse "task generation or head changed before exact run cancellation"; return 1; }
   if run_capture captured "$nm" axi abort --run "$run_id"; then :; else return 1; fi
   [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
     refuse "failed to cancel exact no-mistakes run $run_id"
@@ -338,29 +364,44 @@ reap_no_mistakes_run() {  # <meta>
     refuse "run $run_id cancellation was not confirmed"
     return 1
   }
+  verify_task_custody "$meta" || { refuse "task generation or head changed after exact run cancellation"; return 1; }
   log_result "cancelled no-mistakes run $run_id for $AUTO_REAP_ID"
 }
 
 run_teardown() {  # <task>
-  local task=$1 teardown output
+  local task=$1 teardown output output_file
   teardown=$(auto_reap_tool FM_AUTO_REAP_TEARDOWN_BIN fm-teardown.sh 2>/dev/null || true)
   [ -n "$teardown" ] || teardown="$SCRIPT_DIR/fm-teardown.sh"
-  if output=$("$teardown" "$task" 2>&1); then
+  output_file=$(mktemp "$STATE/.auto-reap-teardown-$task.XXXXXX") || return 1
+  if FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$AUTO_REAP_TASK_LOCK" "$teardown" "$task" > "$output_file" 2>&1; then
+    output=$(cat "$output_file")
+    rm -f "$output_file"
     [ -z "$output" ] || printf '%s\n' "$output"
     log_result "auto-reaped $task"
     printf 'auto-reaped %s\n' "$task"
     return 0
   fi
+  output=$(cat "$output_file")
+  rm -f "$output_file"
   [ -z "$output" ] || printf '%s\n' "$output" >&2
   refuse "ordinary teardown refused; retained endpoint/worktree metadata"
 }
 
 reap_task() {  # <task> <trigger>
-  local id=$1 trigger=$2 meta kind mode
+  local id=$1 trigger=$2 meta kind mode worktree status
   AUTO_REAP_ID=$id
   fm_account_valid_id "$id" || refuse "invalid task id"
+  AUTO_REAP_TASK_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$id") || refuse "could not serialize task lifecycle custody"
   meta="$STATE/$id.meta"
   [ -f "$meta" ] && [ ! -L "$meta" ] || refuse "task metadata is unavailable"
+  AUTO_REAP_EXPECTED_GENERATION=$(meta_value "$meta" generation_id)
+  [ -n "$AUTO_REAP_EXPECTED_GENERATION" ] || refuse "task generation identity is unavailable"
+  worktree=$(meta_value "$meta" worktree)
+  AUTO_REAP_EXPECTED_HEAD=
+  if [ -n "$worktree" ] && [ -d "$worktree" ] && [ ! -L "$worktree" ]; then
+    AUTO_REAP_EXPECTED_HEAD=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) \
+      || refuse "task head identity is unavailable"
+  fi
   kind=$(meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
   mode=$(meta_value "$meta" mode)
@@ -376,8 +417,12 @@ reap_task() {  # <task> <trigger>
     local-merged:ship:local-only) ;;
     *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-no-mistakes}" ;;
   esac
+  verify_task_custody "$meta" || refuse "task generation or head changed before destructive custody"
   reap_no_mistakes_run "$meta" || return 1
-  run_teardown "$id"
+  verify_task_custody "$meta" || refuse "task generation or head changed before teardown"
+  if run_teardown "$id"; then status=0; else status=$?; fi
+  release_auto_reap_task_lock
+  return "$status"
 }
 
 path_age() {

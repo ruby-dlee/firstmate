@@ -14,7 +14,9 @@ Mechanical trigger: spawn admission runs before endpoint creation, direct-accoun
 
 Each new Codex task generation also lacks a runtime receipt by construction, so the already-required live watcher verifies its harness record immediately after start, with a sixty-second startup grace only for rollout publication.
 
-Deterministic predicate: the only admitted profile is `model=gpt-5.6-sol effort=xhigh`, and the latest matching Codex `turn_context` or `thread_settings_applied` rollout record must contain those exact values.
+Deterministic predicate: the only admitted profile is `model=gpt-5.6-sol effort=xhigh`, and the latest matching Codex `turn_context` or `thread_settings_applied` rollout record from the recorded provider session and runtime start must contain those exact values.
+
+The launch record persists the exact runtime home used by direct selection or the Agent Fleet profile, and the verifier never falls back to its own ambient Codex home.
 
 Recovery re-resolves the current harness, model, and effort policy instead of replaying their recorded metadata values.
 
@@ -24,9 +26,9 @@ A native same-session recovery proceeds only when its recorded provider still eq
 
 Failure mode: a below-policy spawn exits before endpoint creation; a runtime mismatch or unreadable runtime record wakes supervision; a direct-account steer exits nonzero.
 
-Herdr Codex steering uses verified literal pane input because Herdr's native `agent send` reapplies account thread defaults.
+Herdr Codex steering refuses because native `agent send` reapplies account thread defaults and pane delivery cannot stay atomically bound to the registered agent session.
 
-An agent-less Herdr pane refuses steering rather than accepting text that the next Enter could execute in a shell.
+An agent-less or Codex Herdr pane never accepts text that a later Enter could execute in a shell.
 
 An opaque raw custom executable remains outside the verified Codex adapter contract because its transitive behavior cannot be inspected deterministically.
 
@@ -68,7 +70,7 @@ Before interpreting the window, it mechanically records contemporaneous `uptime`
 
 The repository-owned reaper skips no-mistakes lookup entirely for detached scouts, selects an active run from the authoritative database by exact repository and task branch, and verifies that run again by both ID and branch.
 
-Deterministic liveness predicate: seven untruncated, exact-run process-table samples span sixty seconds by default; any sample with a run-owned process proves `BUSY`; every result without affirmative evidence is `UNKNOWN`, never `IDLE`, dead, or wedged.
+Deterministic liveness predicate: seven untruncated, exact-run process-table samples span sixty seconds by default; the sampler excludes its own process family, attributes exact-path process roots, follows their descendants, and any sample with a run-owned process proves `BUSY`; every result without affirmative evidence is `UNKNOWN`, never `IDLE`, dead, or wedged.
 
 CPU totals and cumulative CPU delta are recorded as evidence but never override the asymmetric process predicate.
 
@@ -98,7 +100,7 @@ Lifecycle `status` and `updated_at` values remain records rather than heartbeats
 
 If an independently verified load-independent signal becomes available, it should precede process sampling as affirmative evidence without changing the UNKNOWN result for absence.
 
-Deterministic cancellation predicate: immediately before `axi abort`, the task must be a ship lane on its exact `fm/<id>` branch; the authoritative run ID and run branch must match that task; the run head and recorded last-pushed head must both equal current `HEAD`; and the task agent must be affirmatively classified `dead` by the backend adapter.
+Deterministic cancellation predicate: one task lifecycle lock is held from the initial generation and head snapshot through teardown; immediately before `axi abort`, the task must be a ship lane on its exact `fm/<id>` branch; the authoritative run ID and run branch must match that task; the run head and recorded last-pushed head must both equal current `HEAD`; and the task agent must be affirmatively classified `dead` by the backend adapter.
 
 The exact run ID and branch are verified again after cancellation, and cancellation must be reported terminal before teardown proceeds.
 
@@ -124,9 +126,9 @@ Another repository's durations never enter the query.
 
 Covered route: `bin/fm-pr-merge.sh`, the canonical Firstmate PR merge entrypoint.
 
-Mechanical trigger: the script rejects scheduling flags before any GitHub call, runs synchronous admission, and calls GitHub's merge REST endpoint with the admitted `sha` value.
+Mechanical trigger: the script rejects scheduling flags before any GitHub call, runs synchronous admission, publishes an append-only exact-head commit status, re-verifies that status is required by protected-branch policy, and calls GitHub's merge REST endpoint with the admitted `sha` value.
 
-Deterministic predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; the REST merge succeeds only if the current PR head still equals the admitted head.
+Deterministic predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; the base branch must require `firstmate/exact-head-admission`, two approvals, and admin enforcement; and the REST merge succeeds only if the current PR head still equals the admitted head and the server still accepts its required exact-head evidence.
 
 Failure mode: any head movement or merge refusal exits nonzero and no merge remains armed.
 
@@ -154,13 +156,17 @@ Covered route: every merge execution through `bin/fm-pr-merge.sh`.
 
 Mechanical trigger: synchronous `bin/fm-pr-admit.sh` runs immediately before the atomic exact-head merge call.
 
-Deterministic predicate: one unchanged head and base must have a nonempty green and settled check set; two distinct non-author exact-head `APPROVED` review verdicts with no exact-head change request; exact local and PR head equality; an identical GitHub-file and local base-to-head file set; and an explicitly measured zero-byte residual over those files.
+Deterministic predicate: one unchanged head, base, and base ref must have a nonempty green and settled check set; two distinct non-author exact-head `APPROVED` review verdicts with no exact-head change request; exact local and PR head equality; an identical GitHub-file and local base-to-head file set; and a mechanically clean index and worktree including untracked paths.
+
+Files, check runs, and reviews are fetched as explicit bounded pages and combined only after every page is structurally validated and its reported count reconciles.
 
 At least one approval must carry the exact machine-readable attestation `FIRSTMATE-ADVERSARIAL-VERDICT: CLEAN head=<sha>`; an ordinary second approval is not relabelled as adversarial evidence.
 
 A reviewer that stopped without submitting an exact-head `APPROVED` review contributes no verdict and the head is `UNREVIEWED`.
 
-Failure mode: any absent, pending, failed, stale, truncated, moved, or contradictory property exits nonzero before the merge endpoint is called.
+Admission publishes `firstmate/exact-head-admission` on the admitted commit only after every predicate passes; protected-branch enforcement makes that immutable exact-head receipt part of the server merge boundary even when review or check state changes without head movement.
+
+Failure mode: any absent, pending, failed, stale, truncated, moved, dirty, unprotected, or contradictory property exits nonzero before the merge endpoint is called.
 
 Free-form recommendations remain prose and cannot be made route-complete by this repository without the structured reporting transport described under Gate E.
 

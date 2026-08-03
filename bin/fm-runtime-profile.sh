@@ -26,8 +26,10 @@ fi
 MODEL=$(fm_account_meta_value "$META" model)
 EFFORT=$(fm_account_meta_value "$META" effort)
 WORKTREE=$(fm_account_meta_value "$META" worktree)
-CODEX_RUNTIME_HOME=$(fm_account_meta_value "$META" account_home)
-[ -n "$CODEX_RUNTIME_HOME" ] || CODEX_RUNTIME_HOME=${CODEX_HOME:-$HOME/.codex}
+CODEX_RUNTIME_HOME=$(fm_account_meta_value "$META" runtime_home)
+RUNTIME_STARTED_AT_NS=$(fm_account_meta_value "$META" runtime_started_at_ns)
+PROVIDER_SESSION=$(fm_account_meta_value "$META" provider_session_id)
+[ -n "$PROVIDER_SESSION" ] || PROVIDER_SESSION=-
 
 if [ "$MODEL" != gpt-5.6-sol ] || [ "$EFFORT" != xhigh ]; then
   echo "mismatch: recorded Codex profile model=${MODEL:-default} effort=${EFFORT:-default}; expected model=gpt-5.6-sol effort=xhigh" >&2
@@ -41,7 +43,13 @@ fi
   echo "unknown: Codex runtime home is unavailable for $ID" >&2
   exit 2
 }
+case "$RUNTIME_STARTED_AT_NS" in
+  ''|*[!0-9]*)
+    echo "unknown: Codex runtime start identity is unavailable for $ID" >&2
+    exit 2
+    ;;
+esac
 
 node "$SCRIPT_DIR/fm-codex-runtime-profile.mjs" \
-  "$CODEX_RUNTIME_HOME" "$WORKTREE" gpt-5.6-sol xhigh
-
+  "$CODEX_RUNTIME_HOME" "$WORKTREE" gpt-5.6-sol xhigh \
+  "$PROVIDER_SESSION" "$RUNTIME_STARTED_AT_NS"

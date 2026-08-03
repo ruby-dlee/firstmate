@@ -2399,12 +2399,6 @@ except OSError as error:
 PY
 }
 
-if [ "${FM_TEARDOWN_TEST_REMOVAL_AUTHORITY:-}" = firstmate-test-removal-authority-v1 ]; then
-  fm_account_test_lab_enabled || exit 2
-  removal_tree_operation "${FM_TEARDOWN_TEST_REMOVAL_TARGET:?}" "test removal root" remove
-  exit
-fi
-
 safe_rm_rf() {
   local target=$1 label=$2 canonical
   canonical=$(validate_removal_target "$target" "$label") || return 1

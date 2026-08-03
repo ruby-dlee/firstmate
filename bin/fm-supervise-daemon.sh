@@ -989,8 +989,14 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
-  local cache baseline threshold class evidence
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs i
+  local cache baseline threshold class evidence observations observation
+  local -a stale_markers=()
+  local -a stale_tasks=()
+  local -a stale_windows=()
+  local -a stale_ages=()
+  local -a stale_caches=()
+  local -a stale_thresholds=()
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1061,22 +1067,41 @@ housekeeping() {  # <state>
       0) rm -f "$marker" ;;
       2) rm -f "$marker" ;;
       *)
-        class=$(crew_absorb_class "$task")
-        evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
-        case "$class" in
-          working)
-            _now > "$marker"
-            log "self-handle: stale process window remained alive for $win ($evidence; next repository-derived cadence ${threshold}s)"
-            ;;
-          paused)
-            stale_marker_remove "$win" "$state"
-            pause_marker_record "$win" "$state"
-            ;;
-          *)
-            escalate_add "$state" "stale process-window liveness UNKNOWN after ${age}s; no death proof: $win ($evidence)"
-            stale_marker_remove "$win" "$state"
-            ;;
-        esac
+        stale_markers+=("$marker")
+        stale_tasks+=("$task")
+        stale_windows+=("$win")
+        stale_ages+=("$age")
+        stale_caches+=("$cache")
+        stale_thresholds+=("$threshold")
+        ;;
+    esac
+  done
+  observations=
+  if [ "${#stale_tasks[@]}" -gt 0 ]; then
+    observations=$(crew_absorb_observations_bounded "$state" "${stale_tasks[@]}") || observations=
+  fi
+  for ((i = 0; i < ${#stale_tasks[@]}; i++)); do
+    marker=${stale_markers[$i]}
+    task=${stale_tasks[$i]}
+    win=${stale_windows[$i]}
+    age=${stale_ages[$i]}
+    cache=${stale_caches[$i]}
+    threshold=${stale_thresholds[$i]}
+    observation=$(crew_absorb_observation_from_batch "$observations" "$task") || observation=unknown
+    class=$(crew_absorb_class_from_observation "$observation")
+    evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
+    case "$class" in
+      working)
+        _now > "$marker"
+        log "self-handle: stale process window remained alive for $win ($evidence; next repository-derived cadence ${threshold}s)"
+        ;;
+      paused)
+        stale_marker_remove "$win" "$state"
+        pause_marker_record "$win" "$state"
+        ;;
+      *)
+        escalate_add "$state" "stale process-window liveness UNKNOWN after ${age}s; no death proof: $win ($evidence)"
+        stale_marker_remove "$win" "$state"
         ;;
     esac
   done

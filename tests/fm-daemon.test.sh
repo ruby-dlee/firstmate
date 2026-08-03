@@ -5,6 +5,8 @@
 # deterministically reach (persistent-Enter-swallow, max-defer wedge alarms,
 # fm-send swallow reporting, composer-pending ANSI parsing). The operator-visible
 # inject flow lives in fm-afk-inject-e2e and fm-wake-daemon-lifecycle-e2e.
+# Test-local backend stubs are invoked indirectly by sourced production functions.
+# shellcheck disable=SC2329
 set -u
 export FM_ORCA_TEST_LAB=firstmate-orca-test-lab-v1
 export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
@@ -142,29 +144,17 @@ test_liveness_verdicts_surface_through_away_classifiers() {
 
     out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
       FM_FAKE_CREW_STATE="$current" classify_signal "$state/task.turn-ended" "$state")
-    case "$verdict:$out" in
-      alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
-      *) fail "away signal classification mishandled $verdict liveness: $out" ;;
-    esac
+    case "$out" in self\|*) ;; *) fail "away signal inferred liveness from $verdict field: $out" ;; esac
 
     out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
       FM_FAKE_CREW_STATE="$current" classify_stale "sess:fm-task" "$state")
-    case "$verdict:$out" in
-      alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
-      *) fail "away stale classification mishandled $verdict liveness: $out" ;;
-    esac
+    case "$out" in self\|*) ;; *) fail "away stale inferred liveness from $verdict field: $out" ;; esac
 
     out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
       FM_FAKE_CREW_STATE="$current" classify_heartbeat "$state")
-    case "$verdict:$out" in
-      alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
-      *) fail "away heartbeat classification mishandled $verdict liveness: $out" ;;
-    esac
+    case "$out" in self\|*) ;; *) fail "away heartbeat inferred liveness from $verdict field: $out" ;; esac
   done
-  pass "away-mode signal, stale, and heartbeat classifiers preserve alive/dead/unknown actionability"
+  pass "away-mode signal, stale, and heartbeat classifiers never infer liveness from a recorded field"
 }
 
 test_stale_transient_self_records_marker() {
@@ -423,6 +413,44 @@ test_housekeeping_persistent_stale_escalates() {
   [ -s "$state/.subsuper-escalations" ] || fail "persistent stale was not escalated"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "stale marker not cleared after escalation"
   pass "persistent stale escalates after threshold and clears its marker"
+}
+
+test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
+  local dir state fakebin pane liveness_log task win key marker_epoch first last span
+  dir=$(make_supercase stale-parallel)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  pane="$dir/pane.txt"
+  liveness_log="$dir/liveness.log"
+  make_fake_crew_state "$fakebin" >/dev/null
+  printf 'idle prompt $\n' > "$pane"
+  for task in a b c d e; do
+    win="sess:fm-$task"
+    printf 'window=%s\nkind=ship\n' "$win" > "$state/$task.meta"
+    printf 'working: validating\n' > "$state/$task.status"
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  done
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · running' \
+    FM_FAKE_RUN_LIVENESS_LOG="$liveness_log" FM_FAKE_RUN_LIVENESS_SLEEP=1 \
+    FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ "$(wc -l < "$liveness_log" | tr -d ' ')" = 5 ] \
+    || fail "away-daemon stale batch did not sample each validation lane once"
+  first=$(sort -n "$liveness_log" | head -1 | cut -f1)
+  last=$(sort -n "$liveness_log" | tail -1 | cut -f1)
+  span=$((last - first))
+  [ "$span" -lt 3 ] \
+    || fail "away-daemon stale process windows still started serially across ${span}s"
+  for task in a b c d e; do
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    marker_epoch=$(cat "$state/.subsuper-stale-$key" 2>/dev/null || true)
+    case "$marker_epoch" in ''|*[!0-9]*) fail "away daemon did not refresh stale marker for $task" ;; esac
+  done
+  [ ! -s "$state/.subsuper-escalations" ] || fail "positive stale liveness entered the away-mode escalation buffer"
+  pass "away-daemon stale lanes share one explicitly bounded parallel window"
 }
 
 test_housekeeping_resumed_stale_cleared() {
@@ -1483,7 +1511,7 @@ test_fm_send_exits_nonzero_on_confirmed_swallow() {
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_FAKE_COMPOSER="$dir/composer" \
     FM_FAKE_SENT="$sent" "$ROOT/bin/fm-send.sh" sess:win 'route this work' >/dev/null 2>"$err"; rc=$?
   expect_code 1 "$rc" "fm-send must refuse a split literal-plus-Enter adapter"
-  grep -F 'no atomic agent-session-bound tmux route' "$err" >/dev/null \
+  grep -F 'atomic tmux steering verdict=send-failed' "$err" >/dev/null \
     || fail "fm-send did not explain the atomic steering refusal: $(cat "$err")"
   [ ! -s "$sent" ] || fail "atomic steering refusal still wrote pane input"
   pass "fm-send refuses split submit adapters before pane input"
@@ -1698,10 +1726,16 @@ test_inject_msg_defers_on_dead_shell_unknown() {
   pass "inject_msg: defers on a dead-shell/unreadable composer (unknown), never typing the escalation into a shell"
 }
 
-if [ "${FM_TEST_FOCUSED:-}" = liveness-verdicts ]; then
-  test_liveness_verdicts_surface_through_away_classifiers
-  exit 0
-fi
+case "${FM_TEST_FOCUSED:-}" in
+  liveness-batches)
+    test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
+    exit 0
+    ;;
+  liveness-verdicts)
+    test_liveness_verdicts_surface_through_away_classifiers
+    exit 0
+    ;;
+esac
 
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
@@ -1721,6 +1755,7 @@ test_housekeeping_migrates_watcher_pause_marker
 test_housekeeping_migrates_watcher_unpaused_marker_to_clear
 test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
+test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared

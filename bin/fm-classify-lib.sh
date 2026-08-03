@@ -31,7 +31,7 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 FM_RUN_LIVENESS_BIN="${FM_RUN_LIVENESS_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-run-liveness.sh}"
-FM_SIGNAL_LIVENESS_MAX_PARALLEL_DEFAULT=16
+FM_LIVENESS_MAX_PARALLEL_DEFAULT=16
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -339,8 +339,8 @@ signal_reason_is_actionable() {  # <file> ...
 # PR-state calls, so callers run it only on no-verb signal and first-sighting
 # stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
-crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src run_rc
+crew_absorb_observation() {  # <id>
+  local id=$1 line state src run_rc
   [ -n "$id" ] || { printf 'none'; return; }
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
@@ -364,11 +364,71 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
       pane) printf 'working'; return ;;
     esac
   fi
-  if [ "$state" = "done" ] && [ "$src" = run-step ] && status_is_paused "$declared_pause"; then
-    printf 'paused'
+  [ "$state" = "done" ] && [ "$src" = run-step ] && { printf 'done-run-step'; return; }
+  printf 'none'
+}
+
+crew_absorb_class_from_observation() {  # <observation> [declared-pause-status-line]
+  local observation=$1 declared_pause=${2:-}
+  if [ "$observation" = done-run-step ]; then
+    if status_is_paused "$declared_pause"; then
+      printf 'paused'
+    else
+      printf 'none'
+    fi
     return
   fi
-  printf 'none'
+  case "$observation" in working|unknown|paused|none) printf '%s' "$observation" ;; *) printf 'unknown' ;; esac
+}
+
+crew_absorb_class() {  # <id> [declared-pause-status-line]
+  local observation
+  observation=$(crew_absorb_observation "$1")
+  crew_absorb_class_from_observation "$observation" "${2:-}"
+}
+
+crew_absorb_observations_bounded() {  # <state-dir> <id> ...
+  local state=$1 max_parallel batch_dir id pid rc=0 i=0 observation
+  local -a ids=()
+  local -a pids=()
+  shift
+  max_parallel=${FM_LIVENESS_MAX_PARALLEL:-${FM_SIGNAL_LIVENESS_MAX_PARALLEL:-$FM_LIVENESS_MAX_PARALLEL_DEFAULT}}
+  case "$max_parallel" in ''|*[!0-9]*|0) return 1 ;; esac
+  [ "$#" -gt 0 ] && [ "$#" -le "$max_parallel" ] || return 1
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  batch_dir=$(mktemp -d "$state/.classify-batch.XXXXXX") || return 1
+  for id in "$@"; do
+    ids+=("$id")
+    crew_absorb_observation "$id" > "$batch_dir/$i" &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  i=0
+  for id in "${ids[@]}"; do
+    observation=$(cat "$batch_dir/$i" 2>/dev/null || true)
+    case "$observation" in working|unknown|paused|done-run-step|none) ;; *) observation=unknown; rc=1 ;; esac
+    printf '%s\t%s\n' "$id" "$observation"
+    i=$((i + 1))
+  done
+  rm -f "$batch_dir"/*
+  rmdir "$batch_dir"
+  return "$rc"
+}
+
+crew_absorb_observation_from_batch() {  # <batch-output> <id>
+  local batch=$1 wanted=$2 id observation
+  while IFS="$(printf '\t')" read -r id observation; do
+    [ "$id" = "$wanted" ] || continue
+    printf '%s' "$observation"
+    return 0
+  done <<EOF
+$batch
+EOF
+  printf 'unknown'
+  return 1
 }
 
 # 0 if crewmate <id> shows POSITIVE evidence it is still working (crew_absorb_class
@@ -395,9 +455,8 @@ crew_is_paused() {  # <id>
 # task ids by stripping the .status / .turn-ended suffix; a no-verb wake with nothing
 # provably working must surface, so an empty/unresolvable list returns 1.
 signal_crew_provably_working() {  # <file> ...
-  local f base task seen="" max_parallel pid rc=0
+  local f base task seen="" state file_state batch observation rc=0
   local -a tasks=()
-  local -a pids=()
   for f in "$@"; do
     base=${f##*/}
     case "$base" in
@@ -409,17 +468,17 @@ signal_crew_provably_working() {  # <file> ...
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
     tasks+=("$task")
+    case "$f" in */*) file_state=${f%/*} ;; *) file_state=. ;; esac
+    if [ -n "${state:-}" ] && [ "$state" != "$file_state" ]; then
+      return 1
+    fi
+    state=$file_state
   done
   [ "${#tasks[@]}" -gt 0 ] || return 1
-  max_parallel=${FM_SIGNAL_LIVENESS_MAX_PARALLEL:-$FM_SIGNAL_LIVENESS_MAX_PARALLEL_DEFAULT}
-  case "$max_parallel" in ''|*[!0-9]*|0) return 1 ;; esac
-  [ "${#tasks[@]}" -le "$max_parallel" ] || return 1
+  batch=$(crew_absorb_observations_bounded "$state" "${tasks[@]}") || return 1
   for task in "${tasks[@]}"; do
-    crew_is_provably_working "$task" &
-    pids+=("$!")
-  done
-  for pid in "${pids[@]}"; do
-    wait "$pid" || rc=1
+    observation=$(crew_absorb_observation_from_batch "$batch" "$task") || rc=1
+    [ "$(crew_absorb_class_from_observation "$observation")" = working ] || rc=1
   done
   return "$rc"
 }

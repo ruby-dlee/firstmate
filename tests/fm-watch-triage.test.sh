@@ -401,10 +401,50 @@ test_signal_crew_provably_working_runs_one_bounded_parallel_window() {
   [ "$elapsed" -lt 4 ] \
     || fail "five coalesced process windows still ran serially for ${elapsed}s"
   # shellcheck disable=SC2086
-  ! FM_SIGNAL_LIVENESS_MAX_PARALLEL=4 signal_crew_provably_working $files \
+  ! FM_LIVENESS_MAX_PARALLEL=4 signal_crew_provably_working $files \
     || fail "coalesced signal classification exceeded its explicit concurrency bound"
   unset FM_FAKE_CREW_STATE FM_FAKE_RUN_LIVENESS_SLEEP
   pass "coalesced run liveness shares one explicitly bounded parallel window"
+}
+
+test_watcher_stale_liveness_runs_one_bounded_parallel_window() {
+  local dir fakebin state out capture liveness_log task window key pane_hash sig pid first last span
+  dir=$(make_case watcher-stale-parallel); fakebin="$dir/fakebin"; state="$dir/state"
+  out="$dir/watch.out"; capture="$dir/pane.txt"; liveness_log="$dir/liveness.log"
+  printf 'idle validation pane' > "$capture"
+  pane_hash=$(hash_text "idle validation pane")
+  for task in a b c d e; do
+    window="test:fm-$task"
+    printf 'window=%s\nkind=ship\n' "$window" > "$state/$task.meta"
+    printf 'working: validating\n' > "$state/$task.status"
+    sig=$(seen_sig "$state/$task.status")
+    printf '%s' "$sig" > "$state/.seen-${task}_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    printf '%s' "$pane_hash" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+  done
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · running'
+  export FM_FAKE_RUN_LIVENESS_SLEEP=1
+  export FM_FAKE_RUN_LIVENESS_LOG="$liveness_log"
+  watch_bg "$state" "$fakebin" "$out" env FM_FAKE_TMUX_CAPTURE="$capture"
+  pid=$!
+  for task in a b c d e; do
+    window="test:fm-$task"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    wait_file_value "$state/.stale-$key" "$pane_hash" 80 \
+      || { reap "$pid"; fail "watcher did not classify all stale validation lanes"; }
+  done
+  [ "$(wc -l < "$liveness_log" | tr -d ' ')" = 5 ] \
+    || { reap "$pid"; fail "watcher stale batch did not sample each validation lane once"; }
+  first=$(sort -n "$liveness_log" | head -1 | cut -f1)
+  last=$(sort -n "$liveness_log" | tail -1 | cut -f1)
+  span=$((last - first))
+  [ "$span" -lt 3 ] \
+    || { reap "$pid"; fail "watcher stale process windows still started serially across ${span}s"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "positive stale liveness enqueued a wake"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE FM_FAKE_RUN_LIVENESS_SLEEP FM_FAKE_RUN_LIVENESS_LOG
+  pass "watcher stale lanes share one explicitly bounded parallel window"
 }
 
 # --- benign wakes are absorbed ONLY when the crewmate is provably working -----
@@ -1953,6 +1993,12 @@ if [ "${FM_TEST_FOCUSED:-}" = signal-parallel ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = liveness-batches ]; then
+  test_signal_crew_provably_working_runs_one_bounded_parallel_window
+  test_watcher_stale_liveness_runs_one_bounded_parallel_window
+  exit 0
+fi
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1964,6 +2010,7 @@ test_failure_pause_is_failure_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
 test_signal_crew_provably_working_runs_one_bounded_parallel_window
+test_watcher_stale_liveness_runs_one_bounded_parallel_window
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced

@@ -329,7 +329,7 @@ wake() {  # <reason> [durable-resurface-marker]
 # Unknown baselines use the conservative four-minute initial floor, but a
 # fleet-wide duration is never used to call a run anomalous or wedged.
 liveness_recheck_if_due() {  # <window> <since-file> <triage-label> <legacy-escalation-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age reason task cache baseline threshold class evidence
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age reason task cache baseline threshold class evidence now
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -337,7 +337,8 @@ liveness_recheck_if_due() {  # <window> <since-file> <triage-label> <legacy-esca
       triage_log "absorbed $label timer reset: $win"
       ;;
     *)
-      age=$(( $(date +%s) - since ))
+      now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+      age=$(( now - since ))
       task=$(window_to_task "$win" "$STATE")
       cache="$STATE/.run-liveness-$task"
       baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
@@ -350,7 +351,7 @@ liveness_recheck_if_due() {  # <window> <since-file> <triage-label> <legacy-esca
           ;;
       esac
       if [ "$age" -ge "$threshold" ]; then
-        class=$(crew_absorb_class "$task")
+        class=$(watch_absorb_class "$task")
         evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
         if [ "$class" = working ]; then
           date +%s > "$since_file"
@@ -365,6 +366,82 @@ liveness_recheck_if_due() {  # <window> <since-file> <triage-label> <legacy-esca
       fi
       ;;
   esac
+}
+
+liveness_recheck_is_due() {  # <window> <since-file>
+  local win=$1 since_file=$2 since age task cache baseline threshold now
+  since=$(cat "$since_file" 2>/dev/null || true)
+  case "$since" in ''|*[!0-9]*) return 1 ;; esac
+  now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+  age=$(( now - since ))
+  task=$(window_to_task "$win" "$STATE")
+  cache="$STATE/.run-liveness-$task"
+  baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
+  threshold=$STALE_ESCALATE_SECS
+  case "$baseline" in
+    ''|*[!0-9]*) ;;
+    *)
+      threshold=$((baseline / 4))
+      [ "$threshold" -ge "$STALE_ESCALATE_SECS" ] || threshold=$STALE_ESCALATE_SECS
+      ;;
+  esac
+  [ "$age" -ge "$threshold" ]
+}
+
+watch_absorb_class() {  # <task> [declared-pause-status-line]
+  local task=$1 observation
+  observation=$(crew_absorb_observation_from_batch "${WATCH_ABSORB_OBSERVATIONS:-}" "$task") || observation=unknown
+  crew_absorb_class_from_observation "$observation" "${2:-}"
+}
+
+watch_age_of() {  # <file>
+  local f=$1 mtime now age
+  mtime=$(stat_mtime "$f")
+  case "$mtime" in ''|*[!0-9]*) printf '999999'; return ;; esac
+  now=${WATCH_CLASSIFY_EPOCH:-$(date +%s)}
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] || age=0
+  printf '%s' "$age"
+}
+
+pause_state_needs_observation() {  # <window> <status-line>
+  local win=$1 last=$2 key recheck_file
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  if ! status_is_paused "$last"; then
+    return 0
+  fi
+  recheck_file="$STATE/.paused-rechecked-$key"
+  [ -e "$STATE/.paused-$key" ] && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] && return 1
+  return 0
+}
+
+watch_window_needs_observation() {  # <window> <kind> <task> <status-line> <hash> <busy>
+  local win=$1 kind=$2 task=$3 last=$4 h=$5 busy=$6 key prev n sf ssf pf
+  [ "$busy" != 1 ] && ! afk_present || return 1
+  [ "$kind" != secondmate ] || status_is_paused "$last" || return 1
+  if status_is_paused "$last" && pause_state_needs_observation "$win" "$last"; then
+    return 0
+  fi
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  prev=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
+  [ "$h" = "$prev" ] || return 1
+  n=$(( $(cat "$STATE/.count-$key" 2>/dev/null || echo 0) + 1 ))
+  [ "$n" -ge 2 ] || return 1
+  [ "$kind" != secondmate ] || { pause_state_needs_observation "$win" "$last"; return; }
+  sf="$STATE/.stale-$key"
+  ssf="$STATE/.stale-since-$key"
+  pf="$STATE/.paused-$key"
+  if stale_is_terminal "$win" "$STATE"; then
+    [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ] || return 0
+    [ -e "$ssf" ] && liveness_recheck_is_due "$win" "$ssf"
+    return
+  fi
+  [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ] || return 0
+  if [ -e "$pf" ] || status_is_paused "$last"; then
+    pause_state_needs_observation "$win" "$last"
+    return
+  fi
+  liveness_recheck_is_due "$win" "$ssf"
 }
 
 # Absorb a stale pane whose crewmate is in a DECLARED external-wait pause (paused:),
@@ -423,14 +500,14 @@ pause_state_class() {  # <window> <task>
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused "$last"; then
     rm -f "$recheck_file"
-    crew_absorb_class "$task"
+    watch_absorb_class "$task"
     return
   fi
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
+  if [ -e "$STATE/.paused-$key" ] && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
     printf 'paused'
     return
   fi
-  class=$(crew_absorb_class "$task" "$last")
+  class=$(watch_absorb_class "$task" "$last")
   case "$class" in
     paused) date +%s > "$recheck_file" ;;
     *) rm -f "$recheck_file" ;;
@@ -1151,6 +1228,16 @@ EOF
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
   # remembers the hash already classified).
+  stale_windows=()
+  stale_kinds=()
+  stale_tasks=()
+  stale_lasts=()
+  stale_tails=()
+  stale_hashes=()
+  stale_busies=()
+  absorb_tasks=()
+  absorb_seen=
+  WATCH_CLASSIFY_EPOCH=$(date +%s)
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
@@ -1166,10 +1253,47 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
     window_busy=0
     if window_is_busy "$w" "$tail40"; then
       window_busy=1
+    fi
+    stale_windows+=("$w")
+    stale_kinds+=("$kind")
+    stale_tasks+=("$task")
+    stale_lasts+=("$last")
+    stale_tails+=("$tail40")
+    stale_hashes+=("$h")
+    stale_busies+=("$window_busy")
+    skip_observation=0
+    if [ "$window_busy" != 1 ] && ! status_is_paused "$last"; then
+      allow_directory_trust=0
+      brief_processing_started "$task" && allow_directory_trust=1
+      [ -z "$(permission_prompt_kind "$(window_harness "$w")" "$tail40" "$allow_directory_trust" || true)" ] \
+        || skip_observation=1
+    fi
+    if [ "$skip_observation" = 0 ] \
+      && watch_window_needs_observation "$w" "$kind" "$task" "$last" "$h" "$window_busy"; then
+      case " $absorb_seen " in
+        *" $task "*) ;;
+        *) absorb_seen="$absorb_seen $task"; absorb_tasks+=("$task") ;;
+      esac
+    fi
+  done < <(recorded_windows)
+  WATCH_ABSORB_OBSERVATIONS=
+  if [ "${#absorb_tasks[@]}" -gt 0 ]; then
+    WATCH_ABSORB_OBSERVATIONS=$(crew_absorb_observations_bounded "$STATE" "${absorb_tasks[@]}") \
+      || WATCH_ABSORB_OBSERVATIONS=
+  fi
+  for ((stale_i = 0; stale_i < ${#stale_windows[@]}; stale_i++)); do
+    w=${stale_windows[$stale_i]}
+    kind=${stale_kinds[$stale_i]}
+    task=${stale_tasks[$stale_i]}
+    last=${stale_lasts[$stale_i]}
+    tail40=${stale_tails[$stale_i]}
+    h=${stale_hashes[$stale_i]}
+    window_busy=${stale_busies[$stale_i]}
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    if [ "$window_busy" = 1 ]; then
       mark_brief_processing_started "$task" || true
     fi
     # A declared external wait is its own idle state and must be classified
@@ -1251,7 +1375,7 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            if [ "$(watch_absorb_class "$(window_to_task "$w" "$STATE")")" = working ]; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
@@ -1289,7 +1413,7 @@ EOF
           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(crew_absorb_class "$task")" in
+            case "$(watch_absorb_class "$task")" in
               working)
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
@@ -1344,7 +1468,7 @@ EOF
         [ -e "$pf" ] && clear_pause_tracking "$w"
       fi
     fi
-  done < <(recorded_windows)
+  done
 
   # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive

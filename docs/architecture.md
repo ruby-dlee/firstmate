@@ -15,7 +15,7 @@ The permission-prompt matcher and the explicitly heuristic macOS system-dialog f
 Repeated permission-stall escalations add an escalation count to the wake reason and, at `FM_PERMISSION_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when a backend busy signature is present or `bin/fm-run-liveness.sh` finds at least one exact-run process in its repeated process window.
-Coalesced task windows run concurrently up to `FM_SIGNAL_LIVENESS_MAX_PARALLEL`; a larger batch surfaces without guessing so one signal classification never serializes an unbounded fleet.
+Signal and stale-lane task windows run concurrently up to `FM_LIVENESS_MAX_PARALLEL`; a larger batch surfaces without guessing so no supervisor classification pass serializes an unbounded fleet.
 The run status is only the record that selects the process window and never proves life by itself.
 The sampler can emit BUSY only from affirmative evidence; absence at any window length is UNKNOWN and can never become idle, dead, or wedged.
 It rejects detached scouts and any run whose exact ID and branch do not both belong to the ship lane, then records a contemporaneous `uptime` and `vm_stat` snapshot before interpreting process evidence.

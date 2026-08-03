@@ -385,6 +385,44 @@ test_housekeeping_persistent_stale_escalates() {
   pass "persistent stale escalates after threshold and clears its marker"
 }
 
+test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
+  local dir state fakebin pane liveness_log task win key marker_epoch first last span
+  dir=$(make_supercase stale-parallel)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  pane="$dir/pane.txt"
+  liveness_log="$dir/liveness.log"
+  make_fake_crew_state "$fakebin" >/dev/null
+  printf 'idle prompt $\n' > "$pane"
+  for task in a b c d e; do
+    win="sess:fm-$task"
+    printf 'window=%s\nkind=ship\n' "$win" > "$state/$task.meta"
+    printf 'working: validating\n' > "$state/$task.status"
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  done
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · running' \
+    FM_FAKE_RUN_LIVENESS_LOG="$liveness_log" FM_FAKE_RUN_LIVENESS_SLEEP=1 \
+    FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ "$(wc -l < "$liveness_log" | tr -d ' ')" = 5 ] \
+    || fail "away-daemon stale batch did not sample each validation lane once"
+  first=$(sort -n "$liveness_log" | head -1 | cut -f1)
+  last=$(sort -n "$liveness_log" | tail -1 | cut -f1)
+  span=$((last - first))
+  [ "$span" -lt 3 ] \
+    || fail "away-daemon stale process windows still started serially across ${span}s"
+  for task in a b c d e; do
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    marker_epoch=$(cat "$state/.subsuper-stale-$key" 2>/dev/null || true)
+    case "$marker_epoch" in ''|*[!0-9]*) fail "away daemon did not refresh stale marker for $task" ;; esac
+  done
+  [ ! -s "$state/.subsuper-escalations" ] || fail "positive stale liveness entered the away-mode escalation buffer"
+  pass "away-daemon stale lanes share one explicitly bounded parallel window"
+}
+
 test_housekeeping_resumed_stale_cleared() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-resumed)
@@ -1658,6 +1696,11 @@ test_inject_msg_defers_on_dead_shell_unknown() {
   pass "inject_msg: defers on a dead-shell/unreadable composer (unknown), never typing the escalation into a shell"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = liveness-batches ]; then
+  test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
+  exit 0
+fi
+
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
@@ -1675,6 +1718,7 @@ test_housekeeping_migrates_watcher_pause_marker
 test_housekeeping_migrates_watcher_unpaused_marker_to_clear
 test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
+test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared

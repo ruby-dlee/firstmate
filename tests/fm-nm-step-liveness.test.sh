@@ -167,3 +167,54 @@ status=0
 "$PROBE" >/dev/null 2>&1 || status=$?
 [ "$status" = 2 ] || fail "a missing run id must exit 2, got $status"
 pass "a missing run id is a usage error"
+
+# --- (j) REGRESSION: the 2026-08-02 test-start deadlock cannot recur ---------
+#
+# The deadlock was not that a step died. It was that a step recorded `running`
+# was INDISTINGUISHABLE from a slow one, so a healthy multi-hour step and a
+# genuinely dead one produced the same reading and three healthy runs were
+# aborted on it. These cases pin both directions of that distinction over real
+# processes, because a regression in EITHER direction recreates the outage:
+# read a live step as dead and work gets destroyed; read a dead step as alive
+# and the run wedges forever with nothing reporting it.
+
+# (j1) The exact incident signature: a step whose log is quiet, whose agent_pid
+# is empty and whose round reads `starting` - i.e. nothing in `axi status` says
+# it is alive - is still reported ALIVE while its processes are working.
+( cd "$WT" && exec bash -c 'while :; do :; done' ) &
+LIVE=$!
+STARTED_PIDS="$STARTED_PIDS $LIVE"
+out=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+  [ "$(verdict_of "$out")" = alive ] && break
+  sleep 0.3
+done
+[ "$(verdict_of "$out")" = alive ] \
+  || fail "REGRESSION: a working step with no axi-status liveness signal must read alive, got: $out"
+pass "regression: a quiet step with no pid and no round still reads alive while working"
+
+# (j2) A momentary gap between units of work must NOT read dead. The suite loop
+# is empty for the instant between two test scripts; before the confirming
+# rescan, one unlucky sample there reported `dead` - the verdict that authorizes
+# discarding a run. Kill the only process and immediately start another, so the
+# first scan can land in the gap; the confirming rescan must find the successor.
+kill -9 "$LIVE" 2>/dev/null || true
+wait "$LIVE" 2>/dev/null || true
+( sleep 0.35; cd "$WT" && exec bash -c 'while :; do :; done' ) &
+SUCCESSOR=$!
+STARTED_PIDS="$STARTED_PIDS $SUCCESSOR"
+out=$(FM_NM_ABSENCE_CONFIRM_DELAY=3 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" != dead ] \
+  || fail "REGRESSION: a gap between units of work must not be reported dead, got: $out"
+pass "regression: a momentary gap between units of work is not reported as death"
+
+kill_started
+
+# (j3) A genuinely absent step still reads dead after the confirming rescan, so
+# the fix for (j2) did not buy safety by making `dead` unreachable.
+out=$(FM_NM_ABSENCE_CONFIRM_DELAY=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" = dead ] \
+  || fail "REGRESSION: a genuinely empty worktree must still read dead, got: $out"
+assert_contains "$out" "confirmed by a second scan" "the dead verdict states that absence was confirmed"
+pass "regression: confirmed absence still reads dead, so the distinction stays usable"

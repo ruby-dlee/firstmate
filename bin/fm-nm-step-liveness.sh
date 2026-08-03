@@ -47,6 +47,9 @@ set -u
 VERDICT_SEP=' · '
 NM_HOME="${FM_NM_HOME:-${NO_MISTAKES_HOME:-$HOME/.no-mistakes}}"
 SAMPLE_DEFAULT=3
+# How long to wait before re-scanning when the first scan finds nothing, so a
+# momentary gap between the step's units of work cannot be reported as death.
+ABSENCE_CONFIRM_DELAY=${FM_NM_ABSENCE_CONFIRM_DELAY:-1}
 
 RUN_ID=""
 SAMPLE=$SAMPLE_DEFAULT
@@ -199,8 +202,29 @@ PIDS_T0=$(procs_in_worktree) || \
 COUNT_T0=$(printf '%s' "$PIDS_T0" | grep -c . || true)
 case "$COUNT_T0" in ''|*[!0-9]*) COUNT_T0=0 ;; esac
 
+# A single empty scan is NOT proof of death. The step's loop replaces its child
+# between units of work (`for t in tests/*.test.sh; do bash "$t"; done` is empty
+# for the instant between two scripts), so one unlucky sample lands in that gap
+# and reads zero on a perfectly healthy step. `dead` is the only verdict that
+# authorizes discarding a run, so it must survive a CONFIRMING rescan.
+#
+# The confirm delay is paid only when the first scan is already empty, so the
+# common alive case - and the ~0.2s presence-only path on the heartbeat read -
+# is unaffected.
 if [ "$COUNT_T0" = 0 ]; then
-  emit dead 0 "no process has its working directory in $WORKTREE_REAL"
+  sleep "$ABSENCE_CONFIRM_DELAY"
+  PIDS_CONFIRM=$(procs_in_worktree) || \
+    emit unknown 0 "process enumeration failed while confirming absence"
+  COUNT_CONFIRM=$(printf '%s' "$PIDS_CONFIRM" | grep -c . || true)
+  case "$COUNT_CONFIRM" in ''|*[!0-9]*) COUNT_CONFIRM=0 ;; esac
+  if [ "$COUNT_CONFIRM" = 0 ]; then
+    emit dead 0 "no process has its working directory in $WORKTREE_REAL (confirmed by a second scan ${ABSENCE_CONFIRM_DELAY}s later)"
+  fi
+  # Processes reappeared: the first scan caught a gap between units of work.
+  # Continue with the confirming scan's set rather than reporting either verdict
+  # from the reading that was about to be wrong.
+  PIDS_T0=$PIDS_CONFIRM
+  COUNT_T0=$COUNT_CONFIRM
 fi
 
 if [ "$SAMPLE" = 0 ]; then

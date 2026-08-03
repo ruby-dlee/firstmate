@@ -543,6 +543,12 @@ nm_step_liveness() {
   case "$HAVE_TIMEOUT" in
     timeout)  out=$(timeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
     gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    # Same bounded perl fallback nm_run already uses. Without this case, a host
+    # with neither timeout nor gtimeout - the ordinary macOS default, including
+    # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
+    # process scan could block the supervision read for as long as it took.
+    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+                  "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
     *)        out=$("$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
   esac
   [ -n "$out" ] || return 0

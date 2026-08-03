@@ -32,6 +32,23 @@ with_fake_crew_state() {  # <reader> <verdict> <function> [args...]
   "$@"
 }
 
+make_parallel_crew_state_reader() {  # <path>
+  local reader=$1
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$1" >> "$FM_FAKE_PROBES_STARTED"
+i=0
+while [ "$(wc -l < "$FM_FAKE_PROBES_STARTED")" -lt "$FM_FAKE_PROBES_EXPECTED" ]; do
+  i=$((i + 1))
+  [ "$i" -lt 40 ] || { printf 'state: unknown · source: none · serial probe timeout\n'; exit 0; }
+  sleep 0.05
+done
+printf 'state: paused · source: status-log · awaiting upstream\n'
+SH
+  chmod +x "$reader"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -157,16 +174,35 @@ test_classify_check_and_unknown_escalate() {
 }
 
 test_stale_transient_self_records_marker() {
-  local dir state out key
+  local dir state key
   dir=$(make_supercase stale-transient)
   state="$dir/state"
   printf 'working: building\n' > "$state/qux-w4.status"
-  stale_marker_record "sess:fm-qux-w4" "$state"
-  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-qux-w4" "$state")
-  case "$out" in self\|*) ;; *) fail "transient stale did not self-handle: $out" ;; esac
+  FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+    'state: working · source: pane · harness busy' \
+    handle_wake "stale: sess:fm-qux-w4" "$state"
   key=$(printf '%s' "$(window_to_task "sess:fm-qux-w4")" | tr ':/.' '___')
   [ -e "$state/.subsuper-stale-$key" ] || fail "stale marker was not recorded"
-  pass "transient stale self-handles and records a persistence marker"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "positive pane attendance escalated immediately"
+  pass "positive pane attendance starts stale persistence tracking"
+}
+
+test_stale_without_positive_attendance_escalates_immediately() {
+  local dir state task win key
+  dir=$(make_supercase stale-unattended-immediate)
+  state="$dir/state"
+  printf 'working: validating\n' > "$state/working-status.status"
+  for task in working-status missing-status; do
+    win="sess:fm-$task"
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    FM_STATE_OVERRIDE="$state" with_fake_crew_state "$dir/fakebin/fm-crew-state.sh" \
+      'state: working · source: run-step · validating (running)' \
+      handle_wake "stale: $win" "$state"
+    grep -F "stale without positive attendance ($win)" "$state/.subsuper-escalations" >/dev/null \
+      || fail "unattended stale did not escalate immediately for $task"
+    [ ! -e "$state/.subsuper-stale-$key" ] || fail "unattended stale started a persistence timer for $task"
+  done
+  pass "ordinary and missing-status stale wakes surface unattended runs immediately"
 }
 
 test_stale_terminal_escalates() {
@@ -445,19 +481,7 @@ test_pause_custody_snapshot_probes_in_parallel() {
     printf 'window=sess:fm-%s\nkind=ship\n' "$task" > "$state/$task.meta"
     printf 'paused: awaiting upstream\n' > "$state/$task.status"
   done
-  cat > "$reader" <<'SH'
-#!/usr/bin/env bash
-set -u
-printf '%s\n' "$1" >> "$FM_FAKE_PROBES_STARTED"
-i=0
-while [ "$(wc -l < "$FM_FAKE_PROBES_STARTED")" -lt "$FM_FAKE_PROBES_EXPECTED" ]; do
-  i=$((i + 1))
-  [ "$i" -lt 40 ] || { printf 'state: unknown · source: none · serial probe timeout\n'; exit 0; }
-  sleep 0.05
-done
-printf 'state: paused · source: status-log · awaiting upstream\n'
-SH
-  chmod +x "$reader"
+  make_parallel_crew_state_reader "$reader"
   (
     export FM_CREW_STATE_BIN="$reader"
     export FM_FAKE_PROBES_STARTED="$started"
@@ -470,6 +494,38 @@ SH
   done
   [ ! -s "$state/.subsuper-escalations" ] || fail "parallel pause snapshot treated serialized probe timeouts as unattended"
   pass "pause custody snapshot probes the fleet concurrently"
+}
+
+test_signal_snapshot_is_concurrent_and_reused() {
+  local dir state reader started task key reason="" leftover
+  dir=$(make_supercase parallel-signal-probes)
+  state="$dir/state"
+  reader="$dir/fakebin/fm-crew-state-parallel.sh"
+  started="$dir/probes-started"
+  : > "$started"
+  for task in signal-a signal-b signal-c; do
+    printf 'window=sess:fm-%s\nkind=ship\n' "$task" > "$state/$task.meta"
+    printf 'paused: awaiting upstream\n' > "$state/$task.status"
+    reason="$reason $state/$task.status"
+  done
+  reason=${reason# }
+  make_parallel_crew_state_reader "$reader"
+  (
+    export FM_CREW_STATE_BIN="$reader"
+    export FM_FAKE_PROBES_STARTED="$started"
+    export FM_FAKE_PROBES_EXPECTED=3
+    handle_wake "signal: $reason" "$state"
+  )
+  [ "$(wc -l < "$started")" -eq 3 ] || fail "signal classification and pause reconciliation did not reuse one snapshot"
+  for task in signal-a signal-b signal-c; do
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    [ -e "$state/.subsuper-paused-$key" ] || fail "shared signal snapshot did not reconcile pause tracking for $task"
+  done
+  [ ! -s "$state/.subsuper-escalations" ] || fail "concurrent paused signal snapshot escalated a verified external wait"
+  for leftover in "$state"/.subsuper-crew-probes.*; do
+    [ ! -e "$leftover" ] || fail "signal attendance snapshot was not cleaned up"
+  done
+  pass "coalesced signals share one concurrent attendance snapshot"
 }
 
 test_housekeeping_pause_marker_transitions_to_clear() {
@@ -1810,6 +1866,7 @@ test_classify_terminal_signal_escalates
 test_classify_coalesced_signal_checks_each_task
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
+test_stale_without_positive_attendance_escalates_immediately
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_paused_active_or_parked_run_escalates
@@ -1827,6 +1884,7 @@ test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
 test_housekeeping_surfaces_unattended_paused_run
 test_pause_custody_snapshot_probes_in_parallel
+test_signal_snapshot_is_concurrent_and_reused
 test_housekeeping_pause_marker_transitions_to_clear
 test_housekeeping_herdr_persistent_stale_resolves_meta
 test_housekeeping_herdr_idle_busy_footer_clears_stale

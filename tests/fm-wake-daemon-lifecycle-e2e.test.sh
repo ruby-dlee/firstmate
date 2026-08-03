@@ -67,7 +67,12 @@ test_routine_then_terminal_after_restart() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after routine signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null \
     || fail "routine signal was not queued"
-  FM_STATE_OVERRIDE="$state" handle_wake "signal: $status_file" "$state"
+  (
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+    export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
+    handle_wake "signal: $status_file" "$state"
+  )
   [ ! -s "$state/.subsuper-escalations" ] || fail "routine status was escalated by the daemon"
 
   # The watcher is now DOWN (one-shot exit). A terminal status lands while it is
@@ -116,7 +121,12 @@ test_stale_pane_transient_persistent_resume() {
 
   # Transient: first stale observation self-handles and records a marker.
   stale_marker_record "$win" "$state"
-  case "$(FM_STATE_OVERRIDE="$state" classify_stale "$win" "$state")" in
+  case "$(
+    export FM_STATE_OVERRIDE="$state"
+    export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+    export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
+    classify_stale "$win" "$state"
+  )" in
     self\|*) : ;;
     *) fail "transient stale did not self-handle" ;;
   esac

@@ -375,6 +375,22 @@ crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
 
+signal_reason_tasks() {  # <file> ...
+  local f base task seen=""
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    printf '%s\n' "$task"
+  done
+}
+
 # Classify one task referenced by a signal. A turn-ended marker makes a working
 # task actionable because the owner has ended its turn; a real external pause
 # remains safely paused only when no active or parked run contradicts it.
@@ -408,17 +424,9 @@ signal_task_absorb_class() {  # <task> <file> ...
 
 # Classify all tasks referenced by a signal in one token.
 signal_crew_absorb_class() {  # <file> ...
-  local f base task seen="" class saw_paused=0
-  for f in "$@"; do
-    base=${f##*/}
-    case "$base" in
-      *.status)     task=${base%.status} ;;
-      *.turn-ended) task=${base%.turn-ended} ;;
-      *)            continue ;;
-    esac
-    [ -n "$task" ] || continue
-    case " $seen " in *" $task "*) continue ;; esac
-    seen="$seen $task"
+  local task tasks class saw_paused=0
+  tasks=$(signal_reason_tasks "$@")
+  for task in $tasks; do
     class=$(signal_task_absorb_class "$task" "$@")
     case "$class" in
       working) ;;
@@ -426,7 +434,7 @@ signal_crew_absorb_class() {  # <file> ...
       *) printf 'none'; return ;;
     esac
   done
-  [ -n "$seen" ] || { printf 'none'; return; }
+  [ -n "$tasks" ] || { printf 'none'; return; }
   if [ "$saw_paused" = 1 ]; then printf 'paused'; else printf 'working'; fi
 }
 

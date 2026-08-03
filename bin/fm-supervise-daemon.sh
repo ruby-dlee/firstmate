@@ -40,8 +40,8 @@
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
-#   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
+#   - Bounded wedge latency: a stale pane with positive attendance evidence is
+#     escalated after it has been idle for STALE_ESCALATE_SECS
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
 #     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
 #     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
@@ -87,7 +87,7 @@
 #                                   disables. Use sparingly: it overrides the
 #                                   captain-relevant escalation for matching
 #                                   kinds.
-#          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
+#          FM_STALE_ESCALATE_SECS   idle seconds before a positively attended stale pane escalates
 #                                   as a possible wedge (default 240)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
@@ -328,9 +328,21 @@ _collapse_newlines() {  # <text>
 # field for "self" is informational (logged); for "escalate" it is the pre-read
 # summary firstmate would otherwise have to re-read.
 
-classify_signal() {  # <reason-after-colon> <state>
-  local reason=$1 state=$2 f base task last distilled="" rel="" all_seen=1 seen
-  local tasks="" task_seen relevant turn_ended class unattended=""
+classify_signal() {  # <reason-after-colon> <state> [probe-snapshot]
+  local reason=$1 state=$2 snapshot=${3:-} snapshot_supplied=0 own_snapshot=0
+  local f task last distilled="" rel="" all_seen=1 seen all_tasks task_seen
+  local relevant turn_ended class unattended="" decision
+  local -a reason_files task_ids
+  [ "$#" -lt 3 ] || snapshot_supplied=1
+  read -r -a reason_files <<<"$reason"
+  all_tasks=$(signal_reason_tasks "${reason_files[@]}")
+  read -r -a task_ids <<<"${all_tasks//$'\n'/ }"
+  if [ "$snapshot_supplied" = 0 ]; then
+    if [ -n "$all_tasks" ]; then
+      snapshot=$(crew_probe_snapshot_create "$state" "${task_ids[@]}")
+    fi
+    own_snapshot=1
+  fi
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
@@ -346,15 +358,7 @@ classify_signal() {  # <reason-after-colon> <state>
     seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
-  for f in $reason; do
-    base=${f##*/}
-    case "$base" in
-      *.status) task=${base%.status} ;;
-      *.turn-ended) task=${base%.turn-ended} ;;
-      *) continue ;;
-    esac
-    case " $tasks " in *" $task "*) continue ;; esac
-    tasks="$tasks $task"
+  for task in $all_tasks; do
     last=$(last_status_line "$state/$task.status")
     relevant=0
     status_is_captain_relevant "$last" && relevant=1
@@ -363,65 +367,58 @@ classify_signal() {  # <reason-after-colon> <state>
       [ "${task_seen##*/}" = "$task.turn-ended" ] && { turn_ended=1; break; }
     done
     if [ "$relevant" = 0 ] || [ "$turn_ended" = 1 ]; then
-      # shellcheck disable=SC2086 # $reason is the watcher's space-separated signal-path list.
-      class=$(signal_task_absorb_class "$task" $reason)
+      class=$(crew_probe_snapshot_class "$snapshot" "$state" "$task")
+      if [ "$turn_ended" = 1 ] && [ "$class" = working ]; then
+        class=none
+      fi
       case "$class" in
         working|paused) ;;
         *) unattended="$unattended $task" ;;
       esac
     fi
   done
+  [ -n "$all_tasks" ] || unattended=unresolved
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
   unattended=${unattended# }
   if [ -n "$unattended" ]; then
-    printf 'escalate|unattended or unverified signal (%s): %s' "$unattended" "${distilled:-$reason}"
+    decision="escalate|unattended or unverified signal ($unattended): ${distilled:-$reason}"
   elif [ -z "$rel" ]; then
-    printf 'self|routine signal: %s' "$distilled"
+    decision="self|routine signal: $distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
     # self-handle to avoid a duplicate entry in the digest.
-    printf 'self|signal already escalated (catch-all scan): %s' "$distilled"
+    decision="self|signal already escalated (catch-all scan): $distilled"
   else
-    printf 'escalate|%s' "$distilled"
+    decision="escalate|$distilled"
   fi
+  [ "$own_snapshot" = 0 ] || crew_probe_snapshot_remove "$snapshot" "$state"
+  printf '%s' "$decision"
 }
 
-# classify_stale decides the WAKE itself (one-shot per distinct hash). On a
-# first sight of a non-terminal stale it returns "self" and the caller records a
-# timestamp marker; persistence is escalated by housekeeping's recheck, not here.
+# classify_stale decides the WAKE itself (one-shot per distinct hash).
 classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last class
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
-  if { status_is_paused "$last" || status_is_captain_relevant "$last"; } 2>/dev/null; then
-    class=$(crew_absorb_class "$task" "$last")
-    if [ "$class" = working ]; then
-      printf 'self|stale status superseded by positive pane attendance: %s' "$last"
-      return
-    fi
-  else
-    class=none
+  class=$(crew_absorb_class "$task" "$last")
+  if [ "$class" = working ]; then
+    printf 'self|stale has positive pane attendance: %s' "${last:-no status}"
+    return
+  fi
+  if [ "$class" = paused ] && [ -n "$last" ] && status_is_paused "$last"; then
+    printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
+    return
   fi
   if [ -n "$last" ] && status_is_paused "$last"; then
-    case "$class" in
-      paused)
-        printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
-        return
-        ;;
-      *)
-        printf 'escalate|paused status with active, parked, or unverified validation attendance: %s' "$last"
-        return
-        ;;
-    esac
+    printf 'escalate|paused status with active, parked, or unverified validation attendance: %s' "$last"
+    return
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
     printf 'escalate|stale + terminal status without positive attendance: %s' "$last"
     return
   fi
-  # Non-terminal (or no status): defer to the persistence recheck. The caller
-  # records/refreshes the stale marker so housekeeping can age it.
-  printf 'self|transient stale (%s): %s' "$win" "${last:-no status}"
+  printf 'escalate|stale without positive attendance (%s): %s' "$win" "${last:-no status}"
 }
 
 classify_check() {  # <full reason>  — check scripts print only when firstmate should wake
@@ -446,6 +443,75 @@ classify_unknown() {  # <reason>
 #           escalated, so the catch-all does not re-fire the same terminal.
 
 _stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
+
+crew_probe_snapshot_create() {  # <state> <task> ...
+  local state=$1 root task key last result status_file current class i seen=""
+  local count=0 pid
+  local -a tasks results status_files pids
+  shift
+  [ "$#" -gt 0 ] || return 0
+  root=$(mktemp -d "$state/.subsuper-crew-probes.XXXXXX" 2>/dev/null || true)
+  [ -n "$root" ] || return 0
+  for task in "$@"; do
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    key=$(_stale_key "$task")
+    result="$root/$key.class"
+    status_file="$root/$key.status"
+    last=$(last_status_line "$state/$task.status")
+    printf '%s' "$last" > "$status_file"
+    crew_absorb_class "$task" "$last" > "$result" &
+    tasks[$count]=$task
+    results[$count]=$result
+    status_files[$count]=$status_file
+    pids[$count]=$!
+    count=$((count + 1))
+  done
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    result=${results[$i]}
+    status_file=${status_files[$i]}
+    pid=${pids[$i]}
+    class=none
+    if wait "$pid"; then
+      class=$(cat "$result" 2>/dev/null || true)
+    fi
+    case "$class" in working|paused|none) ;; *) class=none ;; esac
+    task=${tasks[$i]}
+    current=$(last_status_line "$state/$task.status")
+    last=$(cat "$status_file" 2>/dev/null || true)
+    [ "$current" = "$last" ] || class=none
+    printf '%s' "$class" > "$result"
+    i=$((i + 1))
+  done
+  printf '%s' "$root"
+}
+
+crew_probe_snapshot_class() {  # <snapshot> <state> <task>
+  local root=$1 state=$2 task=$3 key result status_file class captured current
+  [ -n "$root" ] || { printf 'none'; return; }
+  key=$(_stale_key "$task")
+  result="$root/$key.class"
+  status_file="$root/$key.status"
+  [ -f "$result" ] && [ -f "$status_file" ] || { printf 'none'; return; }
+  captured=$(cat "$status_file" 2>/dev/null || true)
+  current=$(last_status_line "$state/$task.status")
+  [ "$current" = "$captured" ] || { printf 'none'; return; }
+  class=$(cat "$result" 2>/dev/null || true)
+  case "$class" in working|paused|none) printf '%s' "$class" ;; *) printf 'none' ;; esac
+}
+
+crew_probe_snapshot_remove() {  # <snapshot> <state>
+  local root=$1 state=$2 f
+  case "$root" in "$state"/.subsuper-crew-probes.*) ;; *) return 0 ;; esac
+  [ -d "$root" ] && [ ! -L "$root" ] || return 0
+  for f in "$root"/*; do
+    [ -e "$f" ] || continue
+    rm -f "$f"
+  done
+  rmdir "$root" 2>/dev/null || true
+}
 
 stale_marker_record() {  # <window> <state>  — create if absent
   local win=$1 state=$2 key marker
@@ -504,10 +570,9 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line> [absorb-clas
 }
 
 migrate_watcher_pause_markers() {  # <state>
-  local state=$1 meta win task key last watcher_key class seen current result probe_root i pid
+  local state=$1 meta win task key last watcher_key class seen snapshot
   local count=0
-  local -a probe_wins probe_tasks probe_lasts probe_results probe_pids
-  probe_root=
+  local -a tasks
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
@@ -517,44 +582,28 @@ migrate_watcher_pause_markers() {  # <state>
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
-      if [ "$count" -eq 0 ]; then
-        probe_root=$(mktemp -d "$state/.subsuper-pause-probes.XXXXXX" 2>/dev/null || true)
-      fi
-      probe_wins[$count]=$win
-      probe_tasks[$count]=$task
-      probe_lasts[$count]=$last
-      if [ -n "$probe_root" ]; then
-        result="$probe_root/$count"
-        probe_results[$count]=$result
-        crew_absorb_class "$task" "$last" > "$result" &
-        probe_pids[$count]=$!
-      else
-        probe_results[$count]=
-        probe_pids[$count]=
-      fi
+      tasks[$count]=$task
       count=$((count + 1))
     fi
   done
-  i=0
-  while [ "$i" -lt "$count" ]; do
-    win=${probe_wins[$i]}
-    task=${probe_tasks[$i]}
-    last=${probe_lasts[$i]}
-    result=${probe_results[$i]:-}
-    pid=${probe_pids[$i]:-}
-    class=none
-    if [ -n "$pid" ] && wait "$pid"; then
-      class=$(cat "$result" 2>/dev/null || true)
-    fi
-    [ -z "$result" ] || rm -f "$result"
-    case "$class" in working|paused|none) ;; *) class=none ;; esac
-    current=$(last_status_line "$state/$task.status")
-    if [ "$current" != "$last" ]; then
-      last=$current
-      class=none
+  snapshot=
+  if [ "$count" -gt 0 ]; then
+    snapshot=$(crew_probe_snapshot_create "$state" "${tasks[@]}")
+  fi
+  for meta in "$state"/*.meta; do
+    [ -e "$meta" ] || continue
+    win=$(fm_backend_target_of_meta "$meta")
+    [ -n "$win" ] || continue
+    task=$(basename "$meta"); task=${task%.meta}
+    key=$(_stale_key "$task")
+    watcher_key=$(_stale_key "$win")
+    last=$(last_status_line "$state/$task.status")
+    if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
+      class=$(crew_probe_snapshot_class "$snapshot" "$state" "$task")
+    else
+      continue
     fi
     reconcile_pause_tracking "$win" "$state" "$last" "$class"
-    key=$(_stale_key "$task")
     seen="$state/.subsuper-seen-status-$key"
     if status_is_paused "$last" && [ "$class" = none ]; then
       if [ "$(cat "$seen" 2>/dev/null || true)" != "$last" ]; then
@@ -564,13 +613,12 @@ migrate_watcher_pause_markers() {  # <state>
     elif status_is_paused "$last" && [ "$class" = paused ]; then
       rm -f "$seen"
     fi
-    i=$((i + 1))
   done
-  [ -z "$probe_root" ] || rmdir "$probe_root" 2>/dev/null || true
+  crew_probe_snapshot_remove "$snapshot" "$state"
 }
 
-sync_pause_markers_from_signal() {  # <state> <signal files>
-  local state=$1 paths=$2 f last task win class
+sync_pause_markers_from_signal() {  # <state> <signal files> <probe-snapshot>
+  local state=$1 paths=$2 snapshot=$3 f last task win class tasks=""
   local -a files
   read -r -a files <<<"$paths"
   for f in "${files[@]}"; do
@@ -578,9 +626,11 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
     task=$(basename "$f"); task=${task%.status}
+    case " $tasks " in *" $task "*) continue ;; esac
+    tasks="$tasks $task"
     win=$(window_for_task "$task" "$state" 2>/dev/null || true)
     [ -n "$win" ] || continue
-    class=$(crew_absorb_class "$task" "$last")
+    class=$(crew_probe_snapshot_class "$snapshot" "$state" "$task")
     reconcile_pause_tracking "$win" "$state" "$last" "$class"
   done
 }
@@ -1275,15 +1325,22 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last
+  local reason=$1 state=$2 decision action distilled snapshot="" signal_tasks=""
   local kind="" arg=""
+  local -a signal_files signal_task_ids
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
     return
   fi
   case "$reason" in
     signal:*) kind=signal; arg="${reason#signal: }"
-              decision=$(classify_signal "$arg" "$state") ;;
+              read -r -a signal_files <<<"$arg"
+              signal_tasks=$(signal_reason_tasks "${signal_files[@]}")
+              read -r -a signal_task_ids <<<"${signal_tasks//$'\n'/ }"
+              if [ -n "$signal_tasks" ]; then
+                snapshot=$(crew_probe_snapshot_create "$state" "${signal_task_ids[@]}")
+              fi
+              decision=$(classify_signal "$arg" "$state" "$snapshot") ;;
     stale:*)  kind=stale; arg="${reason#stale: }"
               decision=$(classify_stale "$arg" "$state") ;;
     check:*)  decision=$(classify_check "$reason") ;;
@@ -1292,7 +1349,10 @@ handle_wake() {  # <reason> <state>
   esac
   action=${decision%%|*}
   distilled=${decision#*|}
-  [ "$kind" = signal ] && sync_pause_markers_from_signal "$state" "$arg"
+  if [ "$kind" = signal ]; then
+    sync_pause_markers_from_signal "$state" "$arg" "$snapshot"
+    crew_probe_snapshot_remove "$snapshot" "$state"
+  fi
   case "$action" in
     escalate)
       log "escalate: $reason -> $distilled"
@@ -1315,19 +1375,9 @@ handle_wake() {  # <reason> <state>
       log "self-handle (paused): $reason -> $distilled"
       ;;
     *)
-      # Transient (non-terminal) stale: record/refresh the wedge marker so
-      # housekeeping can age it, and drop any pause marker (a crewmate that left its
-      # pause reverts to normal wedge aging). The persistence recheck, not this
-      # wake, escalates a wedge.
       if [ "$kind" = "stale" ]; then
-        task=$(window_to_task "$arg" "$state")
-        last=$(last_status_line "$state/$task.status")
-        if [ -n "$last" ] && status_is_captain_relevant "$last"; then
-          stale_marker_remove "$arg" "$state"
-        else
-          pause_marker_remove "$arg" "$state"
-          stale_marker_record "$arg" "$state"
-        fi
+        pause_marker_remove "$arg" "$state"
+        stale_marker_record "$arg" "$state"
       fi
       log "self-handle: $reason -> $distilled"
       ;;

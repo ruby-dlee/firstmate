@@ -281,7 +281,7 @@ path_age() {
 }
 
 recover_acquisition() {  # <record>
-  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock tmp find_status absence_status absence_class
+  local record=$1 id project holder recorded_worktree worktree snapshot owner_state lock find_status absence_status absence_class
   local recorded_home home_real generation tasktmp tasktmp_phase endpoint_phase backend endpoint_window
   local tmux_window_id tmux_session_target herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id
   local zellij_session zellij_tab_id zellij_pane_id cmux_workspace_id cmux_surface_id
@@ -481,6 +481,12 @@ recover_acquisition() {  # <record>
           return 0
         fi
         if [ "$absence_class" = released ]; then
+          if [ "$endpoint_phase" != not-created ]; then
+            fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+            log_result "retained owner-dead acquisition $id because released lease evidence has no endpoint-absence proof"
+            refuse "Treehouse lease is released but endpoint absence is unproven; retained stale acquisition" || true
+            return 0
+          fi
           if [ "$tasktmp_phase" = created ]; then
             fm_account_safe_remove_task_tmp "$id" "$tasktmp" "$generation" || {
               fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
@@ -513,58 +519,15 @@ recover_acquisition() {  # <record>
       return 0
     fi
   fi
-  [ -n "$worktree" ] || {
+  if [ -n "$worktree" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-    refuse "exact stranded Treehouse lease is not uniquely provable"
+    log_result "retained owner-dead acquisition $id because its Treehouse lease remains acquired"
+    refuse "acquired Treehouse lease evidence requires operator reconciliation; retained stale acquisition" || true
     return 0
-  }
-  tmp=$(mktemp "$STATE/.$id.meta.auto-reap.XXXXXX") || {
-    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-    return 0
-  }
-  {
-    printf 'window=%s\n' "$endpoint_window"
-    printf 'worktree=%s\n' "$worktree"
-    printf 'project=%s\n' "$project"
-    printf 'harness=unknown\nkind=ship\n'
-    printf 'mode=%s\n' "$(single_meta_value "$record" mode 2>/dev/null || printf no-mistakes)"
-    printf 'yolo=%s\n' "$(single_meta_value "$record" yolo 2>/dev/null || printf off)"
-    printf 'tasktmp=%s\ntasktmp_phase=%s\nmodel=default\neffort=default\n' "$tasktmp" "$tasktmp_phase"
-    printf 'generation_id=%s\n' "$generation"
-    printf 'backend=%s\n' "$backend"
-    if [ "$endpoint_phase" = not-created ]; then
-      printf 'direct_spawn_endpoint=not-created\n'
-    else
-      case "$backend" in
-        tmux)
-          printf 'tmux_window_id=%s\ntmux_session_target=%s\n' "$tmux_window_id" "$tmux_session_target"
-          ;;
-        herdr)
-          printf 'herdr_session=%s\nherdr_workspace_id=%s\n' "$herdr_session" "$herdr_workspace_id"
-          printf 'herdr_tab_id=%s\nherdr_pane_id=%s\n' "$herdr_tab_id" "$herdr_pane_id"
-          ;;
-        zellij)
-          printf 'zellij_session=%s\nzellij_tab_id=%s\nzellij_pane_id=%s\n' "$zellij_session" "$zellij_tab_id" "$zellij_pane_id"
-          ;;
-        cmux)
-          printf 'cmux_workspace_id=%s\ncmux_surface_id=%s\n' "$cmux_workspace_id" "$cmux_surface_id"
-          ;;
-      esac
-    fi
-    printf 'direct_spawn_cleanup=pending\nrollback_pending=1\n'
-  } > "$tmp"
-  mv "$tmp" "$STATE/$id.meta" || {
-    rm -f "$tmp"
-    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-    return 0
-  }
-  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || {
-    refuse "failed to release recovery lifecycle lock"
-    return 0
-  }
-  if run_teardown "$id"; then
-    rm -f "$record"
   fi
+  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+  refuse "exact stranded Treehouse lease is not uniquely provable"
+  return 0
 }
 
 maintenance() {

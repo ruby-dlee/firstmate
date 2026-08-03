@@ -1002,6 +1002,126 @@ EOF
   pass "direct recovery migrates legacy tasktmp binding before teardown"
 }
 
+test_direct_recovery_rolls_back_when_legacy_cleanup_refuses() {
+  local record id meta generation legacy_tasktmp outside original_account meta_tmp out status legacy_retained
+  reset_accounts
+  : > "$TMP_ROOT/agent-fleet.log"
+  set_remaining 1 95,90
+  set_remaining 2 30,20
+  id="direct-recovery-tasktmp-rollback-z4-$$"
+  record=$(make_spawn_case direct-recovery-tasktmp-rollback codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool --scout >/dev/null 2>&1
+  meta="$SPAWN_HOME/state/$id.meta"
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  original_account=$(sed -n 's/^account_home=//p' "$meta")
+  legacy_tasktmp="/tmp/fm-$id"
+  outside="$SPAWN_HOME/legacy-tasktmp-symlink-target"
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.direct-recovery-tasktmp-rollback.XXXXXX")
+  [ ! -e "$legacy_tasktmp" ] && [ ! -L "$legacy_tasktmp" ] \
+    || fail "legacy rollback fixture path already exists: $legacy_tasktmp"
+  mkdir -p "$outside"
+  printf '%s\n' preserve > "$outside/sentinel"
+  ln -s "$outside" "$legacy_tasktmp"
+  awk -v tasktmp="$legacy_tasktmp" '
+    /^tasktmp=/ { print "tasktmp=" tasktmp; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+
+  set_remaining 1 20,15
+  set_remaining 2 95,90
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1)
+  status=$?
+  legacy_retained=0
+  [ ! -L "$legacy_tasktmp" ] || legacy_retained=1
+  rm -f "$legacy_tasktmp"
+
+  [ "$status" -ne 0 ] || fail "direct recovery committed after legacy cleanup refusal"
+  assert_contains "$out" "task temp root is not a real directory" \
+    "direct recovery did not surface the legacy cleanup refusal"
+  [ "$legacy_retained" -eq 1 ] || fail "legacy cleanup refusal removed its exact root reference"
+  assert_present "$outside/sentinel" "legacy cleanup refusal traversed the redirected root"
+  assert_grep "tasktmp=$legacy_tasktmp" "$meta" \
+    "legacy cleanup refusal lost its retriable tasktmp authority"
+  assert_grep "generation_id=$generation" "$meta" \
+    "legacy cleanup refusal changed the original generation"
+  assert_grep "account_home=$original_account" "$meta" \
+    "legacy cleanup refusal retained the replacement account generation"
+  assert_absent "$SPAWN_HOME/state/.fake-endpoint" \
+    "legacy cleanup refusal retained the replacement endpoint"
+  pass "legacy cleanup remains inside direct recovery rollback authority"
+}
+
+test_safe_tasktmp_refuses_same_device_bind_mount() {
+  local source target mountpoint runner_script out status
+  if [ "$(uname -s)" != Linux ] || ! command -v unshare >/dev/null 2>&1 \
+    || ! command -v mount >/dev/null 2>&1; then
+    pass "SKIP actual same-device bind mount is unavailable"
+    return
+  fi
+
+  source="$TMP_ROOT/bind-mount-source"
+  target="$TMP_ROOT/bind-mount-tasktmp"
+  mountpoint="$target/mounted"
+  runner_script="$TMP_ROOT/run-bind-mount-tasktmp.sh"
+  mkdir -p "$source" "$mountpoint"
+  printf '%s\n' preserve > "$source/bind-sentinel"
+  printf '%s\n' preserve > "$target/a-before-mount"
+  cat > "$runner_script" <<'SH'
+#!/usr/bin/env bash
+set -u
+source_dir=$1
+target=$2
+mountpoint=$3
+remover=$4
+mount --make-rprivate / >/dev/null 2>&1 || exit 90
+mount --bind "$source_dir" "$mountpoint" >/dev/null 2>&1 || exit 90
+cleanup() {
+  umount "$mountpoint" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+[ "$(stat -c %d "$source_dir")" = "$(stat -c %d "$mountpoint")" ] || exit 91
+out=$(python3 "$remover" "$target" 2>&1)
+status=$?
+[ "$status" -ne 0 ] || exit 92
+case "$out" in
+  *"mount boundary"*) ;;
+  *) exit 93 ;;
+esac
+[ -f "$source_dir/bind-sentinel" ] || exit 94
+[ -f "$mountpoint/bind-sentinel" ] || exit 95
+[ -f "$target/a-before-mount" ] || exit 96
+[ -d "$target" ] || exit 97
+SH
+  chmod +x "$runner_script"
+
+  if unshare --user --map-root-user --mount true >/dev/null 2>&1; then
+    out=$(unshare --user --map-root-user --mount "$runner_script" \
+      "$source" "$target" "$mountpoint" "$ROOT/bin/fm-safe-task-tmp.py" 2>&1)
+    status=$?
+  elif command -v sudo >/dev/null 2>&1 \
+    && sudo -n unshare --mount true >/dev/null 2>&1; then
+    out=$(sudo -n unshare --mount "$runner_script" \
+      "$source" "$target" "$mountpoint" "$ROOT/bin/fm-safe-task-tmp.py" 2>&1)
+    status=$?
+  else
+    pass "SKIP isolated bind-mount authority is unavailable"
+    return
+  fi
+
+  if [ "$status" -eq 90 ]; then
+    pass "SKIP isolated bind mounts are unavailable"
+    return
+  fi
+  [ "$status" -eq 0 ] || fail "same-device bind-mount refusal failed with $status: $out"
+  pass "task temp removal refuses an actual same-device bind mount"
+}
+
 test_direct_recovery_rejects_secondmate_metadata() {
   local record id meta out status
   reset_accounts
@@ -1443,6 +1563,8 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
   test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
+  test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  test_safe_tasktmp_refuses_same_device_bind_mount
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
@@ -1452,6 +1574,18 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp ]; then
   test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
+  test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  test_safe_tasktmp_refuses_same_device_bind_mount
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-tasktmp-rollback ]; then
+  test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = tasktmp-bind-mount ]; then
+  test_safe_tasktmp_refuses_same_device_bind_mount
   exit 0
 fi
 
@@ -1483,6 +1617,8 @@ test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
 test_direct_recovery_migrates_legacy_tasktmp_binding_before_teardown
+test_direct_recovery_rolls_back_when_legacy_cleanup_refuses
+test_safe_tasktmp_refuses_same_device_bind_mount
 test_direct_recovery_rejects_secondmate_metadata
 test_direct_recovery_rejects_worktree_from_another_project
 test_direct_recovery_requires_recorded_brief

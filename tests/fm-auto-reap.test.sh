@@ -218,20 +218,23 @@ write_dead_acquisition() {  # <id> <project> <worktree> <mode> [endpoint-phase] 
   touch -t 202001010000 "$record"
 }
 
-test_dead_acquisition_recovers_but_live_owner_is_untouched() {
+test_acquired_and_live_owner_records_are_retained() {
   local fixture project worktree out rc start live_record
   reset_logs
   fixture=$(make_treehouse_fixture crashed-slot)
   project=${fixture%%$'\t'*}
   worktree=${fixture#*$'\t'}
   write_dead_acquisition crashed-slot "$project" "$worktree" direct
-  FM_FAKE_TEARDOWN_ASSERT_ORPHAN=1
-  export FM_FAKE_TEARDOWN_ASSERT_ORPHAN
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
-  expect_code 0 "$rc" "dead acquisition recovery"
-  assert_contains "$out" "auto-reaped crashed-slot" "dead acquisition reaped"
-  [ ! -e "$HOME_DIR/state/.worktree-acquire-crashed-slot.pending" ] || fail "dead acquisition record survived success"
-  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "crashed-slot" "dead acquisition delegated to teardown"
+  expect_code 0 "$rc" "acquired dead-owner maintenance"
+  assert_contains "$out" "acquired Treehouse lease evidence" \
+    "acquired dead-owner record was not refused explicitly"
+  [ -f "$HOME_DIR/state/.worktree-acquire-crashed-slot.pending" ] \
+    || fail "acquired dead-owner record lost its acquisition authority"
+  [ ! -e "$HOME_DIR/state/crashed-slot.meta" ] \
+    || fail "acquired dead-owner record invented cleanup metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "acquired dead-owner record invoked teardown"
+  rm -f "$HOME_DIR/state/.worktree-acquire-crashed-slot.pending"
 
   reset_logs
   start=$(ps -o lstart= -p $$ | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -250,7 +253,8 @@ test_dead_acquisition_recovers_but_live_owner_is_untouched() {
     "live acquisition did not produce an explicit refusal"
   [ -f "$live_record" ] || fail "live acquisition record was removed"
   [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "live acquisition invoked teardown"
-  pass "crashed acquisition is recovered only after exact owner death proof"
+  rm -f "$live_record"
+  pass "acquired evidence and live owners retain their acquisition records"
 }
 
 test_never_acquired_record_clears_from_phases_and_empty_pool() {
@@ -332,7 +336,7 @@ test_unknown_never_acquired_state_refuses() {
   pass "unknown acquisition state stays fail-closed"
 }
 
-test_dirty_stranded_worktree_is_retained_by_real_teardown() {
+test_dirty_acquired_worktree_is_retained_without_synthetic_metadata() {
   local fixture project worktree out rc
   reset_logs
   fixture=$(make_treehouse_fixture dirty-slot)
@@ -340,16 +344,17 @@ test_dirty_stranded_worktree_is_retained_by_real_teardown() {
   worktree=${fixture#*$'\t'}
   printf 'uncommitted\n' > "$worktree/dirty.txt"
   write_dead_acquisition dirty-slot "$project" "$worktree" local-only
-  unset FM_AUTO_REAP_TEARDOWN_BIN
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
-  export FM_AUTO_REAP_TEARDOWN_BIN="$FAKEBIN/fm-teardown.sh"
-  expect_code 0 "$rc" "dirty acquisition maintenance remains a successful sweep"
-  assert_contains "$out" "uncommitted changes" "real teardown dirty refusal"
-  assert_contains "$out" "ordinary teardown refused" "dirty refusal surfaced by auto-reap"
-  [ -f "$HOME_DIR/state/dirty-slot.meta" ] || fail "dirty worktree recovery metadata was removed"
+  expect_code 0 "$rc" "dirty acquired worktree maintenance"
+  assert_contains "$out" "acquired Treehouse lease evidence" \
+    "dirty acquired worktree was not retained as acquired evidence"
+  [ ! -e "$HOME_DIR/state/dirty-slot.meta" ] \
+    || fail "dirty acquired worktree invented cleanup metadata"
   [ -f "$HOME_DIR/state/.worktree-acquire-dirty-slot.pending" ] || fail "dirty acquisition authority was removed"
-  rm -f "$HOME_DIR/state/dirty-slot.meta" "$HOME_DIR/state/.worktree-acquire-dirty-slot.pending"
-  pass "ordinary teardown preserves a dirty stranded worktree and its recovery authority"
+  [ -f "$worktree/dirty.txt" ] || fail "dirty acquired worktree content was removed"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "dirty acquired worktree invoked teardown"
+  rm -f "$HOME_DIR/state/.worktree-acquire-dirty-slot.pending"
+  pass "dirty acquired worktrees retain exact acquisition authority"
 }
 
 test_unregistered_treehouse_lease_retains_acquisition_authority() {
@@ -461,8 +466,8 @@ test_ambiguous_endpoint_phase_retains_acquisition_authority() {
   pass "an interrupted endpoint creation remains fail-closed for exact reconciliation"
 }
 
-test_created_herdr_endpoint_identity_is_preserved_for_teardown() {
-  local fixture project worktree record tmp out rc id=created-herdr
+test_released_created_endpoint_refuses_without_absence_proof() {
+  local fixture project worktree record state tmp out rc id=created-herdr
   reset_logs
   fixture=$(make_treehouse_fixture "$id")
   project=${fixture%%$'\t'*}
@@ -479,17 +484,34 @@ test_created_herdr_endpoint_identity_is_preserved_for_teardown() {
     'herdr_pane_id=pane-41' >> "$tmp"
   mv "$tmp" "$record"
   touch -t 202001010000 "$record"
-  FM_FAKE_TEARDOWN_ASSERT_HERDR=1
-  export FM_FAKE_TEARDOWN_ASSERT_HERDR
+  state="$(dirname "$(dirname "$worktree")")/treehouse-state.json"
+  git -C "$project" worktree remove --force "$worktree"
+  python3 - "$state" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    state = json.load(stream)
+entry = state["worktrees"][0]
+entry["leased"] = None
+entry["lease_holder"] = None
+entry["destroying"] = None
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream)
+PY
   out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
-  expect_code 0 "$rc" "created Herdr endpoint recovery"
-  assert_contains "$out" "auto-reaped $id" "created Herdr endpoint was not delegated to teardown"
-  [ ! -e "$record" ] || fail "created Herdr endpoint record survived successful teardown"
-  assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "$id" "created Herdr endpoint did not invoke teardown"
-  pass "a post-launch crash retains exact Herdr endpoint identity for quiescence"
+  expect_code 0 "$rc" "released created-endpoint maintenance"
+  assert_contains "$out" "endpoint absence is unproven" \
+    "released created endpoint was not retained without absence proof"
+  [ -f "$record" ] || fail "released created endpoint lost its cleanup authority"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "released created endpoint invented cleanup metadata"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "released created endpoint invoked teardown"
+  rm -f "$record"
+  pass "released leases retain created endpoints without exact absence proof"
 }
 
-test_pre_tasktmp_crash_reaps_with_real_teardown() {
+test_pre_tasktmp_acquired_crash_retains_exact_lease() {
   local fixture project worktree record out rc id=pre-tasktmp realbin treehouse_state treehouse_log
   reset_logs
   fixture=$(make_treehouse_fixture "$id")
@@ -502,21 +524,21 @@ test_pre_tasktmp_crash_reaps_with_real_teardown() {
   treehouse_log="$TMP/pre-tasktmp-treehouse.log"
   mkdir -p "$realbin"
   ln "$ROOT/tests/fixtures/treehouse-return-fixture.sh" "$realbin/treehouse"
-  unset FM_AUTO_REAP_TEARDOWN_BIN
   out=$(PATH="$realbin:$PATH" \
     FM_AUTO_REAP_E2E_WORKTREE="$worktree" \
     FM_AUTO_REAP_E2E_PROJECT="$project" \
     FM_AUTO_REAP_E2E_TREEHOUSE_STATE="$treehouse_state" \
     FM_AUTO_REAP_E2E_TREEHOUSE_LOG="$treehouse_log" \
     FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
-  export FM_AUTO_REAP_TEARDOWN_BIN="$FAKEBIN/fm-teardown.sh"
-  expect_code 0 "$rc" "pre-tasktmp real teardown recovery"
-  assert_contains "$out" "auto-reaped $id" "pre-tasktmp crash did not complete real teardown"
-  [ ! -e "$record" ] || fail "pre-tasktmp acquisition record became a permanent zombie"
-  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "pre-tasktmp recovery retained synthetic metadata"
-  [ ! -e "$worktree" ] || fail "pre-tasktmp recovery retained the returned worktree"
-  assert_contains "$(cat "$treehouse_log")" "returned $worktree" "pre-tasktmp recovery did not return the exact lease"
-  pass "a pre-tasktmp crash completes ordinary teardown without synthetic owner state"
+  expect_code 0 "$rc" "pre-tasktmp acquired crash maintenance"
+  assert_contains "$out" "acquired Treehouse lease evidence" \
+    "pre-tasktmp acquired crash was not refused explicitly"
+  [ -f "$record" ] || fail "pre-tasktmp acquired crash lost its authority"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "pre-tasktmp acquired crash invented cleanup metadata"
+  [ -d "$worktree" ] || fail "pre-tasktmp acquired crash returned the live lease"
+  [ ! -s "$treehouse_log" ] || fail "pre-tasktmp acquired crash invoked Treehouse return"
+  rm -f "$record"
+  pass "pre-tasktmp acquired crashes retain exact lease evidence"
 }
 
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
@@ -612,12 +634,13 @@ test_local_merge_immediately_auto_reaps() {
 if [ "${FM_TEST_FOCUSED:-}" = acquisition-absence-states ]; then
   test_never_acquired_record_clears_from_phases_and_empty_pool
   test_released_acquisition_record_clears_as_released
+  test_released_created_endpoint_refuses_without_absence_proof
   test_unknown_never_acquired_state_refuses
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = acquisition-live-owner ]; then
-  test_dead_acquisition_recovers_but_live_owner_is_untouched
+  test_acquired_and_live_owner_records_are_retained
   exit 0
 fi
 
@@ -628,6 +651,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = acquisition-released ]; then
   test_released_acquisition_record_clears_as_released
+  test_released_created_endpoint_refuses_without_absence_proof
   exit 0
 fi
 
@@ -640,17 +664,17 @@ test_merged_task_cancels_exact_run_then_tears_down
 test_open_pr_refuses_without_teardown
 test_cross_branch_active_run_refuses_without_guessing_id
 test_x_link_and_teardown_refusal_remain_visible
-test_dead_acquisition_recovers_but_live_owner_is_untouched
+test_acquired_and_live_owner_records_are_retained
 test_never_acquired_record_clears_from_phases_and_empty_pool
 test_released_acquisition_record_clears_as_released
 test_unknown_never_acquired_state_refuses
-test_dirty_stranded_worktree_is_retained_by_real_teardown
+test_dirty_acquired_worktree_is_retained_without_synthetic_metadata
 test_unregistered_treehouse_lease_retains_acquisition_authority
 test_malformed_treehouse_leases_retain_acquisition_authority
 test_destroying_treehouse_entry_retains_acquisition_authority
 test_ambiguous_endpoint_phase_retains_acquisition_authority
-test_created_herdr_endpoint_identity_is_preserved_for_teardown
-test_pre_tasktmp_crash_reaps_with_real_teardown
+test_released_created_endpoint_refuses_without_absence_proof
+test_pre_tasktmp_acquired_crash_retains_exact_lease
 test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap
 test_local_merge_immediately_auto_reaps
 

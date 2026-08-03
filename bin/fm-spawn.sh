@@ -4048,6 +4048,37 @@ if [ "$BACKEND" != herdr ]; then
   spawn_send_key "$T" Enter
 fi
 
+cleanup_legacy_task_tmp_before_recovery_commit() {
+  [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ] \
+    && [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$RECORDED_TASKTMP_CLASS" = legacy ] \
+    || return 0
+  META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+  if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+    || [ "$(fm_account_meta_value "$STATE/$ID.meta" tasktmp)" != "$TASK_TMP" ]; then
+    echo "error: task generation changed before prior temp cleanup for $ID" >&2
+    exit 1
+  fi
+  [ "$RECOVERY_ENDPOINT_ABSENCE_PROVEN" -eq 1 ] \
+    || { echo "error: prior endpoint absence is unproven before legacy task temp cleanup for $ID" >&2; exit 1; }
+  if [ "$EXISTING_TASK_TMP" != "$RECORDED_TASKTMP" ] \
+    || ! fm_account_task_tmp_is_legacy "$ID" "$EXISTING_TASK_TMP" \
+    || ! fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then
+      echo "error: legacy task temp migration identity is ambiguous for $ID" >&2
+      exit 1
+  fi
+  if [ -e "$EXISTING_TASK_TMP" ] || [ -L "$EXISTING_TASK_TMP" ]; then
+    LEGACY_TASK_TMP_PARENT=$(cd "$(dirname "$EXISTING_TASK_TMP")" 2>/dev/null && pwd -P) || {
+      echo "error: legacy task temp parent cannot be resolved for $ID" >&2
+      exit 1
+    }
+    LEGACY_TASK_TMP_TARGET="$LEGACY_TASK_TMP_PARENT/$(basename "$EXISTING_TASK_TMP")"
+    python3 "$SCRIPT_DIR/fm-safe-task-tmp.py" "$LEGACY_TASK_TMP_TARGET" || exit 1
+  fi
+  fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
+  META_WRITE_LOCK=
+  EXISTING_TASK_TMP=
+}
+
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
   if [ "$RESUME_ACCOUNT" = 1 ]; then
@@ -4080,6 +4111,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     absent) echo "error: managed endpoint disappeared before launch commit for $ID" >&2; exit 1 ;;
     *) echo "error: managed endpoint state is unknown before launch commit for $ID" >&2; exit 1 ;;
   esac
+  cleanup_legacy_task_tmp_before_recovery_commit
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ ! -f "$STATE/$ID.meta" ] || [ "$(fm_meta_get "$STATE/$ID.meta" account_task)" != "$ACCOUNT_TASK" ]; then
     echo "error: managed task generation changed before launch commit for $ID" >&2
@@ -4099,36 +4131,18 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     fi
   fi
 fi
-[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
+if [ "$ACCOUNT_EFFECTIVE_MODE" != enforce ]; then
+  cleanup_legacy_task_tmp_before_recovery_commit
+  ACCOUNT_SPAWN_COMMITTED=1
+fi
 if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
-  LEGACY_TASK_TMP_PARENT=
-  LEGACY_TASK_TMP_TARGET=
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
     || [ "$(fm_account_meta_value "$STATE/$ID.meta" tasktmp)" != "$TASK_TMP" ]; then
     echo "error: task generation changed before prior temp cleanup for $ID" >&2
     exit 1
   fi
-  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$RECORDED_TASKTMP_CLASS" = legacy ]; then
-    [ "$RECOVERY_ENDPOINT_ABSENCE_PROVEN" -eq 1 ] \
-      || { echo "error: prior endpoint absence is unproven before legacy task temp cleanup for $ID" >&2; exit 1; }
-    if [ "$EXISTING_TASK_TMP" != "$RECORDED_TASKTMP" ] \
-      || ! fm_account_task_tmp_is_legacy "$ID" "$EXISTING_TASK_TMP" \
-      || ! fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$SPAWN_GENERATION_ID"; then
-        echo "error: legacy task temp migration identity is ambiguous for $ID" >&2
-        exit 1
-    fi
-    if [ -e "$EXISTING_TASK_TMP" ] || [ -L "$EXISTING_TASK_TMP" ]; then
-      LEGACY_TASK_TMP_PARENT=$(cd "$(dirname "$EXISTING_TASK_TMP")" 2>/dev/null && pwd -P) || {
-        echo "error: legacy task temp parent cannot be resolved for $ID" >&2
-        exit 1
-      }
-      LEGACY_TASK_TMP_TARGET="$LEGACY_TASK_TMP_PARENT/$(basename "$EXISTING_TASK_TMP")"
-      python3 "$SCRIPT_DIR/fm-safe-task-tmp.py" "$LEGACY_TASK_TMP_TARGET" || exit 1
-    fi
-  else
-    fm_account_safe_remove_task_tmp "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || exit 1
-  fi
+  fm_account_safe_remove_task_tmp "$ID" "$EXISTING_TASK_TMP" "$EXISTING_TASK_GENERATION" || exit 1
   fm_account_meta_lock_release "$META_WRITE_LOCK" || exit 1
   META_WRITE_LOCK=
 fi

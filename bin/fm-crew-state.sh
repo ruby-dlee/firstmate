@@ -21,8 +21,13 @@
 #   ... · liveness: <alive|dead|unknown> [fail-closed aggregate]
 #
 # Logic, in order:
-#   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crewmate's branch, active or terminal
+#   1. Resolve worktree + backend target + kind from state/<id>.meta. For a ship
+#      in no-mistakes mode, bind its task branch to the metadata's exact
+#      worktree_git_ref; never derive it from worktree HEAD. A unique
+#      refs/heads/fm/<id> binding may identify a run. A branch shared by another
+#      live task record cannot, so skip run evidence and use pane/log evidence.
+#   2. Matching no-mistakes run for this crewmate's uniquely self-bound task
+#      branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
 #      The run-step is AUTHORITATIVE for active, parked, and failed states:
 #      running/fixing -> working, ci -> working, awaiting_approval/fix_review ->
@@ -45,7 +50,9 @@
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
 #      `resolved` never become current state or detail.
-#   5. Missing meta or torn-down worktree: report unknown · none. If no run is
+#   5. Missing/ambiguous/uniquely disagreeing task-branch identity, missing meta,
+#      or a torn-down worktree: report unknown · none. A shared branch falls
+#      through to pane/log evidence with an attribution warning. If no run is
 #      attributed to this crewmate, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
 #
@@ -108,6 +115,8 @@ meta_value() {  # <key>
 WT=$(meta_value worktree)
 KIND=$(meta_value kind)
 [ -n "$KIND" ] || KIND=ship
+MODE=$(meta_value mode)
+[ -n "$MODE" ] || MODE=no-mistakes
 
 # A torn-down (or never-created) worktree has no current state to read.
 if [ -z "$WT" ] || [ ! -d "$WT" ]; then
@@ -772,9 +781,59 @@ nm_runs_status_for_branch() {  # <branch>
   return 0
 }
 
-# CREW_BRANCH is empty at detached HEAD (a just-spawned crewmate, or a scout's
-# scratch worktree); with no branch there is no run to attribute to this crewmate.
-CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+# A no-mistakes ship's branch is task identity, not worktree state. Pooled
+# worktrees may legitimately be checked out on a predecessor or neighbour task's
+# branch, so consulting HEAD here can attribute that neighbour's run - including
+# a terminal run - to this task. Direct spawn metadata records the authoritative
+# final ref. Require exactly one ref. A unique ref must self-bind to fm/<id> before
+# run state can be trusted. If another worktree-present task record carries the
+# same ref, branch alone cannot distinguish either lane's run; skip run evidence
+# for both and fall back to their own panes/logs. The reader's public contract
+# always exits zero for a successful read, so a true identity refusal is rendered
+# as unknown/none with the disagreement in detail.
+TASK_BRANCH=""
+RUN_LOOKUP_ALLOWED=0
+RUN_ATTRIBUTION_NOTE=""
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+  EXPECTED_TASK_REF="refs/heads/fm/$ID"
+  TASK_REF_COUNT=0
+  TASK_REF=""
+  while IFS= read -r TASK_META_LINE; do
+    case "$TASK_META_LINE" in
+      worktree_git_ref=*)
+        TASK_REF_COUNT=$((TASK_REF_COUNT + 1))
+        TASK_REF=${TASK_META_LINE#worktree_git_ref=}
+        ;;
+    esac
+  done < "$META"
+  if [ "$TASK_REF_COUNT" != 1 ]; then
+    emit unknown none "task branch identity unavailable: expected exactly one worktree_git_ref=$EXPECTED_TASK_REF, found $TASK_REF_COUNT"
+  fi
+  TASK_BRANCH=${TASK_REF#refs/heads/}
+  TASK_REF_OWNER_COUNT=0
+  TASK_REF_OWNERSHIP_READABLE=1
+  for TASK_META_CANDIDATE in "$STATE"/*.meta; do
+    [ -e "$TASK_META_CANDIDATE" ] || continue
+    if [ ! -r "$TASK_META_CANDIDATE" ]; then
+      TASK_REF_OWNERSHIP_READABLE=0
+      break
+    fi
+    grep -Fqx "worktree_git_ref=$TASK_REF" "$TASK_META_CANDIDATE" 2>/dev/null || continue
+    TASK_META_WORKTREE=$(grep '^worktree=' "$TASK_META_CANDIDATE" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    [ -n "$TASK_META_WORKTREE" ] && [ -d "$TASK_META_WORKTREE" ] || continue
+    TASK_REF_OWNER_COUNT=$((TASK_REF_OWNER_COUNT + 1))
+  done
+  if [ "$TASK_REF_OWNERSHIP_READABLE" != 1 ] || [ "$TASK_REF_OWNER_COUNT" = 0 ]; then
+    emit unknown none "task branch ownership unavailable for $TASK_REF"
+  fi
+  if [ "$TASK_REF_OWNER_COUNT" -gt 1 ]; then
+    RUN_ATTRIBUTION_NOTE="run attribution unavailable: task branch $TASK_BRANCH is shared by $TASK_REF_OWNER_COUNT live task records"
+  elif [ "$TASK_REF" != "$EXPECTED_TASK_REF" ]; then
+    emit unknown none "task branch identity disagreement: metadata has ${TASK_REF:-<empty>}, expected $EXPECTED_TASK_REF"
+  else
+    RUN_LOOKUP_ALLOWED=1
+  fi
+fi
 
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
@@ -785,11 +844,11 @@ RUN_SOURCE=full
 COARSE_STATUS=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
-if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ] && [ "$RUN_LOOKUP_ALLOWED" = 1 ] && [ -n "$TASK_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$TASK_BRANCH" ]; then
       HAVE_RUN=1
     else
       # The active-or-most-recent run is for another branch (the CLI is alive
@@ -798,7 +857,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH")
+      coarse_run=$(nm_runs_status_for_branch "$TASK_BRANCH")
       if [ -n "$coarse_run" ]; then
         COARSE_STATUS=${coarse_run%%|*}
         HAVE_RUN=1
@@ -915,7 +974,7 @@ if [ "$HAVE_RUN" = 1 ]; then
 
   if [ "$RUN_STATE" = "done" ] && [ "$READY_CLAIM" = 1 ]; then
     if [ "$RUN_SOURCE" = full ] && [ "$RUN_STATUS" = completed ]; then
-      verify_no_newer_active_run_or_emit "$CREW_BRANCH"
+      verify_no_newer_active_run_or_emit "$TASK_BRANCH"
     fi
     verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
   fi
@@ -1009,17 +1068,23 @@ fi
 # liveness, so a finished-but-pane-closed crewmate never reaches here. Down here there
 # is no run to consult, so a dead/unreadable target means the crewmate is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
-[ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
-pane_readable "$BACKEND_TARGET" || emit unknown none "backend target gone: $BACKEND_TARGET"
+emit_fallback() {  # <state> <source> <detail>
+  local detail=$3
+  [ -z "$RUN_ATTRIBUTION_NOTE" ] || detail="$detail${SEP}$RUN_ATTRIBUTION_NOTE"
+  emit "$1" "$2" "$detail"
+}
+
+[ -n "$BACKEND_TARGET" ] || emit_fallback unknown none "no backend target recorded"
+pane_readable "$BACKEND_TARGET" || emit_fallback unknown none "backend target gone: $BACKEND_TARGET"
 
 # Secondmates idle on their own watcher (idle pane = healthy), so the busy
 # signature is not meaningful for them; read their state from the status log only.
 if [ "$KIND" != secondmate ] && crew_pane_is_busy "$BACKEND_TARGET"; then
-  emit working pane "harness busy"
+  emit_fallback working pane "harness busy"
 fi
 
 if log_reports_ci_ready; then
-  emit unknown status-log "checks-green currentness is unavailable; do not merge"
+  emit_fallback unknown status-log "checks-green currentness is unavailable; do not merge"
 fi
 
 # Fall back to the status log's last line, but ONLY when its verb maps to a real
@@ -1035,8 +1100,8 @@ fi
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
   if [ "$LOG_STATE" != unknown ]; then
-    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
+    emit_fallback "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
   fi
 fi
 
-emit unknown none "no current-state source available"
+emit_fallback unknown none "no current-state source available"

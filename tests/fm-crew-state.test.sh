@@ -14,7 +14,9 @@
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
 #   (d) terminal run-step is authoritative, while passed PR state is verified
 #       against GitHub rather than inferred from the run outcome  -> run-step
-#   (e) cross-branch attribution: this branch's own run found via list lookup
+#   (e) task-branch attribution: metadata wins over pooled worktree HEAD in both
+#       directions; missing/disagreeing/ambiguous identity refuses; another
+#       active branch still falls through to the task branch's list row
 #   (f) no run + busy pane                                        -> pane
 #   (g) no run + idle pane falls to the status-log verb           -> status-log
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
@@ -37,7 +39,7 @@ set -u
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
 
-CREW_STATE="$ROOT/bin/fm-crew-state.sh"
+CREW_STATE=${FM_CREW_STATE_BIN:-$ROOT/bin/fm-crew-state.sh}
 fm_test_tmproot_into TMP_ROOT fm-crew-state
 fm_git_identity fmtest fmtest@example.invalid
 
@@ -234,7 +236,15 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 
 # Run the helper for one case dir. FM_FAKE_* env (run output, busy flag) are read
 # from the caller's environment by the fakes above.
-run_crew_state() {  # <case-dir> <id>
+run_crew_state() {  # <case-dir> <id> [preserve-missing-task-ref]
+  local meta="$1/state/$2.meta" wt branch
+  if [ "${3:-}" != preserve-missing-task-ref ] && [ -f "$meta" ] \
+    && ! grep -q '^worktree_git_ref=' "$meta" \
+    && grep -q '^kind=ship$' "$meta"; then
+    wt=$(grep '^worktree=' "$meta" | tail -1 | cut -d= -f2-)
+    branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    [ -z "$branch" ] || printf 'worktree_git_ref=refs/heads/%s\n' "$branch" >> "$meta"
+  fi
   PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
     FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
@@ -442,6 +452,19 @@ run:
   head: "abc1234"
   pr: "https://github.com/o/r/pull/2"
   findings: none
+EOF
+}
+
+run_cancelled() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: completed
+  head: "abc1234"
+  pr: ""
+  findings: none
+outcome: cancelled
 EOF
 }
 
@@ -1383,6 +1406,193 @@ test_terminal_failed() {
   pass "terminal failed run is authoritative"
 }
 
+# A pooled worktree can legitimately be checked out on a neighbour task's
+# branch while this task's durable metadata remains bound to refs/heads/fm/<id>.
+# Exercise the actual reader boundary in both dangerous directions, then prove
+# missing, disagreeing, and ambiguous durable identity refuse instead of
+# borrowing the worktree branch. Finally, prove that a branch shared by live task
+# records is never lane identity: the run-owning lane and runless neighbour use
+# their own pane/log evidence, while no positive evidence remains unknown. The
+# function accumulates all eight outcomes so a pre-fix run reports the complete
+# violation count instead of exiting after the first wrong answer.
+test_task_branch_identity_overrides_pooled_worktree_branch() {
+  reset_fakes
+  local d out violations=0
+
+  d=$(new_case task-live-neighbour-cancelled)
+  make_repo_on_branch "$d/wt" fm/neighbour-cancelled
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/task-live.meta" \
+    "window=fm:fm-task-live" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/task-live"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/neighbour-cancelled)"
+  FM_FAKE_RUNS_LIST=$(cat <<'EOF'
+  cancelled  fm/neighbour-cancelled aaaaaaa  2026-08-03 01:10
+  running    fm/task-live bbbbbbb  2026-08-03 01:05
+EOF
+)
+  out=$(run_crew_state "$d" task-live)
+  case "$out" in
+    *"state: working"*"source: run-step"*) ;;
+    *)
+      printf 'task-live wrong boundary result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  reset_fakes
+  d=$(new_case task-cancelled-neighbour-live)
+  make_repo_on_branch "$d/wt" fm/neighbour-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/task-cancelled.meta" \
+    "window=fm:fm-task-cancelled" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/task-cancelled"
+  FM_FAKE_AXI_STATUS="$(run_running fm/neighbour-live)"
+  FM_FAKE_RUNS_LIST=$(cat <<'EOF'
+  running    fm/neighbour-live aaaaaaa  2026-08-03 01:10
+  cancelled  fm/task-cancelled bbbbbbb  2026-08-03 01:05
+EOF
+)
+  out=$(run_crew_state "$d" task-cancelled)
+  case "$out" in
+    *"state: failed"*"source: run-step"*) ;;
+    *)
+      printf 'task-cancelled wrong boundary result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  reset_fakes
+  d=$(new_case missing-task-branch-identity)
+  make_repo_on_branch "$d/wt" fm/neighbour-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/task-unbound.meta" \
+    "window=fm:fm-task-unbound" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  FM_FAKE_AXI_STATUS="$(run_running fm/neighbour-live)"
+  FM_FAKE_RUNS_LIST="  running    fm/neighbour-live aaaaaaa  2026-08-03 01:10"
+  out=$(run_crew_state "$d" task-unbound preserve-missing-task-ref)
+  case "$out" in
+    *"state: unknown"*"source: none"*"task branch identity unavailable"*) ;;
+    *)
+      printf 'task-unbound wrong refusal result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  reset_fakes
+  d=$(new_case disagreeing-task-branch-identity)
+  make_repo_on_branch "$d/wt" fm/neighbour-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/task-disagrees.meta" \
+    "window=fm:fm-task-disagrees" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/some-other-task"
+  FM_FAKE_AXI_STATUS="$(run_running fm/neighbour-live)"
+  FM_FAKE_RUNS_LIST="  running    fm/neighbour-live aaaaaaa  2026-08-03 01:10"
+  out=$(run_crew_state "$d" task-disagrees)
+  case "$out" in
+    *"state: unknown"*"source: none"*"task branch identity disagreement"*) ;;
+    *)
+      printf 'task-disagrees wrong refusal result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  reset_fakes
+  d=$(new_case ambiguous-task-branch-identity)
+  make_repo_on_branch "$d/wt" fm/neighbour-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/task-ambiguous.meta" \
+    "window=fm:fm-task-ambiguous" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/task-ambiguous" \
+    "worktree_git_ref=refs/heads/fm/neighbour-live"
+  FM_FAKE_AXI_STATUS="$(run_running fm/neighbour-live)"
+  FM_FAKE_RUNS_LIST="  running    fm/neighbour-live aaaaaaa  2026-08-03 01:10"
+  out=$(run_crew_state "$d" task-ambiguous)
+  case "$out" in
+    *"state: unknown"*"source: none"*"task branch identity unavailable"*"found 2"*) ;;
+    *)
+      printf 'task-ambiguous wrong refusal result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  reset_fakes
+  d=$(new_case shared-task-branch)
+  make_repo_on_branch "$d/wt-owner" fm/shared-branch
+  make_repo_on_branch "$d/wt-runless" fm/shared-branch
+  make_repo_on_branch "$d/wt-unknown" fm/shared-branch
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/shared-owner.meta" \
+    "window=fm:fm-shared-owner" \
+    "worktree=$d/wt-owner" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/shared-branch"
+  fm_write_meta "$d/state/shared-runless.meta" \
+    "window=fm:fm-shared-runless" \
+    "worktree=$d/wt-runless" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/shared-branch"
+  fm_write_meta "$d/state/shared-unknown.meta" \
+    "window=fm:fm-shared-unknown" \
+    "worktree=$d/wt-unknown" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "worktree_git_ref=refs/heads/fm/shared-branch"
+  printf 'paused: waiting for the owning lane\n' > "$d/state/shared-runless.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/shared-branch)"
+  FM_FAKE_RUNS_LIST="  running    fm/shared-branch aaaaaaa  2026-08-04 01:10"
+
+  FM_FAKE_BUSY=1
+  out=$(run_crew_state "$d" shared-owner)
+  case "$out" in
+    *"state: working"*"source: pane"*"run attribution unavailable"*"shared by 3 live task records"*) ;;
+    *)
+      printf 'shared-owner wrong pane result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  FM_FAKE_BUSY=0
+  out=$(run_crew_state "$d" shared-runless)
+  case "$out" in
+    *"state: paused"*"source: status-log"*"waiting for the owning lane"*"run attribution unavailable"*) ;;
+    *)
+      printf 'shared-runless wrong status result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  out=$(run_crew_state "$d" shared-unknown)
+  case "$out" in
+    *"state: unknown"*"source: none"*"no current-state source available"*"run attribution unavailable"*) ;;
+    *)
+      printf 'shared-unknown wrong third-state result: %s\n' "$out" >&2
+      violations=$((violations + 1))
+      ;;
+  esac
+
+  [ "$violations" -eq 0 ] \
+    || fail "$violations task-branch identity boundary violation(s)"
+  pass "0 task-branch identity boundary violations across eight outcomes"
+}
+
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
 # routine case once more than one crewmate validates the same underlying repo
 # concurrently - they share ONE no-mistakes repo registration), so the helper
@@ -1515,6 +1725,25 @@ test_no_run_busy_pane() {
   pass "no run + busy pane reads working from the pane"
 }
 
+test_direct_pr_ship_does_not_require_no_mistakes_identity() {
+  reset_fakes
+  local d; d=$(new_case direct-pr-busy)
+  make_repo_on_branch "$d/wt" fm/direct-pr-busy
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/direct-pr-busy.meta" \
+    "window=fm:fm-direct-pr-busy" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "mode=direct-PR"
+  FM_FAKE_AXI_STATUS="$(run_running fm/some-neighbour)"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" direct-pr-busy preserve-missing-task-ref)
+  assert_contains "$out" "state: working" "direct-PR ship still reads the busy pane"
+  assert_contains "$out" "source: pane" "direct-PR ship skips no-mistakes attribution"
+  assert_not_contains "$out" "task branch identity" "direct-PR ship does not require a no-mistakes task ref"
+  pass "direct-PR ship skips no-mistakes task-branch identity"
+}
+
 test_no_run_herdr_unknown_uses_backend_capture() {
   command -v jq >/dev/null 2>&1 || { pass "herdr pane fallback skipped without jq"; return; }
   reset_fakes
@@ -1618,7 +1847,7 @@ test_empty_run_lookup_rejects_checks_green_log() {
   pass "empty run lookup rejects a stale checks-green log"
 }
 
-test_skipped_run_lookup_rejects_checks_green_log() {
+test_missing_identity_rejects_checks_green_log() {
   reset_fakes
   local d; d=$(new_case skipped-run-ready-log)
   make_repo_on_branch "$d/wt" fm/feat-detached-ready
@@ -1629,11 +1858,11 @@ test_skipped_run_lookup_rejects_checks_green_log() {
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-detached-ready)"
   FM_FAKE_BUSY=0
   local out; out=$(run_crew_state "$d" feat-detached-ready)
-  assert_contains "$out" "state: unknown" "skipped run lookup with ready log -> unknown"
-  assert_contains "$out" "currentness is unavailable" "skipped lookup names missing currentness"
-  assert_contains "$out" "do not merge" "skipped lookup is merge-safe"
-  assert_not_contains "$out" "state: done" "skipped lookup must not authorize done"
-  pass "skipped run lookup rejects a stale checks-green log"
+  assert_contains "$out" "state: unknown" "missing task identity with ready log -> unknown"
+  assert_contains "$out" "source: none" "missing task identity refuses before status-log attribution"
+  assert_contains "$out" "task branch identity unavailable" "refusal names the missing task identity"
+  assert_not_contains "$out" "state: done" "missing task identity must not authorize done"
+  pass "missing task identity rejects a stale checks-green log"
 }
 
 test_no_run_idle_pane_uses_keyed_log() {
@@ -1792,7 +2021,11 @@ while :; do :; done
 SH
   chmod +x "$d/fakebin/no-mistakes"
   toolbin=$(make_no_timeout_toolbin "$d")
-  fm_write_meta "$d/state/feat-timeout.meta" "window=fm:fm-feat-timeout" "worktree=$d/wt" "kind=ship"
+  fm_write_meta "$d/state/feat-timeout.meta" \
+    "window=fm:fm-feat-timeout" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "worktree_git_ref=refs/heads/fm/feat-timeout"
   FM_FAKE_BUSY=1
   start=$SECONDS
   out=$(FM_FAKE_NM_CALLS="$calls_file" PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout)
@@ -1859,7 +2092,11 @@ test_provably_working_via_runs_list_fallback() {
   local d; d=$(new_case provably-working-crossbranch)
   make_repo_on_branch "$d/wt" fm/feat-provable
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/feat-provable.meta" "window=fm:fm-feat-provable" "worktree=$d/wt" "kind=ship"
+  fm_write_meta "$d/state/feat-provable.meta" \
+    "window=fm:fm-feat-provable" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "worktree_git_ref=refs/heads/fm/feat-provable"
   FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
   FM_FAKE_RUNS_LIST="$(cat <<'EOF'
   running    fm/other-crew aaaaaaa  2026-07-02 22:10
@@ -1876,7 +2113,11 @@ test_not_provably_working_when_stopped() {
   local d; d=$(new_case provably-working-stopped)
   make_repo_on_branch "$d/wt" fm/feat-stopped
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/feat-stopped.meta" "window=fm:fm-feat-stopped" "worktree=$d/wt" "kind=ship"
+  fm_write_meta "$d/state/feat-stopped.meta" \
+    "window=fm:fm-feat-stopped" \
+    "worktree=$d/wt" \
+    "kind=ship" \
+    "worktree_git_ref=refs/heads/fm/feat-stopped"
   # Repo-wide run belongs to someone else, and this branch has no row in the
   # runs list either (it never validated, or genuinely finished/stopped) - the
   # only remaining signal is the pane, which is idle.
@@ -1916,6 +2157,11 @@ if [ "${FM_TEST_FOCUSED:-}" = agent-liveness ]; then
   test_working_agent_displaying_banner_text_is_not_dead
   test_unreadable_agent_probe_remains_unknown
   test_agent_probe_failures_remain_unknown
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = task-branch ]; then
+  test_task_branch_identity_overrides_pooled_worktree_branch
   exit 0
 fi
 
@@ -1961,18 +2207,20 @@ test_terminal_passed_reports_closed_without_merge
 test_terminal_passed_fails_closed_when_pr_state_unavailable
 test_terminal_passed_clamps_invalid_gh_timeouts_and_fails_closed
 test_terminal_failed
+test_task_branch_identity_overrides_pooled_worktree_branch
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_completed_run_without_identity_fails_closed
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane
+test_direct_pr_ship_does_not_require_no_mistakes_identity
 test_no_run_herdr_unknown_uses_backend_capture
 test_no_run_herdr_idle_agent_status_corroborated_by_busy_pane
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle
 test_no_run_idle_pane_uses_log
 test_empty_run_lookup_rejects_checks_green_log
-test_skipped_run_lookup_rejects_checks_green_log
+test_missing_identity_rejects_checks_green_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
 test_no_run_idle_pane_custom_paused_verb

@@ -21,14 +21,32 @@ SH
 
 cat > "$FAKEBIN/no-mistakes" <<'SH'
 #!/usr/bin/env bash
-case "$*" in
-  "axi status") printf '%s\n' "${FM_FAKE_NM_STATUS:-}" ;;
-  "runs --limit 200") printf '%s\n' "${FM_FAKE_NM_RUNS:-}" ;;
-  "axi abort --run "*)
+printf '%s\n' "$*" >> "$FM_FAKE_NM_CALL_LOG"
+case "$1:$2:$3" in
+  "axi:status:--run")
+    id=$4
+    row=$(sqlite3 -separator '|' "$FM_AUTO_REAP_NO_MISTAKES_DB" \
+      "SELECT id, branch, status FROM runs WHERE id='$id'")
+    [ -n "$row" ] || exit 3
+    run_id=${row%%|*}; rest=${row#*|}
+    branch=${rest%%|*}; status=${rest#*|}
+    [ -z "${FM_FAKE_EXACT_BRANCH:-}" ] || branch=$FM_FAKE_EXACT_BRANCH
+    [ -z "${FM_FAKE_EXACT_ID:-}" ] || run_id=$FM_FAKE_EXACT_ID
+    printf 'run:\n  id: "%s"\n  branch: %s\n  status: %s\n' "$run_id" "$branch" "$status"
+    ;;
+  "axi:abort:--run")
+    id=$4
     printf '%s\n' "$*" >> "$FM_FAKE_NM_LOG"
+    sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" "UPDATE runs SET status='cancelled' WHERE id='$id'"
     ;;
   *) exit 2 ;;
 esac
+SH
+
+cat > "$FAKEBIN/agent-liveness" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_AGENT_LOG"
+printf '%s\n' "${FM_FAKE_AGENT_VERDICT:-dead}"
 SH
 
 cat > "$FAKEBIN/fm-teardown.sh" <<'SH'
@@ -59,27 +77,35 @@ fi
 rm -f "$FM_STATE_OVERRIDE/$id.meta"
 printf 'teardown complete for %s\n' "$id"
 SH
-chmod +x "$FAKEBIN/gh-axi" "$FAKEBIN/no-mistakes" "$FAKEBIN/fm-teardown.sh"
+chmod +x "$FAKEBIN/gh-axi" "$FAKEBIN/no-mistakes" "$FAKEBIN/agent-liveness" "$FAKEBIN/fm-teardown.sh"
 
 export FM_AUTO_REAP_TEST_HOOKS=firstmate-auto-reap-tests-v1
 export FM_AUTO_REAP_GH_AXI_BIN="$FAKEBIN/gh-axi"
 export FM_AUTO_REAP_NO_MISTAKES_BIN="$FAKEBIN/no-mistakes"
+export FM_AUTO_REAP_AGENT_LIVENESS_BIN="$FAKEBIN/agent-liveness"
 export FM_AUTO_REAP_TEARDOWN_BIN="$FAKEBIN/fm-teardown.sh"
+export FM_AUTO_REAP_NO_MISTAKES_DB="$TMP/state.sqlite"
 export FM_FAKE_NM_LOG="$TMP/no-mistakes.log"
+export FM_FAKE_NM_CALL_LOG="$TMP/no-mistakes.calls"
+export FM_FAKE_AGENT_LOG="$TMP/agent.log"
 export FM_FAKE_TEARDOWN_LOG="$TMP/teardown.log"
 export FM_HOME="$HOME_DIR"
 export FM_STATE_OVERRIDE="$HOME_DIR/state"
 
 reset_logs() {
   : > "$FM_FAKE_NM_LOG"
+  : > "$FM_FAKE_NM_CALL_LOG"
+  : > "$FM_FAKE_AGENT_LOG"
   : > "$FM_FAKE_TEARDOWN_LOG"
+  rm -f "$FM_AUTO_REAP_NO_MISTAKES_DB"
   FM_FAKE_PR_STATE=merged
-  FM_FAKE_NM_STATUS=
-  FM_FAKE_NM_RUNS=
+  FM_FAKE_AGENT_VERDICT=dead
+  FM_FAKE_EXACT_BRANCH=
+  FM_FAKE_EXACT_ID=
   FM_FAKE_TEARDOWN_STATUS=0
   FM_FAKE_TEARDOWN_ASSERT_ORPHAN=0
   FM_FAKE_TEARDOWN_ASSERT_HERDR=0
-  export FM_FAKE_PR_STATE FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
+  export FM_FAKE_PR_STATE FM_FAKE_AGENT_VERDICT FM_FAKE_EXACT_BRANCH FM_FAKE_EXACT_ID
   export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
 }
 
@@ -88,22 +114,45 @@ make_task() {  # <id> <mode>
   worktree="$TMP/$id"
   fm_git_init_commit "$worktree"
   git -C "$worktree" checkout -qb "fm/$id"
+  git -C "$worktree" remote add no-mistakes "$TMP/no-mistakes-repos/repo-$id.git"
   fm_write_meta "$HOME_DIR/state/$id.meta" \
     "window=fm:$id" "worktree=$worktree" "project=$worktree" \
     "kind=ship" "mode=$mode" "pr=https://github.com/acme/repo/pull/7"
   printf 'done: PR checks green\n' > "$HOME_DIR/state/$id.status"
+  if [ ! -f "$FM_AUTO_REAP_NO_MISTAKES_DB" ]; then
+    sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" <<'SQL'
+CREATE TABLE repos(id TEXT PRIMARY KEY, working_path TEXT NOT NULL UNIQUE);
+CREATE TABLE runs(
+  id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  last_pushed_sha TEXT,
+  created_at INTEGER NOT NULL
+);
+SQL
+  fi
+  sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" \
+    "INSERT INTO repos(id, working_path) VALUES('repo-$id', '$worktree')"
+}
+
+insert_run() {  # <task> <run-id> <branch> <status> [pushed-head] [run-head]
+  local task=$1 run_id=$2 branch=$3 status=$4 pushed=${5:-} head=${6:-}
+  local worktree current
+  worktree="$TMP/$task"
+  current=$(git -C "$worktree" rev-parse HEAD)
+  [ -n "$head" ] || head=$current
+  sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" \
+    "INSERT INTO runs(id, repo_id, branch, status, head_sha, last_pushed_sha, created_at)
+     VALUES('$run_id', 'repo-$task', '$branch', '$status', '$head', NULLIF('$pushed',''), strftime('%s','now'))"
 }
 
 test_merged_task_cancels_exact_run_then_tears_down() {
   local out rc
   reset_logs
   make_task merged-run no-mistakes
-  FM_FAKE_NM_STATUS=$(printf '%s\n' \
-    'run:' \
-    '  id: "01EXACT"' \
-    '  branch: fm/merged-run' \
-    '  status: running')
-  export FM_FAKE_NM_STATUS
+  insert_run merged-run 01EXACT fm/merged-run running "$(git -C "$TMP/merged-run" rev-parse HEAD)"
   out=$("$AUTO_REAP" task merged-run pr-merged 2>&1); rc=$?
   expect_code 0 "$rc" "merged task auto-reap"
   assert_contains "$out" "auto-reaped merged-run" "merged task reports reaping"
@@ -127,24 +176,70 @@ test_open_pr_refuses_without_teardown() {
   pass "unmerged PR retains all task state"
 }
 
-test_cross_branch_active_run_refuses_without_guessing_id() {
+test_exact_status_branch_mismatch_refuses_without_abort() {
   local out rc
   reset_logs
   make_task cross-run no-mistakes
-  FM_FAKE_NM_STATUS=$(printf '%s\n' \
-    'run:' \
-    '  id: "01OTHER"' \
-    '  branch: fm/other' \
-    '  status: running')
-  FM_FAKE_NM_RUNS='running    fm/cross-run abc1234  2026-07-26 12:00'
-  export FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
+  insert_run cross-run 01OWN fm/cross-run running "$(git -C "$TMP/cross-run" rev-parse HEAD)"
+  FM_FAKE_EXACT_BRANCH=fm/other
+  export FM_FAKE_EXACT_BRANCH
   out=$("$AUTO_REAP" task cross-run pr-merged 2>&1); rc=$?
   expect_code 1 "$rc" "cross-branch active run refusal"
-  assert_contains "$out" "exact run ID is unavailable" "cross-branch refusal reason"
+  assert_contains "$out" "exact status did not return run 01OWN on branch fm/cross-run" "cross-branch refusal reason"
   [ ! -s "$FM_FAKE_NM_LOG" ] || fail "cross-branch run was aborted by guess"
   [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "cross-branch task invoked teardown"
   rm -f "$HOME_DIR/state/cross-run.meta" "$HOME_DIR/state/cross-run.status"
-  pass "active cross-branch validation is retained when its exact run ID is unavailable"
+  pass "exact status must return both the task run ID and task branch before abort"
+}
+
+test_unpushed_advanced_head_refuses_cancellation() {
+  local out rc current parent
+  reset_logs
+  make_task unpushed-run no-mistakes
+  printf 'advanced\n' > "$TMP/unpushed-run/advanced.txt"
+  git -C "$TMP/unpushed-run" add advanced.txt
+  git -C "$TMP/unpushed-run" commit -qm advanced
+  current=$(git -C "$TMP/unpushed-run" rev-parse HEAD)
+  parent=$(git -C "$TMP/unpushed-run" rev-parse HEAD^)
+  insert_run unpushed-run 01UNPUSHED fm/unpushed-run running "$parent" "$current"
+  out=$("$AUTO_REAP" task unpushed-run pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "unpushed advanced head cancellation refusal"
+  assert_contains "$out" "is not the run's proved pushed head" "unpushed-head refusal reason"
+  [ ! -s "$FM_FAKE_NM_LOG" ] || fail "unpushed advanced run was aborted"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "unpushed advanced task invoked teardown"
+  rm -f "$HOME_DIR/state/unpushed-run.meta" "$HOME_DIR/state/unpushed-run.status"
+  pass "auto-reap cannot cancel a run whose current head is not the proved pushed head"
+}
+
+test_live_agent_refuses_cancellation() {
+  local out rc
+  reset_logs
+  make_task live-agent no-mistakes
+  insert_run live-agent 01LIVE fm/live-agent running "$(git -C "$TMP/live-agent" rev-parse HEAD)"
+  FM_FAKE_AGENT_VERDICT=alive
+  export FM_FAKE_AGENT_VERDICT
+  out=$("$AUTO_REAP" task live-agent pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "live-agent cancellation refusal"
+  assert_contains "$out" "not provably dead" "live-agent refusal reason"
+  [ ! -s "$FM_FAKE_NM_LOG" ] || fail "live agent run was aborted"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "live agent task invoked teardown"
+  rm -f "$HOME_DIR/state/live-agent.meta" "$HOME_DIR/state/live-agent.status"
+  pass "auto-reap requires affirmative task-agent death before run cancellation"
+}
+
+test_detached_scout_never_looks_up_neighbor_run() {
+  local out rc meta_tmp
+  reset_logs
+  make_task detached-scout no-mistakes
+  git -C "$TMP/detached-scout" checkout -q --detach
+  meta_tmp=$(mktemp "$HOME_DIR/state/.detached-scout.meta.XXXXXX")
+  sed 's/^kind=ship$/kind=scout/' "$HOME_DIR/state/detached-scout.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$HOME_DIR/state/detached-scout.meta"
+  out=$("$AUTO_REAP" task detached-scout scout-done 2>&1); rc=$?
+  expect_code 0 "$rc" "detached scout auto-reap"
+  assert_contains "$out" "auto-reaped detached-scout" "detached scout teardown result"
+  [ ! -s "$FM_FAKE_NM_CALL_LOG" ] || fail "detached scout queried branch-blind no-mistakes state"
+  pass "detached scouts never inherit a neighboring branch run during auto-reap"
 }
 
 test_x_link_and_teardown_refusal_remain_visible() {
@@ -531,7 +626,10 @@ test_local_merge_immediately_auto_reaps() {
 
 test_merged_task_cancels_exact_run_then_tears_down
 test_open_pr_refuses_without_teardown
-test_cross_branch_active_run_refuses_without_guessing_id
+test_exact_status_branch_mismatch_refuses_without_abort
+test_unpushed_advanced_head_refuses_cancellation
+test_live_agent_refuses_cancellation
+test_detached_scout_never_looks_up_neighbor_run
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown

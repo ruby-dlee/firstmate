@@ -706,14 +706,14 @@ test_crew_dispatch_active_rules_are_surfaced() {
   case_dir="$TMP_ROOT/dispatch-active"
   mkdir -p "$case_dir/home/config"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
-  printf '%s\n' '{"rules":[{"when":"fresh news","use":{"harness":"grok"},"why":"current context"},{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}],"default":{"harness":"claude","model":"haiku","effort":"low"}}' > "$case_dir/home/config/crew-dispatch.json"
+  printf '%s\n' '{"rules":[{"when":"fresh news","use":{"harness":"grok"},"why":"current context"},{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"}],"select":"quota-balanced"}],"default":{"harness":"claude","model":"haiku","effort":"low"}}' > "$case_dir/home/config/crew-dispatch.json"
   fakebin=$(make_fake_toolchain "$case_dir")
   add_real_jq "$fakebin"
 
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
 
-  expect=$'CREW_DISPATCH: active config/crew-dispatch.json\n  rule: fresh news -> grok\n  rule: big feature -> quota-balanced[claude/claude-sonnet-5/high, codex/gpt-5.5/high]\n  default: claude/haiku/low'
+  expect=$'CREW_DISPATCH: active config/crew-dispatch.json\n  rule: fresh news -> grok\n  rule: big feature -> quota-balanced[claude/claude-sonnet-5/high, codex/gpt-5.6-sol/xhigh]\n  default: claude/haiku/low'
   [ "$out" = "$expect" ] || fail "active dispatch profile block mismatch"$'\n'"expected: $expect"$'\n'"actual:   $out"
   pass "bootstrap surfaces active crew-dispatch rules and default"
 }
@@ -747,14 +747,14 @@ unsupported codex max effort is flagged^{"rules":[{"when":"big feature","use":{"
 unsupported grok max effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"max"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:max
 unsupported grok xhigh effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"xhigh"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:xhigh
 unsupported opencode effort is flagged^{"rules":[{"when":"opencode work","use":{"harness":"opencode","model":"anthropic/claude-sonnet-4-5","effort":"high"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: opencode:high
-array use with quota-balanced is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
-array use without select is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}]}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+array use with quota-balanced is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+array use without select is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"}]}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
 empty array use is flagged^{"rules":[{"when":"big feature","use":[]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each rule needs at least one use profile
 array profile without harness is flagged^{"rules":[{"when":"big feature","use":[{"model":"gpt-5.5"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each use profile needs harness
 unknown select is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"mystery"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown select: mystery
 array profile unsupported effort is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","effort":"max"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
-quota-balanced account pools are accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
-direct pinned account is accepted^{"rules":[{"when":"delicate task","use":{"harness":"codex","account_pool":"codex-crew","account_profile":"codex-2"}}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+quota-balanced account pools are accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","account_pool":"claude-crew"},{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh","account_pool":"codex-crew"}],"select":"quota-balanced"}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
+direct pinned account is accepted^{"rules":[{"when":"delicate task","use":{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh","account_pool":"codex-crew","account_profile":"codex-2"}}]}^grep^CREW_DISPATCH: active config/crew-dispatch.json
 email-like account pool is flagged^{"rules":[{"when":"anything","use":{"harness":"claude","account_pool":"me@example.com"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_pool
 non-string account profile is flagged^{"rules":[{"when":"anything","use":{"harness":"codex","account_profile":2}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid account_profile
 account pool on unsupported harness is flagged^{"rules":[{"when":"news","use":{"harness":"grok","account_pool":"grok-crew"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - account_pool requires claude or codex harness

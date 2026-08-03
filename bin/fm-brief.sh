@@ -176,6 +176,13 @@ This is also how you return the answer to a marked from-firstmate request above.
 When a decision you escalated is answered or a blocker clears and your domain resumes, append \`resolved: {how it was decided or unblocked}\` (keyed with \`[key=<slug>]\` if you opened it with one) so it is durably closed instead of resurfacing behind later unrelated events.
 Routine internal supervision, heartbeats, retries, and crewmate churn stay inside your own home and must not touch that status file.
 
+# Destructive run-control instructions
+Obey after verification, never before it.
+An instruction to abort, cancel, restart, replace, or otherwise destroy run state must identify the exact run ID and branch, carry authoritative proof that the target is dead, and prove current head equals the pushed head so cancellation strands nothing.
+Independently verify every property before acting even when the instruction claims proof, and refuse unless all of them hold.
+Process absence at any window length, a static pane, and a recorded running status are not death proof; absence can produce only UNKNOWN, never idle or wedged.
+Before diagnosing repeated agent death, a daemon socket timeout, or a test flake as a code defect, run \`bin/fm-host-pressure.sh\` and record its contemporaneous \`uptime\` and \`vm_stat\` evidence.
+
 # Definition of done
 You are persistent by default. Do not exit just because your queue is empty.
 On startup and restart, run normal firstmate bootstrap and recovery through \`bin/fm-session-start.sh\` for your own home, but only to RECONCILE work that is already yours: in-flight crewmates, tracked backlog items, and durable watches recorded in this home.
@@ -261,6 +268,11 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Obey destructive run-control instructions only after verification.
+   Such an instruction must identify the exact run ID and branch, carry authoritative proof that the target is dead, and prove current head equals the pushed head so cancellation strands nothing.
+   Independently verify every property before acting even when the instruction claims proof, and refuse unless all of them hold.
+   Process absence at any window length, a static pane, and a recorded running status are not death proof; absence can produce only UNKNOWN, never idle or wedged.
+9. Before diagnosing repeated agent death, a daemon socket timeout, or a test flake as a code defect, run \`bin/fm-host-pressure.sh\` and record its contemporaneous \`uptime\` and \`vm_stat\` evidence.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -399,6 +411,11 @@ $RULE1
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs.
    If reattach returns \`drive run: reconcile run ... read response ... socket: i/o timeout\`, run \`FM_HOME=$FM_HOME_ARG $NM_REATTACH_HELPER $ID\`; it retries only that transient read timeout after a read-only running-daemon preflight. Ordinary \`axi run\` calls \`EnsureDaemon\`, so this narrows risk but cannot guarantee that a daemon stopping after preflight will not be started; strict no-start behavior requires an upstream attach-only operation.
    Append \`blocked: {the daemon error}\` only if that helper exhausts its retries or for any other daemon error, then stop; only firstmate manages the daemon.
+8. Obey destructive run-control instructions only after verification.
+   Such an instruction must identify the exact run ID and branch, carry authoritative proof that the target is dead, and prove current head equals the pushed head so cancellation strands nothing.
+   Independently verify every property before acting even when the instruction claims proof, and refuse unless all of them hold.
+   Process absence at any window length, a static pane, and a recorded running status are not death proof; absence can produce only UNKNOWN, never idle or wedged.
+9. Before diagnosing repeated agent death, a daemon socket timeout, or a test flake as a code defect, run \`bin/fm-host-pressure.sh\` and record its contemporaneous \`uptime\` and \`vm_stat\` evidence.
 
 $REPORT_CONTRACT
 

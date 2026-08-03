@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Record a PR-ready task: appends pr=<url> and GitHub's pr_head=<sha> to
-# state/<id>.meta when available, then arms the watcher's merge poll by writing
-# state/<id>.check.sh, which prints one line iff the PR is merged (the watcher's
-# check contract: output = wake firstmate, silence = keep sleeping).
+# Record a PR-ready task: appends pr=<url> and GitHub's exact pr_head=<sha> to
+# state/<id>.meta.
+# This command deliberately never creates or replaces state/<id>.check.sh.
+# A merge poll armed future execution and overwrote task-owned custom checks;
+# merge admission is now synchronous in fm-pr-merge.sh.
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 
@@ -23,8 +24,17 @@ META="$STATE/$ID.meta"
 LOOKUP_WT=
 LOOKUP_GENERATION=
 PR_HEAD=
+if [[ "$URL" =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)/pull/([0-9]+)/?$ ]] \
+  && [[ "${BASH_REMATCH[1]}" != *- ]]; then
+  PR_OWNER=${BASH_REMATCH[1]}
+  PR_REPO=${BASH_REMATCH[2]}
+  PR_NUMBER=${BASH_REMATCH[3]}
+else
+  echo "error: PR URL must match https://github.com/<owner>/<repo>/pull/<number> (got: $URL)" >&2
+  exit 1
+fi
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-if [ ! -f "$META" ]; then
+if [ ! -f "$META" ] || [ -L "$META" ]; then
   fm_account_meta_lock_release "$META_LOCK"
   echo "error: no task metadata for $ID" >&2
   exit 1
@@ -52,42 +62,46 @@ if [ -z "$LOOKUP_GENERATION" ]; then
   fi
 fi
 fm_account_meta_lock_release "$META_LOCK"
-if [ -n "$LOOKUP_WT" ] && [ -d "$LOOKUP_WT" ]; then
-  if command -v gh >/dev/null 2>&1; then
-    if REMOTE_HEAD=$(cd "$LOOKUP_WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-      PR_HEAD=$REMOTE_HEAD
-    fi
-  fi
-fi
+REMOTE_PR=$(gh-axi api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER") || {
+  echo "error: could not read PR $URL through gh-axi" >&2
+  exit 1
+}
+PR_HEAD=$(printf '%s\n' "$REMOTE_PR" | awk '
+  /^head:$/ { in_head = 1; next }
+  /^base:$/ { in_head = 0 }
+  in_head && $1 == "sha:" { gsub(/"/, "", $2); print $2; exit }
+')
+case "$PR_HEAD" in
+  ????????????????????????????????????????)
+    case "$PR_HEAD" in *[!0-9a-fA-F]*) echo "error: GitHub returned a non-hex PR head for $URL" >&2; exit 1 ;; esac
+    ;;
+  *) echo "error: GitHub returned no exact 40-character PR head for $URL" >&2; exit 1 ;;
+esac
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 release_meta_lock() {
   fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
 }
 trap release_meta_lock EXIT
-if [ -f "$META" ]; then
+if [ -f "$META" ] && [ ! -L "$META" ]; then
   CURRENT_WT=$(fm_account_meta_value "$META" worktree)
   CURRENT_GENERATION=$(fm_account_meta_value "$META" generation_id)
   if [ "$CURRENT_GENERATION" != "$LOOKUP_GENERATION" ] || [ "$CURRENT_WT" != "$LOOKUP_WT" ]; then
     echo "error: task generation changed while resolving PR state for $ID" >&2
     exit 1
   fi
-  if ! grep -qxF "pr=$URL" "$META"; then
-    echo "pr=$URL" >> "$META"
-  fi
-  if [ -n "$PR_HEAD" ] && [ "$CURRENT_WT" = "$LOOKUP_WT" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
-    echo "pr_head=$PR_HEAD" >> "$META"
+  META_TMP=$(mktemp "$STATE/.$ID.meta.pr.XXXXXX") || exit 1
+  if ! awk -F= '$1 != "pr" && $1 != "pr_head" { print }' "$META" > "$META_TMP" \
+    || ! printf 'pr=%s\npr_head=%s\n' "$URL" "$PR_HEAD" >> "$META_TMP" \
+    || ! fm_account_safe_file_destination "$META" \
+    || ! mv "$META_TMP" "$META"; then
+    rm -f "$META_TMP"
+    echo "error: could not atomically record exact PR state for $ID" >&2
+    exit 1
   fi
 else
   echo "error: task metadata disappeared while resolving PR state for $ID" >&2
   exit 1
 fi
-CHECK_TMP=$(mktemp "$STATE/.$ID.check.XXXXXX") || exit 1
-cat > "$CHECK_TMP" <<EOF
-state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
-[ "\$state" = "MERGED" ] && echo "merged"
-EOF
-chmod +x "$CHECK_TMP"
-mv "$CHECK_TMP" "$STATE/$ID.check.sh"
 fm_account_meta_lock_release "$META_LOCK"
 trap - EXIT
-echo "armed: state/$ID.check.sh polls $URL"
+echo "recorded: $URL head=$PR_HEAD (no merge was armed; custom task check preserved)"

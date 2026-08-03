@@ -21,21 +21,21 @@
 # Keychain access marker.
 # That check happens after pool filtering and before rotation, so a reserved
 # profile cannot become a fallback and an unapproved crewmate profile fails honestly.
-# Codex selection removes that account's quota-axi window cache immediately
-# before every read, sets CODEX_HOME plus the account-isolated XDG_CACHE_HOME,
-# accepts only a fresh result with at least one numeric five_hour or weekly
-# window, and finds the accounts with the highest minimum remaining percentage.
-# Accounts without a freshly readable window do not participate in quota
-# ranking while any readable account remains.
-# If every eligible Codex account lacks a readable window, selection degrades
-# explicitly to rotation across the whole eligible set instead of failing or
-# choosing the stable first directory.
+# Codex quota telemetry was observed to be wrong in both directions, so it never
+# routes or refuses an account.
+# Codex eligibility instead requires codex itself to complete a tiny ephemeral
+# gpt-5.6-sol/xhigh probe under that exact account home.
+# Successful completion is cached for 30 minutes and an unavailable probe for
+# one minute, bounding healthy-account probe cost while keeping failures visible.
+# A missing, timed-out, refused, or malformed probe makes only that account
+# unavailable; if no account has a current positive completion proof, selection
+# fails closed instead of rotating through unproved capacity.
 # Claude quota is not currently distinguishable per config directory because
 # quota-axi cannot non-interactively resolve Claude's config-dir-specific macOS
 # Keychain credential.
 # Claude therefore never treats a missing usage window as account failure and
 # rotates across every eligible account in stable bytewise order.
-# Codex uses the same rotation only to break exact best-score ties.
+# Codex rotates across accounts carrying current positive completion proofs.
 # Rotation is machine-global, persisted under the passwd user's
 # .local/state/firstmate/account-directory/, and serialized by an advisory file
 # lock so concurrent selections spread deterministically instead of racing back
@@ -47,9 +47,12 @@
 # It verifies the installed per-profile hook before printing the chosen home.
 #
 # Credential and profile-registry state is read-only.
-# This script never logs in, imports credentials, or invokes a provider model.
-# Test-only command, root, state-root, passwd-home, Perl, timeout, openat preprocessor,
-# and marker-race hook overrides require FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1.
+# This script never logs in or imports credentials.
+# Its Codex capacity probe deliberately invokes the provider model with a fixed
+# one-token sentinel prompt and never uses pane or run liveness as quota evidence.
+# Test-only command, root, state-root, passwd-home, Perl, timeout, clock, openat
+# preprocessor, and marker-race hook overrides require
+# FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1.
 set -u
 
 TEST_LAB_TOKEN=firstmate-account-directory-test-lab-v1
@@ -144,13 +147,13 @@ account_root() {
   printf '%s\n' "$root"
 }
 
-quota_command() {
-  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_QUOTA_AXI:-}" ]; then
-    printf '%s\n' "$FM_ACCOUNT_DIRECTORY_QUOTA_AXI"
+codex_command() {
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_CODEX:-}" ]; then
+    printf '%s\n' "$FM_ACCOUNT_DIRECTORY_CODEX"
     return 0
   fi
-  command -v quota-axi 2>/dev/null || {
-    echo "error: quota-axi is required for fresh Codex account selection" >&2
+  command -v codex 2>/dev/null || {
+    echo "error: codex is required for per-account completion probes" >&2
     return 1
   }
 }
@@ -248,18 +251,57 @@ rotation_state_root() {
   printf '%s\n' "$root"
 }
 
-quota_timeout_seconds() {
-  local timeout=15
-  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS:-}" ]; then
-    timeout=$FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS
+probe_timeout_seconds() {
+  local timeout=60
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_TIMEOUT_SECONDS:-}" ]; then
+    timeout=$FM_ACCOUNT_DIRECTORY_PROBE_TIMEOUT_SECONDS
   fi
   case "$timeout" in
     ''|*[!0-9]*|0)
-      echo "error: Codex quota timeout must be a positive integer" >&2
+      echo "error: Codex probe timeout must be a positive integer" >&2
       return 1
       ;;
   esac
   printf '%s\n' "$timeout"
+}
+
+probe_cache_ttl_seconds() {
+  local ttl=1800
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_TTL_SECONDS:-}" ]; then
+    ttl=$FM_ACCOUNT_DIRECTORY_PROBE_TTL_SECONDS
+  fi
+  case "$ttl" in
+    ''|*[!0-9]*|0)
+      echo "error: Codex probe cache TTL must be a positive integer" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$ttl"
+}
+
+probe_failure_ttl_seconds() {
+  local ttl=60
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_FAILURE_TTL_SECONDS:-}" ]; then
+    ttl=$FM_ACCOUNT_DIRECTORY_PROBE_FAILURE_TTL_SECONDS
+  fi
+  case "$ttl" in
+    ''|*[!0-9]*|0)
+      echo "error: Codex failed-probe cache TTL must be a positive integer" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$ttl"
+}
+
+probe_now() {
+  if test_lab_enabled && [ -n "${FM_ACCOUNT_DIRECTORY_PROBE_NOW:-}" ]; then
+    case "$FM_ACCOUNT_DIRECTORY_PROBE_NOW" in
+      ''|*[!0-9]*) echo "error: Codex probe test clock must be an integer" >&2; return 1 ;;
+    esac
+    printf '%s\n' "$FM_ACCOUNT_DIRECTORY_PROBE_NOW"
+  else
+    date +%s
+  fi
 }
 
 run_bounded() {
@@ -588,68 +630,149 @@ rotate_account_home() { # <vendor> <pool> <candidate>...
   printf '%s\n' "$selected"
 }
 
-fresh_codex_usage_json() { # <account-home> <quota-command>
-  local account_home=$1 quota_bin=$2 cache_home cache_file environment_name timeout status
-  timeout=$(quota_timeout_seconds) || return 1
-  cache_home=$account_home/.agent-fleet-quota-cache
-  cache_file=$cache_home/quota-axi/quotas.json
-  if { [ -e "$cache_home" ] || [ -L "$cache_home" ]; } \
-    && { [ ! -d "$cache_home" ] || [ -L "$cache_home" ]; }; then
-    log "codex account $account_home skipped: its quota cache root is not a real directory"
-    return 1
-  fi
-  if { [ -e "$cache_home/quota-axi" ] || [ -L "$cache_home/quota-axi" ]; } \
-    && { [ ! -d "$cache_home/quota-axi" ] || [ -L "$cache_home/quota-axi" ]; }; then
-    log "codex account $account_home skipped: its quota-axi cache directory is not a real directory"
-    return 1
-  fi
-  if [ -e "$cache_file" ] || [ -L "$cache_file" ]; then
-    rm -f "$cache_file" || {
-      log "codex account $account_home skipped: could not clear its quota cache for a fresh health read"
+probe_cache_directory() {
+  local state_root probe_root
+  state_root=$(rotation_state_root) || return 1
+  if [ -e "$state_root" ] || [ -L "$state_root" ]; then
+    [ -d "$state_root" ] && [ ! -L "$state_root" ] || {
+      echo "error: account rotation state root is not a real directory: $state_root" >&2
       return 1
     }
+  else
+    mkdir -p "$state_root" || return 1
   fi
-  (
+  chmod 700 "$state_root" 2>/dev/null || return 1
+  probe_root=$state_root/codex-probes
+  if [ ! -e "$probe_root" ] && [ ! -L "$probe_root" ]; then
+    mkdir "$probe_root" 2>/dev/null || true
+  fi
+  [ -d "$probe_root" ] && [ ! -L "$probe_root" ] || {
+    echo "error: Codex probe cache is not a real directory: $probe_root" >&2
+    return 1
+  }
+  chmod 700 "$probe_root" 2>/dev/null || return 1
+  printf '%s\n' "$probe_root"
+}
+
+read_codex_probe_cache() { # <cache-file> <now> <account-identity>
+  local cache=$1 now=$2 expected_identity=$3 version epoch verdict identity ttl age
+  [ -f "$cache" ] && [ ! -L "$cache" ] || return 1
+  IFS=$(printf '\t') read -r version epoch verdict identity < "$cache" || return 1
+  [ "$version" = v2 ] && [ "$identity" = "$expected_identity" ] || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+  case "$verdict" in
+    usable) ttl=$(probe_cache_ttl_seconds) || return 1 ;;
+    unavailable) ttl=$(probe_failure_ttl_seconds) || return 1 ;;
+    *) return 1 ;;
+  esac
+  age=$((now - epoch))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ] || return 1
+  printf '%s\n' "$verdict"
+}
+
+write_codex_probe_cache() { # <cache-file> <epoch> <verdict> <account-identity>
+  local cache=$1 epoch=$2 verdict=$3 identity=$4 tmp
+  case "$verdict" in usable|unavailable) ;; *) return 1 ;; esac
+  case "$identity" in directory:*:*) ;; *) return 1 ;; esac
+  tmp=$(mktemp "${cache}.XXXXXX") || return 1
+  printf 'v2\t%s\t%s\t%s\n' "$epoch" "$verdict" "$identity" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ -L "$cache" ] || { [ -e "$cache" ] && [ ! -f "$cache" ]; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$cache"
+}
+
+probe_codex_account() { # <account-home> <codex-command>
+  local account_home=$1 codex_bin=$2 probe_root account_name cache now cached
+  local timeout output error status verdict tmp_root cache_home environment_name probe_lock account_identity current_identity
+  probe_root=$(probe_cache_directory) || return 1
+  account_name=${account_home##*/}
+  case "$account_name" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  cache=$probe_root/$account_name.status
+  account_identity=$(fm_checkout_physical_path_identity "$account_home" directory) || return 1
+  now=$(probe_now) || return 1
+  if cached=$(read_codex_probe_cache "$cache" "$now" "$account_identity" 2>/dev/null); then
+    log "codex account $account_home completion proof cache=$cached"
+    printf '%s\n' "$cached"
+    return 0
+  fi
+
+  probe_lock=$(fm_account_meta_lock_acquire "$probe_root" "codex-probe-$account_name") || return 1
+  account_identity=$(fm_checkout_physical_path_identity "$account_home" directory) \
+    || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  now=$(probe_now) || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  if cached=$(read_codex_probe_cache "$cache" "$now" "$account_identity" 2>/dev/null); then
+    fm_account_meta_lock_release "$probe_lock" || return 1
+    log "codex account $account_home completion proof cache=$cached"
+    printf '%s\n' "$cached"
+    return 0
+  fi
+
+  timeout=$(probe_timeout_seconds) || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  tmp_root=$(mktemp -d "$probe_root/.probe-$account_name.XXXXXX") \
+    || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  output=$tmp_root/last-message
+  error=$tmp_root/stderr
+  cache_home=$account_home/.agent-fleet-quota-cache
+  mkdir -p "$cache_home" 2>/dev/null || {
+    rm -rf "$tmp_root"
+    write_codex_probe_cache "$cache" "$now" unavailable "$account_identity" || true
+    fm_account_meta_lock_release "$probe_lock" || true
+    printf 'unavailable\n'
+    return 0
+  }
+  if (
     while IFS='=' read -r environment_name _; do
       case "$environment_name" in
-        XDG_*|QUOTA_AXI_*|AGENT_FLEET_*) unset "$environment_name" ;;
+        CODEX_*|OPENAI_*|XDG_*) unset "$environment_name" ;;
       esac
     done < <(/usr/bin/env)
     CODEX_HOME=$account_home
     XDG_CACHE_HOME=$cache_home
     export CODEX_HOME XDG_CACHE_HOME
-    if run_bounded "$timeout" "$quota_bin" --provider codex --json 2>/dev/null; then
-      return 0
-    else
-      status=$?
-    fi
-    if [ "$status" -eq 124 ]; then
-      log "codex account $account_home skipped: quota read timed out after ${timeout}s"
-    fi
-    return "$status"
-  )
-}
-
-codex_score() { # <quota-json>
-  jq -er '
-    [.providers[]?
-      | select(.provider == "codex" and .state.status == "fresh")
-      | (.windows // [])[]?
-      | select((.id == "five_hour" or .id == "weekly")
-          and (.kind // "") != "model"
-          and (.percentRemaining | type) == "number")
-      | .percentRemaining]
-    | if length == 0 then empty else min end
-  ' 2>/dev/null <<EOF
-$1
-EOF
+    run_bounded "$timeout" "$codex_bin" exec \
+      --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check \
+      --sandbox read-only -C "$tmp_root" --model gpt-5.6-sol \
+      -c 'model_reasoning_effort="xhigh"' --output-last-message "$output" \
+      'Return exactly FIRSTMATE_CODEX_ACCOUNT_PROBE_OK without tools.' \
+      >/dev/null 2> "$error"
+  ); then
+    status=0
+  else
+    status=$?
+  fi
+  verdict=unavailable
+  if [ "$status" -eq 0 ] && [ "$(cat "$output" 2>/dev/null || true)" = FIRSTMATE_CODEX_ACCOUNT_PROBE_OK ]; then
+    verdict=usable
+  elif [ "$status" -eq 124 ]; then
+    log "codex account $account_home unavailable: completion probe timed out after ${timeout}s"
+  elif [ "$status" -eq 0 ]; then
+    log "codex account $account_home unavailable: completion probe returned no exact sentinel"
+  else
+    log "codex account $account_home unavailable: codex exec refused or failed (exit $status)"
+  fi
+  current_identity=$(fm_checkout_physical_path_identity "$account_home" directory 2>/dev/null || true)
+  if [ "$current_identity" != "$account_identity" ]; then
+    verdict=unavailable
+    account_identity=$current_identity
+    log "codex account $account_home unavailable: account directory identity changed during completion probe"
+  fi
+  if [ "$verdict" = usable ]; then
+    log "codex account $account_home completed the exact gpt-5.6-sol/xhigh ground-truth probe"
+  fi
+  rm -rf "$tmp_root"
+  write_codex_probe_cache "$cache" "$now" "$verdict" "$account_identity" \
+    || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  fm_account_meta_lock_release "$probe_lock" || return 1
+  printf '%s\n' "$verdict"
 }
 
 select_codex() {
-  local pool quota_bin candidate usage score selected eligible
-  local best_score=''
-  local -a best_homes=()
+  local pool codex_bin candidate verdict selected eligible
   local -a candidates=()
+  local -a usable_homes=()
   pool=$(crew_pool codex) || return 1
   eligible=$(eligible_account_homes codex "$pool") || return 1
   while IFS= read -r candidate; do
@@ -662,38 +785,21 @@ EOF
     echo "error: no eligible account directories remain for codex crew pool '$pool'" >&2
     return 1
   }
-  command -v jq >/dev/null 2>&1 || {
-    echo "error: jq is required for Codex account usage selection" >&2
-    return 1
-  }
-  quota_bin=$(quota_command) || return 1
+  codex_bin=$(codex_command) || return 1
   LC_ALL=C
   export LC_ALL
   for candidate in "${candidates[@]}"; do
-    usage=$(fresh_codex_usage_json "$candidate" "$quota_bin") || usage=
-    score=$(codex_score "$usage") || score=
-    if [ -z "$score" ]; then
-      log "codex account $candidate skipped: no freshly readable usage window"
-      continue
-    fi
-    log "codex account $candidate fresh remaining score=$score"
-    if [ "${#best_homes[@]}" -eq 0 ] || awk -v candidate_score="$score" -v current_score="$best_score" \
-      'BEGIN { exit !(candidate_score > current_score) }'; then
-      best_homes=("$candidate")
-      best_score=$score
-    elif awk -v candidate_score="$score" -v current_score="$best_score" \
-      'BEGIN { exit !(candidate_score == current_score) }'; then
-      best_homes+=("$candidate")
+    verdict=$(probe_codex_account "$candidate" "$codex_bin") || verdict=unavailable
+    if [ "$verdict" = usable ]; then
+      usable_homes+=("$candidate")
     fi
   done
-  if [ "${#best_homes[@]}" -eq 0 ]; then
-    selected=$(rotate_account_home codex "$pool" "${candidates[@]}") || return 1
-    log "CODEX USAGE UNAVAILABLE: no eligible account has a freshly readable usage window; round-robin selection across ${#candidates[@]} eligible $pool accounts chose $selected"
-    printf '%s\n' "$selected"
-    return 0
-  fi
-  selected=$(rotate_account_home codex "$pool" "${best_homes[@]}") || return 1
-  log "selected codex account $selected with fresh remaining score=$best_score; round-robin among ${#best_homes[@]} tied accounts"
+  [ "${#usable_homes[@]}" -gt 0 ] || {
+    echo "error: no Codex account produced a current completion proof; refusing to route from contested quota telemetry, pane state, or run liveness" >&2
+    return 1
+  }
+  selected=$(rotate_account_home codex "$pool" "${usable_homes[@]}") || return 1
+  log "selected codex account $selected from ${#usable_homes[@]} accounts with current completion proof"
   printf '%s\n' "$selected"
 }
 

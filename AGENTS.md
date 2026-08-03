@@ -223,10 +223,10 @@ When candidates carry account pools, the selector chooses the ordered first prof
 Direct selection reads Agent Fleet's profile registry only for pool membership, excludes profiles outside the provider's worker pool, and requires Claude's non-secret per-directory quota-axi Keychain approval marker before any fallback or rotation.
 When no usable Claude account for crewmates survives those checks, selection fails closed and names the reserved or approval-required reasons.
 An explicitly declared `claude-crew-last-resort` pool is consulted only after `claude-crew` has no usable account; manual-only profiles remain excluded, and selector code never guesses account ownership from unreadable identity data.
-Fresh Codex quota is an opportunistic ranking signal.
-Exact best-score Codex ties and an all-unavailable quota result rotate across eligible accounts under a serialized persistent cursor; Claude always uses that rotation because its per-directory quota signal is unreadable.
+Codex account selection ignores contested quota telemetry and admits only account homes with a current exact `gpt-5.6-sol`/`xhigh` `codex exec` completion proof; no positive proof means launch refusal.
+Codex rotates across positively proved accounts under a serialized persistent cursor; Claude uses the same rotation because its per-directory quota signal is unreadable.
 The now-unreachable Agent Fleet pool-summary implementation and inactive new-lease fixtures are legacy code deferred to follow-up task `remove-fleet-routing-deadcode`.
-Quota trouble must never block dispatch.
+Provider-level quota trouble in `fm-dispatch-select.sh` never blocks profile choice, but the later Codex account-capacity proof deliberately fails closed.
 
 Precedence, highest first:
 
@@ -450,7 +450,7 @@ Load `harness-adapters` before spawning or recovering any direct report so trust
 
 ```sh
 bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harness only when no crew-dispatch.json is active
-bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
+bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.6-sol --effort xhigh   # exact admitted Codex profile
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --account-pool codex-crew   # compatibility flag activating direct account-directory selection
 bin/fm-spawn.sh <id> projects/<repo> --harness claude --account-profile claude-2   # compatibility flag activating direct account-directory selection
 bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving ship/scout direct account recovery with fresh selection
@@ -477,6 +477,10 @@ A secondmate spawn adds no backlog row: its identity and scope live in `data/sec
 
 Covered by section 8.
 Steer a crewmate only with short single lines via `FM_HOME=<this-firstmate-home> bin/fm-send.sh` from an active firstmate session unless `FM_HOME` is already set to the active firstmate home; anything long belongs in a file the crewmate can read.
+Any destructive run-control instruction must identify the exact run ID and branch, carry authoritative proof that the target is dead, and prove current head equals the pushed head so cancellation strands nothing.
+The receiving lane independently verifies every property before acting even when the instruction claims proof.
+Process absence at any window length, a static pane, and a recorded running status are not death proof; absence can produce only UNKNOWN, never idle or wedged.
+Before diagnosing repeated agent death, a daemon socket timeout, or a test flake as a code defect, run `bin/fm-host-pressure.sh` and record its contemporaneous `uptime` and `vm_stat` evidence.
 Steer a secondmate the same way.
 Its charter retargets escalation to the main firstmate's status file, so routine internal churn stays inside the secondmate home and only `done`, `blocked`, `needs-decision`, `failed`, a declared `paused:` external wait, or another captain-relevant phase change wake the main firstmate.
 Because `fm-send` to a `kind=secondmate` target marks the request as from-firstmate (section 7 intake), the secondmate's answer comes back on that status/doc path too, not in its chat; read the response there as an ordinary status signal and do not peek its chat for it.
@@ -508,7 +512,9 @@ This do-not-fight rule does not license evidence commits in firstmate's own repo
 **yolo (orthogonal).** With `yolo=off` (default) every approval is the captain's: ask-user findings, PR merges, the local-only merge.
 With `yolo=on`, firstmate makes those calls itself without asking - resolve ask-user findings on your judgment, and run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` / `bin/fm-merge-local.sh` once the work is green/approved - EXCEPT anything destructive, irreversible, or security-sensitive, which still escalates to the captain.
 Never merge a red PR even under yolo.
-`bin/fm-pr-merge.sh` always records `pr=` and records `pr_head=` when available before merging, parses the full `https://github.com/<owner>/<repo>/pull/<n>` URL into `gh-axi pr merge <n> --repo <owner>/<repo>`, and defaults to `--squash` unless an explicit merge method is forwarded after `--`; this holds even on a repo with no PR CI where the "checks green" signal that normally triggers `bin/fm-pr-check.sh` never fires - do not call `gh-axi pr merge` directly for a task's PR, or the recording step can be silently skipped and a later `fm-teardown.sh` has nothing to verify a squash merge against.
+`bin/fm-pr-merge.sh` records `pr=` and the exact `pr_head=`, refuses every scheduled or armed merge mode, synchronously requires the five exact-head properties in `bin/fm-pr-admit.sh`, and sends the admitted head SHA to GitHub's one-shot merge endpoint so a force-push fails atomically.
+It defaults to squash and accepts only an explicit merge method after `--`.
+Do not call a raw GitHub merge command for a task PR because that bypasses exact-head admission and landed-work recording.
 After any merge you perform without asking the captain, post a one-line "merged <full PR URL or local main> after checks passed" FYI so the captain keeps a trail.
 
 ### Validate
@@ -542,13 +548,13 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Before treating a no-mistakes ready signal as merge input, confirm `bin/fm-crew-state.sh <id>` reports `state: done`; a status-log PR URL alone is not currentness evidence, and `state: unknown` or `state: stale` with `do not merge` blocks this stage.
-Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's `pr_head=` when available in the task's meta and arms the watcher's merge poll.
+Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's exact `pr_head=` in task meta, never arms a merge, and preserves any task-owned `state/<id>.check.sh`.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
 (The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
 
 If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` yourself; that instruction is the explicit approval.
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
-The helper defaults to `--squash`, accepts explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge`, and refuses `--repo` or `-R` overrides because the repository is derived from the URL.
+The helper defaults to `--squash`, accepts explicit merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge`, and refuses scheduling, delete-after, admin, `--repo`, and `-R` flags.
 
 ### Ship teardown (only after merge is confirmed)
 
@@ -607,10 +613,10 @@ Whenever at least one task is in flight, keep exactly one live supervision wait 
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when proven benign).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence (including the stale-pane-only terminal-run exception owned by `docs/architecture.md`), and no-change heartbeats.
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence (a complete exact-run process window with any process sample, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence (including the stale-pane-only terminal-run exception owned by `docs/architecture.md`), and no-change heartbeats.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
-Repeated unchanged wedge or permission-stall escalations eventually add `demand-deep-inspection` to the wake reason so they are not mistaken for another routine validation wait.
+Repeated permission-stall escalations eventually add `demand-deep-inspection` to the wake reason so they are not mistaken for another routine wait.
 `docs/architecture.md` ("Event-driven supervision") owns the general classification mechanism and shared classifier library, while `docs/permission-stall-detection.md` owns permission-prompt matching and the macOS timeout heuristic; while `state/.afk` exists the daemon owns triage and the watcher surfaces every wake to it.
 At the start of every wake-handling turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 Session-start recovery is the exception: `bin/fm-session-start.sh` already drained the queue when locked, or deliberately skipped the drain when read-only because another session owns it.
@@ -649,7 +655,9 @@ On wake, in order of cheapness:
 3. `stale:` the crewmate stopped without reporting, a recognized mid-run permission prompt is waiting, or a busy pane exceeded the possible system-dialog no-progress threshold.
    If the reason includes `permission-prompt detected` or `permission/system-dialog suspected`, load `stuck-crewmate-recovery` before taking any ordinary recovery action and follow its permission-blocked branch.
    Otherwise peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
-   If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
+   If the stale reason includes `process-window liveness UNKNOWN`, use its complete process-count and CPU evidence only as an absence of positive evidence; it does not prove death and does not authorize destructive recovery.
+   The attached host-pressure snapshot records load and swap context; it may support a host-overload hypothesis but does not turn absence into a verdict.
+   If the stale reason includes `demand-deep-inspection`, inspect the permission or system-dialog evidence before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
 5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.

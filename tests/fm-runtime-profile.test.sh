@@ -47,7 +47,7 @@ test_matching_runtime_passes() {
 }
 
 test_later_substitution_fails() {
-  local dir file rc
+  local dir file out rc
   dir=$(make_case substituted); file="$dir/codex/sessions/2026/08/02/rollout-substituted.jsonl"
   write_session "$file" session-new
   write_context "$file" 2026-08-02T20:00:00Z "$dir/wt" gpt-5.6-sol xhigh
@@ -55,7 +55,11 @@ test_later_substitution_fails() {
   FM_HOME="$dir/home" "$VERIFY" lane >"$dir/out" 2>"$dir/err"; rc=$?
   expect_code 1 "$rc" "later runtime substitution must fail"
   assert_grep 'model=gpt-5.6-luna effort=medium' "$dir/err" "mismatch did not report the observed runtime"
-  pass "runtime profile detects a post-launch Codex substitution"
+  write_settings "$file" 2026-08-02T20:06:00Z "$dir/wt" gpt-5.6-sol xhigh
+  out=$(FM_HOME="$dir/home" "$VERIFY" lane) || fail "restored exact runtime remained mismatched"
+  assert_contains "$out" 'verified: Codex runtime model=gpt-5.6-sol effort=xhigh' \
+    "restored runtime did not retire the violation"
+  pass "runtime profile rejects and then retires a real post-launch substitution"
 }
 
 test_previous_generation_is_not_runtime_proof() {
@@ -82,7 +86,34 @@ test_missing_runtime_is_unknown() {
   pass "runtime profile never turns an unreadable harness record into success"
 }
 
+test_mismatched_session_skips_large_tail_within_total_budget() {
+  local dir file good rc out
+  dir=$(make_case bounded-mismatch)
+  file="$dir/codex/sessions/2026/08/02/rollout-other.jsonl"
+  write_session "$file" session-other
+  dd if=/dev/zero bs=1048576 count=2 >> "$file" 2>/dev/null
+  FM_CODEX_PROFILE_TOTAL_BYTES=131072 FM_HOME="$dir/home" "$VERIFY" lane >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 2 "$rc" "mismatched session should be rejected from its cheap head"
+  assert_no_grep 'byte budget exceeded' "$dir/err" "mismatched session consumed its large tail budget"
+  rm -f "$file"
+  file="$dir/codex/sessions/2026/08/02/rollout-current-large.jsonl"
+  write_session "$file" session-new
+  dd if=/dev/zero bs=1048576 count=2 >> "$file" 2>/dev/null
+  FM_CODEX_PROFILE_TOTAL_BYTES=131072 FM_HOME="$dir/home" "$VERIFY" lane >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 2 "$rc" "matching session must still respect the total scan budget"
+  assert_grep 'byte budget exceeded' "$dir/err" "total runtime scan budget did not fail closed"
+  rm -f "$file"
+  good="$dir/codex/sessions/2026/08/02/rollout-good.jsonl"
+  write_session "$good" session-new
+  write_context "$good" 2026-08-02T20:00:00Z "$dir/wt" gpt-5.6-sol xhigh
+  out=$(FM_CODEX_PROFILE_TOTAL_BYTES=131072 FM_HOME="$dir/home" "$VERIFY" lane) \
+    || fail "matching bounded runtime was not accepted after mismatch retirement"
+  assert_contains "$out" 'verified: Codex runtime' "bounded runtime repair omitted verification"
+  pass "runtime scanning rejects mismatched sessions before bounded tail reads"
+}
+
 test_matching_runtime_passes
 test_later_substitution_fails
 test_previous_generation_is_not_runtime_proof
 test_missing_runtime_is_unknown
+test_mismatched_session_skips_large_tail_within_total_budget

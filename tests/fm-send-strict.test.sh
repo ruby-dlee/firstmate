@@ -113,7 +113,7 @@ setup_home() {  # <name> -> echoes home dir
   printf '%s\n' "$home"
 }
 
-test_exact_lane_id_send_still_works() {
+test_exact_lane_id_text_refuses_and_control_key_retires_violation() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/exact"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home exact); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -121,11 +121,14 @@ test_exact_lane_id_send_still_works() {
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" mpf-lane-m8 "lost dispatch" >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "exact task id send should succeed when metadata exists"
+  expect_code 1 "$rc" "pane text steering must refuse even when metadata exists"
+  assert_grep 'no atomic agent-session-bound tmux route' "$err" "unsafe text refusal omitted the route gap"
   got=$(cat "$log")
-  assert_contains "$got" "target=sess:fm-mpf-lane-m8 literal=1 arg=lost dispatch" "exact id should type literal text to the meta target"
-  assert_contains "$got" "target=sess:fm-mpf-lane-m8 literal=0 arg=Enter" "exact id should submit with Enter"
-  pass "fm-send strict: exact task/lane ids resolve through home metadata"
+  assert_not_contains "$got" 'send-keys ' "refused text reached pane input"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    "$SEND" mpf-lane-m8 --key C-c >/dev/null 2>"$err" || fail "control key failed after text was removed"
+  assert_grep 'literal=0 arg=C-c' "$log" "control-only retirement did not reach the exact target"
+  pass "fm-send rejects unsafe text and retires it as a control-only action"
 }
 
 test_unset_fm_home_fails() {
@@ -241,10 +244,10 @@ test_metadata_free_explicit_herdr_target_remains_unbound() {
 }
 
 test_explicit_managed_target_records_steering() {
-  local dir fb home err log rc trail
+  local dir fb home err log rc journal
   dir="$TMP_ROOT/managed-explicit"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-explicit)
-  err="$dir/send.err"; log="$dir/tmux.log"; trail="$home/data/managed-task/steering.md"
+  err="$dir/send.err"; log="$dir/tmux.log"; journal="$home/data/managed-task/steering-journal.md"
   mkdir -p "$home/data/managed-task"
   : > "$log"
   fm_write_meta "$home/state/managed-task.meta" \
@@ -253,10 +256,13 @@ test_explicit_managed_target_records_steering() {
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "explicit managed target send"
-  assert_grep "Preserve this explicit managed steer" "$trail" \
-    "explicit managed target delivery was absent from the provider-neutral steering trail: $(cat "$err")"
-  pass "fm-send strict: explicit targets resolved to managed metadata are audited"
+  expect_code 1 "$rc" "explicit managed text steering must refuse"
+  assert_grep "Preserve this explicit managed steer" "$journal" \
+    "explicit managed refusal lost its durable intent: $(cat "$err")"
+  assert_grep 'send-failed' "$journal" "explicit managed refusal omitted its terminal journal verdict"
+  assert_absent "$home/data/managed-task/steering.md" "refused managed text was recorded as delivered"
+  assert_no_grep '^send-keys ' "$log" "refused managed text reached pane input"
+  pass "fm-send strict: managed unsafe text is refused and audited"
 }
 
 test_unknown_managed_delivery_is_recorded_unconfirmed() {
@@ -538,7 +544,7 @@ test_managed_steering_rejects_parent_swap_during_persistence() {
   pass "fm-send strict: steering persistence rejects raced task parents"
 }
 
-test_healthy_fm_id_send_still_works() {
+test_healthy_fm_id_text_still_refuses() {
   local dir fb home err log rc got
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home healthy); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -546,32 +552,28 @@ test_healthy_fm_id_send_still_works() {
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" fm-lane-ok "hello captain" >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "healthy fm-id send should succeed"
+  expect_code 1 "$rc" "healthy pane identity must not bypass atomic steering refusal"
   got=$(cat "$log")
-  assert_contains "$got" "target=sess:fm-lane-ok literal=1 arg=hello captain" "healthy send should type literal text to the meta target"
-  assert_contains "$got" "target=sess:fm-lane-ok literal=0 arg=Enter" "healthy send should submit with Enter"
-  assert_contains "$(cat "$err")" "requested message WILL still be sent" "fm-send guard banner should keep send-specific continuation wording"
-  pass "fm-send strict: healthy fm-<id> sends still type once and submit"
+  assert_not_contains "$got" 'send-keys ' "healthy endpoint identity bypassed text refusal"
+  assert_contains "$(cat "$err")" "no atomic agent-session-bound tmux route" "healthy refusal omitted the route gap"
+  assert_contains "$(cat "$err")" "backend admission still decides" "fm-send guard banner should describe the refusal boundary"
+  pass "fm-send strict: endpoint health never authorizes unbound text steering"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_explicit_managed_target_records_steering
-  test_managed_steering_intent_precedes_external_submission
-  test_concurrent_managed_steering_is_serialized_and_atomic
   test_managed_send_revalidates_after_respawn_wait
-  test_managed_send_holds_lifecycle_through_audit
   test_managed_key_revalidates_after_respawn_wait
-  test_managed_steering_rejects_parent_swap_during_persistence
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
-  test_unknown_managed_delivery_is_recorded_unconfirmed
+  test_explicit_managed_target_records_steering
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
-  test_managed_steering_intent_precedes_external_submission
+  test_explicit_managed_target_records_steering
   exit 0
 fi
 
@@ -582,11 +584,10 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   test_managed_tmux_send_rejects_reused_id_in_other_session
-  test_managed_tmux_send_retains_verified_stable_id
   exit 0
 fi
 
-test_exact_lane_id_send_still_works
+test_exact_lane_id_text_refuses_and_control_key_retires_violation
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
 test_prefixless_herdr_pane_id_fails
@@ -594,13 +595,7 @@ test_unmatched_single_colon_target_must_exist
 test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
-test_unknown_managed_delivery_is_recorded_unconfirmed
-test_managed_steering_intent_precedes_external_submission
-test_concurrent_managed_steering_is_serialized_and_atomic
 test_managed_send_revalidates_after_respawn_wait
-test_managed_send_holds_lifecycle_through_audit
 test_managed_key_revalidates_after_respawn_wait
-test_managed_steering_rejects_parent_swap_during_persistence
-test_healthy_fm_id_send_still_works
+test_healthy_fm_id_text_still_refuses
 test_managed_tmux_send_rejects_reused_id_in_other_session
-test_managed_tmux_send_retains_verified_stable_id

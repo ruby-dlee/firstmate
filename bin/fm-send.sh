@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Send one line of literal text to a crewmate endpoint, then Enter.
+# Send a special key or attempt verified text steering to a crewmate endpoint.
 # Usage: fm-send.sh <target> <text...>
 #   <target> may be an exact task id, a legacy fm-<id> task label resolved
 #   through this home's state/<id>.meta, or an explicit well-formed backend
@@ -10,17 +10,9 @@
 # Key support is backend-specific: tmux/herdr support Escape, Enter, and C-c;
 # Orca currently supports Enter and C-c only, and rejects Escape.
 #
-# Text submission is verified: the line is typed ONCE, then Enter is sent and
-# retried (Enter only, never retyped) until the target backend confirms a
-# submit, and the target is captured once more after delivery.
-# An inconclusive submit or unreadable verification capture exits non-zero.
-# Only a zero exit plus the delivery receipt printed on stdout may be reported
-# as a delivered instruction.
-# Submission dispatches through the target's recorded backend; the tmux adapter
-# shares its composer/submit core with the away-mode daemon via bin/fm-tmux-lib.sh.
-# Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
-# Slash commands, and codex `$...` skill invocations resolved through harness
-# meta, get a longer pre-Enter settle so completion popups do not swallow Enter.
+# Text steering is admitted only through an atomic agent-session-bound backend
+# operation. Current terminal adapters expose pane input or literal native input
+# plus a later submit, so text steering fails closed on every backend.
 #
 # From-firstmate marker: when the resolved target is a task selector whose meta
 # records kind=secondmate, the text is prefixed with the from-firstmate marker
@@ -30,12 +22,6 @@
 # target, and the --key path are never marked - their behavior is unchanged.
 # Successful text steering for a managed account task is also appended to the
 # task-owned data/<id>/steering.md trail for provider-neutral continuation.
-# After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
-# 0 disables) before returning: submit confirmation only proves the text was
-# accepted, but the harness needs a beat to spin up the turn before its busy
-# footer appears, so an immediate peek would otherwise see the stale idle pane.
-# The pause is fm-send-only; the shared submit core (used by the away-mode daemon,
-# which only needs "submitted") does not pay it, and the --key path is unaffected.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,7 +56,7 @@ fi
 # shellcheck source=bin/fm-marker-lib.sh
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 
-FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
+FM_GUARD_CONTINUE_LINE='This is a supervision warning only; backend admission still decides whether the requested action is safe.' "$SCRIPT_DIR/fm-guard.sh" || true
 
 fm_send_id_from_meta() {  # <meta-file>
   local base
@@ -330,70 +316,9 @@ else
       exit 1
     fi
   fi
-  # Slash commands open a completion popup in some TUIs (verified on codex);
-  # submitting too fast selects nothing, so give the popup time to settle before
-  # the (retried) Enter. Codex opens the same kind of popup for a `$<skill>`
-  # invocation, so a `$...` message to a codex target gets the same settle. That
-  # `$` case is scoped to codex on purpose: unlike `/`, a leading `$` commonly
-  # starts ordinary text ("$5/month", "$HOME"), so a universal `$` rule would
-  # needlessly slow plain text to claude/opencode/pi. The target backend's
-  # verified submit retry still backs the settle up either way.
-  case "$*" in
-    /*) settle=1.2 ;;
-    \$*)
-      if [ "$TARGET_HARNESS" = codex ]; then settle=1.2; else settle=0.3; fi
-      ;;
-    *) settle=0.3 ;;
-  esac
-  retries=${FM_SEND_RETRIES:-3}
-  sleep_s=${FM_SEND_SLEEP:-0.4}
-  # Type once, submit, and verify.
-  # Unknown is a hard failure because a caller must never turn an unreadable
-  # delivery into a claim that the crewmate received the instruction.
-  if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"); then
+  if ! fm_backend_send_steering "$TARGET_BACKEND" "$T" "$MESSAGE" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"; then
     [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
-    echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
-    exit 1
-  fi
-  if [ -n "${FM_SEND_TEST_AFTER_SUBMIT_READY:-}" ] && [ -n "${FM_SEND_TEST_AFTER_SUBMIT_PROCEED:-}" ]; then
-    : > "$FM_SEND_TEST_AFTER_SUBMIT_READY"
-    while [ ! -e "$FM_SEND_TEST_AFTER_SUBMIT_PROCEED" ]; do sleep 0.01; done
-  fi
-  case "$verdict" in
-    pending)
-      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event not-submitted >/dev/null 2>&1 || true
-      echo "error: text not submitted to $T (Enter swallowed; text left in composer; tried $RESOLUTION_TRIED)" >&2
-      exit 1
-      ;;
-    send-failed)
-      [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
-      echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
-      exit 1
-      ;;
-    unknown)
-      if [ -n "$MANAGED_STEERING_ID" ]; then
-        record_managed_delivery_event unconfirmed >/dev/null 2>&1 || true
-        if record_unconfirmed_managed_steering "$MESSAGE"; then
-          echo "error: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
-        else
-          echo "error: text delivery to $T could not be confirmed or durably recorded" >&2
-        fi
-      else
-        echo "error: text delivery to $T could not be confirmed; refusing to report it as delivered" >&2
-      fi
-      exit 1
-      ;;
-  esac
-  # Submit confirmation and a readable target are separate facts.
-  # Wait for the harness to start the turn, then require a fresh target read
-  # before recording canonical steering or printing a delivery receipt.
-  [ "${FM_SEND_SETTLE:-1}" = 0 ] || sleep "${FM_SEND_SETTLE:-1}"
-  if ! fm_backend_capture "$TARGET_BACKEND" "$T" 2 "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET" >/dev/null; then
-    if [ -n "$MANAGED_STEERING_ID" ]; then
-      record_managed_delivery_event unconfirmed-after-submit >/dev/null 2>&1 || true
-      record_unconfirmed_managed_steering "$MESSAGE" >/dev/null 2>&1 || true
-    fi
-    echo "error: text was submitted to $T but the required target verification read failed; delivery is unconfirmed" >&2
+    echo "error: text not sent to $T (no atomic agent-session-bound $TARGET_BACKEND route; tried $RESOLUTION_TRIED)" >&2
     exit 1
   fi
   verify_codex_runtime_if_owned || exit 1
@@ -401,16 +326,16 @@ else
     record_managed_delivery_event confirmed >/dev/null 2>&1 || true
     if ! record_managed_steering "$MESSAGE"; then
       if record_pending_managed_steering "$MESSAGE"; then
-        echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
+        echo "warning: text was delivered atomically and recorded as pending because its steering trail could not be appended" >&2
       else
-        echo "warning: text was sent to $T but its managed steering delivery could not be durably recorded" >&2
+        echo "warning: text was delivered atomically but its managed steering delivery could not be durably recorded" >&2
       fi
     fi
     if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
       MANAGED_LIFECYCLE_LOCK=
     else
-      echo "warning: text was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
+      echo "warning: text was delivered atomically but its managed lifecycle lock could not be released cleanly" >&2
     fi
   fi
-  printf 'delivered: text to %s (submit confirmation and target verification read passed)\n' "$T"
+  printf 'delivered: text to %s (atomic agent-session-bound submit)\n' "$T"
 fi

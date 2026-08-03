@@ -79,7 +79,7 @@ The compatibility path injects only into an affirmatively `empty` composer, so b
 Unsupported supervisor backends refuse only on the compatibility path because native reap-wake delivery has no supervisor-pane backend.
 Stalled compatibility delivery writes `state/.subsuper-inject-wedged` and attempts a configured backend-independent active alert after `FM_MAX_DEFER_SECS` instead of silently deferring forever.
 Native tracked delivery has no max-defer guard because a due batch completes the task directly without a pane-dependent defer condition.
-`fm-send.sh` selects a pre-Enter popup-settle for slash commands and for codex `$...` skill invocations using metadata-routed target `harness=` values, then adds its own `FM_SEND_SETTLE` pause after successful text sends so immediate peeks catch the receiving turn starting; the sub-supervisor uses only the shared submit core and does not pay that post-submit pause.
+`fm-send.sh` and the sub-supervisor route text through `fm_backend_send_steering`, which refuses every current pane-backed adapter before literal input because none exposes one atomic agent-session-bound submit.
 
 ## Runtime session backends
 

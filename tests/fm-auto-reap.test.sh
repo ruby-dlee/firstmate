@@ -37,6 +37,18 @@ case "$1:$2:$3" in
   "axi:abort:--run")
     id=$4
     printf '%s\n' "$*" >> "$FM_FAKE_NM_LOG"
+    if [ "${FM_FAKE_ATTEMPT_HEAD_TRANSITION:-0}" = 1 ]; then
+      transition_ref=$(git -C "$FM_FAKE_TRANSITION_WORKTREE" symbolic-ref HEAD)
+      transition_head_lock=$(git -C "$FM_FAKE_TRANSITION_WORKTREE" rev-parse --path-format=absolute --git-path HEAD).lock
+      transition_ref_lock=$(git -C "$FM_FAKE_TRANSITION_WORKTREE" rev-parse --path-format=absolute --git-path "$transition_ref").lock
+      [ ! -f "$transition_head_lock" ] || printf 'head-lock-present\n' >> "$FM_FAKE_TRANSITION_LOG"
+      [ ! -f "$transition_ref_lock" ] || printf 'ref-lock-present\n' >> "$FM_FAKE_TRANSITION_LOG"
+      if git -C "$FM_FAKE_TRANSITION_WORKTREE" commit --allow-empty -qm replacement-during-abort >/dev/null 2>&1; then
+        printf 'advanced\n' >> "$FM_FAKE_TRANSITION_LOG"
+      else
+        printf 'blocked\n' >> "$FM_FAKE_TRANSITION_LOG"
+      fi
+    fi
     sqlite3 "$FM_AUTO_REAP_NO_MISTAKES_DB" "UPDATE runs SET status='cancelled' WHERE id='$id'"
     ;;
   *) exit 2 ;;
@@ -94,6 +106,7 @@ export FM_FAKE_NM_LOG="$TMP/no-mistakes.log"
 export FM_FAKE_NM_CALL_LOG="$TMP/no-mistakes.calls"
 export FM_FAKE_AGENT_LOG="$TMP/agent.log"
 export FM_FAKE_TEARDOWN_LOG="$TMP/teardown.log"
+export FM_FAKE_TRANSITION_LOG="$TMP/transition.log"
 export FM_HOME="$HOME_DIR"
 export FM_STATE_OVERRIDE="$HOME_DIR/state"
 
@@ -102,6 +115,7 @@ reset_logs() {
   : > "$FM_FAKE_NM_CALL_LOG"
   : > "$FM_FAKE_AGENT_LOG"
   : > "$FM_FAKE_TEARDOWN_LOG"
+  : > "$FM_FAKE_TRANSITION_LOG"
   rm -f "$FM_AUTO_REAP_NO_MISTAKES_DB"
   FM_FAKE_PR_STATE=merged
   FM_FAKE_AGENT_VERDICT=dead
@@ -111,9 +125,12 @@ reset_logs() {
   FM_FAKE_TEARDOWN_ASSERT_ORPHAN=0
   FM_FAKE_TEARDOWN_ASSERT_HERDR=0
   FM_FAKE_TEARDOWN_ASSERT_LOCK=0
+  FM_FAKE_ATTEMPT_HEAD_TRANSITION=0
+  FM_FAKE_TRANSITION_WORKTREE=
   export FM_FAKE_PR_STATE FM_FAKE_AGENT_VERDICT FM_FAKE_EXACT_BRANCH FM_FAKE_EXACT_ID
   export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
   export FM_FAKE_TEARDOWN_ASSERT_LOCK
+  export FM_FAKE_ATTEMPT_HEAD_TRANSITION FM_FAKE_TRANSITION_WORKTREE
 }
 
 make_task() {  # <id> <mode>
@@ -169,6 +186,33 @@ test_merged_task_cancels_exact_run_then_tears_down() {
   assert_contains "$(cat "$FM_FAKE_NM_LOG")" "axi abort --run 01EXACT" "exact no-mistakes run canceled"
   assert_contains "$(cat "$FM_FAKE_TEARDOWN_LOG")" "merged-run" "ordinary teardown invoked"
   pass "merged terminal task keeps lifecycle custody through cancellation and teardown"
+}
+
+test_run_head_transition_is_blocked_during_abort() {
+  local out rc before after
+  reset_logs
+  make_task transition-race no-mistakes
+  before=$(git -C "$TMP/transition-race" rev-parse HEAD)
+  insert_run transition-race 01LOCKED fm/transition-race running "$before"
+  FM_FAKE_ATTEMPT_HEAD_TRANSITION=1
+  FM_FAKE_TRANSITION_WORKTREE="$TMP/transition-race"
+  export FM_FAKE_ATTEMPT_HEAD_TRANSITION FM_FAKE_TRANSITION_WORKTREE
+  out=$("$AUTO_REAP" task transition-race pr-merged 2>&1); rc=$?
+  expect_code 0 "$rc" "transition-locked auto-reap"
+  assert_grep 'head-lock-present' "$FM_FAKE_TRANSITION_LOG" \
+    "worktree HEAD lock was absent during abort custody: $(cat "$FM_FAKE_TRANSITION_LOG")"
+  assert_grep 'ref-lock-present' "$FM_FAKE_TRANSITION_LOG" \
+    "branch ref lock was absent during abort custody: $(cat "$FM_FAKE_TRANSITION_LOG")"
+  assert_grep 'blocked' "$FM_FAKE_TRANSITION_LOG" \
+    "run head advanced during exact abort custody: $(cat "$FM_FAKE_TRANSITION_LOG")"
+  after=$(git -C "$TMP/transition-race" rev-parse HEAD)
+  [ "$after" = "$before" ] || fail "blocked replacement changed the exact run head"
+  git -C "$TMP/transition-race" commit --allow-empty -qm replacement-after-abort \
+    || fail "run transition lock was not retired after cancellation"
+  [ "$(git -C "$TMP/transition-race" rev-parse HEAD)" != "$before" ] \
+    || fail "replacement transition remained blocked after custody retired"
+  assert_contains "$out" "auto-reaped transition-race" "transition-locked reaping did not complete"
+  pass "auto-reap serializes the real Git head transition through exact abort"
 }
 
 test_open_pr_refuses_without_teardown() {
@@ -635,6 +679,7 @@ test_local_merge_immediately_auto_reaps() {
 }
 
 test_merged_task_cancels_exact_run_then_tears_down
+test_run_head_transition_is_blocked_during_abort
 test_open_pr_refuses_without_teardown
 test_exact_status_branch_mismatch_refuses_without_abort
 test_unpushed_advanced_head_refuses_cancellation

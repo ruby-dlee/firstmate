@@ -583,6 +583,17 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   esac
 }
 
+fm_backend_send_steering() {  # <backend> <target> <text> [expected-label] [recorded-scoped-target]
+  local backend=$1
+  case "$backend" in
+    tmux|herdr|zellij|orca|cmux)
+      echo "error: backend '$backend' has no atomic agent-session-bound text steering operation" >&2
+      return 1
+      ;;
+    *) echo "error: no steering implementation for backend '$backend'" >&2; return 1 ;;
+  esac
+}
+
 # fm_backend_kill: remove the task's session endpoint (best-effort; a
 # nonexistent/already-gone target is not an error - callers already swallow
 # failures here exactly as the inline `tmux kill-window ... || true` did).

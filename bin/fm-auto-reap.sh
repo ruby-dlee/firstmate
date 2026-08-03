@@ -24,6 +24,10 @@ AUTO_REAP_NO_MISTAKES_DB=${FM_AUTO_REAP_NO_MISTAKES_DB:-$HOME/.no-mistakes/state
 AUTO_REAP_TASK_LOCK=
 AUTO_REAP_EXPECTED_GENERATION=
 AUTO_REAP_EXPECTED_HEAD=
+AUTO_REAP_RUN_HEAD_LOCK=
+AUTO_REAP_RUN_REF_LOCK=
+AUTO_REAP_RUN_LOCK_TOKEN=
+AUTO_REAP_LOCK_OWNER_PID=${BASHPID:-$$}
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
@@ -105,11 +109,63 @@ log_result() {
 }
 
 release_auto_reap_task_lock() {
+  [ "${BASHPID:-$$}" = "$AUTO_REAP_LOCK_OWNER_PID" ] || return 0
   [ -z "$AUTO_REAP_TASK_LOCK" ] \
     || fm_account_lifecycle_lock_release "$AUTO_REAP_TASK_LOCK" >/dev/null 2>&1 || true
   AUTO_REAP_TASK_LOCK=
 }
-trap release_auto_reap_task_lock EXIT
+
+release_auto_reap_run_transition_locks() {
+  local lock
+  [ "${BASHPID:-$$}" = "$AUTO_REAP_LOCK_OWNER_PID" ] || return 0
+  for lock in "$AUTO_REAP_RUN_REF_LOCK" "$AUTO_REAP_RUN_HEAD_LOCK"; do
+    [ -n "$lock" ] || continue
+    [ -f "$lock" ] && [ ! -L "$lock" ] || continue
+    [ "$(cat "$lock" 2>/dev/null)" = "$AUTO_REAP_RUN_LOCK_TOKEN" ] || continue
+    rm -f "$lock" 2>/dev/null || true
+  done
+  AUTO_REAP_RUN_HEAD_LOCK=
+  AUTO_REAP_RUN_REF_LOCK=
+  AUTO_REAP_RUN_LOCK_TOKEN=
+}
+
+cleanup_auto_reap_locks() {
+  release_auto_reap_run_transition_locks
+  release_auto_reap_task_lock
+}
+trap cleanup_auto_reap_locks EXIT
+
+acquire_auto_reap_run_transition_locks() {  # <worktree> <expected-branch>
+  local worktree=$1 expected_branch=$2 ref head_path ref_path head_parent ref_parent token
+  ref=$(git -C "$worktree" symbolic-ref --quiet HEAD 2>/dev/null) || return 1
+  [ "$ref" = "refs/heads/$expected_branch" ] || return 1
+  head_path=$(git -C "$worktree" rev-parse --path-format=absolute --git-path HEAD 2>/dev/null) || return 1
+  ref_path=$(git -C "$worktree" rev-parse --path-format=absolute --git-path "$ref" 2>/dev/null) || return 1
+  case "$head_path:$ref_path" in /*:/*) ;; *) return 1 ;; esac
+  head_parent=$(cd "$(dirname "$head_path")" 2>/dev/null && pwd -P) || return 1
+  ref_parent=$(cd "$(dirname "$ref_path")" 2>/dev/null && pwd -P) || return 1
+  [ "$head_path" = "$head_parent/${head_path##*/}" ] || return 1
+  [ "$ref_path" = "$ref_parent/${ref_path##*/}" ] || return 1
+  AUTO_REAP_RUN_HEAD_LOCK="$head_path.lock"
+  AUTO_REAP_RUN_REF_LOCK="$ref_path.lock"
+  [ ! -e "$AUTO_REAP_RUN_HEAD_LOCK" ] && [ ! -L "$AUTO_REAP_RUN_HEAD_LOCK" ] || return 1
+  [ ! -e "$AUTO_REAP_RUN_REF_LOCK" ] && [ ! -L "$AUTO_REAP_RUN_REF_LOCK" ] || return 1
+  token=$(printf '%s\n%s\n%s\n%s\n' "$AUTO_REAP_ID" "$AUTO_REAP_EXPECTED_GENERATION" "$AUTO_REAP_EXPECTED_HEAD" "${BASHPID:-$$}" \
+    | git hash-object --stdin 2>/dev/null) || return 1
+  AUTO_REAP_RUN_LOCK_TOKEN=$token
+  if ! (umask 077; set -C; printf '%s\n' "$token" > "$AUTO_REAP_RUN_HEAD_LOCK") 2>/dev/null; then
+    AUTO_REAP_RUN_HEAD_LOCK=
+    AUTO_REAP_RUN_REF_LOCK=
+    AUTO_REAP_RUN_LOCK_TOKEN=
+    return 1
+  fi
+  if ! (umask 077; set -C; printf '%s\n' "$token" > "$AUTO_REAP_RUN_REF_LOCK") 2>/dev/null; then
+    release_auto_reap_run_transition_locks
+    return 1
+  fi
+  [ "$(git -C "$worktree" symbolic-ref --quiet HEAD 2>/dev/null)" = "$ref" ] \
+    && [ "$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null)" = "$AUTO_REAP_EXPECTED_HEAD" ]
+}
 
 verify_task_custody() {  # <meta>
   local meta=$1 worktree current
@@ -337,6 +393,10 @@ reap_no_mistakes_run() {  # <meta>
   load_active_run_proof "$meta" || return 1
   [ "$ACTIVE_RUN_COUNT" -eq 1 ] || return 0
   run_id=$ACTIVE_RUN_ID
+  acquire_auto_reap_run_transition_locks "$worktree" "$branch" || {
+    refuse "could not serialize exact run head transitions for $run_id"
+    return 1
+  }
   # Re-read every proof immediately before the destructive call. The proof is
   # conjunctive: exact run ID and branch, exact current/run head, an equal
   # recorded pushed head, and a confidently dead task agent.
@@ -418,7 +478,11 @@ reap_task() {  # <task> <trigger>
     *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-no-mistakes}" ;;
   esac
   verify_task_custody "$meta" || refuse "task generation or head changed before destructive custody"
-  reap_no_mistakes_run "$meta" || return 1
+  if ! reap_no_mistakes_run "$meta"; then
+    release_auto_reap_run_transition_locks
+    return 1
+  fi
+  release_auto_reap_run_transition_locks
   verify_task_custody "$meta" || refuse "task generation or head changed before teardown"
   if run_teardown "$id"; then status=0; else status=$?; fi
   release_auto_reap_task_lock

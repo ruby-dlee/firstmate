@@ -30,7 +30,7 @@ Before any future eligible respawn may mutate repo or worktree state, firstmate 
 The authority gate currently fails closed before repo registration, worktree creation, or terminal creation.
 
 Watching and attaching: Orca owns both the worktree and the terminal for its tasks, so there is nothing to attach to outside the Orca app itself - open the app and find the terminal for the task (recorded as `terminal=<handle>` in the task's meta, with `window=fm-<id>` as the shared firstmate alias).
-You do not need to open the app for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's terminal without opening Orca, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it unless `FM_HOME` is already set to the active firstmate home (the stable `fm-<id>` alias also works; Enter and Ctrl-C are supported; Escape is not).
+You do not need to open the app for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's terminal without opening Orca, while canonical text steering currently refuses because Orca has no atomic agent-session-bound submit; special-key support remains backend-specific.
 
 Do not manufacture pre-cutover metadata or spawn a trivial Orca task for an end-to-end check.
 Use the focused fake-Orca suites below, or verify the recorded fields and terminal only while performing an actual eligible recovery.
@@ -81,7 +81,7 @@ The disabled legacy respawn design is:
 Operation routing:
 
 - `fm-peek.sh` captures with `orca terminal read`.
-- `fm-send.sh` types text with `orca terminal send --text ...`, submits with Enter, and verifies the composer row cleared before returning; when Orca reports a limited page, the verifier follows `oldestCursor` and preserves the current tail so older text cannot hide still-pending composer input.
+- The Orca adapter retains its historical split literal-plus-Enter verifier for compatibility tests, but canonical `fm-send.sh` refuses it because it is not atomic or bound to an expected agent session.
   A slash-command popup that closes by filling an argument-hint placeholder still reads as pending, so the retry loop sends the required second Enter rather than treating the first Enter as a submission.
   The bordered row is classified through the shared composer classifier; a bare shell prompt has no genuine composer row and reads `unknown`, not confirmed empty.
 - `fm-send.sh --key Enter` and `--key C-c` are supported.

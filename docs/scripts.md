@@ -63,8 +63,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, complete native tasks or inject compatibility digests |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crewmate                            |
 | `fm-no-mistakes-reattach.sh` | Retry one home-scoped existing run after its transient reconciliation timeout    |
-| `fm-nm-command-supervisor.sh` | Own one configured command's PID, process group, output, and terminal status   |
-| `fm-nm-step-liveness.sh` | Verify a configured command's supervised process identity                           |
+| `fm-nm-step-liveness.sh` | Prove whether a no-mistakes step's own processes are alive, stalled, or dead         |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
@@ -96,8 +95,6 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
 | `fm-session-lock-lib.sh` | Shared session-lock format, holder liveness, and home-bound supervisor route proof    |
 | `fm-lint.sh`             | Single owner of the shell-lint definition that CI and the no-mistakes gate both run  |
-| `fm-gate-lint.sh`        | Run the complete configured no-mistakes lint command                                |
-| `fm-gate-test.sh`        | Run the complete configured no-mistakes test command                                |
 | `fm-install-shellcheck.sh` | Install CI's pinned, checksum-verified ShellCheck build                            |
 | `fm-x-lib.sh`            | Shared X-mode config, relay, and reply-threading helpers                             |
 | `fm-x-poll.sh`           | One bounded X relay poll: stash pending mentions, print `x-mention <request_id>`     |

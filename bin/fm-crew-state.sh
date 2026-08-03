@@ -22,9 +22,8 @@
 #   2. Matching no-mistakes run for this crewmate's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
 #      The run-step is AUTHORITATIVE for active, parked, and failed states:
-#      running/fixing -> working only when a quiet configured command has exact
-#      supervised identity, ci -> working, awaiting_approval/fix_review -> parked
-#      (with gate findings), and failed/cancelled -> failed. A PR-ready
+#      running/fixing -> working, ci -> working, awaiting_approval/fix_review ->
+#      parked (with gate findings), and failed/cancelled -> failed. A PR-ready
 #      passed/checks-passed claim becomes done only after GitHub resolves the
 #      rendered run head to one full remote commit, that identity exactly matches
 #      the live PR head, and a completed snapshot is still the newest branch run.
@@ -532,22 +531,19 @@ nm_active_step_name() {
   strip_quotes "$(trim "${row%%,*}")"
 }
 
-# One-line liveness verdict for the active configured command, or empty when the
-# bounded probe cannot answer. The supervisor's recorded process identity is the
-# only positive proof; cwd presence without it remains unknown.
+# One-line liveness verdict for the active step's own processes, or empty when it
+# cannot be established. Presence-only (--sample 0) so this stays a ~0.2s read on
+# the heartbeat path; presence alone separates dead from slow, which is the whole
+# distinction firstmate got wrong by hand.
 nm_step_liveness() {
-  local run_id step out probe
+  local run_id out
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || return 0
-  step=$(nm_active_step_name)
-  [ -n "$step" ] || return 0
-  probe=${FM_NM_STEP_LIVENESS_BIN:-$SCRIPT_DIR/fm-nm-step-liveness.sh}
-  [ -x "$probe" ] || return 0
+  [ -x "$SCRIPT_DIR/fm-nm-step-liveness.sh" ] || return 0
   case "$HAVE_TIMEOUT" in
-    timeout)  out=$(timeout "$NM_TIMEOUT" "$probe" "$run_id" --step "$step" --sample 0 2>/dev/null) || true ;;
-    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$probe" "$run_id" --step "$step" --sample 0 2>/dev/null) || true ;;
-    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" "$probe" "$run_id" --step "$step" --sample 0 2>/dev/null) || true ;;
-    *)        return 0 ;;
+    timeout)  out=$(timeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
+    *)        out=$("$SCRIPT_DIR/fm-nm-step-liveness.sh" "$run_id" --sample 0 2>/dev/null) || true ;;
   esac
   [ -n "$out" ] || return 0
   # Compact the probe's own line to `<verdict> (<n> procs) on <unit> (<age>)`.
@@ -556,7 +552,7 @@ nm_step_liveness() {
   # line is the read firstmate actually makes. Omitting them would leave the
   # follow-up question ("alive, but stuck on the same script for three hours?")
   # needing a second command on every heartbeat.
-  local verdict procs doing identity reason
+  local verdict procs doing
   verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
   procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
   [ -n "$verdict" ] || return 0
@@ -565,15 +561,9 @@ nm_step_liveness() {
   # a command line whose shape varies by whatever the step happens to be running.
   doing=${out##*doing: }
   [ "$doing" = "$out" ] && doing=""
-  identity=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*[0-9]*[[:space:]]*·[[:space:]]*\(supervised pid [^·]*\).*/\1/p' | sed 's/[[:space:]]*$//')
   local line="$verdict"
   [ -n "$procs" ] && line="$line ($procs procs)"
-  [ "$verdict" = alive ] && [ -n "$identity" ] && line="$line $identity"
   [ -n "$doing" ] && line="$line on $doing"
-  if [ "$verdict" != alive ]; then
-    reason=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*[0-9]*[[:space:]]*·[[:space:]]*//p')
-    [ -n "$reason" ] && line="$line: $reason"
-  fi
   printf '%s' "$line"
 }
 
@@ -754,20 +744,19 @@ if [ "$HAVE_RUN" = 1 ]; then
     verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
   fi
 
+  # A quiet working step is the exact reading that made firstmate abort two
+  # healthy runs on 2026-08-02, so answer "dead or just slow?" here instead of
+  # leaving it to a hand check that gets it wrong. The verdict is APPENDED as an
+  # observation and never overrides RUN_STATE: a step momentarily between
+  # processes would otherwise be misreported as dead, which is the very failure
+  # mode this exists to end. The ci step is excluded because its monitoring runs
+  # inside the daemon with no worktree process at all, so `dead` there is
+  # meaningless rather than informative.
   if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] && nm_step_is_quiet; then
     ACTIVE_STEP=$(nm_active_step_name)
     if [ -n "$ACTIVE_STEP" ] && [ "$ACTIVE_STEP" != ci ]; then
       LIVENESS=$(nm_step_liveness)
-      if [ -n "$LIVENESS" ]; then
-        RUN_DETAIL="$RUN_DETAIL${SEP}$ACTIVE_STEP $LIVENESS"
-        case "$LIVENESS" in
-          alive*) ;;
-          *) RUN_STATE=unknown ;;
-        esac
-      else
-        RUN_STATE=unknown
-        RUN_DETAIL="$RUN_DETAIL${SEP}$ACTIVE_STEP liveness unknown (bounded probe unavailable)"
-      fi
+      [ -n "$LIVENESS" ] && RUN_DETAIL="$RUN_DETAIL${SEP}$ACTIVE_STEP $LIVENESS"
     fi
   fi
 

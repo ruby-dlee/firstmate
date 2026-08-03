@@ -18,7 +18,6 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LINT="$ROOT/bin/fm-lint.sh"
-GATE_LINT="$ROOT/bin/fm-gate-lint.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 NM="$ROOT/.no-mistakes.yaml"
 INSTALLER="$ROOT/bin/fm-install-shellcheck.sh"
@@ -58,9 +57,7 @@ test_ci_invokes_the_owner() {
 }
 
 test_nomistakes_invokes_the_owner() {
-  grep -Fqx "  lint: 'exec bin/fm-nm-command-supervisor.sh lint bin/fm-gate-lint.sh'" "$NM" || fail "no-mistakes commands.lint must exec the supervised gate lint"
-  assert_grep 'bin/fm-lint.sh' "$GATE_LINT" "gate lint must invoke the shell owner"
-  assert_grep 'uv run --directory tools/agent-fleet --locked ruff check .' "$GATE_LINT" "gate lint must invoke locked Agent Fleet lint"
+  grep -Fqx "  lint: 'bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check .'" "$NM" || fail "no-mistakes commands.lint must invoke the shell owner and locked Agent Fleet lint"
   pass "no-mistakes pre-push lint calls the shell owner and locked Agent Fleet lint"
 }
 

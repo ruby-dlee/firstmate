@@ -350,24 +350,39 @@ parse_config() {
 }
 
 treehouse_worktree_paths() {
-  local roots=()
-  if [ "$MANAGED_TREEHOUSE_ROOT_INVALID" = 1 ]; then
+  local scope=${1:-all} roots=()
+  case "$scope" in
+    all|managed|legacy) ;;
+    *)
+      echo "checkout-refresh: skipped: unknown Treehouse coverage scope '$scope'" >&2
+      return 2
+      ;;
+  esac
+  if [ "$scope" != legacy ] && [ "$MANAGED_TREEHOUSE_ROOT_INVALID" = 1 ]; then
     echo "checkout-refresh: skipped: incomplete Treehouse coverage because the managed home root is unsafe or unreadable: $MANAGED_TREEHOUSE_ROOT_RAW" >&2
     return 1
   fi
-  if [ "$TREEHOUSE_ROOT_INVALID" = 1 ]; then
+  if [ "$scope" = all ] && [ "$TREEHOUSE_ROOT_INVALID" = 1 ]; then
     echo "checkout-refresh: skipped: incomplete Treehouse coverage because the configured root is unsafe or unreadable: $TREEHOUSE_ROOT_RAW" >&2
     return 1
   fi
-  if [ -e "$MANAGED_TREEHOUSE_ROOT" ] || [ -L "$MANAGED_TREEHOUSE_ROOT" ]; then
+  if [ "$scope" = legacy ] && [ "$TREEHOUSE_ROOT_INVALID" = 1 ]; then
+    echo "checkout-refresh: ignored foreign Treehouse root because it is unsafe or unreadable: $TREEHOUSE_ROOT_RAW" >&2
+    return 0
+  fi
+  if [ "$scope" != legacy ] && { [ -e "$MANAGED_TREEHOUSE_ROOT" ] || [ -L "$MANAGED_TREEHOUSE_ROOT" ]; }; then
     [ -d "$MANAGED_TREEHOUSE_ROOT" ] || {
       echo "checkout-refresh: skipped: incomplete Treehouse coverage because the managed home root is not a directory: $MANAGED_TREEHOUSE_ROOT" >&2
       return 1
     }
     roots+=("$MANAGED_TREEHOUSE_ROOT")
   fi
-  if [ -e "$TREEHOUSE_ROOT" ] || [ -L "$TREEHOUSE_ROOT" ]; then
+  if [ "$scope" != managed ] && { [ -e "$TREEHOUSE_ROOT" ] || [ -L "$TREEHOUSE_ROOT" ]; }; then
     [ -d "$TREEHOUSE_ROOT" ] || {
+      if [ "$scope" = legacy ]; then
+        echo "checkout-refresh: ignored foreign Treehouse root because it is not a directory: $TREEHOUSE_ROOT" >&2
+        return 0
+      fi
       echo "checkout-refresh: skipped: incomplete Treehouse coverage because the root is not a directory: $TREEHOUSE_ROOT" >&2
       return 1
     }
@@ -378,13 +393,31 @@ treehouse_worktree_paths() {
     echo "checkout-refresh: skipped: incomplete Treehouse coverage because python3 is unavailable" >&2
     return 1
   }
-  python3 - "${roots[@]}" <<'PY'
+  python3 - "$scope" "$FM_HOME_CANONICAL" "$MANAGED_TREEHOUSE_ROOT" "$TREEHOUSE_ROOT" "${roots[@]}" <<'PY'
 import json
 import os
 import stat
 import sys
 
 failed = False
+scope, owning_home, managed_root, legacy_root, *roots = sys.argv[1:]
+strict = scope != "legacy"
+
+
+def owner_for(root):
+    if root == managed_root:
+        return owning_home
+    return f"unknown (legacy shared Treehouse root {legacy_root})"
+
+
+def report_failure(path, owner, error):
+    global failed
+    failed = True
+    if strict:
+        prefix = "checkout-refresh: skipped: incomplete Treehouse coverage"
+    else:
+        prefix = "checkout-refresh: ignored foreign Treehouse state"
+    print(f"{prefix} at {path} for owning home {owner}: {error}", file=sys.stderr)
 
 
 def directory_entries(path, label):
@@ -402,17 +435,16 @@ def directory_entries(path, label):
 
 state_paths = []
 pool_entries = []
-for root in sys.argv[1:]:
+for root in roots:
+    owner = owner_for(root)
     try:
-        pool_entries.extend(directory_entries(root, "Treehouse root"))
-    except OSError as error:
-        failed = True
-        print(
-            f"checkout-refresh: skipped: incomplete Treehouse coverage at {root}: {error}",
-            file=sys.stderr,
+        pool_entries.extend(
+            (entry, owner) for entry in directory_entries(root, "Treehouse root")
         )
+    except OSError as error:
+        report_failure(root, owner, error)
 
-for pool_entry in pool_entries:
+for pool_entry, owner in pool_entries:
     try:
         metadata = pool_entry.stat(follow_symlinks=False)
         if stat.S_ISLNK(metadata.st_mode):
@@ -431,15 +463,13 @@ for pool_entry in pool_entries:
         states = [entry for entry in entries if entry.name == "treehouse-state.json"]
         if len(states) != 1:
             raise OSError("Treehouse pool must contain exactly one treehouse-state.json")
-        state_paths.append(os.path.join(pool_entry.path, "treehouse-state.json"))
-    except OSError as error:
-        failed = True
-        print(
-            f"checkout-refresh: skipped: incomplete Treehouse coverage at {pool_entry.path}: {error}",
-            file=sys.stderr,
+        state_paths.append(
+            (os.path.join(pool_entry.path, "treehouse-state.json"), owner)
         )
+    except OSError as error:
+        report_failure(pool_entry.path, owner, error)
 
-for state_path in state_paths:
+for state_path, owner in state_paths:
     try:
         metadata = os.lstat(state_path)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
@@ -452,8 +482,10 @@ for state_path in state_paths:
         if not isinstance(state, dict):
             raise TypeError("root must be an object")
         if "worktrees" not in state:
-            raise TypeError("worktrees is required")
+            raise TypeError("worktrees is required; state is unknown, not an empty pool")
         worktrees = state["worktrees"]
+        if worktrees is None:
+            raise TypeError("worktrees is null; state is unknown, not an empty pool")
         if not isinstance(worktrees, list):
             raise TypeError("worktrees must be an array")
         for entry in worktrees:
@@ -468,12 +500,8 @@ for state_path in state_paths:
                 raise TypeError("worktree path contains unsupported control characters")
             print(f"{state_path}\t{os.path.dirname(state_path)}\t{path}")
     except (OSError, ValueError, TypeError) as error:
-        failed = True
-        print(
-            f"checkout-refresh: skipped: incomplete Treehouse coverage at {state_path}: {error}",
-            file=sys.stderr,
-        )
-if failed:
+        report_failure(state_path, owner, error)
+if failed and strict:
     raise SystemExit(1)
 PY
 }
@@ -1048,6 +1076,10 @@ acquire_worktree() {
   local expected_source=$1 lease_holder=$2 status=0 canonical treehouse_source
   canonical=$(require_exact_git_root "$expected_source" "Treehouse acquisition source") || return 1
   expected_source=$canonical
+  if ! pool_preflight "$expected_source"; then
+    echo "error: refusing Treehouse acquisition for owning home $FM_HOME_CANONICAL because its managed pool safety could not be inspected" >&2
+    return 1
+  fi
   (
     local checkout_lock process_guard
     ensure_lock_roots || exit 1
@@ -2852,10 +2884,16 @@ pool_preflight() {
     return 1
   }
   treehouse_paths=$(mktemp "${TMPDIR:-/tmp}/fm-checkout-refresh-pool.XXXXXX") || return 1
-  if ! treehouse_worktree_paths > "$treehouse_paths"; then
+  # Acquisition only consumes the current home's managed Treehouse root.
+  # Global legacy pools remain part of discovery health, but an unreadable
+  # third-party state file there cannot veto a lease from this isolated home.
+  if ! treehouse_worktree_paths managed > "$treehouse_paths"; then
     rm -f "$treehouse_paths"
     return 1
   fi
+  # Keep valid legacy entries visible for dirty-worktree diagnostics, but never
+  # let a malformed external state veto an acquisition from the managed root.
+  treehouse_worktree_paths legacy >> "$treehouse_paths"
   # This sweep walks one pool's worktrees, all of which share a repository, so
   # let backing_checkout reuse its pool-scoped facts across them instead of
   # recomputing per worktree. Scoped to this loop and cleared straight after, so
@@ -2867,10 +2905,11 @@ pool_preflight() {
   BC_CACHE_LISTED_ROOTS=''
   while IFS=$'\t' read -r treehouse_state pool worktree; do
     [ -n "$worktree" ] || continue
-    # FOREIGN-POOL SHORT CIRCUIT. This loop visits every Treehouse worktree on the
-    # machine, but the checks below only ever report on worktrees belonging to
-    # THIS repository - the `common = expected_common` test further down discards
-    # every other one after the expensive work has already been paid for.
+    # FOREIGN-POOL SHORT CIRCUIT. This loop visits every valid worktree visible
+    # from the managed root and the best-effort legacy root, but the checks below
+    # only ever report on worktrees belonging to THIS repository - the
+    # `common = expected_common` test further down discards every other one after
+    # the expensive work has already been paid for.
     #
     # That was the whole spawn cost. `backing_checkout` runs `git worktree list`
     # and then calls exact_git_root on EVERY listed worktree, so across a pool it
@@ -2894,13 +2933,13 @@ pool_preflight() {
       continue
     fi
     # A worktree we cannot fully inspect is SKIPPED, not fatal. The preflight
-    # iterates every Treehouse worktree in every pool, so a single busy,
-    # foreign, or half-torn-down worktree anywhere (including unrelated pools)
-    # must not cap acquisition for THIS pool - Treehouse pools grow, and acquire
-    # creates a fresh clean slot when no existing one is reusable. This mirrors
-    # the dirty-worktree case below, which already skips without failing. We can
-    # only confirm a worktree belongs to the target pool AFTER inspecting it, so
-    # an uninspectable one is by definition not provably ours to block on.
+    # iterates every visible Treehouse worktree, so a single busy, foreign, or
+    # half-torn-down worktree must not cap acquisition for THIS pool - Treehouse
+    # pools grow, and acquire creates a fresh clean slot when no existing one is
+    # reusable. This mirrors the dirty-worktree case below, which already skips
+    # without failing. We can only confirm a worktree belongs to the target pool
+    # AFTER inspecting it, so an uninspectable one is by definition not provably
+    # ours to block on.
     backing_checkout "$worktree" "$pool" "$treehouse_state" >/dev/null 2>&1 || {
       echo "checkout-refresh: skipped: Treehouse worktree identity or registration is not inspectable: $worktree" >&2
       continue

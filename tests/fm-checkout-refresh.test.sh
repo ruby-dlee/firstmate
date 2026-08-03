@@ -764,6 +764,105 @@ test_treehouse_discovery_failure_invalidates_coverage_health() {
   pass "unreadable roots, malformed schemas, and uninspectable paths invalidate coverage health"
 }
 
+test_treehouse_state_failure_is_scoped_to_owning_home() {
+  local owner_home="$TMP_ROOT/treehouse-null-owner" owner_source owner_root owner_state
+  local other_home other_source fakebin marker out status lease
+  fakebin="$TMP_ROOT/treehouse-null-fakebin"
+  owner_source="$owner_home/projects/source"
+  owner_root="$owner_home/.treehouse"
+  owner_state="$owner_root/source-null/treehouse-state.json"
+  mkdir -p "$owner_source" "$owner_home/config" "$(dirname "$owner_state")" "$fakebin"
+  fm_git_init_commit "$owner_source"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+touch "${FM_TEST_TREEHOUSE_CALLED:?}"
+printf '%s\n' "$PWD/fake-acquired"
+SH
+  chmod +x "$fakebin/treehouse"
+
+  printf '%s\n' '{"worktrees":[]}' > "$owner_state"
+  marker="$TMP_ROOT/treehouse-owner-empty-called"
+  lease=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$owner_home/refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$owner_home/refresh-locks" \
+    FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$owner_source" owner-empty)
+  [ -e "$marker" ] || fail "known-empty owner pool did not reach the Treehouse acquisition boundary"
+  assert_contains "$lease" fake-acquired \
+    "known-empty owner pool did not return the fake acquisition result"
+  rm -f "$marker"
+
+  printf '%s\n' '{"worktrees":null}' > "$owner_state"
+  for other_home in "$TMP_ROOT/treehouse-null-other-a" "$TMP_ROOT/treehouse-null-other-b"; do
+    other_source="$other_home/projects/source"
+    mkdir -p "$other_source" "$other_home/config"
+    fm_git_init_commit "$other_source"
+    set +e
+    out=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
+      FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
+      FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
+      FM_TREEHOUSE_ROOT="$owner_root" \
+      "$ROOT/bin/fm-checkout-refresh.sh" pool-preflight "$other_source" 2>&1)
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] \
+      || fail "foreign malformed state blocked pool preflight for other home $other_home: $out"
+    marker="$other_home/treehouse-called"
+    lease=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
+      FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
+      FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
+      FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
+      PATH="$fakebin:$PATH" \
+      "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$other_source" other-home)
+    [ -e "$marker" ] \
+      || fail "foreign malformed state blocked acquisition for other home $other_home"
+    assert_contains "$lease" fake-acquired \
+      "other home did not receive the fake acquisition result"
+  done
+
+  marker="$TMP_ROOT/treehouse-owner-null-called"
+  set +e
+  out=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$owner_home/refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$owner_home/refresh-locks" \
+    FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$owner_source" owner-null 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "null owner state reached Treehouse acquisition"
+  [ ! -e "$marker" ] || fail "Treehouse ran after the owner state became unknown"
+  assert_contains "$out" "$owner_state" \
+    "null-state refusal did not name the owning state file"
+  assert_contains "$out" "owning home $owner_home" \
+    "null-state refusal did not name the owning Firstmate home"
+  assert_contains "$out" "worktrees is null; state is unknown, not an empty pool" \
+    "null-state refusal did not distinguish unknown state from an empty pool"
+
+  chmod 000 "$owner_state"
+  set +e
+  out=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$owner_home/refresh-state" \
+    FM_CHECKOUT_REFRESH_LOCK_ROOT="$owner_home/refresh-locks" \
+    FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$owner_source" owner-unreadable 2>&1)
+  status=$?
+  set -e
+  chmod 600 "$owner_state"
+  [ "$status" -ne 0 ] || fail "unreadable owner state reached Treehouse acquisition"
+  [ ! -e "$marker" ] || fail "Treehouse ran while the owner state was unreadable"
+  assert_contains "$out" "$owner_state" \
+    "unreadable-state refusal did not name the owning state file"
+  assert_contains "$out" "owning home $owner_home" \
+    "unreadable-state refusal did not name the owning Firstmate home"
+  assert_contains "$out" "Treehouse state is unreadable" \
+    "unreadable-state refusal did not identify its outcome class"
+
+  pass "malformed Treehouse state blocks its owner and not independent homes"
+}
+
 test_raw_treehouse_root_symlink_invalidates_coverage_health() {
   local real_root linked_root linked_parent linked_child missing_root out status
   real_root="$TMP_ROOT/treehouse-root-real"
@@ -2546,6 +2645,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-symlinks ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-state-isolation ]; then
+  test_treehouse_state_failure_is_scoped_to_owning_home
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-refresh-authority ]; then
   test_empty_treehouse_and_identity_tool_failures_fail_closed
   test_config_git_metadata_and_non_git_races_fail_closed
@@ -2567,6 +2671,7 @@ test_ignored_skill_files_are_outside_the_collision_guard
 test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection
 test_bootstrap_relays_hygiene_alerts
 test_treehouse_discovery_failure_invalidates_coverage_health
+test_treehouse_state_failure_is_scoped_to_owning_home
 test_raw_treehouse_root_symlink_invalidates_coverage_health
 test_empty_treehouse_and_identity_tool_failures_fail_closed
 test_config_git_metadata_and_non_git_races_fail_closed

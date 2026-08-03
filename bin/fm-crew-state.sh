@@ -21,15 +21,19 @@
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crewmate's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
-#      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
-#      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. A passed
-#      outcome's PR detail is cross-checked against GitHub through gh-axi rather
-#      than inferred from the pipeline outcome. EXCEPT: while the active step is
-#      ci, `axi status` alone cannot tell "still waiting on checks" from "checks
-#      green, waiting on merge" (see nm_ci_checks_state) - a ci-step log-tail
-#      check overrides working -> done once checks read green, so a green PR is
-#      never silently read as still-validating.
+#      The run-step is AUTHORITATIVE for active, parked, and failed states:
+#      running/fixing -> working, ci -> working, awaiting_approval/fix_review ->
+#      parked (with gate findings), and failed/cancelled -> failed. A PR-ready
+#      passed/checks-passed claim becomes done only after GitHub resolves the
+#      rendered run head to one full remote commit, that identity exactly matches
+#      the live PR head, and a completed snapshot is still the newest branch run.
+#      Local Git objects and a PR URL found only in the append-only status log are
+#      never publication-currentness evidence.
+#      Missing remote proof -> unknown and a mismatch or newer run -> stale.
+#      While the active step is ci, `axi status` alone cannot tell "still waiting
+#      on checks" from "checks green, waiting on merge" (see nm_ci_checks_state),
+#      so a ci-step log-tail marker supplies the ready claim before the same
+#      remote-currentness checks decide whether it is done.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log

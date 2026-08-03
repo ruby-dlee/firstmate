@@ -8,7 +8,7 @@ The three affected lanes were `audit-evidence-m7`, `retention-erasure-d8`, and `
 The captured failure was `drive run: reconcile run <id>: read response: read unix -><NM_HOME>/socket: i/o timeout` on no-mistakes v1.41.2 (`867d64d`).
 The first two lanes recovered after another attach and the third stopped, proving that the run remained attachable after at least two occurrences but that the client performed no reliable outer retry.
 An independently repeated machine-level load measurement found an operational ceiling of about five concurrent no-mistakes pipeline runs.
-During the incident, five lanes across two firstmate homes were parked; `docs/stalled-lane-recovery-2026-08-01.md` owns their inventory and recovery disposition.
+During the incident, five lanes across two firstmate homes were parked; [the stalled-lane recovery report](stalled-lane-recovery-2026-08-01.md) owns their inventory and recovery disposition.
 That measured ceiling establishes the shared-contention symptom, not the exact query responsible for any individual timeout.
 
 At tag v1.41.2, `internal/cli/run_reconciler.go` retries subscription connection failures for up to 30 seconds, but `reconcile` returns the first `get_run` failure immediately.
@@ -34,15 +34,11 @@ It does not establish that descriptor pressure was absent elsewhere in the daemo
 Before each attempt it uses the read-only AXI home view to require the daemon to report running.
 It retries only the exact reconciliation socket-read timeout with bounded exponential backoff and deterministic per-task jitter.
 It never directly calls daemon start, stop, restart, update, abort, or rerun.
-Any other error returns immediately. This is containment, not a strict no-start guarantee: ordinary `axi run` calls `EnsureDaemon`, so a daemon that stops after the read-only preflight can be started during the check-to-use race. Only an upstream attach-only operation that never starts, stops, restarts, or updates the daemon can close that race.
+Any other error returns immediately.
+This is containment, not a strict no-start guarantee: ordinary `axi run` calls `EnsureDaemon`, so a daemon that stops after the read-only preflight can be started during the check-to-use race.
+Only an upstream attach-only operation that never starts, stops, restarts, or updates the daemon can close that race.
 
-`bin/fm-crew-state.sh` now treats a PR-ready run-step as current only when GitHub resolves its rendered head to one full commit in the PR repository and that exact remote identity matches the full live GitHub PR head read through `gh-axi`.
-It never uses local Git object availability as evidence of a remote publication fact, so an unrelated fetch cannot change the verdict.
-A missing or ambiguous remote commit resolution returns `unknown` and `do not merge`, and a PR URL found only in the append-only status log is never promoted to current run identity.
-A mismatch returns `state: stale`, names both heads, and says `do not merge` instead of reporting checks green.
-An unavailable PR-head read returns `unknown` with the same merge prohibition.
-For a completed snapshot, it also requires the newest-first run list to report that branch's newest run as completed.
-A newer running, failed, or cancelled run makes the earlier completed snapshot `stale`; an unavailable newest-run read fails closed as `unknown`.
+`bin/fm-crew-state.sh`'s header owns the exact remote-only, fail-closed PR-ready currentness contract; the verification below records the evidence for it.
 
 ## Verification
 

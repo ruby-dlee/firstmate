@@ -9,20 +9,8 @@
 # found nothing because the test command's argv carries neither the run id nor
 # the worktree path. Two healthy runs were aborted on that reading.
 #
-# These cases pin the probe over REAL processes in a REAL directory, because the
-# whole point is that it observes the operating system rather than a status
-# report:
-#   (a) no process in the worktree            -> dead
-#   (b) a live process in the worktree        -> alive (presence-only, --sample 0)
-#   (c) argv-invisible process: the exact regression for the false negative -
-#       the process is undiscoverable by name and discoverable by cwd
-#   (d) a CPU-burning process                 -> alive, with measured progress
-#   (e) a sleeping process                    -> stalled, explicitly NOT dead
-#   (f) worktree resolution through the no-mistakes home layout
-#   (g) unresolvable worktree                 -> unknown (never dead)
-#   (h) usage error                           -> exit 2
-#   (i) the named unit of work and its age, which separate slow from hung and
-#       which bin/fm-crew-state.sh carries onto every heartbeat read
+# These cases pin exact supervised identity separately from unowned worktree
+# process presence.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -33,7 +21,9 @@ fm_test_tmproot_into TMP_ROOT fm-nm-step-liveness
 
 RUN_ID=01TESTRUNTESTRUNTESTRUN00
 WT="$TMP_ROOT/worktree"
-mkdir -p "$WT"
+STATE_DIR="$TMP_ROOT/command-state"
+mkdir -p "$WT" "$STATE_DIR"
+export FM_NM_COMMAND_STATE_DIR="$STATE_DIR"
 
 # Track every process this suite starts so a failing assertion never leaks one.
 # Descendants are killed too, not just the tracked pid: a leaked grandchild
@@ -62,14 +52,14 @@ verdict_of() {  # <probe output> -> the verdict word
   printf '%s\n' "$1" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p'
 }
 
-# --- (a) no process in the worktree -> dead ---------------------------------
+# --- no command identity never proves either liveness direction --------------
 
 out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
-[ "$(verdict_of "$out")" = dead ] || fail "empty worktree must read dead, got: $out"
-assert_contains "$out" "procs: 0" "dead verdict reports zero processes"
-pass "no process with its cwd in the worktree reads dead"
+[ "$(verdict_of "$out")" = unknown ] || fail "unowned empty worktree must read unknown, got: $out"
+assert_contains "$out" "two checks" "absence is rechecked before it is reported"
+pass "worktree absence without command identity reads unknown"
 
-# --- (b) a live process in the worktree -> alive ----------------------------
+# --- unowned worktree presence remains unknown ------------------------------
 
 ( cd "$WT" && exec sleep 120 ) &
 SLEEPER=$!
@@ -79,11 +69,12 @@ STARTED_PIDS="$STARTED_PIDS $SLEEPER"
 out=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
-  [ "$(verdict_of "$out")" = alive ] && break
+  case "$out" in *"procs: "[1-9]*) break ;; esac
   sleep 0.3
 done
-[ "$(verdict_of "$out")" = alive ] || fail "live process in worktree must read alive, got: $out"
-pass "a live process with its cwd in the worktree reads alive"
+[ "$(verdict_of "$out")" = unknown ] || fail "unowned worktree process must read unknown, got: $out"
+assert_contains "$out" "no supervised command identity" "presence is not treated as command identity"
+pass "an unrelated worktree process cannot prove command liveness"
 
 # --- (c) the false-negative regression: invisible to a name search ----------
 #
@@ -92,53 +83,39 @@ pass "a live process with its cwd in the worktree reads alive"
 # command and its `bash tests/<name>.test.sh` children.
 by_name=$(pgrep -f "$WT" 2>/dev/null || true)
 [ -z "$by_name" ] || fail "fixture is wrong: the process must be invisible to an argv search"
-[ "$(verdict_of "$out")" = alive ] || fail "cwd search must find what an argv search cannot"
-pass "a process invisible to an argv search is still found by working directory"
+[ "$(verdict_of "$out")" = unknown ] || fail "cwd presence without identity must stay unknown"
+pass "argv-invisible cwd presence remains observation rather than liveness proof"
 
-# --- (e) a sleeping process reads stalled, never dead -----------------------
-#
-# Ordered before the CPU case so the sleeper is still the only process here.
+# A stale exact identity is dead even when an unrelated process holds the cwd.
+touch "$STATE_DIR/$RUN_ID.test.identity.99999999"
+cat > "$STATE_DIR/$RUN_ID.test.state" <<EOF
+version=2
+run_id=$RUN_ID
+step=test
+worktree=$(cd "$WT" && pwd -P)
+pid=99999999
+pgid=99999999
+start=Mon Jan 1 00:00:00 2000
+identity_file=$STATE_DIR/$RUN_ID.test.identity.99999999
+EOF
+out=$("$PROBE" "$RUN_ID" --step test --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" = dead ] || fail "missing exact identity must read dead despite cwd process, got: $out"
+assert_contains "$out" "after two checks" "dead identity requires a stable absence recheck"
+pass "an unrelated cwd process cannot mask a missing supervised command"
+rm -f "$STATE_DIR/$RUN_ID.test.state" "$STATE_DIR/$RUN_ID.test.identity.99999999"
+
 out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 1)
-[ "$(verdict_of "$out")" = stalled ] || fail "an idle process must read stalled, got: $out"
-assert_not_contains "$out" "liveness: dead" "a sleeping process is never reported dead"
-assert_contains "$out" "blocked on I/O" "stalled explains that it may be legitimately waiting"
-pass "a process making no progress reads stalled, explicitly distinct from dead"
+[ "$(verdict_of "$out")" = unknown ] || fail "sleeping unowned process must remain unknown, got: $out"
+pass "an idle unowned process is not mislabeled alive or dead"
 
-# --- (d) a CPU-burning process reports measured progress --------------------
+# --- unowned CPU activity remains unknown -----------------------------------
 
 ( cd "$WT" && exec bash -c 'while :; do :; done' ) &
 BURNER=$!
 STARTED_PIDS="$STARTED_PIDS $BURNER"
 out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 1)
-[ "$(verdict_of "$out")" = alive ] || fail "a CPU-burning process must read alive, got: $out"
-assert_contains "$out" "cpu +" "the alive verdict reports the measured CPU delta"
-pass "a process consuming CPU reads alive with measured progress"
-
-kill_started
-
-# --- (i) the reported unit of work ------------------------------------------
-#
-# "alive" alone still leaves hours of runtime unexplained, which is what made a
-# healthy multi-hour step indistinguishable from a hang. The probe names the
-# step's current unit of work and its age, and bin/fm-crew-state.sh carries that
-# onto every heartbeat read, so the field is load-bearing rather than cosmetic.
-#
-# The shape mirrors the real one: a root shell the daemon owns, running one
-# child at a time - the suite's `for t in tests/*.test.sh` loop.
-( cd "$WT" && exec bash -c 'sleep 120 & wait' ) &
-PARENT=$!
-STARTED_PIDS="$STARTED_PIDS $PARENT"
-out=""
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
-  case "$out" in *"doing: "*) break ;; esac
-  sleep 0.3
-done
-assert_contains "$out" "doing: sleep 120" "the probe names the child the step is currently running"
-# The age is what separates "slow" from "sitting on the same script for hours".
-printf '%s\n' "$out" | grep -qE 'doing: sleep 120 \([0-9]+:[0-9]{2}' \
-  || fail "the reported unit of work must carry its age, got: $out"
-pass "the probe names the current unit of work and how long it has been running"
+[ "$(verdict_of "$out")" = unknown ] || fail "busy unowned process must remain unknown, got: $out"
+pass "CPU activity without command identity is not liveness proof"
 
 kill_started
 
@@ -147,7 +124,7 @@ kill_started
 NM_HOME="$TMP_ROOT/nm-home"
 mkdir -p "$NM_HOME/worktrees/repoid123/$RUN_ID"
 out=$(FM_NM_HOME="$NM_HOME" "$PROBE" "$RUN_ID" --sample 0)
-[ "$(verdict_of "$out")" = dead ] || fail "layout resolution must find the worktree, got: $out"
+[ "$(verdict_of "$out")" = unknown ] || fail "layout resolution must find the worktree, got: $out"
 assert_contains "$out" "$RUN_ID" "the resolved worktree path names the run"
 pass "the run's worktree resolves through the no-mistakes home layout"
 

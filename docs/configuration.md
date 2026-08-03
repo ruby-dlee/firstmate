@@ -94,10 +94,11 @@ See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verif
 
 ## Gate defaults (.no-mistakes.yaml)
 
-The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite directly.
+The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite through `bin/fm-nm-command-supervisor.sh`.
 That evidence policy is specific to the firstmate repo: target projects may legitimately commit `.no-mistakes/evidence/` from their own no-mistakes pipeline, but firstmate keeps `.no-mistakes/` local and CI rejects tracked entries under that path.
 That command requires `tmux` on `PATH`, prints `tmux -V`, runs every `tests/*.test.sh` with `bash`, and fails if any script exits non-zero.
 It intentionally runs the complete behavior-test inventory serially instead of reproducing the duration-balanced CI sharding owned by [`bin/fm-behavior-shards.sh`](../bin/fm-behavior-shards.sh) or delegating the test step to an agent.
+The configured lint command uses the same supervisor, so both shell-command steps expose exact process identity and return a missing command as a failed step.
 
 ## Captain preferences (data/captain.md)
 

@@ -8,8 +8,10 @@ set -u
 fm_test_tmproot_into TMP_ROOT fm-report-stack
 HOME_DIR="$TMP_ROOT/home"
 STACK="$TMP_ROOT/stack"
-SCRIPT="$ROOT/bin/fm-report-stack.mjs"
-mkdir -p "$HOME_DIR/state" "$HOME_DIR/data"
+SCRIPT=${FM_REPORT_STACK_SCRIPT_OVERRIDE:-$ROOT/bin/fm-report-stack.mjs}
+RETENTION_ADMISSION_DIR="$TMP_ROOT/retention-admission"
+mkdir -p "$HOME_DIR/state" "$HOME_DIR/data" "$RETENTION_ADMISSION_DIR"
+export FM_REPORT_RETENTION_ADMISSION_DIR="$RETENTION_ADMISSION_DIR"
 export FM_REPORT_RETENTION_INSTALL_TEST_SIMULATE_LAUNCH=1
 export FM_REPORT_RETENTION_ACTIVATION_WAIT_MS=250
 
@@ -2621,6 +2623,39 @@ NODE
   pass "preflight failures claim admission before lock-scoped validation and cadence"
 }
 
+test_wrong_type_stack_root_is_root_independently_admitted() {
+  local stack="$TMP_ROOT/retention-wrong-root" mutant_stack="$TMP_ROOT/retention-wrong-root-mutant"
+  local mutant_root="$TMP_ROOT/retention-wrong-root-mutant-root" first second mutant_first mutant_second status
+  printf 'wrong root\n' > "$stack"
+  printf 'wrong root mutant\n' > "$mutant_stack"
+  write_report_stack_mutant "$mutant_root" \
+    'rootAdmission = claimRootIndependentRetentionAttempt()' \
+    'rootAdmission = { admitted: true }'
+
+  if first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "wrong-type stack root unexpectedly completed"
+  assert_contains "$first" "report stack root must be a real directory" \
+    "wrong-type stack root did not fail after root-independent admission"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "wrong-type stack root retried instead of observing root-independent cadence"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "wrong-type stack root remained eligible on the immediate next loop"
+
+  if mutant_first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "root-admission mutant unexpectedly completed against a wrong-type root"
+  if mutant_second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$mutant_stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$mutant_root/bin/fm-report-stack.mjs" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "root-admission mutant was unexpectedly cadence-blocked"
+  assert_contains "$mutant_first" "report stack root must be a real directory" \
+    "root-admission mutant first failure missed the root boundary"
+  assert_contains "$mutant_second" "report stack root must be a real directory" \
+    "root-admission mutant immediate retry missed the root boundary"
+  pass "wrong-type roots are throttled before root inspection"
+}
+
 test_malformed_retention_attempt_is_replaced_before_validation_error() {
   local stack="$TMP_ROOT/retention-malformed-attempt-stack" mutant_stack="$TMP_ROOT/retention-malformed-attempt-mutant-stack"
   local mutant_root="$TMP_ROOT/retention-malformed-attempt-mutant" first second mutant_first mutant_second
@@ -2643,7 +2678,9 @@ const mutation = `    if (markerState.kind === "invalid") throw markerState.erro
     if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
       inspectPinnedDirectory(pinnedRoot);`;
 if (source.split(boundary).length !== 2) throw new Error("could not isolate malformed-marker admission ordering");
-fs.writeFileSync(destinationFile, source.replace(boundary, mutation));
+const rootBoundary = "rootAdmission = claimRootIndependentRetentionAttempt();";
+if (source.split(rootBoundary).length !== 2) throw new Error("could not isolate root-independent admission ordering");
+fs.writeFileSync(destinationFile, source.replace(rootBoundary, "rootAdmission = { admitted: true };").replace(boundary, mutation));
 NODE
   chmod +x "$mutant_root/bin/fm-report-stack.mjs" "$mutant_root/bin/fm-contained-read.py"
 
@@ -2841,13 +2878,14 @@ PY
 test_valid_retention_claim_release_does_not_persist_quarantine() {
   local stack="$TMP_ROOT/retention-valid-claim-release-stack" output
   mkdir -p "$stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.claim.json"
   output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
     || fail "valid retention claim release failed"
   assert_contains "$output" '"admitted":true,"reason":"completed"' \
     "valid retention claim did not complete its admitted pass"
   assert_absent "$stack/.retention-attempt.claim.json" "valid retention claim remained canonical after release"
-  [ "$(find "$stack" -mindepth 1 -maxdepth 1 -name '..retention-attempt.claim.json.released.*' | wc -l | tr -d ' ')" -eq 0 ] \
+  [ "$(find "$stack" -mindepth 1 -maxdepth 1 \( -name '..retention-attempt.claim.json.released.*' -o -name '..retention-attempt.claim.json.expired.*' \) | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "valid retention claim release leaked persistent quarantine"
   pass "valid claim release removes its inode-owned file"
 }
@@ -2865,6 +2903,18 @@ test_stale_claim_quarantine_failure_still_installs_admission() {
   cat > "$python_wrapper" <<'SH'
 #!/bin/sh
 if [ "${2:-}" = quarantine-owned-entry-fd ] && [ "${3:-}" = .retention-attempt.claim.json ]; then
+  find "$FM_REPORT_RETENTION_ADMISSION_DIR" -mindepth 1 -maxdepth 1 -type f \
+    -name '.firstmate-report-retention-*' -print -quit | grep -q . || {
+    echo 'root-independent admission missing before stale claim quarantine' >&2
+    exit 1
+  }
+  node -e '
+    const record=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+    if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs)) process.exit(1);
+  ' "$FM_REPORT_STACK_ROOT/.retention-attempt.json" || {
+    echo 'canonical admission missing before stale claim quarantine' >&2
+    exit 1
+  }
   echo 'synthetic stale claim quarantine failure' >&2
   exit 1
 fi
@@ -2901,7 +2951,7 @@ test_retention_future_timestamp_uses_bounded_file_age_fallback() {
   ' "$stack/.retention-attempt.json"
   before=$(cat "$stack/.retention-attempt.json")
   first=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
-    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    FM_REPORT_RETENTION_INTERVAL=60 "$SCRIPT" prune --status) \
     || fail "fresh file-age fallback rejected a recently written future timestamp"
   assert_contains "$first" '"admitted":false,"reason":"cadence"' \
     "recent future timestamp did not use bounded file-age fallback"
@@ -2910,7 +2960,7 @@ test_retention_future_timestamp_uses_bounded_file_age_fallback() {
   node -e 'const fs=require("fs"); const old=new Date(Date.now()-7200000); fs.utimesSync(process.argv[1], old, old)' \
     "$stack/.retention-attempt.json"
   if second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
-    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    FM_REPORT_RETENTION_INTERVAL=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "aged future timestamp suppressed retention indefinitely"
   assert_contains "$second" "invalid report retention attempt marker" \
     "aged future timestamp did not reach timestamp validation"
@@ -3365,62 +3415,1112 @@ test_retention_postquarantine_javascript_predicate_mutations() {
   pass "post-quarantine absence and generation mutants are detected"
 }
 
-test_retention_admission_mutation_inventory_is_complete() {
-  node - "$SCRIPT" "$ROOT/bin/fm-contained-read.py" "$ROOT/tests/fm-report-stack-suite.sh" <<'NODE'
-const fs = require("fs");
-const [javascriptFile, pythonFile, testFile] = process.argv.slice(2);
-const javascript = fs.readFileSync(javascriptFile, "utf8");
-const python = fs.readFileSync(pythonFile, "utf8");
-const javascriptStart = javascript.indexOf("function readRetentionAttemptRecord(");
-const javascriptEnd = javascript.indexOf("\nfunction acquireLock(", javascriptStart);
-const pythonStart = python.indexOf("def command_quarantine_owned_entry_fd(");
-const pythonEnd = python.indexOf("\n\ndef ensure_child_directory", pythonStart);
-if (javascriptStart < 0 || javascriptEnd < 0 || pythonStart < 0 || pythonEnd < 0) {
-  throw new Error("could not derive admission predicate source ranges");
+retention_admission_prefix_for_stack() {
+  node -e '
+    const crypto = require("crypto");
+    const path = require("path");
+    const stack = path.resolve(process.argv[1]);
+    const scope = crypto.createHash("sha256").update(stack).digest("hex").slice(0, 24);
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    process.stdout.write(`.firstmate-report-retention-${uid}-${scope}`);
+  ' "$1"
 }
-const sources = [
-  [javascriptFile, javascript, javascriptStart, javascript.slice(javascriptStart, javascriptEnd), /const\s+(\w+Guard)\s*=/g],
-  [pythonFile, python, pythonStart, python.slice(pythonStart, pythonEnd), /^\s+(\w+_guard)\s*=/gm],
-];
-const covered = new Set([
-  "schemaGuard",
-  "timestampIntegralGuard",
-  "timestampNonnegativeGuard",
-  "timestampWithinSkewGuard",
-  "fileTimeWithinSkewGuard",
-  "fileAgeWithinIntervalGuard",
-  "fallbackEligibleGuard",
-  "ageFreshGuard",
-  "pathAbsentGuard",
-  "pathIdentityChangedGuard",
-  "candidateIdentityGuard",
-  "candidateTimestampGuard",
-  "installedIdentityGuard",
-  "installedTimestampGuard",
-  "source_identity_guard",
-  "moved_device_guard",
-  "moved_inode_guard",
-  "moved_type_guard",
-]);
-const inventory = new Map();
-for (const [file, completeSource, offset, source, pattern] of sources) {
-  for (const match of source.matchAll(pattern)) {
-    const line = completeSource.slice(0, offset + match.index).split("\n").length;
-    if (!inventory.has(match[1])) inventory.set(match[1], `${file}:${line}`);
+
+test_retention_changed_index_read_races() {
+  local stage stack ready proceed saved output state pid status ready_name proceed_name
+  for stage in preopen postread; do
+    stack="$TMP_ROOT/mutant-contract-index-$stage"
+    ready="$TMP_ROOT/mutant-contract-index-$stage.ready"
+    proceed="$TMP_ROOT/mutant-contract-index-$stage.proceed"
+    saved="$TMP_ROOT/mutant-contract-index-$stage.saved"
+    output="$TMP_ROOT/mutant-contract-index-$stage.out"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    mkfifo "$ready" "$proceed"
+    exec 7<>"$ready"
+    exec 8<>"$proceed"
+    if [ "$stage" = preopen ]; then
+      ready_name=FM_REPORT_RETENTION_INDEX_PREOPEN_TEST_READY
+      proceed_name=FM_REPORT_RETENTION_INDEX_PREOPEN_TEST_PROCEED
+    else
+      ready_name=FM_REPORT_RETENTION_INDEX_POSTREAD_TEST_READY
+      proceed_name=FM_REPORT_RETENTION_INDEX_POSTREAD_TEST_PROCEED
+    fi
+    env FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$ready_name=$ready" "$proceed_name=$proceed" \
+      "$SCRIPT" prune --status > "$output" 2>&1 &
+    pid=$!
+    if ! IFS= read -r -t 10 state <&7; then
+      kill -TERM "$pid" 2>/dev/null || true
+      fail "changed-control index $stage race did not reach its boundary: $(cat "$output")"
+    fi
+    mv "$stack/index.html" "$saved"
+    cp "$saved" "$stack/index.html"
+    printf 'continue\n' >&8
+    if wait "$pid"; then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "changed-control index $stage race was accepted as a no-op"
+    assert_grep "synthetic report publication lock setup failure" "$output" \
+      "changed-control index $stage race missed stable authority validation"
+    exec 7>&-; exec 8>&-
+  done
+  pass "changed index authority reads reject pre-open and post-read replacement"
+}
+
+test_installed_retention_marker_contract() {
+  local mode stack ready proceed saved output state pid status
+  for mode in identity timestamp; do
+    stack="$TMP_ROOT/mutant-contract-installed-$mode"
+    ready="$TMP_ROOT/mutant-contract-installed-$mode.ready"
+    proceed="$TMP_ROOT/mutant-contract-installed-$mode.proceed"
+    saved="$TMP_ROOT/mutant-contract-installed-$mode.saved"
+    output="$TMP_ROOT/mutant-contract-installed-$mode.out"
+    mkdir -p "$stack/entries/cohort-1"
+    mkfifo "$ready" "$proceed"
+    exec 7<>"$ready"
+    exec 8<>"$proceed"
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_INSTALLED_TEST_READY="$ready" \
+      FM_REPORT_RETENTION_INSTALLED_TEST_PROCEED="$proceed" FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 \
+      "$SCRIPT" prune --status > "$output" 2>&1 &
+    pid=$!
+    if ! IFS= read -r -t 10 state <&7; then
+      kill -TERM "$pid" 2>/dev/null || true
+      fail "changed-control installed $mode case did not reach verification: $(cat "$output")"
+    fi
+    if [ "$mode" = identity ]; then
+      mv "$stack/.retention-attempt.json" "$saved"
+      cp "$saved" "$stack/.retention-attempt.json"
+    else
+      node -e 'require("fs").writeFileSync(process.argv[1],"{\"schemaVersion\":1,\"attemptedAtMs\":0}\n")' \
+        "$stack/.retention-attempt.json"
+    fi
+    printf 'continue\n' >&8
+    if wait "$pid"; then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "changed-control installed $mode mutation unexpectedly completed"
+    assert_grep "report retention attempt marker changed while installing" "$output" \
+      "changed-control installed $mode mutation missed installation verification"
+    assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+      || fail "changed-control installed $mode failure did not restore canonical admission"
+    exec 7>&-; exec 8>&-
+  done
+  pass "installed retention markers verify identity and timestamp"
+}
+
+test_candidate_prelink_contract() {
+  local mode stack ready proceed output candidate state pid status
+  for mode in fresh fallback; do
+    stack="$TMP_ROOT/mutant-contract-candidate-prelink-$mode"
+    ready="$TMP_ROOT/mutant-contract-candidate-prelink-$mode.ready"
+    proceed="$TMP_ROOT/mutant-contract-candidate-prelink-$mode.proceed"
+    output="$TMP_ROOT/mutant-contract-candidate-prelink-$mode.out"
+    mkdir -p "$stack/entries/cohort-1"
+    mkfifo "$ready" "$proceed"
+    exec 7<>"$ready"
+    exec 8<>"$proceed"
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_READY="$ready" \
+      FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_PROCEED="$proceed" \
+      "$SCRIPT" prune --status > "$output" 2>&1 &
+    pid=$!
+    if ! IFS= read -r -t 10 state <&7; then
+      kill -TERM "$pid" 2>/dev/null || true
+      fail "changed-control candidate $mode did not reach the pre-link boundary: $(cat "$output")"
+    fi
+    candidate=$state
+    if [ "$mode" = fresh ]; then
+      ln "$stack/$candidate" "$stack/.retention-attempt.json"
+    else
+      node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n")' \
+        "$stack/.retention-attempt.json"
+    fi
+    printf 'continue\n' >&8
+    if wait "$pid"; then status=0; else status=$?; fi
+    [ "$status" -eq 0 ] || fail "changed-control candidate $mode link collision failed: $(cat "$output")"
+    assert_grep '"admitted":false,"reason":"cadence"' "$output" \
+      "changed-control candidate $mode link collision was not rejected by canonical ownership"
+    assert_absent "$stack/$candidate" "changed-control candidate $mode link collision leaked its candidate"
+    exec 7>&-; exec 8>&-
+  done
+  pass "candidate link collisions preserve canonical ownership"
+}
+
+test_candidate_postlink_contract() {
+  local mode stack ready proceed output state pid status
+  for mode in timestamp claim-error; do
+    stack="$TMP_ROOT/mutant-contract-candidate-$mode"
+    ready="$TMP_ROOT/mutant-contract-candidate-$mode.ready"
+    proceed="$TMP_ROOT/mutant-contract-candidate-$mode.proceed"
+    output="$TMP_ROOT/mutant-contract-candidate-$mode.out"
+    mkdir -p "$stack/entries/cohort-1"
+    mkfifo "$ready" "$proceed"
+    exec 7<>"$ready"
+    exec 8<>"$proceed"
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_CANDIDATE_TEST_READY="$ready" \
+      FM_REPORT_RETENTION_CANDIDATE_TEST_PROCEED="$proceed" \
+      "$SCRIPT" prune --status > "$output" 2>&1 &
+    pid=$!
+    if ! IFS= read -r -t 10 state <&7; then
+      kill -TERM "$pid" 2>/dev/null || true
+      fail "changed-control candidate $mode did not reach the post-link boundary: $(cat "$output")"
+    fi
+    if [ "$mode" = timestamp ]; then
+      node -e '
+        const fs=require("fs");
+        const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+        value.attemptedAtMs += 1;
+        fs.writeFileSync(process.argv[1],JSON.stringify(value)+"\n");
+      ' "$stack/.retention-attempt.json"
+    else
+      printf 'invalid claim\n' > "$stack/.retention-attempt.claim.json"
+    fi
+    printf 'continue\n' >&8
+    if wait "$pid"; then status=0; else status=$?; fi
+    if [ "$mode" = timestamp ]; then
+      [ "$status" -eq 0 ] || fail "changed-control candidate timestamp race failed: $(cat "$output")"
+      assert_grep '"admitted":false,"reason":"cadence"' "$output" \
+        "changed-control candidate timestamp race claimed an unowned record"
+    else
+      [ "$status" -ne 0 ] || fail "changed-control candidate claim error unexpectedly completed"
+      assert_grep "invalid report retention admission claim" "$output" \
+        "changed-control candidate claim error missed validation"
+    fi
+    exec 7>&-; exec 8>&-
+  done
+  pass "candidate ownership verifies timestamps and post-link claim validation"
+}
+
+test_post_quarantine_replacement_contract() {
+  local stack="$TMP_ROOT/mutant-contract-post-quarantine-replacement"
+  local ready="$TMP_ROOT/mutant-contract-post-quarantine-replacement.ready"
+  local proceed="$TMP_ROOT/mutant-contract-post-quarantine-replacement.proceed"
+  local output="$TMP_ROOT/mutant-contract-post-quarantine-replacement.out" state pid status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'invalid canonical\n' > "$stack/.retention-attempt.json"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_QUARANTINED_TEST_READY="$ready" \
+    FM_REPORT_RETENTION_QUARANTINED_TEST_PROCEED="$proceed" \
+    "$SCRIPT" prune --status > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "changed-control quarantine did not reach the post-mutation boundary: $(cat "$output")"
+  fi
+  node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()})+"\n")' \
+    "$stack/.retention-attempt.json"
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "changed-control quarantine rejected a replacement generation: $(cat "$output")"
+  assert_grep '"admitted":false,"reason":"cadence"' "$output" \
+    "changed-control quarantine did not preserve replacement cadence"
+  exec 7>&-; exec 8>&-
+  pass "post-quarantine generation checks preserve replacements"
+}
+
+test_quarantine_error_after_absence_contract() {
+  local stack="$TMP_ROOT/mutant-contract-quarantine-error-absent"
+  local wrapper="$TMP_ROOT/mutant-contract-quarantine-error-python" output status
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'invalid canonical\n' > "$stack/.retention-attempt.json"
+  node - "$wrapper" <<'NODE'
+const fs = require("fs");
+fs.writeFileSync(process.argv[2], `#!/usr/bin/env bash
+if [ "\${2:-}" = quarantine-owned-entry-fd ]; then
+  "\$FM_REAL_PYTHON" "\$@" || exit \$?
+  printf 'synthetic post-quarantine failure\\n' >&2
+  exit 1
+fi
+exec "\$FM_REAL_PYTHON" "\$@"
+`);
+NODE
+  chmod +x "$wrapper"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_PYTHON="$wrapper" FM_REAL_PYTHON="$(command -v python3)" \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control post-quarantine failure unexpectedly completed"
+  assert_contains "$output" "invalid report retention attempt marker" \
+    "changed-control post-quarantine absence did not preserve validation"
+  assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+    || fail "changed-control post-quarantine absence did not restore admission"
+  pass "post-quarantine helper errors accept an already absent generation"
+}
+
+test_fresh_retention_marker_short_circuits_installation() {
+  local kind stack ready output status
+  for kind in fresh fallback-fresh; do
+    stack="$TMP_ROOT/mutant-contract-marker-short-circuit-$kind"
+    ready="$TMP_ROOT/mutant-contract-marker-short-circuit-$kind.ready"
+    mkdir -p "$stack/entries/cohort-1"
+    if [ "$kind" = fresh ]; then
+      node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()})+"\n")' \
+        "$stack/.retention-attempt.json"
+    else
+      node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n")' \
+        "$stack/.retention-attempt.json"
+    fi
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_INSTALL_TEST_READY="$ready" \
+      "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -eq 0 ] || fail "changed-control $kind marker reached canonical installation: $output"
+    assert_contains "$output" '"admitted":false,"reason":"cadence"' \
+      "changed-control $kind marker missed cadence"
+    assert_absent "$ready" "changed-control $kind marker reached the candidate boundary"
+  done
+  pass "fresh and fallback-fresh markers short-circuit installation"
+}
+
+test_initial_claim_validation_survives_installation_race() {
+  local stack="$TMP_ROOT/mutant-contract-initial-claim-validation"
+  local ready="$TMP_ROOT/mutant-contract-initial-claim-validation.ready"
+  local proceed="$TMP_ROOT/mutant-contract-initial-claim-validation.proceed"
+  local saved="$TMP_ROOT/mutant-contract-initial-claim-validation.saved"
+  local output="$TMP_ROOT/mutant-contract-initial-claim-validation.out" state pid status second
+  mkdir -p "$stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+  printf 'invalid claim\n' > "$stack/.retention-attempt.claim.json"
+  touch -t 200001010000 "$stack/.retention-attempt.claim.json"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"
+  exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_READY="$ready" \
+    FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_PROCEED="$proceed" \
+    "$SCRIPT" prune --status > "$output" 2>&1 &
+  pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "changed-control initial claim validation did not reach installation: $(cat "$output")"
+  fi
+  mv "$stack/.retention-attempt.claim.json" "$saved"
+  printf 'continue\n' >&8
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control initial claim validation was lost after path replacement"
+  assert_grep "invalid report retention admission claim" "$output" \
+    "changed-control initial claim validation failed outside its observation boundary"
+  assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+    || fail "changed-control initial claim validation did not install canonical admission"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "changed-control initial claim validation retried immediately"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "changed-control initial claim validation remained immediately eligible"
+  exec 7>&-; exec 8>&-
+  pass "initial claim validation survives installation races"
+}
+
+test_missing_policy_frame_item_uses_default_authority() {
+  local stack="$TMP_ROOT/mutant-contract-missing-policy-frame-item"
+  local wrapper="$TMP_ROOT/mutant-contract-missing-policy-frame-item-python" output status
+  mkdir -p "$stack/entries/cohort-1"
+  node - "$wrapper" <<'NODE'
+const fs = require("fs");
+fs.writeFileSync(process.argv[2], `#!/usr/bin/env bash
+if [ "\${2:-}" = read-fd ] && [ "\${3:-}" = .retention-policy.js ]; then
+  printf '{"items":[]}\\n'
+  exit 0
+fi
+exec "\$FM_REAL_PYTHON" "\$@"
+`);
+NODE
+  chmod +x "$wrapper"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_PYTHON="$wrapper" FM_REAL_PYTHON="$(command -v python3)" \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "changed-control missing policy frame item rejected default authority: $output"
+  assert_contains "$output" '"admitted":true,"reason":"completed"' \
+    "changed-control missing policy frame item did not complete"
+  pass "missing policy frame items use default authority"
+}
+
+test_retention_changed_control_flow_contract() {
+  local stack output status second prefix old_marker sentinel foreign_marker mismatch authority helper marker bucket expected
+
+  stack="$TMP_ROOT/mutant-contract-valid-noop"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control valid no-op failed"
+  assert_contains "$output" '"admitted":false,"reason":"no-work"' \
+    "changed-control valid no-op reached admission"
+
+  stack="$TMP_ROOT/mutant-contract-missing-root"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control missing-root no-op failed"
+  assert_contains "$output" '"admitted":false,"reason":"no-work"' \
+    "changed-control missing root was not a no-op"
+
+  stack="$TMP_ROOT/mutant-contract-force"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --force --status) || fail "changed-control forced prune failed"
+  assert_contains "$output" '"admitted":true,"reason":"forced"' \
+    "changed-control forced prune did not bypass scheduled admission"
+
+  stack="$TMP_ROOT/mutant-contract-due"
+  mkdir -p "$stack/entries/cohort-1"
+  prefix=$(retention_admission_prefix_for_stack "$stack")
+  old_marker="$RETENTION_ADMISSION_DIR/$prefix.0.json"
+  sentinel="$RETENTION_ADMISSION_DIR/$prefix.sentinel"
+  foreign_marker="$RETENTION_ADMISSION_DIR/x${prefix#?}.0.json"
+  printf 'old admission\n' > "$old_marker"
+  printf 'unrelated admission sentinel\n' > "$sentinel"
+  printf 'foreign admission marker\n' > "$foreign_marker"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control due pass failed"
+  assert_contains "$output" '"admitted":true,"reason":"completed"' \
+    "changed-control due pass did not complete"
+  [ "$(find "$stack" -mindepth 1 -maxdepth 1 -name '.*retention-attempt.json.candidate.*' | wc -l | tr -d ' ')" -eq 0 ] \
+    || fail "changed-control due pass leaked a canonical admission candidate"
+  assert_absent "$old_marker" "root-independent admission did not retire an old bucket"
+  assert_present "$sentinel" "root-independent admission cleanup removed an unrelated entry"
+  assert_present "$foreign_marker" "root-independent admission cleanup crossed its stack namespace"
+  [ "$(find "$RETENTION_ADMISSION_DIR" -mindepth 1 -maxdepth 1 -type f -name "$prefix.*.json" | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "root-independent admission did not retain exactly its current bucket"
+  test_fresh_retention_marker_short_circuits_installation
+  test_initial_claim_validation_survives_installation_race
+  test_missing_policy_frame_item_uses_default_authority
+  test_candidate_prelink_contract
+  test_candidate_postlink_contract
+
+  stack="$TMP_ROOT/mutant-contract-internal-cadence"
+  mkdir -p "$stack/entries/cohort-1"
+  node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()})+"\n")' \
+    "$stack/.retention-attempt.json"
+  prefix=$(retention_admission_prefix_for_stack "$stack")
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control internal cadence failed"
+  assert_contains "$output" '"admitted":false,"reason":"cadence"' \
+    "changed-control internal marker did not suppress admission"
+  [ "$(find "$RETENTION_ADMISSION_DIR" -mindepth 1 -maxdepth 1 -name "$prefix.*.json" | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "root-independent admission did not remain durable after internal cadence"
+
+  stack="$TMP_ROOT/mutant-contract-cutover"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  printf 'pending cutover\n' > "$stack/.retention-cutover.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control cutover marker became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control cutover marker missed admission"
+
+  stack="$TMP_ROOT/mutant-contract-legacy-cutover"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  printf 'pending legacy cutover\n' > "$stack/.legacy-cutover.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control legacy cutover marker became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control legacy cutover marker missed admission"
+
+  stack="$TMP_ROOT/mutant-contract-due-cohort"
+  write_retention_scale_fixture "$stack" 0 1 valid
+  mv "$(find "$stack/entries" -mindepth 1 -maxdepth 1 -type d -print -quit)" "$stack/entries/cohort-1"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control due cohort became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control due cohort missed admission"
+
+  stack="$TMP_ROOT/mutant-contract-cohort-file"
+  write_retention_scale_fixture "$stack" 0 0 valid
+  printf 'not a cohort directory\n' > "$stack/entries/cohort-9999999999999"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control cohort-shaped file became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control cohort directory predicate missed its boundary"
+
+  stack="$TMP_ROOT/mutant-contract-noncohort-directory"
+  write_retention_scale_fixture "$stack" 0 0 stale
+  mkdir "$stack/entries/.hidden-cohort"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control hidden non-cohort failed"
+  assert_contains "$output" '"admitted":false,"reason":"no-work"' \
+    "changed-control hidden non-cohort was treated as a cohort"
+
+  for authority in tmp-file tmp-name tmp-age; do
+    stack="$TMP_ROOT/mutant-contract-$authority"
+    write_retention_scale_fixture "$stack" 0 0 valid
+    case "$authority" in
+      tmp-file)
+        printf 'not a directory\n' > "$stack/entries/.report.1.tmp"
+        touch -t 200001010000 "$stack/entries/.report.1.tmp"
+        ;;
+      tmp-name)
+        mkdir "$stack/entries/.hidden-staging"
+        touch -t 200001010000 "$stack/entries/.hidden-staging"
+        ;;
+      tmp-age)
+        mkdir "$stack/entries/.report.1.tmp"
+        ;;
+    esac
+    output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      "$SCRIPT" prune --status) || fail "changed-control $authority negative control failed"
+    assert_contains "$output" '"admitted":false,"reason":"no-work"' \
+      "changed-control $authority negative control became due"
+  done
+
+  stack="$TMP_ROOT/mutant-contract-previous-file"
+  write_retention_scale_fixture "$stack" 0 0 valid
+  printf 'not a recovery directory\n' > "$stack/entries/.report.previous"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control previous-file negative control failed"
+  assert_contains "$output" '"admitted":false,"reason":"no-work"' \
+    "changed-control previous-file negative control became due"
+
+  stack="$TMP_ROOT/mutant-contract-wrong-root"
+  printf 'wrong root\n' > "$stack"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control wrong root unexpectedly completed"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control wrong root retried"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "changed-control wrong root was not root-independently throttled"
+
+  stack="$TMP_ROOT/mutant-contract-malformed-policy"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  printf 'malformed policy\n' > "$stack/.retention-policy.js"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control malformed policy unexpectedly completed"
+  assert_contains "$output" "invalid report retention authority" \
+    "changed-control malformed policy missed validation"
+  second=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    "$SCRIPT" prune --status) || fail "changed-control malformed policy retried"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "changed-control malformed policy was immediately eligible"
+
+  stack="$TMP_ROOT/mutant-contract-index-schema"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  node - "$stack/.retention-policy.js" "$stack/index.html" <<'NODE'
+const fs = require("fs");
+const [policyFile, indexFile] = process.argv.slice(2);
+const source = fs.readFileSync(policyFile, "utf8").trim();
+const policy = JSON.parse(source.match(/^window\.firstmateRetentionPolicy=(\{.*\});$/)[1]);
+fs.writeFileSync(indexFile, `<!-- firstmate-retention ${JSON.stringify({ ...policy, schemaVersion: 2 })} -->\nexisting index\n`);
+NODE
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control index schema mismatch became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control index schema mismatch missed admission"
+
+  stack="$TMP_ROOT/mutant-contract-index-header-limit"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  node - "$stack/.retention-policy.js" "$stack/index.html" <<'NODE'
+const fs = require("fs");
+const [policyFile, indexFile] = process.argv.slice(2);
+const source = fs.readFileSync(policyFile, "utf8").trim();
+const policy = JSON.parse(source.match(/^window\.firstmateRetentionPolicy=(\{.*\});$/)[1]);
+const json = JSON.stringify(policy);
+const prefix = `<!-- firstmate-retention ${json.slice(0, -1)}`;
+const suffix = "} -->";
+const padding = 512 - Buffer.byteLength(prefix + suffix);
+if (padding < 0) throw new Error("authority fixture exceeds its intended boundary");
+fs.writeFileSync(indexFile, `${prefix}${" ".repeat(padding)}${suffix}x`);
+NODE
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control unterminated index header became a no-op"
+  assert_contains "$output" "synthetic report publication lock setup failure" \
+    "changed-control index header limit missed admission"
+
+  test_retention_changed_index_read_races
+
+  for stack in \
+    "$TMP_ROOT/mutant-contract-stale-index" \
+    "$TMP_ROOT/mutant-contract-cutoff-index" \
+    "$TMP_ROOT/mutant-contract-corrupt-index"; do
+    case "$stack" in
+      *stale*) write_retention_scale_fixture "$stack" 1 1 stale ;;
+      *cutoff*) write_retention_scale_fixture "$stack" 1 1 cutoff ;;
+      *) write_retention_scale_fixture "$stack" 1 1 corrupt ;;
+    esac
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "changed-control invalid index authority became a no-op at $stack"
+    assert_contains "$output" "synthetic report publication lock setup failure" \
+      "changed-control invalid index authority missed the lock boundary at $stack"
+  done
+
+  for stack in \
+    "$TMP_ROOT/mutant-contract-entries-symlink" \
+    "$TMP_ROOT/mutant-contract-transaction" \
+    "$TMP_ROOT/mutant-contract-previous" \
+    "$TMP_ROOT/mutant-contract-aged-temp" \
+    "$TMP_ROOT/mutant-contract-public-entry" \
+    "$TMP_ROOT/mutant-contract-tombstone"; do
+    mkdir -p "$stack"
+    case "$stack" in
+      *entries-symlink*) ln -s missing "$stack/entries" ;;
+      *transaction*) mkdir -p "$stack/entries"; printf 'transaction\n' > "$stack/entries/.report.transaction" ;;
+      *previous*) mkdir -p "$stack/entries/.report.previous" ;;
+      *aged-temp*) mkdir -p "$stack/entries/.report.1.tmp"; touch -t 200001010000 "$stack/entries/.report.1.tmp" ;;
+      *public-entry*) mkdir -p "$stack/entries/report-visible" ;;
+      *tombstone*) mkdir -p "$stack/entries" "$stack/.retention-tombstones/tombstone-1" ;;
+    esac
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "changed-control recovery work became a no-op at $stack"
+    assert_contains "$output" "synthetic report publication lock setup failure" \
+      "changed-control recovery work missed admission at $stack"
+  done
+
+  stack="$TMP_ROOT/mutant-contract-malformed-marker"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'malformed admission\n' > "$stack/.retention-attempt.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control malformed marker unexpectedly completed"
+  assert_contains "$output" "invalid report retention attempt marker" \
+    "changed-control malformed marker missed validation"
+  assert_valid_fresh_retention_attempt "$stack/.retention-attempt.json" \
+    || fail "changed-control malformed marker did not restore canonical admission"
+  [ "$(find "$stack" -mindepth 1 -maxdepth 1 -name '.*retention-attempt.json.invalid.*' | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "changed-control malformed marker was not persistently quarantined"
+
+  stack="$TMP_ROOT/mutant-contract-marker-schema"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:2,attemptedAtMs:Date.now()})+"\n")' \
+    "$stack/.retention-attempt.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control marker schema mismatch unexpectedly completed"
+  assert_contains "$output" "invalid report retention attempt marker" \
+    "changed-control marker schema mismatch missed validation"
+
+  for authority in integral negative; do
+    stack="$TMP_ROOT/mutant-contract-marker-$authority"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    mkdir "$stack/entries/cohort-1"
+    if [ "$authority" = integral ]; then
+      node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:String(Date.now())})+"\n")' \
+        "$stack/.retention-attempt.json"
+    else
+      printf '{"schemaVersion":1,"attemptedAtMs":-1}\n' > "$stack/.retention-attempt.json"
+    fi
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    [ "$status" -ne 0 ] || fail "changed-control marker $authority mismatch unexpectedly completed"
+    assert_contains "$output" "invalid report retention attempt marker" \
+      "changed-control marker $authority mismatch missed validation"
+  done
+
+  stack="$TMP_ROOT/mutant-contract-fresh-invalid-claim"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+  printf 'partial claim\n' > "$stack/.retention-attempt.claim.json"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "changed-control fresh invalid claim rejected its bounded fallback"
+  assert_contains "$output" '"admitted":false,"reason":"cadence"' \
+    "changed-control fresh invalid claim missed bounded fallback"
+
+  stack="$TMP_ROOT/mutant-contract-fresh-valid-claim"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+  node -e 'require("fs").writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()})+"\n")' \
+    "$stack/.retention-attempt.claim.json"
+  output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status) \
+    || fail "changed-control fresh valid claim failed"
+  assert_contains "$output" '"admitted":false,"reason":"cadence"' \
+    "changed-control fresh valid claim missed cadence"
+
+  stack="$TMP_ROOT/mutant-contract-stale-claim"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1" "$stack/.retention-attempt.claim.json"
+  printf '{"schemaVersion":1,"attemptedAtMs":0}\n' > "$stack/.retention-attempt.json"
+  touch -t 200001010000 "$stack/.retention-attempt.claim.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control stale wrong-type claim unexpectedly completed"
+  assert_contains "$output" "report retention admission claim" \
+    "changed-control stale wrong-type claim missed validation"
+  assert_absent "$stack/.retention-attempt.claim.json" \
+    "changed-control stale wrong-type claim was not retired after canonical admission"
+
+  stack="$TMP_ROOT/mutant-contract-future-marker"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  node -e '
+    const fs=require("fs");
+    fs.writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n");
+    const old=new Date(Date.now()-7200000);
+    fs.utimesSync(process.argv[1],old,old);
+  ' "$stack/.retention-attempt.json"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control future marker unexpectedly completed"
+  assert_contains "$output" "invalid report retention attempt marker" \
+    "changed-control future marker missed timestamp validation"
+
+  for authority in recent future-mtime; do
+    stack="$TMP_ROOT/mutant-contract-future-$authority"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    mkdir "$stack/entries/cohort-1"
+    node -e '
+      const fs=require("fs");
+      fs.writeFileSync(process.argv[1],JSON.stringify({schemaVersion:1,attemptedAtMs:Date.now()+86400000})+"\n");
+      if (process.argv[2] === "future-mtime") {
+        const future=new Date(Date.now()+86400000);
+        fs.utimesSync(process.argv[1],future,future);
+      }
+    ' "$stack/.retention-attempt.json" "$authority"
+    if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3600 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    if [ "$authority" = recent ]; then
+      [ "$status" -eq 0 ] || fail "changed-control recent future marker rejected bounded fallback"
+      assert_contains "$output" '"admitted":false,"reason":"cadence"' \
+        "changed-control recent future marker missed bounded fallback"
+    else
+      [ "$status" -ne 0 ] || fail "changed-control future file timestamp bypassed validation"
+      assert_contains "$output" "invalid report retention attempt marker" \
+        "changed-control future file timestamp missed validation"
+    fi
+  done
+
+  stack="$TMP_ROOT/mutant-contract-post-quarantine"
+  write_retention_scale_fixture "$stack" 1 1 valid
+  mkdir "$stack/entries/cohort-1"
+  printf 'malformed admission\n' > "$stack/.retention-attempt.json"
+  mismatch="$TMP_ROOT/mutant-contract-post-quarantine.used"
+  if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_RETENTION_INTERVAL=3600 FM_CONTAINED_QUARANTINE_DEVICE_MISMATCH_TEST="$mismatch" \
+    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control post-quarantine mismatch unexpectedly completed"
+  assert_contains "$output" "owned entry generation changed during quarantine" \
+    "changed-control post-quarantine mismatch missed helper validation"
+
+  test_quarantine_error_after_absence_contract
+  test_post_quarantine_replacement_contract
+
+  for authority in batch batch-zero cohort cohort-zero interval interval-zero interval-overflow drift; do
+    stack="$TMP_ROOT/mutant-contract-invalid-$authority"
+    write_retention_scale_fixture "$stack" 1 1 valid
+    case "$authority" in
+      batch)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_BATCH=invalid "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      batch-zero)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_BATCH=0 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      cohort)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_COHORT_MS=invalid "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      cohort-zero)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_COHORT_MS=0 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      interval)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_INTERVAL=1.5 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      interval-zero)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_INTERVAL=0 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      interval-overflow)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_INTERVAL=9007199254740991 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+      drift)
+        if output=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+          FM_REPORT_RETENTION_COHORT_MS=1296000000 FM_REPORT_RETENTION_INTERVAL=1 \
+          "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+        ;;
+    esac
+    [ "$status" -ne 0 ] || fail "changed-control invalid $authority configuration unexpectedly completed"
+    prefix=$(retention_admission_prefix_for_stack "$stack")
+    marker=$(find "$RETENTION_ADMISSION_DIR" -mindepth 1 -maxdepth 1 -type f -name "$prefix.*.json" -print -quit)
+    [ -n "$marker" ] || fail "changed-control invalid $authority configuration missed root-independent admission"
+    case "$authority" in
+      interval*)
+        bucket=${marker#"$RETENTION_ADMISSION_DIR/$prefix."}
+        bucket=${bucket%.json}
+        expected=$(node -e 'process.stdout.write(String(Math.floor(Date.now()/300000)))')
+        case "$bucket" in *[!0-9]*|'') fail "changed-control invalid $authority configuration used a non-fallback bucket" ;; esac
+        [ "$bucket" -ge $((expected - 1)) ] && [ "$bucket" -le $((expected + 1)) ] \
+          || fail "changed-control invalid $authority configuration bypassed the five-minute admission fallback"
+        ;;
+    esac
+  done
+
+  helper=$(dirname "$SCRIPT")/fm-contained-read.py
+  if output=$(python3 "$helper" quarantine-owned-entry-fd 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control quarantine helper accepted missing arguments"
+  assert_contains "$output" "usage: fm-contained-read.py quarantine-owned-entry-fd" \
+    "changed-control quarantine helper missed argument validation"
+  stack="$TMP_ROOT/mutant-contract-helper-root"
+  mkdir -p "$stack"
+  if output=$(python3 "$helper" quarantine-owned-entry-fd safe/source 0:0 quarantine 3<"$stack" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control quarantine helper accepted an unsafe component"
+  assert_contains "$output" "owned entry names must be single safe components" \
+    "changed-control quarantine helper missed component validation"
+  printf 'source\n' > "$stack/source"
+  if output=$(python3 "$helper" quarantine-owned-entry-fd source 0:0 safe/quarantine 3<"$stack" 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "changed-control quarantine helper accepted an unsafe destination"
+  assert_contains "$output" "owned entry names must be single safe components" \
+    "changed-control quarantine helper missed destination validation"
+
+  test_installed_retention_marker_contract
+  test_retention_invalid_marker_quarantine_is_inode_owned
+  test_retention_quarantine_postrename_predicate_mutations
+  test_retention_admission_and_lock_share_root_generation
+  pass "changed retention control flow has valid positive and negative controls"
+}
+
+test_retention_admission_mutation_inventory_is_complete() {
+  node - "$ROOT" "$ROOT/tests/fm-report-stack-suite.sh" "$TMP_ROOT/changed-control-mutants" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { spawn, spawnSync } = require("child_process");
+const [root, suite, mutantRoot] = process.argv.slice(2);
+const base = "68f014697d0eea733a4e7c0294becff4e76c7bcf";
+const javascriptFile = path.join(root, "bin", "fm-report-stack.mjs");
+const pythonFile = path.join(root, "bin", "fm-contained-read.py");
+const parserFile = path.join(root, "bin", "fm-markdown-structure.cjs");
+
+function changedLines(file) {
+  const relative = path.relative(root, file);
+  const diff = spawnSync("git", ["-C", root, "diff", "--unified=0", base, "--", relative], { encoding: "utf8" });
+  if (diff.status !== 0) throw new Error(`could not derive changed lines for ${relative}: ${diff.stderr}`);
+  const result = new Set();
+  for (const line of diff.stdout.split("\n")) {
+    const match = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+    if (!match) continue;
+    const start = Number(match[1]);
+    const count = match[2] === undefined ? 1 : Number(match[2]);
+    for (let index = 0; index < count; index += 1) result.add(start + index);
+  }
+  return result;
+}
+
+function lineStarts(source) {
+  const starts = [0];
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\n") starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineForOffset(starts, offset) {
+  let low = 0;
+  let high = starts.length;
+  while (low + 1 < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (starts[middle] <= offset) low = middle;
+    else high = middle;
+  }
+  return low + 1;
+}
+
+function scrubJavascript(source) {
+  const output = [...source];
+  let index = 0;
+  let state = "code";
+  while (index < source.length) {
+    if (state === "code") {
+      if (source.startsWith("//", index)) {
+        output[index] = output[index + 1] = " ";
+        index += 2;
+        state = "line";
+      } else if (source.startsWith("/*", index)) {
+        output[index] = output[index + 1] = " ";
+        index += 2;
+        state = "block";
+      } else if (source[index] === "\"" || source[index] === "'" || source[index] === "`") {
+        state = source[index];
+        output[index] = " ";
+        index += 1;
+      } else {
+        index += 1;
+      }
+    } else if (state === "line") {
+      if (source[index] === "\n") state = "code";
+      else output[index] = " ";
+      index += 1;
+    } else if (state === "block") {
+      if (source.startsWith("*/", index)) {
+        output[index] = output[index + 1] = " ";
+        index += 2;
+        state = "code";
+      } else {
+        if (source[index] !== "\n") output[index] = " ";
+        index += 1;
+      }
+    } else if (source[index] === "\\") {
+      output[index] = " ";
+      index += 1;
+      if (index < source.length) output[index] = " ";
+      index += 1;
+    } else if (source[index] === state) {
+      output[index] = " ";
+      index += 1;
+      state = "code";
+    } else {
+      if (source[index] !== "\n") output[index] = " ";
+      index += 1;
+    }
+  }
+  return output.join("");
+}
+
+function javascriptPredicates() {
+  const source = fs.readFileSync(javascriptFile, "utf8");
+  const clean = scrubJavascript(source);
+  const changed = changedLines(javascriptFile);
+  const starts = lineStarts(source);
+  const predicates = [];
+  function logicalLeaves(start, end, fallbackReplacement = "false") {
+    while (start < end && /\s/.test(source[start])) start += 1;
+    while (end > start && /\s/.test(source[end - 1])) end -= 1;
+    if (clean[start] === "(") {
+      let depth = 0;
+      let closesAtEnd = false;
+      for (let index = start; index < end; index += 1) {
+        if (clean[index] === "(") depth += 1;
+        else if (clean[index] === ")") {
+          depth -= 1;
+          if (depth === 0) {
+            closesAtEnd = index === end - 1;
+            break;
+          }
+        }
+      }
+      if (closesAtEnd) return logicalLeaves(start + 1, end - 1, fallbackReplacement);
+    }
+    for (const operator of ["||", "&&"]) {
+      const separators = [];
+      let round = 0;
+      let square = 0;
+      let brace = 0;
+      for (let index = start; index < end - 1; index += 1) {
+        if (clean[index] === "(") round += 1;
+        else if (clean[index] === ")") round -= 1;
+        else if (clean[index] === "[") square += 1;
+        else if (clean[index] === "]") square -= 1;
+        else if (clean[index] === "{") brace += 1;
+        else if (clean[index] === "}") brace -= 1;
+        if (round === 0 && square === 0 && brace === 0 && clean.startsWith(operator, index)) {
+          separators.push(index);
+          index += 1;
+        }
+      }
+      if (!separators.length) continue;
+      const replacement = operator === "||" ? "false" : "true";
+      const result = [];
+      let segmentStart = start;
+      for (const separator of separators) {
+        result.push(...logicalLeaves(segmentStart, separator, replacement));
+        segmentStart = separator + 2;
+      }
+      result.push(...logicalLeaves(segmentStart, end, replacement));
+      return result;
+    }
+    return [{ start, end, replacement: fallbackReplacement }];
+  }
+  const pattern = /\bif\s*\(/g;
+  for (const match of clean.matchAll(pattern)) {
+    const open = clean.indexOf("(", match.index);
+    let depth = 0;
+    let close = open;
+    for (; close < clean.length; close += 1) {
+      if (clean[close] === "(") depth += 1;
+      else if (clean[close] === ")") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (depth !== 0) throw new Error(`unterminated changed predicate at ${javascriptFile}:${lineForOffset(starts, open)}`);
+    const firstLine = lineForOffset(starts, match.index);
+    const lastLine = lineForOffset(starts, close);
+    if (![...changed].some((line) => line >= firstLine && line <= lastLine)) continue;
+    const branchPredicate = source.slice(open + 1, close);
+    if (/process\.env\.[A-Z0-9_]*(?:_TEST|TEST_)/.test(branchPredicate)) continue;
+    if (branchPredicate.includes("retentionInvalidMarkerTestGateUsed")) continue;
+    for (const leaf of logicalLeaves(open + 1, close)) {
+      const predicate = source.slice(leaf.start, leaf.end).replace(/\s+/g, " ").trim();
+      predicates.push({
+        file: javascriptFile,
+        source,
+        start: leaf.start,
+        end: leaf.end,
+        line: lineForOffset(starts, leaf.start),
+        predicate,
+        replacement: leaf.replacement,
+      });
+    }
+  }
+  return predicates;
+}
+
+function pythonPredicates() {
+  const changed = [...changedLines(pythonFile)];
+  const program = String.raw`
+import ast, json, sys
+source = open(sys.argv[1], encoding="utf-8").read()
+changed = set(json.loads(sys.argv[2]))
+tree = ast.parse(source)
+lines = source.splitlines(keepends=True)
+offsets = [0]
+for line in lines:
+    offsets.append(offsets[-1] + len(line))
+parents = {}
+for parent in ast.walk(tree):
+    for child in ast.iter_child_nodes(parent):
+        parents[child] = parent
+
+hook_names = set()
+for node in ast.walk(tree):
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        continue
+    value = node.value
+    if not isinstance(value, ast.Call) or not value.args:
+        continue
+    if not isinstance(value.args[0], ast.Constant) or not isinstance(value.args[0].value, str):
+        continue
+    if "FM_" not in value.args[0].value or "TEST" not in value.args[0].value:
+        continue
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    for target in targets:
+        if isinstance(target, ast.Name):
+            hook_names.add(target.id)
+
+def uses_hook_name(test):
+    return any(isinstance(item, ast.Name) and item.id in hook_names for item in ast.walk(test))
+
+def test_hook(node):
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, ast.If) and uses_hook_name(current.test):
+            return True
+    return uses_hook_name(node.test)
+
+result = []
+def logical_leaves(test, fallback=False):
+    if isinstance(test, ast.BoolOp):
+        replacement = True if isinstance(test.op, ast.And) else False
+        leaves = []
+        for value in test.values:
+            leaves.extend(logical_leaves(value, replacement))
+        return leaves
+    return [(test, fallback)]
+
+for node in ast.walk(tree):
+    if not isinstance(node, ast.If):
+        continue
+    test = node.test
+    if not any(line in changed for line in range(test.lineno, test.end_lineno + 1)):
+        continue
+    if test_hook(node):
+        continue
+    for leaf, replacement in logical_leaves(test):
+        start = offsets[leaf.lineno - 1] + leaf.col_offset
+        end = offsets[leaf.end_lineno - 1] + leaf.end_col_offset
+        result.append({"start": start, "end": end, "line": leaf.lineno, "predicate": ast.get_source_segment(source, leaf), "replacement": replacement})
+print(json.dumps(result))
+`;
+  const parsed = spawnSync("python3", ["-c", program, pythonFile, JSON.stringify(changed)], { encoding: "utf8" });
+  if (parsed.status !== 0) throw new Error(`could not derive Python predicates: ${parsed.stderr}`);
+  const source = fs.readFileSync(pythonFile, "utf8");
+  return JSON.parse(parsed.stdout).map((item) => ({ ...item, file: pythonFile, source, predicate: item.predicate.replace(/\s+/g, " ").trim() }));
+}
+
+const predicates = [...javascriptPredicates(), ...pythonPredicates()];
+if (predicates.length < 40) throw new Error(`changed-control predicate derivation was unexpectedly narrow (${predicates.length})`);
+fs.mkdirSync(mutantRoot, { recursive: true });
+const jobs = [];
+for (const [index, predicate] of predicates.entries()) {
+  for (const replacement of [predicate.replacement]) {
+    const directory = path.join(mutantRoot, `${String(index + 1).padStart(3, "0")}-${replacement}`);
+    const bin = path.join(directory, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    const javascript = predicate.file === javascriptFile
+      ? predicate.source.slice(0, predicate.start) + replacement + predicate.source.slice(predicate.end)
+      : fs.readFileSync(javascriptFile, "utf8");
+    const python = predicate.file === pythonFile
+      ? predicate.source.slice(0, predicate.start) + (replacement === "true" ? "True" : "False") + predicate.source.slice(predicate.end)
+      : fs.readFileSync(pythonFile, "utf8");
+    const executable = path.join(bin, "fm-report-stack.mjs");
+    fs.writeFileSync(executable, javascript);
+    fs.writeFileSync(path.join(bin, "fm-contained-read.py"), python);
+    fs.copyFileSync(parserFile, path.join(bin, "fm-markdown-structure.cjs"));
+    fs.chmodSync(executable, 0o755);
+    fs.chmodSync(path.join(bin, "fm-contained-read.py"), 0o755);
+    jobs.push({ index, predicate, replacement, executable });
   }
 }
-const missing = [...inventory.keys()].filter((name) => !covered.has(name));
-const stale = [...covered].filter((name) => !inventory.has(name));
-if (missing.length || stale.length) {
-  throw new Error(`admission mutation inventory mismatch; missing=${missing.join(",")}; stale=${stale.join(",")}`);
+
+function runContract(executable) {
+  return new Promise((resolve) => {
+    const child = spawn("bash", [suite], {
+      env: { ...process.env, FM_TEST_FOCUSED: "retention-mutant-contract", FM_REPORT_STACK_SCRIPT_OVERRIDE: executable },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let timedOut = false;
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 900000);
+    child.on("close", (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, timedOut, output });
+    });
+  });
 }
-const tests = fs.readFileSync(testFile, "utf8");
-for (const [name, location] of inventory) {
-  if (tests.split(name).length < 3) throw new Error(`admission predicate lacks mutation evidence: ${name} at ${location}`);
-  process.stdout.write(`ok - admission predicate ${location} ${name} mutation=red\n`);
+
+async function main() {
+  const positive = await runContract(javascriptFile);
+  if (positive.status !== 0) throw new Error(`changed-control positive controls failed:\n${positive.output}`);
+
+  const results = new Array(jobs.length);
+  let nextJob = 0;
+  async function worker() {
+    while (true) {
+      const jobIndex = nextJob;
+      nextJob += 1;
+      if (jobIndex >= jobs.length) return;
+      results[jobIndex] = await runContract(jobs[jobIndex].executable);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(8, jobs.length) }, () => worker()));
+
+  const failures = [];
+  for (const [jobIndex, job] of jobs.entries()) {
+    const result = results[jobIndex];
+    const reason = result.output.split("\n").find((line) => line.startsWith("not ok -"));
+    if (result.status === 0 || !reason) {
+      failures.push(`${path.relative(root, job.predicate.file)}:${job.predicate.line} ${job.replacement} survived status=${result.status} signal=${result.signal || ""} timedOut=${result.timedOut}`);
+      continue;
+    }
+    job.reason = reason.replace(/^not ok -\s*/, "").slice(0, 180);
+  }
+  if (failures.length) throw new Error(`uncovered or unexecuted changed-control mutants:\n${failures.join("\n")}`);
+
+  for (const [index, predicate] of predicates.entries()) {
+    const falseJob = jobs[index];
+    process.stdout.write(`ok - executed mutant ${path.relative(root, predicate.file)}:${predicate.line} predicate=${JSON.stringify(predicate.predicate)} replacement=${falseJob.replacement} red=${JSON.stringify(falseJob.reason)}\n`);
+  }
 }
+main().catch((error) => { console.error(error.stack || error.message); process.exit(1); });
 NODE
-  pass "code-derived admission predicate inventory is mutation-complete"
+  [ "$?" -eq 0 ] || fail "changed-control mutation inventory failed"
+  pass "complete changed control flow has executed red mutants"
 }
 
 test_invalid_retention_configuration_is_admitted_before_validation() {
@@ -3472,13 +4572,13 @@ test_retention_admission_and_lock_share_root_generation() {
   assert_absent "$old_stack/.publish.lock" "original stack generation received a lock after its path was replaced"
   assert_absent "$stack/.publish.lock" "replacement stack generation received an unadmitted lock"
 
-  if contender=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+  contender=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_RETENTION_INTERVAL=3600 FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 \
-    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
-  [ "$status" -ne 0 ] || fail "replacement generation lock-boundary positive control unexpectedly succeeded"
-  assert_contains "$contender" "synthetic report publication lock setup failure" \
-    "replacement generation could not claim and reach its own lock boundary"
-  assert_present "$stack/.retention-attempt.json" "replacement generation did not own its lock admission"
+    "$SCRIPT" prune --status) \
+    || fail "replacement generation did not observe the root-independent admission"
+  assert_contains "$contender" '"admitted":false,"reason":"cadence"' \
+    "replacement root generation split the fleet admission namespace"
+  assert_absent "$stack/.retention-attempt.json" "replacement generation installed a second local admission"
   assert_absent "$old_stack/.publish.lock" "root swap split the admitted attempt across lock namespaces"
   exec 7>&-; exec 8>&-
   pass "retention admission and publication lock remain on one root generation"
@@ -5269,10 +6369,16 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-fixtures ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = retention-mutant-contract ]; then
+  test_retention_changed_control_flow_contract
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
   test_noop_retention_skips_helpers_and_publication_lock_at_scale
   test_retention_admission_bounds_total_fleet_attempts_above_current_population
   test_failed_retention_attempt_is_ineligible_on_the_next_loop
+  test_wrong_type_stack_root_is_root_independently_admitted
   test_malformed_retention_attempt_is_replaced_before_validation_error
   test_retention_invalid_marker_quarantine_is_inode_owned
   test_retention_admission_recovers_every_marker_path_type
@@ -5294,6 +6400,7 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = retention-admission-integrity ]; then
+  test_wrong_type_stack_root_is_root_independently_admitted
   test_malformed_retention_attempt_is_replaced_before_validation_error
   test_retention_invalid_marker_quarantine_is_inode_owned
   test_retention_admission_recovers_every_marker_path_type
@@ -5419,6 +6526,7 @@ run_partitioned_test test_watcher_periodically_owns_idle_report_retention
 run_partitioned_test test_noop_retention_skips_helpers_and_publication_lock_at_scale
 run_partitioned_test test_retention_admission_bounds_total_fleet_attempts_above_current_population
 run_partitioned_test test_failed_retention_attempt_is_ineligible_on_the_next_loop
+run_partitioned_test test_wrong_type_stack_root_is_root_independently_admitted
 run_partitioned_test test_malformed_retention_attempt_is_replaced_before_validation_error
 run_partitioned_test test_retention_invalid_marker_quarantine_is_inode_owned
 run_partitioned_test test_retention_admission_recovers_every_marker_path_type

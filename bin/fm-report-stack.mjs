@@ -62,6 +62,9 @@ const retentionPolicyName = ".retention-policy.js";
 const retentionAttemptName = ".retention-attempt.json";
 const retentionAttemptClaimName = ".retention-attempt.claim.json";
 const retentionAdmissionClockSkewMs = 60 * 1000;
+const retentionAdmissionDirectory = path.resolve(process.env.FM_REPORT_RETENTION_ADMISSION_DIR || os.tmpdir());
+const retentionAdmissionScope = crypto.createHash("sha256").update(configuredStackRoot).digest("hex").slice(0, 24);
+const retentionAdmissionPrefix = `.firstmate-report-retention-${process.getuid?.() ?? "user"}-${retentionAdmissionScope}`;
 const retentionIndexAuthorityLimit = 512;
 let retentionInvalidMarkerTestGateUsed = false;
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
@@ -386,21 +389,34 @@ function readBoundedRegularFile(file, maxBytes, label) {
 
 function readRegularFileFirstLine(file, maxBytes, label) {
   const initial = fs.lstatSync(file);
-  if (initial.isSymbolicLink() || !initial.isFile()) throw new Error(`${label} must be a real regular file at ${file}`);
+  runTestFifoHandshake(
+    "FM_REPORT_RETENTION_INDEX_PREOPEN_TEST_READY",
+    "FM_REPORT_RETENTION_INDEX_PREOPEN_TEST_PROCEED",
+    "index-observed\n",
+    "report retention index pre-open test gate",
+  );
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   const descriptor = fs.openSync(file, flags);
   try {
     const opened = fs.fstatSync(descriptor);
-    if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino) {
+    const openedStable = opened.isFile() && `${opened.dev}:${opened.ino}` === `${initial.dev}:${initial.ino}`;
+    if (!openedStable) {
       throw new Error(`${label} must be a stable real regular file at ${file}`);
     }
     const buffer = Buffer.alloc(maxBytes + 1);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
     const newline = buffer.subarray(0, bytesRead).indexOf(10);
-    if (newline < 0 || newline > maxBytes) throw new Error(`${label} exceeds its ${maxBytes}-byte header limit at ${file}`);
+    if (newline < 0) throw new Error(`${label} exceeds its ${maxBytes}-byte header limit at ${file}`);
+    runTestFifoHandshake(
+      "FM_REPORT_RETENTION_INDEX_POSTREAD_TEST_READY",
+      "FM_REPORT_RETENTION_INDEX_POSTREAD_TEST_PROCEED",
+      "index-read\n",
+      "report retention index post-read test gate",
+    );
     const current = fs.lstatSync(file);
-    if (current.isSymbolicLink() || !current.isFile()
-      || current.dev !== opened.dev || current.ino !== opened.ino) {
+    const currentStable = !current.isSymbolicLink() && current.isFile()
+      && `${current.dev}:${current.ino}` === `${opened.dev}:${opened.ino}`;
+    if (!currentStable) {
       throw new Error(`${label} changed while reading ${file}`);
     }
     return buffer.subarray(0, newline).toString("utf8").replace(/\r$/, "");
@@ -675,10 +691,13 @@ function indexPage(rows, policy) {
 
 function parseRetentionIndexAuthority(source) {
   const match = source.match(/^<!-- firstmate-retention (\{.*\}) -->$/);
-  if (!match) throw new Error("invalid report retention authority in index.html");
-  const authority = JSON.parse(match[1]);
-  if (authority.schemaVersion !== 1 || typeof authority.generation !== "string"
-    || !Number.isFinite(authority.cutoffMs)) {
+  let authority;
+  try {
+    authority = JSON.parse(match?.[1] ?? "");
+  } catch {
+    throw new Error("invalid report retention authority in index.html");
+  }
+  if (authority.schemaVersion !== 1) {
     throw new Error("invalid report retention authority in index.html");
   }
   return authority;
@@ -691,8 +710,7 @@ function validateRetentionConfiguration() {
   if (!Number.isSafeInteger(reportRetentionCohortMs) || reportRetentionCohortMs <= 0) {
     throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer");
   }
-  if (!Number.isSafeInteger(reportRetentionSweepSeconds) || reportRetentionSweepSeconds <= 0
-    || !Number.isSafeInteger(reportRetentionSweepMs)) {
+  if (!Number.isSafeInteger(reportRetentionSweepSeconds) || reportRetentionSweepSeconds <= 0) {
     throw new Error("FM_REPORT_RETENTION_INTERVAL must be a positive integer number of seconds");
   }
   if (reportRetentionCohortMs + reportRetentionSweepMs > reportRetentionDriftMs) {
@@ -713,9 +731,6 @@ function checkedRetentionWorkDueWithoutLock() {
   validateRetentionConfiguration();
   const rootStat = lstatIfPresent(configuredStackRoot);
   if (!rootStat) return false;
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error(`report stack root must be a real directory at ${configuredStackRoot}`);
-  }
 
   const previousDirectory = process.cwd();
   const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
@@ -723,21 +738,20 @@ function checkedRetentionWorkDueWithoutLock() {
   let pinnedTombstones;
   try {
     process.chdir(configuredStackRoot);
-    if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
-      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
-    }
+    inspectPinnedDirectory(pinnedRoot);
     if (pathExistsNoFollow(retentionCutoverName) || pathExistsNoFollow(legacyCutoverName)) return true;
 
     const now = Date.now();
     let hasCohorts = false;
     const entriesStat = lstatIfPresent("entries");
     if (entriesStat) {
-      if (entriesStat.isSymbolicLink() || !entriesStat.isDirectory()) return true;
-      pinnedEntries = pinnedDirectory("entries", pinnedRoot.real, "report entries directory");
+      pinnedEntries = pinnedDirectory(
+        path.join(configuredStackRoot, "entries"),
+        pinnedRoot.real,
+        "report entries directory",
+      );
       process.chdir("entries");
-      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
-        throw new Error("report entries directory changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedEntries);
       for (const entry of fs.readdirSync(".", { withFileTypes: true })) {
         const deadline = retentionCohortDeadline(entry.name);
         if (entry.isDirectory() && Number.isFinite(deadline)) {
@@ -756,42 +770,27 @@ function checkedRetentionWorkDueWithoutLock() {
         }
         if (!entry.name.startsWith(".")) return true;
       }
-      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
-        throw new Error("report entries directory changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedEntries);
       process.chdir("..");
-      if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
-        throw new Error("report stack root changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedRoot);
     }
 
     const tombstonesStat = lstatIfPresent(".retention-tombstones");
     if (tombstonesStat) {
-      if (tombstonesStat.isSymbolicLink() || !tombstonesStat.isDirectory()) return true;
       pinnedTombstones = pinnedDirectory(
-        ".retention-tombstones",
+        path.join(configuredStackRoot, ".retention-tombstones"),
         pinnedRoot.real,
         "report retention tombstone directory",
       );
       process.chdir(".retention-tombstones");
-      if (!sameDirectoryIdentity(pinnedTombstones.descriptor)) {
-        throw new Error("report retention tombstone directory changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedTombstones);
       if (fs.readdirSync(".").length > 0) return true;
-      if (!sameDirectoryIdentity(pinnedTombstones.descriptor)) {
-        throw new Error("report retention tombstone directory changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedTombstones);
       process.chdir("..");
-      if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
-        throw new Error("report stack root changed while checking retention work");
-      }
+      inspectPinnedDirectory(pinnedRoot);
     }
 
     if (hasCohorts) {
-      const indexStat = lstatIfPresent("index.html");
-      const policyStat = lstatIfPresent(retentionPolicyName);
-      if (!indexStat || indexStat.isSymbolicLink() || !indexStat.isFile()
-        || !policyStat || policyStat.isSymbolicLink() || !policyStat.isFile()) return true;
       const policy = parseRetentionPolicySource(
         readBoundedRegularFile(
           retentionPolicyName,
@@ -825,9 +824,47 @@ function retentionWorkDueWithoutLock() {
 }
 
 function retentionAdmissionIntervalMs() {
-  return Number.isSafeInteger(reportRetentionSweepMs) && reportRetentionSweepMs > 0
-    ? reportRetentionSweepMs
-    : 5 * 60 * 1000;
+  let intervalMs = 5 * 60 * 1000;
+  if (Number.isSafeInteger(reportRetentionSweepSeconds) && reportRetentionSweepSeconds > 0
+    && Number.isSafeInteger(reportRetentionSweepMs)) {
+    intervalMs = reportRetentionSweepMs;
+  }
+  return intervalMs;
+}
+
+function claimRootIndependentRetentionAttempt() {
+  const attemptedAtMs = Date.now();
+  const intervalMs = retentionAdmissionIntervalMs();
+  const bucket = Math.floor(attemptedAtMs / intervalMs);
+  const markerName = `${retentionAdmissionPrefix}.${bucket}.json`;
+  const markerPath = path.join(retentionAdmissionDirectory, markerName);
+  let descriptor;
+  try {
+    descriptor = fs.openSync(markerPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") return { admitted: false };
+    throw error;
+  }
+  let observed;
+  try {
+    observed = fs.fstatSync(descriptor);
+    fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, attemptedAtMs, bucket, stackRoot: configuredStackRoot })}\n`);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  runTestFifoHandshake(
+    "FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_READY",
+    "FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_PROCEED",
+    "root-attempt-admitted\n",
+    "root-independent retention admission test gate",
+  );
+  for (const entry of fs.readdirSync(retentionAdmissionDirectory)) {
+    if (!entry.startsWith(`${retentionAdmissionPrefix}.`) || entry === markerName) continue;
+    if (!/^\d+\.json$/.test(entry.slice(retentionAdmissionPrefix.length + 1))) continue;
+    fs.unlinkSync(path.join(retentionAdmissionDirectory, entry));
+  }
+  return { admitted: true, path: markerPath, dev: observed.dev, ino: observed.ino };
 }
 
 function invalidRetentionAttemptRecord(name, label) {
@@ -890,6 +927,12 @@ function retentionAttemptPathStateAfterMutation(name, observed) {
   return "same";
 }
 
+function retentionAttemptDisposition(state) {
+  let disposition = "expired";
+  if (state.kind === "invalid") disposition = "invalid";
+  return disposition;
+}
+
 function retireObservedRetentionAttempt(name, observed, pinnedRoot, disposition) {
   if (disposition === "invalid" && !retentionInvalidMarkerTestGateUsed) {
     retentionInvalidMarkerTestGateUsed = true;
@@ -901,21 +944,23 @@ function retireObservedRetentionAttempt(name, observed, pinnedRoot, disposition)
     );
   }
   const persistentQuarantine = disposition === "invalid";
+  let helperArguments = [
+    "remove-owned-file-fd",
+    name,
+    `${observed.dev}:${observed.ino}`,
+    `.${name}.${disposition}.${crypto.randomUUID()}`,
+  ];
+  if (persistentQuarantine) {
+    helperArguments = [
+      "quarantine-owned-entry-fd",
+      name,
+      `${observed.dev}:${observed.ino}`,
+      `.${name}.${disposition}.${crypto.randomUUID()}`,
+    ];
+  }
   try {
     runContainedHelper(
-      persistentQuarantine
-        ? [
-          "quarantine-owned-entry-fd",
-          name,
-          `${observed.dev}:${observed.ino}`,
-          `.${name}.${disposition}.${crypto.randomUUID()}`,
-        ]
-        : [
-          "remove-owned-file-fd",
-          name,
-          `${observed.dev}:${observed.ino}`,
-          `.${name}.${disposition}.${crypto.randomUUID()}`,
-        ],
+      helperArguments,
       [pinnedRoot.descriptor],
       1024 * 1024,
     );
@@ -956,18 +1001,25 @@ function installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemp
       return { owned: false, observed: markerState.observed };
     }
     if (markerState.kind !== "missing") {
-      if (!retireObservedRetentionAttempt(
+      retireObservedRetentionAttempt(
         retentionAttemptName,
         markerState.observed,
         pinnedRoot,
-        markerState.kind === "invalid" ? "invalid" : "expired",
-      )) continue;
+        retentionAttemptDisposition(markerState),
+      );
+      continue;
     }
     const candidateName = `.${retentionAttemptName}.candidate.${crypto.randomUUID()}`;
     let candidateObserved;
     try {
       fs.writeFileSync(candidateName, attemptRecord, { flag: "wx", mode: 0o600 });
       candidateObserved = fs.lstatSync(candidateName);
+      runTestFifoHandshake(
+        "FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_READY",
+        "FM_REPORT_RETENTION_CANDIDATE_PRELINK_TEST_PROCEED",
+        `${candidateName}\n`,
+        "report retention candidate pre-link test gate",
+      );
       fs.linkSync(candidateName, retentionAttemptName);
       installedCandidate = candidateObserved;
       runTestFifoHandshake(
@@ -998,15 +1050,11 @@ function claimRetentionAttempt() {
   const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
   const attemptedAtMs = Date.now();
   const attemptRecord = `${JSON.stringify({ schemaVersion: 1, attemptedAtMs })}\n`;
-  let transferPinnedRoot = false;
-  let ownsClaim = false;
   try {
     process.chdir(configuredStackRoot);
-    if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
-      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
-    }
+    inspectPinnedDirectory(pinnedRoot);
     let validationError;
-    let markerState = retentionAttemptState(
+    const markerState = retentionAttemptState(
       retentionAttemptName,
       "report retention attempt marker",
       attemptedAtMs,
@@ -1014,70 +1062,49 @@ function claimRetentionAttempt() {
     if (markerState.kind === "invalid") validationError ||= markerState.error;
     if (markerState.kind === "fresh" || markerState.kind === "fallback-fresh") {
       inspectPinnedDirectory(pinnedRoot);
+      fs.closeSync(pinnedRoot.descriptor);
       return { admitted: false };
     }
-
-    for (let attempt = 0; attempt < 16; attempt += 1) {
+    const initialClaimState = retentionAttemptState(
+      retentionAttemptClaimName,
+      "report retention admission claim",
+      attemptedAtMs,
+      true,
+    );
+    if (initialClaimState.kind === "fresh" || initialClaimState.kind === "fallback-fresh") {
+      inspectPinnedDirectory(pinnedRoot);
+      fs.closeSync(pinnedRoot.descriptor);
+      return { admitted: false };
+    }
+    if (initialClaimState.error) validationError ||= initialClaimState.error;
+    runTestFifoHandshake(
+      "FM_REPORT_RETENTION_INSTALL_TEST_READY",
+      "FM_REPORT_RETENTION_INSTALL_TEST_PROCEED",
+      "attempt-installing\n",
+      "report retention installation test gate",
+    );
+    let installation;
+    try {
+      installation = installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
+      if (!installation.owned) {
+        inspectPinnedDirectory(pinnedRoot);
+        fs.closeSync(pinnedRoot.descriptor);
+        return { admitted: false };
+      }
       const claimState = retentionAttemptState(
         retentionAttemptClaimName,
         "report retention admission claim",
         attemptedAtMs,
         true,
       );
-      if (claimState.kind === "fresh" || claimState.kind === "fallback-fresh") {
-        inspectPinnedDirectory(pinnedRoot);
-        return { admitted: false };
-      }
       if (claimState.kind !== "missing") {
-        if (claimState.kind === "invalid") validationError ||= claimState.error;
-        try {
-          if (!retireObservedRetentionAttempt(
-            retentionAttemptClaimName,
-            claimState.observed,
-            pinnedRoot,
-            claimState.kind === "invalid" ? "invalid" : "expired",
-          )) continue;
-        } catch (error) {
-          installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
-          throw error;
-        }
-      }
-
-      try {
-        fs.writeFileSync(retentionAttemptClaimName, attemptRecord, { flag: "wx", mode: 0o600 });
-        ownsClaim = true;
-        break;
-      } catch (error) {
-        if (error.code === "EEXIST") continue;
-        installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
-        throw error;
-      }
-    }
-    if (!ownsClaim) {
-      installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
-      throw new Error(`report retention admission claim could not be installed at ${path.join(configuredStackRoot, retentionAttemptClaimName)}`);
-    }
-    let installation;
-    try {
-      installation = installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
-      if (!installation.owned) {
-        const claimState = retentionAttemptState(
+        if (claimState.error) validationError ||= claimState.error;
+        retireObservedRetentionAttempt(
           retentionAttemptClaimName,
-          "report retention admission claim",
-          attemptedAtMs,
-          true,
+          claimState.observed,
+          pinnedRoot,
+          retentionAttemptDisposition(claimState),
         );
-        if (claimState.kind !== "missing") {
-          retireObservedRetentionAttempt(
-            retentionAttemptClaimName,
-            claimState.observed,
-            pinnedRoot,
-            claimState.error ? "invalid" : "released",
-          );
-        }
-        ownsClaim = false;
-        inspectPinnedDirectory(pinnedRoot);
-        return { admitted: false };
       }
       runTestFifoHandshake(
         "FM_REPORT_RETENTION_INSTALLED_TEST_READY",
@@ -1103,28 +1130,13 @@ function claimRetentionAttempt() {
       installFreshCanonicalRetentionAttempt(pinnedRoot, attemptedAtMs, attemptRecord);
       throw error;
     }
-    const finalClaimState = retentionAttemptState(
-      retentionAttemptClaimName,
-      "report retention admission claim",
-      attemptedAtMs,
-      true,
-    );
-    if (finalClaimState.kind !== "missing") {
-      if (finalClaimState.error) validationError ||= finalClaimState.error;
-      retireObservedRetentionAttempt(
-        retentionAttemptClaimName,
-        finalClaimState.observed,
-        pinnedRoot,
-        finalClaimState.error ? "invalid" : "released",
-      );
-    }
-    ownsClaim = false;
     inspectPinnedDirectory(pinnedRoot);
-    transferPinnedRoot = true;
     return { admitted: true, pinnedRoot, validationError };
+  } catch (error) {
+    fs.closeSync(pinnedRoot.descriptor);
+    throw error;
   } finally {
     try { process.chdir(previousDirectory); } catch {}
-    if (!transferPinnedRoot) fs.closeSync(pinnedRoot.descriptor);
   }
 }
 
@@ -1133,14 +1145,14 @@ function acquireLock(admittedStackRoot) {
   try {
     if (!admittedStackRoot) fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
     pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
-    if (admittedStackRoot && (pinnedStackRoot.dev !== admittedStackRoot.dev
-      || pinnedStackRoot.ino !== admittedStackRoot.ino || pinnedStackRoot.real !== admittedStackRoot.real)) {
+    const lockGenerationAgrees = !admittedStackRoot
+      || `${pinnedStackRoot.dev}:${pinnedStackRoot.ino}:${pinnedStackRoot.real}`
+        === `${admittedStackRoot.dev}:${admittedStackRoot.ino}:${admittedStackRoot.real}`;
+    if (!lockGenerationAgrees) {
       throw new Error("report stack root generation changed between retention admission and publication lock acquisition");
     }
     process.chdir(configuredStackRoot);
-    if (!sameDirectoryIdentity(pinnedStackRoot.descriptor)) {
-      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
-    }
+    inspectPinnedDirectory(pinnedStackRoot);
   } catch (error) {
     try { fs.closeSync(pinnedStackRoot?.descriptor); } catch {}
     throw error;
@@ -1522,6 +1534,11 @@ function prune(force) {
       lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "no-work" };
       return;
     }
+    const rootAdmission = claimRootIndependentRetentionAttempt();
+    if (!rootAdmission.admitted) {
+      lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "cadence" };
+      return;
+    }
     const admission = claimRetentionAttempt();
     if (!admission.admitted) {
       lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "cadence" };
@@ -1545,7 +1562,7 @@ function prune(force) {
   } finally {
     try { fs.closeSync(admittedStackRoot?.descriptor); } catch {}
   }
-  lastPruneStatus = { ...lastPruneStatus, admitted: true, reason: force ? "forced" : "completed" };
+  lastPruneStatus = { ...lastPruneStatus, admitted: true, reason: ["completed", "forced"][Number(force)] };
 }
 
 function snapshotTaskArtifacts(dataRoot, taskId, sourceName, staged, sourceFile) {

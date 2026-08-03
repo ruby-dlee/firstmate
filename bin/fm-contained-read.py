@@ -1683,11 +1683,6 @@ def command_quarantine_owned_entry_fd(arguments):
     source_identity_guard = f"{before.st_dev}:{before.st_ino}" == identity
     if not source_identity_guard:
         fail("owned entry generation changed before quarantine")
-    try:
-        os.stat(quarantine, dir_fd=root, follow_symlinks=False)
-        fail("owned entry quarantine already exists")
-    except FileNotFoundError:
-        pass
     rename_noreplace(root, root, name, quarantine)
     ready = os.environ.get("FM_CONTAINED_QUARANTINE_TEST_READY")
     proceed = os.environ.get("FM_CONTAINED_QUARANTINE_TEST_PROCEED")

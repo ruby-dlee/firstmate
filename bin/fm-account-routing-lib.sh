@@ -1287,7 +1287,7 @@ fm_account_safe_lineage_value() {
 
 fm_account_meta_key_owned() {  # <key>
   case "$1" in
-    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|tasktmp_phase|model|effort|report_required|generation_id|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_endpoint|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|orca_cleanup_pending|orca_cleanup_phase|orca_terminal_proof|orca_repo_id|orca_expected_task|orca_provider_task|orca_discovery_label|orca_provider_scope|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
+    window|worktree|worktree_git_dir|worktree_git_dir_identity|worktree_git_ref|worktree_git_head|worktree_git_setup_ref|worktree_git_setup_head|project|harness|kind|mode|yolo|tasktmp|tasktmp_phase|model|effort|report_required|generation_id|runtime_home|runtime_started_at_ns|backend|tmux_window_id|tmux_session_target|account_home|direct_spawn_cleanup|direct_spawn_endpoint|direct_spawn_backup|direct_spawn_artifacts|direct_recovery_cleanup|direct_recovery_backup|direct_recovery_artifacts|account_pool|account_profile|account_task|account_attempt|account_predecessor_task|account_predecessor_attempt|account_predecessor_provider|account_predecessor_profile|account_predecessor_pool|account_predecessor_session|account_predecessor_cleanup|account_rollback_cleanup|account_rollback_backup|account_rollback_artifacts|account_rollback_preserve_session|continuation_packet|provider_session_id|herdr_session|herdr_workspace_id|herdr_tab_id|herdr_pane_id|zellij_session|zellij_tab_id|zellij_pane_id|orca_worktree_id|terminal|orca_cleanup_pending|orca_cleanup_phase|orca_terminal_proof|orca_repo_id|orca_expected_task|orca_provider_task|orca_discovery_label|orca_provider_scope|cmux_workspace_id|cmux_surface_id|home|projects|rollback_pending) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1743,6 +1743,28 @@ fm_account_exec_command() {  # <profile> <pool> <task> <workspace> <turn-end-mar
     "$(fm_account_shell_quote "$2")" \
     "$(fm_account_shell_quote "$4")" \
     "$(fm_account_shell_quote "$5")"
+}
+
+fm_account_profile_home() {  # <provider> <profile>
+  local provider=$1 profile=$2 binary json home physical
+  case "$provider" in claude|codex) ;; *) return 1 ;; esac
+  fm_account_valid_id "$profile" || return 1
+  fm_account_pin_fleet_bin || return 1
+  binary=$FM_ACCOUNT_FLEET_PINNED_BIN
+  fm_account_validate_contract "$binary" || return 1
+  json=$(fm_account_run_control "$binary" --format json profile list) || return 1
+  home=$(printf '%s\n' "$json" | fm_account_system_exec "$FM_ACCOUNT_SYSTEM_JQ_BIN" -er \
+    --arg provider "$provider" --arg profile "$profile" '
+      [.profiles[]
+        | select(.provider == $provider and .id == $profile)
+        | .home
+        | select(type == "string" and startswith("/"))]
+      | if length == 1 then .[0] else error("profile home is not unique") end
+    ' 2>/dev/null) || return 1
+  [ -d "$home" ] && [ ! -L "$home" ] || return 1
+  physical=$(cd "$home" 2>/dev/null && pwd -P) || return 1
+  [ "$physical" = "$home" ] || return 1
+  printf '%s\n' "$home"
 }
 
 fm_account_resume_command() {  # <task> <workspace> <turn-end-marker>

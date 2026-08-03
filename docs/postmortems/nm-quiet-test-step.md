@@ -96,29 +96,21 @@ That reasoning was sound but answered the wrong question: load explains *how muc
 
 ## What changed here
 
-The configured lint and test commands now `exec bin/fm-nm-command-supervisor.sh` as the exact process no-mistakes waits on.
-The supervisor records its PID, process group, process start identity, run id, step, and physical worktree atomically under the no-mistakes home.
-It redirects every descendant away from no-mistakes' captured pipe, propagates the command's exit status, and reaps its process group on every normal, failed, or signalled exit.
-A watchdog reaps the group if the supervisor itself disappears.
-That ownership makes a dead command close no-mistakes' wait and become an ordinary failed step, so the existing retry and fix path remains usable without aborting the run.
+`bin/fm-nm-step-liveness.sh` answers the question the tool could not: are this run's own processes alive and doing work?
+It finds processes by **working directory**, which is the one attribute that reliably identifies them, and separates four outcomes that were previously indistinguishable.
 
-`bin/fm-nm-step-liveness.sh` verifies that exact identity and separates three outcomes.
-
-- `alive` - the recorded PID still has the recorded process group and start identity.
-- `dead` - the same recorded identity is absent across two checks.
-- `unknown` - the supervisor record is missing, invalid, unreadable, or changing; worktree process presence is reported only as supporting detail.
-
-An unrelated background process holding the worktree cwd can no longer prove the command alive.
-An empty cwd scan without a supervisor record can no longer prove it dead.
+- `alive` - processes present and making measurable progress.
+- `stalled` - processes present but no progress in the sample window; explicitly not dead, because a command blocked on I/O or sleeping reads this way.
+- `dead` - provably zero processes while the step is recorded running. This is the only verdict that justifies discarding a run.
+- `unknown` - the answer could not be established. Fail-closed, following the rule `bin/fm-lock-lib.sh` already applies to `lsof`: an unreadable answer is never evidence of absence.
 
 `bin/fm-crew-state.sh` calls it automatically whenever the active step renders quiet, so the verdict appears in the ordinary heartbeat read:
 
 ```
-state: working · source: run-step · validating (running) · test alive (3 procs) supervised pid 57496, pgid 57496 on bash tests/fm-teardown-a.test.sh (38:37)
+state: working · source: run-step · validating (running) · test alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37)
 ```
 
-Only an exact `alive` verdict preserves `state: working`.
-Every `dead` or `unknown` verdict makes the current-state read `unknown`, so the shared absorb classifier surfaces it instead of treating inactive or uninspectable work as healthy.
+The verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
 The `ci` step is exempt: its monitoring runs inside the daemon and owns no worktree process, so a verdict there would always read `dead` and mean nothing.
 
 The unit of work and its age ride along on that line because "alive" alone still leaves hours of runtime unexplained.
@@ -126,21 +118,20 @@ They are carried on the heartbeat read rather than left to a second command, sin
 Run the probe directly for the full detail:
 
 ```
-liveness: alive · run: 01KZ0Q9CZ4B4170FSBM0HX1F0M · procs: 7 · supervised pid 57496, pgid 57496 · doing: bash tests/fm-teardown-a.test.sh (38:37)
+liveness: alive · run: 01KZ0Q9CZ4B4170FSBM0HX1F0M · procs: 7 · processes present in worktree · doing: bash tests/fm-teardown-a.test.sh (38:37)
 ```
 
 That is what makes slow separable from hung without spending a run to find out: a step that keeps changing what it is on is slow, and one sitting on the same script past any plausible budget is worth investigating.
 
 ## Operating rule
 
-**Never abort a run to recover a reported-quiet configured command.**
+**Never abort a run on a reported-quiet step without a `dead` verdict from `bin/fm-nm-step-liveness.sh`.**
 Quiet is not evidence.
-An exact live supervisor reports working, missing identity reports unknown, and a missing supervised command returns through no-mistakes as a failed step.
 For a configured-command step, quiet is the *expected* rendering for the step's entire duration, and for this repo that duration is routinely measured in hours.
 
 ## What is still a no-mistakes defect
 
-The root reporting and recovery gaps remain defects in no-mistakes itself.
+Two things here are the tool's to fix, and firstmate should not paper over either.
 
 **Reporting.**
 A step running a configured command should publish the command's pid the way an agent step publishes `agent_pid`, and should flush its log incrementally rather than at step end.
@@ -148,9 +139,13 @@ Either change alone would have prevented this incident, because either one makes
 The smallest correct fix is the pid: it is a single field on a record no-mistakes already writes when it spawns the process, and it makes liveness answerable from `axi status` alone with no process inspection at all.
 
 **Recovery.**
-no-mistakes should record and reap its configured-command child directly.
-This repo fixes the running system at the command boundary it controls: `exec` makes the supervisor the exact child already owned by no-mistakes, and pipe isolation guarantees that the existing wait observes its death and writes the failed step.
-That is recovery rather than containment for every configured command in this repo, while the general no-mistakes implementation still needs the same ownership natively.
+A step whose process genuinely dies stays `running` forever.
+`axi respond --action fix` refuses because the step is not `awaiting_approval`, `axi run` re-attaches to the same stuck run, and only `abort` escapes - at the cost of the entire run.
+That gap is real and was correctly identified; it is simply not what happened on 2026-08-02.
+The smallest correct fix is for the daemon to reap a step whose recorded process is gone and mark it failed, which makes the existing auto-fix path applicable instead of requiring an abort.
+
+Neither can be fixed from this repo: no-mistakes is installed as a compiled binary at `~/.no-mistakes/bin/no-mistakes` with no source available here.
+Until they land, `bin/fm-nm-step-liveness.sh` is the detection firstmate needs, and abort remains the only recovery for a genuinely dead step.
 
 ## Separate finding: is a multi-hour test step legitimate or hung?
 
@@ -191,7 +186,7 @@ They are competing for 14 cores, at a load average of 26-31 during this incident
 
 Three separate problems compounded, and only the first is fixed here.
 
-1. **No liveness signal for a configured-command step.** The subject of this postmortem, fixed by `bin/fm-nm-command-supervisor.sh` and `bin/fm-nm-step-liveness.sh`.
+1. **No liveness signal for a configured-command step.** The subject of this postmortem, fixed by `bin/fm-nm-step-liveness.sh`.
 2. **The suite is an hour long serially.** `tests/behavior-test-durations.tsv` sums to 59.2 minutes across 92 scripts, and the gate runs them in one serial loop. Tracked separately as `fm-gate-serial-e2e-bottleneck`; deliberately not addressed here.
 3. **Nothing bounds how many validation runs share the machine.** See the correction below.
 

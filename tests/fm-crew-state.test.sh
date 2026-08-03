@@ -20,8 +20,9 @@
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
-#   (l) a quiet configured command is working only with exact supervised process
-#       identity; cwd presence or absence without it is unknown
+#   (l) a quiet active step carries a real liveness verdict (dead / alive) from
+#       bin/fm-nm-step-liveness.sh, and the ci step is exempted because it owns
+#       no worktree process - the 2026-08-02 false-dead regression pair
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
 #       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
 #       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
@@ -36,7 +37,6 @@ set -u
 . "$ROOT/bin/fm-classify-lib.sh"
 
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
-SUPERVISOR="$ROOT/bin/fm-nm-command-supervisor.sh"
 fm_test_tmproot_into TMP_ROOT fm-crew-state
 fm_git_identity fmtest fmtest@example.invalid
 
@@ -239,7 +239,6 @@ reset_fakes() {
   FM_FAKE_REMOTE_COMMIT_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_REMOTE_COMMIT_FAIL=0
   FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
-  unset FM_NM_COMMAND_STATE_DIR FM_NM_STEP_LIVENESS_BIN
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
@@ -476,24 +475,25 @@ test_active_run_is_authoritative() {
   pass "active run-step is authoritative"
 }
 
-# (l) quiet configured-command state is fail-closed without exact identity.
-test_quiet_step_without_identity_is_unknown() {
+# (l) a quiet step carries a real liveness verdict instead of leaving firstmate
+# to hand-check it. On 2026-08-02 that hand check was wrong and two healthy runs
+# were aborted, so both directions are pinned here.
+test_quiet_step_reports_dead_liveness() {
   reset_fakes
   local d; d=$(new_case quiet-dead)
   make_repo_on_branch "$d/wt" fm/feat-q
   make_fakebin "$d" >/dev/null
+  # An existing run worktree with nothing running in it: provably dead.
   mkdir -p "$d/nm-home/worktrees/repo1/01RUN"
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
   local out; out=$(run_crew_state "$d" feat-q)
-  assert_contains "$out" "state: unknown" "unowned quiet step must not be reported working"
-  assert_contains "$out" "supervised command identity unavailable" "absence is reported without guessing dead"
-  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" FM_NM_HOME="$d/nm-home" crew_is_provably_working feat-q \
-    && fail "quiet step without command identity was absorbed as provably working"
-  pass "a quiet step without exact command identity is not reported working"
+  assert_contains "$out" "state: working" "a quiet step is still reported working"
+  assert_contains "$out" "test dead (0 procs)" "a quiet step with no process reports dead"
+  pass "a quiet step with no live process reports a dead liveness verdict"
 }
 
-test_quiet_step_unrelated_process_is_unknown() {
+test_quiet_step_reports_alive_liveness() {
   reset_fakes
   local d; d=$(new_case quiet-alive)
   make_repo_on_branch "$d/wt" fm/feat-q
@@ -502,53 +502,28 @@ test_quiet_step_unrelated_process_is_unknown() {
   mkdir -p "$nmwt"
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
+  # A real process working in that worktree, named nothing like the run - the
+  # exact shape the false-negative argv search missed. It is a parent shell with
+  # a child, matching a suite loop running one script at a time, so the reported
+  # unit of work is exercised too and not just the bare verdict.
   ( cd "$nmwt" && exec sh -c 'sleep 30 & wait' ) &
   local sleeper=$!
   local out=""
   local _
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     out=$(run_crew_state "$d" feat-q)
-    case "$out" in *"test unknown ("*) break ;; esac
+    case "$out" in *"test alive"*" on "*) break ;; esac
     sleep 0.3
   done
   pkill -9 -P "$sleeper" 2>/dev/null || true
   kill -9 "$sleeper" 2>/dev/null || true
   wait "$sleeper" 2>/dev/null || true
-  assert_contains "$out" "state: unknown" "unrelated cwd process must not prove the command alive"
-  assert_contains "$out" "no supervised command identity" "unowned process is labeled as presence only"
-  pass "an unrelated worktree process cannot mask unknown command liveness"
-}
-
-test_quiet_step_supervised_process_is_working() {
-  reset_fakes
-  local d; d=$(new_case quiet-supervised)
-  make_repo_on_branch "$d/wt" fm/feat-q
-  make_fakebin "$d" >/dev/null
-  local nmwt="$d/nm-home/worktrees/repo1/01RUN"
-  local state_dir="$d/command-state" supervisor_pid out="" _
-  mkdir -p "$nmwt" "$state_dir"
-  fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
-  FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
-  (
-    cd "$nmwt" || exit 1
-    exec perl -e 'setpgrp(0, 0); exec @ARGV' env FM_NM_COMMAND_STATE_DIR="$state_dir" \
-      "$SUPERVISOR" test sleep 30
-  ) &
-  supervisor_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -s "$state_dir/01RUN.test.state" ] && break
-    sleep 0.3
-  done
-  FM_NM_COMMAND_STATE_DIR=$state_dir
-  export FM_NM_COMMAND_STATE_DIR
-  out=$(run_crew_state "$d" feat-q)
-  kill -TERM "$supervisor_pid" 2>/dev/null || true
-  wait "$supervisor_pid" 2>/dev/null || true
-  unset FM_NM_COMMAND_STATE_DIR
-  assert_contains "$out" "state: working" "exact live command identity proves the quiet step working"
-  assert_contains "$out" "test alive" "supervised command carries an alive verdict"
-  assert_contains "$out" "supervised pid $supervisor_pid" "reported liveness names the exact command pid"
-  pass "a quiet step is working only with exact supervised command identity"
+  assert_contains "$out" "test alive" "a quiet step with a live process reports alive"
+  # Alive alone leaves hours of runtime unexplained; naming the current unit of
+  # work and its age is what separates a slow step from a hung one without
+  # spending a run to find out, so the heartbeat read must carry it.
+  assert_contains "$out" " on sleep 30 (" "the alive verdict names the current unit of work and its age"
+  pass "a quiet step with a live process reports an alive liveness verdict"
 }
 
 # The ci step monitors GitHub from inside the daemon and owns no worktree
@@ -1569,32 +1544,6 @@ SH
   pass "no timeout command uses perl bound"
 }
 
-test_no_timeout_perl_bounds_liveness_probe() {
-  reset_fakes
-  local d toolbin out start elapsed probe
-  d=$(new_case no-timeout-liveness)
-  make_repo_on_branch "$d/wt" fm/feat-timeout-live
-  make_fakebin "$d" >/dev/null
-  mkdir -p "$d/nm-home/worktrees/repo1/01RUN"
-  probe="$d/hanging-probe"
-  cat > "$probe" <<'SH'
-#!/usr/bin/env bash
-while :; do :; done
-SH
-  chmod +x "$probe"
-  toolbin=$(make_no_timeout_toolbin "$d")
-  fm_write_meta "$d/state/feat-timeout-live.meta" "window=fm:fm-feat-timeout-live" "worktree=$d/wt" "kind=ship"
-  FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-timeout-live test)"
-  start=$SECONDS
-  out=$(PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" FM_NM_HOME="$d/nm-home" \
-    FM_NM_STEP_LIVENESS_BIN="$probe" FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout-live)
-  elapsed=$((SECONDS - start))
-  assert_contains "$out" "state: unknown" "timed-out liveness probe must fail closed"
-  assert_contains "$out" "bounded probe unavailable" "timed-out liveness probe is observable"
-  [ "$elapsed" -lt 5 ] || fail "perl timeout did not bound liveness probe (elapsed ${elapsed}s)"
-  pass "perl fallback bounds the quiet-step liveness probe"
-}
-
 # (i) kind=scout skips the run lookup entirely (its deliverable is a report).
 test_scout_skips_run_lookup() {
   reset_fakes
@@ -1691,9 +1640,8 @@ test_usage_error() {
 }
 
 test_active_run_is_authoritative
-test_quiet_step_without_identity_is_unknown
-test_quiet_step_unrelated_process_is_unknown
-test_quiet_step_supervised_process_is_working
+test_quiet_step_reports_dead_liveness
+test_quiet_step_reports_alive_liveness
 test_quiet_ci_step_skips_liveness
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1747,7 +1695,6 @@ test_dead_window_ignores_stale_status_log
 test_dead_window_still_reports_terminal_run_step
 test_dead_window_still_reports_active_run_step
 test_no_timeout_uses_perl_bound
-test_no_timeout_perl_bounds_liveness_probe
 test_scout_skips_run_lookup
 test_torn_down_worktree
 test_missing_meta

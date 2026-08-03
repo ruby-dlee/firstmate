@@ -23,6 +23,12 @@ if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
   . "$DAEMON"
 fi
 
+fm_backend_send_steering() {
+  local verdict
+  verdict=$(fm_backend_send_text_submit "$1" "$2" "$3" 3 0 0)
+  [ "$verdict" = empty ]
+}
+
 fm_test_tmproot_into TMP_ROOT fm-daemon-tests
 
 test_afk_start_refuses_when_flag_cannot_be_written() {
@@ -1484,26 +1490,16 @@ test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
 }
 
 test_fm_send_exits_nonzero_on_confirmed_swallow() {
-  # fm-send.sh must exit NON-ZERO when a steer's Enter is positively swallowed
-  # (text left in the composer), so firstmate learns the instruction did not land
-  # — and exit ZERO on a clean submit.
-  local dir fakebin err
+  local dir fakebin err sent rc
   dir=$(make_bordered_case send-swallow)
-  fakebin="$dir/fakebin"; err="$dir/send.err"
-  # Clean submit -> exit 0.
+  fakebin="$dir/fakebin"; err="$dir/send.err"; sent="$dir/sent.log"; : > "$sent"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_FAKE_COMPOSER="$dir/composer" \
-    FM_SEND_SLEEP=0.05 "$ROOT/bin/fm-send.sh" sess:win 'route this work' >/dev/null 2>"$err" \
-    || fail "fm-send exited non-zero on a clean submit: $(cat "$err")"
-  # Persistent swallow -> exit non-zero with a clear message.
-  printf '│ > │\n' > "$dir/composer"
-  touch "$dir/.swallow"
-  if PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_FAKE_COMPOSER="$dir/composer" \
-    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 FM_SEND_SLEEP=0.05 \
-    "$ROOT/bin/fm-send.sh" sess:win 'fix findings 1 and 3, skip 2' >/dev/null 2>"$err"; then
-    fail "fm-send exited zero despite a swallowed Enter (silent unsubmitted instruction)"
-  fi
-  grep -F 'not submitted' "$err" >/dev/null || fail "fm-send did not explain the swallowed submit: $(cat "$err")"
-  pass "fm-send exits non-zero on a confirmed swallow, zero on a clean submit"
+    FM_FAKE_SENT="$sent" "$ROOT/bin/fm-send.sh" sess:win 'route this work' >/dev/null 2>"$err"; rc=$?
+  expect_code 1 "$rc" "fm-send must refuse a split literal-plus-Enter adapter"
+  grep -F 'no atomic agent-session-bound tmux route' "$err" >/dev/null \
+    || fail "fm-send did not explain the atomic steering refusal: $(cat "$err")"
+  [ ! -s "$sent" ] || fail "atomic steering refusal still wrote pane input"
+  pass "fm-send refuses split submit adapters before pane input"
 }
 
 test_fm_send_exits_nonzero_on_initial_send_failure() {
@@ -1804,7 +1800,6 @@ test_wedge_alarm_shutdown_stops_active_notifier_group
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
 test_fm_send_exits_nonzero_on_confirmed_swallow
-test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
 test_pane_is_busy_herdr_native_busy_state

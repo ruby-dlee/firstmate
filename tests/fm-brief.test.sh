@@ -457,6 +457,36 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
+test_destructive_run_control_carries_obey_after_verify() {
+  local home kind id brief
+  home="$TMP_ROOT/destructive-run-control-home"
+  mkdir -p "$home/data"
+  for kind in ship scout secondmate; do
+    id="brief-run-control-$kind"
+    case "$kind" in
+      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1 ;;
+      scout) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1 ;;
+      secondmate) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1 ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    assert_grep "must identify the exact run ID and branch" "$brief" \
+      "$kind brief omitted exact run identity"
+    assert_grep "prove current head equals the pushed head" "$brief" \
+      "$kind brief omitted no-stranded-head proof"
+    assert_grep "Independently verify every property before acting" "$brief" \
+      "$kind brief omitted receiver-side verification"
+    assert_grep "Process absence at any window length" "$brief" \
+      "$kind brief promoted a liveness proxy to death proof"
+    assert_grep "absence can produce only UNKNOWN, never idle or wedged" "$brief" \
+      "$kind brief made positive-only liveness tunable"
+    assert_grep "Before diagnosing repeated agent death, a daemon socket timeout, or a test flake as a code defect" "$brief" \
+      "$kind brief omitted the host-sensitive diagnosis trigger"
+    assert_grep "fm-host-pressure.sh" "$brief" \
+      "$kind brief omitted the host-pressure evidence instrument"
+  done
+  pass "fm-brief.sh: every lane carries both halves of obey-after-verify for destructive run control"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
@@ -475,3 +505,4 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
+test_destructive_run_control_carries_obey_after_verify

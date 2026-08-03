@@ -182,7 +182,9 @@ SH
 #!/usr/bin/env bash
 set -u
 id=${1:-unknown}
-rc=${FM_FAKE_RUN_LIVENESS_RC:-0}
+key=$(printf '%s' "$id" | tr -c 'A-Za-z0-9' '_')
+var="FM_FAKE_RUN_LIVENESS_RC_$key"
+rc=${!var:-${FM_FAKE_RUN_LIVENESS_RC:-0}}
 [ -z "${FM_FAKE_RUN_LIVENESS_LOG:-}" ] || printf '%s\t%s\n' "$(date +%s)" "$id" >> "$FM_FAKE_RUN_LIVENESS_LOG"
 [ -z "${FM_FAKE_RUN_LIVENESS_SLEEP:-}" ] || sleep "$FM_FAKE_RUN_LIVENESS_SLEEP"
 if [ "$rc" -eq 0 ]; then

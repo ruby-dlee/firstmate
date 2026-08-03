@@ -206,8 +206,6 @@ WEDGE_ALARM_NOTIFIER_PID=
 # bin/fm-tmux-lib.sh (FM_TMUX_BUSY_REGEX_DEFAULT / fm_tmux_composer_state);
 # FM_BUSY_REGEX still overrides the fallback busy set here, as before.
 INJECT_FAIL_SLEEP_DEFAULT=30
-INJECT_CONFIRM_RETRIES_DEFAULT=3
-INJECT_CONFIRM_SLEEP_DEFAULT=0.5
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -332,32 +330,9 @@ _collapse_newlines() {  # <text>
 
 classify_signal() {  # <reason-after-colon> <state>
   local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
-  local current liveness liveness_rel="" liveness_seen=""
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
-    case "$f" in
-      *.status) task=$(basename "$f"); task=${task%.status} ;;
-      *.turn-ended) task=$(basename "$f"); task=${task%.turn-ended} ;;
-      *) task= ;;
-    esac
-    if [ -n "$task" ]; then
-      case " $liveness_seen " in
-        *" $task "*) ;;
-        *)
-          liveness_seen="$liveness_seen $task"
-          current=$(crew_state_line "$task")
-          liveness=$(crew_state_liveness_verdict "$current")
-          case "$liveness" in
-            alive|'') ;;
-            dead|unknown)
-              liveness_rel=1
-              distilled="${distilled}${task} liveness ${liveness}: ${current} | "
-              ;;
-          esac
-          ;;
-      esac
-    fi
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
     status_is_captain_relevant "$last" || continue
@@ -372,9 +347,7 @@ classify_signal() {  # <reason-after-colon> <state>
   done
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
-  if [ -n "$liveness_rel" ]; then
-    printf 'escalate|%s' "$distilled"
-  elif [ -z "$rel" ]; then
+  if [ -z "$rel" ]; then
     printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
@@ -389,17 +362,8 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen current liveness
+  local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
-  current=$(crew_state_line "$task")
-  liveness=$(crew_state_liveness_verdict "$current")
-  case "$liveness" in
-    alive|'') ;;
-    dead|unknown)
-      printf 'escalate|%s liveness %s: %s' "$task" "$liveness" "$current"
-      return
-      ;;
-  esac
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_paused "$last"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
@@ -431,21 +395,7 @@ classify_check() {  # <full reason>  — check scripts print only when firstmate
 }
 
 classify_heartbeat() {  # [state]
-  local state=${1:-$(_state_root)} task liveness current distilled=""
-  while IFS=$(printf '\t') read -r task liveness current; do
-    [ -n "$task" ] || continue
-    case "$liveness" in
-      alive) ;;
-      dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
-      *) distilled="${distilled}${task} liveness unknown: ${current} | " ;;
-    esac
-  done < <(scan_crew_liveness_observations "$state")
-  distilled=${distilled% | }
-  if [ -n "$distilled" ]; then
-    printf 'escalate|%s' "$distilled"
-  else
-    printf 'self|heartbeat (no dead or unknown command-step liveness observation)'
-  fi
+  printf 'self|heartbeat (process absence is never an away-mode verdict)'
 }
 
 # Anything unrecognized is escalated (fail-safe).

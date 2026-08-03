@@ -2078,12 +2078,6 @@ case "${FM_TEST_FOCUSED:-}" in
     ;;
 esac
 
-if [ "${FM_TEST_FOCUSED:-}" = liveness-batches ]; then
-  test_signal_crew_provably_working_runs_one_bounded_parallel_window
-  test_watcher_stale_liveness_runs_one_bounded_parallel_window
-  exit 0
-fi
-
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier

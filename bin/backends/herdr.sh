@@ -2986,13 +2986,20 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 # backend; how each backend confirms it is an internal decision - herdr's is
 # no longer literally "the composer read empty").
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} i=0 verdict baseline confirm_sleep
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} i=0 verdict baseline confirm_sleep agent_json agent raw_status
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_expected_label_matches "$target" "$expected_label" || { printf 'send-failed'; return 0; }
-  fm_backend_herdr_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
+  agent_json=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent get "$FM_BACKEND_HERDR_PANE" 2>/dev/null) \
+    || { printf 'send-failed'; return 0; }
+  agent=$(printf '%s' "$agent_json" | fm_backend_herdr_control_jq -r '.result.agent.agent // empty' 2>/dev/null) \
+    || { printf 'send-failed'; return 0; }
+  raw_status=$(printf '%s' "$agent_json" | fm_backend_herdr_control_jq -r '.result.agent.agent_status // empty' 2>/dev/null) \
+    || { printf 'send-failed'; return 0; }
+  [ -n "$agent" ] && [ "$agent" != codex ] || { printf 'send-failed'; return 0; }
+  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent send "$FM_BACKEND_HERDR_PANE" "$text" >/dev/null 2>&1 \
+    || { printf 'send-failed'; return 0; }
   fm_backend_herdr_control_exec sleep "$settle"
-  baseline=$(fm_backend_herdr_classify_submit_agent_status \
-    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")
+  baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   while :; do
     fm_backend_herdr_send_key "$target" Enter "$expected_label" || true

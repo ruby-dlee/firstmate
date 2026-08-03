@@ -1,9 +1,18 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process';
-import { access, lstat, readFile, readdir, stat } from 'node:fs/promises';
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +38,9 @@ const VERSION = '1.1.0';
 const PROGRAM = basename(process.argv[1] ?? 'lavish-axi');
 const SOURCE_WAKE_ADAPTER = fileURLToPath(
   new URL('../../../bin/fm-lavish-wake.sh', import.meta.url),
+);
+const CAPTAIN_ITEM_CHECK = fileURLToPath(
+  new URL('../../../bin/fm-captain-item-check.sh', import.meta.url),
 );
 
 function usage() {
@@ -658,6 +670,8 @@ async function createCommand(options) {
   const home = resolveHome(options);
   const requestPath = resolve(requireOption(options, 'request'));
   const questionsPath = resolve(requireOption(options, 'questions'));
+  const request = await readFile(requestPath);
+  await validateCaptainRequest(request);
   let questions;
   try {
     questions = JSON.parse(await readFile(questionsPath, 'utf8'));
@@ -667,7 +681,7 @@ async function createCommand(options) {
   const result = await createDecision(home, {
     id: requireOption(options, 'id'),
     title: requireOption(options, 'title'),
-    request: await readFile(requestPath),
+    request,
     questions,
     destination: requireOption(options, 'destination'),
     visualsDirectory: options.visuals === undefined ? undefined : resolve(options.visuals),
@@ -677,6 +691,31 @@ async function createCommand(options) {
     `${result.created ? 'Created' : 'Already exists'}: ${result.decision.id}\n`
     + `Run: lavish answer ${result.decision.id} --home ${shellQuote(home)}\n`,
   );
+}
+
+async function validateCaptainRequest(request) {
+  const temporary = await mkdtemp(join(tmpdir(), 'lavish-captain-request-'));
+  const snapshot = join(temporary, 'request.md');
+  try {
+    await writeFile(snapshot, request, { flag: 'wx', mode: 0o600 });
+    const checked = await new Promise((resolveCheck) => {
+      execFile(
+        CAPTAIN_ITEM_CHECK,
+        ['request', snapshot],
+        { encoding: 'utf8', maxBuffer: 1024 * 1024, windowsHide: true },
+        (error, stdout, stderr) => resolveCheck({ error, stdout, stderr }),
+      );
+    });
+    if (checked.error !== null) {
+      const detail = `${checked.stdout}${checked.stderr}`.trim();
+      throw new LavishError(
+        `captain request refused by the required draft check${detail === '' ? '' : `:\n${detail}`}`,
+        2,
+      );
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 async function intakeCommand(options) {

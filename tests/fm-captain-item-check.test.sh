@@ -78,6 +78,52 @@ test_opaque_mechanism_fails() {
   pass "opaque mechanism and engineering evidence fail specifically"
 }
 
+test_verbatim_block_preserves_technical_detail() {
+  local rc
+  cp "$FIXTURES/positive/risk-billing.md" "$TMP_ROOT/verbatim.md"
+  {
+    printf '\n## Verbatim technical finding\n\n'
+    printf '<!-- fm-verbatim:start -->\n'
+    printf '%s\n' 'worker.py:97 kept the ClickHouse pointer guard green on main.'
+    printf '<!-- fm-verbatim:end -->\n'
+  } >> "$TMP_ROOT/verbatim.md"
+  cp "$TMP_ROOT/verbatim.md" "$TMP_ROOT/verbatim.before"
+
+  rc=$(run_check decision "$TMP_ROOT/verbatim.md")
+  [ "$rc" -eq 0 ] || fail "technical terms inside the verbatim block did not clear"
+  cmp -s "$TMP_ROOT/verbatim.before" "$TMP_ROOT/verbatim.md" \
+    || fail "the checker changed the verbatim finding"
+  pass "plain-language wrapper clears while verbatim technical detail stays exact"
+}
+
+test_request_assembly() {
+  local rc
+  {
+    printf '<!-- fm-captain-item: risk -->\n'
+    cat "$FIXTURES/positive/risk-billing.md"
+    printf '<!-- /fm-captain-item -->\n\n'
+    printf '<!-- fm-captain-item: decision -->\n'
+    cat "$FIXTURES/positive/risk-privacy.md"
+    printf '<!-- /fm-captain-item -->\n'
+  } > "$TMP_ROOT/request.md"
+
+  rc=$(run_check request "$TMP_ROOT/request.md")
+  [ "$rc" -eq 0 ] || fail "complete two-item request did not clear"
+  grep -F 'mode=request' "$TMP_ROOT/output" >/dev/null \
+    || fail "request mode did not report its verdict"
+  grep -F 'items=2' "$TMP_ROOT/output" >/dev/null \
+    || fail "request mode did not report both checked items"
+
+  printf 'Unchecked introduction.\n%s' "$(cat "$TMP_ROOT/request.md")" \
+    > "$TMP_ROOT/request-unchecked.md"
+  rc=$(run_check request "$TMP_ROOT/request-unchecked.md")
+  [ "$rc" -eq 1 ] || fail "request mode accepted prose outside checked items"
+  grep -F 'invalid: request-assembly - unchecked prose outside item markers' \
+    "$TMP_ROOT/output" >/dev/null \
+    || fail "unchecked request prose did not get the assembly failure"
+  pass "request mode checks multi-item assembly and refuses unchecked prose"
+}
+
 test_usage_and_file_errors() {
   local rc
   rc=$(run_check invalid "$FIXTURES/positive/risk-billing.md")
@@ -94,15 +140,21 @@ test_wiring() {
   grep -F 'require `bin/fm-captain-item-check.sh` to clear' "$ROOT/AGENTS.md" >/dev/null \
     || fail "AGENTS.md does not require the check before surfacing an item"
   # shellcheck disable=SC2016  # These are literal tracked Markdown fragments.
-  grep -F 'run `bin/fm-captain-item-check.sh` as documented for every item' \
+  grep -F 'Creation snapshots the request bytes once' \
     "$ROOT/.agents/skills/lavish-decisions/SKILL.md" >/dev/null \
-    || fail "lavish-decisions does not invoke the check before creation"
-  pass "always-loaded and Lavish workflows invoke the check"
+    || fail "lavish-decisions does not bind creation to the checked request"
+  grep -F 'await validateCaptainRequest(request);' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
+    || fail "Lavish creation does not invoke the request check on its snapshot"
+  grep -F 'request,' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
+    || fail "Lavish creation does not pass the checked bytes to durable creation"
+  pass "always-loaded and Lavish creation paths invoke the check"
 }
 
 test_negative_controls
 test_positive_controls
 test_decision_mode
 test_opaque_mechanism_fails
+test_verbatim_block_preserves_technical_detail
+test_request_assembly
 test_usage_and_file_errors
 test_wiring
